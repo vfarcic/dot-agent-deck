@@ -56,9 +56,9 @@ use crate::project_config::{
     ProjectConfig, default_orchestration, load_project_config, resolve_orchestration_name,
 };
 use crate::prompt_delivery::{
-    AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, log_prompt_abandoned, log_prompt_confirmed,
-    log_prompt_stopped, log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written,
-    mint_delivery_id, unconfirmed_retry_delay,
+    AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, confirmation_latency_floor, log_prompt_abandoned,
+    log_prompt_confirmed, log_prompt_stopped, log_prompt_unconfirmable, log_prompt_unconfirmed,
+    log_prompt_written, mint_delivery_id, unconfirmed_retry_delay,
 };
 use crate::scheduler::{Notifier, NotifyEvent};
 
@@ -1544,11 +1544,12 @@ async fn deliver(
     // Issue #424 F4: the launcher handoff is STANDING, not capability, so it is
     // recorded rather than folded into the answer above. Arming here instead
     // would put the one replacement payload on the retry schedule's clock —
-    // ~500 ms after the write — which for `scheduler/dispatch/015` means typing
-    // it into a launcher that has not exec'd the real agent yet, and every
-    // attempt after that is a submit-only probe with nothing to submit. What the
-    // handoff licenses is accepting the successor WHEN IT ANNOUNCES ITSELF, so
-    // the payload goes in exactly when the agent is there to receive it. See
+    // one retry window after the write — which for `scheduler/dispatch/015`
+    // means typing it into a launcher that has not exec'd the real agent yet,
+    // and every attempt after that is a submit-only probe with nothing to
+    // submit. What the handoff licenses is accepting the successor WHEN IT
+    // ANNOUNCES ITSELF, so the payload goes in exactly when the agent is there
+    // to receive it. See
     // [`crate::state::SessionStartWait::launcher_handoff`].
     //
     // Issue #666: the DECLARED TYPE goes with it. It is the pane's believed type
@@ -1570,6 +1571,7 @@ async fn deliver(
             let pane_id = pane_id.to_string();
             let agent_id = agent_id.to_string();
             let prompt = prompt.to_string();
+            let confirmation_floor = confirmation_floor_for(&registry, &agent_id);
             let task = ConfirmationTask {
                 pane_id,
                 agent_id,
@@ -1577,6 +1579,7 @@ async fn deliver(
                 delivery_id,
                 generation,
                 can_report_prompts,
+                confirmation_floor,
                 deadline,
             };
             spawn_confirmation_task(registry, rx, task);
@@ -1839,6 +1842,7 @@ async fn confirm_prompt_delivery(
         delivery_id,
         mut generation,
         can_report_prompts,
+        confirmation_floor,
         deadline,
     } = task;
     // Issue #424 S1/S2 (both reviewers): THIS delivery's own clock — the
@@ -1947,7 +1951,7 @@ async fn confirm_prompt_delivery(
             }
             return;
         }
-        let window = unconfirmed_retry_delay(attempt).min(remaining);
+        let window = unconfirmed_retry_delay(attempt, confirmation_floor).min(remaining);
         match crate::state::wait_for_prompt_submission(
             &mut rx,
             &pane_id,
@@ -2046,8 +2050,8 @@ async fn confirm_prompt_delivery(
             }
         }
         // Reviewer finding B3, daemon side: capability is a property of the
-        // PRODUCER, not a verdict a 500 ms timeout may return. Nothing has
-        // identified itself yet, so the write stays PROVISIONAL — held, never
+        // PRODUCER, not a verdict one watch window's timeout may return. Nothing
+        // has identified itself yet, so the write stays PROVISIONAL — held, never
         // retyped — and the next window asks again. Returning here (what this
         // did) abandoned the watch half a second after the write while up to 59
         // seconds of the deadline remained, so an agent booting behind a
@@ -2344,6 +2348,26 @@ fn abandon_spawn_prompt(
     });
 }
 
+/// Issue #637: the floor under every watch window of a delivery to `agent_id` —
+/// [`confirmation_latency_floor`] of the agent type THE DECK ITSELF spawned
+/// there ([`AgentPtyRegistry::spawn_agent_type`]), and the slow floor when it
+/// spawned no known type.
+///
+/// No window may end before a genuine confirmation from that producer could
+/// plausibly have arrived, or the retry that follows races it and the agent
+/// receives the prompt twice. Deliberately NOT
+/// [`AgentPtyRegistry::pre_write_believed_agent_type`], which also accepts a
+/// launcher's pre-write declaration (PR #1314 review): a short floor is a
+/// permission to re-submit sooner, and — as with the #666 rearm, where a
+/// declared type may withhold but never grant — a producer's own claim does not
+/// earn it. A launcher that declares Claude Code and execs Codex would otherwise
+/// have its payload retried after 2 s while the Codex confirmation was still on
+/// its way. What it costs is recovery latency for the `devbox run claude …`
+/// shape, whose command resolves to no type: it takes the slow floor.
+fn confirmation_floor_for(registry: &AgentPtyRegistry, agent_id: &str) -> Duration {
+    confirmation_latency_floor(registry.spawn_agent_type(agent_id).as_ref())
+}
+
 /// Everything one detached confirmation loop needs, bundled so the loop's
 /// parameter list stays readable and the identity it is bound to travels as one
 /// value.
@@ -2357,6 +2381,12 @@ struct ConfirmationTask {
     /// `/clear` between them is caught (reviewer findings B1/B2).
     generation: Option<(String, DateTime<Utc>)>,
     can_report_prompts: bool,
+    /// Issue #637: the shortest any watch window may be — how long a genuine
+    /// confirmation from this pane's producer can plausibly still be in flight
+    /// after a submission. See [`confirmation_floor_for`]. Tests of other
+    /// properties pass `Duration::ZERO`, which reproduces the unfloored schedule
+    /// their timings were written against.
+    confirmation_floor: Duration,
     deadline: Instant,
 }
 
@@ -3388,24 +3418,6 @@ mod tests {
         spawn_typed_byte_target(registry, pane_id, None)
     }
 
-    /// A hook endpoint with no listener, for the byte targets' children.
-    ///
-    /// Clearing the inherited endpoints (`crate::test_isolation`) stops a child
-    /// INHERITING a route to a real deck; it does not stop one RESOLVING it.
-    /// With the variable absent, [`crate::platform::paths::socket_path`] falls
-    /// back to `$XDG_RUNTIME_DIR/dot-agent-deck.sock` — the developer's live
-    /// daemon — so an emitting child reaches it either way, and `spawn`'s own
-    /// `env_remove` of the same variable cannot help. Pinning a path nothing
-    /// listens on makes the emit fail closed instead. These targets are bare
-    /// byte sinks that emit nothing at all, so this is belt to that braces: it
-    /// is what keeps the guarantee true for a fixture added later.
-    fn unreachable_hook_endpoint() -> String {
-        std::env::temp_dir()
-            .join(format!("dad-unit-no-listener-{}.sock", std::process::id()))
-            .to_string_lossy()
-            .into_owned()
-    }
-
     /// The same byte-observation target, carrying the
     /// [`SpawnOptions::agent_type`] the deck itself decides at the spawn site
     /// (issue #570). `None` is the hookless pane the deck can vouch for
@@ -3444,13 +3456,15 @@ mod tests {
         let agent_id = registry
             .spawn_agent(SpawnOptions {
                 command: Some(command),
-                env: vec![
-                    (DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string()),
-                    (
-                        crate::agent_pty::DOT_AGENT_DECK_SOCKET.to_string(),
-                        unreachable_hook_endpoint(),
-                    ),
-                ],
+                // Pinned endpoints: clearing the inherited ones
+                // (`crate::test_isolation`) stops a child INHERITING a route to
+                // a real deck, not RESOLVING one. These targets are bare byte
+                // sinks that emit nothing, so this is belt to that braces — it
+                // is what keeps the guarantee true for a fixture added later.
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane_id.to_string(),
+                )]),
                 agent_type: if wrapped { None } else { agent_type.clone() },
                 ..SpawnOptions::default()
             })
@@ -3692,6 +3706,7 @@ mod tests {
                 // varied independently and only decides whether the post-write
                 // start may authorize a payload rather than the ordinary probe.
                 can_report_prompts: true,
+                confirmation_floor: Duration::ZERO,
                 deadline: Instant::now() + Duration::from_secs(12),
             },
         ));
@@ -4118,7 +4133,8 @@ mod tests {
         // `common::init_test_env()`, so nothing had cleared the deck endpoints
         // this process inherited from the pane the suite was launched in. See
         // `crate::test_isolation` for what that does and does not cover; the
-        // byte targets pin an unreachable endpoint of their own for the rest.
+        // byte targets pin unreachable endpoints for the rest
+        // (`test_isolation::pin_unreachable_endpoints`).
         crate::test_isolation::detach_from_any_live_deck();
         cancel_all_prompt_confirmations();
         const PROMPT: &str = "DETACHED-STALE-PROMPT-MARKER";
@@ -4137,6 +4153,7 @@ mod tests {
                 delivery_id: "replacement-guard-test".into(),
                 generation: Some(("original-generation".into(), Utc::now())),
                 can_report_prompts: true,
+                confirmation_floor: Duration::ZERO,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
@@ -4180,6 +4197,7 @@ mod tests {
                 delivery_id: "clear-generation-test".into(),
                 generation: Some(("bound-before-clear".into(), Utc::now())),
                 can_report_prompts: true,
+                confirmation_floor: Duration::ZERO,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
@@ -4240,6 +4258,7 @@ mod tests {
                 delivery_id: "lagged-stream-test".into(),
                 generation: None,
                 can_report_prompts: true,
+                confirmation_floor: Duration::ZERO,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
@@ -4262,6 +4281,7 @@ mod tests {
                 delivery_id: "closed-stream-test".into(),
                 generation: None,
                 can_report_prompts: true,
+                confirmation_floor: Duration::ZERO,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
@@ -4303,6 +4323,7 @@ mod tests {
                 delivery_id: "close-cancel-test".into(),
                 generation: None,
                 can_report_prompts: true,
+                confirmation_floor: Duration::ZERO,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         );
@@ -4320,6 +4341,7 @@ mod tests {
                 delivery_id: "single-flight-old".into(),
                 generation: None,
                 can_report_prompts: true,
+                confirmation_floor: Duration::ZERO,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         );
@@ -4333,6 +4355,7 @@ mod tests {
                 delivery_id: "single-flight-new".into(),
                 generation: None,
                 can_report_prompts: false,
+                confirmation_floor: Duration::ZERO,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         );
@@ -4350,6 +4373,7 @@ mod tests {
                     delivery_id: format!("shutdown-cancel-{pane_id}"),
                     generation: None,
                     can_report_prompts: true,
+                    confirmation_floor: Duration::ZERO,
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
             );
@@ -4407,6 +4431,7 @@ mod tests {
                 delivery_id: "unmarked-forged-capability".into(),
                 generation: None,
                 can_report_prompts: false,
+                confirmation_floor: Duration::ZERO,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
@@ -4461,6 +4486,7 @@ mod tests {
                 delivery_id: "deck-spawned-late-capability".into(),
                 generation: None,
                 can_report_prompts: false,
+                confirmation_floor: Duration::ZERO,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
@@ -4716,6 +4742,7 @@ mod tests {
                 delivery_id: "detached-replacement-user-draft-safety".into(),
                 generation: None,
                 can_report_prompts: true,
+                confirmation_floor: Duration::ZERO,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
@@ -4749,6 +4776,7 @@ mod tests {
                 delivery_id: "detached-user-draft-safety".into(),
                 generation: None,
                 can_report_prompts: true,
+                confirmation_floor: Duration::ZERO,
                 deadline: Instant::now() + Duration::from_secs(4),
             },
         ));
@@ -5224,16 +5252,18 @@ mod tests {
                 delivery_id: "detached-backstop-report".into(),
                 generation: None,
                 can_report_prompts: true,
+                confirmation_floor: Duration::ZERO,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
 
-        // Let the confirmation task install its first 500 ms watch timer before
+        // Let the confirmation task install its first watch timer before
         // moving virtual time. After `advance`, the only await it can reach is
         // the writer we still own, so the caller-side clock precheck has
         // necessarily completed before this test records the user's input.
         tokio::task::yield_now().await;
-        tokio::time::advance(unconfirmed_retry_delay(1) + Duration::from_millis(1)).await;
+        tokio::time::advance(unconfirmed_retry_delay(1, Duration::ZERO) + Duration::from_millis(1))
+            .await;
         for _ in 0..3 {
             tokio::task::yield_now().await;
         }
@@ -5267,6 +5297,141 @@ mod tests {
         drop(notices);
         drop(event_tx);
         registry.shutdown_all();
+    }
+
+    /// Issue #637, PR #1314 review (Qodo): only the type the deck itself
+    /// spawned earns a producer's short floor. A launcher's pre-write
+    /// declaration is the producer's own claim, so a pane whose command
+    /// resolved to no type takes the slow floor whatever it declared.
+    #[test]
+    fn confirmation_floor_is_earned_by_the_spawn_record_not_a_launcher_claim() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawned_claude = spawn_typed_byte_target(
+            &registry,
+            "floor-spawned-claude",
+            Some(AgentType::ClaudeCode),
+        );
+        let launcher = spawn_byte_target(&registry, "floor-launcher-declared-claude");
+        registry.note_launcher_handoff(&launcher, AgentType::ClaudeCode);
+        assert_eq!(
+            registry.pre_write_believed_agent_type(&launcher),
+            Some(AgentType::ClaudeCode),
+            "precondition: the launcher's declaration is the pane's pre-write belief"
+        );
+        let spawned_codex =
+            spawn_typed_byte_target(&registry, "floor-spawned-codex", Some(AgentType::Codex));
+
+        let floors = (
+            confirmation_floor_for(&registry, &spawned_claude),
+            confirmation_floor_for(&registry, &launcher),
+            confirmation_floor_for(&registry, &spawned_codex),
+        );
+        registry.shutdown_all();
+        assert_eq!(
+            floors,
+            (
+                crate::prompt_delivery::FAST_CONFIRMATION_LATENCY,
+                crate::prompt_delivery::SLOW_CONFIRMATION_LATENCY,
+                crate::prompt_delivery::SLOW_CONFIRMATION_LATENCY,
+            )
+        );
+    }
+
+    /// Scenario: Write a prompt into a pane the deck spawned as Codex and start the detached confirmation watch on paused time, then deliver the agent's genuine submission report 8.45 s later — the latency issue #637 reports for Codex. The watch must accept it as attempt 1's confirmation, having logged no re-submission: no replacement payload and no submit probe went into the pane in between.
+    #[spec("scheduler/dispatch/022")]
+    #[tokio::test]
+    async fn dispatch_022_detached_retry_waits_out_a_slow_genuine_confirmation() {
+        const PANE_ID: &str = "detached-slow-confirmation-pane";
+        const PROMPT: &str = "DETACHED-SLOW-GENUINE-CONFIRMATION";
+        // What #637 measured for a genuine Codex confirmation. The first retry
+        // used to fire at 500 ms, 7.95 s ahead of it.
+        const MEASURED_CONFIRMATION: Duration = Duration::from_millis(8450);
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_typed_byte_target(&registry, PANE_ID, Some(AgentType::Codex));
+        // Attempt 1 — `deliver`'s own write, made before the watch starts.
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(PANE_ID, PROMPT, &agent_id, || async { true })
+                .await
+                .expect("attempt 1 guarded delivery"),
+            GuardedSend::Applied
+        );
+
+        // The delivery log is where the watch publishes each re-submission, and
+        // it does so BEFORE the write, so reading it is not a race against the
+        // PTY echo the way counting copies in the scrollback would be. Both the
+        // watch and the driver run on this task (`join!`, not `spawn`), so every
+        // line lands in the thread-local subscriber.
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+            .with_ansi(false)
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let (event_tx, event_rx) = broadcast::channel(8);
+        tokio::time::pause();
+        let watch = confirm_prompt_delivery(
+            registry.clone(),
+            event_rx,
+            ConfirmationTask {
+                pane_id: PANE_ID.into(),
+                agent_id: agent_id.clone(),
+                prompt: PROMPT.into(),
+                delivery_id: "detached-slow-genuine-confirmation".into(),
+                generation: None,
+                can_report_prompts: true,
+                // The production derivation, from the spawn record's Codex type.
+                confirmation_floor: confirmation_floor_for(&registry, &agent_id),
+                deadline: Instant::now() + AUTOMATIC_PROMPT_DEADLINE,
+            },
+        );
+        let driver = async {
+            tokio::task::yield_now().await;
+            tokio::time::advance(MEASURED_CONFIRMATION).await;
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            let mut submitted = typed_prompt_watch_event(
+                PANE_ID,
+                &agent_id,
+                "codex-slow-confirmation-session",
+                EventType::Thinking,
+                AgentType::Codex,
+                false,
+            );
+            submitted.user_prompt = Some(PROMPT.into());
+            event_tx
+                .send(BroadcastMsg::Event(submitted))
+                .expect("the watch is subscribed");
+            tokio::time::resume();
+        };
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(watch, driver)
+        })
+        .await
+        .expect("the genuine confirmation must end the watch");
+        drop(subscriber_guard);
+        drop(event_tx);
+        registry.shutdown_all();
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone())
+            .expect("captured log must be valid UTF-8");
+        assert!(
+            !log.contains("re-submitting") && !log.contains("probing submit"),
+            "the watch re-submitted into the pane before a genuine confirmation \
+             {MEASURED_CONFIRMATION:?} after the write — the agent received the prompt twice; \
+             captured log = {log:?}"
+        );
+        assert!(
+            log.lines().any(|line| {
+                line.contains("prompt delivery confirmed by the agent's submitted prompt")
+                    && line.contains("attempt=1")
+            }),
+            "the slow genuine confirmation must confirm attempt 1; captured log = {log:?}"
+        );
     }
 
     /// Scenario: Abandon a spawn prompt against its exact pane owner, then replace that owner and exhaust the 256-watch cap for a new delivery. Abandonment must report state without pane bytes, a stale report must not mark the replacement, and the 257th delivery must visibly report that it is unwatched.
@@ -5343,6 +5508,7 @@ mod tests {
                 delivery_id: "cap-exhausted-257".into(),
                 generation: None,
                 can_report_prompts: true,
+                confirmation_floor: Duration::ZERO,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         );
@@ -5392,6 +5558,7 @@ mod tests {
                 delivery_id: "absolute-deadline-test".into(),
                 generation: None,
                 can_report_prompts: true,
+                confirmation_floor: Duration::ZERO,
                 deadline,
             },
         ));

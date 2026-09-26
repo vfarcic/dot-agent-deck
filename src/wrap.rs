@@ -468,16 +468,17 @@ fn tee<R: Read, W: Write>(mut reader: R, mut writer: W, mut on_line: impl FnMut(
 /// type) are returned unchanged.
 pub fn wrap_launch_command(command: &str, agent_type: &AgentType) -> String {
     let spec = crate::agent_registry::spec(agent_type);
-    if spec.strategy != Some(crate::agent_registry::IntegrationStrategy::Wrapper)
-        || is_wrap_invocation(command)
-    {
+    if spec.strategy != Some(crate::agent_registry::IntegrationStrategy::Wrapper) {
+        return command.to_string();
+    }
+    let deck = deck_binary_for_wrap();
+    if is_wrap_invocation(command, &deck) {
         return command.to_string();
     }
     // Prefer the registry detection basename (the stable `--agent` alias the
     // wrapper resolves back through `detect_from_basename`); fall back to the
     // label only if an entry somehow ships without one.
     let name = spec.detect_basenames.first().copied().unwrap_or(spec.label);
-    let deck = deck_binary_for_wrap();
     format!("{deck} wrap --agent {name} -- {command}")
 }
 
@@ -505,24 +506,7 @@ pub const DOT_AGENT_DECK_WRAP_BIN: &str = "DOT_AGENT_DECK_WRAP_BIN";
 ///
 /// Same rationale (and the same fix) as [`crate::daemon_attach`] locating the
 /// daemon via `current_exe` rather than `$PATH`.
-///
-/// Falls back to the bare name when the resolved path is unusable, so behaviour
-/// only ever improves on what `$PATH` would have found:
-/// - a test-harness executable — those live in `target/<profile>/deps/`, so a
-///   sibling `dot-agent-deck` one level up is preferred when present, which is
-///   what lets in-process tests drive the build they just compiled;
-/// - a path that no longer exists: Linux reports a replaced binary as
-///   `<path> (deleted)`, routine while rebuilding during development;
-/// - a path containing whitespace, which the shell would re-split (nothing
-///   quotes this command string).
 fn deck_binary_for_wrap() -> String {
-    const BARE: &str = "dot-agent-deck";
-    fn usable(path: &std::path::Path) -> Option<String> {
-        let text = path.to_str()?;
-        (path.file_name()? == BARE && !text.chars().any(char::is_whitespace) && path.is_file())
-            .then(|| text.to_string())
-    }
-
     // Explicit override, consulted first. Resolving the co-located build is what
     // makes the suite honest, but it also takes away the one seam a test had for
     // observing the rewrite: planting a fake `dot-agent-deck` on `$PATH`. This is
@@ -534,40 +518,150 @@ fn deck_binary_for_wrap() -> String {
     {
         return explicit;
     }
+    resolve_deck_binary_for_wrap(std::env::current_exe())
+}
 
-    let Ok(exe) = std::env::current_exe() else {
-        return BARE.to_string();
+/// Pure seam behind [`deck_binary_for_wrap`], with `current_exe()` injected so a
+/// build under a non-default file name is testable without renaming the test
+/// binary.
+///
+/// Issue #533: this used to gate the running executable on its file name being
+/// the literal `dot-agent-deck`. That rejected a renamed build's OWN executable
+/// (a release asset run as downloaded, `dot-agent-deck-linux-amd64`; any
+/// `dot-agent-deck.exe` on Windows), which then fell through to a co-located
+/// `dot-agent-deck` — a different build — or to a bare name `$PATH` resolves.
+/// The executable is now taken by whatever name it has, the way
+/// [`crate::platform::paths::binary_name`] takes it.
+///
+/// The name check was standing in for "is this process the deck binary", and
+/// in production it always is: the callers of [`wrap_launch_command`] are the
+/// daemon's spawn seam (`agent_pty`) and the TUI (`ui`), both subcommands of
+/// the one `dot-agent-deck` binary. The process that is NOT the deck is a cargo
+/// test harness, and that is now recognised by cargo's own signature for one:
+/// it lives in a `deps` directory (`target/<profile>/deps/`) AND its file stem
+/// ends in cargo's `-<16 hex digits>` metadata hash (`dot_agent_deck-3f…`).
+/// Both are required, so a real deck that merely sits in a directory called
+/// `deps` still names itself.
+///
+/// Falls back when the running executable is unusable, so behaviour only ever
+/// improves on what `$PATH` would have found:
+/// - a test-harness executable — those live in `target/<profile>/deps/`, so a
+///   sibling `dot-agent-deck` one level up is preferred when present, which is
+///   what lets in-process tests drive the build they just compiled;
+/// - a path that no longer exists: Linux reports a replaced binary as
+///   `<path> (deleted)`, routine while rebuilding during development;
+/// - a path the shell would not read back as the same file — nothing quotes
+///   this command string, so it is rejected rather than quoted, the posture
+///   [`crate::platform::paths::binary_name`] takes for the same reason. The
+///   file name must pass `is_safe_binary_name` (ASCII alphanumerics plus
+///   `-_.+`, no leading `-`), and every character of the path must be in
+///   [`is_shell_inert_path_char`]'s allowlist, which excludes whitespace,
+///   quotes, `$`, backticks, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `*`, `?`,
+///   `[`, `#`, `!`, and `~` except in a Windows path. Before issue #533 the file name was pinned to
+///   `dot-agent-deck` and only whitespace was checked; accepting a renamed
+///   build's own file name is what made the allowlist necessary.
+///
+/// The sibling looked for is the package's own file name
+/// ([`crate::platform::paths::durable_binary_file_name`], `.exe` on Windows),
+/// because that is what cargo names the bin target it builds next to its tests.
+fn resolve_deck_binary_for_wrap(current_exe: std::io::Result<std::path::PathBuf>) -> String {
+    use crate::platform::paths::{DEFAULT_BINARY_NAME, durable_binary_file_name};
+    fn usable(path: &std::path::Path) -> Option<String> {
+        let text = path.to_str()?;
+        let name = path.file_name()?.to_str()?;
+        (crate::platform::paths::is_safe_binary_name(name)
+            && text
+                .chars()
+                .all(|c| is_shell_inert_path_char(c, cfg!(windows)))
+            && path.is_file())
+        .then(|| text.to_string())
+    }
+    fn in_deps_dir(dir: &std::path::Path) -> bool {
+        dir.file_name() == Some(std::ffi::OsStr::new("deps"))
+    }
+    fn has_cargo_hash_suffix(exe: &std::path::Path) -> bool {
+        exe.file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.rsplit_once('-'))
+            .is_some_and(|(_, hash)| {
+                hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+    }
+
+    let Ok(exe) = current_exe else {
+        return DEFAULT_BINARY_NAME.to_string();
     };
-    if let Some(found) = usable(&exe) {
+    let Some(dir) = exe.parent() else {
+        return DEFAULT_BINARY_NAME.to_string();
+    };
+    let is_test_harness = in_deps_dir(dir) && has_cargo_hash_suffix(&exe);
+    if !is_test_harness && let Some(found) = usable(&exe) {
         return found;
     }
-    let Some(dir) = exe.parent() else {
-        return BARE.to_string();
-    };
-    usable(&dir.join(BARE))
+    let sibling = durable_binary_file_name();
+    usable(&dir.join(&sibling))
         .or_else(|| {
-            (dir.file_name() == Some(std::ffi::OsStr::new("deps")))
-                .then(|| dir.parent().map(|up| up.join(BARE)))
+            in_deps_dir(dir)
+                .then(|| dir.parent().map(|up| up.join(&sibling)))
                 .flatten()
                 .as_deref()
                 .and_then(usable)
         })
-        .unwrap_or_else(|| BARE.to_string())
+        .unwrap_or_else(|| DEFAULT_BINARY_NAME.to_string())
 }
 
-/// Whether `command` is already a `dot-agent-deck wrap …` invocation — the
-/// idempotency guard for [`wrap_launch_command`]. Tolerant of a leading path on
-/// the binary (`/usr/local/bin/dot-agent-deck wrap …`).
-fn is_wrap_invocation(command: &str) -> bool {
+/// Whether `c` can appear UNQUOTED in the wrapper's command word and still be
+/// read back by the spawning shell as itself: ASCII alphanumerics plus
+/// `/ . _ - + = : @ % ,` — the set `platform::paths::shell_quote_if_needed`
+/// leaves unquoted — and, only when `windows_host`, the `\` separator, which a
+/// POSIX shell would instead consume as an escape, and `~`, which every 8.3
+/// short name carries (`C:\Users\RUNNER~1\…`, the GitHub runner's own temp
+/// directory) and which a POSIX shell could tilde-expand at the start of a
+/// relative path. A parameter rather than a `#[cfg]` so both dialects are
+/// unit-testable from any host.
+fn is_shell_inert_path_char(c: char, windows_host: bool) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '/' | '.' | '_' | '-' | '+' | '=' | ':' | '@' | '%' | ',')
+        || (windows_host && matches!(c, '\\' | '~'))
+}
+
+/// Whether `command` is already a `wrap` invocation of a deck — the idempotency
+/// guard for [`wrap_launch_command`]. `deck` is the program the rewrite would
+/// name ([`deck_binary_for_wrap`]'s result). Tolerant of a leading path on the
+/// binary (`/usr/local/bin/dot-agent-deck wrap …`).
+///
+/// Issue #533: the program's file name used to be compared against the literal
+/// `dot-agent-deck` only. That held while [`deck_binary_for_wrap`] could name
+/// nothing else; now that a renamed build names itself, a literal-only guard
+/// would miss the invocation the build had itself produced and wrap it a second
+/// time. The file name of `deck` is therefore accepted too, alongside the
+/// package name (with and without the platform's executable suffix), which a
+/// command from a default-named build carries.
+///
+/// This guard can only know the names of the build it runs in, which is why
+/// the TUI's new-pane path no longer pre-wraps a command it hands to the daemon
+/// (`ui.rs`, the `StartAgent` spawn): a renamed TUI's rewrite reaching a daemon
+/// of a different build would not be recognised there. The daemon wraps it
+/// instead, naming its own binary. What remains is a command that already
+/// carries some OTHER renamed build's `wrap` invocation — typed or configured
+/// that way by hand — which is not recognised and gets a second wrapper.
+fn is_wrap_invocation(command: &str, deck: &str) -> bool {
+    use crate::platform::paths::{DEFAULT_BINARY_NAME, durable_binary_file_name};
+    let file_name = |program: &str| -> Option<String> {
+        Some(
+            std::path::Path::new(program)
+                .file_name()?
+                .to_str()?
+                .to_string(),
+        )
+    };
     let mut tokens = command.split_whitespace();
     match (tokens.next(), tokens.next()) {
-        (Some(program), Some(subcommand)) => {
-            std::path::Path::new(program)
-                .file_name()
-                .and_then(|s| s.to_str())
-                == Some("dot-agent-deck")
-                && subcommand == "wrap"
-        }
+        (Some(program), Some("wrap")) => file_name(program).is_some_and(|name| {
+            name == DEFAULT_BINARY_NAME
+                || name == durable_binary_file_name()
+                || file_name(deck).as_deref() == Some(name.as_str())
+        }),
         _ => false,
     }
 }
@@ -1032,6 +1126,14 @@ fn inject_lifetime_tag(cmd: &mut StdCommand) -> Option<crate::lifetime_tag::Life
 ///
 /// It is itself bounded by deadline + grace and holds no descriptor, so it can
 /// never become the leak it exists to prevent.
+///
+/// **It is forked after `spawn` returns, so there is a window with no reaper.**
+/// The child is already running by then, and a wrapper `SIGKILL`ed before this
+/// fork completes leaves nothing holding the deadline. On the PTY path the
+/// inner master's hangup still ends the child; on the pipe path the child sees
+/// at most an EOF on its stdin, which ends only a child that reads it.
+/// The window is one scheduling gap wide rather than zero, and issue #963 is a
+/// test that used to land its `SIGKILL` inside it under CI load.
 ///
 /// **Telling a reaper apart from the leak it hunts.** It is a `fork` of this
 /// wrapper, so it keeps the wrapper's argv and shows up in `ps` looking like a
@@ -2203,7 +2305,9 @@ fn run_wrap_pty(
     // The session has begun — surface the card immediately. PRD #225 M3: this is
     // a CARD-SURFACING signal, not a readiness signal (the child may still be
     // `devbox`/a shell for seconds before the agent TUI exists), so it carries
-    // the wrapper-fork origin marker.
+    // the wrapper-fork origin marker. Keep it AFTER `arm_child_group_backstop`:
+    // `tests/wrap_io.rs`'s stranded-child probe reads it as proof the reaper is
+    // forked before it SIGKILLs this wrapper (issue #963).
     emitter.emit_fork_session_start();
 
     // Raw-mode the outer terminal ONLY when stdin is itself a terminal, so
@@ -2504,6 +2608,7 @@ fn run_wrap_pipe(
 
     // PRD #225 M3: same fork-time card-surfacing event as the PTY path, and the
     // same marker — it says "a session exists", not "the agent is ready".
+    // After the arm above for the same reason as there (issue #963).
     emitter.emit_fork_session_start();
 
     let child_stdout = child.stdout.take().expect("piped child stdout");
@@ -2873,11 +2978,15 @@ mod tests {
         let (program, rest) = rewritten
             .split_once(' ')
             .expect("rewritten command has a program and arguments");
-        assert_eq!(
-            std::path::Path::new(program)
-                .file_name()
-                .and_then(|n| n.to_str()),
-            Some("dot-agent-deck"),
+        // The co-located build carries the platform's executable suffix; the
+        // bare `$PATH` fallback does not.
+        let name = std::path::Path::new(program)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string);
+        assert!(
+            name.as_deref() == Some(crate::platform::paths::DEFAULT_BINARY_NAME)
+                || name == Some(crate::platform::paths::durable_binary_file_name()),
             "the rewrite must name a dot-agent-deck binary; got {rewritten:?}"
         );
         assert_eq!(rest, "wrap --agent codex -- codex");
@@ -2891,14 +3000,15 @@ mod tests {
     fn wrap_launch_command_names_this_build_not_path() {
         let rewritten = wrap_launch_command("codex", &AgentType::Codex);
         let program = rewritten.split_once(' ').expect("program present").0;
+        let sibling_name = crate::platform::paths::durable_binary_file_name();
         let sibling = std::env::current_exe().ok().and_then(|exe| {
             let dir = exe.parent()?;
-            let direct = dir.join("dot-agent-deck");
+            let direct = dir.join(&sibling_name);
             if direct.is_file() {
                 return Some(direct);
             }
             (dir.file_name() == Some(std::ffi::OsStr::new("deps")))
-                .then(|| dir.parent().map(|up| up.join("dot-agent-deck")))
+                .then(|| dir.parent().map(|up| up.join(&sibling_name)))
                 .flatten()
                 .filter(|p| p.is_file())
         });
@@ -2955,13 +3065,180 @@ mod tests {
     /// or without a leading path) and rejects anything else.
     #[test]
     fn is_wrap_invocation_matches_only_wrap() {
+        let deck = "dot-agent-deck";
         assert!(is_wrap_invocation(
-            "dot-agent-deck wrap --agent codex -- codex"
+            "dot-agent-deck wrap --agent codex -- codex",
+            deck
         ));
-        assert!(is_wrap_invocation("/opt/bin/dot-agent-deck wrap -- codex"));
-        assert!(!is_wrap_invocation("codex"));
-        assert!(!is_wrap_invocation("dot-agent-deck daemon serve"));
-        assert!(!is_wrap_invocation(""));
+        assert!(is_wrap_invocation(
+            "/opt/bin/dot-agent-deck wrap -- codex",
+            deck
+        ));
+        assert!(!is_wrap_invocation("codex", deck));
+        assert!(!is_wrap_invocation("dot-agent-deck daemon serve", deck));
+        assert!(!is_wrap_invocation("", deck));
+    }
+
+    /// Issue #533: a build under a non-default file name names ITSELF as the
+    /// wrapper. It used to be rejected by name and lose to a co-located
+    /// `dot-agent-deck` — a different build — planted here to prove it.
+    #[test]
+    fn resolve_deck_binary_for_wrap_takes_a_renamed_build_itself() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let renamed = root.path().join("dot-agent-deck-linux-amd64");
+        std::fs::write(&renamed, b"").expect("seed renamed build");
+        std::fs::write(
+            root.path()
+                .join(crate::platform::paths::durable_binary_file_name()),
+            b"",
+        )
+        .expect("seed co-located default-named build");
+
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(renamed.clone())),
+            renamed.to_str().expect("tempdir path is UTF-8"),
+            "a renamed build must name its own executable, not a sibling build"
+        );
+    }
+
+    /// Nothing quotes the wrapper's command word, so a renamed executable (or
+    /// a directory above it) the shell would reinterpret is refused, never
+    /// quoted: the resolution falls back as it does for any unusable path.
+    ///
+    /// Unix-only because several of these names (`"`, `|`) cannot be created on
+    /// Windows at all; the Windows dialect of the allowlist is covered by
+    /// `is_shell_inert_path_char_admits_backslash_and_tilde_only_for_windows`.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_deck_binary_for_wrap_refuses_shell_syntax_in_the_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let hostile_names = [
+            "deck$(touch pwned)",
+            "deck`id`",
+            "deck;id",
+            "deck'q",
+            "deck\"q",
+            "deck&id",
+            "deck|id",
+            "deck (1)",
+            "-deck",
+        ];
+        for name in hostile_names {
+            let exe = root.path().join(name);
+            std::fs::write(&exe, b"").expect("seed hostile build");
+            assert_eq!(
+                resolve_deck_binary_for_wrap(Ok(exe)),
+                crate::platform::paths::DEFAULT_BINARY_NAME,
+                "{name:?} must not reach the unquoted command word"
+            );
+        }
+
+        // A hostile DIRECTORY is refused too, including for a default-named
+        // build — the sibling lookup shares the directory, so it falls back to
+        // the bare name rather than to a sibling.
+        let dir = root.path().join("d$(id)");
+        std::fs::create_dir(&dir).expect("hostile dir");
+        let exe = dir.join(crate::platform::paths::durable_binary_file_name());
+        std::fs::write(&exe, b"").expect("seed build in hostile dir");
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(exe)),
+            crate::platform::paths::DEFAULT_BINARY_NAME
+        );
+    }
+
+    #[test]
+    fn is_shell_inert_path_char_admits_backslash_and_tilde_only_for_windows() {
+        assert!(is_shell_inert_path_char('\\', true));
+        assert!(!is_shell_inert_path_char('\\', false));
+        // 8.3 short names (`RUNNER~1`) are ordinary Windows paths.
+        assert!(is_shell_inert_path_char('~', true));
+        assert!(!is_shell_inert_path_char('~', false));
+        for c in ['/', '.', '_', '-', '+', ':', 'a', 'Z', '0'] {
+            assert!(is_shell_inert_path_char(c, false), "{c:?}");
+        }
+        for c in [
+            ' ', '$', '`', ';', '\'', '"', '&', '|', '(', ')', '*', '#', '!',
+        ] {
+            assert!(!is_shell_inert_path_char(c, false), "{c:?}");
+            assert!(!is_shell_inert_path_char(c, true), "{c:?}");
+        }
+    }
+
+    /// A real deck that merely sits in a directory named `deps` is not a test
+    /// harness: without cargo's `-<16 hex>` hash on its stem it names itself.
+    #[test]
+    fn resolve_deck_binary_for_wrap_takes_a_renamed_build_in_a_deps_dir() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let deps = root.path().join("deps");
+        std::fs::create_dir(&deps).expect("deps dir");
+        let renamed = deps.join("dot-agent-deck-linux-amd64");
+        std::fs::write(&renamed, b"").expect("seed renamed build");
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(renamed.clone())),
+            renamed.to_str().expect("tempdir path is UTF-8")
+        );
+    }
+
+    /// The name check #533 removed was what kept a cargo test harness from
+    /// naming itself as the wrapper. It still cannot: an executable inside a
+    /// `deps` directory is passed over for the build one level up, whatever its
+    /// name — including one that happens to look like a deck.
+    #[test]
+    fn resolve_deck_binary_for_wrap_passes_over_a_test_harness() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let profile = root.path().join("target").join("debug");
+        let deps = profile.join("deps");
+        std::fs::create_dir_all(&deps).expect("deps dir");
+        let harness = deps.join("dot_agent_deck-0123456789abcdef");
+        std::fs::write(&harness, b"").expect("seed harness");
+        let built = profile.join(crate::platform::paths::durable_binary_file_name());
+
+        // No build beside the harness yet: the bare name, never the harness.
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(harness.clone())),
+            crate::platform::paths::DEFAULT_BINARY_NAME
+        );
+
+        std::fs::write(&built, b"").expect("seed built deck");
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(harness)),
+            built.to_str().expect("tempdir path is UTF-8")
+        );
+    }
+
+    /// Issue #533: a renamed build recognises the `wrap` invocation it produced
+    /// itself, so re-applying the rewrite does not stack a second wrapper. The
+    /// rewrite and the
+    /// guard are driven through the same resolved program, exactly as
+    /// [`wrap_launch_command`] drives them.
+    #[test]
+    fn is_wrap_invocation_recognises_a_renamed_build() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let renamed = root.path().join("deck-beta");
+        std::fs::write(&renamed, b"").expect("seed renamed build");
+        let deck = resolve_deck_binary_for_wrap(Ok(renamed));
+
+        let wrapped = format!("{deck} wrap --agent codex -- codex");
+        assert!(
+            is_wrap_invocation(&wrapped, &deck),
+            "a renamed build must recognise its own wrap invocation: {wrapped:?}"
+        );
+        // Also by bare name, as a saved command from that build would carry it.
+        assert!(is_wrap_invocation(
+            "deck-beta wrap --agent codex -- codex",
+            &deck
+        ));
+        // A default-named build's saved command is still recognised.
+        assert!(is_wrap_invocation(
+            "dot-agent-deck wrap --agent codex -- codex",
+            &deck
+        ));
+        // And recognising the renamed build does not widen to other programs.
+        assert!(!is_wrap_invocation(
+            "other wrap --agent codex -- codex",
+            &deck
+        ));
+        assert!(!is_wrap_invocation("deck-beta daemon serve", &deck));
     }
 
     // PRD #20 finding #12 targeted coverage for the edges the subprocess harness

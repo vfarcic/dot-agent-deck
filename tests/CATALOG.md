@@ -1306,6 +1306,27 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** an LLM response (nothing is submitted, exactly like `prompt/pane-input/022`); that the daemon rather than the user sent the bytes — no fault seam for a partial PTY write exists at the e2e layer, so the write path itself is covered at L1 (`scheduler/idle-worker/019`, `orchestration/delegate/031`); the abstaining conditions (`agent_pty::deliver_payload_refuses_to_erase_what_it_cannot_undo_exactly`); the other agent CLIs, whose editors are unexercised here.
 - **Platform coverage:** mac+linux.
 
+##### prompt/pane-input/039 — An oversized `delivery_id` is refused before the ledger stores it or anything is written (issue #527).
+- **Layer:** L1 protocol integration with an in-process daemon and a real PTY-backed shell.
+- **Agent:** synthetic pane target backed by `/bin/sh`, registered as a sessionless pane so a guarded send is otherwise deliverable.
+- **Asserts:** a `write-and-submit` whose `delivery_id` is `MAX_DELIVERY_ID_BYTES + 1` bytes is answered with an error and no `SendResult`, and its marker never reaches the pane; the same request with an id of exactly `MAX_DELIVERY_ID_BYTES` bytes is `Applied` and its marker arrives, so the refusal is the cap and not the fixture.
+- **Does not assert:** that the ledger stays empty after the refusal, or that the longest id a client mints fits the cap — both pinned at the unit level by `agent_pty::delivery_ledger_refuses_an_oversized_id_without_storing_it`.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/040 — The 10-second readiness fallback pays the readiness buffer before it writes, on both spawn-time delivery paths (issue #529).
+- **Layer:** L1, in `src/ui.rs`'s own test module (the production `process_pending_seed_prompts` and `deliver_orchestrator_prompt` driven over a recording pane controller), so it runs under `cargo test-fast` and therefore in the `build` job.
+- **Agent:** none (panes with no session at all, so nothing announces a conversation and `spawn_time_agent_ready` stays false — asserted as a precondition on the seed half).
+- **Asserts:** a seed aged 1 ms past `SPAWN_TIME_READINESS_TIMEOUT` gets NO write and is held rather than dropped; re-aged to `SPAWN_TIME_READINESS_TIMEOUT + SPAWN_TIME_READINESS_BUFFER` it gets exactly one write carrying the seed. The same pair for an orchestration start-role remit, driven with explicit instants against its tab anchor: no write and the remit not consumed at `anchor + 10 s + 1 ms`, exactly one write carrying it at `anchor + 10 s + 500 ms`. The seed fixture carries an already-spent `ready_since`, so a fallback that borrowed that stamp instead of counting from its own 10 s would also go red.
+- **Why it exists:** both paths used to set `buffer_elapsed = true` on the timeout branch, so the one delivery made with no evidence at all that the agent's input handling was up was also the one made with no buffer. Fails on the pre-fix code at each half's first assertion.
+- **Does not assert:** the buffer's size (500 ms, tuned under PRD #128); the fast path's buffer (`should_inject_spawn_time_prompt`'s unit tests); that the fallback still delivers for a producer that announces nothing (`prompt/pane-input/036`); confirmation, retry or deadline behaviour after the write (`prompt/pane-input/023`–`/030`); the daemon-owned delegate path, which pays its own buffer after its timeout in `state.rs`.
+
+##### prompt/pane-input/041 — A TUI-owned retry waits out a genuine Codex confirmation 8.45 s after the write, and a delivery that is never confirmed is still retried (issue #637).
+- **Layer:** L1, in `src/ui.rs`'s own test module (the production `deliver_orchestrator_prompt` driven over an `Applied`-returning pane controller at explicit clock offsets, with a hook-derived `AppState`), so it runs under `cargo test-fast`.
+- **Agent:** none (a synthetic Codex pane — `announced_prompt_snapshot` declares the producer as Codex).
+- **Asserts:** two runs against the same fixture. In the first, a render pass 8.45 s after the write — the genuine Codex confirmation latency #637 reports — makes no second write, and the agent's submission report arriving after it finalizes the prompt and the role (`Working`) on that ONE write. In the second, where no report ever comes, a pass one second past `SLOW_CONFIRMATION_LATENCY` (10 s) DOES re-submit, so the floor delays recovery rather than removing it. Measured RED with the floor taken out of `unconfirmed_retry_delay` (the pre-#637 schedule): the 8.45 s pass wrote a second time.
+- **Does not assert:** the seed path's own call site (it shares `schedule_unconfirmed_retry` with this one); the daemon-owned detached path (`scheduler/dispatch/022`); Claude Code's shorter floor, which is unit-tested in `src/prompt_delivery.rs` (`confirmation_latency_floor_takes_the_slowest_reporting_producer`); any real agent's actual confirmation latency — the 8.45 s figure is the downstream measurement #637 quotes, not one taken here.
+- **Platform coverage:** mac+linux+windows.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
@@ -1632,6 +1653,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the 10s re-run interval; the ordering of interleaved stdout/stderr; the buffer-then-clear internals (covered by `watch::tests` unit tests).
 - **Platform coverage:** mac+linux.
 
+##### tabs/mode/007 — A mode's `seed_prompt` reaches an agent that never signals readiness, through the 10-second fallback and no sooner than its readiness buffer allows (issue #529).
+- **Layer:** L2 (lane 1).
+- **Agent:** none — `tabs/mode/005`'s recorder with its `SessionStart` line removed, so nothing announces a conversation and only the `timeout_ready` fallback in `process_pending_seed_prompts` can open the pane.
+- **Asserts:** spawning the `seeded` mode via the new-pane dialog with that silent recorder still delivers the configured `seed_prompt` into the agent pane (the marker is recorded within 30 s), and it is observed more than 10.5 s after the test began typing the spawn. That instant precedes the seed's `created_at` anchor, so with the buffer in place the bound holds by construction and cannot flake on a slow box.
+- **Does not assert:** the 500 ms boundary itself. Spawn latency and render-frame jitter are the same order as the buffer, so the pre-fix code can also clear 10.5 s here; `prompt/pane-input/040` is the discriminator, at L1 with explicit instants. Also not: the orchestrator remit's fallback (L1 only, same entry), or confirmation and retry after the write.
+- **Platform coverage:** mac+linux.
+
 #### tabs/orchestration
 
 ##### tabs/orchestration/001 — Selecting an orchestration on the new-pane form opens one pane per role with the orchestrator's pane in focus.
@@ -1710,6 +1738,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** at width 80 the whole run label `dispatch-team · issue-960` paints. At width 33 — where the two-tab overhead of 5 leaves a per-tab cap of 14, one more than `dispatch-team` — the canonical orchestration name still reads, a `…` is present and `issue-960` is gone, so the run suffix is demonstrably what got elided. Then the CONTROL that makes the ordering load-bearing rather than arbitrary: the same two components in the opposite order (`issue-960 · dispatch-team`) LOSE the canonical name entirely at the identical width. Both narrow legs carry explicit preconditions (the `…` and the absent suffix), so a width that stopped truncating would fail loudly instead of passing vacuously.
 - **Why it exists:** `dispatched_orchestration_display_title`'s doc comment claims "`name` stays the PREFIX so the canonical label reads first and survives the tab strip's trailing-ellipsis truncation" — the entire reason for the field order — and nothing asserted it. `orchestration/dispatch/005` proves the label survives the daemon round trip as a STRING; this proves the string the user actually reads still names the orchestration once the strip runs out of room. Added in answer to a Greptile P2 on PR #961 asking for coverage of the visible label: it closes the string-vs-painted gap at the tier where the painting lives.
 - **Does not assert:** the round trip that produces the label (`orchestration/dispatch/005`); label COLOR or modifiers (`tabs/orchestration/009`, `/010`); the truncation arithmetic as a unit (`src/tab_layout.rs`'s own tests); the click-to-switch hit regions (`mouse/tabstrip/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/orchestration/014 — An orchestration tab rebuilt from daemon role metadata that no longer matches `.dot-agent-deck.toml` paints a `!` prefix and a `[config drift]` suffix around its name, only that tab does, and the prefix survives truncation (issue #554).
+- **Layer:** L1 widget (in-process `TestBackend` through the production `orchestration_tab_label` → `render_tab_bar_to_buffer` → `render_tab_strip` path; no subprocess, no PTY, no LLM).
+- **Agent:** none — the input is two orchestration tab labels.
+- **Asserts:** with one drifted and one matching orchestration tab, the strip paints `! review [active] [config drift]` for the drifted one and `build [active]` for the other, and the marker appears exactly once. Then, crowded to four tabs at width 60 — with the explicit precondition that the spelled-out suffix is truncated away and a `…` is present — the strip still reads `! review`: the one-column prefix exists because truncation keeps the head (Greptile on PR #1281), and the name still follows it.
+- **Does not assert:** WHEN a tab is drifted (the pure `orchestration_config_drift_warning` decision is unit-tested in `src/ui.rs`'s `config_drift_tests`, and the real reattach is `session/restore/020`); label color or modifiers (`tabs/orchestration/009`, `/010`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### tabs/orchestration/011 — In command mode `z` zooms the focused role pane to the whole frame with a `[Z]` marker on its kept border, while in PaneInput the same key is an ordinary character; every non-focused agent keeps running behind the zoom and a second `z` restores the previous view (PRD #313).
@@ -3276,7 +3311,7 @@ without depending on the config struct API.
 
 #### orchestration/lock
 
-##### orchestration/lock/001 — `scope_command_entry_lock` claims `Ctrl+E` only on an Orchestration tab in command mode.
+##### orchestration/lock/001 — `scope_orchestration_chord` claims `Ctrl+E` only on an Orchestration tab in command mode.
 - **Layer:** L1 (pure function, `src/ui.rs`'s own `#[cfg(test)]` module — the scoping helper is module-private).
 - **Agent:** none.
 - **Asserts:** table-driven over the full cross product of `is_orchestration_tab` (true/false) × every `UiMode` variant × the action being `ToggleOrchestrationLock`, some other action (`Quit`), or `None`: the toggle survives ONLY at `(true, UiMode::Normal)`; every other action passes through untouched in EVERY cell (including `(false, non-Normal)`, ruling out a blanket "drop the action" implementation); `None` in always yields `None` out. The `UiMode` list is guarded by an exhaustive match so a new variant cannot silently drop out of the cross product.
@@ -3520,10 +3555,10 @@ without depending on the config struct API.
 - **Does not assert:** the resulting rendered geometry (covered by `orchestration/layout/003`); spawn-time PTY dims (covered by `orchestration/layout/006`).
 - **Platform coverage:** mac+linux+windows.
 
-##### orchestration/layout/005 — `scope_orchestration_split` claims the split toggle only on an orchestration tab in command mode, un-resolving it everywhere else so `Ctrl+l` reaches the pane's PTY as `0x0c`, and passes every other action through untouched (PRD #336, issue #439).
-- **Layer:** L1 (pure function plus `key_action_for_mode`, the public L1 seam over the same mode-aware resolver chain the event loop runs; no PTY, no render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `scope_orchestration_split` is module-private.
+##### orchestration/layout/005 — `scope_orchestration_chord` claims the split toggle only on an orchestration tab in command mode, un-resolving it everywhere else so `Ctrl+l` reaches the pane's PTY as `0x0c`, and passes every other action through untouched (PRD #336, issue #439).
+- **Layer:** L1 (pure function plus `key_action_for_mode`, the public L1 seam over the same mode-aware resolver chain the event loop runs; no PTY, no render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `scope_orchestration_chord` is module-private.
 - **Agent:** none.
-- **Asserts:** a simulated `Ctrl+l` `KeyEvent` resolves through `key_action_for_mode` to `Action::ToggleOrchestrationSplit` specifically in `UiMode::Normal`, not merely to "some action"; `Some(ToggleOrchestrationSplit)` survives `scope_orchestration_split` only for (orchestration tab, `UiMode::Normal`) and becomes `None` off an orchestration tab in any mode, and on an orchestration tab in `PaneInput`/`Filter`/`Help`/`NewPaneForm` (so the key falls through to the `PaneInput` forwarding path). The mode half mirrors `close_pane` (PRD #241 M1), which is command-mode only so `Ctrl+w` still reaches the PTY as word-delete. Then the payoff end to end, and the half issue #439 added: the SAME chord through the SAME seam in `UiMode::PaneInput` must NOT come back as `ToggleOrchestrationSplit` and must instead forward `0x0c` to the pane's PTY as readline's clear-screen — the shape `orchestration/layout/007` asserts for `Ctrl+Z` and `0x1a`. Also that `ToggleLayout`, `DetachToNormal` and `None` pass through unchanged for every tab/mode pair, proving the guard is surgical rather than a general-purpose filter. Verified with teeth: deleting the `scope_orchestration_split` pass from `key_action_for_mode` — the pre-#439 state, where the seam applied only two of the three scoping passes — fails this test with `got Some(ToggleOrchestrationSplit)`, while `orchestration/layout/003` and `/007` both stay green, so this is the only test that catches it.
+- **Asserts:** a simulated `Ctrl+l` `KeyEvent` resolves through `key_action_for_mode` to `Action::ToggleOrchestrationSplit` specifically in `UiMode::Normal`, not merely to "some action"; `Some(ToggleOrchestrationSplit)` survives `scope_orchestration_chord` only for (orchestration tab, `UiMode::Normal`) and becomes `None` off an orchestration tab in any mode, and on an orchestration tab in `PaneInput`/`Filter`/`Help`/`NewPaneForm` (so the key falls through to the `PaneInput` forwarding path). The mode half mirrors `close_pane` (PRD #241 M1), which is command-mode only so `Ctrl+w` still reaches the PTY as word-delete. Then the payoff end to end, and the half issue #439 added: the SAME chord through the SAME seam in `UiMode::PaneInput` must NOT come back as `ToggleOrchestrationSplit` and must instead forward `0x0c` to the pane's PTY as readline's clear-screen — the shape `orchestration/layout/007` asserts for `Ctrl+Z` and `0x1a`. Also that `ToggleLayout`, `DetachToNormal` and `None` pass through unchanged for every tab/mode pair, proving the guard is surgical rather than a general-purpose filter. Verified with teeth: deleting the split-toggle `scope_orchestration_chord` pass from `key_action_for_mode` — the pre-#439 state, where the seam applied only two of the three scoping passes — fails this test with `got Some(ToggleOrchestrationSplit)`, while `orchestration/layout/003` and `/007` both stay green, so this is the only test that catches it.
 - **Does not assert:** that the event loop actually calls the scoping pass (covered end-to-end by `tabs/orchestration/008`); the TAB term through `key_action_for_mode`, which is not knowable at that seam — it answers for the most permissive tab and the live call site supplies the tab kind, so the tab half is only reachable here through the pure function directly.
 - **Platform coverage:** mac+linux+windows.
 
@@ -3897,6 +3932,13 @@ without depending on the config struct API.
 - **Agent:** none (all three roles run `sleep 600`; no LLM).
 - **Asserts:** with the orchestration tab rebuilt from disk (`reviewer` present, so the landing is a choice between two tabs rather than the only option) and a staged `[focus]` naming the Dashboard as active plus `active_pane = "2"` — deliberately the id a three-pane rebuild really does mint for its middle role, so ignoring it is observable rather than vacuous — the deck lands on the **Dashboard** (no role pane expanded, tab strip highlighting it) rather than on the rebuilt orchestration tab, and is in **command mode** (`[New Pane Ctrl+N]` live, no `[Command Mode Ctrl+D]`). This is the real-binary cover for the `SavedFocus::retain_pane_ids` call site `session/restore/018` cannot reach — here the daemon-supplied set is EMPTY, since nothing hydrated — and for the mode reconciliation: the snapshot-restore block ends in PaneInput on the first pane it rebuilt, which on a tab with no pane of its own would send keystrokes to a pane that is not drawn.
 - **Does not assert:** the warm-daemon reattach, where pane ids ARE honoured (`session/restore/016`); the pure `without_pane_ids` contract (`session/restore/018` case (d)); which pane the controller ends up focused on after the mode step-back (unobservable on the Dashboard, whose selection is keyed by session id).
+- **Platform coverage:** mac+linux.
+
+##### session/restore/020 — A TUI reattaching to a warm daemon whose orchestration no longer matches `.dot-agent-deck.toml` marks the rebuilt tab `[config drift]`, explains it on the status line, and prints a warning naming the drift on exit (issue #554).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness, `tests/e2e_orchestration_config_drift.rs`, attached to a `daemon serve` seeded over the attach socket).
+- **Agent:** none (both roles run `sleep 600`, started with the `TabMembership::Orchestration` stamps a detached TUI leaves behind; no LLM).
+- **Asserts:** five attaches to one daemon running `review-team` (`lead`, `coder`). **Control:** with a config that still lists it, the tab reattaches with no `[config drift]` marker and the detach-quit prints nothing about drift. **Orchestration renamed** in the file (the issue's report): the tab strip reads `! review-team [config drift]`, the status line carries `Config drift:`, and the detach-quit's flushed `session_warnings` name the orchestration as not listed in `<cwd>/.dot-agent-deck.toml` together with the roles it is running, `(lead, coder)`. **Role renamed** (`coder` → `qa`, the misroute the issue's follow-up describes, where the local config still wins): the tab is marked again and the exit warning names both `(lead, coder)` and `(lead, qa)`. **File does not parse** (Qodo on PR #1281 — the rebuild falls back to the daemon's roles exactly as for an absent file): the tab is marked and the exit warning names `<cwd>/.dot-agent-deck.toml` as not loadable. **File deleted** (the branch PRD #111's remote reconnect takes, where synthesis is the right answer): the tab reattaches unmarked and nothing about drift is printed.
+- **Does not assert:** a genuinely remote daemon whose cwd does not exist locally (the deleted file reaches the same `config absent` branch, which is what decides the outcome); the live daemon-dispatch surfacing path `surface_one_orchestration`, which calls the same helpers and the same surfacing function, and whose grow-an-open-tab check (`grown_orchestration_tab_drift_warning`) is unit-tested — driving a live role spawn at lane 1 needs the per-spawn hook capability token (#1077), which only the spawned agent's environment holds; what `dot-agent-deck delegate` reports for a renamed role (`delegate_verdict`'s unit tests in `src/main.rs`); the exact warning wording beyond the quoted fragments.
 - **Platform coverage:** mac+linux.
 
 ### Live session status on reconnect (PRD #162)
@@ -4354,6 +4396,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe; the launched interactive agent receives no prompt.
 
+##### codex/spawn/013 — A plain new-pane Codex command launches through the Wrapper strategy exactly once (issue #533).
+- **Layer:** L2 synthetic PTY-attached new-pane flow (no mode) with PATH recorder stubs.
+- **Agent:** synthetic Codex recorder.
+- **Asserts:** submitting the Ctrl+N form with no mode and Command bare `codex` executes exactly `dot-agent-deck wrap --agent codex -- codex` — the wrapper once, never bare Codex and never a second wrapper. Issue #533 moved this path's rewrite from the TUI to the daemon's spawn boundary, which this pins from the outside.
+- **Does not assert:** which deck binary the daemon names as the wrapper (the recorder is injected through `DOT_AGENT_DECK_WRAP_BIN`; renamed-build resolution is unit-tested in `src/wrap.rs`); a real Codex process (`codex/live/001`).
+- **Platform coverage:** mac+linux.
+
 #### codex/hooks
 
 ##### codex/hooks/001 — A real launcher-script interactive Codex turn reports native prompt/tool detail and becomes Idle without process exit (PRD #20 W1, R20-013/R20-014, §4.3.7). [reel]
@@ -4588,6 +4637,20 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Agent:** none (a `sleep 0.2` crashed worker stand-in, then a `cat` stand-in installed as the healthy replacement).
 - **Asserts:** with the worker's record marked crashed, the test holds `pane_dispatch_lock(WORKER_PANE)`, then manually polls `handle_restart_role_with_state(force: true)` once with a no-op waker and asserts that first poll is already `Pending` (blocked acquiring the same lock). Only then — still holding the lock — does the test call `AgentPtyRegistry::respawn_or_recreate_agent_for_pane` to install a healthy replacement, the same simulated concurrent-delegate step `pane/restart/010` uses. After the lock is released and the restart future is driven to completion, it must report `restarted: true` with no error, and the pane's occupant afterward must be a freshly spawned agent, NOT the replacement installed by the simulated delegate — proof force restarts regardless of the pane no longer being crashed by the time the dispatch lock is actually held.
 - **Does not assert:** the non-force refusal path (`pane/restart/010` owns that); the CLI/socket layer.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/012 — A delegate to a worker that still owes a work-done is refused as busy, and `pane restart --force` cancels that task so the role takes a plain delegate again (issues #580 and #590).
+- **Layer:** L1/fast (in-process — the real `handle_delegate_with_state` and `handle_restart_role_with_state` against a daemon-owned `cat`-orchestrator + `cat` worker; no daemon socket, no LLM).
+- **Agent:** none (a `cat` stand-in, which echoes the task pointer so its delivery is observable).
+- **Asserts:** the first delegate is dispatched and its pointer reaches the worker; a second plain delegate before any work-done comes back with `delivered` empty, the role in `busy` and an `error` naming `--supersede`, and no second pointer reaches the pane; after `pane restart --force` a plain delegate is dispatched with nothing in `busy` or `superseded`, and its pointer reaches the replacement agent.
+- **Does not assert:** the CLI's rendering of the refusal (`delegate_verdict`'s unit tests in `src/main.rs` own that); the commission's age-based expiry (`agent_pty`'s `commission_ledger_*` unit tests own that); a real agent.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/013 — `pane restart --force` cancels the silent-worker notice for the task it cancelled (issue #590; PR #1285 review).
+- **Layer:** L1/fast (in-process — the real `handle_delegate_with_state` and `handle_restart_role_with_state` against a daemon-owned `cat`-orchestrator + `cat` worker, with `DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS=1000` and the idle detector off; no daemon socket, no LLM).
+- **Agent:** none (`cat` stand-ins: the worker never emits an agent event, and the orchestrator echoes whatever the daemon writes into its pane).
+- **Asserts:** after a delegate whose pointer landed is cancelled with `pane restart --force`, three silent-worker windows pass with no "delegated worker went quiet" notice in the orchestrator pane; a second, uncancelled delegate then produces that notice (the control that makes the negative mean something).
+- **Does not assert:** the idle-worker (`worker_response_timeout_minutes`) report, which the same restart cancels by the same call; the case of a dispatch queued behind the pane lock during the restart (`agent_pty`'s `replaced_agent_watches_are_cancelled_unless_a_dispatch_is_in_flight` owns that).
 - **Platform coverage:** mac+linux (unix-only).
 
 #### pane/spawn
@@ -5416,6 +5479,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none.
 - **Asserts:** paused time deterministically completes the confirmation window while the writer is held, user input is stamped only after the caller's precheck has run and before the writer-held backstop proceeds, and that backstop refusal publishes one durable `DeliveryNotice` instead of becoming a log-only `target went stale` stop.
 - **Does not assert:** the notice sink's daemon-to-TUI rendering (covered by `scheduler/dispatch/017`) or exact log wording.
+- **Platform coverage:** mac+linux+windows.
+
+##### scheduler/dispatch/022 — A detached retry waits out a genuine Codex confirmation 8.45 s after the write (issue #637).
+- **Layer:** L1 (in-process detached confirmation loop on paused time, a real byte-observation PTY stamped with a Codex spawn record, and a thread-scoped `tracing` subscriber reading the delivery log).
+- **Agent:** none — a `/bin/cat` byte target (`more.com` on Windows) whose frozen spawn type is Codex, so `confirmation_floor_for` derives the floor exactly as `deliver` does.
+- **Asserts:** after attempt 1, the genuine submission report arriving 8.45 s later on virtual time is accepted as attempt 1's confirmation, and the delivery log carries no `re-submitting` and no `probing submit` line — i.e. no replacement payload and no submit probe went into the pane first. The log is read rather than the scrollback because the watch logs a re-submission BEFORE writing it, so the assertion is not a race against the PTY echo. Measured RED with the floor taken out of `unconfirmed_retry_delay` (the pre-#637 schedule).
+- **Does not assert:** that a never-confirmed delivery is still retried on this path (the TUI half of that is `prompt/pane-input/041`; the daemon schedule itself is unit-tested beside `unconfirmed_retry_delay`); any real agent's confirmation latency.
 - **Platform coverage:** mac+linux+windows.
 
 #### scheduler/pi

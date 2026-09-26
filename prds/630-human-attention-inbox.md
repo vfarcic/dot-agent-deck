@@ -5,7 +5,7 @@
 **Priority**: High
 **Created**: 2026-08-21
 **Builds on**: [#126](https://github.com/vfarcic/dot-agent-deck/issues/126) (agent-driven notifications and idle-worker detection), [#333](https://github.com/vfarcic/dot-agent-deck/issues/333) (orchestration tab status)
-**Interacts with**: [#447](https://github.com/vfarcic/dot-agent-deck/issues/447) (waiting worker escalation), [#628](https://github.com/vfarcic/dot-agent-deck/issues/628) (durable work identity), [PRD #78](78-tab-level-status-indicators.md) (older tab-indicator concept), [PRD #18](done/18-permission-prompt-control.md) and [PRD #92](done/92-process-boundary-invariant-audit.md) (existing approval controls)
+**Interacts with**: [#447](https://github.com/vfarcic/dot-agent-deck/issues/447) (waiting worker escalation), [#628](https://github.com/vfarcic/dot-agent-deck/issues/628) (durable work identity), [PRD #78](done/78-tab-level-status-indicators.md) (older tab-indicator concept), [PRD #18](done/18-permission-prompt-control.md) and [PRD #92](done/92-process-boundary-invariant-audit.md) (existing approval controls)
 
 ## Opportunity
 

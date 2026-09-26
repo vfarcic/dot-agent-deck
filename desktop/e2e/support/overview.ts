@@ -85,20 +85,37 @@ export function legendFor(columns: Iterable<OverviewColumn>): string[] {
 }
 
 /**
- * Load the fixture and click through to the agent overview.
- *
- * There is no URL that lands on the overview — `DeckShell` starts on the deck
- * and the rail button is the only way across — so this is a real click on the
- * real production bundle, not a router shortcut.
+ * Load the fixture and select the agent overview through its rail control.
+ * This also works when the overview is already the landing screen.
  */
 export async function openOverview(page: Page, scenario: FixtureScenario = "crowded"): Promise<void> {
   await page.goto(`/?fixture=1&state=${scenario}`);
-  await page.getByTestId("open-overview").click();
+  await selectOverview(page);
   // `.first()`, because PRD #742 M4 made the deck the outer unit and each deck
   // carries its own table region — `fleet` has three sections and a strict
   // locator would fail on the count rather than on anything a reader would
   // notice. Every single-deck scenario still matches exactly one.
   await expect(tableRegion(page).first()).toBeVisible();
+}
+
+/** Select the overview on the current page without discarding its query state. */
+export async function selectOverview(page: Page): Promise<void> {
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await expect(tableRegion(page).first()).toBeVisible();
+}
+
+/** Enter the experimental deck for browser cases that exercise its tiles or controls. */
+export async function enterDeck(page: Page): Promise<void> {
+  const url = new URL(page.url());
+  if (url.searchParams.get("experimental") !== "1") {
+    url.searchParams.set("experimental", "1");
+    await page.goto(url.toString());
+  }
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  const button = page.getByTestId("open-deck");
+  if (await button.count()) await button.click();
+  await expect(page.locator(".agent-grid")).toBeVisible();
 }
 
 /**

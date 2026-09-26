@@ -1661,8 +1661,49 @@ pub struct DelegateResponse {
     #[serde(default)]
     pub unresolved_roles: Vec<String>,
     /// Set when the delegate could not be routed at all.
+    ///
+    /// Issue #580: also set when EVERY resolved role was refused as
+    /// [`Self::busy`] and nothing was dispatched, carrying the same explanation
+    /// the CLI prints. That is what makes the refusal loud on a CLI that predates
+    /// `busy`: it reads `error`, and without it would see an empty `delivered`,
+    /// an empty `unresolved_roles` and no error — a clean success.
     #[serde(default)]
     pub error: Option<String>,
+    /// Issue #580: roles NOT dispatched because their worker still owes a
+    /// `work-done` for an earlier delegation, and the caller did not pass
+    /// `--supersede`. The daemon reads that from its commission ledger, not from
+    /// the worker's status. A role listed here is absent from `delivered`.
+    ///
+    /// Additive on the hook socket, like every field of this reply: an older
+    /// daemon never writes it, and an older CLI ignores it. The behaviour behind
+    /// it is not additive — a delegate that used to be dispatched is now refused —
+    /// which is `changelog.d/580.breaking.md`.
+    #[serde(default)]
+    pub busy: Vec<BusyWorker>,
+    /// Issue #580: roles that WERE dispatched while their worker still owed a
+    /// `work-done` — the supersession, reported instead of silent. Either the
+    /// caller passed `--supersede`, or what was owed had been delegated by an
+    /// orchestrator agent since replaced in its pane, which the successor is
+    /// not refused over. A role listed here is also in `delivered`.
+    #[serde(default)]
+    pub superseded: Vec<BusyWorker>,
+}
+
+/// Issue #580: one worker that still owed a `work-done` when a delegate named
+/// it. See [`DelegateResponse::busy`] and [`DelegateResponse::superseded`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusyWorker {
+    /// The `--to` role the worker pane is registered for.
+    pub role: String,
+    /// Delegations to this worker that no `work-done` had been credited to,
+    /// before this delegate.
+    #[serde(default)]
+    pub outstanding: u32,
+    /// Age, in whole seconds, of the oldest of those delegations the daemon
+    /// still tracks individually. Each expires on its own a fixed time after it
+    /// was issued (issue #590), so this also says how long the refusal can last.
+    #[serde(default)]
+    pub oldest_age_secs: u64,
 }
 
 /// The value [`DelegateResponse::kind`] carries on every reply this daemon
@@ -1678,6 +1719,8 @@ impl Default for DelegateResponse {
             delivered: Vec::new(),
             unresolved_roles: Vec::new(),
             error: None,
+            busy: Vec::new(),
+            superseded: Vec::new(),
         }
     }
 }
@@ -1714,6 +1757,15 @@ pub struct DelegateSignal {
     /// `changelog.d/1077.breaking.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Issue #580: dispatch even to a worker that still owes a `work-done` for
+    /// an earlier delegation (`delegate --supersede`). Without it the daemon
+    /// refuses that worker and reports it in [`DelegateResponse::busy`].
+    ///
+    /// Skipped when false, so a plain delegate serializes exactly as it did
+    /// before this field existed. An older daemon ignores the key — and delivers
+    /// regardless, which is what `--supersede` asks for anyway.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supersede: bool,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -2432,6 +2484,7 @@ mod tests {
             pane_id: "pane-1".into(),
             task: "Implement login".into(),
             to: vec!["coder".into()],
+            supersede: false,
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -2802,6 +2855,7 @@ mod tests {
                 pane_id: "p".into(),
                 task: "t".into(),
                 to: vec!["worker".into()],
+                supersede: false,
                 timestamp: ts,
                 token: None,
             }),

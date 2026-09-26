@@ -236,6 +236,7 @@ fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
         pane_id: orchestrator_pane,
         task: "Remain silent so the idle detector can surface its prompt.".to_string(),
         to: vec!["worker".to_string()],
+        supersede: false,
         timestamp: chrono::Utc::now(),
         token: None,
     });

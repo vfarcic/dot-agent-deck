@@ -107,17 +107,19 @@ fn nonblank_rows(buffer: &Buffer) -> usize {
         .count()
 }
 
+/// Issue #413: the instant the selected-card fixture is built against and
+/// rendered at. The card seams take `now` instead of reading the clock, so the
+/// card's `Last:` field is a pure function of the fixture's own timestamps.
+fn render_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_767_225_600, 0).expect("a valid fixed instant")
+}
+
 fn selected_card_fixture() -> SessionState {
-    // `last_activity` is nudged 30s into the future of `now` (issue #350):
     // `mode_deck_001_selected_card_styles` pins this fixture's rendered card
-    // into a color/style-aware snapshot, and the bottom border's `Last:` field
-    // is computed by `format_elapsed` (src/ui.rs) from `Utc::now()` at render
-    // time, not at fixture-build time. Seeding it to exactly `now` raced that
-    // computation across a whole second boundary under any scheduling delay.
-    // The forward nudge relies on `format_elapsed`'s existing clamp of a
-    // negative delta to zero (`delta.num_seconds().max(0)`), so the rendered
-    // value holds at `0s` for 30s. Committed snapshot is unchanged.
-    let now = chrono::Utc::now();
+    // into a color/style-aware snapshot. Activity at the render instant keeps
+    // its bottom border at `Last: 0s`; issue #413 made that exact, where the
+    // 30s forward nudge #350 added only bounded the race.
+    let now = render_now();
     SessionState {
         session_id: "mode-card".to_string(),
         agent_type: AgentType::ClaudeCode,
@@ -125,7 +127,7 @@ fn selected_card_fixture() -> SessionState {
         status: SessionStatus::Working,
         active_tool: None,
         started_at: now,
-        last_activity: now + chrono::Duration::seconds(30),
+        last_activity: now,
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: None,
@@ -1000,6 +1002,7 @@ fn mode_deck_001_selected_card_accent_tracks_mode() {
         Some(1),
         density,
         0,
+        render_now(),
         true,
         UiMode::Normal,
         width,
@@ -1011,6 +1014,7 @@ fn mode_deck_001_selected_card_accent_tracks_mode() {
         Some(1),
         density,
         0,
+        render_now(),
         true,
         UiMode::PaneInput,
         width,
@@ -1022,6 +1026,7 @@ fn mode_deck_001_selected_card_accent_tracks_mode() {
         Some(1),
         density,
         0,
+        render_now(),
         true,
         width,
         height,

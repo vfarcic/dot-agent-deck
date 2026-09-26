@@ -1261,6 +1261,19 @@ impl DesktopSettings {
         }
     }
 
+    /// Whether this document selects **All Decks** — the one selection
+    /// [`Self::resolve_endpoint`] answers with a deck it does not mean.
+    ///
+    /// That answer is the local deck, with no fallback, because the watcher,
+    /// the tunnels and the selected-deck snapshot all need *an* endpoint (see
+    /// [`EndpointSettings::resolve`]). An operation that acts on one deck must
+    /// not take it as the user's choice, and this is how it tells (#1083).
+    pub fn selects_all_decks(&self) -> bool {
+        self.endpoints
+            .as_ref()
+            .is_some_and(|endpoints| matches!(endpoints.selection, Selection::All))
+    }
+
     /// Every deck this document says to keep alive — PRD #742 M2's set, and
     /// the document-level twin of [`Self::resolve_endpoint`].
     ///
@@ -1390,6 +1403,13 @@ impl EndpointSettings {
     /// print a substitution notice about a selection that is in force.
     /// [`Self::connectable_endpoints`] is where the connectable set lives, and
     /// [`Self::unconfigured_decks`] is the rest of what the fleet shows.
+    ///
+    /// **That local answer is for the plumbing, not for an operation.** An
+    /// operation that acts on the selected deck — list or resolve a project,
+    /// launch a workflow, rename or type into an agent — must not read it as
+    /// the user's choice, or All Decks silently means "local" (#1083).
+    /// `crate::daemon_bridge::trusted_daemon` refuses under All Decks for that
+    /// reason, via [`DesktopSettings::selects_all_decks`].
     pub fn resolve(&self) -> ResolvedEndpoint {
         let local = || ResolvedEndpoint {
             endpoint: Endpoint::local(),
@@ -7389,6 +7409,35 @@ level = 1.0
             );
         }
         assert_eq!(Selection::Local.as_token(), LOCAL_SELECTION_TOKEN);
+    }
+
+    /// Scenario (#1083): a document with no `[endpoints]` section, one selecting
+    /// the local deck, one selecting a row and one selecting All Decks. Only the
+    /// last is All Decks — and it still resolves to the local deck, which is
+    /// exactly why an operation has to ask `selects_all_decks` rather than read
+    /// the resolved endpoint as the user's choice.
+    #[test]
+    fn only_the_fleet_selection_selects_all_decks() {
+        let with = |selection| DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: Vec::new(),
+                selection,
+            }),
+            ..DesktopSettings::default()
+        };
+        assert!(!DesktopSettings::default().selects_all_decks());
+        assert!(!with(Selection::Local).selects_all_decks());
+        assert!(!with(Selection::One(EndpointId::parse("deck1").unwrap())).selects_all_decks());
+        let all = with(Selection::All);
+        assert!(all.selects_all_decks());
+        assert_eq!(
+            all.resolve_endpoint(),
+            ResolvedEndpoint {
+                endpoint: Endpoint::local(),
+                fallback: None,
+            },
+            "All Decks resolves to the local deck with no fallback, so the resolved endpoint cannot tell it apart"
+        );
     }
 
     /// Scenario: a fleet selection is stored, loaded and stored again. The `all`

@@ -208,7 +208,7 @@ Zoom is its own section rather than a second row in Appearance because the contr
 
 ### Feature flag
 
-CLAUDE.md rule 9 asks whether a new user-visible surface ships behind `experimental`. **No, and this is settled by precedent rather than re-decided**: PRD #176 decision 6 (`prds/176-desktop-gui.md:101`) records it for the entire desktop binary — *"a separate GUI binary has no such seam — the act of building/running it is the opt-in. So maturity is handled by packaging."* PRD #745 followed the same precedent for the same reason. Nothing about a keybinding changes it: the flag gates render/input seams inside the **TUI** binary, and there is no TUI seam here.
+CLAUDE.md rule 9 asks whether a new user-visible surface ships behind `experimental`. **No, and this is settled by precedent rather than re-decided**: PRD #176 decision 6 (`prds/done/176-desktop-gui.md:101`) records it for the entire desktop binary — *"a separate GUI binary has no such seam — the act of building/running it is the opt-in. So maturity is handled by packaging."* PRD #745 followed the same precedent for the same reason. Nothing about a keybinding changes it: the flag gates render/input seams inside the **TUI** binary, and there is no TUI seam here.
 
 ### Rule 12: no contract change
 

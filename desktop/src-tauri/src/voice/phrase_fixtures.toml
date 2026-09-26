@@ -67,10 +67,16 @@ outcome = "dispatch"
 [[fixtures]]
 name = "open-overview-unavailable"
 utterance = "show me everything"
-screen = "overview"
+# The agent screen: the one rail offers Overview on the deck and the overview
+# alike (#1197), and it is inert only behind an agent's modal pane.
+screen = "agent"
 action = "open_overview"
 outcome = "unavailable"
 
+# These first four `open_deck` fixtures run with the experimental deck shown.
+# The deck-hidden fixtures following them exercise the shipped overview: a
+# bare "go back" routes to `close`, while explicit deck requests resolve to
+# `open_deck` and are refused with the hidden-deck hint.
 [[fixtures]]
 name = "open-deck-back"
 utterance = "go back"
@@ -95,7 +101,32 @@ outcome = "dispatch"
 [[fixtures]]
 name = "open-deck-unavailable"
 utterance = "take me back to the terminals"
-screen = "deck"
+# The agent screen, for `open-overview-unavailable`'s reason (#1197).
+screen = "agent"
+action = "open_deck"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "deck-hidden-go-back"
+utterance = "go back"
+screen = "overview"
+deck_hidden = true
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "deck-hidden-back-to-deck"
+utterance = "back to the deck"
+screen = "overview"
+deck_hidden = true
+action = "open_deck"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "deck-hidden-open-deck"
+utterance = "open the deck"
+screen = "overview"
+deck_hidden = true
 action = "open_deck"
 outcome = "unavailable"
 
@@ -171,6 +202,82 @@ form = true
 action = "open_deck"
 outcome = "dispatch"
 
+# Issue #1247 — "cancel" over the dialog CLOSES it, which keeps the form as a
+# draft; only "discard" throws it away. The Discard button's label and its
+# accessible name must both reach `discard_new_agent`, said on their own.
+[[fixtures]]
+name = "cancel-closes-the-new-agent-dialog"
+utterance = "cancel"
+screen = "overview"
+form = true
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "discard-the-new-agent-form"
+utterance = "discard"
+screen = "overview"
+form = true
+action = "discard_new_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "discard-new-agent-by-its-accessible-name"
+utterance = "Discard new agent"
+screen = "overview"
+dialog = true
+action = "discard_new_agent"
+outcome = "dispatch"
+
+# Issue #1263 — the deck field once the dialog is open. Over a dialog with no
+# form yet, and over a live form (where a different deck clears the directory);
+# the field's label said with a deck's name; and the deck screen, where there is
+# no dialog, must say where it works rather than guess.
+[[fixtures]]
+name = "choose-deck-in-the-open-dialog"
+utterance = "use the build box deck"
+screen = "overview"
+dialog = true
+action = "choose_deck"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "choose-deck-over-a-live-form"
+utterance = "switch to the local deck"
+screen = "overview"
+form = true
+action = "choose_deck"
+outcome = "dispatch"
+resolved_deck = "deck-local"
+
+[[fixtures]]
+name = "choose-deck-by-its-label"
+utterance = "deck build box"
+screen = "overview"
+dialog = true
+action = "choose_deck"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "choose-deck-unavailable"
+utterance = "use the build box deck"
+screen = "deck"
+action = "choose_deck"
+outcome = "unavailable"
+
+# The steering residual `choose_deck`'s narrow vocabulary is about: "deck"
+# inside a naming request is the naming request.
+[[fixtures]]
+name = "name-new-agent-with-a-deck-word"
+utterance = "name it deck worker"
+screen = "overview"
+form = true
+action = "name_new_agent"
+outcome = "dispatch"
+dictate_prefix = "name it"
+
 # Settings is exposed only from the deck; overview and agent requests must be unavailable.
 
 [[fixtures]]
@@ -183,9 +290,10 @@ outcome = "dispatch"
 [[fixtures]]
 name = "open-settings-preferences"
 utterance = "change my preferences"
+# Callable here since #1197 put Settings in the overview's rail.
 screen = "overview"
 action = "open_settings"
-outcome = "unavailable"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "open-settings-api-key"
@@ -197,16 +305,20 @@ outcome = "dispatch"
 [[fixtures]]
 name = "open-settings-overview-collision"
 utterance = "show me all the settings"
+# `open_overview` is callable here too since #1197, so "show me all" no longer
+# has the callability tie-break on its side; the settings word has to win.
 screen = "overview"
 action = "open_settings"
-outcome = "unavailable"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "open-settings-deck-collision"
 utterance = "go back to settings"
+# Both rows are callable here since #1197; "back" is `open_deck`'s word on the
+# overview, and "go back to settings" must still reach Settings.
 screen = "overview"
 action = "open_settings"
-outcome = "unavailable"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "open-settings-unavailable"

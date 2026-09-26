@@ -2254,6 +2254,32 @@ async fn desktop_terminal_detach(
     terminal::detach(&state, &session_id).await
 }
 
+/// Which of the app's experimental surfaces to show (issue #1198) — the
+/// desktop process's own flag, through one `features::show_desktop_*` wrapper
+/// per surface. The webview asks once at startup; the flag itself is resolved
+/// once, by [`init_features`], so restarting the app is how it changes.
+#[tauri::command]
+async fn desktop_features(webview: Webview) -> Result<dto::DesktopFeatures, String> {
+    ensure_main_webview(&webview)?;
+    Ok(dto::DesktopFeatures::current())
+}
+
+/// Resolve the desktop process's experimental flag (issue #1198). Until this
+/// runs every `show_desktop_*` wrapper reads the default, OFF.
+///
+/// From this process's environment ONLY — `DOT_AGENT_DECK_EXPERIMENTAL`, and
+/// the file `DOT_AGENT_DECK_FEATURES_CONFIG` names outright — through
+/// `features::init_from_process_env`. There is deliberately no walk up from the
+/// working directory for a `.dot-agent-deck.toml`, which is what the TUI and
+/// the daemon do: that is a client-side project guess, exactly what PRD #819
+/// removed from this crate and linkage-check rule 12 refuses here. A remote
+/// deck's project is on another machine, and a Finder-launched app's working
+/// directory is `/`. `docs/develop/experimental-flag.md` says how a packaged
+/// app is given either variable.
+fn init_features() {
+    dot_agent_deck::features::init_from_process_env();
+}
+
 /// Read the desktop app's own settings document, and where it lives (PRD #803).
 ///
 /// A standalone command rather than a `DesktopAction`, for the same reason the
@@ -2889,6 +2915,9 @@ async fn desktop_voice_resolve(
         new_agent.as_ref(),
         voice::Transcript::new(utterance),
         settings.labels,
+        // Issue #1198: the deck is an experimental surface, so voice neither
+        // offers nor dispatches the way there while it is hidden.
+        dot_agent_deck::features::show_desktop_deck(),
     )
     .await)
 }
@@ -2990,6 +3019,9 @@ async fn desktop_voice_commands(
             .voice
             .unwrap_or_default()
             .labels,
+        // Issue #1198: the list marks the deck's row unavailable while the deck
+        // is hidden, for the same reason the resolver refuses it.
+        dot_agent_deck::features::show_desktop_deck(),
     ))
 }
 
@@ -3416,6 +3448,87 @@ struct StartedOrchestration {
     agent_ids: Vec<String>,
     /// The deck, captured once before the first await.
     scope: crate::dto::DeckScope,
+}
+
+/// [`DesktopAction::StartWorkflow`]'s fields, unpacked for
+/// [`start_workflow_action`].
+struct StartWorkflowRequest {
+    name: String,
+    cwd: String,
+    task_prompt: String,
+    roles: Vec<WorkflowRoleInput>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+    config_revision: Option<String>,
+}
+
+/// The Runs screen's workflow launch ([`DesktopAction::StartWorkflow`]).
+///
+/// # It launches on the SELECTED deck, and never under All Decks
+///
+/// The Runs screen shows one deck, so its launch names none and goes to the
+/// selected one through [`trusted_daemon`]. Under **All Decks** that refuses
+/// before any deck is contacted (#1083): the selection resolves to the local
+/// deck there only because the plumbing needs an endpoint, and a launch that
+/// took it would start agents on this machine because the user chose every
+/// deck. The webview shows "Select a deck" instead of the launch form in that
+/// state; this is the backstop. Split out of the action arm so that property
+/// can be driven against a real daemon
+/// (`daemon_bridge::tests::a_runs_launch_under_all_decks_never_reaches_the_local_deck`).
+async fn start_workflow_action(
+    state: &DesktopState,
+    request: StartWorkflowRequest,
+) -> Result<WorkflowLaunchResult, DesktopActionError> {
+    let StartWorkflowRequest {
+        name,
+        cwd,
+        task_prompt,
+        roles,
+        rows,
+        cols,
+        config_revision,
+    } = request;
+    ensure_desktop_workflow_platform_supported(std::env::consts::OS)?;
+    let (rows, cols) =
+        validate_workflow_shape(&name, &cwd, &roles, rows.unwrap_or(32), cols.unwrap_or(120))?;
+    // PRD #819 M6: the connection comes FIRST now. Resolution used to
+    // run two lines above the first daemon contact, against this
+    // process's own filesystem; it now runs on the daemon's, so a
+    // connection has to exist before a launch can be prepared at all.
+    // The supported non-Pi coordinator still uses the readiness-gated,
+    // identity-bound retry path in `launch_workflow`; Pi is rejected
+    // inside the preparation, before anything is spawned.
+    let daemon = trusted_daemon(&state.daemon).await?;
+    daemon.require_compatible()?;
+    ensure_daemon_can_prepare(daemon.client.cached_capabilities().as_ref())?;
+    let (roles, prepared) = prepare_workflow_launch(
+        daemon.client.as_ref(),
+        &name,
+        &cwd,
+        &task_prompt,
+        &roles,
+        config_revision.as_deref(),
+    )
+    .await?;
+    let orchestration_id = mint_orchestration_id();
+    launch_workflow(
+        daemon.client.as_ref(),
+        &name,
+        // The daemon's CANONICAL spelling, not the one that was sent.
+        // An alias or a symlink resolves elsewhere, canonicalising
+        // changes the basename, and an empty orchestration name is
+        // derived from that basename — so preparing under one spelling
+        // and spawning under another is PRD #220's bug verbatim.
+        &prepared.path,
+        &roles,
+        rows,
+        cols,
+        &orchestration_id,
+        &prepared.prompt,
+        Some(&prepared.token),
+    )
+    .await
+    .map_err(|failure| DesktopActionError::launch(failure.message, failure.unconfirmed_stops))
 }
 
 /// Launch one of a project's orchestrations on the deck `deck_id` names, the
@@ -3929,54 +4042,19 @@ async fn desktop_run_action(
             cols,
             config_revision,
         } => {
-            ensure_desktop_workflow_platform_supported(std::env::consts::OS)?;
-            let (rows, cols) = validate_workflow_shape(
-                &name,
-                &cwd,
-                &roles,
-                rows.unwrap_or(32),
-                cols.unwrap_or(120),
-            )?;
-            // PRD #819 M6: the connection comes FIRST now. Resolution used to
-            // run two lines above the first daemon contact, against this
-            // process's own filesystem; it now runs on the daemon's, so a
-            // connection has to exist before a launch can be prepared at all.
-            // The supported non-Pi coordinator still uses the readiness-gated,
-            // identity-bound retry path in `launch_workflow`; Pi is rejected
-            // inside the preparation, before anything is spawned.
-            let daemon = trusted_daemon(&state.daemon).await?;
-            daemon.require_compatible()?;
-            ensure_daemon_can_prepare(daemon.client.cached_capabilities().as_ref())?;
-            let (roles, prepared) = prepare_workflow_launch(
-                daemon.client.as_ref(),
-                &name,
-                &cwd,
-                &task_prompt,
-                &roles,
-                config_revision.as_deref(),
+            let launched = start_workflow_action(
+                &state,
+                StartWorkflowRequest {
+                    name,
+                    cwd,
+                    task_prompt,
+                    roles,
+                    rows,
+                    cols,
+                    config_revision,
+                },
             )
             .await?;
-            let orchestration_id = mint_orchestration_id();
-            let launched = launch_workflow(
-                daemon.client.as_ref(),
-                &name,
-                // The daemon's CANONICAL spelling, not the one that was sent.
-                // An alias or a symlink resolves elsewhere, canonicalising
-                // changes the basename, and an empty orchestration name is
-                // derived from that basename — so preparing under one spelling
-                // and spawning under another is PRD #220's bug verbatim.
-                &prepared.path,
-                &roles,
-                rows,
-                cols,
-                &orchestration_id,
-                &prepared.prompt,
-                Some(&prepared.token),
-            )
-            .await
-            .map_err(|failure| {
-                DesktopActionError::launch(failure.message, failure.unconfirmed_stops)
-            })?;
             result_agent_id = Some(launched.start_agent_id);
             result_agent_ids = launched.agent_ids;
             result_message = Some(
@@ -4301,6 +4379,7 @@ pub fn run() {
         // A missing window is not an error. `load_snapshot` never fails, and a
         // default level makes this a no-op rather than a special case.
         .setup(|app| {
+            init_features();
             let stored = settings::load_snapshot().settings;
             // PRD #741 M7: the stored deck selection goes into force before the
             // first snapshot, so the app connects to the deck the user chose
@@ -4401,6 +4480,7 @@ pub fn run() {
             desktop_terminal_write,
             desktop_terminal_resize,
             desktop_terminal_detach,
+            desktop_features,
             desktop_get_settings,
             desktop_set_settings,
             desktop_test_endpoint,

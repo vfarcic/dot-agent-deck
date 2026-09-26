@@ -16,6 +16,39 @@ use spec::spec;
 
 const SENTINEL_NAME: &str = "codex_sentinel_a7c91f.txt";
 const INTERACTIVE_PROOF_NAME: &str = "codex-interactive-proof.txt";
+/// Codex's empty-composer placeholder. Same needle, and the same reasoning for
+/// matching only the meaningful part of it, as `tests/e2e_codex_hooks.rs`.
+const CODEX_COMPOSER_READY: &str = "Ask Codex to do anything";
+
+/// Whether this host lets an unprivileged process create a user namespace,
+/// which Codex's Linux `workspace-write` sandbox needs (it runs its tools
+/// under `bwrap`). A host that refuses — Ubuntu's
+/// `kernel.apparmor_restrict_unprivileged_userns=1` is the measured case —
+/// makes every shell command and every patch Codex attempts fail with
+/// `bwrap: setting up uid map: Permission denied`, so a test that needs Codex
+/// to do real work there cannot pass whatever the deck does. Probed with
+/// util-linux's `unshare -Ur true`; a host without `unshare` is not judged, so
+/// the test runs and speaks for itself.
+fn check_codex_sandbox_can_start() -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    match std::process::Command::new("unshare")
+        .args(["-Ur", "true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if !status.success() => Err(
+            "this host refuses unprivileged user namespaces (`unshare -Ur true` failed), so \
+             Codex's workspace-write sandbox cannot start a shell or apply a patch here — \
+             check `kernel.apparmor_restrict_unprivileged_userns`"
+                .into(),
+        ),
+        _ => Ok(()),
+    }
+}
 
 fn path_with_binary_dir() -> String {
     let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
@@ -124,6 +157,7 @@ fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
 #[test]
 fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
     skip_unless!(common::check_codex_available());
+    skip_unless!(check_codex_sandbox_can_start());
 
     let prompt = format!(
         "Use the shell to list the current directory and confirm {SENTINEL_NAME} exists. Then write exactly {SENTINEL_NAME} followed by a newline to {INTERACTIVE_PROOF_NAME}. Do not modify any other file."
@@ -158,9 +192,40 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
         "the bare interactive Codex UI never became ready in the new pane:\n{}",
         deck.snapshot_grid()
     );
+    // Typing before Codex's composer has painted loses the payload, and the
+    // first Enter after it is dropped while Codex is still initialising — both
+    // measured and written up in `codex_hooks_001` (`tests/e2e_codex_hooks.rs`),
+    // which gates and retries exactly as below. This test pressed Enter once, and
+    // in each of three runs against Codex 0.156.1 on 2026-09-24 the prompt sat
+    // unsubmitted in the composer until the proof-file wait expired.
+    assert!(
+        deck.wait_for_grid_string_within(CODEX_COMPOSER_READY, Duration::from_secs(90)),
+        "Codex's composer never painted {CODEX_COMPOSER_READY:?} within 90s:\n{}",
+        deck.snapshot_grid()
+    );
     deck.send_keys(prompt.as_bytes());
     deck.wait_for_string(SENTINEL_NAME);
-    deck.send_keys(b"\r");
+    // Retry on the OUTCOME: the placeholder returns only once the composer has
+    // been emptied into a turn, and an Enter landing on an empty composer does
+    // nothing, so a repeat after the submit is harmless.
+    let submit_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut attempts = 0_usize;
+    let submitted = loop {
+        deck.send_keys(b"\r");
+        attempts += 1;
+        if deck.wait_for_grid_string_within(CODEX_COMPOSER_READY, Duration::from_secs(2)) {
+            break true;
+        }
+        if std::time::Instant::now() >= submit_deadline {
+            break false;
+        }
+    };
+    assert!(
+        submitted,
+        "after {attempts} Enter(s) over 60s the prompt is still sitting unsubmitted \
+         in Codex's composer:\n{}",
+        deck.snapshot_grid()
+    );
 
     let thinking = events.wait_for(
         |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Thinking,

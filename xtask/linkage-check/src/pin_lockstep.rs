@@ -28,6 +28,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use regex::Regex;
 use tempfile::TempDir;
 
 /// The workspace root, from this crate's manifest dir rather than the process
@@ -71,6 +72,13 @@ fn combined(out: &Output) -> String {
 }
 
 /// A synthetic repository holding nothing but the two files the script reads.
+///
+/// Every fixture also gets a `default-pnpm.yml` carrying an agreeing pnpm pin
+/// ([`pnpm_workflow`] at [`PNPM`]) unless one of the workflows passed in already
+/// names `pnpm/action-setup`. Without it every fixture would also fail the pnpm
+/// class (issue #1262), and a test asserting only that the script FAILS — such
+/// as `an_unreadable_pin_fails_even_when_every_readable_pin_agrees` — would
+/// then pass for the wrong reason.
 struct Fixture {
     dir: TempDir,
 }
@@ -100,6 +108,26 @@ impl Fixture {
         for (name, body) in workflows {
             fs::write(wf.join(name), body).expect("write a fixture workflow");
         }
+        // A full-line comment naming the action is not a step, and the
+        // scanner ignores it too, so it must not suppress the default.
+        if !workflows.iter().any(|(_, body)| {
+            body.lines()
+                .any(|l| !l.trim_start().starts_with('#') && l.contains("pnpm/action-setup"))
+        }) {
+            // A name no test passes, so the default can never overwrite a
+            // workflow a test supplied (raised by Qodo on #1284).
+            assert!(
+                workflows
+                    .iter()
+                    .all(|(name, _)| *name != DEFAULT_PNPM_WORKFLOW),
+                "{DEFAULT_PNPM_WORKFLOW} is reserved for the fixture's default pnpm pin"
+            );
+            fs::write(
+                wf.join(DEFAULT_PNPM_WORKFLOW),
+                pnpm_workflow(&format!("version: {PNPM}")),
+            )
+            .expect("write the fixture pnpm workflow");
+        }
         Self { dir }
     }
 
@@ -108,7 +136,13 @@ impl Fixture {
     }
 }
 
-/// devbox.json entries that agree with [`workflow`]'s defaults.
+/// The pnpm version the fixtures agree on.
+const PNPM: &str = "11.22.0";
+
+/// Where [`Fixture`] writes its default agreeing pnpm workflow.
+const DEFAULT_PNPM_WORKFLOW: &str = "default-pnpm.yml";
+
+/// devbox.json entries that agree with [`workflow`]'s defaults and [`PNPM`].
 fn good_packages() -> Vec<&'static str> {
     vec![
         "jq@1.8.2",
@@ -117,7 +151,26 @@ fn good_packages() -> Vec<&'static str> {
         "cargo@1.97.1",
         "clippy@1.97.1",
         "rustfmt@1.97.1",
+        "pnpm@11.22.0",
     ]
+}
+
+/// A workflow whose one `pnpm/action-setup` step carries `with_lines` verbatim
+/// under its `with:` — `version: 11.22.0`, say — followed by a
+/// `actions/setup-node` step, which is what follows it in the real files and
+/// whose `node-version:` must not be read as a pnpm pin.
+fn pnpm_workflow(with_lines: &str) -> String {
+    format!(
+        "jobs:\n  \
+         desktop-web:\n    \
+         steps:\n      \
+         - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6\n        \
+         with:\n          \
+         {with_lines}\n      \
+         - uses: actions/setup-node@v7\n        \
+         with:\n          \
+         node-version: 24\n"
+    )
 }
 
 /// A minimal workflow carrying one of each pin, in the exact spelling the real
@@ -171,6 +224,143 @@ fn repository_pins_are_in_lockstep() {
          version — `cargo test-fast` in a devbox shell and `cargo nextest run` \
          in CI would run different builds (issue #648):\n{}",
         combined(&out)
+    );
+}
+
+/// renovate.json's pnpm customManager (issue #1319), compiled: its one file
+/// pattern and its one matchString. Found by what it reads — depName `pnpm`
+/// from the `devbox` datasource — rather than by its position in the array, and
+/// required to be unique, so adding a second pnpm manager goes red here instead
+/// of leaving this test comparing the guard against half of what Renovate reads.
+fn renovate_pnpm_manager() -> (Regex, Regex) {
+    let text = fs::read_to_string(repo_root().join("renovate.json")).expect("read renovate.json");
+    let config: serde_json::Value =
+        serde_json::from_str(&text).expect("renovate.json is not valid JSON");
+    let managers: Vec<&serde_json::Value> = config["customManagers"]
+        .as_array()
+        .expect("renovate.json has a customManagers array")
+        .iter()
+        .filter(|m| m["depNameTemplate"] == "pnpm" && m["datasourceTemplate"] == "devbox")
+        .collect();
+    assert_eq!(
+        managers.len(),
+        1,
+        "renovate.json must carry exactly one customManager reading pnpm from the \
+         devbox datasource (issue #1319)"
+    );
+    let only = |key: &str| -> String {
+        let values = managers[0][key]
+            .as_array()
+            .unwrap_or_else(|| panic!("the pnpm customManager has no {key} array"));
+        assert_eq!(
+            values.len(),
+            1,
+            "the pnpm customManager must have exactly one {key}; this test and \
+             scripts/check-pin-lockstep.sh agree on ONE canonical layout"
+        );
+        values[0]
+            .as_str()
+            .unwrap_or_else(|| panic!("{key} holds a non-string"))
+            .to_string()
+    };
+    // managerFilePatterns wraps a regex in slashes, JavaScript-style.
+    let file_pattern = only("managerFilePatterns");
+    let file_pattern = file_pattern
+        .strip_prefix('/')
+        .and_then(|p| p.strip_suffix('/'))
+        .expect("the pnpm managerFilePatterns entry is a /regex/");
+    (
+        Regex::new(file_pattern).expect("the pnpm managerFilePatterns regex compiles"),
+        Regex::new(&only("matchStrings")).expect("the pnpm matchString compiles"),
+    )
+}
+
+/// What renovate.json's pnpm customManager extracts under `root`, as
+/// `<file>:<line> <version>` — the same shape `--pnpm-sites` prints, with the
+/// line being the one the captured `currentValue` sits on.
+fn renovate_pnpm_sites(root: &Path) -> Vec<String> {
+    let (files, matcher) = renovate_pnpm_manager();
+    let dir = root.join(".github/workflows");
+    let mut rels: Vec<String> = fs::read_dir(&dir)
+        .expect("list .github/workflows")
+        .map(|e| e.expect("read a .github/workflows entry"))
+        .filter(|e| e.path().is_file())
+        .map(|e| format!(".github/workflows/{}", e.file_name().to_string_lossy()))
+        .filter(|rel| files.is_match(rel))
+        .collect();
+    rels.sort();
+    let mut sites = Vec::new();
+    for rel in rels {
+        let text = fs::read_to_string(root.join(&rel)).expect("read a workflow");
+        for caps in matcher.captures_iter(&text) {
+            let value = caps
+                .name("currentValue")
+                .expect("the pnpm matchString captures currentValue");
+            let line = text[..value.start()].matches('\n').count() + 1;
+            sites.push(format!("{rel}:{line} {}", value.as_str()));
+        }
+    }
+    sites.sort();
+    sites
+}
+
+/// What `scripts/check-pin-lockstep.sh --pnpm-sites` reports under `root`:
+/// the sites it reads, sorted, and its `!ERR` lines for the ones it rejects.
+fn guard_pnpm_sites(root: &Path) -> (Vec<String>, Vec<String>) {
+    let out = Command::new("bash")
+        .arg(script())
+        .arg("--pnpm-sites")
+        .arg(root)
+        .output()
+        .expect("run scripts/check-pin-lockstep.sh --pnpm-sites");
+    assert!(
+        out.status.success(),
+        "--pnpm-sites failed:\n{}",
+        combined(&out)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (errors, mut sites): (Vec<String>, Vec<String>) = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .partition(|l| l.starts_with("!ERR "));
+    sites.sort();
+    (sites, errors)
+}
+
+/// Issue #1319, and the other half of THE guard above. The workflows' pnpm pin
+/// is read by Renovate through a regex customManager, which matches one layout,
+/// while the guard finds a pnpm step by walking the YAML. If the two ever
+/// disagree about which sites exist, a pin can be one the guard compares and
+/// Renovate never bumps — so the next grouped pnpm PR carries only devbox.json's
+/// half and fails the lockstep check. This runs the matchString straight out of
+/// renovate.json over the real workflows and requires exactly the sites, lines
+/// and versions the guard reads, with nothing rejected.
+#[test]
+fn renovate_reads_exactly_the_pnpm_sites_the_guard_finds() {
+    if !bash_present() {
+        eprintln!("SKIP: the pin-lockstep guard needs `bash` on PATH");
+        return;
+    }
+    let root = repo_root();
+    let (guard, errors) = guard_pnpm_sites(&root);
+    assert!(
+        errors.is_empty(),
+        "scripts/check-pin-lockstep.sh rejects a pnpm site in .github/workflows/:\n{}",
+        errors.join("\n")
+    );
+    assert!(
+        !guard.is_empty(),
+        "the guard found no pnpm/action-setup site at all, so this comparison \
+         would pass vacuously"
+    );
+    assert_eq!(
+        renovate_pnpm_sites(&root),
+        guard,
+        "renovate.json's pnpm customManager and scripts/check-pin-lockstep.sh \
+         disagree about which pnpm pins exist in .github/workflows/ (left: what \
+         Renovate extracts, right: what the guard reads). A site only the guard \
+         reads is one Renovate never bumps (issue #1319)."
     );
 }
 
@@ -280,6 +470,7 @@ fn inconsistent_devbox_rust_components_fail() {
             "cargo@1.98.0",
             "clippy@1.98.0",
             "rustfmt@1.97.1",
+            "pnpm@11.22.0",
         ],
         &good_workflows(),
     )
@@ -715,6 +906,7 @@ fn object_packages(nextest: &str, rustc: &str, clippy: &str) -> String {
          \"cargo\": \"1.97.1\",\n    \
          \"clippy\": \"{clippy}\",\n    \
          \"rustfmt\": \"1.97.1\",\n    \
+         \"pnpm\": \"11.22.0\",\n    \
          \"path:tauri-deps#tauri-deps\": \"\"\n  \
          }}"
     )
@@ -863,5 +1055,470 @@ fn a_script_named_after_a_package_is_not_a_pin() {
         "a devbox SCRIPT named after a package must not be read as that package's \
          pin — the pins here agree and nothing should be reported:\n{}",
         combined(&out)
+    );
+}
+
+/// Issue #1262, in the exact shape that shipped: a bare major. `pnpm/action-setup`
+/// accepts `version: 12` and installs whatever 12.x is newest at run time, so
+/// 12.6.0 reached `desktop-browser` with no commit here and hung it. The
+/// fixture's devbox side is deliberately the SAME major, so this fails on
+/// exactness and not merely because 12 differs from 11.22.0.
+#[test]
+fn a_major_only_pnpm_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let mut packages = good_packages();
+    packages.retain(|p| !p.starts_with("pnpm@"));
+    packages.push("pnpm@12.5.1");
+    let out = Fixture::new(
+        &packages,
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("version: 12")),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "`version: 12` floats across every 12.x release and must fail:\n{text}"
+    );
+    assert!(
+        text.contains("not an exact X.Y.Z") && text.contains("desktop.yml"),
+        "the failure must say the pin is not exact and point at the file:\n{text}"
+    );
+}
+
+#[test]
+fn drifted_pnpm_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("version: 11.21.0")),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "11.22.0 vs 11.21.0 must fail:\n{text}"
+    );
+    assert!(
+        text.contains("pnpm") && text.contains("11.21.0") && text.contains("11.22.0"),
+        "the failure must name the class and BOTH versions:\n{text}"
+    );
+}
+
+/// The half-applied bump: `desktop-web`, `desktop-browser` and the release's
+/// desktop bundle each carry their own `pnpm/action-setup` step, so "all but
+/// one moved" is the realistic way this pin goes wrong.
+#[test]
+fn one_drifted_pnpm_site_among_several_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("version: 11.22.0")),
+            ("release.yml", pnpm_workflow("version: 11.27.1")),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "one pnpm site left behind must fail:\n{text}"
+    );
+    assert!(
+        text.contains("internally inconsistent") && text.contains("release.yml"),
+        "the failure must say the workflows disagree and point at the odd one:\n{text}"
+    );
+}
+
+#[test]
+fn a_pnpm_step_with_no_version_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("run_install: false")),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a pnpm/action-setup step with no version pins nothing and must fail:\n{text}"
+    );
+    assert!(
+        text.contains("no version: input"),
+        "the failure must say the version input is missing:\n{text}"
+    );
+}
+
+/// The toolchain and nextest pins' rule, now applied to pnpm too (issue #1319).
+/// Until then the pin was read by Renovate's github-actions known-actions
+/// registry, which YAML-parses the step, so a quoted version was tracked and
+/// this test asserted it passed. That lane is disabled for pnpm, and the regex
+/// customManager that replaced it wants a BARE X.Y.Z — so a quoted pin, even one
+/// that agrees, is a pin Renovate cannot bump and must fail as unreadable. A
+/// quoted pin that also drifted must still be reported, not skipped.
+#[test]
+fn a_quoted_pnpm_pin_fails_as_unreadable_by_renovate() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let agreeing = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("version: \"11.22.0\"")),
+            ("release.yml", pnpm_workflow("version: '11.22.0'")),
+        ],
+    );
+    let out = agreeing.run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a quoted pnpm pin is one renovate.json cannot read, even when it agrees:\n{text}"
+    );
+    for file in ["desktop.yml:6", "release.yml:6"] {
+        assert!(
+            text.contains(&format!(
+                "{file} has a pnpm/action-setup version renovate.json cannot read"
+            )),
+            "{file}'s quoted pin must be reported as unreadable by renovate.json:\n{text}"
+        );
+    }
+    assert!(
+        !text.contains("not an exact"),
+        "the version is exact; only its spelling is wrong:\n{text}"
+    );
+    assert!(
+        renovate_pnpm_sites(agreeing.dir.path()).is_empty(),
+        "the premise: renovate.json's regex must not read a quoted pin"
+    );
+
+    let drifted = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("version: \"11.21.0\"")),
+        ],
+    )
+    .run();
+    let text = combined(&drifted);
+    assert!(
+        !drifted.status.success()
+            && text.contains(
+                "desktop.yml:6 has a pnpm/action-setup version renovate.json cannot read"
+            ),
+        "a quoted pin that drifted must still be reported:\n{text}"
+    );
+}
+
+/// Greptile's third form on #1320: another input written before `version:` in
+/// the same block `with:`, and — the same defect on the line above — a comment
+/// on the `with:` line. Both are valid YAML the old known-actions lane read, and
+/// both put a line the regex cannot cross between `uses:` and `version:`.
+#[test]
+fn a_pnpm_pin_off_the_canonical_lines_fails_as_unreadable_by_renovate() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let commented = "jobs:\n  desktop-web:\n    steps:\n      \
+                     - uses: pnpm/action-setup@v6\n        \
+                     with: # the desktop toolchain\n          \
+                     version: 11.22.0\n";
+    let fixture = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            (
+                "desktop.yml",
+                pnpm_workflow("run_install: false\n          version: 11.22.0"),
+            ),
+            ("release.yml", commented.to_string()),
+        ],
+    );
+    let out = fixture.run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a pin off the canonical lines is one renovate.json cannot read:\n{text}"
+    );
+    for file in ["desktop.yml:7", "release.yml:6"] {
+        assert!(
+            text.contains(&format!(
+                "{file} has a pnpm/action-setup version renovate.json cannot read"
+            )),
+            "{file} must be reported as unreadable by renovate.json:\n{text}"
+        );
+    }
+    assert!(
+        renovate_pnpm_sites(fixture.dir.path()).is_empty(),
+        "the premise: renovate.json's regex must read neither site"
+    );
+}
+
+/// What makes a `version:` a pnpm pin is the step it sits in, so the scanner
+/// walks the step rather than grepping for the key. Here the inputs are written
+/// BEFORE `uses:`, in flow style — valid YAML, and a layout renovate.json's
+/// regex cannot read (issue #1319), so the site must be FOUND and rejected,
+/// even though its value agrees: a walk that missed it would report nothing
+/// and the step would silently stop being bumped. The `version:` on the NEXT
+/// step belongs to another action and must not be read; it has drifted, so
+/// reading it would show up as a drift on line 7.
+#[test]
+fn a_pnpm_pin_is_found_by_its_step_not_by_its_key() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let body = "jobs:\n  desktop-web:\n    steps:\n      \
+                - with: { version: 11.22.0, run_install: false }\n        \
+                uses: pnpm/action-setup@v6\n      \
+                - uses: some/other-action@v1\n        \
+                with:\n          \
+                version: 11.21.0\n";
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", body.to_string()),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "the flow-style pin ahead of `uses:` must be found and rejected:\n{text}"
+    );
+    assert!(
+        text.contains("desktop.yml:4 has a pnpm/action-setup version renovate.json cannot read")
+            && !text.contains("desktop.yml:7"),
+        "exactly the pnpm step's version must be read, and the other action's \
+         `version:` must not be:\n{text}"
+    );
+}
+
+#[test]
+fn devbox_without_pnpm_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let packages: Vec<&str> = good_packages()
+        .into_iter()
+        .filter(|p| !p.starts_with("pnpm@"))
+        .collect();
+    let out = Fixture::new(&packages, &good_workflows()).run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a workflow pnpm pin with nothing on the devbox side must fail:\n{text}"
+    );
+    assert!(
+        text.contains("pins no pnpm"),
+        "the failure must name the missing package:\n{text}"
+    );
+}
+
+/// Raised by Qodo on #1284. Renovate YAML-parses `uses:` as it does `version:`,
+/// so a quoted `uses: "pnpm/action-setup@…"` is the same tracked step. The
+/// scanner used to match only the bare spelling, so a quoted site that drifted
+/// was silently dropped and the class compared the survivors.
+#[test]
+fn a_quoted_pnpm_action_reference_is_still_a_site() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let body = "jobs:\n  desktop-web:\n    steps:\n      \
+                - uses: \"pnpm/action-setup@v6\"\n        \
+                with:\n          \
+                version: 11.21.0\n";
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("version: 11.22.0")),
+            ("release.yml", body.to_string()),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success() && text.contains("release.yml:6 11.21.0"),
+        "the drifted pin behind a quoted `uses:` must be read and reported:\n{text}"
+    );
+}
+
+/// Raised by Qodo on #1284. A trailing comment that mentions `version:` is not
+/// an input, and reading it as one failed the guard on a file whose pin is
+/// fine — the false positive that makes a guard the problem.
+#[test]
+fn a_version_in_a_trailing_comment_is_not_a_pnpm_pin() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            (
+                "desktop.yml",
+                pnpm_workflow(
+                    "version: 11.22.0 # exact\n          run_install: false # was version: 12",
+                ),
+            ),
+        ],
+    )
+    .run();
+    assert!(
+        out.status.success(),
+        "a `version:` inside a trailing comment must not be read as a pin:\n{}",
+        combined(&out)
+    );
+}
+
+/// Raised by Greptile on #1284. Only the step's `with:` mapping carries the
+/// action's input, so a `version:` elsewhere in the step — here an `env:` —
+/// must not be read as the pin. It used to be, which let a step with NO pnpm
+/// version pass the missing-pin check on an unrelated key's agreeing value.
+#[test]
+fn a_version_outside_the_with_mapping_is_not_a_pnpm_pin() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let body = "jobs:\n  desktop-web:\n    steps:\n      \
+                - uses: pnpm/action-setup@v6\n        \
+                env: { version: 11.22.0 }\n        \
+                with:\n          \
+                run_install: false\n";
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", body.to_string()),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success() && text.contains("no version: input"),
+        "an `env:` version is not the action's input, so this step is unpinned:\n{text}"
+    );
+}
+
+/// Raised by Qodo on #1284. A flow mapping may span lines — `with: {` on one,
+/// the keys on the next. The scanner read a flow mapping only on the `with:`
+/// line itself, so this spelling reported a correctly pinned step as having no
+/// version. The quoted `${{ … }}` before the pin is the follow-up Qodo raised: a
+/// brace inside a quoted value must not read as the mapping closing. Since issue
+/// #1319 the pin is found and then REJECTED, because renovate.json's regex
+/// cannot read a flow mapping — so it must be reported on its own line, as
+/// unreadable, and never as a step with no version.
+#[test]
+fn a_multiline_flow_with_mapping_is_found_and_rejected() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let body = "jobs:\n  desktop-web:\n    steps:\n      \
+                - uses: pnpm/action-setup@v6\n        \
+                with: {\n          \
+                package_json_file: \"${{ matrix.file }}\",\n          \
+                version: 11.22.0,\n          \
+                run_install: false }\n      \
+                - uses: actions/setup-node@v7\n        \
+                with:\n          \
+                node-version: 24\n";
+    let fixture = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", body.to_string()),
+        ],
+    );
+    let out = fixture.run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success()
+            && text.contains(
+                "desktop.yml:7 has a pnpm/action-setup version renovate.json cannot read"
+            ),
+        "the version inside a multi-line flow mapping must be found and rejected:\n{text}"
+    );
+    assert!(
+        !text.contains("no version: input"),
+        "a multi-line flow mapping carries the input, so the step is pinned:\n{text}"
+    );
+    assert!(
+        renovate_pnpm_sites(fixture.dir.path()).is_empty(),
+        "the premise: renovate.json's regex must not read a flow mapping"
+    );
+}
+
+/// Raised by Qodo on #1284. A double-quoted scalar may span lines, so the
+/// quote state has to survive the line break: here the `}` on the scalar's
+/// second line is inside the quotes and must not close the mapping, which
+/// would hide the `version:` after it and report the step as unpinned. The
+/// next step's drifted `version:` belongs to another action and must not be
+/// read.
+#[test]
+fn a_quoted_scalar_spanning_lines_does_not_close_the_flow_mapping() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let body = "jobs:\n  desktop-web:\n    steps:\n      \
+                - uses: pnpm/action-setup@v6\n        \
+                with: {\n          \
+                package_json_file: \"first half\n            \
+                second } half\",\n          \
+                version: 11.22.0 }\n      \
+                - uses: some/other-action@v1\n        \
+                with:\n          \
+                version: 11.21.0\n";
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", body.to_string()),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success()
+            && text.contains(
+                "desktop.yml:8 has a pnpm/action-setup version renovate.json cannot read"
+            )
+            && !text.contains("no version: input"),
+        "the pin after a multi-line quoted scalar must be found (and, being in a \
+         flow mapping, rejected as unreadable by renovate.json):\n{text}"
+    );
+    assert!(
+        !text.contains("desktop.yml:11"),
+        "the next action's `version:` must never be read as this step's pin:\n{text}"
     );
 }

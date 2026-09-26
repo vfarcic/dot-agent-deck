@@ -31,11 +31,11 @@ use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::prompt_delivery::{
     AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, ConfirmedSubmission,
-    attempt_delivery_id, attempt_writes_payload, classify_prompt_submission, log_prompt_abandoned,
-    log_prompt_accumulated, log_prompt_confirmed, log_prompt_probe_submitted, log_prompt_stopped,
-    log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written, mint_delivery_id,
-    pane_confirmation_capability, prompt_submission_accumulated, submission_is_after_watermark,
-    unconfirmed_retry_delay,
+    attempt_delivery_id, attempt_writes_payload, classify_prompt_submission,
+    confirmation_latency_floor, log_prompt_abandoned, log_prompt_accumulated, log_prompt_confirmed,
+    log_prompt_probe_submitted, log_prompt_stopped, log_prompt_unconfirmable,
+    log_prompt_unconfirmed, log_prompt_written, mint_delivery_id, pane_confirmation_capability,
+    prompt_submission_accumulated, submission_is_after_watermark, unconfirmed_retry_delay,
 };
 use crate::repo_identity;
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
@@ -1659,13 +1659,27 @@ const SNAPSHOT_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// to make the failure mode disappear.
 pub const SPAWN_TIME_READINESS_BUFFER: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long a spawn-time delivery waits for the agent to announce a
+/// conversation before the `timeout_ready` fallback treats the pane as ready
+/// anyway (opencode's cold boot, Pi's `NoSignal`, a launcher that never
+/// announces). Measured from the delivery's own anchor — the seed's
+/// `created_at`, the orchestration tab's `orchestration_prompt_anchor_at`.
+///
+/// Issue #529: crossing it is a readiness FACT like `SessionStart`, not a
+/// licence to write — the fallback still owes [`SPAWN_TIME_READINESS_BUFFER`]
+/// after it, so its first write lands no earlier than `anchor + TIMEOUT +
+/// BUFFER`. See [`spawn_time_fallback_ready_at`].
+pub(crate) const SPAWN_TIME_READINESS_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
 /// PRD #128 Direction B-1 — returns whether the spawn-time orchestrator
 /// role prompt should fire NOW. Returns `false` if `ready_since` is set
 /// but `SPAWN_TIME_READINESS_BUFFER` hasn't elapsed yet; `true` once it
-/// has. `ready_since == None` means the readiness gate isn't engaged yet
-/// (caller drives that — e.g. the timeout-ready fallback path that
-/// ignores SessionStart and fires after 10 s); the helper returns `true`
-/// in that case so the caller's own gating wins.
+/// has. `ready_since == None` means the readiness gate isn't engaged yet;
+/// the helper returns `true` in that case so the caller's own gating wins.
+/// Both callers' 10 s fallback passes `Some` since issue #529 (see
+/// [`spawn_time_fallback_ready_at`]), so it pays the buffer exactly as a
+/// `SessionStart` stamp does.
 ///
 /// Extracted so the policy is unit-testable AND so the integration test
 /// at `tests/spawn_time_role_prompt_submit_after_session_start.rs` can
@@ -1679,6 +1693,24 @@ pub fn should_inject_spawn_time_prompt(
         Some(t) => now.saturating_duration_since(t) >= SPAWN_TIME_READINESS_BUFFER,
         None => true,
     }
+}
+
+/// Issue #529 — the instant the `timeout_ready` fallback treats as the pane's
+/// readiness signal: the delivery's anchor plus [`SPAWN_TIME_READINESS_TIMEOUT`].
+///
+/// Handed to [`should_inject_spawn_time_prompt`] in place of a `SessionStart`
+/// stamp, so the fallback in [`process_pending_seed_prompts`] and
+/// [`deliver_orchestrator_prompt`] writes through the same buffer as their fast
+/// path. It used to skip the buffer outright, and it is the branch that most
+/// needs it: a pane that has not announced anything in 10 s
+/// has given no evidence its input handling is up, which is the same reasoning
+/// the daemon's delegate path documents at its readiness gate in `state.rs`
+/// ("a timeout means readiness was never *confirmed*, which is more reason to
+/// wait, not less"). Derived from the anchor rather than stamped on the first
+/// frame that sees the timeout, so it holds no extra state and does not depend
+/// on how often the render loop happens to run.
+fn spawn_time_fallback_ready_at(anchor: std::time::Instant) -> std::time::Instant {
+    anchor + SPAWN_TIME_READINESS_TIMEOUT
 }
 
 /// Issue #1005 — does this pane hold an agent that can actually READ what a
@@ -2187,6 +2219,13 @@ struct UiState {
     command_entry_locked: bool,
     /// Warnings collected during session save/restore, flushed after terminal restore.
     session_warnings: Vec<String>,
+    /// Issue #554: orchestration tabs rebuilt from a daemon whose role metadata
+    /// no longer matches the project config (see
+    /// [`orchestration_config_drift_warning`]). Their tab-strip label carries
+    /// [`CONFIG_DRIFT_TAB_MARKER`] for as long as the tab lives. Keyed by
+    /// [`TabId`], which `TabManager` allocates monotonically and never reuses,
+    /// so an entry left behind by a closed tab can never mark a later one.
+    config_drift_tabs: HashSet<TabId>,
     /// PRD #89 review-fix G1: tracks whether the most recent periodic snapshot
     /// write (in `flush_session_snapshot_if_due`) failed. F10 keeps the
     /// coalescer dirty on failure so the next loop retries; on a *persistent*
@@ -2571,6 +2610,7 @@ impl UiState {
             pane_layout: PaneLayout::Stacked,
             command_entry_locked: true,
             session_warnings: Vec::new(),
+            config_drift_tabs: HashSet::new(),
             session_snapshot_write_failed: false,
             selection: None,
             focused_pane_rect: None,
@@ -3122,9 +3162,9 @@ pub struct OrchestrationRoleSlot {
 ///   same role names, same start role) but enrichment fields are
 ///   defaulted.
 ///
-/// The hydration call site decides which `tracing::info!` line to
-/// emit *before* calling this helper so the "config absent" vs
-/// "config drift" distinction (auditor nit) stays observable.
+/// The "config absent" vs "config drift" distinction is not made here:
+/// callers ask [`orchestration_config_drift_warning`] first, which stays
+/// quiet for an absent file and surfaces drift to the user (issue #554).
 pub fn resolve_orch_config_for_hydration(
     local: Option<crate::project_config::OrchestrationConfig>,
     bucket: &OrchestrationHydrationBucket,
@@ -3145,6 +3185,275 @@ pub fn resolve_orch_config_for_hydration(
         &bucket.orchestration_name,
         &synthesis_slots,
     )
+}
+
+/// Issue #554: the suffix an orchestration tab's strip label carries when
+/// [`orchestration_config_drift_warning`] fired for it. Short on purpose — the
+/// strip truncates — and the full explanation is on the status line and in the
+/// exit warnings.
+pub const CONFIG_DRIFT_TAB_MARKER: &str = "[config drift]";
+
+/// Issue #554: the one-column PREFIX a drifted tab's strip label also carries.
+/// The strip truncates labels from the tail (`fit_tab_labels` keeps the head
+/// and appends `…`), so the spelled-out suffix is the first thing a crowded
+/// strip drops — while the status line has expired and the exit warning is not
+/// printed yet (Greptile on PR #1281). The prefix survives any truncation that
+/// leaves the label a visible character. ASCII, so its width cannot vary by
+/// terminal.
+pub const CONFIG_DRIFT_TAB_PREFIX: &str = "!";
+
+/// Issue #554: the strip label of an orchestration tab — its title, a status
+/// suffix, and, when the tab was rebuilt from daemon role metadata that no
+/// longer matches the project config, [`CONFIG_DRIFT_TAB_PREFIX`] in front and
+/// [`CONFIG_DRIFT_TAB_MARKER`] behind. Extracted from the render loop so the
+/// label is testable without a terminal.
+pub fn orchestration_tab_label(name: &str, status: &OrchestrationStatus, drifted: bool) -> String {
+    let label = match status {
+        OrchestrationStatus::Completed => format!("{name} [done]"),
+        OrchestrationStatus::Delegated => format!("{name} [active]"),
+        OrchestrationStatus::WaitingForOrchestrator => name.to_string(),
+    };
+    if drifted {
+        format!("{CONFIG_DRIFT_TAB_PREFIX} {label} {CONFIG_DRIFT_TAB_MARKER}")
+    } else {
+        label
+    }
+}
+
+/// Issue #554: put a drift warning from [`orchestration_config_drift_warning`]
+/// in front of the user, for the orchestration tab it was computed for.
+///
+/// Three surfaces, because each covers a gap in the others: the tab keeps
+/// [`CONFIG_DRIFT_TAB_MARKER`] on its strip label for as long as it lives (the
+/// status line expires after [`STATUS_MESSAGE_TTL`]); the status line says what
+/// the marker means at the moment the tab appears; and the full message — which
+/// names the roles on both sides and is too long for one status row — joins
+/// `session_warnings`, printed to stderr when the deck exits, which is where the
+/// snapshot-restore path reports the same drift class.
+///
+/// `tab` is the tab the rebuild just opened; anything but an orchestration tab
+/// (including `None`) records the warning without a marker rather than marking
+/// the wrong tab.
+fn surface_orchestration_config_drift(ui: &mut UiState, tab: Option<&Tab>, warning: String) {
+    let file = crate::project_config::CONFIG_FILE_NAME;
+    let marked_this_tab = match tab {
+        Some(Tab::Orchestration { id, .. }) => {
+            ui.config_drift_tabs.insert(*id);
+            true
+        }
+        _ => false,
+    };
+    let summary = if marked_this_tab {
+        format!(
+            "Config drift: an orchestration tab marked {CONFIG_DRIFT_TAB_PREFIX} … {CONFIG_DRIFT_TAB_MARKER} no longer matches \
+             {file} — details are printed on exit"
+        )
+    } else {
+        format!(
+            "Config drift: an orchestration no longer matches {file} — details are printed on exit"
+        )
+    };
+    ui.status_message = Some((summary, std::time::Instant::now()));
+    ui.session_warnings.push(warning);
+}
+
+/// Issue #554: what the TUI found when it looked for the project config of an
+/// orchestration it is about to rebuild — the input to
+/// [`orchestration_config_drift_warning`]. Three states rather than an
+/// `Option`, because "no file" and "a file that failed to load" both fall back
+/// to the daemon's roles but only the first is expected (Qodo on PR #1281).
+#[derive(Debug, Clone, Copy)]
+pub enum LocalOrchestrationConfig<'a> {
+    /// No `.dot-agent-deck.toml` in the orchestration's cwd.
+    Absent,
+    /// The file exists but reading or parsing it failed; carries the error.
+    Unreadable(&'a str),
+    /// The file loaded; carries the orchestration of this name, if it lists one.
+    Loaded(Option<&'a crate::project_config::OrchestrationConfig>),
+}
+
+/// Issue #554: decide whether rebuilding an orchestration tab from `bucket` is
+/// config drift the user has to be told about, and if so, what to tell them.
+///
+/// The daemon routes `dot-agent-deck delegate` by the role name recorded for
+/// each pane when it was started (its `pane_role_map`), and does not re-derive
+/// that name from `.dot-agent-deck.toml` while the pane runs. So once the file
+/// stops matching those names, the tab either shows roles the file no longer
+/// has, or shows the file's names over panes the daemon knows by others — and a
+/// delegate to a renamed role reaches no pane. Both used to be one `info!` line.
+///
+/// - [`LocalOrchestrationConfig::Absent`] → `None`. There is no file for
+///   `bucket.cwd`, which is the legitimate remote-reconnect case (PRD #111: a
+///   laptop TUI on a VM daemon whose cwd is not local). The synthesised config
+///   is the right answer there and warning on every remote reconnect would be
+///   noise.
+/// - [`LocalOrchestrationConfig::Unreadable`] → a warning naming the file and
+///   the load error. The file exists but could not be read or parsed, so the
+///   tab falls back to the daemon's roles exactly as if it were absent — the
+///   one thing that must not happen quietly, because the user's edit is what
+///   broke it (Qodo on PR #1281).
+/// - the file is present but lists no orchestration named
+///   `bucket.orchestration_name` → a warning naming it, its cwd and the roles
+///   the daemon is running.
+/// - the file lists it, but a live slot's daemon-recorded role name differs
+///   from the file's role at that index (a renamed, removed or re-ordered role)
+///   → a warning naming both lists. A slot whose `role_name` is empty (a daemon
+///   older than PRD #111 echoes none) is not evidence either way and is
+///   skipped.
+///
+/// Pure: the caller decides where the message goes. It does not change which
+/// config the tab is built from — [`resolve_orch_config_for_hydration`] still
+/// prefers the local config — because re-slotting live panes against a changed
+/// role list is a separate decision (issue #554).
+pub fn orchestration_config_drift_warning(
+    local: LocalOrchestrationConfig<'_>,
+    bucket: &OrchestrationHydrationBucket,
+) -> Option<String> {
+    if matches!(local, LocalOrchestrationConfig::Absent) {
+        return None;
+    }
+    // The live slots in role order, first-wins on a duplicate index — the same
+    // rule the hydration loop and `synthesize_from_bucket_metadata` apply, so
+    // the names reported are the ones the tab was actually built from.
+    let mut slots: Vec<&OrchestrationRoleSlot> = Vec::new();
+    for slot in &bucket.role_slots {
+        if !slots.iter().any(|s| s.role_index == slot.role_index) {
+            slots.push(slot);
+        }
+    }
+    slots.sort_by_key(|s| s.role_index);
+    let running: Vec<String> = slots
+        .iter()
+        .map(|s| {
+            if s.role_name.is_empty() {
+                // Not `role-{i}`, the synthesised card label: this list is
+                // presented as the names the daemon routes by, and a daemon
+                // that echoed none has no name to route by (Qodo on #1281).
+                format!("<unnamed role at slot {}>", s.role_index)
+            } else {
+                s.role_name.clone()
+            }
+        })
+        .collect();
+    let name = &bucket.orchestration_name;
+    let cwd = &bucket.cwd;
+    let consequence = "`dot-agent-deck delegate` still routes to these panes by the role names \
+                       they were started with; restart the orchestration to pick up the file's \
+                       roles.";
+    let local = match local {
+        LocalOrchestrationConfig::Absent => return None,
+        LocalOrchestrationConfig::Unreadable(error) => {
+            return Some(format!(
+                "Warning: config drift — {cwd}/{file} could not be loaded ({error}), so orchestration \
+                 '{name}' was rebuilt from the roles the daemon started it with ({roles}), not \
+                 from the project config. {consequence}",
+                file = crate::project_config::CONFIG_FILE_NAME,
+                roles = running.join(", "),
+            ));
+        }
+        LocalOrchestrationConfig::Loaded(local) => local,
+    };
+    let Some(local) = local else {
+        return Some(format!(
+            "Warning: config drift — orchestration '{name}' is not listed in {cwd}/{file}, so its \
+             tab shows the roles the daemon started it with ({roles}), not the project config. \
+             {consequence}",
+            file = crate::project_config::CONFIG_FILE_NAME,
+            roles = running.join(", "),
+        ));
+    };
+    let diverged = slots.iter().any(|s| {
+        !s.role_name.is_empty()
+            && local.roles.get(s.role_index).map(|r| r.name.as_str()) != Some(s.role_name.as_str())
+    });
+    if !diverged {
+        return None;
+    }
+    let configured: Vec<&str> = local.roles.iter().map(|r| r.name.as_str()).collect();
+    // A live slot past the file's last role is not relabelled — every rebuild
+    // path drops it from the tab (Greptile on PR #1281) — so say so rather than
+    // imply it is on screen under another name.
+    let left_out: Vec<&str> = slots
+        .iter()
+        .zip(&running)
+        .filter(|(s, _)| s.role_index >= local.roles.len())
+        .map(|(_, name)| name.as_str())
+        .collect();
+    let placement = if left_out.is_empty() {
+        "its tab labels them from the file".to_string()
+    } else {
+        format!(
+            "its tab labels the ones the file still has a slot for from the file, and leaves \
+             out {}",
+            left_out.join(", ")
+        )
+    };
+    Some(format!(
+        "Warning: config drift — orchestration '{name}' in {cwd} was started with roles \
+         ({running}) that no longer match {file} ({configured}); {placement}. {consequence}",
+        file = crate::project_config::CONFIG_FILE_NAME,
+        running = running.join(", "),
+        configured = configured.join(", "),
+    ))
+}
+
+/// Issue #554: the names of an orchestration tab's roles that are backed by a
+/// live daemon pane, in tab order — every role whose slot is not a synthetic
+/// dead-slot placeholder ([`is_dead_slot_pane_id`]). `role_pane_ids` is aligned
+/// with `config.roles`; a role with no entry at all is treated as dead.
+fn live_tab_role_names<'a>(
+    config: &'a crate::project_config::OrchestrationConfig,
+    role_pane_ids: &[String],
+) -> Vec<&'a str> {
+    config
+        .roles
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            role_pane_ids
+                .get(*i)
+                .is_some_and(|p| !is_dead_slot_pane_id(p))
+        })
+        .map(|(_, r)| r.name.as_str())
+        .collect()
+}
+
+/// Issue #554 (Qodo on PR #1281): the drift check for a role surfaced into an
+/// orchestration tab that is ALREADY open. A live surface carries only the
+/// newly spawned role, so [`orchestration_config_drift_warning`] run on it sees
+/// one matching role and cannot notice that a role already on the tab was since
+/// renamed or removed in the file. This compares the tab's own role names — the
+/// ones it was built with — against the file's, and reports any the file no
+/// longer lists.
+///
+/// A name check rather than an index check on purpose: inserting a role
+/// mid-list and spawning it into the running orchestration is a supported
+/// workflow (issue #1096) that shifts every later index while leaving every
+/// existing name routable, and it must not read as drift.
+pub fn grown_orchestration_tab_drift_warning(
+    tab_role_names: &[&str],
+    local: &crate::project_config::OrchestrationConfig,
+    name: &str,
+    cwd: &str,
+) -> Option<String> {
+    let configured: Vec<&str> = local.roles.iter().map(|r| r.name.as_str()).collect();
+    let missing: Vec<&str> = tab_role_names
+        .iter()
+        .copied()
+        .filter(|role| !configured.contains(role))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Warning: config drift — the open tab of orchestration '{name}' in {cwd} shows roles \
+         ({missing}) that {file} no longer lists ({configured}). `dot-agent-deck delegate` still \
+         routes to those panes by the role names they were started with; restart the \
+         orchestration to pick up the file's roles.",
+        file = crate::project_config::CONFIG_FILE_NAME,
+        missing = missing.join(", "),
+        configured = configured.join(", "),
+    ))
 }
 
 /// Diagnostic info for a hydrated pane the partition couldn't bucket
@@ -3625,15 +3934,15 @@ fn process_pending_seed_prompts(
         // Issue #424 (reviewer finding B3): this still decides WHEN to write,
         // exactly as before, but no longer decides whether the write is
         // confirmable. That question is answered by the producer, below.
-        let timeout_ready =
-            !agent_ready && sp.created_at.elapsed() > std::time::Duration::from_secs(10);
+        let timeout_ready = !agent_ready && sp.created_at.elapsed() > SPAWN_TIME_READINESS_TIMEOUT;
         if agent_ready {
             sp.ready_since.get_or_insert(now);
         }
         // Hold the write until the readiness buffer elapses (mirrors the
-        // orchestrator path). The timeout path bypasses the buffer.
+        // orchestrator path). Issue #529: the timeout path owes the buffer too,
+        // counted from the instant it declared the pane ready.
         let buffer_elapsed = if timeout_ready {
-            true
+            should_inject_spawn_time_prompt(Some(spawn_time_fallback_ready_at(sp.created_at)), now)
         } else {
             should_inject_spawn_time_prompt(sp.ready_since, now)
         };
@@ -3797,7 +4106,14 @@ fn process_pending_seed_prompts(
                         }
                         ConfirmationCapability::Reports => {
                             log_prompt_unconfirmed("seed", &sp.pane_id, &delivery_id, attempt);
-                            schedule_unconfirmed_retry(&mut backoff, &sp.pane_id, now, attempt);
+                            schedule_unconfirmed_retry(
+                                &mut backoff,
+                                snapshot,
+                                &sp.pane_id,
+                                expected_agent_id.as_deref(),
+                                now,
+                                attempt,
+                            );
                             return true;
                         }
                     }
@@ -4468,16 +4784,50 @@ fn pane_event_watermark(snapshot: &AppState, pane_id: &str) -> Option<DateTime<U
 /// [`unconfirmed_retry_delay`]. Distinct from [`schedule_send_retry`], which
 /// backs off a target that REFUSED delivery; see that helper's docs for why the
 /// two schedules differ.
+///
+/// Issue #637: the window is floored at the confirmation latency of the
+/// producers this pane's sessions declare ([`confirmation_latency_floor`]), so a
+/// retry does not fire inside the time a genuine confirmation from the slowest
+/// of them can plausibly take.
+///
+/// Two details decide whether that holds, both from PR #1314's review:
+///
+/// * **Only the delivery's own agent's sessions are consulted** when its
+///   identity is known. A pane that changed hands can still carry the previous
+///   occupant's session until the new one sends an event, and a departed Claude
+///   session must not lend its 2 s floor to a Codex successor. With no session
+///   of that agent on the pane there is no producer to go on, and
+///   [`confirmation_latency_floor`] answers with the slow floor.
+/// * **The window starts when the write RETURNED**, not at `now`. Callers pass
+///   the pass's clock, which was sampled before the write, and a guarded send
+///   is a synchronous round trip to the daemon: a slow one would otherwise eat
+///   into the window and let the retry land inside the confirmation it exists
+///   to wait out. `max` keeps a caller's `now` when it is later than the wall
+///   clock, which is how the clock-driven tests supply it.
 fn schedule_unconfirmed_retry(
     backoff: &mut HashMap<String, SendRetryState>,
+    snapshot: &AppState,
     pane_id: &str,
+    expected_agent_id: Option<&str>,
     now: std::time::Instant,
     attempts: u32,
 ) {
+    let floor = confirmation_latency_floor(
+        snapshot
+            .sessions
+            .values()
+            .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+            .filter(|session| {
+                expected_agent_id
+                    .is_none_or(|expected| session.agent_id.as_deref() == Some(expected))
+            })
+            .map(|session| &session.agent_type),
+    );
+    let written_at = now.max(std::time::Instant::now());
     backoff.insert(
         pane_id.to_string(),
         SendRetryState {
-            next_attempt_at: now + unconfirmed_retry_delay(attempts),
+            next_attempt_at: written_at + unconfirmed_retry_delay(attempts, floor),
             attempts,
         },
     );
@@ -4740,16 +5090,16 @@ fn deliver_orchestrator_prompt(
     // below is untouched, so a start role whose producer announces nothing still
     // gets its remit after 10 s.
     let agent_ready = spawn_time_agent_ready(snapshot, &start_pane_id);
+    let anchor = ui.orchestration_prompt_anchor_at.get(&tab_id).copied();
     let timeout_ready = !agent_ready
-        && ui
-            .orchestration_prompt_anchor_at
-            .get(&tab_id)
-            .is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(10));
+        && anchor.is_some_and(|t| now.duration_since(t) > SPAWN_TIME_READINESS_TIMEOUT);
     if agent_ready {
         ui.orchestration_ready_since.entry(tab_id).or_insert(now);
     }
+    // Issue #529: the timeout path owes the readiness buffer too, counted from
+    // the instant it declared the pane ready — see the seed path's twin.
     let buffer_elapsed = if timeout_ready {
-        true
+        should_inject_spawn_time_prompt(anchor.map(spawn_time_fallback_ready_at), now)
     } else {
         should_inject_spawn_time_prompt(ui.orchestration_ready_since.get(&tab_id).copied(), now)
     };
@@ -4904,7 +5254,9 @@ fn deliver_orchestrator_prompt(
                     log_prompt_unconfirmed("orchestrator", &start_pane_id, &logged_id, attempt);
                     schedule_unconfirmed_retry(
                         &mut ui.send_retry_backoff,
+                        snapshot,
                         &start_pane_id,
+                        expected_agent_id.as_deref(),
                         now,
                         attempt,
                     );
@@ -5233,15 +5585,22 @@ fn surface_one_orchestration(
             })
             .collect(),
     };
-    let local = load_project_config(Path::new(&surface.cwd))
+    let project_config = load_project_config(Path::new(&surface.cwd)).map_err(|e| e.to_string());
+    let local = project_config
+        .as_ref()
         .ok()
-        .flatten()
-        .and_then(|c| {
-            c.orchestrations
-                .into_iter()
-                .find(|o| o.name == surface.name)
-        });
-    let orch_config = resolve_orch_config_for_hydration(local, &bucket);
+        .and_then(Option::as_ref)
+        .and_then(|c| c.orchestrations.iter().find(|o| o.name == surface.name))
+        .cloned();
+    // Issue #554: the same drift decision as reconnect hydration, surfaced on
+    // both paths below — growing an existing tab and building a new one.
+    let lookup = match &project_config {
+        Err(error) => LocalOrchestrationConfig::Unreadable(error),
+        Ok(None) => LocalOrchestrationConfig::Absent,
+        Ok(Some(_)) => LocalOrchestrationConfig::Loaded(local.as_ref()),
+    };
+    let drift_warning = orchestration_config_drift_warning(lookup, &bucket);
+    let orch_config = resolve_orch_config_for_hydration(local.clone(), &bucket);
 
     // Issue #868: the `already_built` guard above only catches a duplicate
     // re-broadcast of an EXISTING tab's own roles — it's always false for
@@ -5259,6 +5618,27 @@ fn surface_one_orchestration(
         &surface.name,
         surface.orchestration_id.as_deref(),
     ) {
+        // Issue #554: the surface's own bucket holds only the new role, so also
+        // check the roles the tab already shows — read BEFORE the growth below
+        // rewrites the tab's config with the file's role list.
+        let drift_warning = drift_warning.or_else(|| {
+            let (Ok(Some(_)), Some(local)) = (&project_config, local.as_ref()) else {
+                return None;
+            };
+            let Some(Tab::Orchestration {
+                config: tab_config,
+                role_pane_ids,
+                ..
+            }) = tab_manager.tabs().get(existing_tab_index)
+            else {
+                return None;
+            };
+            // Only roles with a live daemon pane: a dead-slot placeholder has
+            // no pane the daemon could route to, so removing its role from the
+            // file is a cleanup, not drift (Qodo on PR #1281).
+            let tab_roles = live_tab_role_names(tab_config, role_pane_ids);
+            grown_orchestration_tab_drift_warning(&tab_roles, local, &surface.name, &surface.cwd)
+        });
         // Whether anything actually grew, so the "grew existing tab" info
         // log below only fires when it's true — it would otherwise fire
         // unconditionally even when every role in this surface failed to
@@ -5482,6 +5862,27 @@ fn surface_one_orchestration(
                 "live orchestration surface: grew existing tab with newly-spawned role(s)"
             );
         }
+        // Issue #554 (Greptile on PR #1281): a role spawned into a tab whose
+        // config changed since it opened is drift too — the new pane is
+        // labelled from the current file while the daemon registered the name
+        // it spawned under. Surfaced once per tab: a tab already marked has
+        // already said this, and repeating it on every spawn would only keep
+        // resetting the status line.
+        if let Some(warning) = drift_warning {
+            let tab = tab_manager.tabs().get(existing_tab_index);
+            let already_marked = matches!(
+                tab,
+                Some(Tab::Orchestration { id, .. }) if ui.config_drift_tabs.contains(id)
+            );
+            if !already_marked {
+                tracing::warn!(
+                    cwd = %surface.cwd,
+                    orchestration = %surface.name,
+                    "live orchestration surface: {warning}"
+                );
+                surface_orchestration_config_drift(ui, tab, warning);
+            }
+        }
         return;
     }
 
@@ -5541,7 +5942,15 @@ fn surface_one_orchestration(
         bucket.display_title.as_deref(),
         bucket.orchestration_id.as_deref(),
     ) {
-        Ok(_) => {
+        Ok((tab_index, _)) => {
+            if let Some(warning) = drift_warning {
+                tracing::warn!(
+                    cwd = %surface.cwd,
+                    orchestration = %surface.name,
+                    "live orchestration surface: {warning}"
+                );
+                surface_orchestration_config_drift(ui, tab_manager.tabs().get(tab_index), warning);
+            }
             let mut st = state.blocking_write();
             // Seed placeholder cards for synthetic dead slots only (live roles
             // get their card from the agent's own SessionStart hook).
@@ -5689,7 +6098,7 @@ pub enum Action {
     /// Toggle the deck-global command-entry lock (Ctrl+E), which decides
     /// whether keystrokes reach a focused non-orchestrator role pane's PTY.
     /// Only ever reaches the handler from an Orchestration tab in command mode
-    /// — [`scope_command_entry_lock`] un-resolves it everywhere else.
+    /// — [`scope_orchestration_chord`] un-resolves it everywhere else.
     ToggleOrchestrationLock,
     /// PRD #336: toggle the orchestration sidebar/pane-column split between
     /// the default 34/66 ratio and the narrower-sidebar 25/75 (Ctrl+L). The
@@ -6366,7 +6775,7 @@ fn handle_pane_input_key(key: KeyEvent) -> Action {
 ///
 /// It names `Ctrl+D` **first**, and that is load-bearing rather than
 /// stylistic: this message is only ever shown from `UiMode::PaneInput`, which
-/// — since [`scope_command_entry_lock`] claims the chord in `UiMode::Normal`
+/// — since [`scope_orchestration_chord`] claims the chord in `UiMode::Normal`
 /// only — is precisely the mode where `Ctrl+E` alone does nothing. Naming just
 /// the unlock chord would instruct the user to press a chord that provably
 /// cannot work from where they are standing.
@@ -9087,7 +9496,7 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
         return Some(Action::ToggleLayout);
     }
     // PRD #336. This stays a pure chord→action mapping with no tab awareness;
-    // the orchestration-tab scoping is applied by `scope_orchestration_split`
+    // the orchestration-tab scoping is applied by `scope_orchestration_chord`
     // at the one dispatch site that has tab context. Resolving here and
     // narrowing there keeps this function a plain keybinding table.
     if kb.matches(KbAction::ToggleOrchestrationSplit, key) {
@@ -9157,35 +9566,61 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
     }
 }
 
-/// Un-resolve `Ctrl+E` (`ToggleOrchestrationLock`) unless the active tab is an
-/// Orchestration tab **and** the deck is in command mode.
+/// Un-resolve an orchestration-scoped chord unless the active tab is an
+/// Orchestration tab **and** the deck is in command mode (issue #438).
 ///
-/// Same conflict class, and the same trade, as [`global_action_for_mode`]'s
-/// `CloseSelected` scoping above: `Ctrl+E` is `0x05`, readline's
-/// `end-of-line`. A globally-bound chord that a pane's occupant also wants is
-/// claimed only in command mode, and the user pays one extra `Ctrl+D` rather
-/// than losing the chord entirely. Without this, an Orchestration tab would
-/// swallow the byte unconditionally and a focused role pane's PTY would never
-/// receive it — so the user could not move to the end of a line they were
-/// typing at the agent.
+/// `chord` names the action being scoped — today
+/// `Action::ToggleOrchestrationLock` (`Ctrl+E`, PRD #393) and
+/// `Action::ToggleOrchestrationSplit` (`Ctrl+L`, PRD #336). If `action`
+/// resolved to that variant outside (Orchestration tab, `UiMode::Normal`) it
+/// becomes `None`; every other action, and `None`, passes through untouched.
+/// The variants are compared with [`std::mem::discriminant`] because
+/// [`Action`] derives no `PartialEq`, so a payload-carrying `chord` would match
+/// that variant whatever its payload — neither current caller passes one.
+///
+/// Both chords collide with a byte a pane's occupant legitimately wants:
+/// `Ctrl+E` is `0x05`, readline's `end-of-line`, and `Ctrl+L` is `0x0c`,
+/// readline's `clear-screen`. The global resolvers are pure chord→action tables
+/// with no tab context, so left alone they claim the chord everywhere — and a
+/// focused role pane's PTY would never receive the byte. Both halves of the
+/// narrowing matter, and for the same reason:
+///
+/// - **Tab type** — only [`Tab::Orchestration`] gives these chords something
+///   to mean (its `role_pane_ids[start_role_index]` for the lock, its
+///   sidebar/pane-column split for the split toggle). On a Dashboard or Mode
+///   tab they reach nothing, so claiming the chord there would cost the byte
+///   for no behaviour. (The split's `dispatch_action` arm also re-checks the
+///   tab; the lock's arm does not, so for the lock this helper is the only tab
+///   guard.)
+/// - **Mode** — the same conflict class, and the same trade, as
+///   [`global_action_for_mode`]'s `CloseSelected` scoping (PRD #241 M1), which
+///   is command-mode only precisely so `Ctrl+w` still reaches the PTY as
+///   word-delete while the user is typing. A globally-bound chord that a pane's
+///   occupant also wants is claimed only in command mode, and the user pays one
+///   extra `Ctrl+D` rather than losing the chord entirely — without this, the
+///   user could not move to the end of, or clear, what they were typing at the
+///   agent.
 ///
 /// It cannot live inside `global_action_for_mode` the way `CloseSelected`'s
 /// mode term does, because it needs one thing that function has no access to:
-/// which KIND of tab is active. `is_orchestration_tab` is true **only** for
-/// [`Tab::Orchestration`], whose `role_pane_ids[start_role_index]` is what
-/// gives the chord something to mean; on a Dashboard or Mode tab the lock
-/// reaches nothing, so claiming the chord there would cost the byte for no
-/// behaviour. Kept a standalone pure function rather than an inline `if` at the
-/// call site because it is then unit-testable without a PTY — an inline
-/// condition is only reachable through the full event loop.
-fn scope_command_entry_lock(
+/// which KIND of tab is active. The tab term is a parameter rather than
+/// computed here so a caller can fold a feature gate into it (the lock's
+/// PRD #393 experimental flag). Returning `None` un-resolves the action so the
+/// key falls through to the normal `PaneInput` forwarding path. Kept a
+/// standalone pure function rather than an inline `if` at the call site
+/// because it is then unit-testable without a PTY (`orchestration/lock/001`,
+/// `orchestration/layout/005`) — an inline condition is only reachable through
+/// the full event loop.
+fn scope_orchestration_chord(
     action: Option<Action>,
+    chord: Action,
     is_orchestration_tab: bool,
     mode: UiMode,
 ) -> Option<Action> {
     match action {
-        Some(Action::ToggleOrchestrationLock)
-            if !is_orchestration_tab || mode != UiMode::Normal =>
+        Some(ref resolved)
+            if std::mem::discriminant(resolved) == std::mem::discriminant(&chord)
+                && (!is_orchestration_tab || mode != UiMode::Normal) =>
         {
             None
         }
@@ -9203,9 +9638,9 @@ fn scope_command_entry_lock(
 /// that mode's own handler.
 ///
 /// The `ToggleOrchestrationLock`, `ToggleOrchestrationSplit` and `ToggleZoom`
-/// passes below apply [`scope_command_entry_lock`]'s,
-/// [`scope_orchestration_split`]'s and [`scope_zoom`]'s MODE term only, with
-/// `is_orchestration_tab: true`, in the order the live call site applies them.
+/// passes below apply [`scope_orchestration_chord`]'s (for the first two) and
+/// [`scope_zoom`]'s MODE term only, with `is_orchestration_tab: true`, in the
+/// order the live call site applies them.
 /// Mode is this helper's whole subject and is knowable here, so leaving any of
 /// them out would make the helper over-report `Ctrl+E`, `Ctrl+L` or `Ctrl+Z` as
 /// claimed in `PaneInput` — the exact thing the scoping exists to stop. Tab kind
@@ -9213,13 +9648,14 @@ fn scope_command_entry_lock(
 /// answers for the most permissive tab.
 pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
     let resolved = global_action_for_mode(kb, mode, key);
-    let resolved = scope_command_entry_lock(resolved, true, mode);
+    let resolved = scope_orchestration_chord(resolved, Action::ToggleOrchestrationLock, true, mode);
     // PRD #336 (issue #439): the same MODE-only pass for the split toggle, in
     // the position the live call site gives it — after the lock, before the
     // zoom. Leaving it out made this helper report `Ctrl+L` as claimed in
     // `PaneInput`, when the live loop un-resolves it there and forwards `0x0c`
     // to the agent as readline's clear-screen.
-    let resolved = scope_orchestration_split(resolved, true, mode);
+    let resolved =
+        scope_orchestration_chord(resolved, Action::ToggleOrchestrationSplit, true, mode);
     // PRD #313: and the same pass for the zoom toggle. Leaving it out would
     // make this helper report `Ctrl+Z` as claimed in `PaneInput`, when the live
     // loop un-resolves it there and forwards `0x1a` to the agent — the tty's
@@ -9237,48 +9673,7 @@ pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) 
     None
 }
 
-/// PRD #336: narrow a resolved action to the tab type AND mode it applies to.
-///
-/// `Action::ToggleOrchestrationSplit` resolves only on an orchestration tab, in
-/// command mode. The global resolvers are pure chord→action tables with no tab
-/// context, so left alone they claim the chord everywhere — and because
-/// `dispatch_action`'s handler no-ops off an orchestration tab, the keystroke is
-/// swallowed rather than reaching the focused pane's PTY.
-///
-/// Both halves of the narrowing matter, and for the same reason: the default
-/// `Ctrl+l` is readline's `clear-screen`, so anything running in a pane has a
-/// legitimate claim on it.
-///
-/// - **Tab type** — on a Dashboard or Mode tab the action can do nothing, so
-///   claiming the chord there is pure loss.
-/// - **Mode** — this mirrors `close_pane` (PRD #241 M1), which is command-mode
-///   only precisely so `Ctrl+w` still reaches the PTY as word-delete while the
-///   user is typing. Same conflict class here: without the mode check, `Ctrl+l`
-///   typed into a *role pane* — the most likely place to want a screen clear —
-///   would resize the sidebar instead of clearing. Toggling costs one extra
-///   keystroke (`Ctrl+d` first); silently eating clear-screen costs more.
-///
-/// Returning `None` un-resolves it so the key falls through to the normal
-/// `PaneInput` forwarding path. Every other action passes through untouched.
-/// Kept as a standalone pure function so it is unit-testable without a PTY
-/// (`orchestration/layout/005`) — an inline `if` at the call site would only
-/// be reachable through the full event loop.
-fn scope_orchestration_split(
-    action: Option<Action>,
-    is_orchestration_tab: bool,
-    mode: UiMode,
-) -> Option<Action> {
-    match action {
-        Some(Action::ToggleOrchestrationSplit)
-            if !is_orchestration_tab || mode != UiMode::Normal =>
-        {
-            None
-        }
-        other => other,
-    }
-}
-
-/// PRD #313: the same narrowing as [`scope_orchestration_split`], for the zoom
+/// PRD #313: the same narrowing as [`scope_orchestration_chord`], for the zoom
 /// toggle — `Action::ToggleZoom` resolves only on a tab that HAS a card
 /// sidebar to reclaim (Dashboard or Orchestration), and only in command mode.
 ///
@@ -9849,7 +10244,7 @@ fn dispatch_action(
         }
         // Ctrl+e: toggle the deck-global command-entry lock. The action only
         // ever reaches here from an Orchestration tab in command mode —
-        // `scope_command_entry_lock` un-resolves it everywhere else — so there
+        // `scope_orchestration_chord` un-resolves it everywhere else — so there
         // is no per-tab guard left to apply.
         Action::ToggleOrchestrationLock => {
             ui.command_entry_locked = !ui.command_entry_locked;
@@ -9884,7 +10279,7 @@ fn dispatch_action(
         // from an orchestration tab, so the guard below stays: pressing it on
         // the Dashboard must not silently change orchestration geometry.
         // Unreachable off an orchestration tab anyway —
-        // `scope_orchestration_split` un-resolves the chord there — but the
+        // `scope_orchestration_chord` un-resolves the chord there — but the
         // `matches!` keeps this a no-op rather than a panic if that changes.
         Action::ToggleOrchestrationSplit => {
             if matches!(tab_manager.active_tab(), Tab::Orchestration { .. }) {
@@ -10813,7 +11208,7 @@ fn dispatch_action(
                     // while the identity may be declared in `[[modes]]`, so the
                     // declaration answers first — that is the only thing that
                     // can identify a `devbox run codex-big` agent pane, and it
-                    // drives the wrap below as well as the badge.
+                    // drives the (daemon-side) wrap as well as the badge.
                     let spawn_agent_type = match req.mode_config.as_ref() {
                         Some(mode) if !req.command.is_empty() => {
                             mode.resolved_agent_type(req.command.as_str())
@@ -10822,23 +11217,30 @@ fn dispatch_action(
                         None if req.command.is_empty() => None,
                         None => AgentType::from_command(Some(req.command.as_str())),
                     };
-                    // PRD #20 M8: launch Wrapper-strategy agents (Codex now;
-                    // Gemini later) WRAPPED so their stdout is monitored
-                    // transparently — whether the command came from the registry
-                    // seed or was typed by the user. Only the LAUNCHED process is
-                    // rewritten to `dot-agent-deck wrap --agent <name> -- <base>`;
-                    // the Command field, `last_command`, and the persisted
-                    // `SavedPane.command` all keep the bare base command (so the
-                    // seed round-trips), and the transform is idempotent so a
-                    // restore re-wraps exactly once, never double-wraps.
-                    let launch_command = match &spawn_agent_type {
-                        Some(at) => crate::wrap::wrap_launch_command(&req.command, at),
-                        None => req.command.clone(),
-                    };
+                    // PRD #20 M8: Wrapper-strategy agents (Codex now; Gemini
+                    // later) launch WRAPPED so their stdout is monitored
+                    // transparently, but the wrap is applied by the DAEMON, not
+                    // here: this command goes out BARE with `spawn_agent_type` as
+                    // `StartAgent.agent_type`, and `agent_pty`'s common spawn
+                    // boundary rewrites it to `<deck> wrap --agent <name> --
+                    // <base>` from that same identity. The Command field,
+                    // `last_command` and `SavedPane.command` keep the bare base
+                    // command as before.
+                    //
+                    // Issue #533: this site used to rewrite the command itself,
+                    // and the daemon then re-applied the rewrite, relying on its
+                    // idempotency guard to recognise the TUI's. Once a renamed
+                    // build names ITSELF as the wrapper, a daemon of a different
+                    // build cannot recognise that name and wraps a second time.
+                    // Leaving the rewrite to the daemon means every daemon names
+                    // its own binary, in any TUI/daemon pairing. Mode panes do
+                    // not come through here (`cmd` is `None` for them): their
+                    // command is typed into a shell, which `wrap_agent_command`
+                    // still wraps TUI-side because no daemon rewrite follows.
                     let cmd = if req.command.is_empty() || is_mode {
                         None
                     } else {
-                        Some(launch_command.as_str())
+                        Some(req.command.as_str())
                     };
                     // Thread the form's Name through to `StartAgent.display_name`
                     // so a disconnect or crash between create and rename can't
@@ -10886,8 +11288,8 @@ fn dispatch_action(
                             tab_manager.show_tab_bar(),
                         )
                     };
-                    // `spawn_agent_type` and the wrapped `launch_command` (used
-                    // for `cmd` above) were both resolved before the dims block.
+                    // `spawn_agent_type` (which the daemon also wraps from) and
+                    // `cmd` were both resolved before the dims block.
                     match pane.create_pane_with_options(
                         cmd,
                         Some(&dir_str),
@@ -12106,22 +12508,28 @@ fn handle_key_event(
         // `PaneInput` forwarding path (`0x05`) instead.
         let is_orchestration_tab = matches!(tab_manager.active_tab(), Tab::Orchestration { .. });
         // PRD #393 experimental gate (CLAUDE.md #9). Passing `false` for the
-        // tab term when the flag is off makes `scope_command_entry_lock`
+        // tab term when the flag is off makes `scope_orchestration_chord`
         // un-resolve `Ctrl+E` everywhere, exactly as it already does off an
         // Orchestration tab — so the key falls through to the PTY and the lock
         // has no binding at all. Expressed through the existing tab term rather
         // than a second branch so there is only one place that decides whether
         // the chord is claimed.
-        action = scope_command_entry_lock(
+        action = scope_orchestration_chord(
             action,
+            Action::ToggleOrchestrationLock,
             is_orchestration_tab && crate::features::show_command_entry_lock(),
             ui.mode,
         );
         // PRD #336: the split toggle resolves only on an orchestration tab, in
         // command mode. This is the first point in the funnel with tab context,
         // so narrow it here — otherwise `Ctrl+l` is claimed everywhere and
-        // never reaches a pane's PTY. See `scope_orchestration_split`.
-        action = scope_orchestration_split(action, is_orchestration_tab, ui.mode);
+        // never reaches a pane's PTY. See `scope_orchestration_chord`.
+        action = scope_orchestration_chord(
+            action,
+            Action::ToggleOrchestrationSplit,
+            is_orchestration_tab,
+            ui.mode,
+        );
         // PRD #313: and the zoom toggle, on nearly the same terms — but a
         // WIDER tab predicate, because the Dashboard is the same card-sidebar
         // shape as an orchestration tab and zoom is worth the same there. See
@@ -12606,31 +13014,27 @@ pub fn run_tui(
             }
         }
         // Cache cwd → project config so the lookup happens once per
-        // distinct cwd regardless of how many buckets share it.
-        let mut config_cache: std::collections::HashMap<
-            String,
-            Option<crate::project_config::ProjectConfig>,
-        > = std::collections::HashMap::new();
-        let lookup_config = |cache: &mut std::collections::HashMap<
-            String,
-            Option<crate::project_config::ProjectConfig>,
-        >,
+        // distinct cwd regardless of how many buckets share it. A load error
+        // is kept as `Err` (issue #554, Qodo on PR #1281) so the orchestration
+        // loop can tell it apart from an absent file; mode tabs still treat
+        // both as "no config".
+        type ConfigLookup = Result<Option<crate::project_config::ProjectConfig>, String>;
+        let mut config_cache: std::collections::HashMap<String, ConfigLookup> =
+            std::collections::HashMap::new();
+        let lookup_config = |cache: &mut std::collections::HashMap<String, ConfigLookup>,
                              cwd: &str|
-         -> Option<crate::project_config::ProjectConfig> {
+         -> ConfigLookup {
             if let Some(cached) = cache.get(cwd) {
                 return cached.clone();
             }
-            let loaded = match load_project_config(std::path::Path::new(cwd)) {
-                Ok(opt) => opt,
-                Err(e) => {
-                    tracing::error!(
-                        cwd = %cwd,
-                        error = %e,
-                        "hydration: failed to load project config; dropping mode/orchestration tabs to dashboard"
-                    );
-                    None
-                }
-            };
+            let loaded = load_project_config(std::path::Path::new(cwd)).map_err(|e| {
+                tracing::error!(
+                    cwd = %cwd,
+                    error = %e,
+                    "hydration: failed to load project config; mode tabs drop to dashboard, orchestration tabs rebuild from daemon roles"
+                );
+                e.to_string()
+            });
             cache.insert(cwd.to_string(), loaded.clone());
             loaded
         };
@@ -12643,7 +13047,7 @@ pub fn run_tui(
         // is active, but spawning at the right size avoids the 24×80 hiccup.
         let hydration_frame_area = terminal.get_frame().area();
         for bucket in &partition.mode_buckets {
-            let cfg = lookup_config(&mut config_cache, &bucket.cwd);
+            let cfg = lookup_config(&mut config_cache, &bucket.cwd).ok().flatten();
             let mode_config = cfg
                 .as_ref()
                 .and_then(|c| c.modes.iter().find(|m| m.name == bucket.mode_name).cloned());
@@ -12688,7 +13092,7 @@ pub fn run_tui(
         let mut first_orchestration_tab_index: Option<usize> = None;
         for bucket in &partition.orchestration_buckets {
             let cfg = lookup_config(&mut config_cache, &bucket.cwd);
-            let local_orch_config = cfg.as_ref().and_then(|c| {
+            let local_orch_config = cfg.as_ref().ok().and_then(Option::as_ref).and_then(|c| {
                 c.orchestrations
                     .iter()
                     .find(|o| o.name == bucket.orchestration_name)
@@ -12706,29 +13110,32 @@ pub fn run_tui(
             // missing. Without this fallback, every remote-reconnect
             // user would see their orchestration panes dumped into the
             // dashboard.
-            if local_orch_config.is_none() {
-                // PRD #111 auditor nit: distinguish the two
-                // "synthesise" cases so operators can tell whether
-                // the file is genuinely absent (legitimate remote
-                // reconnect — `cfg.is_none()`) or present but
-                // missing this orchestration (config drift —
-                // `cfg.is_some()`). Same level (info) for both;
-                // distinct messages so log search picks them apart.
-                if cfg.is_none() {
-                    tracing::info!(
-                        cwd = %bucket.cwd,
-                        orchestration = %bucket.orchestration_name,
-                        role_count = bucket.role_slots.len(),
-                        "hydration: rebuilding orchestration tab from synthesised config (local .dot-agent-deck.toml absent — remote daemon path)"
-                    );
-                } else {
-                    tracing::info!(
-                        cwd = %bucket.cwd,
-                        orchestration = %bucket.orchestration_name,
-                        role_count = bucket.role_slots.len(),
-                        "hydration: rebuilding orchestration tab from synthesised config (local config exists but does not list this orchestration — config drift or stale)"
-                    );
-                }
+            // Issue #554: the file-absent case (legitimate remote reconnect)
+            // stays at `info!` and off the screen; drift against a file that
+            // WAS read is decided by the pure helper and surfaced below, once
+            // the tab exists to carry the marker.
+            if matches!(cfg, Ok(None)) {
+                tracing::info!(
+                    cwd = %bucket.cwd,
+                    orchestration = %bucket.orchestration_name,
+                    role_count = bucket.role_slots.len(),
+                    "hydration: rebuilding orchestration tab from synthesised config (local .dot-agent-deck.toml absent — remote daemon path)"
+                );
+            }
+            let lookup = match &cfg {
+                Err(error) => LocalOrchestrationConfig::Unreadable(error),
+                Ok(None) => LocalOrchestrationConfig::Absent,
+                Ok(Some(_)) => LocalOrchestrationConfig::Loaded(local_orch_config.as_ref()),
+            };
+            let drift_warning = orchestration_config_drift_warning(lookup, bucket);
+            if let Some(warning) = &drift_warning {
+                tracing::warn!(
+                    cwd = %bucket.cwd,
+                    orchestration = %bucket.orchestration_name,
+                    role_count = bucket.role_slots.len(),
+                    local_config_lists_orchestration = local_orch_config.is_some(),
+                    "hydration: {warning}"
+                );
             }
             let orch_config = resolve_orch_config_for_hydration(local_orch_config, bucket);
             // Build a Vec<Option<String>> of length config.roles.len()
@@ -12819,6 +13226,13 @@ pub fn run_tui(
                 Ok((tab_index, _)) => {
                     if first_orchestration_tab_index.is_none() {
                         first_orchestration_tab_index = Some(tab_index);
+                    }
+                    if let Some(warning) = drift_warning {
+                        surface_orchestration_config_drift(
+                            &mut ui,
+                            tab_manager.tabs().get(tab_index),
+                            warning,
+                        );
                     }
                     let mut st = state.blocking_write();
                     // CodeRabbit PR #118 finding #3: seed placeholder
@@ -13935,11 +14349,9 @@ pub fn run_tui(
                     .get(agent_pane_id)
                     .map(|m| m.name.clone())
                     .unwrap_or_else(|| name.clone()),
-                Tab::Orchestration { name, status, .. } => match status {
-                    OrchestrationStatus::Completed => format!("{name} [done]"),
-                    OrchestrationStatus::Delegated => format!("{name} [active]"),
-                    OrchestrationStatus::WaitingForOrchestrator => name.clone(),
-                },
+                Tab::Orchestration {
+                    id, name, status, ..
+                } => orchestration_tab_label(name, status, ui.config_drift_tabs.contains(id)),
             })
             .collect();
         // PRD #333: join each Orchestration tab's role panes to their live
@@ -14035,6 +14447,9 @@ pub fn run_tui(
                 &tab_view,
                 &tab_bar_info,
                 &frame_layout,
+                // Issue #413: the cards' clock, read once per frame here so
+                // every card on it measures `Last:` against the same instant.
+                Utc::now(),
             );
             // PRD #139: draw the experimental footer into the reserved bottom
             // row (disjoint from `frame_layout`), using the SAME flag snapshot
@@ -16259,6 +16674,7 @@ fn deck_title_line(showing: usize, total_sessions: usize, scroll_hint: &str) -> 
 ///   there was the bug: an unpainted role is indistinguishable from a role that
 ///   failed to start, which sent two separate investigations after a hydration
 ///   defect that was not there.
+#[allow(clippy::too_many_arguments)]
 fn render_card_grid(
     frame: &mut Frame,
     area: Rect,
@@ -16267,6 +16683,8 @@ fn render_card_grid(
     session_ids: &[&String],
     total_sessions: usize,
     tick: u64,
+    // Issue #413: handed to every card's `Last:` field — see `format_elapsed`.
+    now: DateTime<Utc>,
 ) -> Rect {
     // 1 row for the title + 1 row for the stats bar at the bottom of the deck.
     let available_for_cards = area.height.saturating_sub(2);
@@ -16413,6 +16831,7 @@ fn render_card_grid(
                 // selection accent and the running app cannot disagree.
                 ui.mode,
                 declared_agent_type,
+                now,
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -16437,6 +16856,11 @@ fn render_frame(
     tab_view: &ActiveTabView,
     tab_bar: &TabBarInfo,
     layout: &FrameLayout,
+    // Issue #413: the wall-clock instant this frame is drawn at, read once by
+    // the caller. Distinct from the monotonic `now` below, which times the
+    // command banner; this one is only what the cards' `Last:` field measures
+    // elapsed time against.
+    wall_now: DateTime<Utc>,
 ) {
     // PRD #84 + #139: `render_frame` reads the precomputed `FrameLayout` (one
     // layout pass per frame). The PRD #139 experimental-footer row is reserved
@@ -16743,6 +17167,7 @@ fn render_frame(
             &session_ids,
             total_sessions,
             tick,
+            wall_now,
         );
         render_stats_bar(
             frame,
@@ -20657,6 +21082,10 @@ fn render_session_card(
     // with no declaration, which is every pane before this key existed and the
     // default for the L1 render seams.
     declared_agent_type: Option<&AgentType>,
+    // Issue #413: the instant the bottom border's `Last:` field is measured
+    // against. Passed in, never read here, so a card renders as a pure function
+    // of its inputs — see `format_elapsed`.
+    now: DateTime<Utc>,
 ) {
     // The type the card SHOWS. A launcher command (`devbox run -- codex`)
     // identifies nothing, so without the declaration this stays
@@ -20803,7 +21232,7 @@ fn render_session_card(
     //
     // The border reads `Last: 2m`, not `Last: 2m ago` — four columns of suffix
     // are expensive there, and the `Last:` label already says "time since".
-    let elapsed = format_elapsed(session.last_activity);
+    let elapsed = format_elapsed(session.last_activity, now);
     let stats_title = card_stats_border_label(
         area.width.saturating_sub(2),
         &elapsed,
@@ -20982,8 +21411,13 @@ fn status_style(status: &SessionStatus) -> (&str, Style) {
 /// No ` ago` suffix — four columns of it are expensive on a border, and the
 /// `Last:` label already says "time since". [`render_session_card`] is the only
 /// caller, so there is one form and one function.
-fn format_elapsed(last_activity: DateTime<Utc>) -> String {
-    let now = Utc::now();
+///
+/// Issue #413: `now` is an input rather than a `Utc::now()` read, so the text
+/// is a pure function of its two arguments. The render path takes `now` from
+/// its caller all the way down — the main loop reads the clock once per frame
+/// and the L1 seams take it from the test — so a card snapshot built against a
+/// fixed instant renders the same `Last:` text however long the render takes.
+fn format_elapsed(last_activity: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let delta = now.signed_duration_since(last_activity);
     let total_secs = delta.num_seconds().max(0);
 
@@ -21212,6 +21646,10 @@ pub fn render_config_gen_prompt_to_buffer(
 /// full-strength Magenta+BOLD+`▸ ` rendering, byte-for-byte what it produced
 /// before the mode became an input. Use [`render_card_for_mode_to_buffer`] to
 /// vary the mode.
+///
+/// Issue #413: `now` is the instant the card's `Last:` field is measured
+/// against. The seam reads no clock, so a fixture built against a fixed instant
+/// and rendered with that same instant produces the same buffer every run.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_card_to_buffer(
@@ -21220,6 +21658,7 @@ pub fn render_card_to_buffer(
     card_number: Option<u8>,
     density: CardDensityKind,
     tick: u64,
+    now: DateTime<Utc>,
     selected: bool,
     width: u16,
     height: u16,
@@ -21230,6 +21669,7 @@ pub fn render_card_to_buffer(
         card_number,
         density,
         tick,
+        now,
         selected,
         UiMode::Normal,
         width,
@@ -21257,6 +21697,7 @@ pub fn render_card_for_mode_to_buffer(
     card_number: Option<u8>,
     density: CardDensityKind,
     tick: u64,
+    now: DateTime<Utc>,
     selected: bool,
     mode: UiMode,
     width: u16,
@@ -21268,6 +21709,7 @@ pub fn render_card_for_mode_to_buffer(
         card_number,
         density,
         tick,
+        now,
         selected,
         mode,
         // Issue #308: the pre-#308 seams declare nothing, so a fixture that
@@ -21306,6 +21748,7 @@ pub fn render_card_with_declared_agent_to_buffer(
     card_number: Option<u8>,
     density: CardDensityKind,
     tick: u64,
+    now: DateTime<Utc>,
     selected: bool,
     mode: UiMode,
     declared_agent_type: Option<&AgentType>,
@@ -21339,6 +21782,7 @@ pub fn render_card_with_declared_agent_to_buffer(
                 density.into(),
                 mode,
                 declared_agent_type,
+                now,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -21356,12 +21800,16 @@ pub fn render_card_with_declared_agent_to_buffer(
 /// PRD #341 M4: like [`render_card_to_buffer`], this is the command-mode
 /// (`UiMode::Normal`) baseline — the full-strength selection accent. The
 /// mode-varying single-card seam is [`render_card_for_mode_to_buffer`].
+///
+/// Issue #413: every card's `Last:` field is measured against `now`, as in
+/// [`render_card_to_buffer`].
 #[doc(hidden)]
 pub fn render_dashboard_cards_to_buffer(
     cards: &[(&SessionState, Option<&str>)],
     selected: Option<usize>,
     density: CardDensityKind,
     tick: u64,
+    now: DateTime<Utc>,
     width: u16,
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
@@ -21408,6 +21856,7 @@ pub fn render_dashboard_cards_to_buffer(
                     card_density,
                     UiMode::Normal,
                     None,
+                    now,
                 );
             }
         })
@@ -21443,12 +21892,14 @@ pub struct CardGridProbe {
 /// — the thing that was dropping cards — had no L1 coverage at all.
 ///
 /// `cards` is `(session, display_name)` in deck order; `width` × `height` is the
-/// deck area, including the title and stats-bar rows it reserves.
+/// deck area, including the title and stats-bar rows it reserves. `now` is the
+/// instant each card's `Last:` field is measured against (issue #413).
 #[doc(hidden)]
 pub fn render_card_grid_to_buffer(
     cards: &[(&SessionState, Option<&str>)],
     selected: Option<usize>,
     scroll_offset: usize,
+    now: DateTime<Utc>,
     width: u16,
     height: u16,
 ) -> (ratatui::buffer::Buffer, CardGridProbe) {
@@ -21493,6 +21944,7 @@ pub fn render_card_grid_to_buffer(
                 &id_refs,
                 sessions.len(),
                 0,
+                now,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -21663,12 +22115,13 @@ pub fn render_orchestration_frame_to_buffer(
 
     let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
     let mut state = AppState::default();
-    // Two hours back rather than "now": the card's bottom border renders
-    // `format_elapsed`, so a fresh timestamp reads `0s` for only ONE second
-    // before it becomes `1s`. At two hours the string is `2h` for a full minute,
-    // which is the difference between a snapshot that is deterministic in
-    // practice and one that is deterministic on a loaded machine too.
-    let last_activity = Utc::now() - chrono::Duration::hours(2);
+    // Issue #413: `now` is read once here and handed to `render_frame`, which
+    // reads no clock of its own, so every card's `Last:` field is `2h` however
+    // long the render takes. The two-hour offset used to be what bought that
+    // determinism (a fresh timestamp read `0s` for only one second); it now just
+    // keeps the rendering `render/layout/006` has always pinned.
+    let now = Utc::now();
+    let last_activity = now - chrono::Duration::hours(2);
     for (i, role) in role_names.iter().enumerate() {
         let session_id = format!("seam-role-{i}");
         state.sessions.insert(
@@ -21739,6 +22192,7 @@ pub fn render_orchestration_frame_to_buffer(
         .draw(|frame| {
             render_frame(
                 frame, &state, &mut ui, &filtered, 0, true, &ctrl, &tab_view, &tab_bar, &layout,
+                now,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -22453,10 +22907,11 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
 
     let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
     let mut state = AppState::default();
-    // Two hours back for the same reason the orchestration frame seam uses it:
-    // `format_elapsed` renders into the card, and a fresh timestamp changes
-    // string width within a second of the render.
-    let last_activity = Utc::now() - chrono::Duration::hours(2);
+    // Issue #413: one `now`, shared by the fixture and `render_frame`, as in the
+    // orchestration frame seam — the cards' `Last:` text cannot drift between
+    // building the sessions and drawing them.
+    let now = Utc::now();
+    let last_activity = now - chrono::Duration::hours(2);
     for i in 0..card_count {
         let session_id = format!("seam-session-{i}");
         state.sessions.insert(
@@ -22518,6 +22973,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
         .draw(|frame| {
             render_frame(
                 frame, &state, &mut ui, &filtered, 0, true, &ctrl, &tab_view, &tab_bar, &layout,
+                now,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -24183,8 +24639,17 @@ mod tests {
                     .map(|(_, r)| *r);
 
                 render_frame(
-                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
                     &layout,
+                    Utc::now(),
                 );
             })
             .unwrap();
@@ -24733,13 +25198,13 @@ mod tests {
         }
     }
 
-    /// Scenario: PRD #336 — `scope_orchestration_split` is the guard that keeps
+    /// Scenario: PRD #336 — `scope_orchestration_chord` is the guard that keeps
     /// `Ctrl+l` from being swallowed anywhere it cannot act. Press `Ctrl+l` in
     /// command mode and the deck must resolve `Action::ToggleOrchestrationSplit`;
     /// press it while typing at a pane and the deck must NOT claim it, so the
     /// byte still reaches the agent as `0x0c`, readline's clear-screen. Resolves
     /// a simulated `Ctrl+l` `KeyEvent` through `key_action_for_mode` in both
-    /// modes, then drives `scope_orchestration_split` across every tab/mode pair
+    /// modes, then drives `scope_orchestration_chord` across every tab/mode pair
     /// and confirms every other action passes through untouched.
     #[spec("orchestration/layout/005")]
     #[test]
@@ -24759,6 +25224,15 @@ mod tests {
         );
 
         let split = || Some(Action::ToggleOrchestrationSplit);
+        // The helper under test, fixed to the chord this test is about.
+        let scope_orchestration_split = |action, is_orchestration_tab, mode| {
+            scope_orchestration_chord(
+                action,
+                Action::ToggleOrchestrationSplit,
+                is_orchestration_tab,
+                mode,
+            )
+        };
 
         // The ONLY combination that resolves: orchestration tab + command mode.
         // (`Action` derives no `PartialEq`, so these assert on the variant.)
@@ -27473,15 +27947,20 @@ mod tests {
 
     #[test]
     fn test_format_elapsed() {
-        let now = Utc::now();
+        // Issue #413: a fixed instant, not `Utc::now()` — `format_elapsed` no
+        // longer reads the clock, so nothing here depends on how long it runs.
+        let now = DateTime::from_timestamp(1_767_225_600, 0).expect("valid instant");
         // PRD #339: compact form, no ` ago` suffix — the card's bottom border
         // is the only surface that renders this.
-        assert_eq!(format_elapsed(now), "0s");
-        assert_eq!(format_elapsed(now - Duration::seconds(3)), "3s");
-        assert_eq!(format_elapsed(now - Duration::seconds(90)), "1m 30s");
-        assert_eq!(format_elapsed(now - Duration::seconds(60)), "1m");
-        assert_eq!(format_elapsed(now - Duration::seconds(3900)), "1h 5m");
-        assert_eq!(format_elapsed(now - Duration::seconds(3600)), "1h");
+        assert_eq!(format_elapsed(now, now), "0s");
+        assert_eq!(format_elapsed(now - Duration::seconds(3), now), "3s");
+        assert_eq!(format_elapsed(now - Duration::seconds(90), now), "1m 30s");
+        assert_eq!(format_elapsed(now - Duration::seconds(60), now), "1m");
+        assert_eq!(format_elapsed(now - Duration::seconds(3900), now), "1h 5m");
+        assert_eq!(format_elapsed(now - Duration::seconds(3600), now), "1h");
+        // A `last_activity` ahead of `now` (clock skew between the event's
+        // producer and the deck) clamps to zero rather than going negative.
+        assert_eq!(format_elapsed(now + Duration::seconds(30), now), "0s");
     }
 
     #[test]
@@ -27604,8 +28083,17 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
                     &layout,
+                    Utc::now(),
                 )
             })
             .unwrap();
@@ -27686,8 +28174,17 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
                     &layout,
+                    Utc::now(),
                 )
             })
             .unwrap();
@@ -27819,8 +28316,17 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
                     &layout,
+                    Utc::now(),
                 )
             })
             .unwrap();
@@ -28172,8 +28678,17 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
                     &layout,
+                    Utc::now(),
                 )
             })
             .unwrap();
@@ -28322,8 +28837,17 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
                     &layout,
+                    Utc::now(),
                 )
             })
             .unwrap();
@@ -28382,8 +28906,17 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
                     &layout,
+                    Utc::now(),
                 )
             })
             .unwrap();
@@ -29112,6 +29645,7 @@ mod tests {
             ui.selected_index,
             CardDensityKind::Normal,
             0,
+            Utc::now(),
             100,
         );
         let visible: String = (0..buffer.area().height)
@@ -30165,6 +30699,7 @@ mod tests {
             ui.selected_index,
             CardDensityKind::Normal,
             0,
+            Utc::now(),
             80,
         );
         assert!(
@@ -30497,6 +31032,7 @@ mod tests {
             ui.selected_index,
             CardDensityKind::Normal,
             0,
+            Utc::now(),
             80,
         );
         assert!(
@@ -30505,8 +31041,14 @@ mod tests {
         );
 
         // Inactive → no card carries the marker.
-        let inactive =
-            render_dashboard_cards_to_buffer(&cards, None, CardDensityKind::Normal, 0, 80);
+        let inactive = render_dashboard_cards_to_buffer(
+            &cards,
+            None,
+            CardDensityKind::Normal,
+            0,
+            Utc::now(),
+            80,
+        );
         assert!(
             !buf_text(&inactive).contains('▸'),
             "an inactive selection paints no highlight"
@@ -36931,14 +37473,19 @@ mod tests {
     /// it — since issue #1005 the only route that WRITES into a pane no producer
     /// has announced on, the `devbox run claude …` launcher case issue #424
     /// exists for. (The 60-second hard deadline also reaches such a pane, but it
-    /// abandons rather than delivers.) Mirrors [`ready_seed_prompt`] in every
-    /// other respect.
+    /// abandons rather than delivers.) Aged past the readiness buffer the
+    /// fallback owes after its 10 s as well (issue #529). Mirrors
+    /// [`ready_seed_prompt`] in every other respect.
     fn aged_seed_prompt(pane_id: &str, prompt: &str) -> PendingSeedPrompt {
         seed_prompt_created_at(
             pane_id,
             prompt,
             std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_millis(10_100))
+                .checked_sub(
+                    SPAWN_TIME_READINESS_TIMEOUT
+                        + SPAWN_TIME_READINESS_BUFFER
+                        + std::time::Duration::from_millis(100),
+                )
                 .expect("aged creation timestamp"),
         )
     }
@@ -37951,7 +38498,11 @@ mod tests {
             .insert(
                 tab_id,
                 started
-                    .checked_sub(std::time::Duration::from_millis(10_100))
+                    .checked_sub(
+                        SPAWN_TIME_READINESS_TIMEOUT
+                            + SPAWN_TIME_READINESS_BUFFER
+                            + std::time::Duration::from_millis(100),
+                    )
                     .expect("aged anchor timestamp"),
             );
         held_role_ui.orchestration_ready_since.insert(
@@ -38091,7 +38642,11 @@ mod tests {
             .insert(
                 burst_tab_id,
                 burst_started
-                    .checked_sub(std::time::Duration::from_millis(10_100))
+                    .checked_sub(
+                        SPAWN_TIME_READINESS_TIMEOUT
+                            + SPAWN_TIME_READINESS_BUFFER
+                            + std::time::Duration::from_millis(100),
+                    )
                     .expect("aged anchor timestamp"),
             );
         burst_role_ui.orchestration_ready_since.insert(
@@ -38220,7 +38775,11 @@ mod tests {
             .insert(
                 lost_tab_id,
                 lost_started
-                    .checked_sub(std::time::Duration::from_millis(10_100))
+                    .checked_sub(
+                        SPAWN_TIME_READINESS_TIMEOUT
+                            + SPAWN_TIME_READINESS_BUFFER
+                            + std::time::Duration::from_millis(100),
+                    )
                     .expect("aged anchor timestamp"),
             );
         lost_role_ui.orchestration_ready_since.insert(
@@ -38811,6 +39370,128 @@ mod tests {
         );
     }
 
+    /// Scenario: Queue a mode seed and an orchestration start-role remit for
+    /// panes that never announce a conversation, and let each cross the
+    /// 10-second readiness fallback. Neither may be written until the readiness
+    /// buffer has also elapsed after that 10 s; once it has, each is written
+    /// exactly once.
+    #[spec("prompt/pane-input/040")]
+    #[test]
+    fn pane_input_040_the_readiness_fallback_pays_the_buffer() {
+        const PROMPT: &str = "Read the fallback remit and begin";
+        let inside_buffer = SPAWN_TIME_READINESS_TIMEOUT + std::time::Duration::from_millis(1);
+        let past_buffer = SPAWN_TIME_READINESS_TIMEOUT + SPAWN_TIME_READINESS_BUFFER;
+
+        // --- `process_pending_seed_prompts` (a mode's seed). -----------------
+        const SEED_PANE: &str = "fallback-buffer-seed-pane";
+        let seed_controller = Arc::new(RecordingPaneController::default());
+        let seed_writes = seed_controller.writes.clone();
+        let seed_pane: Arc<dyn PaneController> = seed_controller;
+        let mut seed_ui = default_ui();
+        seed_ui.pending_seed_prompts.push(seed_prompt_created_at(
+            SEED_PANE,
+            PROMPT,
+            std::time::Instant::now()
+                .checked_sub(inside_buffer)
+                .expect("aged creation timestamp"),
+        ));
+        let mut seed_snapshot = AppState::default();
+        seed_snapshot.register_pane(SEED_PANE.to_string());
+        assert!(
+            !spawn_time_agent_ready(&seed_snapshot, SEED_PANE),
+            "precondition: nothing announced, so only the fallback can open this pane"
+        );
+
+        process_pending_seed_prompts(&mut seed_ui, &seed_pane, &seed_snapshot);
+        let seed_inside = seed_writes.lock().unwrap().clone();
+        assert!(
+            seed_inside.is_empty(),
+            "seed: past 10 s but inside the readiness buffer, the fallback must \
+             hold its write like every other readiness signal; writes={seed_inside:?}"
+        );
+        assert_eq!(
+            seed_ui.pending_seed_prompts.len(),
+            1,
+            "seed: held, not dropped. status={:?}",
+            seed_ui.status_message
+        );
+
+        seed_ui.pending_seed_prompts[0].created_at = std::time::Instant::now()
+            .checked_sub(past_buffer)
+            .expect("aged creation timestamp");
+        process_pending_seed_prompts(&mut seed_ui, &seed_pane, &seed_snapshot);
+        let seed_past = seed_writes.lock().unwrap().clone();
+        assert_eq!(
+            seed_past.len(),
+            1,
+            "seed: once the buffer has elapsed after the 10 s, the fallback writes \
+             exactly once; writes={seed_past:?}"
+        );
+        assert_eq!(seed_past[0].0, PROMPT, "seed: the write carries the seed");
+
+        // --- `deliver_orchestrator_prompt` (the start role's remit). ----------
+        const ROLE_PANE: &str = "fallback-buffer-role-pane";
+        let role_controller = Arc::new(RecordingPaneController::default());
+        let role_writes = role_controller.writes.clone();
+        let role_pane: Arc<dyn PaneController> = role_controller;
+        let anchor = std::time::Instant::now();
+        let tab_id: TabId = 1040;
+        let mut role_ui = default_ui();
+        role_ui
+            .orchestration_prompt_anchor_at
+            .insert(tab_id, anchor);
+        let mut role_snapshot = AppState::default();
+        role_snapshot.register_pane(ROLE_PANE.to_string());
+        let role_panes = [ROLE_PANE.to_string()];
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut role_prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut role_ui,
+            role_pane.as_ref(),
+            &role_snapshot,
+            anchor + inside_buffer,
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        let role_inside = role_writes.lock().unwrap().clone();
+        assert!(
+            role_inside.is_empty(),
+            "orchestrator: past 10 s but inside the readiness buffer, the fallback \
+             must hold its write; writes={role_inside:?}"
+        );
+        assert!(
+            role_prompt.is_some(),
+            "orchestrator: the remit is held, not consumed"
+        );
+
+        deliver_orchestrator_prompt(
+            &mut role_ui,
+            role_pane.as_ref(),
+            &role_snapshot,
+            anchor + past_buffer,
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        let role_past = role_writes.lock().unwrap().clone();
+        assert_eq!(
+            role_past.len(),
+            1,
+            "orchestrator: once the buffer has elapsed after the 10 s, the fallback \
+             writes exactly once; writes={role_past:?}"
+        );
+        assert_eq!(
+            role_past[0].0, PROMPT,
+            "orchestrator: the write carries the remit"
+        );
+    }
+
     /// Scenario: Write a seed to a target with no usable prompt-reporting channel, then supply daemon-synthetic evidence beside an untagged legacy hook. Those events must not arm a second physical write into a target that cannot actually confirm submission.
     #[spec("prompt/pane-input/031")]
     #[test]
@@ -39159,6 +39840,182 @@ mod tests {
         assert!(
             slow_ui.send_retry_backoff.contains_key(SLOW_PANE_ID),
             "the late producer's unconfirmed retry remains provisionally watched"
+        );
+    }
+
+    /// Issue #637, PR #1314 review (Qodo): the floor is read from the delivery's
+    /// OWN agent's sessions. A departed Claude session still on the pane must not
+    /// lend its 2 s floor to a successor that has not reported yet.
+    #[test]
+    fn unconfirmed_retry_floor_ignores_a_departed_occupants_session() {
+        const PANE_ID: &str = "handed-over-pane";
+        let mut snapshot = AppState::default();
+        snapshot.register_pane(PANE_ID.to_string());
+        snapshot.insert_placeholder_session(
+            PANE_ID.to_string(),
+            None,
+            Some(AgentType::ClaudeCode),
+            Some("departed-claude".to_string()),
+        );
+        // Far enough ahead that the wall clock never overtakes it, so the
+        // window is measured from exactly this instant.
+        let now = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let window = |expected: Option<&str>| {
+            let mut backoff = HashMap::new();
+            schedule_unconfirmed_retry(&mut backoff, &snapshot, PANE_ID, expected, now, 1);
+            backoff[PANE_ID].next_attempt_at - now
+        };
+        assert_eq!(
+            window(Some("codex-successor")),
+            crate::prompt_delivery::SLOW_CONFIRMATION_LATENCY,
+            "a session of a different agent must not set the floor"
+        );
+        assert_eq!(
+            window(Some("departed-claude")),
+            crate::prompt_delivery::FAST_CONFIRMATION_LATENCY
+        );
+        assert_eq!(
+            window(None),
+            crate::prompt_delivery::FAST_CONFIRMATION_LATENCY,
+            "with no identity to match, every session on the pane still counts"
+        );
+    }
+
+    /// Issue #637, PR #1314 review (Greptile): the window starts when the write
+    /// RETURNED. `now` is the pass's clock, sampled before a synchronous guarded
+    /// send; a slow round trip must not come out of the window.
+    #[test]
+    fn unconfirmed_retry_window_starts_after_the_write_returns() {
+        const PANE_ID: &str = "slow-round-trip-pane";
+        let snapshot = AppState::default();
+        let before_call = std::time::Instant::now();
+        // The pass sampled its clock 5 s before the write came back.
+        let stale_now = before_call
+            .checked_sub(std::time::Duration::from_secs(5))
+            .expect("stale timestamp");
+        let mut backoff = HashMap::new();
+        schedule_unconfirmed_retry(&mut backoff, &snapshot, PANE_ID, None, stale_now, 1);
+        assert!(
+            backoff[PANE_ID].next_attempt_at
+                >= before_call + crate::prompt_delivery::SLOW_CONFIRMATION_LATENCY,
+            "the retry window was measured from before the write"
+        );
+    }
+
+    /// Scenario: Write an orchestrator prompt into a Codex pane, then let a render pass run 8.45 s later — the latency issue #637 reports for a genuine Codex confirmation — before the agent's submission report arrives. No second write may reach the pane before that report, which then finalizes the role on the one write; separately, a pane whose report never comes is still re-submitted once the confirmation floor has passed.
+    #[spec("prompt/pane-input/041")]
+    #[test]
+    fn pane_input_041_retry_waits_out_a_slow_genuine_confirmation() {
+        const PANE_ID: &str = "slow-confirmation-pane";
+        const AGENT_ID: &str = "slow-confirmation-agent";
+        const PROMPT: &str = "Prompt whose confirmation is genuinely slow";
+        // What #637 measured for a genuine Codex confirmation. The retry used to
+        // fire at 500 ms, 7.95 s ahead of it.
+        let measured_confirmation = std::time::Duration::from_millis(8450);
+
+        let run = |confirm: bool| {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+                InjectedSendOutcome::Applied,
+                attempts.clone(),
+            ));
+            let created = std::time::Instant::now();
+            let tab_id: TabId = 41;
+            let mut ui = default_ui();
+            ui.orchestration_prompt_anchor_at.insert(tab_id, created);
+            ui.orchestration_ready_since.insert(
+                tab_id,
+                created
+                    .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("ready timestamp"),
+            );
+            // `announced_prompt_snapshot` declares the pane's producer as Codex.
+            let mut snapshot = announced_prompt_snapshot(PANE_ID, AGENT_ID);
+            let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+            let mut prompt = Some(PROMPT.to_string());
+            let pass_at = |ui: &mut UiState,
+                           snapshot: &AppState,
+                           role_statuses: &mut [OrchestrationRoleStatus],
+                           prompt: &mut Option<String>,
+                           offset: std::time::Duration| {
+                deliver_orchestrator_prompt(
+                    ui,
+                    pane.as_ref(),
+                    snapshot,
+                    created.checked_add(offset).expect("pass timestamp"),
+                    tab_id,
+                    &[PANE_ID.to_string()],
+                    0,
+                    role_statuses,
+                    prompt,
+                );
+            };
+
+            pass_at(
+                &mut ui,
+                &snapshot,
+                &mut role_statuses,
+                &mut prompt,
+                std::time::Duration::ZERO,
+            );
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "precondition: attempt 1"
+            );
+            pass_at(
+                &mut ui,
+                &snapshot,
+                &mut role_statuses,
+                &mut prompt,
+                measured_confirmation,
+            );
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "a retry fired while a genuine Codex confirmation could still be in flight — \
+                 the agent would receive this prompt twice"
+            );
+            if confirm {
+                apply_prompt_confirmation(&mut snapshot, PANE_ID, AGENT_ID, PROMPT);
+                pass_at(
+                    &mut ui,
+                    &snapshot,
+                    &mut role_statuses,
+                    &mut prompt,
+                    measured_confirmation + std::time::Duration::from_millis(1),
+                );
+                assert!(
+                    prompt.is_none(),
+                    "the slow genuine confirmation must still finalize the prompt"
+                );
+                assert_eq!(role_statuses, [OrchestrationRoleStatus::Working]);
+            } else {
+                pass_at(
+                    &mut ui,
+                    &snapshot,
+                    &mut role_statuses,
+                    &mut prompt,
+                    // A second past the floor: the window is measured from when
+                    // the write returned, a few microseconds after `created`.
+                    crate::prompt_delivery::SLOW_CONFIRMATION_LATENCY
+                        + std::time::Duration::from_secs(1),
+                );
+                assert_eq!(prompt.as_deref(), Some(PROMPT));
+            }
+            attempts.load(Ordering::SeqCst)
+        };
+
+        assert_eq!(
+            run(true),
+            1,
+            "a confirmed delivery must finalize on its one write"
+        );
+        assert_eq!(
+            run(false),
+            2,
+            "a delivery that is never confirmed must still be re-submitted once the floor passes \
+             — the fix must not trade the double submit for a missing one"
         );
     }
 
@@ -40100,8 +40957,8 @@ mod tests {
         );
     }
 
-    /// Scenario: Table-driven unit test of the pure `scope_command_entry_lock`
-    /// function over the full cross product of `is_orchestration_tab`
+    /// Scenario: Table-driven unit test of the pure `scope_orchestration_chord`
+    /// function, scoping `ToggleOrchestrationLock`, over the full cross product of `is_orchestration_tab`
     /// (true/false) x every `UiMode` variant x the action being
     /// `ToggleOrchestrationLock`, some other action (`Quit`), or `None`.
     /// Confirms `ToggleOrchestrationLock` survives ONLY at
@@ -40115,6 +40972,15 @@ mod tests {
     #[test]
     fn lock_001_scope_command_entry_lock_claims_only_when_orchestration_and_normal_mode() {
         let modes = all_ui_modes();
+        // The helper under test, fixed to the chord this test is about.
+        let scope_command_entry_lock = |action, is_orchestration_tab, mode| {
+            scope_orchestration_chord(
+                action,
+                Action::ToggleOrchestrationLock,
+                is_orchestration_tab,
+                mode,
+            )
+        };
 
         for is_orchestration_tab in [true, false] {
             for &mode in &modes {
@@ -41654,5 +42520,421 @@ mod pane_closure_tests {
         announce(&state, pc.as_ref(), &mut tab_manager, &mut ui, "lead", "1");
         assert!(pc.holds("lead"));
         assert_eq!(tab_manager.tab_count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod config_drift_tests {
+    //! Issue #554: an orchestration tab rebuilt from daemon role metadata that
+    //! no longer matches `.dot-agent-deck.toml` is surfaced, not silent.
+    use super::*;
+    use crate::project_config::OrchestrationRoleConfig;
+
+    struct NoopPC;
+    impl PaneController for NoopPC {
+        fn focus_pane(&self, _id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(vec![])
+        }
+        fn resize_pane(
+            &self,
+            _i: &str,
+            _d: crate::pane::PaneDirection,
+            _a: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _i: &str, n: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::Applied(n.to_string()))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _i: &str, _t: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "noop"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn role(name: &str, start: bool) -> OrchestrationRoleConfig {
+        OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: format!("echo {name}"),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        }
+    }
+
+    fn config(name: &str, roles: &[&str]) -> OrchestrationConfig {
+        OrchestrationConfig {
+            default: false,
+            name: name.to_string(),
+            roles: roles
+                .iter()
+                .enumerate()
+                .map(|(i, r)| role(r, i == 0))
+                .collect(),
+        }
+    }
+
+    /// A bucket as the daemon reports it: `slots` are `(role_index, role_name)`
+    /// pairs, each on its own pane.
+    fn bucket(name: &str, slots: &[(usize, &str)]) -> OrchestrationHydrationBucket {
+        OrchestrationHydrationBucket {
+            cwd: "/work/proj".into(),
+            orchestration_name: name.into(),
+            display_title: None,
+            orchestration_id: None,
+            role_slots: slots
+                .iter()
+                .map(|(i, r)| OrchestrationRoleSlot {
+                    role_index: *i,
+                    pane_id: format!("p{i}-{r}"),
+                    role_name: r.to_string(),
+                    is_start_role: *i == 0,
+                })
+                .collect(),
+        }
+    }
+
+    /// PRD #111's motivating case: a laptop TUI on a remote daemon whose cwd has
+    /// no local config. Synthesis is the right answer and must stay quiet, or
+    /// every remote reconnect would be spammed.
+    #[test]
+    fn drift_warning_is_silent_when_the_config_file_is_absent() {
+        let b = bucket("review", &[(0, "lead"), (1, "coder")]);
+        assert_eq!(
+            orchestration_config_drift_warning(LocalOrchestrationConfig::Absent, &b),
+            None
+        );
+    }
+
+    /// The issue's reported case: the file was read and does not list the
+    /// orchestration (renamed or removed). The warning names the orchestration,
+    /// its cwd, the file, and the roles the tab is actually showing.
+    #[test]
+    fn drift_warning_names_an_orchestration_the_file_no_longer_lists() {
+        let b = bucket("review", &[(1, "coder"), (0, "lead")]);
+        let warning =
+            orchestration_config_drift_warning(LocalOrchestrationConfig::Loaded(None), &b)
+                .expect("a config that does not list the orchestration is drift");
+        for needle in [
+            "config drift",
+            "'review'",
+            "/work/proj",
+            ".dot-agent-deck.toml",
+            "(lead, coder)",
+            "dot-agent-deck delegate",
+        ] {
+            assert!(
+                warning.contains(needle),
+                "warning must contain {needle:?}: {warning}"
+            );
+        }
+    }
+
+    /// Qodo on PR #1281: a file that exists but fails to load falls back to the
+    /// daemon's roles exactly like an absent one, and must not be quiet like it.
+    #[test]
+    fn drift_warning_names_a_config_file_that_failed_to_load() {
+        let b = bucket("review", &[(0, "lead"), (1, "coder")]);
+        let warning = orchestration_config_drift_warning(
+            LocalOrchestrationConfig::Unreadable("TOML parse error at line 3"),
+            &b,
+        )
+        .expect("an unreadable config is drift, not the quiet remote case");
+        for needle in [
+            "/work/proj/.dot-agent-deck.toml",
+            "could not be loaded",
+            "TOML parse error at line 3",
+            "'review'",
+            "(lead, coder)",
+        ] {
+            assert!(
+                warning.contains(needle),
+                "warning must contain {needle:?}: {warning}"
+            );
+        }
+    }
+
+    /// Qodo on PR #1281: a daemon older than PRD #111 echoes no role name, and
+    /// the warning must not present the synthesised `role-{i}` card label as a
+    /// name the daemon routes by.
+    #[test]
+    fn drift_warning_does_not_invent_names_for_unnamed_slots() {
+        let b = bucket("review", &[(0, ""), (1, "coder")]);
+        let warning = orchestration_config_drift_warning(
+            LocalOrchestrationConfig::Unreadable("parse error"),
+            &b,
+        )
+        .expect("drift");
+        assert!(
+            warning.contains("(<unnamed role at slot 0>, coder)"),
+            "{warning}"
+        );
+        assert!(!warning.contains("role-0"), "{warning}");
+    }
+
+    /// Qodo on PR #1281: a role renamed in the file while its tab is open is
+    /// caught when another role is later spawned into that tab.
+    #[test]
+    fn grown_tab_drift_names_tab_roles_the_file_no_longer_lists() {
+        let local = config("review", &["lead", "qa", "tester"]);
+        let warning = grown_orchestration_tab_drift_warning(
+            &["lead", "coder"],
+            &local,
+            "review",
+            "/work/proj",
+        )
+        .expect("a tab role the file no longer lists is drift");
+        assert!(
+            warning.contains("(coder)") && warning.contains("(lead, qa, tester)"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("'review'") && warning.contains("/work/proj"),
+            "{warning}"
+        );
+    }
+
+    /// Qodo on PR #1281: a dead-slot placeholder has no daemon pane, so a role
+    /// removed from the file while its slot is dead is not drift.
+    #[test]
+    fn live_tab_role_names_skip_dead_slot_placeholders() {
+        let cfg = config("review", &["lead", "coder", "tester"]);
+        let mut ids = vec![
+            Some("p-lead".to_string()),
+            None,
+            Some("p-tester".to_string()),
+        ];
+        let _ = assign_synthetic_dead_slot_ids(
+            &mut ids,
+            &crate::state::OrchestrationIdentity::NameCwd {
+                name: "review".into(),
+                cwd: "/w".into(),
+            },
+        );
+        let ids: Vec<String> = ids.into_iter().map(|p| p.expect("filled")).collect();
+        assert!(
+            is_dead_slot_pane_id(&ids[1]),
+            "precondition: slot 1 is a dead slot"
+        );
+        let live = live_tab_role_names(&cfg, &ids);
+        assert_eq!(live, vec!["lead", "tester"]);
+        // `coder` (dead) was removed from the file: not drift.
+        let local = config("review", &["lead", "tester"]);
+        assert_eq!(
+            grown_orchestration_tab_drift_warning(&live, &local, "review", "/w"),
+            None
+        );
+    }
+
+    /// Issue #1096's supported workflow — insert a role mid-list and spawn it
+    /// into the running orchestration — shifts indices but renames nothing, and
+    /// must not read as drift.
+    #[test]
+    fn grown_tab_drift_is_silent_for_a_role_inserted_mid_list() {
+        let local = config("review", &["lead", "reviewer", "coder"]);
+        assert_eq!(
+            grown_orchestration_tab_drift_warning(&["lead", "coder"], &local, "review", "/w"),
+            None
+        );
+    }
+
+    /// The control: a file that lists the orchestration with the same role
+    /// names at the same indices is not drift.
+    #[test]
+    fn drift_warning_is_silent_when_the_file_matches_the_running_roles() {
+        let local = config("review", &["lead", "coder", "tester"]);
+        // A dead `tester` slot is absent from the bucket; that is not drift.
+        let b = bucket("review", &[(0, "lead"), (1, "coder")]);
+        assert_eq!(
+            orchestration_config_drift_warning(LocalOrchestrationConfig::Loaded(Some(&local)), &b),
+            None
+        );
+    }
+
+    /// The misroute the issue's follow-up describes: a role renamed in the file
+    /// while the orchestration runs. The daemon still routes by the old name, so
+    /// the warning must name both lists.
+    #[test]
+    fn drift_warning_names_both_role_lists_after_a_role_rename() {
+        let local = config("review", &["lead", "qa"]);
+        let b = bucket("review", &[(0, "lead"), (1, "tester")]);
+        let warning =
+            orchestration_config_drift_warning(LocalOrchestrationConfig::Loaded(Some(&local)), &b)
+                .expect("a renamed role is drift");
+        assert!(
+            warning.contains("(lead, tester)") && warning.contains("(lead, qa)"),
+            "warning must name the running and the configured roles: {warning}"
+        );
+        assert!(
+            warning.contains("'review'") && warning.contains("/work/proj"),
+            "{warning}"
+        );
+    }
+
+    /// A role removed from the end of the file leaves a live slot past the
+    /// configured roles — drift, even though every configured name matches.
+    /// The rebuild drops such a slot from the tab (Greptile on PR #1281), so
+    /// the warning must say it is left out rather than relabelled.
+    #[test]
+    fn drift_warning_fires_for_a_live_slot_past_the_configured_roles() {
+        let local = config("review", &["lead"]);
+        let b = bucket("review", &[(0, "lead"), (1, "coder")]);
+        let warning =
+            orchestration_config_drift_warning(LocalOrchestrationConfig::Loaded(Some(&local)), &b)
+                .expect("a live slot past the configured roles is drift");
+        assert!(warning.contains("leaves out coder"), "{warning}");
+        assert!(
+            !warning.contains("its tab labels them from the file"),
+            "{warning}"
+        );
+    }
+
+    /// A daemon older than PRD #111 echoes no role name. That says nothing about
+    /// the file, so it must not read as drift.
+    #[test]
+    fn drift_warning_skips_slots_with_no_recorded_role_name() {
+        let local = config("review", &["lead", "coder"]);
+        let b = bucket("review", &[(0, ""), (1, "coder")]);
+        assert_eq!(
+            orchestration_config_drift_warning(LocalOrchestrationConfig::Loaded(Some(&local)), &b),
+            None
+        );
+    }
+
+    /// Duplicate indices are first-wins everywhere else in hydration, so the
+    /// reported running roles must be too — the names in the warning are the
+    /// ones the tab was built from.
+    #[test]
+    fn drift_warning_reports_the_first_slot_of_a_duplicate_index() {
+        let b = bucket("review", &[(0, "lead"), (0, "impostor"), (1, "coder")]);
+        let warning =
+            orchestration_config_drift_warning(LocalOrchestrationConfig::Loaded(None), &b)
+                .expect("drift");
+        assert!(warning.contains("(lead, coder)"), "{warning}");
+        assert!(!warning.contains("impostor"), "{warning}");
+    }
+
+    #[test]
+    fn orchestration_tab_label_appends_the_marker_after_the_status() {
+        assert_eq!(
+            orchestration_tab_label(
+                "review",
+                &OrchestrationStatus::WaitingForOrchestrator,
+                false
+            ),
+            "review"
+        );
+        assert_eq!(
+            orchestration_tab_label("review", &OrchestrationStatus::Delegated, false),
+            "review [active]"
+        );
+        assert_eq!(
+            orchestration_tab_label("review", &OrchestrationStatus::Completed, true),
+            "! review [done] [config drift]"
+        );
+        assert_eq!(
+            orchestration_tab_label("review", &OrchestrationStatus::WaitingForOrchestrator, true),
+            "! review [config drift]"
+        );
+    }
+
+    /// The surfacing: the tab the rebuild opened is marked (and only that tab),
+    /// the status line explains the marker, and the full warning joins the
+    /// exit warnings the snapshot-restore path already uses for this class.
+    #[test]
+    fn surfacing_marks_the_tab_sets_the_status_line_and_queues_the_warning() {
+        let mut tab_manager = TabManager::new(Arc::new(NoopPC));
+        let (drifted, _) = tab_manager
+            .open_orchestration_tab_with_existing_role_panes(
+                &config("review", &["lead", "coder"]),
+                "/work/proj",
+                vec![Some("a0".into()), Some("a1".into())],
+                None,
+                None,
+            )
+            .expect("open drifted tab");
+        let (clean, _) = tab_manager
+            .open_orchestration_tab_with_existing_role_panes(
+                &config("build", &["lead", "coder"]),
+                "/work/other",
+                vec![Some("b0".into()), Some("b1".into())],
+                None,
+                None,
+            )
+            .expect("open clean tab");
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+
+        surface_orchestration_config_drift(
+            &mut ui,
+            tab_manager.tabs().get(drifted),
+            "Warning: config drift — the full text".to_string(),
+        );
+
+        let id_of = |index: usize| match &tab_manager.tabs()[index] {
+            Tab::Orchestration { id, .. } => *id,
+            _ => panic!("tab {index} is not an orchestration tab"),
+        };
+        assert!(ui.config_drift_tabs.contains(&id_of(drifted)));
+        assert!(
+            !ui.config_drift_tabs.contains(&id_of(clean)),
+            "only the rebuilt tab may carry the marker"
+        );
+        let (status, _) = ui.status_message.as_ref().expect("status line set");
+        assert!(
+            status.contains(CONFIG_DRIFT_TAB_MARKER) && status.contains(".dot-agent-deck.toml"),
+            "the status line must explain the marker: {status}"
+        );
+        assert_eq!(
+            ui.session_warnings,
+            vec!["Warning: config drift — the full text".to_string()]
+        );
+
+        // The label the render loop builds for each tab.
+        let labels: Vec<String> = tab_manager
+            .tabs()
+            .iter()
+            .filter_map(|tab| match tab {
+                Tab::Orchestration {
+                    id, name, status, ..
+                } => Some(orchestration_tab_label(
+                    name,
+                    status,
+                    ui.config_drift_tabs.contains(id),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, vec!["! review [config drift]", "build"]);
+    }
+
+    /// A tab that is not an orchestration tab (or none at all) must not be
+    /// marked, and the status line must not claim a marker it did not place.
+    #[test]
+    fn surfacing_without_an_orchestration_tab_records_the_warning_unmarked() {
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        surface_orchestration_config_drift(&mut ui, None, "w".to_string());
+        assert!(ui.config_drift_tabs.is_empty());
+        let (status, _) = ui.status_message.as_ref().expect("status line set");
+        assert!(!status.contains(CONFIG_DRIFT_TAB_MARKER), "{status}");
+        assert_eq!(ui.session_warnings, vec!["w".to_string()]);
     }
 }

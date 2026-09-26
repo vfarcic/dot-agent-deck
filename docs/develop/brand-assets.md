@@ -11,7 +11,7 @@ The Agent Deck mark is one symbol — a stack of three terminal windows fanning 
 | `assets/brand/reference/gpt-original.png` | the GPT-generated image the symbol was traced from | kept for reference only; nothing reads it |
 | `site/static/img/logo.svg` | docs navbar logo (`site/docusaurus.config.js`) | copy of the master, `scripts/brand-icons.sh` |
 | `site/static/img/favicon.ico` | docs favicon, frames at 16/24/32/48/64/256px | copy of the Tauri `icon.ico`, `scripts/brand-icons.sh` |
-| `desktop/src/assets/logo.svg` | the desktop rail badge (`desktop/src/components/BrandMark.tsx`) | copy of the master, `scripts/brand-icons.sh` |
+| `desktop/src/assets/logo.svg` | the desktop rail badge (`desktop/src/components/NavigationRail.tsx`) | copy of the master, `scripts/brand-icons.sh` |
 | `desktop/src-tauri/icons/*` | the desktop app icon set: `icon.png`, `32x32.png`, `64x64.png`, `128x128.png`, `128x128@2x.png`, `icon.icns` (macOS), `icon.ico` (Windows) | `tauri icon`, via `scripts/brand-icons.sh` |
 
 Every copy is a copy: **edit the master, never a derived file**, then regenerate. A derived file edited in place is silently overwritten by the next regeneration.

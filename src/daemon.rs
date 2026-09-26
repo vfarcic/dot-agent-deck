@@ -2953,14 +2953,26 @@ async fn run_hook_loop_with_idle_timeout(
                                     // put the role registration back. The read guard
                                     // below is released before the detached dispatch
                                     // task ever takes the write lock.
+                                    // Issue #580 review (Qodo, #1285): the
+                                    // sender the gate attested, so the busy
+                                    // check cannot re-resolve a predecessor's
+                                    // delegate onto a successor that took the
+                                    // pane in between.
+                                    let sender_agent_id = match &provenance {
+                                        crate::hook_provenance::Provenance::Attested {
+                                            agent_id,
+                                        } => Some(agent_id.clone()),
+                                        _ => None,
+                                    };
                                     let resp = state
                                         .read()
                                         .await
-                                        .handle_delegate_with_state(
+                                        .handle_attested_delegate(
                                             signal,
                                             &pty_registry,
                                             &event_tx,
                                             Some(&state),
+                                            sender_agent_id.as_deref(),
                                         )
                                         .await;
                                     // Answer on the same connection, like
@@ -5785,6 +5797,7 @@ mod hook_ingestion_tests {
                 pane_id: claimed_pane.to_string(),
                 task: "PROVENANCE-TASK".to_string(),
                 to: vec!["worker".to_string()],
+                supersede: false,
                 timestamp: chrono::Utc::now(),
                 token: token.map(str::to_string),
             });
