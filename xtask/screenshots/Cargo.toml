@@ -1,0 +1,30 @@
+[package]
+name = "xtask-screenshots"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Issue #1322: regenerate the docs screenshots of both clients from code.
+# `cargo docs-screenshots` (alias in `.cargo/config.toml`) runs the binary;
+# `docs/develop/docs-screenshots.md` is the maintainer page.
+#
+# The library half is the vt100 → HTML renderer and the scenario registry.
+# The root package takes it as a path dev-dependency so the TUI capture in
+# `tests/e2e_docs_screenshots.rs` can hand it the harness's `vt100::Screen`
+# directly — which is why `vt100` here is the same `0.16` the root package
+# pins: two versions would be two unrelated `Screen` types.
+#
+# Its own crate rather than an arm of the `cargo xtask` multiplexer for the
+# reason `xtask/cross-version` gives: `xtask-linkage-check` should not build a
+# terminal emulator it never uses.
+
+[lib]
+name = "xtask_screenshots"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xtask-screenshots"
+path = "src/main.rs"
+
+[dependencies]
+vt100 = "0.16"

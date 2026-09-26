@@ -1373,6 +1373,36 @@ impl TuiDeck {
         }
     }
 
+    /// Issue #1322: wait until `capture` returns `Some` for the outer vt100
+    /// screen, and return what it returned. `capture` runs under the parser
+    /// lock, so the frame it inspects is the frame it captures — a blink or a
+    /// redraw cannot land between deciding the screen is ready and reading it,
+    /// which [`Self::wait_until_grid`] followed by a separate read cannot
+    /// promise. Panics after the harness timeout, naming `what`.
+    pub fn capture_screen_when<R>(
+        &self,
+        what: &str,
+        capture: impl Fn(&vt100::Screen) -> Option<R>,
+    ) -> R {
+        install_credential_redaction();
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            {
+                let parser = self.parser.lock().unwrap();
+                if let Some(captured) = capture(parser.screen()) {
+                    return captured;
+                }
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "did not reach screen state {what:?} within {WAIT_TIMEOUT:?}.\nFinal grid:\n{}",
+                    self.snapshot_grid()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Wait for an observable grid state, then keep asserting that it remains
     /// visible for `hold_for`. Recording-focused E2E scenarios use this for
     /// deliberate demo beats without putting raw sleeps in test bodies.
