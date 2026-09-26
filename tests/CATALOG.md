@@ -2029,7 +2029,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** as `hooks/install/007`.
 - **Agent:** none (no install seeded).
 - **Asserts:** with no `$HOME/.local/bin/dot-agent-deck` and no deck on the child's `PATH`, the command still succeeds and every deck-owned command in `~/.claude/settings.json` names the running binary. This is the third arm of the resolver's policy and the counterweight to `007`: preferring an install over a scratch copy is #1140's fix, but refusing the scratch copy when there is no install buys no agent hooks at all on a machine whose only deck is that binary — a packaged desktop running its bundled sidecar. A **cargo artifact** still refuses in the same situation, which is what separates "known ephemeral" from "not vouched for" (`hooks/install/005`).
-- **Does not assert:** the `tracing::warn!` the last-resort pin emits (unit-covered in `platform::paths`); the desktop bundle layouts themselves (#1157).
+- **Does not assert:** the `tracing::warn!` the last-resort pin emits (unit-covered in `platform::paths`); that the packaged desktop's daemon reaches this install at all — that is `hooks/install/009`.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/009 — A headless `daemon serve`, which is all the packaged desktop starts, installs Claude Code's hooks and the OpenCode plugin (issue #1157).
+- **Layer:** L2 (the REAL binary as a `daemon serve` subprocess against an isolated `HOME` and sockets; no PTY, no TUI, no LLM).
+- **Agent:** none (the freshly built binary is the subject, hard-linked — or copied across a device boundary — to `…/Agent Deck.app/Contents/MacOS/dot-agent-deck`, the v0.42.0 `.dmg`'s sidecar layout, space included; `~/.claude/` and `~/.opencode/` seeded; no install and an empty `PATH`).
+- **Asserts:** once the daemon binds its attach socket, every deck-owned command in `~/.claude/settings.json` names the sidecar, single-quoted because the path holds a space, and the OpenCode plugin's `BINARY_PATH` names it too. Until #1157 only the TUI ran the Claude Code and OpenCode installers, so a desktop-only user — whose desktop starts its bundled sidecar as `daemon serve` and never launches a TUI — got neither; measured against the v0.42.0 `.deb`'s sidecar before the fix.
+- **Does not assert:** the Codex and Devin installers, which `daemon serve` already ran (`hooks/install/004`–`006` cover their writers); the desktop app's own spawn of the sidecar (`daemon_bridge::resolve_daemon_executable`, which needs a display and WebKitGTK); where macOS's `current_exe()` actually points for an installed or translocated bundle, which is unverified (#1157).
 - **Platform coverage:** mac+linux.
 
 ### Pane / agent lifecycle
