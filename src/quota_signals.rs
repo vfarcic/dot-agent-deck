@@ -186,17 +186,22 @@ pub fn read_claude_transcript_tail(path: &str) -> Option<Vec<u8>> {
 pub struct OpenCodeErrorFields {
     /// `error.name`, e.g. `APIError`.
     pub error_name: Option<String>,
-    /// `error.data.responseBody`, truncated by the plugin.
-    pub response_body: Option<String>,
+    /// The marker keys of `error.data.responseBody`, which the plugin parses
+    /// WHOLE and reduces to the keys below, at the same paths — never a
+    /// truncated copy of the body, which a long provider error would turn into
+    /// invalid JSON. `None` when the body was absent, not a JSON object, or too
+    /// large for the plugin to parse.
+    pub response_markers: Option<Value>,
     /// The allow-listed response headers, names lowercased.
     pub response_headers: HashMap<String, String>,
 }
 
 /// Classify an OpenCode `session.error`.
 ///
-/// Only an `APIError` is considered, and only these key-anchored markers block;
-/// the response body is parsed as JSON and a body that is not JSON counts as no
-/// body:
+/// Only an `APIError` is considered, and only these key-anchored markers block.
+/// The body keys are read from [`OpenCodeErrorFields::response_markers`], which
+/// the plugin extracts from the whole body; a body that is not JSON arrives as
+/// no markers:
 ///
 /// | marker | outcome |
 /// | --- | --- |
@@ -233,12 +238,8 @@ pub fn classify_opencode_error(fields: &OpenCodeErrorFields, now_ms: i64) -> Fai
             .filter(|&ms| ms > 0)
             .map(|ms| now_ms.saturating_add(ms))
     };
-    let body: Option<Value> = fields
-        .response_body
-        .as_deref()
-        .and_then(|b| serde_json::from_str::<Value>(b).ok())
-        .filter(Value::is_object);
-    let error = body.as_ref().and_then(|b| b.get("error"));
+    let body: Option<&Value> = fields.response_markers.as_ref().filter(|b| b.is_object());
+    let error = body.and_then(|b| b.get("error"));
     fn at<'a>(v: Option<&'a Value>, key: &str) -> Option<&'a str> {
         v.and_then(|v| v.get(key)).and_then(Value::as_str)
     }
@@ -272,8 +273,8 @@ pub fn classify_opencode_error(fields: &OpenCodeErrorFields, now_ms: i64) -> Fai
     }
     let named = |marker: &str| {
         [
-            at(body.as_ref(), "type"),
-            at(body.as_ref(), "name"),
+            at(body, "type"),
+            at(body, "name"),
             err_type,
             at(error, "name"),
             err_code,
@@ -743,10 +744,12 @@ mod tests {
         );
     }
 
+    /// `body` is a provider response body as text; like the plugin, a body
+    /// that is not JSON yields no markers.
     fn opencode(body: Option<&str>, headers: &[(&str, &str)]) -> OpenCodeErrorFields {
         OpenCodeErrorFields {
             error_name: Some("APIError".to_string()),
-            response_body: body.map(str::to_owned),
+            response_markers: body.and_then(|b| serde_json::from_str(b).ok()),
             response_headers: headers
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

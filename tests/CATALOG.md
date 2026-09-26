@@ -598,7 +598,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### status/blocked/016 — The OpenCode plugin forwards only selected structured error fields (issue #714).
 - **Layer:** L1 unit (src/opencode_manage.rs; Node stand-in).
 - **Agent:** none.
-- **Asserts:** session.error forwards typed fields, capped provider body and allow-listed headers.
+- **Asserts:** session.error forwards typed fields, allow-listed headers and, instead of the provider body, only the body's classifier marker keys (`type`/`name`, and `error.type`/`code`/`name`/`resets_at`/`resets_in_seconds`), parsed from the whole body. The body is over 8 KiB with its marker after a long message, and the recorded payload classifies as `QuotaBlocked` through `build_opencode_event` — the regression Qodo found on PR #1346, where an 8 KiB truncation made such a body invalid JSON and it classified as `Error`.
 - **Does not assert:** a real OpenCode process.
 - **Platform coverage:** mac+linux when Node is available (the recorder is a Unix shell script).
 

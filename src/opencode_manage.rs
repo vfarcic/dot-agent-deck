@@ -213,7 +213,53 @@ const cleanupSessionMessages = (sessionId) => {{
 // `quota_signals::classify_opencode_error`). Every read is guarded and every
 // value type-checked, so a changed OpenCode error shape degrades to sending no
 // fields, which the deck reads as a plain error. Only allow-listed response
-// headers are forwarded, each value bounded, and the body is bounded too.
+// headers are forwarded, each value bounded.
+//
+// The response body is NOT forwarded. It is parsed here, whole, and only the
+// marker keys the classifier reads are forwarded, at the same paths, as
+// `response_markers`: `type` and `name` at the top level, and `type`, `code`,
+// `name`, `resets_at` and `resets_in_seconds` under `error`. Classifying a
+// truncated copy instead would turn a long but valid provider error into
+// invalid JSON and lose its markers (Qodo on PR #1346). Strings are bounded,
+// numbers must be finite, and a body over MAX_PARSED_BODY characters is not
+// parsed at all, which the deck reads as a plain error.
+const MAX_PARSED_BODY = 1024 * 1024;
+const markerString = (value) => (typeof value === "string" ? value.slice(0, 200) : undefined);
+const markerNumber = (value) =>
+  typeof value === "number" && Number.isFinite(value) ? value : undefined;
+const isPlainObject = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+const responseMarkers = (body) => {{
+  if (typeof body !== "string" || body.length > MAX_PARSED_BODY) {{
+    return undefined;
+  }}
+  let parsed;
+  try {{
+    parsed = JSON.parse(body);
+  }} catch (_) {{
+    return undefined;
+  }}
+  if (!isPlainObject(parsed)) {{
+    return undefined;
+  }}
+  const put = (target, key, value) => {{
+    if (value !== undefined) {{
+      target[key] = value;
+    }}
+  }};
+  const out = {{}};
+  put(out, "type", markerString(parsed.type));
+  put(out, "name", markerString(parsed.name));
+  if (isPlainObject(parsed.error)) {{
+    const error = {{}};
+    put(error, "type", markerString(parsed.error.type));
+    put(error, "code", markerString(parsed.error.code));
+    put(error, "name", markerString(parsed.error.name));
+    put(error, "resets_at", markerNumber(parsed.error.resets_at));
+    put(error, "resets_in_seconds", markerNumber(parsed.error.resets_in_seconds));
+    out.error = error;
+  }}
+  return out;
+}};
 const ERROR_HEADER_ALLOW = new Set(["retry-after", "retry-after-ms", "x-codex-rate-limit-reached-type"]);
 const ERROR_HEADER_PREFIX = "anthropic-ratelimit-unified-";
 const errorFields = (error) => {{
@@ -228,8 +274,9 @@ const errorFields = (error) => {{
   if (typeof data.message === "string") {{
     out.error_message = data.message.slice(0, 500);
   }}
-  if (typeof data.responseBody === "string") {{
-    out.response_body = data.responseBody.slice(0, 8192);
+  const markers = responseMarkers(data.responseBody);
+  if (markers !== undefined) {{
+    out.response_markers = markers;
   }}
   const headers =
     data.responseHeaders && typeof data.responseHeaders === "object" ? data.responseHeaders : {{}};
@@ -1449,9 +1496,10 @@ mod tests {
 
     /// Scenario: Load the generated plugin under Node with its binary pinned to
     /// a recorder script, and send it a `session.error` whose error carries a
-    /// status, a JSON body, and a mix of allowed and other response headers.
-    /// The recorded payload carries the typed fields and only the allow-listed
-    /// headers; an error of an unexpected shape forwards no fields.
+    /// status, a JSON body over 8 KiB, and a mix of allowed and other response
+    /// headers. The recorded payload carries the typed fields, only the body's
+    /// marker keys, and only the allow-listed headers, and the deck classifies
+    /// it as Blocked; an error of an unexpected shape forwards no fields.
     #[cfg(unix)]
     #[spec("status/blocked/016")]
     #[test]
@@ -1491,7 +1539,8 @@ const hooks = await plugin({{ directory: "/work" }});
 await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: "s1", error: {{
   name: "APIError",
   data: {{ message: "The usage limit has been reached", statusCode: 429, isRetryable: true,
-    responseBody: JSON.stringify({{ error: {{ type: "usage_limit_reached", resets_at: 1790001000 }} }}) + "x".repeat(9000),
+    responseBody: JSON.stringify({{ type: "error", error: {{ message: "x".repeat(9000),
+      type: "usage_limit_reached", resets_at: 1790001000, code: 7, param: "model" }}, request_id: "r1" }}),
     responseHeaders: {{ "Retry-After": "60", "x-codex-rate-limit-reached-type": "workspace_member_usage_limit_reached",
       "anthropic-ratelimit-unified-status": "rejected", "set-cookie": "secret", "authorization": "Bearer nope",
       "x-request-id": "r1" }},
@@ -1530,10 +1579,28 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
             structured["error_message"],
             "The usage limit has been reached"
         );
+        assert!(
+            structured.get("response_body").is_none(),
+            "the raw body is not forwarded: {structured}"
+        );
+        // Qodo on PR #1346: the body is over 8 KiB and carries its marker after
+        // the long message, so a truncated copy would have been invalid JSON.
+        // Only the classifier's keys survive, each with its type checked.
         assert_eq!(
-            structured["response_body"].as_str().unwrap().len(),
-            8192,
-            "the body is bounded"
+            structured["response_markers"],
+            serde_json::json!({
+                "type": "error",
+                "error": {"type": "usage_limit_reached", "resets_at": 1790001000}
+            })
+        );
+        let hook_input: crate::hook::OpenCodeHookInput =
+            serde_json::from_value(structured.clone()).unwrap();
+        assert_eq!(
+            crate::hook::build_opencode_event(hook_input)
+                .unwrap()
+                .event_type,
+            crate::event::EventType::QuotaBlocked,
+            "the forwarded payload must classify as Blocked"
         );
         let headers = structured["response_headers"].as_object().unwrap();
         let mut names: Vec<&str> = headers.keys().map(String::as_str).collect();
@@ -1552,7 +1619,7 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
         for key in [
             "error_name",
             "error_message",
-            "response_body",
+            "response_markers",
             "response_headers",
         ] {
             assert!(

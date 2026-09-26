@@ -62,7 +62,7 @@ fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct OpenCodeHookInput {
+pub(crate) struct OpenCodeHookInput {
     session_id: String,
     event: String,
     tool_name: Option<String>,
@@ -78,12 +78,19 @@ struct OpenCodeHookInput {
     error_name: Option<String>,
     #[serde(default, deserialize_with = "lenient_string")]
     error_message: Option<String>,
-    #[serde(default, deserialize_with = "lenient_string")]
-    response_body: Option<String>,
+    // The response body's marker keys only, parsed from the WHOLE body by the
+    // plugin (`crate::opencode_manage`), never a truncated copy of it.
+    #[serde(default, deserialize_with = "lenient_object")]
+    response_markers: Option<Value>,
     #[serde(default, deserialize_with = "lenient_string_map")]
     response_headers: HashMap<String, String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
+}
+
+/// [`lenient_string`] for a JSON object: anything else is `None`.
+fn lenient_object<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Ok(Option::<Value>::deserialize(d)?.filter(Value::is_object))
 }
 
 /// [`lenient_string`] for a string map: anything but a JSON object is empty,
@@ -713,7 +720,7 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
     }
 }
 
-fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
+pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     let mut event_type = map_opencode_event_type(&input.event, input.status.as_deref())?;
     let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
     let user_prompt = input.prompt.as_deref().map(record_submitted_prompt);
@@ -748,7 +755,7 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     if input.event == "session.error" {
         let fields = crate::quota_signals::OpenCodeErrorFields {
             error_name: input.error_name,
-            response_body: input.response_body,
+            response_markers: input.response_markers,
             response_headers: input.response_headers,
         };
         if let crate::quota_signals::FailureOutcome::Blocked { kind, resets_at_ms } =
@@ -3505,7 +3512,7 @@ mod tests {
         let opencode: OpenCodeHookInput = serde_json::from_str(
             r#"{"session_id":"oc","event":"session.error","error_name":"APIError",
                 "error_message":"The usage limit has been reached",
-                "response_body":"{\"error\":{\"type\":\"usage_limit_reached\",\"resets_at\":1790001000}}",
+                "response_markers":{"error":{"type":"usage_limit_reached","resets_at":1790001000}},
                 "response_headers":{"Retry-After":"60"}}"#,
         )
         .unwrap();
@@ -3517,7 +3524,7 @@ mod tests {
         );
         let bare: OpenCodeHookInput = serde_json::from_str(
             r#"{"session_id":"oc","event":"session.error","error_name":"APIError",
-                "response_body":"{\"error\":{\"type\":\"rate_limit_error\"}}",
+                "response_markers":{"error":{"type":"rate_limit_error"}},
                 "response_headers":"not an object"}"#,
         )
         .unwrap();
