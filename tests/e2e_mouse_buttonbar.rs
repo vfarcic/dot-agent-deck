@@ -45,21 +45,13 @@ fn buttonbar_003_click_new_pane_opens_picker() {
     deck.wait_for_string("Select Directory");
 }
 
-/// Scenario: Seed a global `schedules.toml` (one enabled task, `btnopen`) via
-/// `DOT_AGENT_DECK_SCHEDULES`, launch against the `minimal` fixture, wait for
-/// the empty dashboard, locate the `[Schedules …]` button in the bottom
-/// button bar, and left-click it. The "Schedules" manager dialog must
-/// open — demonstrating click→action parity for the dialog open-shortcut
-/// (PRD #80), just like the `[New Agent Ctrl+N]` button. We confirm the dialog
-/// opened by waiting for the seeded task name `btnopen`, which renders only
-/// inside the dialog's list (not in the button-bar label). RED today: there is
-/// NO Schedules button in the bar (the open-shortcut bypasses the action
-/// registry entirely), so the lookup fails.
+/// Scenario: Seed a schedule, open the empty dashboard, and click its
+/// `[Schedules s]` button. The Schedules manager must show the seeded task,
+/// proving the button opens the same dialog as the keyboard shortcut.
 #[spec("mouse/buttonbar/004")]
 #[test]
-fn buttonbar_004_click_scheduled_tasks_opens_manager() {
-    // PRD #127 finding #4 (RED). Pinned for the coder: the new bar button's
-    // label must START WITH `[Scheduled` (e.g. `[Schedules s]`, mirroring
+fn buttonbar_004_click_schedules_opens_manager() {
+    // The bar button's label starts with `[Schedules` (e.g. `[Schedules s]`, mirroring
     // the inline-shortcut convention of `[New Agent Ctrl+N]` / `[Help ?]`), so
     // this black-box lookup finds it.
     let dir = common::harness_tempdir().expect("scratch tempdir");
@@ -84,7 +76,7 @@ fn buttonbar_004_click_scheduled_tasks_opens_manager() {
     deck.wait_for_string("No active agents");
 
     // Find the Schedules button by its on-screen label and click inside it.
-    let (col, row) = deck.wait_for_in_grid("[Scheduled");
+    let (col, row) = deck.wait_for_in_grid("[Schedules");
     deck.click(col + 1, row);
 
     // Same outcome as the keyboard open-shortcut: the manager dialog opens,

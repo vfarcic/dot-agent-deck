@@ -129,26 +129,17 @@ fn buttonbar_002_narrow_terminal_wraps_keeping_full_labels() {
     );
 }
 
-/// Scenario: Render the dashboard button bar at a comfortable 200-column
-/// width with ZERO schedules configured — the seam drives
-/// `dashboard_context_buttons` with `has_schedules = false` (an empty global
-/// `schedules.toml`, no `DOT_AGENT_DECK_SCHEDULES` tasks). Even with no
-/// schedules the bottom bar must show the Schedules open button (a
-/// label starting `[Scheduled`, carrying its `s` shortcut), because that
-/// button opens the manager — which is itself how you CREATE the first
-/// schedule (its `[Add a]` action works on an empty list). The 200-col width
-/// fits the full global+context bar, so this isolates the `has_schedules`
-/// gate rather than the bar's overflow / shortcut-only behavior. RED today:
-/// the `if has_schedules` gate in `dashboard_context_buttons` omits the
-/// button when the schedule list is empty.
+/// Scenario: Render the dashboard button bar at 200 columns with no schedules
+/// configured. It must show the `[Schedules s]` manager button so a user can
+/// create the first schedule.
 #[spec("mouse/buttonbar/005")]
 #[test]
-fn buttonbar_005_scheduled_tasks_button_present_with_zero_schedules() {
+fn buttonbar_005_schedules_button_present_with_zero_schedules() {
     let buffer = render_button_bar_with_bindings_to_buffer(&KeybindingConfig::default(), 200, 1);
     let bar = row_text(&buffer);
 
     assert!(
-        bar.contains("[Scheduled"),
+        bar.contains("[Schedules"),
         "dashboard button bar must show the Schedules open button even with \
          zero schedules (the manager it opens is how you create the first one), got {bar:?}"
     );
