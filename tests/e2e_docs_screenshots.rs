@@ -88,19 +88,43 @@ fn launch_with(customize: impl FnOnce(TuiDeckBuilder) -> TuiDeckBuilder) -> TuiD
 /// Wait until `ready` holds for the frame, render that same frame, and write
 /// it as `<scenario>-tui.html`.
 fn capture(deck: &TuiDeck, scenario: &str, ready: impl Fn(&str) -> bool) {
+    let captured = capture_unless(deck, scenario, ready, || false);
+    assert!(
+        captured,
+        "a capture that never gives up returned without one"
+    );
+}
+
+/// [`capture`], except that it stops waiting and returns `false`, writing
+/// nothing, once `give_up` holds before `ready` does. `ready` is checked
+/// first, so a frame that is ready is written even as `give_up` turns true.
+/// Returns `true` once the frame is written; the harness's timeout still
+/// panics with the final grid if neither ever holds.
+fn capture_unless(
+    deck: &TuiDeck,
+    scenario: &str,
+    ready: impl Fn(&str) -> bool,
+    give_up: impl Fn() -> bool,
+) -> bool {
     let page = deck.capture_screen_when(scenario, |screen| {
-        ready(&screen.contents()).then(|| {
-            render_page(
+        if ready(&screen.contents()) {
+            Some(Some(render_page(
                 screen,
                 &format!("{scenario} (TUI)"),
                 &RenderOptions::default(),
-            )
-        })
+            )))
+        } else {
+            give_up().then_some(None)
+        }
     });
+    let Some(page) = page else {
+        return false;
+    };
     let dir = html_dir();
     std::fs::create_dir_all(&dir).expect("create the TUI HTML dir");
     let path = dir.join(format!("{scenario}-tui.html"));
     std::fs::write(&path, page).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    true
 }
 
 /// One agent on the dashboard: the pane it runs in and the hook events that
@@ -265,29 +289,53 @@ const FOCUSED_PANE_LINES: &[&str] = &[
 /// cards' `Dir:` reads the same whichever of the two it shows.
 const LAUNCH_DIR: &str = "storefront";
 
-/// Write each agent's transcript and the script its pane runs under `dir`, and
-/// return the script path per agent. The script records the NAMES of the
-/// variables in its environment (never a value), so the capture can prove no
-/// agent credential reached the panes, prints the transcript, and then stays
-/// up so the pane stays open.
-fn write_stand_ins(dir: &Path) -> Vec<PathBuf> {
+/// The script every stand-in pane runs, the same text for every agent: it
+/// takes the file to record its environment's variable names in as `$1` and
+/// the transcript to print as `$2`, so no path is ever spliced into it. It
+/// records the NAMES and never a value, so the capture can prove no agent
+/// credential reached the panes: awk's `ENVIRON` is built from the process's
+/// environment entries, each split on its first `=`, and the loop prints only
+/// the keys, so a value — newlines included — is never written anywhere. Then
+/// it prints the transcript and stays up so the pane stays open.
+const STAND_IN_SCRIPT: &str = "awk 'BEGIN { for (name in ENVIRON) print name }' > \"$1\"\n\
+                               cat \"$2\"\n\
+                               exec sleep 600\n";
+
+/// `s` as one POSIX shell word: wrapped in single quotes, with each `'` in it
+/// spelled `'\''` (close the quote, an escaped `'`, reopen). Nothing is
+/// special inside single quotes, so any path — spaces, `$`, backticks,
+/// apostrophes — reaches the command as the one argument it is.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+fn shell_word(path: &Path) -> String {
+    shell_quote(
+        path.to_str()
+            .unwrap_or_else(|| panic!("{} is not UTF-8", path.display())),
+    )
+}
+
+/// Write the stand-in script and each agent's transcript under `dir`, and
+/// return the command each agent's pane runs: [`STAND_IN_SCRIPT`] with that
+/// agent's env-names file and transcript as its arguments, every path quoted
+/// with [`shell_quote`]. The harness temp root is configurable
+/// (`DAD_E2E_TMPDIR`), so the paths are not ours to assume shell-safe.
+fn write_stand_ins(dir: &Path) -> Vec<String> {
     std::fs::create_dir_all(dir).expect("create the stand-in dir");
+    let script = dir.join("stand-in.sh");
+    std::fs::write(&script, STAND_IN_SCRIPT).expect("write the stand-in script");
     DASHBOARD_AGENTS
         .iter()
         .map(|agent| {
             let transcript = dir.join(format!("{}.txt", agent.session));
             std::fs::write(&transcript, agent.transcript).expect("write a transcript");
-            let script = dir.join(format!("{}.sh", agent.session));
-            std::fs::write(
-                &script,
-                format!(
-                    "env | cut -d= -f1 > '{names}'\ncat '{transcript}'\nexec sleep 600\n",
-                    names = env_names_path(dir, agent).display(),
-                    transcript = transcript.display(),
-                ),
+            format!(
+                "sh {} {} {}",
+                shell_word(&script),
+                shell_word(&env_names_path(dir, agent)),
+                shell_word(&transcript),
             )
-            .expect("write a stand-in script");
-            script
         })
         .collect()
 }
@@ -347,6 +395,20 @@ fn send(deck: &TuiDeck, event: serde_json::Value) {
         .expect("write a hook event to the sandbox's hook socket");
 }
 
+/// How many times `docs_screenshot_dashboard` builds its scene before it gives
+/// up. See [`DashboardScene::capture_at`] for what a missed attempt is.
+const DASHBOARD_ATTEMPTS: usize = 3;
+
+/// The `dashboard` scene, staged and waiting for its capture second.
+struct DashboardScene {
+    deck: TuiDeck,
+    /// The whole second, as a Unix timestamp, during which every card's
+    /// `Last:` label reads exactly its agent's `quiet_for_secs`. The frame can
+    /// only be taken inside it, so a staging that ran past it, or a capture
+    /// that never saw every status dot lit inside it, is a missed attempt.
+    capture_at: i64,
+}
+
 /// Scenario: Launch the deck in a sandbox and open four panes through the
 /// new-pane form, each running a stand-in that prints a fixed agent-like
 /// transcript. Focus the working agent's pane and go back to the dashboard,
@@ -354,11 +416,60 @@ fn send(deck: &TuiDeck, event: serde_json::Value) {
 /// events addressed to its pane, one at a time and each confirmed by the
 /// daemon before the next. Once every card shows its name, tool and exact
 /// `Last:` age with every status dot lit, and the focused pane shows its
-/// transcript beside the card column, write the frame as `dashboard-tui.html`.
+/// transcript beside the card column, write the frame as `dashboard-tui.html`;
+/// if that second passes first, build the whole scene again in a fresh
+/// sandbox, up to three times.
 #[test]
 #[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
 fn docs_screenshot_dashboard() {
     html_dir();
+    let lasts: Vec<String> = DASHBOARD_AGENTS
+        .iter()
+        .map(|a| format!("Last: {}s ", a.quiet_for_secs))
+        .collect();
+    let ready = |grid: &str| {
+        DASHBOARD_AGENTS.iter().all(|a| {
+            grid.contains(a.name)
+                && grid.contains(a.prompt)
+                && a.tool.is_none_or(|(_, detail)| grid.contains(detail))
+        }) && lasts.iter().all(|l| grid.contains(l.as_str()))
+            && FOCUSED_PANE_LINES.iter().all(|l| grid.contains(l))
+            && !grid.contains("COMMAND MODE")
+            // Idle and waiting cards blink their status dot by drawing a space
+            // in its place (`flash_dot` in `src/ui.rs`), and nothing else on
+            // this screen draws a `●` (the transcripts are written without
+            // one), so exactly one per card means every dot is lit and the
+            // image never shows a half-blink. A future `●` elsewhere on the
+            // dashboard makes this time out, never pass early.
+            && grid.matches('●').count() == DASHBOARD_AGENTS.len()
+    };
+    // A missed capture second is retried by building the whole scene again,
+    // never by re-stamping the cards: the only events that move a card's
+    // `Last:` also add to what it shows (a second `tool_start` is a second
+    // tool line, a second prompt a second prompt line), so a re-stamped scene
+    // would not be the same image. The last attempt does not give up, so it
+    // fails with the harness's timeout panic and the final grid.
+    for attempt in 1..=DASHBOARD_ATTEMPTS {
+        let scene = stage_dashboard();
+        let last_attempt = attempt == DASHBOARD_ATTEMPTS;
+        // The labels roll over at `capture_at + 1`. A frame drawn inside the
+        // second can still be the latest one shortly after it ends, so give
+        // it until `capture_at + 2` before calling the attempt missed.
+        let missed = || !last_attempt && Utc::now().timestamp() >= scene.capture_at + 2;
+        if capture_unless(&scene.deck, "dashboard", ready, missed) {
+            return;
+        }
+        eprintln!(
+            "docs_screenshot_dashboard: attempt {attempt} of {DASHBOARD_ATTEMPTS} \
+             missed its capture second; building the scene again"
+        );
+    }
+    unreachable!("the last attempt either captures or panics");
+}
+
+/// Stage the `dashboard` scene in a fresh sandbox: open the four panes, focus
+/// [`FOCUSED_AGENT`]'s, and send each agent's stamped events.
+fn stage_dashboard() -> DashboardScene {
     // The events come from this process, which is not the pane and so cannot
     // present the per-pane capability the daemon gives each pane's own agent.
     let deck = launch_with(|builder| {
@@ -368,12 +479,11 @@ fn docs_screenshot_dashboard() {
     });
     deck.wait_for_string("No active sessions");
     let stand_ins = deck.workdir().join("docs-stand-ins");
-    let scripts = write_stand_ins(&stand_ins);
+    let commands = write_stand_ins(&stand_ins);
 
-    let mut last_command = String::new();
-    for (agent, script) in DASHBOARD_AGENTS.iter().zip(&scripts) {
-        let command = format!("sh '{}'", script.display());
-        open_pane(&deck, agent, &command, &last_command);
+    let mut last_command = "";
+    for (agent, command) in DASHBOARD_AGENTS.iter().zip(&commands) {
+        open_pane(&deck, agent, command, last_command);
         last_command = command;
     }
 
@@ -413,22 +523,23 @@ fn docs_screenshot_dashboard() {
     // once a second, and during the second that starts at `capture_at` they
     // read exactly `quiet_for_secs` each. The `ready` check names those
     // labels, so the frame is always taken in that second, and a capture that
-    // somehow missed it times out rather than writing a wrong image. Until
-    // then the stamps are in the future and the cards read `Last: 0s`.
+    // missed it is retried or times out rather than writing a wrong image.
+    // Until then the stamps are in the future and the cards read `Last: 0s`.
+    // One clock sample feeds both the capture second and the uptimes.
     let max_quiet = DASHBOARD_AGENTS
         .iter()
         .map(|a| a.quiet_for_secs)
         .max()
         .unwrap_or(0);
-    let capture_at = Utc::now().timestamp() + 2 + max_quiet;
-    let base = Utc::now();
+    let now = Utc::now();
+    let capture_at = now.timestamp() + 2 + max_quiet;
     for agent in DASHBOARD_AGENTS {
         let record = wait_for_record(&deck, agent.name, |_| true);
         let pane_id = record
             .pane_id_env
             .clone()
             .unwrap_or_else(|| panic!("{}'s pane has no pane id", agent.name));
-        let started = (base - ChronoDuration::minutes(agent.up_for_minutes)).to_rfc3339();
+        let started = (now - ChronoDuration::minutes(agent.up_for_minutes)).to_rfc3339();
         let last = chrono::DateTime::from_timestamp(capture_at - agent.quiet_for_secs, 0)
             .expect("a representable instant")
             .to_rfc3339();
@@ -472,27 +583,38 @@ fn docs_screenshot_dashboard() {
                 .is_some_and(|live| live.last_user_prompt.as_deref() == Some(agent.prompt))
         });
     }
+    DashboardScene { deck, capture_at }
+}
 
-    let lasts: Vec<String> = DASHBOARD_AGENTS
-        .iter()
-        .map(|a| format!("Last: {}s ", a.quiet_for_secs))
+/// `shell_quote` keeps every path one argument, whatever it contains. Runs
+/// the quoted words through `sh` rather than comparing strings, so it checks
+/// what the pane's shell will actually see.
+#[test]
+fn shell_quote_keeps_hostile_paths_one_word() {
+    let hostile = [
+        "/plain/path",
+        "/with space/and\ttab",
+        "/it's/an apostrophe",
+        "/'leading and trailing'",
+        "/''",
+        "/$(touch pwned)/`id`/$HOME/;rm -rf x",
+        "/new\nline",
+    ];
+    let words: Vec<String> = hostile.iter().map(|s| shell_quote(s)).collect();
+    let script = format!("printf '%s\\0' {}", words.join(" "));
+    let out = std::process::Command::new("sh")
+        .args(["-c", &script])
+        .output()
+        .expect("run sh");
+    assert!(out.status.success(), "sh failed: {out:?}");
+    let args: Vec<&[u8]> = out
+        .stdout
+        .strip_suffix(b"\0")
+        .expect("NUL-terminated")
+        .split(|b| *b == 0)
         .collect();
-    capture(&deck, "dashboard", |grid| {
-        DASHBOARD_AGENTS.iter().all(|a| {
-            grid.contains(a.name)
-                && grid.contains(a.prompt)
-                && a.tool.is_none_or(|(_, detail)| grid.contains(detail))
-        }) && lasts.iter().all(|l| grid.contains(l.as_str()))
-            && FOCUSED_PANE_LINES.iter().all(|l| grid.contains(l))
-            && !grid.contains("COMMAND MODE")
-            // Idle and waiting cards blink their status dot by drawing a space
-            // in its place (`flash_dot` in `src/ui.rs`), and nothing else on
-            // this screen draws a `●` (the transcripts are written without
-            // one), so exactly one per card means every dot is lit and the
-            // image never shows a half-blink. A future `●` elsewhere on the
-            // dashboard makes this time out, never pass early.
-            && grid.matches('●').count() == DASHBOARD_AGENTS.len()
-    });
+    let expected: Vec<&[u8]> = hostile.iter().map(|s| s.as_bytes()).collect();
+    assert_eq!(args, expected);
 }
 
 /// Scenario: Launch the deck in a sandbox with no agents and write the
