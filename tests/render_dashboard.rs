@@ -13,7 +13,8 @@ use dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN;
 use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
 use dot_agent_deck::pane::RenameOutcome;
 use dot_agent_deck::state::{
-    ActiveTool, AppState, DashboardStats, SessionSnapshot, SessionState, SessionStatus,
+    ActiveTool, AppState, BlockedKind, BlockedReason, DashboardStats, SessionSnapshot,
+    SessionState, SessionStatus,
 };
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
@@ -1103,6 +1104,7 @@ fn palette_session(status: SessionStatus) -> SessionState {
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/example-project".to_string()),
         status,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -1116,6 +1118,43 @@ fn palette_session(status: SessionStatus) -> SessionState {
         shell_synthetic_working: false,
         orchestration_orphaned: false,
     }
+}
+
+/// Scenario: Render a dashboard card whose agent is blocked because its credits
+/// are depleted. The card must show a Blocked badge, use the error colour, and
+/// display the credit reason on its own line.
+#[spec("status/badge/002")]
+#[test]
+fn status_badge_002_blocked_card_snapshot() {
+    let mut session = palette_session(SessionStatus::Blocked);
+    session.blocked = Some(BlockedReason {
+        kind: BlockedKind::CreditsDepleted,
+        detected_at_ms: render_now().timestamp_millis(),
+        detail: Some("purchase more credits".to_string()),
+    });
+    let density = CardDensityKind::Normal;
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("quota-worker"),
+        Some(1),
+        density,
+        0,
+        render_now(),
+        false,
+        80,
+        density.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("Blocked"),
+        "missing Blocked badge:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Credits"),
+        "missing credits reason:\n{rendered}"
+    );
+    assert_eq!(border_style_at_mid(&buffer).0, Color::Red);
+    insta::assert_snapshot!(rendered);
 }
 
 /// Read the `(fg, modifier)` of a card/pane's left border at a mid-height row.
@@ -1213,10 +1252,10 @@ fn border_glyph_at_mid(buffer: &ratatui::buffer::Buffer) -> String {
     buffer[(0, y)].symbol().to_string()
 }
 
-/// The six status roles in the centralized palette and the named-ANSI color each
+/// The seven status values in the centralized palette and the named-ANSI color each
 /// must resolve to (PRD #155 locked plan): working=Green, thinking=Blue,
-/// compacting=Blue (shares the thinking role), waiting=Magenta, error=Red,
-/// idle=DarkGray. The single source of truth shared by the deck-card (T1) and
+/// compacting=Blue (shares the thinking role), waiting=Magenta, error and
+/// blocked=Red, idle=DarkGray. The single source of truth shared by the deck-card (T1) and
 /// embedded-pane (T2) assertions.
 ///
 /// Waiting left Yellow in issue #579: yellow measured 1.70:1 against a white
@@ -1226,7 +1265,7 @@ fn border_glyph_at_mid(buffer: &ratatui::buffer::Buffer) -> String {
 /// clears AA on a light *and* a dark terminal. `theme/contrast/002` asserts the
 /// ratios; these tests keep asserting identity, which is what makes the two
 /// complementary rather than redundant.
-fn status_role_colors() -> [(SessionStatus, Color); 6] {
+fn status_role_colors() -> [(SessionStatus, Color); 7] {
     [
         (SessionStatus::Working, Color::Green),
         (SessionStatus::Thinking, Color::Blue),
@@ -1237,15 +1276,16 @@ fn status_role_colors() -> [(SessionStatus, Color); 6] {
         (SessionStatus::Compacting, Color::Blue),
         (SessionStatus::WaitingForInput, Color::Magenta),
         (SessionStatus::Error, Color::Red),
+        (SessionStatus::Blocked, Color::Red),
         (SessionStatus::Idle, Color::DarkGray),
     ]
 }
 
-/// Scenario: Render a deck card for each of the six agent statuses
-/// (working/thinking/compacting/waiting/error/idle), none selected or focused,
+/// Scenario: Render a deck card for each of the seven agent statuses
+/// (working/thinking/compacting/waiting/error/blocked/idle), none selected or focused,
 /// and assert the card's border color is the matching centralized status role —
 /// working=Green, thinking=Blue, compacting=Blue (it shares the thinking role),
-/// waiting=Magenta, error=Red, idle=DarkGray. Also assert each status border is a
+/// waiting=Magenta, error/blocked=Red, idle=DarkGray. Also assert each status border is a
 /// status role and never an accent role (Reset=selected, Cyan=focused), so a
 /// status can never collide with selection/focus. This pins PRD #155 Option A:
 /// the deck-card border encodes status via the centralized palette roles.
@@ -1276,8 +1316,8 @@ fn palette_001_deck_card_border_is_status_role() {
     }
 }
 
-/// Scenario: For each of the six agent statuses
-/// (working/thinking/compacting/waiting/error/idle), render the deck card AND an
+/// Scenario: For each of the seven agent statuses
+/// (working/thinking/compacting/waiting/error/blocked/idle), render the deck card AND an
 /// embedded pane (neither selected nor focused) and assert the pane's border
 /// color is the SAME as the deck card's for that status — and that both equal the
 /// palette status role color. This is the consistency criterion: a given state
