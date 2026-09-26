@@ -605,8 +605,17 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     hidden is on — rewritten every render, and by `toggleHidden` directly so a
     reload it starts sees the new value before the next render does.
   */
-  const browse = useRef({ showHidden, filter, supports: new Set<string>() });
-  browse.current = { showHidden, filter, supports: new Set(choices.flatMap((choice) => (choice.listingOptions ? [choice.deckId] : []))) };
+  const browse = useRef<{ showHidden: boolean; filter: string; supports: Set<string>; cursor: number; row?: Focus }>({ showHidden, filter, supports: new Set<string>(), cursor });
+  const cursorRow = rows[cursor];
+  browse.current = {
+    showHidden,
+    filter,
+    supports: new Set(choices.flatMap((choice) => (choice.listingOptions ? [choice.deckId] : []))),
+    cursor,
+    // The row the cursor is on, by identity — what a reload that lands after
+    // the user moved puts the cursor back on.
+    ...(cursorRow?.kind === "entry" ? { row: { path: cursorRow.entry.path, name: cursorRow.entry.displayName } } : {}),
+  };
   /**
    * Issue #1240: where a search that lands after a Show hidden reload should
    * put the cursor — and the cursor that reload left, so a user who has moved
@@ -633,6 +642,8 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    */
   const loadListing = useCallback(async (deckId: string, path?: string, focusPath?: string | Focus, onFailure: "report" | "home" | "quiet" = "report", keepFilter = false): Promise<ListingOutcome> => {
     const seq = ++listingSeq.current;
+    /** Where the cursor was when this reload began, so one the user moves during it is kept. */
+    const startCursor = browse.current.cursor;
     setListingError(undefined);
     setListingState((current) => (current === "ready" ? current : "loading"));
     try {
@@ -655,7 +666,12 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
       searchSeq.current += 1;
       setSearched(undefined);
       setSearchError(undefined);
-      const focus = typeof focusPath === "string" ? { path: focusPath } : focusPath;
+      // A Show hidden reload is of the directory on screen, which stays
+      // browsable meanwhile: if the user moved while it was out, the row they
+      // are on NOW is the one to keep, not the one the toggle was on.
+      const moved = keepFilter && browse.current.cursor !== startCursor;
+      const requested = typeof focusPath === "string" ? { path: focusPath } : focusPath;
+      const focus = moved ? browse.current.row : requested;
       const shown = filterDirectoryEntries(reply.entries, kept);
       const offset = reply.parent === undefined ? 0 : 1;
       const focused = focusIndex(shown, focus);

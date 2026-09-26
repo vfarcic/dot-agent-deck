@@ -687,6 +687,33 @@ describe("New agent dialog — hidden, symlinked and past-the-cap directories (i
   });
 
   /**
+   * Scenario (review of #1332): the Show hidden reload itself is slow, and the
+   * user moves from `Alpha-project` to `beta` while it is out. When it lands —
+   * with `.config` now first, so every index has shifted — the cursor is on
+   * `beta`, the row the user moved to, not back on `Alpha-project`.
+   */
+  it("keeps the row a user moved to while a Show hidden reload was out", async () => {
+    let release: () => void = () => undefined;
+    const listDirectories = vi.fn(async (_deckId: string, _path?: string, options?: DeckListingOptions): Promise<DeckDirectoryListing> => {
+      const home = structuredClone(TREE[""]);
+      if (!options?.includeHidden || home.kind !== "listing") return home;
+      const widened = { ...home, entries: [{ path: "/home/dev/.config", displayName: ".config", isProject: false }, ...home.entries] };
+      return new Promise((resolve) => { release = () => resolve(widened); });
+    });
+    renderDialog(fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local", listingOptions: true })], listDirectories }));
+    await currentPath("/home/dev");
+    expect(activeRow()).toBe("/home/dev/Alpha-project");
+
+    fireEvent.keyDown(directoryList(), { key: "." });
+    await waitFor(() => expect(listDirectories).toHaveBeenLastCalledWith(LOCAL, "/home/dev", { includeSymlinks: true, includeHidden: true }));
+    fireEvent.keyDown(directoryList(), { key: "j" });
+    expect(activeRow()).toBe("/home/dev/beta");
+    await act(async () => release());
+    await waitFor(() => expect(rowPaths()).toContain("/home/dev/.config"));
+    expect(activeRow()).toBe("/home/dev/beta");
+  });
+
+  /**
    * Scenario (review of #1332): the cursor is on the third row of the
    * truncated listing when a one-match search lands. The cursor stays on a
    * row that exists, so Enter still opens something.

@@ -3019,8 +3019,16 @@ mod tests {
             .into_iter()
             .map(|dir| dir.join("id"))
             .chain(["/usr/bin/id", "/bin/id"].map(std::path::PathBuf::from))
-            .find(|candidate| candidate.is_file())
-            .expect("an `id` binary on PATH, at /usr/bin/id or at /bin/id");
+            // Unix `execvp` semantics, near enough: an executable regular
+            // file, resolved to an absolute path so the link is not relative
+            // to wherever a relative PATH entry pointed.
+            .filter_map(|candidate| std::fs::canonicalize(candidate).ok())
+            .find(|candidate| {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::metadata(candidate)
+                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            })
+            .expect("an executable `id` on PATH, at /usr/bin/id or at /bin/id");
         std::os::unix::fs::symlink(&id, shim.path().join("id")).expect("link `id` into the shim");
         let path = shim.path().to_str().expect("a UTF-8 temp path").to_string();
         (shim, path)
