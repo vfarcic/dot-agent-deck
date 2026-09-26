@@ -826,17 +826,12 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     );
 }
 
-/// Scenario: Launch the deck on the two-role `orch-deck` fixture, open one ordinary
-/// `cat` pane so a registered pane exists to dispatch from, then run the REAL
-/// `dot-agent-deck dispatch <name> --orchestration demo-orch` CLI against the deck's
-/// own hook socket exactly as an agent in that pane would. A full orchestration tab
-/// labelled `demo-orch` must surface live on the tab strip, with the sibling worktree
-/// and the orchestrator's delegation context on disk. Then open the SAME orchestration
-/// the normal way with Ctrl+N as a control, and run the real `dot-agent-deck delegate`
-/// CLI from each orchestrator: both workers must receive the daemon's task pointer in
-/// their panes. Finally, delegate twice more in ways that cannot resolve — from a pane
-/// with no role, and to a role that does not exist — and require the CLI to exit
-/// non-zero naming what it could not resolve.
+/// Scenario: Dispatch the two-role `orch-deck` fixture through the real CLI and
+/// confirm that its tab, worktree, context, and worker delegation appear, using
+/// a normally opened orchestration as a control. Delegations from an unknown
+/// pane or to an unknown role must fail loudly. After the worker reports its
+/// first task done, a delegate to it and a nonexistent role must report partial
+/// delivery without inviting a duplicate retry.
 #[spec("orchestration/dispatch/001")]
 #[test]
 fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
@@ -1114,6 +1109,30 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
 
     // ===== …and a HALF-landed delegate is not a failure =====================
     //
+    // The worker already received a delegation above. A second delegate is
+    // refused while it still owes work-done (#580), so finish that first task
+    // before exercising a different partial-delivery outcome.
+    let done = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["work-done", "--task", "Dispatched delegation complete."])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", &dispatched["worker"])
+        .output()
+        .expect("the work-done CLI should run");
+    assert!(
+        done.status.success(),
+        "`work-done` from the dispatched worker exited {:?}.\nstdout: {}\nstderr: {}",
+        done.status.code(),
+        String::from_utf8_lossy(&done.stdout),
+        String::from_utf8_lossy(&done.stderr)
+    );
+    assert!(
+        common::wait_for_path(
+            &expected_worktree.join(".dot-agent-deck/work-done-worker.md"),
+            Duration::from_secs(20)
+        ),
+        "the dispatched worker's work-done report was not written before its next delegation"
+    );
+
     // PR #466 review's blocker, from the real CLI. `--to worker
     // --to nonexistent-role` fans out to the worker for real — the task is in
     // its PTY and its idle-worker record is armed — so reporting failure would
