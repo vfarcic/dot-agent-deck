@@ -625,13 +625,19 @@ fn contract_refusal(response: &AttachResponse) -> Option<String> {
 /// The verbs the desktop's project-aware surfaces need (PRD #819 M6).
 ///
 /// All four, because the surface is one flow: list or resolve a project, prepare
-/// its workflow, start the prepared agent. A daemon advertising three of them
-/// can get a user as far as a launch that then fails, which is worse than
+/// its orchestration, start the prepared agent. A daemon advertising three of
+/// them can get a user as far as a launch that then fails, which is worse than
 /// saying so first.
+///
+/// The prepare verb is listed by its current spelling, but it is checked
+/// through `DaemonCapabilities::supports_prepare_orchestration`, which also
+/// accepts the legacy `prepare-workflow` a daemon built before #1045 advertises
+/// — and the current spelling is also the one the sentence names when it is
+/// missing, so no user is shown the legacy string.
 const DESKTOP_PROJECT_CAPABILITIES: [&str; 4] = [
     dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS,
     dot_agent_deck::daemon_protocol::CAP_RESOLVE_PROJECT,
-    dot_agent_deck::daemon_protocol::CAP_PREPARE_WORKFLOW,
+    dot_agent_deck::daemon_protocol::CAP_PREPARE_ORCHESTRATION,
     dot_agent_deck::daemon_protocol::CAP_START_PREPARED_AGENT,
 ];
 
@@ -657,13 +663,19 @@ fn project_actions_reason(response: &AttachResponse) -> Option<String> {
     let capabilities = dot_agent_deck::daemon_client::DaemonCapabilities::from_hello(response);
     let missing: Vec<&str> = DESKTOP_PROJECT_CAPABILITIES
         .into_iter()
-        .filter(|capability| !capabilities.supports(capability))
+        .filter(|capability| {
+            if *capability == dot_agent_deck::daemon_protocol::CAP_PREPARE_ORCHESTRATION {
+                !capabilities.supports_prepare_orchestration()
+            } else {
+                !capabilities.supports(capability)
+            }
+        })
         .collect();
     if missing.is_empty() {
         return None;
     }
     Some(format!(
-        "This deck does not advertise {}, so projects and workflows cannot be started from here. Agents already running on it stay visible and usable.",
+        "This deck does not advertise {}, so projects and orchestrations cannot be started from here. Agents already running on it stay visible and usable.",
         missing.join(", ")
     ))
 }
@@ -1964,8 +1976,12 @@ mod tests {
         .expect("three of four is not four");
 
         assert!(
-            reason.contains(dot_agent_deck::daemon_protocol::CAP_PREPARE_WORKFLOW),
+            reason.contains(dot_agent_deck::daemon_protocol::CAP_PREPARE_ORCHESTRATION),
             "{reason}"
+        );
+        assert!(
+            !reason.contains(dot_agent_deck::daemon_protocol::CAP_PREPARE_WORKFLOW),
+            "the legacy capability string is never shown: {reason}"
         );
         assert!(
             !reason.contains(dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS),
@@ -5754,7 +5770,7 @@ agent = "opencode"
     /// PRD #1223 audit V4: the same project with the orchestration name
     /// declared TWICE, each declaration role-bearing and each with its own
     /// commands. Config validation only warns about this, and
-    /// `PrepareWorkflow` takes the first declaration.
+    /// `PrepareOrchestration` takes the first declaration.
     #[cfg(unix)]
     fn namesake_orchestration_project(root: &std::path::Path) -> std::path::PathBuf {
         let project = root.join("v4-project");
@@ -5981,7 +5997,7 @@ start = true
     /// the ambiguity and not the project.
     ///
     /// **What it fails against.** Without the check the launch reaches
-    /// `PrepareWorkflow`, which takes the FIRST declaration: the context file
+    /// `PrepareOrchestration`, which takes the FIRST declaration: the context file
     /// appears and `first-planner` runs under a name the user could equally
     /// have meant for the second.
     #[cfg(unix)]
@@ -6058,14 +6074,14 @@ start = true
         );
         assert!(
             !published_after_refusal,
-            "the refused launch did not reach PrepareWorkflow, so it published no coordinator context"
+            "the refused launch did not reach PrepareOrchestration, so it published no orchestrator context"
         );
         let solo =
             solo.expect("the uniquely named orchestration in the same project still launches");
         assert_eq!(solo.agent_ids.len(), 1);
         assert!(
             published_after_solo,
-            "the launch that WAS prepared published its coordinator context"
+            "the launch that WAS prepared published its orchestrator context"
         );
     }
 
@@ -6076,7 +6092,7 @@ start = true
     /// reason — the missing configured-command start, and the connection's own
     /// `projectActionsReason` — and a launch aimed at the first is refused with
     /// the same sentence. Neither deck receives a single request beyond the
-    /// handshake: no `ResolveProject`, and no `PrepareWorkflow` publishing a
+    /// handshake: no `ResolveProject`, and no `PrepareOrchestration` publishing a
     /// context nothing could read. A query and a launch aimed at a deck the
     /// app is not observing are refused with `DeckScope::resolve`'s error, and
     /// the local deck gains nothing throughout.
@@ -6084,7 +6100,8 @@ start = true
     #[tokio::test]
     async fn an_orchestration_the_deck_cannot_start_is_withheld_and_sends_nothing() {
         use dot_agent_deck::daemon_protocol::{
-            CAP_PREPARE_WORKFLOW, CAP_PREPARED_ROLE_COMMAND, CAP_START_PREPARED_AGENT,
+            CAP_PREPARE_ORCHESTRATION, CAP_PREPARE_WORKFLOW, CAP_PREPARED_ROLE_COMMAND,
+            CAP_START_PREPARED_AGENT,
         };
         let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let local = RealDeck::start("m6-old-local");
@@ -6092,6 +6109,7 @@ start = true
         let oldest = OlderDeck::withholding(
             "m6-oldest-remote",
             &[
+                CAP_PREPARE_ORCHESTRATION,
                 CAP_PREPARE_WORKFLOW,
                 CAP_START_PREPARED_AGENT,
                 CAP_PREPARED_ROLE_COMMAND,
@@ -6148,7 +6166,8 @@ start = true
         match oldest_query.expect("an older deck answers, it does not fail") {
             crate::dto::DesktopNewAgentOrchestrations::Unsupported { reason } => {
                 assert!(
-                    reason.contains("does not advertise") && reason.contains(CAP_PREPARE_WORKFLOW),
+                    reason.contains("does not advertise")
+                        && reason.contains(CAP_PREPARE_ORCHESTRATION),
                     "the connection's projectActionsReason: {reason}"
                 );
             }

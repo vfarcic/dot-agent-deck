@@ -17,6 +17,20 @@
 //!   whose refusal by an older daemon fails closed. See the PRD #1105 note on
 //!   [`PROTOCOL_VERSION`] for the argument and its limits.
 //!
+//! **Legacy wire names still answered (issue #1045).** The prepare verb was
+//! renamed from `prepare-workflow` to `prepare-orchestration` on the wire, by
+//! the capability-gated rung above rather than by a bump, and the old spelling
+//! is kept alongside it: the op [`AttachRequest::PrepareWorkflow`], the
+//! capability [`CAP_PREPARE_WORKFLOW`] (still in [`DAEMON_CAPABILITIES`]) and
+//! the response field [`AttachResponse::workflow_prepared`]. The daemon answers
+//! each spelling under its own field ([`AttachResponse::prepared`]) — never
+//! both — and a reader accepts either field
+//! ([`AttachResponse::into_prepared_orchestration`]), so old client ↔ new
+//! daemon and new client ↔ old daemon both keep working. All three legacy
+//! names go together, in the change that next bumps [`PROTOCOL_VERSION`];
+//! [`CAP_PREPARE_WORKFLOW`]'s doc says why that is the point they stop being
+//! reachable.
+//!
 //! The handshake itself ([`AttachRequest::Hello`]) is enforced by the
 //! **desktop** client, which refuses to connect unless the daemon reports
 //! exactly this [`PROTOCOL_VERSION`] (`desktop/src-tauri/src/daemon_bridge.rs`,
@@ -291,7 +305,8 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 ///
 /// **PRD #819's four new `AttachRequest` variants rode that same 9, and did not
 /// bump again.** [`AttachRequest::ListProjects`], [`AttachRequest::ResolveProject`],
-/// [`AttachRequest::PrepareWorkflow`] and [`AttachRequest::StartPreparedAgent`]
+/// [`AttachRequest::PrepareWorkflow`] (since #1045 the legacy spelling of
+/// [`AttachRequest::PrepareOrchestration`]) and [`AttachRequest::StartPreparedAgent`]
 /// are on the bump list for the ordinary reason — an older daemon fails the
 /// frame decode on a variant it does not have — but one bump covers every wire
 /// change made before 9 ships, and 9 was unreleased when they landed: `v0.39.4`
@@ -393,6 +408,20 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// that residual. No existing field changed meaning, so no
 /// [`CONTRACT_BREAKS`] entry either.
 ///
+/// **Issue #1045 contributes no bump for renaming `prepare-workflow` to
+/// [`AttachRequest::PrepareOrchestration`] on the wire.** The new op is gated
+/// on [`CAP_PREPARE_ORCHESTRATION`] by the client library, in
+/// [`crate::daemon_client::DaemonClient::prepare_orchestration`], which falls
+/// back to the legacy op when a daemon advertises only [`CAP_PREPARE_WORKFLOW`];
+/// and the legacy op, capability and response field are all still answered, so
+/// a desktop built before the rename sees exactly the wire it always did. The
+/// new response field [`AttachResponse::orchestration_prepared`] is additive and
+/// optional and is written only in reply to the new op. Nothing changed meaning,
+/// so no [`CONTRACT_BREAKS`] entry and no `.breaking.md`. The residual is the
+/// usual one — a cached capability set that outlived a daemon replaced by an
+/// older build — and it fails closed: the older daemon refuses the unknown
+/// variant and nothing is prepared.
+///
 /// # Where this constant is enforced
 ///
 /// **Exactly one call site refuses on it: the desktop.**
@@ -460,14 +489,40 @@ pub const CAP_LIST_PROJECTS: &str = "list-projects";
 /// Capability string for [`AttachRequest::ResolveProject`].
 pub const CAP_RESOLVE_PROJECT: &str = "resolve-project";
 
-/// Capability string for [`AttachRequest::PrepareWorkflow`].
+/// Capability string for [`AttachRequest::PrepareOrchestration`] (issue #1045).
+///
+/// The verb PRD #819 shipped as `prepare-workflow`, renamed on the wire so the
+/// protocol says **orchestration** like both clients do
+/// (`docs/develop/glossary.md`). Advertised on exactly the platforms
+/// [`CAP_PREPARE_WORKFLOW`] is, beside it rather than instead of it — see that
+/// constant for why both are advertised and when the old one can go.
+pub const CAP_PREPARE_ORCHESTRATION: &str = "prepare-orchestration";
+
+/// **Legacy** capability string for [`AttachRequest::PrepareWorkflow`], the
+/// pre-#1045 spelling of [`CAP_PREPARE_ORCHESTRATION`].
+///
+/// Still advertised, and the legacy variant still answered, because a desktop
+/// built before #1045 checks for this string and sends this op: striking it
+/// would degrade that desktop to "cannot launch" against a newer daemon at an
+/// unchanged [`PROTOCOL_VERSION`]. A client of this build prefers the new
+/// spelling and falls back to this one only against a daemon that advertises
+/// nothing newer
+/// ([`crate::daemon_client::DaemonCapabilities::prepare_orchestration_spelling`]).
+///
+/// **When it can be retired:** in the change that next bumps
+/// [`PROTOCOL_VERSION`]. The desktop is the one client in this repository that
+/// sends a prepare verb, and its `classify_handshake` refuses any daemon whose
+/// number differs from its own — so once the number moves, no desktop that
+/// knows only this spelling can connect to a build carrying the new number.
+/// Retire it together with [`AttachRequest::PrepareWorkflow`] and
+/// [`AttachResponse::workflow_prepared`]; the three are one legacy surface.
 pub const CAP_PREPARE_WORKFLOW: &str = "prepare-workflow";
 
 /// Capability string for [`AttachRequest::StartPreparedAgent`].
 ///
-/// Withheld wherever [`CAP_PREPARE_WORKFLOW`] is withheld, and the two are only
-/// useful together: a build that cannot prepare a workflow can never have issued
-/// a token, so a prepared start on it has nothing to present.
+/// Withheld wherever [`CAP_PREPARE_ORCHESTRATION`] is withheld, and the two are
+/// only useful together: a build that cannot prepare an orchestration can never
+/// have issued a token, so a prepared start on it has nothing to present.
 pub const CAP_START_PREPARED_AGENT: &str = "start-prepared-agent";
 
 /// Capability string for [`AttachRequest::StopDaemon`] (issue #1049).
@@ -491,7 +546,7 @@ pub const CAP_STOP_DAEMON: &str = "stop-daemon";
 ///
 /// Advertised on every platform: recording which client claimed focus touches
 /// no filesystem and no platform-specific surface, so nothing here parallels the
-/// Unix-only carve-out of [`CAP_PREPARE_WORKFLOW`].
+/// Unix-only carve-out of [`CAP_PREPARE_ORCHESTRATION`].
 pub const CAP_FOCUS_GAINED: &str = "focus-gained";
 
 /// Capability string for [`AttachRequest::ListDirectories`] (PRD #1223 M1).
@@ -502,7 +557,7 @@ pub const CAP_FOCUS_GAINED: &str = "focus-gained";
 /// check, so no call site repeats it. Advertised on every platform: the arm is
 /// not `#[cfg]`-gated and the listing reads a directory without writing
 /// anything, so nothing here parallels the Unix-only carve-out of
-/// [`CAP_PREPARE_WORKFLOW`].
+/// [`CAP_PREPARE_ORCHESTRATION`].
 pub const CAP_LIST_DIRECTORIES: &str = "list-directories";
 
 /// Capability string for [`AttachRequest::NewAgentOptions`] (PRD #1223 M2).
@@ -585,8 +640,9 @@ fn invalid_client_id_message() -> String {
 /// build stops accepting it; do not leave a name here that the dispatch no
 /// longer has an arm for.
 ///
-/// **[`CAP_PREPARE_WORKFLOW`] and [`CAP_START_PREPARED_AGENT`] are Unix-only**,
-/// which is the one place that distinction bites. A non-Unix build refuses both
+/// **[`CAP_PREPARE_ORCHESTRATION`] (with its legacy spelling
+/// [`CAP_PREPARE_WORKFLOW`]) and [`CAP_START_PREPARED_AGENT`] are Unix-only**,
+/// which is the one place that distinction bites. A non-Unix build refuses those
 /// verbs *unconditionally* with [`PROJECT_ERR_UNSUPPORTED_PLATFORM`] — the
 /// publish cannot deliver the owner-only guarantee there, so no preparation can
 /// exist and nothing can be started against one — and that is not a bounded
@@ -611,6 +667,7 @@ fn invalid_client_id_message() -> String {
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
     CAP_RESOLVE_PROJECT,
+    CAP_PREPARE_ORCHESTRATION,
     CAP_PREPARE_WORKFLOW,
     CAP_START_PREPARED_AGENT,
     CAP_STOP_DAEMON,
@@ -855,7 +912,7 @@ pub fn compare_contract_breaks(peer: Option<&[String]>) -> ContractComparison {
 /// and that half arrives with M3.
 pub const PROJECT_ERR_INVALID_PATH: &str = "invalid-path";
 
-/// The `task` on [`AttachRequest::PrepareWorkflow`] exceeded
+/// The `task` on [`AttachRequest::PrepareOrchestration`] exceeded
 /// [`crate::bounded_read::MAX_TASK_BYTES`], or carried a NUL. See
 /// [`PROJECT_ERR_INVALID_PATH`] for the code convention.
 pub const PROJECT_ERR_TASK_REJECTED: &str = "task-rejected";
@@ -880,7 +937,7 @@ pub const PROJECT_ERR_TASK_REJECTED: &str = "task-rejected";
 /// reverted. Keep it, and give it back to any verb this file grows a stub for.
 pub const PROJECT_ERR_UNIMPLEMENTED: &str = "unimplemented";
 
-/// PRD #819 M4: the caller's [`AttachRequest::PrepareWorkflow::config_revision`]
+/// PRD #819 M4: the caller's [`AttachRequest::PrepareOrchestration::config_revision`]
 /// does not match the config the daemon just read.
 ///
 /// The client resolved against one snapshot and is asking to launch against
@@ -900,8 +957,8 @@ pub const PROJECT_ERR_STALE_REVISION: &str = "stale-revision";
 /// merely have pasted.
 pub const PROJECT_ERR_NO_ORCHESTRATION: &str = "no-such-orchestration";
 
-/// PRD #819 M4: the project and the orchestration resolved, but the coordinator
-/// context could not be published.
+/// PRD #819 M4: the project and the orchestration resolved, but the
+/// orchestrator context could not be published.
 ///
 /// See [`crate::orchestrator_context::ContextPublishError::client_sentence`] for
 /// what the text after it is allowed to say and why it is allowed to be more
@@ -981,8 +1038,8 @@ pub const PROJECT_ERR_PREPARATION_MISMATCH: &str = "preparation-mismatch";
 /// the point of the code existing.
 pub const PROJECT_ERR_WRONG_START_VERB: &str = "wrong-start-verb";
 
-/// PRD #819 audit fix: [`AttachRequest::PrepareWorkflow`] is refused on this
-/// platform because the publish cannot deliver the owner-only guarantee it
+/// PRD #819 audit fix: [`AttachRequest::PrepareOrchestration`] (in either
+/// spelling) is refused on this platform because the publish cannot deliver the owner-only guarantee it
 /// documents.
 ///
 /// **The premise this replaces was false.** The publish's mode bits,
@@ -1479,8 +1536,8 @@ pub enum AttachRequest {
         /// desktop client's filesystem need not be the daemon's.
         path: String,
     },
-    /// PRD #819 M2/M4: prepare a workflow launch — resolve, compose the
-    /// coordinator context, and publish it. **The only new verb that writes.**
+    /// PRD #819 M2/M4: prepare an orchestration launch — resolve, compose the
+    /// orchestrator context, and publish it. **The only new verb that writes.**
     ///
     /// Preparing the context is an explicit launch phase rather than an
     /// incidental side effect of resolution: enumerate and resolve stay
@@ -1489,14 +1546,20 @@ pub enum AttachRequest {
     /// config revision, and is issued once per role). A failed preparation
     /// starts no roles.
     ///
-    /// The reply rides back on [`AttachResponse::workflow_prepared`].
-    PrepareWorkflow {
+    /// The reply rides back on [`AttachResponse::orchestration_prepared`].
+    ///
+    /// Issue #1045 renamed the op from `prepare-workflow`, which
+    /// [`AttachRequest::PrepareWorkflow`] still answers. Gated on
+    /// [`CAP_PREPARE_ORCHESTRATION`]: a client sends this spelling only to a
+    /// daemon that advertises it, so an older daemon is never sent a variant it
+    /// cannot decode.
+    PrepareOrchestration {
         /// The daemon-canonical path, as returned by
         /// [`AttachRequest::ListProjects`] or [`AttachRequest::ResolveProject`].
         /// Not a client-derived path.
         path: String,
         orchestration: String,
-        /// The coordinator task. Bounded server-side at
+        /// The orchestrator task. Bounded server-side at
         /// [`crate::bounded_read::MAX_TASK_BYTES`] before any filesystem work —
         /// the desktop's own 64 KiB check is a UI affordance and not a bound
         /// this daemon may rely on.
@@ -1516,7 +1579,31 @@ pub enum AttachRequest {
         #[serde(default)]
         config_revision: Option<String>,
     },
-    /// PRD #819 audit follow-up: start ONE role of a workflow this daemon
+    /// **Legacy spelling** of [`AttachRequest::PrepareOrchestration`]: op
+    /// `prepare-workflow`, the name PRD #819 shipped it under. Same fields,
+    /// same meaning, same dispatch; the one difference is that the reply rides
+    /// back on the legacy field [`AttachResponse::workflow_prepared`], which is
+    /// the only field a client that sends this op knows to read.
+    ///
+    /// A distinct variant rather than a serde `alias` on the new one, because
+    /// the daemon has to know which spelling it was sent in order to answer
+    /// under the matching response field — an alias erases exactly that. Kept
+    /// for desktops built before #1045, which check [`CAP_PREPARE_WORKFLOW`]
+    /// and send this op; retire it with that constant (whose doc says when).
+    PrepareWorkflow {
+        /// The daemon-canonical path, as returned by
+        /// [`AttachRequest::ListProjects`] or [`AttachRequest::ResolveProject`].
+        /// Not a client-derived path.
+        path: String,
+        orchestration: String,
+        /// As [`AttachRequest::PrepareOrchestration`]'s `task`.
+        task: String,
+        /// As [`AttachRequest::PrepareOrchestration`]'s `config_revision`,
+        /// including its `#[serde(default)]` and what absence means.
+        #[serde(default)]
+        config_revision: Option<String>,
+    },
+    /// PRD #819 audit follow-up: start ONE role of an orchestration this daemon
     /// prepared. [`AttachRequest::StartAgent`] plus a **required** `prep_token`.
     ///
     /// # Why a verb and not a field
@@ -1547,7 +1634,7 @@ pub enum AttachRequest {
     /// on this socket already holds the daemon user's local-exec authority
     /// through `StartAgent`, which takes arbitrary `command`, `cwd` and `env`; a
     /// peer that wants to spawn something arbitrary calls that and is not
-    /// slowed down here. What the verb protects is a *coordinator* against
+    /// slowed down here. What the verb protects is an *orchestrator* against
     /// launching on a preparation some other launch replaced — a staleness and
     /// integrity property, and the same one the token always carried.
     ///
@@ -1556,8 +1643,8 @@ pub enum AttachRequest {
     /// Every one carries the same `serde` attribute it does there, so the two
     /// cannot drift in their defaults.
     StartPreparedAgent {
-        /// The token [`AttachRequest::PrepareWorkflow`] handed back
-        /// ([`crate::event::PreparedWorkflow::token`]).
+        /// The token [`AttachRequest::PrepareOrchestration`] handed back
+        /// ([`crate::event::PreparedOrchestration::token`]).
         ///
         /// **Required, and that is the entire point.** A `#[serde(default)]`
         /// here would let a client omit it and be served anyway, which is the
@@ -1595,7 +1682,7 @@ pub enum AttachRequest {
         /// type (a declared `agent` wins, else the type its command infers); the
         /// role name as the display name when the request names none; and, for
         /// the configured **start** role when that type is Pi, the preparation's
-        /// coordinator prompt as PRD #201's native `seed`. Every other start
+        /// orchestrator prompt as PRD #201's native `seed`. Every other start
         /// role's prompt is still the client's to deliver, exactly as on the
         /// unflagged verb. The identity fields (`cwd`, the membership's
         /// orchestration, role, start marker, index, title and id) are the
@@ -2096,12 +2183,26 @@ pub struct AttachResponse {
     /// basis as [`Self::projects`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<crate::event::ResolvedProject>,
-    /// PRD #819 M2: the answer to [`AttachRequest::PrepareWorkflow`]. `None` on
-    /// every other response, and on a preparation that failed — a failed
-    /// preparation publishes nothing and starts no roles. Additive + optional
-    /// on the same basis as [`Self::projects`].
+    /// PRD #819 M2 / issue #1045: the answer to
+    /// [`AttachRequest::PrepareOrchestration`]. `None` on every other response,
+    /// and on a preparation that failed — a failed preparation publishes
+    /// nothing and starts no roles. Additive + optional on the same basis as
+    /// [`Self::projects`].
+    ///
+    /// Filled **only** for the new op; the legacy op is answered on
+    /// [`Self::workflow_prepared`] instead ([`Self::prepared`] picks the
+    /// field). A reader should go through [`Self::into_prepared_orchestration`],
+    /// which accepts either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow_prepared: Option<crate::event::PreparedWorkflow>,
+    pub orchestration_prepared: Option<crate::event::PreparedOrchestration>,
+    /// **Legacy** name of [`Self::orchestration_prepared`]: the answer to
+    /// [`AttachRequest::PrepareWorkflow`], and the only field a client built
+    /// before #1045 reads. Filled only for that op, and read by this build only
+    /// as the fallback in [`Self::into_prepared_orchestration`] — which is what
+    /// keeps a new client working against a daemon built before #1045. Retire
+    /// it with [`CAP_PREPARE_WORKFLOW`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_prepared: Option<crate::event::PreparedOrchestration>,
     /// PRD #819 M2/M5: explicit capability advertisement on the
     /// [`AttachRequest::Hello`] reply — the general form of
     /// [`Self::guarded_send`], which stays exactly as it is and is deliberately
@@ -2214,7 +2315,98 @@ pub struct AttachResponse {
     pub new_agent_options: Option<crate::new_agent_options::NewAgentOptions>,
 }
 
+/// Issue #1045: which spelling of the prepare verb a request used, or a client
+/// is about to send.
+///
+/// The two spellings are one verb — [`AttachRequest::PrepareOrchestration`] and
+/// its legacy [`AttachRequest::PrepareWorkflow`] — and this names the three
+/// things that differ between them on the wire: the op, the capability that
+/// licenses it, and the response field its answer rides on. Deriving all three
+/// from one value is what stops the daemon answering one spelling under the
+/// other's field, and a client sending one spelling on the strength of the
+/// other's capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareSpelling {
+    /// `prepare-orchestration`, answered on
+    /// [`AttachResponse::orchestration_prepared`].
+    Orchestration,
+    /// `prepare-workflow`, answered on [`AttachResponse::workflow_prepared`].
+    /// Retire with [`CAP_PREPARE_WORKFLOW`].
+    LegacyWorkflow,
+}
+
+impl PrepareSpelling {
+    /// The capability a daemon advertises when it answers this spelling.
+    pub fn capability(self) -> &'static str {
+        match self {
+            Self::Orchestration => CAP_PREPARE_ORCHESTRATION,
+            Self::LegacyWorkflow => CAP_PREPARE_WORKFLOW,
+        }
+    }
+
+    /// The request, in this spelling. The fields are the same for both.
+    pub fn request(
+        self,
+        path: String,
+        orchestration: String,
+        task: String,
+        config_revision: Option<String>,
+    ) -> AttachRequest {
+        match self {
+            Self::Orchestration => AttachRequest::PrepareOrchestration {
+                path,
+                orchestration,
+                task,
+                config_revision,
+            },
+            Self::LegacyWorkflow => AttachRequest::PrepareWorkflow {
+                path,
+                orchestration,
+                task,
+                config_revision,
+            },
+        }
+    }
+}
+
+impl AttachRequest {
+    /// Issue #1045: the prepare spelling this request is, or `None` for every
+    /// other verb.
+    pub fn prepare_spelling(&self) -> Option<PrepareSpelling> {
+        match self {
+            Self::PrepareOrchestration { .. } => Some(PrepareSpelling::Orchestration),
+            Self::PrepareWorkflow { .. } => Some(PrepareSpelling::LegacyWorkflow),
+            _ => None,
+        }
+    }
+}
+
 impl AttachResponse {
+    /// Issue #1045: a successful preparation, answered under the response
+    /// field that matches the spelling it was asked in — so a client that sent
+    /// `prepare-workflow` finds its answer on `workflow_prepared`, the only
+    /// field it knows, and one that sent `prepare-orchestration` finds it on
+    /// `orchestration_prepared`. Exactly one of the two is set.
+    pub fn prepared(
+        prepared: crate::event::PreparedOrchestration,
+        spelling: PrepareSpelling,
+    ) -> Self {
+        let mut resp = Self::ok();
+        match spelling {
+            PrepareSpelling::Orchestration => resp.orchestration_prepared = Some(prepared),
+            PrepareSpelling::LegacyWorkflow => resp.workflow_prepared = Some(prepared),
+        }
+        resp
+    }
+
+    /// Issue #1045: the preparation this reply carries, under either field
+    /// name — [`Self::orchestration_prepared`] first, then the legacy
+    /// [`Self::workflow_prepared`], so a reply from a daemon built before #1045
+    /// reads the same as one from this build.
+    pub fn into_prepared_orchestration(self) -> Option<crate::event::PreparedOrchestration> {
+        self.orchestration_prepared.or(self.workflow_prepared)
+    }
+
     pub fn ok() -> Self {
         Self {
             ok: true,
@@ -3091,7 +3283,7 @@ async fn handle_connection(
             seed,
             use_configured_command,
         } => {
-            // Refused where `PrepareWorkflow` is refused, and for its reason
+            // Refused where `PrepareOrchestration` is refused, and for its reason
             // rather than a reason of its own: no preparation can exist on this
             // platform, so nothing can be started against one. Saying so beats
             // the `stale-token` this would otherwise produce — that answer is
@@ -3160,6 +3352,10 @@ async fn handle_connection(
         }
         other => (other, None, false),
     };
+
+    // Issue #1045: read before `req` is moved into the dispatch, so the one
+    // prepare arm below can answer under the field the sender reads.
+    let prepare_spelling = req.prepare_spelling();
 
     match req {
         AttachRequest::ListAgents => {
@@ -3393,7 +3589,7 @@ async fn handle_connection(
                         &mut stream,
                         &AttachResponse::err(format!(
                             "{PROJECT_ERR_STALE_TOKEN}: that preparation is unknown or has \
-                             expired; prepare the workflow again"
+                             expired; prepare the orchestration again"
                         )),
                     )
                     .await?;
@@ -4513,7 +4709,7 @@ async fn handle_connection(
         }
         // PRD #819 M4: the only project verb that writes. Resolve one validated
         // config snapshot, check the revision the client believes it resolved
-        // against, find the orchestration, compose the coordinator context and
+        // against, find the orchestration, compose the orchestrator context and
         // publish it — then report success. Nothing is started here, and a
         // failure at any step returns before the publish, which is what makes
         // "a failed preparation starts no roles" a property of the ordering
@@ -4523,12 +4719,26 @@ async fn handle_connection(
         // to the variant is a compile error at this seam rather than a value
         // silently dropped — the mistake `map_tab` in the desktop crate records
         // having made with `orchestration_cwd`.
-        AttachRequest::PrepareWorkflow {
+        //
+        // Issue #1045: both spellings of the verb share this one arm, so they
+        // cannot drift in what they check or publish; they differ only in the
+        // response field the answer rides on (`AttachResponse::prepared`).
+        AttachRequest::PrepareOrchestration {
+            path,
+            orchestration,
+            task,
+            config_revision,
+        }
+        | AttachRequest::PrepareWorkflow {
             path,
             orchestration,
             task,
             config_revision,
         } => {
+            // Always `Some` in this arm; the fallback is the current spelling
+            // rather than a panic, because `handle_connection` serves other
+            // clients too.
+            let spelling = prepare_spelling.unwrap_or(PrepareSpelling::Orchestration);
             let resp = match refuse_prepare_where_unsupported()
                 .and_then(|()| validate_project_path(&path))
                 .and_then(|()| validate_task(&task))
@@ -4545,7 +4755,7 @@ async fn handle_connection(
                     // second permit from inside work that already holds one,
                     // which is the shape that deadlocks a bounded pool.
                     match crate::project_resolve::run_bounded(move || {
-                        crate::project_resolve::prepare_workflow_for_wire(
+                        crate::project_resolve::prepare_orchestration_for_wire(
                             &path,
                             &orchestration,
                             &task,
@@ -4555,14 +4765,10 @@ async fn handle_connection(
                     })
                     .await
                     {
-                        Ok(Ok(prepared)) => {
-                            let mut resp = AttachResponse::ok();
-                            resp.workflow_prepared = Some(prepared);
-                            resp
-                        }
+                        Ok(Ok(prepared)) => AttachResponse::prepared(prepared, spelling),
                         Ok(Err(refusal)) => AttachResponse::err(refusal),
                         Err(e) => {
-                            warn!(reason = %e, "prepare-workflow could not complete");
+                            warn!(reason = %e, "prepare-orchestration could not complete");
                             AttachResponse::err(format!(
                                 "{PROJECT_ERR_UNRESOLVED}: {}",
                                 crate::project_resolve::ProjectResolveError::Internal.detail()
@@ -4597,7 +4803,7 @@ async fn handle_connection(
         // new-agent queries' own pool (audit A4), taken with try-acquire: a full
         // pool refuses as `busy` rather than queueing, and a listing never holds
         // one of the project verbs' permits, so a burst of slow listings cannot
-        // starve `ResolveProject` / `PrepareWorkflow`.
+        // starve `ResolveProject` / `PrepareOrchestration`.
         AttachRequest::ListDirectories { path } => {
             let resp = match crate::new_agent_options::run_new_agent_query(move || {
                 crate::directory_listing::list_directories(path.as_deref())
@@ -4712,7 +4918,8 @@ async fn project_candidates(
 /// On refusal it returns the message the caller wraps in an
 /// [`AttachResponse::err`], and that message names no path. See
 /// [`PROJECT_ERR_INVALID_PATH`].
-/// PRD #819 audit fix: refuse [`AttachRequest::PrepareWorkflow`] outright where
+/// PRD #819 audit fix: refuse [`AttachRequest::PrepareOrchestration`] (in either
+/// spelling) outright where
 /// the publish cannot deliver its owner-only, reparse-safe guarantee.
 ///
 /// **First, before the path and the task are even validated.** The refusal is a
@@ -4732,9 +4939,9 @@ fn refuse_prepare_where_unsupported() -> Result<(), String> {
     #[cfg(not(unix))]
     {
         Err(format!(
-            "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon cannot publish a coordinator context \
-             with owner-only permissions on this platform, so preparing a workflow is refused; \
-             launch the orchestration from a daemon running on Unix"
+            "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon cannot publish an orchestrator \
+             context with owner-only permissions on this platform, so preparing an orchestration \
+             is refused; launch the orchestration from a daemon running on Unix"
         ))
     }
 }
@@ -4743,7 +4950,7 @@ fn refuse_prepare_where_unsupported() -> Result<(), String> {
 /// [`AttachRequest::StartPreparedAgent`], for the same reason one hop earlier.
 ///
 /// Not a property of the request: [`refuse_prepare_where_unsupported`] refuses
-/// every preparation on such a build, and the `PrepareWorkflow` arm is the only
+/// every preparation on such a build, and the `PrepareOrchestration` arm is the only
 /// production path to [`crate::prep_token::issue`] — so this daemon can never
 /// have issued a token, and every prepared start on it is answering for a
 /// preparation that could not have happened. `PROJECT_ERR_STALE_TOKEN` would also be true of that and is
@@ -4759,8 +4966,8 @@ fn refuse_prepared_start_where_unsupported() -> Result<(), String> {
     #[cfg(not(unix))]
     {
         Err(format!(
-            "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon cannot prepare a workflow on this \
-             platform, so it holds no preparation to start a role against; launch the \
+            "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon cannot prepare an orchestration on \
+             this platform, so it holds no preparation to start a role against; launch the \
              orchestration from a daemon running on Unix"
         ))
     }
@@ -4849,7 +5056,7 @@ fn validate_project_path(path: &str) -> Result<(), String> {
 }
 
 /// PRD #819 M2/A5: the wire-boundary bound on
-/// [`AttachRequest::PrepareWorkflow`]'s caller-supplied `task`, applied before
+/// [`AttachRequest::PrepareOrchestration`]'s caller-supplied `task`, applied before
 /// any filesystem work.
 ///
 /// The bound is [`crate::bounded_read::MAX_TASK_BYTES`] — the constant issue
@@ -5416,7 +5623,7 @@ mod tests {
     use super::*;
     use spec::spec;
 
-    /// PRD #819 audit fix: `PrepareWorkflow` is available exactly where the
+    /// PRD #819 audit fix: `PrepareOrchestration` is available exactly where the
     /// publish can deliver its owner-only guarantee, and the capability list
     /// says the same thing the dispatch does.
     ///
@@ -5430,9 +5637,17 @@ mod tests {
     /// can execute that arm, and `cargo clippy --all-targets` for a Windows
     /// target type-checks it.
     #[test]
-    fn prepare_workflow_is_offered_exactly_where_it_is_supported() {
+    fn prepare_orchestration_is_offered_exactly_where_it_is_supported() {
         let gate = refuse_prepare_where_unsupported();
-        let advertised = DAEMON_CAPABILITIES.contains(&CAP_PREPARE_WORKFLOW);
+        let advertised = DAEMON_CAPABILITIES.contains(&CAP_PREPARE_ORCHESTRATION);
+        // Issue #1045: the legacy spelling travels with the new one, on exactly
+        // the same platforms, so an older desktop is offered what a newer one is.
+        assert_eq!(
+            DAEMON_CAPABILITIES.contains(&CAP_PREPARE_WORKFLOW),
+            advertised,
+            "the legacy `prepare-workflow` capability must be advertised exactly where \
+             `prepare-orchestration` is"
+        );
         assert_eq!(
             gate.is_ok(),
             advertised,
@@ -8654,5 +8869,169 @@ mod tests {
         let decoded: AttachResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
         assert!(decoded.directories.is_none());
         assert!(decoded.new_agent_options.is_none());
+    }
+
+    /// Issue #1045: a preparation to put on the wire in the tests below.
+    fn sample_prepared() -> crate::event::PreparedOrchestration {
+        crate::event::PreparedOrchestration {
+            context_path: "/p/.dot-agent-deck/orchestrator-context.md".into(),
+            path: "/p".into(),
+            token: "prep-1".into(),
+            roles: vec![crate::event::ProjectRole {
+                name: "orchestrator".into(),
+                start: true,
+            }],
+            prompt: "Read .dot-agent-deck/orchestrator-context.md for your role.".into(),
+        }
+    }
+
+    /// Issue #1045: the renamed op serializes as `prepare-orchestration` and
+    /// decodes back into the same variant, fields intact.
+    #[test]
+    fn prepare_orchestration_op_round_trips() {
+        let request = PrepareSpelling::Orchestration.request(
+            "/p".into(),
+            "loop".into(),
+            "a task".into(),
+            Some("rev-1".into()),
+        );
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["op"], "prepare-orchestration");
+        let decoded: AttachRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            decoded.prepare_spelling(),
+            Some(PrepareSpelling::Orchestration)
+        );
+        match decoded {
+            AttachRequest::PrepareOrchestration {
+                path,
+                orchestration,
+                task,
+                config_revision,
+            } => {
+                assert_eq!(
+                    (path.as_str(), orchestration.as_str(), task.as_str()),
+                    ("/p", "loop", "a task")
+                );
+                assert_eq!(config_revision.as_deref(), Some("rev-1"));
+            }
+            other => panic!("expected PrepareOrchestration, got {other:?}"),
+        }
+    }
+
+    /// Issue #1045: the op a desktop built before the rename sends still
+    /// decodes — into the legacy variant, so the daemon knows to answer it on
+    /// the legacy field — and this build still serializes it the old way.
+    #[test]
+    fn legacy_prepare_workflow_op_still_deserializes() {
+        let decoded: AttachRequest = serde_json::from_value(serde_json::json!({
+            "op": "prepare-workflow",
+            "path": "/p",
+            "orchestration": "loop",
+            "task": "a task",
+        }))
+        .expect("the pre-#1045 op must still parse");
+        assert_eq!(
+            decoded.prepare_spelling(),
+            Some(PrepareSpelling::LegacyWorkflow)
+        );
+        assert!(matches!(
+            decoded,
+            AttachRequest::PrepareWorkflow {
+                config_revision: None,
+                ..
+            }
+        ));
+        let legacy = PrepareSpelling::LegacyWorkflow.request(
+            "/p".into(),
+            "loop".into(),
+            String::new(),
+            None,
+        );
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap()["op"],
+            "prepare-workflow"
+        );
+        // Every other verb is no prepare spelling at all.
+        assert_eq!(AttachRequest::ListAgents.prepare_spelling(), None);
+    }
+
+    /// Issue #1045: both capability strings are advertised together — the new
+    /// one for this build's clients, the legacy one for older desktops — and
+    /// each spelling names its own.
+    #[test]
+    fn daemon_capabilities_advertise_both_prepare_spellings() {
+        assert_eq!(
+            DAEMON_CAPABILITIES.contains(&CAP_PREPARE_ORCHESTRATION),
+            cfg!(unix)
+        );
+        assert_eq!(
+            DAEMON_CAPABILITIES.contains(&CAP_PREPARE_WORKFLOW),
+            cfg!(unix)
+        );
+        assert_eq!(CAP_PREPARE_ORCHESTRATION, "prepare-orchestration");
+        assert_eq!(CAP_PREPARE_WORKFLOW, "prepare-workflow");
+        assert_eq!(
+            PrepareSpelling::Orchestration.capability(),
+            CAP_PREPARE_ORCHESTRATION
+        );
+        assert_eq!(
+            PrepareSpelling::LegacyWorkflow.capability(),
+            CAP_PREPARE_WORKFLOW
+        );
+    }
+
+    /// Issue #1045, old client ↔ new daemon: a reply to each spelling carries
+    /// the preparation under that spelling's field and ONLY that field. The
+    /// legacy half is the one an older desktop depends on — it reads
+    /// `workflow_prepared` and nothing else, so a reply that moved the value
+    /// would read as "ok but no preparation".
+    #[test]
+    fn a_prepared_reply_rides_on_the_field_matching_the_spelling_it_was_asked_in() {
+        let legacy = serde_json::to_value(AttachResponse::prepared(
+            sample_prepared(),
+            PrepareSpelling::LegacyWorkflow,
+        ))
+        .unwrap();
+        assert_eq!(legacy["workflow_prepared"]["token"], "prep-1");
+        assert!(legacy.get("orchestration_prepared").is_none(), "{legacy}");
+
+        let current = serde_json::to_value(AttachResponse::prepared(
+            sample_prepared(),
+            PrepareSpelling::Orchestration,
+        ))
+        .unwrap();
+        assert_eq!(current["orchestration_prepared"]["token"], "prep-1");
+        assert!(current.get("workflow_prepared").is_none(), "{current}");
+
+        // And an older client's reading of the legacy reply, done the way it
+        // does it: decode, then take `workflow_prepared` directly.
+        let older_reading: AttachResponse = serde_json::from_value(legacy).unwrap();
+        assert_eq!(older_reading.workflow_prepared, Some(sample_prepared()));
+    }
+
+    /// Issue #1045, new client ↔ old daemon (and new ↔ new): the reader takes
+    /// the preparation from whichever field carried it.
+    #[test]
+    fn a_reader_accepts_the_preparation_under_either_field() {
+        let prepared = serde_json::to_value(sample_prepared()).unwrap();
+        let from_older_daemon: AttachResponse = serde_json::from_value(
+            serde_json::json!({ "ok": true, "workflow_prepared": prepared }),
+        )
+        .unwrap();
+        assert_eq!(
+            from_older_daemon.into_prepared_orchestration(),
+            Some(sample_prepared())
+        );
+        let from_this_build: AttachResponse = serde_json::from_value(
+            serde_json::json!({ "ok": true, "orchestration_prepared": prepared }),
+        )
+        .unwrap();
+        assert_eq!(
+            from_this_build.into_prepared_orchestration(),
+            Some(sample_prepared())
+        );
+        let neither: AttachResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert_eq!(neither.into_prepared_orchestration(), None);
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! # Why this exists at all
 //!
-//! [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`] resolves a
+//! [`crate::daemon_protocol::AttachRequest::PrepareOrchestration`] resolves a
 //! project, composes the coordinator context and publishes it in one operation.
 //! **Spawning is not part of that operation** — PRD #819 Open Question 5 was
 //! settled toward the smaller change, so the roles are still started by a later
@@ -34,7 +34,7 @@
 //!
 //! # What a token is, and what it is NOT
 //!
-//! It **is** a statement that this daemon prepared *this* workflow — this
+//! It **is** a statement that this daemon prepared *this* orchestration — this
 //! directory, this config revision, this orchestration, these published bytes —
 //! within the last [`PREP_TOKEN_TTL`], and that the preparation has not been
 //! aged out. That is the entire claim, and it is a **staleness and integrity**
@@ -94,7 +94,7 @@ use std::time::{Duration, Instant};
 /// How long a preparation token stays valid.
 ///
 /// **Two minutes.** The window it has to cover is one client's prepare → spawn
-/// sequence: the desktop issues `PrepareWorkflow` and then one `StartAgent` per
+/// sequence: the desktop issues `PrepareOrchestration` and then one `StartAgent` per
 /// role from the same action handler, which is sub-second in the ordinary case
 /// and a few seconds if a PTY spawn is slow. Two minutes is three orders of
 /// magnitude of headroom over that, so the TTL never turns a slow launch into a
@@ -180,7 +180,7 @@ pub fn inode_identity(metadata: &std::fs::Metadata) -> Option<InodeIdentity> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepBinding {
     /// The daemon-canonical project directory the preparation resolved to — the
-    /// one string the whole launch uses (`crate::event::PreparedWorkflow::path`).
+    /// one string the whole launch uses (`crate::event::PreparedOrchestration::path`).
     pub project_dir: PathBuf,
     /// That directory's inode identity at preparation time, so a delete and
     /// recreate under the same name is caught rather than accepted because the
@@ -202,7 +202,7 @@ pub struct PrepBinding {
     /// keeps the inode (a shell `>` redirect, another tool's `fs::write`).
     pub context_digest: String,
     /// PRD #1223 M6: the one-line coordinator prompt this preparation composed
-    /// ([`crate::event::PreparedWorkflow::prompt`]), kept so a prepared start
+    /// ([`crate::event::PreparedOrchestration::prompt`]), kept so a prepared start
     /// that opts into the role's configured command can seed a **Pi** start role
     /// natively — the TUI's PRD #201 delivery — without the client handing the
     /// line back. Not a check: nothing is compared against it. It is the same

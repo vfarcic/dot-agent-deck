@@ -1082,6 +1082,52 @@ impl DaemonCapabilities {
              ok:false, which is not something to branch on)"
         )))
     }
+
+    /// Issue #1045: which spelling of the prepare verb to send this daemon —
+    /// the one gate every sender of it goes through.
+    ///
+    /// * [`CAP_PREPARE_ORCHESTRATION`] advertised → the current spelling,
+    ///   whether or not the legacy one is advertised beside it (a daemon of
+    ///   this build advertises both);
+    /// * only the legacy [`CAP_PREPARE_WORKFLOW`] advertised → the legacy
+    ///   spelling, which is what keeps this client working against a daemon
+    ///   built before #1045;
+    /// * neither → the uniform withhold, naming both strings, so nothing is
+    ///   sent.
+    ///
+    /// The fallback is not a downgrade of anything: the two spellings are one
+    /// verb with the same fields and the same meaning, and differ only in the
+    /// response field the answer rides on
+    /// ([`crate::daemon_protocol::AttachResponse::prepared`]).
+    ///
+    /// [`CAP_PREPARE_ORCHESTRATION`]: crate::daemon_protocol::CAP_PREPARE_ORCHESTRATION
+    /// [`CAP_PREPARE_WORKFLOW`]: crate::daemon_protocol::CAP_PREPARE_WORKFLOW
+    pub fn prepare_orchestration_spelling(
+        &self,
+    ) -> Result<crate::daemon_protocol::PrepareSpelling, ClientError> {
+        use crate::daemon_protocol::{
+            CAP_PREPARE_ORCHESTRATION, CAP_PREPARE_WORKFLOW, PrepareSpelling,
+        };
+        if self.supports(CAP_PREPARE_ORCHESTRATION) {
+            return Ok(PrepareSpelling::Orchestration);
+        }
+        if self.supports(CAP_PREPARE_WORKFLOW) {
+            return Ok(PrepareSpelling::LegacyWorkflow);
+        }
+        Err(ClientError::Server(format!(
+            "daemon does not advertise the `{CAP_PREPARE_ORCHESTRATION}` capability (nor its \
+             legacy spelling `{CAP_PREPARE_WORKFLOW}`); withholding the request rather than \
+             assuming support (an older daemon answers an unknown op with a bare ok:false, which \
+             is not something to branch on)"
+        )))
+    }
+
+    /// Whether this daemon answers the prepare verb in either spelling — the
+    /// boolean form of [`Self::prepare_orchestration_spelling`], for a caller
+    /// that only needs to decide whether to offer a launch.
+    pub fn supports_prepare_orchestration(&self) -> bool {
+        self.prepare_orchestration_spelling().is_ok()
+    }
 }
 
 /// PRD #819 M5: the daemon identity a captured [`DaemonCapabilities`] describes.
@@ -1830,7 +1876,7 @@ impl DaemonClient {
     /// uniform withhold error from [`DaemonCapabilities::require`].
     ///
     /// This is what a project-aware call site puts in front of an
-    /// [`AttachRequest::ListProjects`] / `ResolveProject` / `PrepareWorkflow`,
+    /// [`AttachRequest::ListProjects`] / `ResolveProject` / `PrepareOrchestration`,
     /// so that an older daemon's clean `ok:false` — whose only discriminator is
     /// serde's `unknown variant …` text — is never reached, let alone matched.
     pub async fn require_capability(&self, capability: &str) -> Result<(), ClientError> {
@@ -1872,7 +1918,7 @@ impl DaemonClient {
     ///
     /// The reply's [`crate::event::ResolvedProject::path`] is the daemon's
     /// **canonical** spelling and may differ from the one sent. That is the
-    /// string every later `PrepareWorkflow` and `StartAgent.cwd` must carry, not
+    /// string every later `PrepareOrchestration` and `StartAgent.cwd` must carry, not
     /// the one the caller had: canonicalising a symlinked path changes its
     /// basename, and an empty orchestration name is derived from the basename
     /// (PRD #220's bug, `crate::dispatch`).
@@ -1907,44 +1953,67 @@ impl DaemonClient {
     /// [`Self::resolve_project`]. `config_revision` is the one that resolve
     /// handed back; passing it is what closes the window between the picker and
     /// the write, and `None` means "no expectation" rather than "any revision"
-    /// (see [`AttachRequest::PrepareWorkflow::config_revision`]).
+    /// (see [`AttachRequest::PrepareOrchestration::config_revision`]).
+    ///
+    /// Issue #1045: sends `prepare-orchestration` to a daemon that advertises
+    /// it and falls back to the legacy `prepare-workflow` for one that
+    /// advertises only that — [`DaemonCapabilities::prepare_orchestration_spelling`]
+    /// holds the choice, so no call site repeats it — and reads the answer off
+    /// either response field.
     ///
     /// A failed preparation starts no roles, because it starts nothing at all:
     /// spawning is the caller's later `StartAgent` sequence, which presents
-    /// [`crate::event::PreparedWorkflow::token`] through
+    /// [`crate::event::PreparedOrchestration::token`] through
     /// [`Self::start_agent_with_prep_token`].
+    pub async fn prepare_orchestration(
+        &self,
+        path: &str,
+        orchestration: &str,
+        task: &str,
+        config_revision: Option<&str>,
+    ) -> Result<crate::event::PreparedOrchestration, ClientError> {
+        let spelling = self
+            .capabilities()
+            .await?
+            .prepare_orchestration_spelling()?;
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &spelling.request(
+                path.to_string(),
+                orchestration.to_string(),
+                task.to_string(),
+                config_revision.map(str::to_string),
+            ),
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "prepare-orchestration failed".into()),
+            ));
+        }
+        resp.into_prepared_orchestration().ok_or_else(|| {
+            ClientError::Malformed("prepare-orchestration ok but no preparation".into())
+        })
+    }
+
+    /// The pre-#1045 name of [`Self::prepare_orchestration`], which it calls
+    /// unchanged. Kept so callers under `tests/` that still spell it compile
+    /// while they migrate; delete it once nothing names it.
     pub async fn prepare_workflow(
         &self,
         path: &str,
         orchestration: &str,
         task: &str,
         config_revision: Option<&str>,
-    ) -> Result<crate::event::PreparedWorkflow, ClientError> {
-        self.require_capability(crate::daemon_protocol::CAP_PREPARE_WORKFLOW)
-            .await?;
-        let (mut rd, mut wr) = self.connect().await?;
-        let resp = issue_command(
-            &mut rd,
-            &mut wr,
-            &AttachRequest::PrepareWorkflow {
-                path: path.to_string(),
-                orchestration: orchestration.to_string(),
-                task: task.to_string(),
-                config_revision: config_revision.map(str::to_string),
-            },
-        )
-        .await?;
-        if !resp.ok {
-            return Err(ClientError::Server(
-                resp.error
-                    .unwrap_or_else(|| "prepare-workflow failed".into()),
-            ));
-        }
-        resp.workflow_prepared
-            .ok_or_else(|| ClientError::Malformed("prepare-workflow ok but no preparation".into()))
+    ) -> Result<crate::event::PreparedOrchestration, ClientError> {
+        self.prepare_orchestration(path, orchestration, task, config_revision)
+            .await
     }
 
-    /// PRD #819 M4/M6: start one role of a workflow this daemon prepared.
+    /// PRD #819 M4/M6: start one role of an orchestration this daemon prepared.
     ///
     /// `prep_token: None` is byte-for-byte [`Self::start_agent`] and sends the
     /// ordinary `start-agent` op; a token sends
@@ -1996,7 +2065,7 @@ impl DaemonClient {
         self.send_start_prepared_agent(opts, token, false).await
     }
 
-    /// PRD #1223 M6 — start one role of a workflow this daemon prepared **with
+    /// PRD #1223 M6 — start one role of an orchestration this daemon prepared **with
     /// the role's configured command**, the way the TUI's orchestration launch
     /// spawns it. Answers the new agent's id.
     ///
@@ -4964,6 +5033,54 @@ start = true
                     "the decline must name the capability it withheld: {text}"
                 );
             }
+        }
+    }
+
+    /// Issue #1045: the client's choice of prepare spelling, for the three
+    /// daemons it can meet — one of this build (both strings), one built
+    /// before the rename (legacy only), and one that answers the verb in
+    /// neither spelling (older still, or a non-Unix build).
+    #[test]
+    fn prepare_orchestration_spelling_prefers_the_new_op_and_falls_back_to_the_legacy_one() {
+        use crate::daemon_protocol::{CAP_PREPARE_ORCHESTRATION, PrepareSpelling};
+
+        let current = DaemonCapabilities::from_hello(&hello_advertising(&[
+            CAP_PREPARE_ORCHESTRATION,
+            CAP_PREPARE_WORKFLOW,
+        ]));
+        assert_eq!(
+            current.prepare_orchestration_spelling().unwrap(),
+            PrepareSpelling::Orchestration
+        );
+        // The new capability alone is enough; the legacy one is not required.
+        let new_only =
+            DaemonCapabilities::from_hello(&hello_advertising(&[CAP_PREPARE_ORCHESTRATION]));
+        assert_eq!(
+            new_only.prepare_orchestration_spelling().unwrap(),
+            PrepareSpelling::Orchestration
+        );
+
+        let legacy = DaemonCapabilities::from_hello(&hello_advertising(&[CAP_PREPARE_WORKFLOW]));
+        assert_eq!(
+            legacy.prepare_orchestration_spelling().unwrap(),
+            PrepareSpelling::LegacyWorkflow,
+            "a daemon built before #1045 must still be sent the op it knows"
+        );
+        assert!(legacy.supports_prepare_orchestration());
+
+        for neither in [
+            DaemonCapabilities::from_hello(&hello_advertising(&[CAP_LIST_PROJECTS])),
+            DaemonCapabilities::absent(),
+        ] {
+            let withheld = neither
+                .prepare_orchestration_spelling()
+                .expect_err("neither spelling advertised must withhold");
+            let text = withheld.to_string();
+            assert!(
+                text.contains(CAP_PREPARE_ORCHESTRATION) && text.contains(CAP_PREPARE_WORKFLOW),
+                "the decline names both spellings that were checked: {text}"
+            );
+            assert!(!neither.supports_prepare_orchestration());
         }
     }
 

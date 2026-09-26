@@ -825,7 +825,7 @@ pub enum TerminalState {
 // kept the result as the ONLY copy. That breaks the principle the whole PRD
 // exists to establish — the daemon owns canonical identity — because the
 // desktop stores these values and later sends them back: `path` becomes
-// `PrepareWorkflow.cwd` and every `StartAgent.cwd`, an orchestration `name`
+// `PrepareOrchestration.cwd` and every `StartAgent.cwd`, an orchestration `name`
 // becomes `StartWorkflow.name`, a role `name` becomes the requested role and
 // the pane's `display_name`, and `config_revision` is echoed back so a config
 // edited under the picker is refused. Two concrete failures followed:
@@ -927,7 +927,7 @@ pub struct DesktopResolvedProject {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopOrchestration {
-    /// **Verbatim** — this goes back as `PrepareWorkflow.orchestration`, and a
+    /// **Verbatim** — this goes back as `PrepareOrchestration.orchestration`, and a
     /// name the daemon offered must be a name the daemon can find again.
     pub name: String,
     /// [`Self::name`] made safe to render.
@@ -993,7 +993,7 @@ pub(crate) fn map_resolved_project(project: ResolvedProject) -> DesktopResolvedP
     //
     // PRD #819 Greptile P2(e): PLATFORM-AWARE, and it used to split on `/`
     // alone. Project resolution is not refused on Windows — only
-    // `PrepareWorkflow` is, with `unsupported-platform`, because only its
+    // `PrepareOrchestration` is, with `unsupported-platform`, because only its
     // publish carries an owner-only guarantee it cannot deliver there. So a
     // Windows client lists and resolves, and a canonical Windows path
     // (`\\?\C:\Users\dev\project`) contains no `/` at all: the whole path
@@ -3363,7 +3363,7 @@ mod tests {
     /// must label it `project`, not with the whole path.
     ///
     /// PRD #819 Greptile P2(e). The basename used to be `path.rsplit('/')`, and
-    /// project resolution is NOT refused on Windows — only `PrepareWorkflow` is,
+    /// project resolution is NOT refused on Windows — only `PrepareOrchestration` is,
     /// with `unsupported-platform`, because only its publish carries an
     /// owner-only guarantee it cannot deliver there. So a Windows client lists
     /// and resolves, every segment fell out of the `/` split, and the whole path
@@ -3462,7 +3462,7 @@ mod tests {
 
     /// Scenario: an orchestration and one of its roles carry control
     /// characters. Both names are protocol identities — the orchestration's
-    /// goes back as `PrepareWorkflow.orchestration`, the role's is matched by
+    /// goes back as `PrepareOrchestration.orchestration`, the role's is matched by
     /// `order_workflow_roles` and becomes the pane's `display_name` — so both
     /// cross verbatim, with escaped twins for the picker.
     #[test]

@@ -49,7 +49,7 @@ use dot_agent_deck::daemon_client::{
 };
 use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{
-    AgentType, BroadcastMsg, EventType, PreparedWorkflow, ProjectRole, SendResult,
+    AgentType, BroadcastMsg, EventType, PreparedOrchestration, ProjectRole, SendResult,
 };
 use dot_agent_deck::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE;
 
@@ -200,7 +200,7 @@ async fn prepare_workflow_launch<D: WorkflowDaemon + Sync>(
     task_prompt: &str,
     requested: &[WorkflowRoleInput],
     config_revision: Option<&str>,
-) -> Result<(Vec<WorkflowRoleInput>, PreparedWorkflow), String> {
+) -> Result<(Vec<WorkflowRoleInput>, PreparedOrchestration), String> {
     let task_prompt = task_prompt.trim();
     if task_prompt.is_empty() {
         return Err("task prompt must not be empty".into());
@@ -238,11 +238,14 @@ async fn prepare_workflow_launch<D: WorkflowDaemon + Sync>(
     Ok((roles, prepared))
 }
 
-/// PRD #819 audit fix: turn a **withheld** `prepare-workflow` into the outcome
-/// it actually is, rather than letting the launch fail on
-/// `DaemonCapabilities::require`'s uniform withhold sentence.
+/// PRD #819 audit fix: turn a **withheld** `prepare-orchestration` into the
+/// outcome it actually is, rather than letting the launch fail on
+/// `DaemonCapabilities::prepare_orchestration_spelling`'s uniform withhold
+/// sentence.
 ///
-/// The daemon strikes `prepare-workflow` from `DAEMON_CAPABILITIES` where the
+/// The daemon strikes both spellings of the prepare verb (`prepare-orchestration`
+/// and its legacy `prepare-workflow`, issue #1045) from `DAEMON_CAPABILITIES`
+/// where the
 /// publish cannot deliver the owner-only guarantee it documents — the mode
 /// bits, the `O_NOFOLLOW | O_DIRECTORY` open and the group/other-write refusal
 /// are all Unix, and the constant is `#[cfg(not(unix))]`-narrowed to the two
@@ -268,24 +271,23 @@ async fn prepare_workflow_launch<D: WorkflowDaemon + Sync>(
 fn ensure_daemon_can_prepare(
     capabilities: Option<&dot_agent_deck::daemon_client::DaemonCapabilities>,
 ) -> Result<(), String> {
-    use dot_agent_deck::daemon_protocol::{
-        CAP_LIST_PROJECTS, CAP_PREPARE_WORKFLOW, PROJECT_ERR_UNSUPPORTED_PLATFORM,
-    };
+    use dot_agent_deck::daemon_protocol::{CAP_LIST_PROJECTS, PROJECT_ERR_UNSUPPORTED_PLATFORM};
 
     let Some(capabilities) = capabilities else {
         return Ok(());
     };
     if !capabilities.is_advertised()
-        || capabilities.supports(CAP_PREPARE_WORKFLOW)
+        || capabilities.supports_prepare_orchestration()
         || !capabilities.supports(CAP_LIST_PROJECTS)
     {
         return Ok(());
     }
     Err(format!(
-        "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this deck offers the project verbs but withholds \
-         `{CAP_PREPARE_WORKFLOW}`, which is what a deck does when its platform cannot give the \
-         published coordinator context an owner-only guarantee. Nothing was started. Launch this \
-         workflow from the TUI on that deck's own host, or point the app at a deck on a Unix host."
+        "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this deck offers the project verbs but cannot \
+         prepare an orchestration, which is what a deck does when its platform cannot give the \
+         published orchestrator context an owner-only guarantee. Nothing was started. Launch this \
+         orchestration from the TUI on that deck's own host, or point the app at a deck on a Unix \
+         host."
     ))
 }
 
@@ -350,7 +352,7 @@ trait WorkflowDaemon {
         orchestration: &str,
         task: &str,
         config_revision: Option<&str>,
-    ) -> Result<PreparedWorkflow, String>;
+    ) -> Result<PreparedOrchestration, String>;
 
     /// `prep_token` is the one the preparation handed back. A token routes the
     /// spawn onto `start-prepared-agent`, where the token is a required field,
@@ -414,8 +416,8 @@ impl WorkflowDaemon for DaemonClient {
         orchestration: &str,
         task: &str,
         config_revision: Option<&str>,
-    ) -> Result<PreparedWorkflow, String> {
-        DaemonClient::prepare_workflow(self, cwd, orchestration, task, config_revision)
+    ) -> Result<PreparedOrchestration, String> {
+        DaemonClient::prepare_orchestration(self, cwd, orchestration, task, config_revision)
             .await
             .map_err(|error| safe_message(error.to_string()))
     }
@@ -1256,7 +1258,7 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
     daemon: &D,
     orchestration: &str,
     display_title: Option<&str>,
-    prepared: &PreparedWorkflow,
+    prepared: &PreparedOrchestration,
     rows: u16,
     cols: u16,
     orchestration_id: &str,
@@ -3661,7 +3663,7 @@ fn ambiguous_orchestration_refusal(orchestration: &str) -> String {
 /// PRD #1223 audit V4: refuse a launch whose orchestration name names MORE
 /// than one of the project's orchestrations on that deck.
 ///
-/// `PrepareWorkflow` takes the FIRST role-bearing definition with the name
+/// `PrepareOrchestration` takes the FIRST role-bearing definition with the name
 /// (`project_resolve.rs`, the same rule the TUI's spawn uses), so launching a
 /// namesake would run the other definition's roles and commands under the name
 /// the user chose. Config validation only warns about the duplicate, and the
@@ -3672,12 +3674,12 @@ fn ambiguous_orchestration_refusal(orchestration: &str) -> String {
 /// crosses — the main webview's own action, a frontend regression, a fixture
 /// caller — so the invariant is checked where the launch is decided.
 ///
-/// **Desktop-side only, deliberately.** Changing `PrepareWorkflow`'s
+/// **Desktop-side only, deliberately.** Changing `PrepareOrchestration`'s
 /// first-match rule would change an existing verb that older desktops and the
 /// TUI already call, which is not this PR's to do; see issue #1233.
 ///
 /// A name the project defines NO orchestration under is deliberately left to
-/// the deck: its `PrepareWorkflow` refuses that before it composes or publishes
+/// the deck: its `PrepareOrchestration` refuses that before it composes or publishes
 /// anything, in its own words and with its own stable code, so refusing it here
 /// would only be a second copy of that sentence in a crate that is not allowed
 /// to resolve projects itself (`xtask/linkage-check` rule 12). The roleless
@@ -5807,7 +5809,7 @@ mod tests {
     struct FakeWorkflowDaemon {
         now: Mutex<std::time::Instant>,
         prepare_requests: Mutex<Vec<PrepareRequest>>,
-        prepare_results: Mutex<VecDeque<Result<PreparedWorkflow, String>>>,
+        prepare_results: Mutex<VecDeque<Result<PreparedOrchestration, String>>>,
         /// Every spawn this fake was asked for, in order and by role name.
         /// `started` records the options; this records the sequence, which is
         /// what a rollback assertion needs to say WHICH role a launch died on.
@@ -5900,7 +5902,7 @@ mod tests {
             orchestration: &str,
             task: &str,
             config_revision: Option<&str>,
-        ) -> Result<PreparedWorkflow, String> {
+        ) -> Result<PreparedOrchestration, String> {
             self.prepare_requests.lock().unwrap().push(PrepareRequest {
                 cwd: cwd.to_string(),
                 orchestration: orchestration.to_string(),
@@ -6069,8 +6071,8 @@ mod tests {
     /// deliberately DIFFERS from every spelling the tests send, so a spawn that
     /// reuses the caller's string instead of the daemon's is a failed assertion
     /// rather than a coincidence.
-    fn prepared_workflow() -> PreparedWorkflow {
-        PreparedWorkflow {
+    fn prepared_workflow() -> PreparedOrchestration {
+        PreparedOrchestration {
             context_path: "/canonical/project/.dot-agent-deck/orchestrator-context.md".into(),
             path: "/canonical/project".into(),
             token: "prep-token-1".into(),
@@ -6432,8 +6434,8 @@ command = "configured-planner"
     fn a_withheld_prepare_workflow_reads_as_an_unsupported_platform() {
         use dot_agent_deck::daemon_client::DaemonCapabilities;
         use dot_agent_deck::daemon_protocol::{
-            AttachResponse, CAP_LIST_PROJECTS, CAP_PREPARE_WORKFLOW, CAP_RESOLVE_PROJECT,
-            PROJECT_ERR_UNSUPPORTED_PLATFORM,
+            AttachResponse, CAP_LIST_PROJECTS, CAP_PREPARE_ORCHESTRATION, CAP_PREPARE_WORKFLOW,
+            CAP_RESOLVE_PROJECT, PROJECT_ERR_UNSUPPORTED_PLATFORM,
         };
 
         fn advertising(capabilities: &[&str]) -> DaemonCapabilities {
@@ -6457,11 +6459,25 @@ command = "configured-planner"
             error.contains("owner-only") && error.contains("Nothing was started"),
             "the sentence must say what happened and why: {error}"
         );
+        assert!(
+            !error.contains(CAP_PREPARE_WORKFLOW),
+            "the sentence must not print the legacy capability string: {error}"
+        );
 
         // Not classified: nothing captured, nothing advertised, the verb present,
         // and a set that says nothing about a platform.
         assert!(ensure_daemon_can_prepare(None).is_ok());
         assert!(ensure_daemon_can_prepare(Some(&DaemonCapabilities::absent())).is_ok());
+        // Issue #1045: either spelling of the verb counts as advertising it —
+        // the current one, or only the legacy one a pre-#1045 daemon sends.
+        assert!(
+            ensure_daemon_can_prepare(Some(&advertising(&[
+                CAP_LIST_PROJECTS,
+                CAP_RESOLVE_PROJECT,
+                CAP_PREPARE_ORCHESTRATION,
+            ])))
+            .is_ok()
+        );
         assert!(
             ensure_daemon_can_prepare(Some(&advertising(&[
                 CAP_LIST_PROJECTS,
@@ -6554,12 +6570,12 @@ command = "configured-planner"
     async fn an_unreported_path_or_prompt_refuses_the_launch() {
         for (mutate, expected) in [
             (
-                Box::new(|prepared: &mut PreparedWorkflow| prepared.path.clear())
-                    as Box<dyn Fn(&mut PreparedWorkflow)>,
+                Box::new(|prepared: &mut PreparedOrchestration| prepared.path.clear())
+                    as Box<dyn Fn(&mut PreparedOrchestration)>,
                 "canonical project path",
             ),
             (
-                Box::new(|prepared: &mut PreparedWorkflow| prepared.prompt = "   ".into()),
+                Box::new(|prepared: &mut PreparedOrchestration| prepared.prompt = "   ".into()),
                 "coordinator prompt",
             ),
         ] {
@@ -6608,9 +6624,9 @@ command = "configured-planner"
     async fn a_publish_refusal_reaches_the_caller_with_its_path_and_remedy_intact() {
         let sentence = "publish-failed: /home/dev/project/.dot-agent-deck is mode 0775, which \
                         grants write to group or other — another local account could replace the \
-                        coordinator context's directory entry after it is published. The deck \
-                        tried to clear those bits and could not, so publishing is refused. On the \
-                        machine running the deck, run: chmod go-w \
+                        orchestrator context's directory entry after it is published. The \
+                        daemon tried to clear those bits and could not, so publishing is refused. \
+                        On the machine running the daemon, run: chmod go-w \
                         '/home/dev/project/.dot-agent-deck'";
         let daemon = FakeWorkflowDaemon::new(
             Ok(Some("unused-session")),
@@ -6951,8 +6967,8 @@ command = "configured-planner"
     }
 
     /// A preparation with `names.len()` roles, the first the start role.
-    fn prepared_with_roles(names: &[&str]) -> PreparedWorkflow {
-        PreparedWorkflow {
+    fn prepared_with_roles(names: &[&str]) -> PreparedOrchestration {
+        PreparedOrchestration {
             roles: names
                 .iter()
                 .enumerate()
