@@ -53,6 +53,22 @@ Each dispatched unit appears on your deck like any other work: a card for a sing
 
 The unit works in `../<your-repo>-dispatch-<name>` — a sibling directory of your project, never inside it.
 
+### What "dispatched" actually tells you
+
+Starting a unit happens in three steps, and each one tells you something different. Your dispatcher is taught to wait for the second before telling you a unit has started, and for the third before treating its task as received.
+
+| What you see | What it means | What it does not mean |
+| --- | --- | --- |
+| The `dot-agent-deck dispatch` command succeeds (exit status 0) | The deck received the request and accepted it — or gave no answer the command could check, which an older deck does | That a worktree was created, that a unit started, or that it got its task. The deck answers the command before doing any of that work |
+| A turn in the dispatcher beginning `dispatch: spawned isolated` | The worktree exists and the unit's agent was started in it. The turn names what was started and where | That the agent received its task. The deck may still be checking that the agent submitted it — for up to a minute after this turn — and nothing that check finds is sent to your dispatcher |
+| A turn beginning `dispatch: a unit you dispatched has completed` | The unit is reporting back — finished, or stuck and unable to continue. This is the first sign that its task arrived | That the work is correct; read the report. The deck does not check the report against the task's delivery, so it is a sign rather than proof |
+
+Any other turn beginning `dispatch:` is a failure — a name already in use, an orchestration your project does not define, a worktree that could not be created — and says why. The unit did not start. In the rare case where some of an orchestration's agents were already running when it failed, the deck leaves them and their directory in place rather than deleting it under them, and the turn says so.
+
+A command that fails (non-zero exit status) never reached that point. Either no deck was reachable, the deck refused the request, or the command itself was unusable: it was run outside a deck pane, or its `--task-file` could not be read. The command prints which.
+
+If the unit's agent never reports submitting its task, the deck gives up after a minute and puts a notice on **the unit's own card** saying the task may never have arrived. That notice is not sent to your dispatcher, and a unit that never got its task has nothing to report back — so a unit that stays quiet for a long time is worth opening. Do not wait for the notice, though: it is not the only way a task goes missing, and not every way leaves one. Some agents cannot report a submitted prompt at all; the deck types the task into those once, has nothing to check, and shows no notice either way. And if the deck could not type the task in at all — the pane went away, or its agent was replaced, before the write — it records that in its log and not on the card, and the dispatcher is still told the unit started. A notice does appear when the write is held back because someone had started typing into the unit's pane. The command's exit status is 0 in all of these cases: it was decided before any of them could happen.
+
 ## Hearing back from a unit
 
 When a unit finishes, it reports back to the pane that started it. The report arrives in your dispatcher conversation as a turn — as though you had typed it yourself — opening with `dispatch: a unit you dispatched has completed`, then the unit's name, then its own account of what it did. Your dispatcher reads it and can act on it, so if you want something done with each result — collect them, compare them, start the next thing — say so in that conversation and it will.
@@ -78,7 +94,7 @@ Delivery is to a **live pane**, and nothing is stored on the way. If the dispatc
 
 The unit's actual work is untouched by that: it is still committed on the unit's own branch and its directory is still on disk, exactly as it would have been. What is lost is the summary of it.
 
-Closing the deck window is a *detach*, not a close — your panes keep running in the daemon, so a report that lands while you are away is in the dispatcher pane waiting when you come back. Moving around the deck costs nothing either. And a report only ever goes to the agent that asked for the work: if that pane was closed and something else has since taken its place, the report is refused rather than handed to a stranger.
+Closing the deck window is a *detach*, not a close — your panes keep running in the daemon, so a report that lands while you are away is in the dispatcher pane waiting when you come back. Moving around the deck costs nothing either.
 
 ## Pointing a unit at the right thing
 
@@ -96,7 +112,7 @@ Closing a unit's tab removes that unit's copy of the repo. Your own repository i
 
 If a unit still has **uncommitted changes**, closing it leaves its directory on disk instead of deleting it, so the work is recoverable. A leftover directory costs disk space; a deleted one costs work.
 
-The close confirmation tells you when that is about to happen, and where: before you answer it, the dialog names the directory the work would be kept in. That warning is a forecast — the unit is still running while you read it, so it can commit its work between the dialog and the close — so the deck checks again once the unit has actually stopped, and the status line afterwards reports what really happened. A unit whose copy turned out to be clean is simply removed and nothing is said, which is why the message appearing is worth reading. If you dismiss the status line and want the path back, `dot-agent-deck worktree list` reports every worktree the deck knows about.
+The close confirmation tells you when that is about to happen, and names the directory the work would be kept in. After the close, the status line reports what actually happened; a unit whose copy turned out to be clean is simply removed and nothing is said. If you dismiss the status line and want the path back, `dot-agent-deck worktree list` reports every worktree the deck knows about.
 
 The unit's branch (`agent/dispatch-<name>`) always survives, since it may hold committed work. Dispatching the *same name* again is therefore refused, telling you the branch is there — delete it with `git branch -D agent/dispatch-<name>` when you are done, or use a different name.
 
