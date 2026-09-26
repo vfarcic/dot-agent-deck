@@ -1350,6 +1350,7 @@ dependencies = [
  "getrandom 0.4.3",
  "insta",
  "libc",
+ "memchr",
  "open",
  "portable-pty",
  "ratatui",

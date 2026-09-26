@@ -1,0 +1,12 @@
+---
+source: tests/render_dashboard.rs
+expression: rendered
+---
+┌ 1 ClaudeCode · quota-worker ────────────────────────────────────── ● Blocked ┐
+│Dir:  example-project                                                         │
+│⚠ Credits depleted (no reset) — purchase more credits                         │
+│Prmt: do the thing                                                            │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└────────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘

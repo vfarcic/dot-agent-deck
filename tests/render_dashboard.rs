@@ -13,7 +13,8 @@ use dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN;
 use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
 use dot_agent_deck::pane::RenameOutcome;
 use dot_agent_deck::state::{
-    ActiveTool, AppState, DashboardStats, SessionSnapshot, SessionState, SessionStatus,
+    ActiveTool, AppState, BlockedKind, BlockedReason, DashboardStats, SessionSnapshot,
+    SessionState, SessionStatus,
 };
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
@@ -83,6 +84,7 @@ fn pane_004_card_title_row() {
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/example-project".to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Read".to_string(),
             detail: Some("src/main.rs".to_string()),
@@ -129,6 +131,7 @@ fn card_stats_session(cwd: &str) -> SessionState {
         agent_type: AgentType::ClaudeCode,
         cwd: Some(cwd.to_string()),
         status: SessionStatus::Thinking,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Read".to_string(),
             detail: Some("src/ui.rs".to_string()),
@@ -285,6 +288,7 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
             last_user_prompt: Some("move the stats into the border".to_string()),
             live_target: None,
             last_activity_ms,
+            blocked: None,
         };
         let mut state = AppState::default();
         state.register_pane("pane-reconnect".to_string());
@@ -571,14 +575,15 @@ fn buffer_to_color_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// `theme/contrast/001` and `theme/guard/001` drive these same seams; the
 /// label is only used to point assertion failures at the offending surface.
 fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
-    // Representative mix so every status segment renders, 140 cells wide so the
-    // whole bar fits without truncation (mirrors the prior contrast fixtures).
+    // Representative status mix, 140 cells wide so the bar fits without
+    // truncation (mirrors the prior contrast fixtures).
     let stats = DashboardStats {
         active: 6,
         working: 1,
         thinking: 1,
         waiting: 1,
         errors: 1,
+        blocked: 0,
         idle: 1,
         compacting: 1,
         total_tools: 42,
@@ -608,6 +613,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         agent_type: AgentType::None,
         cwd: None,
         status: SessionStatus::Idle,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -796,6 +802,7 @@ fn pane_007_pi_card_shows_pi_identity() {
         agent_type: AgentType::Pi,
         cwd: Some("/home/dev/workspace".to_string()),
         status: SessionStatus::Thinking,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -860,6 +867,7 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
         agent_type: AgentType::Codex,
         cwd: Some("/home/dev/workspace".to_string()),
         status: SessionStatus::Thinking,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -1103,6 +1111,7 @@ fn palette_session(status: SessionStatus) -> SessionState {
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/example-project".to_string()),
         status,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -1115,6 +1124,62 @@ fn palette_session(status: SessionStatus) -> SessionState {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+    }
+}
+
+/// Scenario: Render a dashboard card whose agent is blocked because its credits
+/// are depleted, then render a stats bar with one blocked agent. The card must
+/// show a Blocked badge and credit reason, and both surfaces must use the error colour.
+#[spec("status/badge/002")]
+#[test]
+fn status_badge_002_blocked_card_snapshot() {
+    let mut session = palette_session(SessionStatus::Blocked);
+    session.blocked = Some(BlockedReason {
+        kind: BlockedKind::CreditsDepleted,
+        detected_at_ms: render_now().timestamp_millis(),
+        detail: Some("purchase more credits".to_string()),
+    });
+    let density = CardDensityKind::Normal;
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("quota-worker"),
+        Some(1),
+        density,
+        0,
+        render_now(),
+        false,
+        80,
+        density.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("Blocked"),
+        "missing Blocked badge:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Credits"),
+        "missing credits reason:\n{rendered}"
+    );
+    assert_eq!(border_style_at_mid(&buffer).0, Color::Red);
+    insta::assert_snapshot!(rendered);
+
+    let stats = DashboardStats {
+        blocked: 1,
+        ..DashboardStats::default()
+    };
+    let stats_buffer = render_stats_bar_to_buffer(&stats, None, 80, 1);
+    let stats_text = buffer_to_text(&stats_buffer);
+    let blocked_byte = stats_text
+        .find("1 blocked")
+        .unwrap_or_else(|| panic!("missing blocked stats segment:\n{stats_text}"));
+    let blocked_x = stats_text[..blocked_byte].chars().count() as u16;
+    for x in blocked_x..blocked_x + "1 blocked".len() as u16 {
+        assert_eq!(
+            stats_buffer[(x, 0)].fg,
+            Color::Red,
+            "blocked stats segment must use the error colour:\n{}",
+            buffer_to_color_text(&stats_buffer)
+        );
     }
 }
 
@@ -1213,10 +1278,10 @@ fn border_glyph_at_mid(buffer: &ratatui::buffer::Buffer) -> String {
     buffer[(0, y)].symbol().to_string()
 }
 
-/// The six status roles in the centralized palette and the named-ANSI color each
+/// The seven status values in the centralized palette and the named-ANSI color each
 /// must resolve to (PRD #155 locked plan): working=Green, thinking=Blue,
-/// compacting=Blue (shares the thinking role), waiting=Magenta, error=Red,
-/// idle=DarkGray. The single source of truth shared by the deck-card (T1) and
+/// compacting=Blue (shares the thinking role), waiting=Magenta, error and
+/// blocked=Red, idle=DarkGray. The single source of truth shared by the deck-card (T1) and
 /// embedded-pane (T2) assertions.
 ///
 /// Waiting left Yellow in issue #579: yellow measured 1.70:1 against a white
@@ -1226,7 +1291,7 @@ fn border_glyph_at_mid(buffer: &ratatui::buffer::Buffer) -> String {
 /// clears AA on a light *and* a dark terminal. `theme/contrast/002` asserts the
 /// ratios; these tests keep asserting identity, which is what makes the two
 /// complementary rather than redundant.
-fn status_role_colors() -> [(SessionStatus, Color); 6] {
+fn status_role_colors() -> [(SessionStatus, Color); 7] {
     [
         (SessionStatus::Working, Color::Green),
         (SessionStatus::Thinking, Color::Blue),
@@ -1237,15 +1302,16 @@ fn status_role_colors() -> [(SessionStatus, Color); 6] {
         (SessionStatus::Compacting, Color::Blue),
         (SessionStatus::WaitingForInput, Color::Magenta),
         (SessionStatus::Error, Color::Red),
+        (SessionStatus::Blocked, Color::Red),
         (SessionStatus::Idle, Color::DarkGray),
     ]
 }
 
-/// Scenario: Render a deck card for each of the six agent statuses
-/// (working/thinking/compacting/waiting/error/idle), none selected or focused,
+/// Scenario: Render a deck card for each of the seven agent statuses
+/// (working/thinking/compacting/waiting/error/blocked/idle), none selected or focused,
 /// and assert the card's border color is the matching centralized status role —
 /// working=Green, thinking=Blue, compacting=Blue (it shares the thinking role),
-/// waiting=Magenta, error=Red, idle=DarkGray. Also assert each status border is a
+/// waiting=Magenta, error/blocked=Red, idle=DarkGray. Also assert each status border is a
 /// status role and never an accent role (Reset=selected, Cyan=focused), so a
 /// status can never collide with selection/focus. This pins PRD #155 Option A:
 /// the deck-card border encodes status via the centralized palette roles.
@@ -1276,8 +1342,8 @@ fn palette_001_deck_card_border_is_status_role() {
     }
 }
 
-/// Scenario: For each of the six agent statuses
-/// (working/thinking/compacting/waiting/error/idle), render the deck card AND an
+/// Scenario: For each of the seven agent statuses
+/// (working/thinking/compacting/waiting/error/blocked/idle), render the deck card AND an
 /// embedded pane (neither selected nor focused) and assert the pane's border
 /// color is the SAME as the deck card's for that status — and that both equal the
 /// palette status role color. This is the consistency criterion: a given state
@@ -1787,6 +1853,7 @@ fn pane_005_highlight_follows_selected_session_id() {
         agent_type: AgentType::ClaudeCode,
         cwd: Some(cwd.to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Read".to_string(),
             detail: Some("src/main.rs".to_string()),
@@ -1987,6 +2054,7 @@ fn filled_session() -> SessionState {
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/example-project".to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Bash".to_string(),
             detail: Some("cargo test".to_string()),
@@ -2746,6 +2814,7 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         agent_type: AgentType::None,
         cwd: Some("/home/dev/workspace".to_string()),
         status: SessionStatus::Idle,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -3089,6 +3158,7 @@ fn role_session(index: usize, role: &str) -> SessionState {
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/dot-agent-deck".to_string()),
         status: SessionStatus::Idle,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,

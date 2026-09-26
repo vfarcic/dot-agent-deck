@@ -529,6 +529,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .node-active .node-glyph { color: var(--teal); border-color: var(--teal); background: var(--teal-soft); box-shadow: 0 0 0 3px rgb(var(--teal-rgb) / .1); }
 .node-failed .node-glyph { color: var(--red); border-color: var(--red-rim-strong); background: var(--red-soft); }
 .node-waiting .node-glyph { color: var(--amber); border-color: var(--amber-rim); background: var(--amber-soft); }
+.node-blocked .node-glyph { color: var(--red); border-color: var(--red-rim-strong); border-style: dashed; background: var(--red-soft); }
 .workflow-node.is-disabled { opacity: .42; }
 .workflow-node.is-disabled .node-glyph { border-style: dashed; }
 .workflow-empty { grid-column: 1 / -1; display: grid; place-items: center; color: var(--muted); font-size: 11px; }
@@ -546,6 +547,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-state-mark.status-running { color: var(--teal); background: var(--teal); }
 .agent-state-mark.status-passed { color: var(--green); background: var(--green); }
 .agent-state-mark.status-failed { color: var(--red); background: var(--red); }
+/* Issue #714: blocked shares failed's colour (a person has to act) but not its
+   shape, so it reads as a distinct state beside a crashed agent. */
+.agent-state-mark.status-blocked { color: var(--red); background: transparent; box-shadow: inset 0 0 0 2px var(--red); }
 .agent-state-mark.status-waiting, .agent-state-mark.status-queued { color: var(--amber); background: var(--amber); }
 .agent-title-line { display: flex; align-items: center; gap: 6px; }
 .agent-title-line h2 { margin: 0; font-size: 12px; font-weight: 720; }
@@ -554,6 +558,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .status-label.status-running { color: var(--teal); background: var(--teal-soft); }
 .status-label.status-passed { color: var(--green); background: var(--green-soft); }
 .status-label.status-failed { color: var(--red); background: var(--red-soft); }
+.status-label.status-blocked { color: var(--red); background: var(--red-soft); outline: 1px dashed var(--red); outline-offset: -1px; }
+.agent-identity p.agent-blocked-reason, .agent-blocked-reason { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status-label.status-waiting, .status-label.status-queued { color: var(--amber); background: var(--amber-soft); }
 /*
   Issue #1143 — a HELD record's status is a past reading, so it is drawn as one:

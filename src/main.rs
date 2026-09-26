@@ -781,15 +781,22 @@ fn delegate_verdict(
     pane_id: &str,
     resp: &dot_agent_deck::event::DelegateResponse,
 ) -> DelegateVerdict {
+    let blocked_note = blocked_workers_note(resp);
     if let Some(error) = resp.error.as_deref() {
+        let mut message = format!("Error: delegate from pane {pane_id} failed: {error}");
+        if let Some(note) = blocked_note {
+            message.push('\n');
+            message.push_str(&note);
+        }
         return DelegateVerdict {
             failed: true,
-            message: Some(format!(
-                "Error: delegate from pane {pane_id} failed: {error}"
-            )),
+            message: Some(message),
         };
     }
     let mut notes: Vec<String> = Vec::new();
+    if let Some(note) = blocked_note {
+        notes.push(note);
+    }
     if !resp.superseded.is_empty() {
         notes.push(format!(
             "Note: dispatched to worker(s) that still owed a work-done for an earlier \
@@ -859,6 +866,43 @@ fn delegate_verdict(
         failed: false,
         message: Some(notes.join("\n")),
     }
+}
+
+/// Issue #714: the warning `delegate` prints for
+/// [`dot_agent_deck::event::DelegateResponse::blocked`], split by what happened
+/// to each blocked role. Never a failure on its own: a blocked worker that was
+/// delivered to really has the task (a windowed limit may even have reset), so
+/// the exit code stays governed by the rules above. Fixed text plus role labels
+/// and ages only — no pane text, which is agent-controlled.
+fn blocked_workers_note(resp: &dot_agent_deck::event::DelegateResponse) -> Option<String> {
+    if resp.blocked.is_empty() {
+        return None;
+    }
+    let (busy, delivered): (Vec<_>, Vec<_>) = resp
+        .blocked
+        .iter()
+        .cloned()
+        .partition(|b| resp.busy.iter().any(|w| w.role == b.role));
+    let mut lines = Vec::new();
+    if !delivered.is_empty() {
+        lines.push(format!(
+            "Warning: worker(s) {} appear BLOCKED by a provider usage limit. The task WAS \
+             delivered but will likely not be worked on while that lasts — if the worker's card \
+             still shows Blocked, reassign it to a role backed by a different provider or \
+             account, or restore the quota and re-delegate.",
+            dot_agent_deck::state::describe_blocked_workers(&delivered)
+        ));
+    }
+    if !busy.is_empty() {
+        lines.push(format!(
+            "Warning: busy worker(s) {} also appear BLOCKED by a provider usage limit, so \
+             --supersede will likely not get the task worked on while that lasts — if the \
+             worker's card still shows Blocked, reassign it to a role backed by a different \
+             provider or account.",
+            dot_agent_deck::state::describe_blocked_workers(&busy)
+        ));
+    }
+    Some(lines.join("\n"))
 }
 
 fn main() -> ExitCode {
@@ -3479,6 +3523,80 @@ mod tests {
             outstanding,
             oldest_age_secs: 12 * 60,
         }
+    }
+
+    use spec::spec;
+
+    fn blocked(
+        role: &str,
+        kind: dot_agent_deck::state::BlockedKind,
+    ) -> dot_agent_deck::event::BlockedWorker {
+        dot_agent_deck::event::BlockedWorker {
+            role: role.to_string(),
+            kind,
+            blocked_for_secs: 5 * 60,
+        }
+    }
+
+    /// Scenario: Feed `delegate`'s verdict a daemon reply naming a blocked
+    /// worker that was delivered to, then one naming a blocked worker that was
+    /// refused as busy. The first warns that the task was delivered but will
+    /// likely not be worked on and still exits 0; the second names the busy
+    /// role as blocked so `--supersede` is not mistaken for a fix. Neither
+    /// carries any pane text.
+    #[spec("orchestration/delegate/038")]
+    #[test]
+    fn orchestration_delegate_038_verdict_reports_blocked_for_delivered_and_busy() {
+        use dot_agent_deck::state::BlockedKind;
+        let mut resp = reply(&["coder"], &[], None);
+        resp.blocked = vec![blocked("coder", BlockedKind::CreditsDepleted)];
+        let v = delegate_verdict("pane-1", &resp);
+        assert!(!v.failed, "the task WAS delivered: exit 0");
+        let msg = v.message.expect("a blocked worker must never be silent");
+        assert!(
+            msg.contains("appear BLOCKED by a provider usage limit")
+                && msg.contains("[UNTRUSTED-ROLE-LABEL: coder :END-UNTRUSTED-ROLE-LABEL]")
+                && msg.contains("detected 5 minutes ago")
+                && msg.contains("credits do not reset on their own")
+                && msg.contains("The task WAS delivered"),
+            "{msg}"
+        );
+
+        // Busy AND blocked, nothing delivered: the routing failure, annotated.
+        let mut resp = reply(&[], &[], Some("this delegate was NOT sent"));
+        resp.busy = vec![busy("coder", 1)];
+        resp.blocked = vec![blocked("coder", BlockedKind::UsageLimit)];
+        let v = delegate_verdict("pane-1", &resp);
+        assert!(v.failed, "nothing was dispatched: non-zero");
+        let msg = v.message.expect("reported");
+        assert!(
+            msg.contains("NOT sent")
+                && msg.contains("busy worker(s)")
+                && msg.contains("also appear BLOCKED")
+                && msg.contains("--supersede will likely not get the task worked on")
+                && !msg.contains("credits do not reset"),
+            "{msg}"
+        );
+
+        // Busy-and-blocked beside a delivered, healthy role: exit 0, both said.
+        let mut resp = reply(&["tester"], &[], None);
+        resp.busy = vec![busy("coder", 1)];
+        resp.blocked = vec![blocked("coder", BlockedKind::UsageLimit)];
+        let v = delegate_verdict("pane-1", &resp);
+        assert!(!v.failed);
+        let msg = v.message.expect("reported");
+        assert!(
+            msg.contains("also appear BLOCKED") && msg.contains("NOT sent"),
+            "{msg}"
+        );
+        assert!(!msg.contains("The task WAS delivered but"), "{msg}");
+
+        // The reply carries no pane text to leak, and an older daemon's reply
+        // (no `blocked` key) decodes to an empty list and prints nothing extra.
+        let old: DelegateResponse =
+            serde_json::from_str(r#"{"kind":"delegate","delivered":["coder"]}"#).unwrap();
+        assert!(old.blocked.is_empty());
+        assert!(delegate_verdict("pane-1", &old).message.is_none());
     }
 
     /// Issue #580: a busy worker beside a delivered one is a partial outcome.

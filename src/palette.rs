@@ -210,6 +210,10 @@ pub fn status_color(status: &SessionStatus) -> Color {
         SessionStatus::Compacting => STATUS_THINKING,
         SessionStatus::WaitingForInput => STATUS_WAITING,
         SessionStatus::Error => STATUS_ERROR,
+        // Issue #714: a quota-blocked agent needs a person exactly as an
+        // erroring one does, so it shares the error role rather than adding a
+        // palette role (which would re-open `theme/contrast`).
+        SessionStatus::Blocked => STATUS_ERROR,
         SessionStatus::Idle => STATUS_IDLE,
         // PRD #162 forward-compat: an unknown wire status renders with the
         // neutral idle color so it never masquerades as an active state.
@@ -219,11 +223,11 @@ pub fn status_color(status: &SessionStatus) -> Color {
 
 /// This status's rank in the PRD #333 fixed priority order — lower ranks
 /// win. Mirrors the aliasing [`status_color`] already applies (Compacting
-/// shares Thinking's rank, Unknown shares Idle's) so a status that resolves
-/// to the same color also resolves to the same priority.
+/// shares Thinking's rank, Unknown shares Idle's, Blocked shares Error's) so a
+/// status that resolves to the same color also resolves to the same priority.
 fn priority_rank(status: &SessionStatus) -> u8 {
     match status {
-        SessionStatus::Error => 0,
+        SessionStatus::Error | SessionStatus::Blocked => 0,
         SessionStatus::WaitingForInput => 1,
         SessionStatus::Working => 2,
         SessionStatus::Thinking | SessionStatus::Compacting => 3,

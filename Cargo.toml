@@ -68,6 +68,10 @@ portable-pty = "=0.8.1"
 vt100 = "0.16"
 futures-util = "=0.3.34"
 regex = "1"
+# Issue #714: substring search for the quota detector's per-chunk hint scan
+# (`src/quota_detect.rs`). Already in the graph as a transitive of `regex`, so
+# naming it adds no new code to the build.
+memchr = "2"
 open = "5"
 unicode-width = "0.2"
 cron = "0.17.0"

@@ -523,6 +523,78 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the dot animation frame.
 - **Platform coverage:** mac+linux+windows.
 
+##### status/badge/002 — A quota-blocked card visibly names its depleted credits and uses the error colour (issue #714).
+- **Layer:** L1 (ratatui buffer with an insta snapshot).
+- **Agent:** none (a fixed `CreditsDepleted` session fixture).
+- **Asserts:** Blocked badge, credits reason line, and red border on the rendered card.
+- **Does not assert:** the daemon's quota classifier or a live agent.
+- **Platform coverage:** mac+linux+windows.
+
+#### status/blocked
+
+##### status/blocked/001 — The quota classifier accepts real Codex and OpenCode provider messages (issue #714).
+- **Layer:** L1 unit (`src/quota_detect.rs`).
+- **Agent:** none.
+- **Asserts:** prefixed, bare, and wrapped provider lines (at 30, 40 and 80 columns — at 30 the credits suffix wraps past the rows the match reads) classify to the right usage-limit or credits-depleted kind.
+- **Does not assert:** live terminal output or daemon status.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/002 — The quota classifier rejects quoted, misplaced, and wrong-agent near-misses (issue #714).
+- **Layer:** L1 unit (`src/quota_detect.rs`).
+- **Agent:** none.
+- **Asserts:** ASCII-apostrophe variants, quotes, Markdown, grep output, comments, mid-sentence mentions, wrong agent types, and matches outside the bottom 10 rows do not classify.
+- **Does not assert:** a real provider's output format.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/003 — Quota detection needs a quiet pane and two matching probes before confirmation (issue #714).
+- **Layer:** L1 unit (`src/quota_detect.rs`).
+- **Agent:** none.
+- **Asserts:** a hint followed by quiet output and two matching probes a confirmation window apart confirms; a work event cancels, active output delays probing, and probes are rate-limited.
+- **Does not assert:** daemon timer scheduling or a live PTY.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/004 — A quota hint survives a split PTY chunk (issue #714).
+- **Layer:** L1 unit (`src/agent_pty.rs`).
+- **Agent:** none.
+- **Asserts:** a usage-limit needle split across two bus pushes still sets the hint without emitting a blocked event on its own.
+- **Does not assert:** visual confirmation of the quota line.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/005 — A confirmed block remains sticky until work resumes (issue #714).
+- **Layer:** L1 unit (`src/state.rs`).
+- **Agent:** none.
+- **Asserts:** `apply_event` stores Blocked and its reason; Idle, Error, ShellBusy, and ShellIdle cannot erase it; work events clear it, and the live snapshot carries the reason.
+- **Does not assert:** how the daemon detects a quota line.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/006 — A producer cannot forge a quota-blocked status (issue #714).
+- **Layer:** L1 unit (`src/daemon.rs`).
+- **Agent:** none.
+- **Asserts:** the daemon drops an inbound `quota_blocked` or `quota_cleared` event and strips forged `quota_blocked_*` metadata from producer events.
+- **Does not assert:** the daemon's own synthetic blocked and cleared events.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/007 — Older readers decode Blocked safely and its wire form stays a unit variant (issue #714).
+- **Layer:** L1 unit (`src/state.rs`).
+- **Agent:** none.
+- **Asserts:** an older reader maps Blocked to Unknown, while current serialization keeps Blocked as a bare string.
+- **Does not assert:** a full mixed-version daemon connection.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/008 — A Codex quota message leaves a live stand-in with a Blocked card and daemon status (issue #714).
+- **Layer:** L2, lane 1, PTY-attached.
+- **Agent:** synthetic `codex` executable on PATH; no provider credential. This cannot exhaust a real account on demand, so real-agent positive coverage is unavailable.
+- **Asserts:** the Codex U+2019 quota line leads to Blocked in the attached vt100 card and `daemon status --json`.
+- **Does not assert:** a provider's real quota response.
+- **Platform coverage:** mac+linux.
+
+##### status/blocked/009 — OpenCode's bare quota error blocks, while an active quoted mention does not (issue #714).
+- **Layer:** L2, lane 1, PTY-attached.
+- **Agent:** two synthetic `opencode` panes; no provider credential.
+- **Asserts:** the bare error becomes Blocked; a second pane printing the quoted sentence continuously stays unblocked for twice the confirmation window.
+- **Does not assert:** a provider's real quota response.
+- **Platform coverage:** mac+linux.
+
 #### status/agent-event
 
 ##### status/agent-event/001 — A `dot-agent-deck agent-event --type <state>` frame routes into the existing `AgentEvent` stream and drives the target pane's card status, with NO hook and no `settings.json` mutation (PRD #201 M1.2/M1.3).
@@ -3200,6 +3272,20 @@ without depending on the config struct API.
 - **Does not assert:** the other two facts that can refuse a recovery (S, no resolvable launch identity; T, a producer whose `SessionStart` follows its first prompt rather than preceding it) — both are unit-tested against `AgentStartRearm` directly, and T's population is why no Codex or OpenCode worker reaches this path at all; that a `/clear` inside a live worker is a scenario anyone has measured in production.
 - **Platform coverage:** mac+linux (unix-only, with the rest of this file).
 
+##### orchestration/delegate/037 — Delegation to a blocked worker warns but still delivers (issue #714).
+- **Layer:** L2, lane 1, PTY-attached.
+- **Agent:** synthetic Codex quota stand-in; no provider credential.
+- **Asserts:** after the worker becomes Blocked, `delegate --to worker` exits 0, warns that it appears BLOCKED, its task pointer reaches the worker PTY, and the orchestrator receives exactly one blocked-worker notice for that new delegation (the block was published before the delegation existed).
+- **Does not assert:** whether the quota-bound agent can actually complete the task.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/038 — The delegate verdict reports blocked delivered and busy workers without agent detail (issue #714).
+- **Layer:** L1 unit (`src/main.rs`).
+- **Agent:** none.
+- **Asserts:** a blocked delivered role still exits successfully with a warning, a blocked busy role is named, and neither warning exposes agent-controlled detail.
+- **Does not assert:** actual pointer delivery or the worker's ability to complete it.
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
@@ -5803,6 +5889,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** the reported shape end to end. A worker is delegated to, that delegation is left unanswered (production's `release` had its pointer land in a `clear = false` session and sit unsubmitted), a second delegation supersedes it, and ONE work-done arrives. The orchestrator pane must carry that worker's completion feedback and NO idle prompt naming it, while a silent control delegated on the same clock does produce one — which is what proves a deadline actually elapsed rather than the test having simply not waited. A third delegation to the same pane is then left silent and MUST be reported, so the disarm is scoped to the delegation the completion answered and is not a permanent switch-off of the detector for that worker.
 - **Verified load-bearing:** reverting `retire_outstanding_delegation` to the oldest-first accounting turns the negative assertion red, and the failure message carries the idle prompt naming the answered worker. The silent control's assertion passes on that same run, since it precedes the negative one; the third-delegation assertion is not reached on it.
 - **Does not assert:** that the role is literally configured `clear = false` — the harness spawns one long-lived `cat` per worker, which is the same pane/agent-id continuity that configuration produces, and the defect is in the pane-keyed delegation ledger rather than in the `clear` flag (agent ids never move in this test). Also not asserted: the `#249` silence notice that accompanied the lost pointer in production (`orchestration/delegate/*`), and the user-visible rendering of the prompt in an attached TUI (`scheduler/idle-worker/011`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/021 — A blocked worker with an outstanding delegation notifies the orchestrator once without retiring the ledger (issue #714).
+- **Layer:** L2, lane 1, PTY-attached; the notice and ledger require the running daemon path.
+- **Agent:** synthetic Codex stand-in with a test-triggered quota line; no provider credential.
+- **Asserts:** one fixed blocked notice reaches the orchestrator pane with the worker pane id, no agent-controlled detail, and a second delegate remains busy because work-done is still owed.
+- **Does not assert:** eventual worker completion or provider quota reset.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live

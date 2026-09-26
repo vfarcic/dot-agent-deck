@@ -619,6 +619,7 @@ describe("TauriDeckBridge", () => {
       waiting_for_input: "waiting",
       idle: "waiting",
       error: "failed",
+      blocked: "blocked",
       unknown: "waiting",
     };
 
@@ -633,6 +634,52 @@ describe("TauriDeckBridge", () => {
     const future = structuredClone(snapshot);
     future.agents[0].status = "hyperthinking" as DesktopAgentDto["status"];
     expect(mapDesktopSnapshot(future).agents[0]?.status).toBe("waiting");
+  });
+
+  /**
+   * Issue #714. A quota-blocked agent is alive and its provider refuses it: it
+   * must read as neither `failed` (nothing crashed) nor `waiting` (that is what
+   * hid it), keep its reason beside the status and only there, and put the run
+   * into `attention` rather than `failed`.
+   */
+  it("blocked daemon status is a distinct agent status", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const dto = structuredClone(snapshot);
+    dto.agents[0].status = "blocked";
+    dto.agents[0].blocked = { kind: "credits_depleted", detectedAtMs: 1_700_000_000_000, detail: "purchase more credits" };
+    const mapped = mapDesktopSnapshot(dto);
+    expect(mapped.agents[0]?.status).toBe("blocked");
+    expect(mapped.agents[0]?.blocked).toEqual({ kind: "credits_depleted", detectedAtMs: 1_700_000_000_000, detail: "purchase more credits" });
+    expect(mapped.health).toBe("attention");
+
+    // A kind this build does not know degrades to `unknown`, not to a guess.
+    const future = structuredClone(dto);
+    future.agents[0].blocked = { kind: "future_kind", detectedAtMs: 1 };
+    expect(mapDesktopSnapshot(future).agents[0]?.blocked).toEqual({ kind: "unknown", detectedAtMs: 1 });
+
+    // The reason never outlives the status it explains.
+    const cleared = structuredClone(dto);
+    cleared.agents[0].status = "thinking";
+    expect(mapDesktopSnapshot(cleared).agents[0]?.blocked).toBeUndefined();
+  });
+
+  /**
+   * Issue #714 (review). The run graph built from the same snapshot must agree
+   * with the tile: a blocked agent is a `blocked` node, never `queued`, and it
+   * stops being one once the daemon reports it working again.
+   */
+  it("a blocked agent is a blocked run-graph node, not a queued one", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const dto = structuredClone(snapshot);
+    dto.agents[0].status = "blocked";
+    dto.agents[0].blocked = { kind: "usage_limit", detectedAtMs: 1 };
+    const mapped = mapDesktopSnapshot(dto);
+    expect(mapped.agents[0]?.status).toBe("blocked");
+    expect(mapped.stages[0]?.status).toBe("blocked");
+
+    const working = structuredClone(dto);
+    working.agents[0].status = "thinking";
+    expect(mapDesktopSnapshot(working).stages[0]?.status).toBe("active");
   });
 
   it("sends allow_build_mismatch through the live bridge", async () => {

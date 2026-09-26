@@ -249,6 +249,7 @@ mod tests {
             last_user_prompt: None,
             live_target: None,
             last_activity_ms: None,
+            blocked: None,
         }
     }
 
@@ -350,6 +351,11 @@ mod tests {
             SessionStatus::WaitingForInput => "WaitingForInput",
             SessionStatus::Idle => "Idle",
             SessionStatus::Error => "Error",
+            // Issue #714. No `SCHEMA_VERSION` bump, deliberately: the value is
+            // additive, and a consumer of this document already has to tolerate
+            // a status string it does not know (`"Unknown"` below is exactly
+            // that case re-emitted), so no existing reader's contract moves.
+            SessionStatus::Blocked => "Blocked",
             // Deserialize-side catch-all for a status string a newer daemon
             // sends that this build does not know. The CLI still re-emits it,
             // so it is part of what a script can read.
@@ -357,13 +363,14 @@ mod tests {
         }
     }
 
-    const ALL_STATUSES: [SessionStatus; 7] = [
+    const ALL_STATUSES: [SessionStatus; 8] = [
         SessionStatus::Thinking,
         SessionStatus::Working,
         SessionStatus::Compacting,
         SessionStatus::WaitingForInput,
         SessionStatus::Idle,
         SessionStatus::Error,
+        SessionStatus::Blocked,
         SessionStatus::Unknown,
     ];
 
