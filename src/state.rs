@@ -2753,18 +2753,71 @@ impl AppState {
     /// it. The daemon's hook ingestion (`crate::daemon::ingest_event`) calls
     /// this in place of `apply_event`; the TUI never does.
     ///
-    /// Keyed on the TRANSITION the daemon itself applied, not on the event's
-    /// type — so `PermissionRequest` counts like `WaitingForInput` (both set
-    /// the status), a `ToolStart` that preserves the status keeps the episode
-    /// open, and any event that moves the pane off the status closes it.
+    /// Keyed on the status the daemon itself applied, not on the event's type —
+    /// so `PermissionRequest` counts like `WaitingForInput` (both set the
+    /// status), and a `ToolStart` that preserves the status keeps the episode
+    /// open. Every applied event that leaves the pane waiting asks
+    /// [`Self::open_waiting_episode`], which is idempotent per agent, so a
+    /// repeated report keeps the first clock, while a replacement agent or a
+    /// tagged report superseding an untagged one still gets its own episode
+    /// (Qodo, #1347).
+    ///
+    /// An event that moves the pane OFF the status closes the episode only when
+    /// it names the pane's live agent (Greptile, #1347): the hook socket is
+    /// unauthenticated, and an untagged or foreign report that repaints the card
+    /// must not be able to silence the report about the agent that is still at
+    /// its prompt. An episode whose agent has been replaced is dropped when it
+    /// fires instead, by its own identity check.
+    pub fn apply_event_watching_waiting(
+        &mut self,
+        event: AgentEvent,
+        registry: &Arc<AgentPtyRegistry>,
+        pane_live_agent_id: Option<&str>,
+    ) {
+        let pane_id = event.pane_id.clone();
+        let event_agent_id = event.agent_id.clone();
+        self.apply_event(event);
+        let Some(pane_id) = pane_id else {
+            return;
+        };
+        if self.pane_status(&pane_id) == Some(SessionStatus::WaitingForInput) {
+            self.open_waiting_episode(
+                &pane_id,
+                event_agent_id.as_deref(),
+                pane_live_agent_id,
+                registry,
+            );
+            return;
+        }
+        if event_agent_id.is_some()
+            && event_agent_id.as_deref() == pane_live_agent_id
+            && registry.cancel_waiting_notice(&pane_id)
+        {
+            tracing::debug!(
+                pane_id = %pane_id,
+                "waiting notice: the worker left WaitingForInput; episode closed"
+            );
+        }
+    }
+
+    /// Issue #447: open a waiting episode for `pane_id`, whose status is
+    /// `WaitingForInput`, unless one is already open for the same agent.
+    ///
+    /// Called from two places: the hook ingestion above, with the reporting
+    /// event's agent id; and `handle_delegate`, right after a commission is
+    /// armed, with the agent id of the session that set the status — because a
+    /// worker already waiting when it is delegated to never makes the
+    /// transition again, and would otherwise owe a `work-done` at its prompt
+    /// with nobody told (Greptile, #1347).
     ///
     /// An episode is opened only when all of these hold:
     ///
-    /// * the event names the pane's CURRENT registry agent
-    ///   (`pane_live_agent_id`, read by the caller before taking the state lock).
-    ///   The hook socket is unauthenticated, so a report that cannot name the
-    ///   live generation does not get to start a notice about it;
-    /// * the status was not already set by an untagged producer
+    /// * the status was reported by the pane's CURRENT registry agent
+    ///   (`live_agent_id`, which the daemon's ingestion reads before taking the
+    ///   state lock). The hook socket is unauthenticated, so a report that
+    ///   cannot name the live generation does not get to start a notice about
+    ///   it;
+    /// * the status was not set by an untagged producer
     ///   ([`Self::untagged_status_panes`]) — the command-entry lock refuses to
     ///   act on such a status, and so does this;
     /// * the pane is an orchestration role pane with an outstanding commission
@@ -2777,53 +2830,31 @@ impl AppState {
     /// looks; where a notice may go comes from the commission ledger, and the
     /// notice itself changes no delegation (see
     /// [`compose_worker_waiting_notice`]).
-    pub fn apply_event_watching_waiting(
-        &mut self,
-        event: AgentEvent,
+    fn open_waiting_episode(
+        &self,
+        pane_id: &str,
+        reporting_agent_id: Option<&str>,
+        live_agent_id: Option<&str>,
         registry: &Arc<AgentPtyRegistry>,
-        pane_live_agent_id: Option<&str>,
     ) {
-        let pane_id = event.pane_id.clone();
-        let event_agent_id = event.agent_id.clone();
-        let was_waiting = pane_id
-            .as_deref()
-            .is_some_and(|pane| self.pane_status(pane) == Some(SessionStatus::WaitingForInput));
-        self.apply_event(event);
-        let Some(pane_id) = pane_id else {
-            return;
-        };
-        let now_waiting = self.pane_status(&pane_id) == Some(SessionStatus::WaitingForInput);
-        if !now_waiting {
-            if registry.cancel_waiting_notice(&pane_id) {
-                tracing::debug!(
-                    pane_id = %pane_id,
-                    "waiting notice: the worker left WaitingForInput; episode closed, no notice"
-                );
-            }
-            return;
-        }
-        if was_waiting {
-            return;
-        }
-        let (Some(event_agent_id), Some(live_agent_id)) =
-            (event_agent_id.as_deref(), pane_live_agent_id)
+        let (Some(reporting_agent_id), Some(live_agent_id)) = (reporting_agent_id, live_agent_id)
         else {
             return;
         };
-        if event_agent_id != live_agent_id || self.untagged_status_panes.contains(&pane_id) {
+        if reporting_agent_id != live_agent_id || self.untagged_status_panes.contains(pane_id) {
             return;
         }
-        let Some(role) = self.pane_role_map.get(&pane_id).cloned() else {
+        let Some(role) = self.pane_role_map.get(pane_id).cloned() else {
             return;
         };
         let Some(debounce) = waiting_notice_debounce() else {
             return;
         };
-        if registry.commission_owed_to(&pane_id).is_none() {
+        if registry.commission_owed_to(pane_id).is_none() {
             return;
         }
         let Some(armed) = registry.arm_waiting_notice(
-            &pane_id,
+            pane_id,
             live_agent_id,
             debounce * WAITING_NOTICE_COOLDOWN_FACTOR,
         ) else {
@@ -2833,18 +2864,44 @@ impl AppState {
             pane_id = %pane_id,
             role = %role,
             debounce_ms = debounce.as_millis(),
-            "waiting notice: a delegated worker entered WaitingForInput; episode opened"
+            "waiting notice: a delegated worker is waiting for input; episode opened"
         );
         arm_waiting_notice_watch(
             Arc::clone(registry),
             WaitingNoticeWatch {
-                worker_pane_id: pane_id.clone(),
+                worker_pane_id: pane_id.to_string(),
                 worker_agent_id: live_agent_id.to_string(),
                 role,
-                orchestration: self.pane_orchestration_map.get(&pane_id).cloned(),
+                orchestration: self.pane_orchestration_map.get(pane_id).cloned(),
                 debounce,
             },
             armed,
+        );
+    }
+
+    /// Issue #447: [`Self::open_waiting_episode`] for a worker that has just
+    /// been delegated to while its status already reads `WaitingForInput`. The
+    /// reporting agent is the one recorded on the session that set the status.
+    fn open_waiting_episode_if_already_waiting(
+        &self,
+        pane_id: &str,
+        registry: &Arc<AgentPtyRegistry>,
+    ) {
+        let Some(session) = self
+            .pane_session_id(pane_id)
+            .and_then(|id| self.sessions.get(&id))
+        else {
+            return;
+        };
+        if session.status != SessionStatus::WaitingForInput {
+            return;
+        }
+        let live_agent_id = registry.pane_current_agent_id(pane_id);
+        self.open_waiting_episode(
+            pane_id,
+            session.agent_id.as_deref(),
+            live_agent_id.as_deref(),
+            registry,
         );
     }
 }
@@ -2879,8 +2936,9 @@ struct WaitingNoticeWatch {
 ///   recorded when the orchestrator delegated. An orchestrator whose id was
 ///   unknown then has nothing to bind to, and the report stays in the log;
 /// * **immediately before the write**, under the held writer, the closure
-///   re-checks that neither pane is closing, that the episode is still open
-///   (the worker has not left the state), that the commission is still owed to
+///   re-checks that neither pane is closing, that the agent that reported the
+///   wait still owns the worker pane, that the episode is still open (the
+///   worker has not left the state), that the commission is still owed to
 ///   that same orchestrator agent (a `work-done` or a pane close since means
 ///   there is nothing to report), and that the orchestrator pane still belongs
 ///   to the worker's orchestration.
@@ -2959,23 +3017,31 @@ fn arm_waiting_notice_watch(
         // Issue #686's read, reused: the worker's own screen, keyed by AGENT id
         // so it is this generation's. Every failure degrades to "no readable
         // text" — the notice must not fail louder than the wait it reports.
-        let pane_text = registry
-            .snapshot_with_pty_size(&worker_agent_id)
-            .ok()
-            .map(|(bytes, rows, cols)| {
-                crate::pane_screen_text::visible_tail_lines(
-                    &bytes,
-                    rows,
-                    cols,
-                    crate::pane_screen_text::MAX_REPORTED_ROWS,
-                )
-            })
-            .as_deref()
-            .and_then(quote_untrusted_pane_text);
+        // Off the async worker: the snapshot takes the registry's and the
+        // scrollback's synchronous mutexes and copies the buffer (Qodo, #1347).
+        let snapshot_registry = Arc::clone(&registry);
+        let snapshot_agent = worker_agent_id.clone();
+        let pane_text = tokio::task::spawn_blocking(move || {
+            snapshot_registry.snapshot_with_pty_size(&snapshot_agent)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(|(bytes, rows, cols)| {
+            crate::pane_screen_text::visible_tail_lines(
+                &bytes,
+                rows,
+                cols,
+                crate::pane_screen_text::MAX_REPORTED_ROWS,
+            )
+        })
+        .as_deref()
+        .and_then(quote_untrusted_pane_text);
         let notice = compose_worker_waiting_notice(&role, opened.elapsed(), pane_text.as_deref());
         let orchestrator_pane_id = owner.orchestrator_pane_id.clone();
         let revalidate_registry = Arc::clone(&registry);
         let revalidate_worker = worker_pane_id.clone();
+        let revalidate_worker_agent = worker_agent_id.clone();
         let revalidate_orchestrator = orchestrator_pane_id.clone();
         let outcome = registry
             .write_and_submit_guarded(
@@ -2983,8 +3049,15 @@ fn arm_waiting_notice_watch(
                 &notice,
                 &expected_agent_id,
                 || async move {
+                    // The worker's identity again, not only before the wait
+                    // for the writer: a `clear = true` respawn can replace it
+                    // while this send queues (Greptile, #1347).
                     if revalidate_registry.is_pane_closing(&revalidate_orchestrator)
                         || revalidate_registry.is_pane_closing(&revalidate_worker)
+                        || revalidate_registry
+                            .pane_current_agent_id(&revalidate_worker)
+                            .as_deref()
+                            != Some(revalidate_worker_agent.as_str())
                         || !revalidate_registry.waiting_notice_is_current(&revalidate_worker, seq)
                         || revalidate_registry.commission_owed_to(&revalidate_worker) != Some(owner)
                     {
@@ -8450,6 +8523,14 @@ impl AppState {
                 }
                 crate::agent_pty::CommissionArm::Closing => None,
             };
+            // Issue #447 (Greptile, #1347): a worker already at a prompt when it
+            // is delegated to never makes the transition into WaitingForInput
+            // again, so its waiting episode is opened here, now that it owes a
+            // work-done. If the task pointer's delivery moves it on, its next
+            // hook event closes the episode before the debounce runs out.
+            if commission_in_flight.is_some() {
+                self.open_waiting_episode_if_already_waiting(&pane_id, &registry);
+            }
             if !delivered.iter().any(|r| r == &target_role) {
                 delivered.push(target_role.clone());
             }

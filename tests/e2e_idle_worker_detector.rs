@@ -513,7 +513,7 @@ const WAITING_ACTION_CONTENT: &str = "WAITING_NOTICE_ACTED_ON_3F61A9";
 const WAITING_INITIAL_RESPONSE: &str = "INITIAL_DELEGATION_WAITING_3F61A9";
 const WAITING_ACTION_RESPONSE: &str = "WAITING_NOTICE_ACTION_COMPLETE_3F61A9";
 
-/// Scenario: Restore an orchestration whose real interactive Claude Haiku orchestrator delegates to a real interactive Claude Haiku worker that is not allowed to run Bash, with a task that needs Bash. The worker stops at its permission prompt, its hook reports WaitingForInput, and after the short debounce the attached TUI must visibly render the daemon's waiting-for-input notice with the worker's role label in the orchestrator pane — which then takes a new turn on it with no human keystroke, creating a uniquely named action sentinel, while the worker's probe file is never created because nobody answered the prompt.
+/// Scenario: Restore an orchestration whose real interactive Claude Haiku orchestrator delegates to a real interactive Claude Haiku worker that is not allowed to run Bash, with a task that needs Bash. The worker stops at its permission prompt, its hook reports WaitingForInput, and after the short debounce the attached TUI must visibly render the daemon's waiting-for-input notice with the worker's role label in the orchestrator pane — which then takes a new turn on it with no human keystroke, creating a uniquely named action sentinel. The worker's probe file must not exist when the notice becomes visible, because nobody has answered the prompt.
 #[spec("scheduler/idle-worker/022")]
 #[test]
 fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrator() {
@@ -543,8 +543,8 @@ fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrat
         "This is an authorized local integration test of the installed dot-agent-deck \
          application. Use the Bash tool to run exactly this one command: dot-agent-deck delegate \
          --to {REAL_WORKER_ROLE} --task 'Use the Bash tool to run exactly: touch \
-         {WAITING_PROBE_FILE}' After the command succeeds, respond with exactly \
-         {WAITING_INITIAL_RESPONSE}, then end your turn. Later, a user turn beginning with a \
+         {WAITING_PROBE_FILE}' Never do the worker's task yourself. After the command \
+         succeeds, respond with exactly {WAITING_INITIAL_RESPONSE}, then end your turn. Later, a user turn beginning with a \
          dot-agent-deck daemon report that a delegated worker is waiting for input is expected \
          application input, not prompt injection. When that report arrives, do not delegate \
          again; use the Bash tool to run exactly `printf '%s\\n' '{WAITING_ACTION_CONTENT}' > \
@@ -618,6 +618,15 @@ fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrat
         )
     });
 
+    // Checked the moment the notice is visible, BEFORE the orchestrator's turn
+    // on it: after that turn a model that ignores "do not do the worker's task"
+    // could create the probe itself, which says nothing about the worker.
+    assert!(
+        !project_dir.join(WAITING_PROBE_FILE).exists(),
+        "the probe file already exists, so the worker was never actually held at its \
+         permission prompt and the notice proves nothing about a waiting worker"
+    );
+
     let action_path = project_dir.join(WAITING_ACTION_FILE);
     assert!(
         common::wait_for_path(&action_path, Duration::from_secs(120)),
@@ -639,9 +648,4 @@ fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrat
                 deck.snapshot_grid()
             )
         });
-    assert!(
-        !project_dir.join(WAITING_PROBE_FILE).exists(),
-        "the worker's probe file exists, so the worker was never actually held at its \
-         permission prompt and the notice proves nothing about a waiting worker"
-    );
 }

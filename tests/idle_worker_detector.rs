@@ -1654,7 +1654,7 @@ fn waiting_notices_for(snapshot: &str, role: &str) -> usize {
         .count()
 }
 
-/// Scenario: Delegate to four workers of one orchestration and leave a fifth undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; the undelegated `idle-bystander` waits too. Within a few seconds the orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice, naming `asking-worker` in the untrusted role label and quoting its question inside the untrusted pane-text frame — and nothing about the other four, then or after further waiting.
+/// Scenario: Delegate to six workers of one orchestration and leave a seventh undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card; `already-waiting-worker` was waiting before it was delegated to; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first three — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other four, then or after further waiting.
 #[spec("scheduler/idle-worker/021")]
 #[test]
 fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() {
@@ -1673,6 +1673,8 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
                 ("idle-bystander", WORKER_COMMAND),
                 ("finishing-worker", WORKER_COMMAND),
                 ("impersonated-worker", WORKER_COMMAND),
+                ("repainted-worker", WORKER_COMMAND),
+                ("already-waiting-worker", WORKER_COMMAND),
             ],
             None,
         )
@@ -1683,6 +1685,8 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             "idle-bystander",
             "finishing-worker",
             "impersonated-worker",
+            "repainted-worker",
+            "already-waiting-worker",
         ] {
             harness.manage_worker_pane(role).await;
             harness.worker_event(role, "session_start").await;
@@ -1699,12 +1703,19 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             "precondition: the asking worker never drew its question"
         );
 
+        // Already at its prompt BEFORE it is delegated to, so the delegation
+        // lands on a worker that never makes the transition again.
+        harness
+            .worker_event("already-waiting-worker", "waiting_for_input")
+            .await;
         harness
             .delegate(&[
                 "asking-worker",
                 "flapping-worker",
                 "finishing-worker",
                 "impersonated-worker",
+                "repainted-worker",
+                "already-waiting-worker",
             ])
             .await;
         // Let the task pointers land before the workers start "asking".
@@ -1732,9 +1743,33 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             )
             .await;
         tokio::time::sleep(debounce / 4).await;
+        harness
+            .worker_event("repainted-worker", "waiting_for_input")
+            .await;
         // A permission prompt someone cleared at once: back to work well
         // inside the debounce, so it must generate no traffic.
         harness.worker_event("flapping-worker", "thinking").await;
+        // An UNTAGGED report repaints the repainted worker's card as working.
+        // It names no generation, so it must not silence the report about the
+        // agent that is still at its prompt.
+        {
+            let event: dot_agent_deck::event::AgentEvent =
+                serde_json::from_value(serde_json::json!({
+                    "session_id": "session-repainted-worker",
+                    "agent_type": "claude_code",
+                    "event_type": "thinking",
+                    "timestamp": chrono::Utc::now(),
+                    "pane_id": worker_pane("repainted-worker"),
+                }))
+                .expect("build an untagged hook event");
+            dot_agent_deck::daemon::ingest_event(
+                &harness.state,
+                &harness.event_tx,
+                &harness.registry,
+                event,
+            )
+            .await;
+        }
         // A worker that reports its completion while still showing as
         // waiting owes nothing any more, so there is nothing to report.
         harness.work_done("finishing-worker").await;
@@ -1762,7 +1797,13 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
         let snapshot = harness
             .wait_for_snapshot(
                 |snapshot| {
-                    waiting_notices_for(snapshot, "asking-worker") > 0
+                    [
+                        "asking-worker",
+                        "repainted-worker",
+                        "already-waiting-worker",
+                    ]
+                    .iter()
+                    .all(|role| waiting_notices_for(snapshot, role) > 0)
                         && snapshot.contains(&format!("{WAITING_FINAL_CLAUSE}\r"))
                 },
                 common::load_scaled(Duration::from_secs(5)),
@@ -1773,6 +1814,18 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             1,
             "a delegated worker that stopped to wait for input was never reported to the \
              orchestrator that delegated to it (issue #447); snapshot = {snapshot:?}"
+        );
+        assert_eq!(
+            waiting_notices_for(&snapshot, "repainted-worker"),
+            1,
+            "an untagged report that repainted the card silenced the report about a worker \
+             still at its prompt; snapshot = {snapshot:?}"
+        );
+        assert_eq!(
+            waiting_notices_for(&snapshot, "already-waiting-worker"),
+            1,
+            "a worker already waiting when it was delegated to was never reported; \
+             snapshot = {snapshot:?}"
         );
         assert!(
             snapshot.contains(&format!("{WAITING_FINAL_CLAUSE}\r")),
@@ -1789,11 +1842,19 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
         // debounce and confirm nothing repeats, and that neither the flapping
         // worker nor the undelegated one was ever reported.
         tokio::time::sleep(debounce * 3).await;
+        // Re-reporting the same wait must not buy a second notice either —
+        // waited past the per-worker cooldown (four debounce windows), which is
+        // when a re-opened episode would fire.
+        harness
+            .worker_event("asking-worker", "waiting_for_input")
+            .await;
+        tokio::time::sleep(debounce * 6).await;
         let settled = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
         assert_eq!(
             settled.matches(WAITING_NEEDLE).count(),
-            1,
-            "exactly one waiting notice may reach the orchestrator; snapshot = {settled:?}"
+            3,
+            "exactly one waiting notice per waiting worker may reach the orchestrator; \
+             snapshot = {settled:?}"
         );
         assert_eq!(
             waiting_notices_for(&settled, "flapping-worker"),

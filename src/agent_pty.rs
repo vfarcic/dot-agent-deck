@@ -3761,11 +3761,12 @@ struct DelegationTracker {
     /// marks. Lets an in-flight wait (the M1 readiness gate) abandon promptly
     /// instead of sleeping out its remainder against a target that is gone.
     close_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
-    /// Issue #447: the pending waiting-for-input notices, keyed by the
-    /// *worker's* `pane_id_env`; at most one per worker pane — one per waiting
-    /// episode, armed when the worker's hook moves it INTO `WaitingForInput`
-    /// and dropped (cancelling its task) when it leaves, when the notice is
-    /// settled, or when the pane closes. See [`WaitingNoticeRecord`].
+    /// Issue #447: the open waiting episodes, keyed by the *worker's*
+    /// `pane_id_env`; at most one per worker pane. Opened when the worker's hook
+    /// puts it in `WaitingForInput`, kept (marked settled) once its one notice
+    /// has been decided, and removed — cancelling a pending task — when the live
+    /// agent reports it has left the state or the pane closes. See
+    /// [`WaitingNoticeRecord`].
     waiting_notices: HashMap<String, WaitingNoticeRecord>,
     /// Issue #447: when each worker pane last had a waiting-for-input notice
     /// SUBMITTED to its orchestrator, so the next one waits out
@@ -3796,9 +3797,16 @@ struct WaitingNoticeRecord {
     /// to one generation of the pane: a different agent reporting a wait
     /// replaces the record rather than riding its clock.
     worker_agent_id: String,
-    /// The live end of the task's cancellation channel. Never sent on: the task
-    /// selects on it and exits as soon as this record leaves the map.
-    _cancel: oneshot::Sender<()>,
+    /// Whether this episode's one notice has been decided — sent, refused or
+    /// abandoned. A settled record stays in the map for as long as the episode
+    /// lasts, so a repeated `WaitingForInput` from the same agent cannot open a
+    /// second episode (and a second notice) for the same wait (Qodo, #1347);
+    /// and settling a record the close sweep already removed finds nothing, so
+    /// no cooldown outlives the pane (Qodo, #1347).
+    settled: bool,
+    /// The live end of the task's cancellation channel, `None` once settled.
+    /// Never sent on: the task selects on it and exits as soon as it drops.
+    _cancel: Option<oneshot::Sender<()>>,
 }
 
 /// Issue #447: handed back by [`AgentPtyRegistry::arm_waiting_notice`] to the
@@ -5187,10 +5195,11 @@ impl AgentPtyRegistry {
     ///
     /// `None` — nothing armed, no task to spawn — when the pane is mid-close
     /// (the arm-after-cancel guard every other arm here has), or when an episode
-    /// for the same agent is already open: a repeated `WaitingForInput` report
-    /// keeps the first one's clock rather than restarting it, which is what
-    /// stops a worker re-reporting the state from postponing its notice for
-    /// ever. An open episode for a DIFFERENT agent is replaced.
+    /// for the same agent is already open, settled or not: a repeated
+    /// `WaitingForInput` report keeps the first one's clock rather than
+    /// restarting it, which is what stops a worker re-reporting the state from
+    /// postponing its notice for ever, and a wait already reported is not
+    /// reported again. An open episode for a DIFFERENT agent is replaced.
     ///
     /// `cooldown` bounds the rate per worker pane: the returned `not_before` is
     /// the previous submitted notice plus `cooldown`. It delays a notice; it
@@ -5219,7 +5228,8 @@ impl AgentPtyRegistry {
             WaitingNoticeRecord {
                 seq,
                 worker_agent_id: worker_agent_id.to_string(),
-                _cancel: cancel_tx,
+                settled: false,
+                _cancel: Some(cancel_tx),
             },
         );
         let not_before = tracker
@@ -5244,33 +5254,38 @@ impl AgentPtyRegistry {
             .is_some()
     }
 
-    /// Issue #447: whether the waiting episode `seq` is still the open one for
-    /// `worker_pane_id` — i.e. the worker has not left `WaitingForInput`, been
-    /// replaced by a newer episode, or had its pane closed since. Re-checked
-    /// immediately before the notice is written.
+    /// Issue #447: whether the waiting episode `seq` is still the open,
+    /// unsettled one for `worker_pane_id` — i.e. the worker has not reported
+    /// leaving `WaitingForInput`, been replaced by a newer episode, or had its
+    /// pane closed since. Re-checked immediately before the notice is written.
     pub fn waiting_notice_is_current(&self, worker_pane_id: &str, seq: u64) -> bool {
         self.delegations
             .lock()
             .unwrap()
             .waiting_notices
             .get(worker_pane_id)
-            .is_some_and(|open| open.seq == seq)
+            .is_some_and(|open| open.seq == seq && !open.settled)
     }
 
-    /// Issue #447: end the waiting episode `seq` — one notice per episode —
-    /// and, when a notice was `submitted`, start the pane's cooldown. A no-op
-    /// on the record when a newer episode has replaced it; the cooldown is
-    /// still recorded, because a notice really was sent.
+    /// Issue #447: decide the waiting episode `seq` — one notice per episode —
+    /// and, when a notice was `submitted`, start the pane's cooldown. The
+    /// record stays, marked settled, until the episode ends. A no-op when the
+    /// record is no longer this episode's: replaced by a newer generation's,
+    /// removed because the worker left the state, or swept by a pane close — in
+    /// which last case recording a cooldown would throttle whatever agent next
+    /// takes the pane id (Qodo, #1347).
     pub fn settle_waiting_notice(&self, worker_pane_id: &str, seq: u64, submitted: bool) {
         let mut tracker = self.delegations.lock().unwrap();
-        if tracker
+        let Some(open) = tracker
             .waiting_notices
-            .get(worker_pane_id)
-            .is_some_and(|open| open.seq == seq)
-        {
-            tracker.waiting_notices.remove(worker_pane_id);
-        }
-        if submitted && !tracker.closing_panes.contains(worker_pane_id) {
+            .get_mut(worker_pane_id)
+            .filter(|open| open.seq == seq)
+        else {
+            return;
+        };
+        open.settled = true;
+        open._cancel = None;
+        if submitted {
             tracker
                 .waiting_notice_sent_at
                 .insert(worker_pane_id.to_string(), Instant::now());
@@ -17091,10 +17106,11 @@ mod spawn_tests {
         );
     }
 
-    /// Issue #447: a submitted notice starts the pane's cooldown, which the
-    /// next episode reads as its floor; an unsent one does not; and a pane
-    /// close clears both the episode and the cooldown and refuses re-arming
-    /// while it runs.
+    /// Issue #447: a settled episode stays open, so the same agent's repeated
+    /// report cannot buy a second notice for the same wait; a submitted notice
+    /// starts the pane's cooldown, which the next episode reads as its floor, and
+    /// an unsent one does not; and a pane close clears both and refuses
+    /// re-arming while it runs.
     #[test]
     fn waiting_notice_cooldown_follows_a_submitted_notice_and_close_sweeps_it() {
         let reg = Arc::new(AgentPtyRegistry::new());
@@ -17102,6 +17118,19 @@ mod spawn_tests {
 
         let unsent = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
         reg.settle_waiting_notice("worker", unsent.seq, false);
+        assert!(
+            !reg.waiting_notice_is_current("worker", unsent.seq),
+            "a settled episode is no longer pending"
+        );
+        assert!(
+            reg.arm_waiting_notice("worker", "agent", cooldown)
+                .is_none(),
+            "the same agent re-reporting the same wait must not open a second episode"
+        );
+        assert!(
+            reg.cancel_waiting_notice("worker"),
+            "leaving the state ends it"
+        );
         let after_unsent = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
         assert_eq!(
             after_unsent.not_before, None,
@@ -17110,6 +17139,7 @@ mod spawn_tests {
 
         let before = Instant::now();
         reg.settle_waiting_notice("worker", after_unsent.seq, true);
+        assert!(reg.cancel_waiting_notice("worker"));
         let next = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
         let floor = next
             .not_before
@@ -17134,6 +17164,27 @@ mod spawn_tests {
         assert_eq!(
             reopened.not_before, None,
             "a closed pane's cooldown must not outlive it onto a pane id reused later"
+        );
+    }
+
+    /// Issue #447 (Qodo, #1347): a notice whose send was already in flight when
+    /// the pane's close ran must not record a cooldown when it settles after
+    /// the close has finished — that would throttle whatever agent takes the
+    /// pane id next.
+    #[test]
+    fn waiting_notice_settled_after_a_close_records_no_cooldown() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let cooldown = Duration::from_secs(120);
+        let armed = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        drop(reg.begin_pane_close("worker"));
+        drop(reg.finish_pane_close("worker", true));
+        reg.settle_waiting_notice("worker", armed.seq, true);
+        let successor = reg
+            .arm_waiting_notice("worker", "successor", cooldown)
+            .expect("the reused pane id opens a fresh episode");
+        assert_eq!(
+            successor.not_before, None,
+            "a notice about the closed pane's agent must not delay its successor's"
         );
     }
 

@@ -189,9 +189,9 @@ and changes no delegation.
 
 A few properties are deliberate.
 
-- **Only a worker with an outstanding delegation is reported.** The report is about work the orchestrator is waiting on, so a worker nobody delegated to — or one that has already sent its `work-done` — produces nothing, whatever its status says.
+- **Only a worker with an outstanding delegation is reported.** The report is about work the orchestrator is waiting on, so a worker nobody delegated to — or one that has already sent its `work-done` — produces nothing, whatever its status says. A worker that was already waiting when it was delegated to counts from the delegation: if the task does not move it on within the 30 seconds, it is reported.
 - **A short wait produces nothing.** A permission prompt the person watching clears within the 30 seconds, or a worker that flickers in and out of the state, never lasts the window. A worker that keeps reporting the state does not restart it either.
-- **One report per wait, and at most one per worker every two minutes.** A worker that is answered and then waits again is reported again, but no sooner than two minutes after its previous report; a second wait is delayed by that, never dropped.
+- **One report per wait, and at most one per worker every two minutes.** A worker that re-reports the same wait is not reported again. A worker that is answered and then waits again is, but no sooner than two minutes after its previous report; a second wait is delayed by that, never dropped. Only the worker's own agent can end a wait: a status report that names no agent, or another one, can repaint the card but does not cancel the report.
 - **It is submitted and identity-bound like the other two.** It arrives as a turn the orchestrator answers, bound to the orchestrator agent that made the delegation, and it is dropped rather than delivered if that orchestrator is gone, either pane is closing, the worker has left the waiting state, or its delegation has been answered in the meantime. A report whose worker was replaced in its pane is dropped too.
 - **It is information, not authority.** A status is something the worker reports about itself, and the deck does not act on it: the report grants, cancels and reroutes nothing, and what happens next is the orchestrator's call.
 
