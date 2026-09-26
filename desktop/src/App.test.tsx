@@ -1597,12 +1597,12 @@ describe("ControlDeck", () => {
     // The whole document crosses the bridge, so a save can never drop a section
     // this build's UI has not loaded. `zoom` riding along untouched here IS
     // that guarantee — the Appearance panel knows nothing about PRD #744's
-    // section and still cannot lose it.
-    expect(store.saveSettings).toHaveBeenCalledWith({
-      version: 1,
-      appearance: { mode: "dark" },
-      zoom: { level: 1 },
-    });
+    // section and still cannot lose it. The second argument is the document
+    // the edit was made against, so the Rust side writes only the edit (#828).
+    expect(store.saveSettings).toHaveBeenCalledWith(
+      { version: 1, appearance: { mode: "dark" }, zoom: { level: 1 } },
+      { version: 1, appearance: { mode: "system" }, zoom: { level: 1 } },
+    );
     expect(store.current.appearance.mode).toBe("dark");
 
     first.unmount();

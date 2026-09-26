@@ -8,7 +8,7 @@
  * and #741's and #802's sections will add fields here without this file
  * changing at all.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "../lib/bridge";
 import type { DeckRuntimeState } from "../types";
 
@@ -73,12 +73,36 @@ export interface DesktopSettingsState {
    * #829), and the footer must not go on naming that path as the store.
    */
   problem?: string;
-  save: (next: DesktopSettingsDto) => void;
+  /**
+   * Persist `next`. `from` is the document `next` was derived from, when that
+   * is not the one on screen — a write-back that runs after an `await` and
+   * builds on a snapshot it kept. Omitted, the document on screen is assumed,
+   * which is right for any handler reacting to the render it was given.
+   */
+  save: (next: DesktopSettingsDto, from?: DesktopSettingsDto) => void;
 }
 
 export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsState {
   const { getSettings, saveSettings } = runtime;
   const [settings, setSettings] = useState<DesktopSettingsDto>(DEFAULT_DESKTOP_SETTINGS);
+  // The document as last COMMITTED to the screen (issue #828). A save sends it
+  // as the `base` its edit was made against, so the Rust side writes only what
+  // this edit changed and leaves every other field as the file holds it — which
+  // may be another app window's newer value.
+  //
+  // The committed document rather than the newest state, because a caller
+  // derives `next` from the `settings` it was RENDERED with, and the base must
+  // be that same snapshot. The two part company when a reply is applied and a
+  // caller acts before the re-render reaches it: the newest state then already
+  // holds another window's value, the caller's `next` still holds this
+  // window's old one, and the difference would be read as an edit and written
+  // over the newer value. A layout effect updates it after the commit and
+  // before the browser dispatches another event, so a handler never sees it
+  // ahead of the props it was rendered with.
+  const rendered = useRef<DesktopSettingsDto>(DEFAULT_DESKTOP_SETTINGS);
+  useLayoutEffect(() => {
+    rendered.current = settings;
+  }, [settings]);
   const [path, setPath] = useState<string>();
   const [loaded, setLoaded] = useState(false);
   // Whether a document actually came back, which `loaded` does NOT answer:
@@ -106,10 +130,20 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
   // state — so a stale document could win twice over. Today the only
   // consequence is a stale appearance choice; it matters more once the document
   // holds a daemon endpoint (#741) or a backend selection (#802). The
-  // cross-process half of the same problem — two app windows racing on one
-  // field — is #828, and is not something a hook can fix.
+  // cross-process half of the same problem — two app windows each saving a copy
+  // loaded before the other's write — is #828, and the hook's part in that fix
+  // is `rendered` above: each save names the document its edit was made against.
   const queue = useRef<Promise<void>>(Promise.resolve());
   const newest = useRef(0);
+  // The base of a save that FAILED, carried to the next save that runs (issue
+  // #828 review). Each save's base is the document its own edit was made
+  // against, so after a failure the next one's base already contains the
+  // failed edit — diffing against it would treat that edit as unchanged, leave
+  // the file's old value in place, and the reply would then roll it back on
+  // screen. Starting the next save from the failed one's base instead makes its
+  // delta cover both edits, which is what sending the whole document did
+  // before the base existed.
+  const carried = useRef<DesktopSettingsDto | undefined>(undefined);
   // How many saves have come back accepted. A load that was already in flight
   // when one did describes the file as it was BEFORE that write, so its
   // `problem` is stale: the backend has since accepted the document, and
@@ -156,11 +190,18 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
     return () => { cancelled = true; };
   }, [getSettings]);
 
-  const save = useCallback((next: DesktopSettingsDto) => {
+  const save = useCallback((next: DesktopSettingsDto, from?: DesktopSettingsDto) => {
     // Applied first, written behind it. PRD #743 requires the appearance change
     // to be visible with no restart, and waiting for a disk write to repaint
     // would put a round trip between the click and the theme.
     edited.current = true;
+    // What this edit was made against: the document the caller says it derived
+    // `next` from, or else the one on screen. The difference between the two
+    // IS the edit, and it is all the Rust side writes. Captured here rather
+    // than when the queued save runs: by then a response may have brought in
+    // another window's value, and diffing `next` against that would read this
+    // window's stale copy of it as a change.
+    const base = from ?? rendered.current;
     setSettings(next);
     setSaveFailure(undefined);
 
@@ -170,33 +211,45 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
     // settled, so the last choice made is the last one on disk. The inner
     // handlers never reject, so one failed save cannot break the chain for
     // every save after it.
-    queue.current = queue.current.then(() => saveSettings(next)
-      .then((written) => {
-        // Any save that came back at all means the document on disk is one this
-        // build can read: `save_to` refuses before writing otherwise. True of a
-        // superseded response too, so this is cleared before the ticket check —
-        // the document's state is not a property of which write won.
-        accepted.current += 1;
-        setDocumentProblem(undefined);
-        // A superseded response is dropped rather than applied — it is an
-        // older document, and the user has already moved past it.
-        if (newest.current === ticket) setSettings(written);
-      })
-      .catch((cause: unknown) => {
-        // Deliberately NOT reverted. The user asked for this and can see it;
-        // what failed is making it survive a restart, and saying so is more
-        // use than silently undoing a choice they just made.
-        //
-        // Superseded failures are dropped for the same reason as superseded
-        // successes: the message would be about a choice no longer on screen.
-        if (newest.current !== ticket) return;
-        const message = cause instanceof Error ? cause.message : String(cause);
-        // The lead-in is composed here rather than in each panel, because a
-        // panel now renders `saveError` verbatim: the other thing that reaches
-        // that prop is a document problem, which is already a whole sentence and
-        // must not acquire a "saving it failed" preamble it has not earned.
-        setSaveFailure(`This change is applied, but saving it failed, so it will not survive a restart. ${message}`);
-      }));
+    queue.current = queue.current.then(() => {
+      // Read here, when this save runs, because only now is it known whether
+      // the one before it failed.
+      const sentBase = carried.current ?? base;
+      carried.current = undefined;
+      return saveSettings(next, sentBase)
+        .then((written) => {
+          // Any save that came back at all means the document on disk is one this
+          // build can read: `save_to` refuses before writing otherwise. True of a
+          // superseded response too, so this is cleared before the ticket check —
+          // the document's state is not a property of which write won.
+          accepted.current += 1;
+          setDocumentProblem(undefined);
+          // A superseded response is dropped rather than applied — it is an
+          // older document, and the user has already moved past it. The newest
+          // one is the file as written, so applying it also shows what another
+          // window saved meanwhile (issue #828).
+          if (newest.current === ticket) setSettings(written);
+        })
+        .catch((cause: unknown) => {
+          // The edit did not reach the file, so the next save must carry it —
+          // superseded or not, which is exactly the case where it would
+          // otherwise be lost. See `carried`.
+          carried.current = sentBase;
+          // Deliberately NOT reverted. The user asked for this and can see it;
+          // what failed is making it survive a restart, and saying so is more
+          // use than silently undoing a choice they just made.
+          //
+          // Superseded failures are dropped for the same reason as superseded
+          // successes: the message would be about a choice no longer on screen.
+          if (newest.current !== ticket) return;
+          const message = cause instanceof Error ? cause.message : String(cause);
+          // The lead-in is composed here rather than in each panel, because a
+          // panel now renders `saveError` verbatim: the other thing that reaches
+          // that prop is a document problem, which is already a whole sentence and
+          // must not acquire a "saving it failed" preamble it has not earned.
+          setSaveFailure(`This change is applied, but saving it failed, so it will not survive a restart. ${message}`);
+        });
+    });
   }, [saveSettings]);
 
   // `edited` is a ref, and this reads it during render — safe here, and only

@@ -51,10 +51,15 @@ export interface SettingsPanelProps {
    *
    * Saves are serialised inside `useDesktopSettings` and a superseded response
    * is dropped, so two rapid calls reach the disk in the order they were made
-   * and a stale reply cannot overwrite newer state. Two *processes* racing on
-   * the same field is a different problem, not handled, tracked as #828.
+   * and a stale reply cannot overwrite newer state. Across *processes* — two
+   * app windows, or the app and a hand edit — only the fields this call changed
+   * are written, so another writer's edit to a field you did not touch survives
+   * (issue #828). Compute `next` from the `settings` you were handed: the
+   * difference between the two is what the hook treats as your edit. A write
+   * that builds on some OTHER snapshot — one kept across an `await` — passes it
+   * as `from`, so the difference is measured against what it actually edited.
    */
-  onSave: (next: DesktopSettingsDto) => void;
+  onSave: (next: DesktopSettingsDto, from?: DesktopSettingsDto) => void;
   /**
    * Why the settings document cannot be written right now, as a **complete
    * sentence** — render it verbatim rather than composing around it.
