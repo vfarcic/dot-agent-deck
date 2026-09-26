@@ -3827,6 +3827,75 @@ mod tests {
         );
     }
 
+    /// The macOS desktop's bundled sidecar, in the layout the v0.42.0 `.dmg`
+    /// actually ships (issue #1157, measured by extracting the release asset):
+    /// `Agent Deck.app/Contents/MacOS/dot-agent-deck` beside the desktop
+    /// executable, with an `Applications -> /Applications` link to drag it to.
+    ///
+    /// A bundle is deliberately **not** an install location, and this pins that
+    /// decision in the direction that matters: with a CLI install present, the
+    /// install wins over the sidecar. Were the bundle promoted to step 1, a
+    /// daemon started by the desktop would pin the bundle path while a TUI run
+    /// from the install pins the install — two deck rules per event in every
+    /// agent's global config, which is issue #1140's harm by a second route.
+    /// Nothing about the path is platform-specific, so this runs everywhere.
+    #[test]
+    fn durable_binary_path_prefers_an_install_over_a_macos_app_bundle_sidecar() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+
+        let installed = home.join(".local").join("bin").join(&name);
+        write_stub_executable(&installed);
+        let sidecar = dir
+            .path()
+            .join("Applications")
+            .join("Agent Deck.app")
+            .join("Contents")
+            .join("MacOS")
+            .join(&name);
+        write_stub_executable(&sidecar);
+
+        let resolved = durable_binary_path_with(Ok(sidecar.clone()), &home, None);
+
+        assert_eq!(
+            assert_durable(&resolved),
+            installed.to_str().expect("installed path is UTF-8"),
+            "a CLI install must win over the desktop's bundled sidecar, or the two write two \
+             sets of deck rules"
+        );
+    }
+
+    /// The other direction of the same decision: a desktop-only machine — the
+    /// bundled sidecar and no CLI install anywhere — still gets the sidecar
+    /// pinned, by step 3, rather than a refusal. That is what keeps a
+    /// desktop-only user's agents reporting status (issue #1157).
+    #[test]
+    fn durable_binary_path_pins_a_macos_app_bundle_sidecar_when_it_is_the_only_deck() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let sidecar = dir
+            .path()
+            .join("Applications")
+            .join("Agent Deck.app")
+            .join("Contents")
+            .join("MacOS")
+            .join(format!(
+                "{DEFAULT_BINARY_NAME}{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+        write_stub_executable(&sidecar);
+
+        let resolved = durable_binary_path_with(Ok(sidecar.clone()), &home, None);
+
+        assert_eq!(
+            assert_durable(&resolved),
+            sidecar.to_str().expect("sidecar path is UTF-8"),
+            "a desktop-only machine must get its sidecar pinned, not no hooks at all"
+        );
+    }
+
     /// Step 2a: the running binary IS a build artifact, and
     /// `<home>/.local/bin/<name>` exists and is executable — that path wins,
     /// and the artifact never appears.
