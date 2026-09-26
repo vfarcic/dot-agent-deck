@@ -39,7 +39,23 @@ export class WebDriverError extends Error {
  * because a session request includes launching the app, the slowest single
  * thing this client asks for.
  */
-const REQUEST_MS = Number(process.env.DAD_DRIVER_WAIT_MS ?? 120_000);
+export const WAIT_MS = parseWaitMs(process.env.DAD_DRIVER_WAIT_MS);
+const REQUEST_MS = WAIT_MS;
+
+/**
+ * `DAD_DRIVER_WAIT_MS`, validated once for both this client and the harness.
+ * `Number("abc")` is `NaN`, and a `NaN` deadline never compares as expired —
+ * every wait would then spin forever, which is the one outcome a bound exists
+ * to rule out — so anything but a positive safe integer is refused at load.
+ */
+function parseWaitMs(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return 120_000;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`DAD_DRIVER_WAIT_MS must be a positive whole number of milliseconds, got ${JSON.stringify(raw)}`);
+  }
+  return value;
+}
 
 async function call(base: string, method: string, path: string, body?: unknown): Promise<unknown> {
   const response = await fetch(`${base}${path}`, {

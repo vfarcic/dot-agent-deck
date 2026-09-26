@@ -15,7 +15,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type Element, Session, serverReady } from "./webdriver.ts";
+import { type Element, Session, serverReady, WAIT_MS } from "./webdriver.ts";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -24,9 +24,10 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
  * it, so raising it costs nothing but the time a genuine hang takes to report.
  * 120s because the first GitHub runner measurement ran each scenario in
  * ~37-38s end to end against 6-10s on a 16-core dev box: a bound sized from
- * the dev box would leave a slow runner a fraction of that margin.
+ * the dev box would leave a slow runner a fraction of that margin. Parsed and
+ * validated in `webdriver.ts`, which bounds every request by the same value.
  */
-export const WAIT_MS = Number(process.env.DAD_DRIVER_WAIT_MS ?? 120_000);
+export { WAIT_MS };
 
 /** Polling cadence inside `waitFor`. Not a wait in its own right. */
 const POLL_MS = 100;
