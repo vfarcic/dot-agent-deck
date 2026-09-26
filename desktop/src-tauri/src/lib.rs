@@ -2904,8 +2904,16 @@ async fn desktop_voice_resolve(
         .unwrap_or_default();
     let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
     let snapshot = get_snapshot(&state.daemon).await;
-    let decks = voice_decks(&snapshot.observed, deck_step.as_deref());
-    Ok(voice::handle_utterance_with(
+    let mut decks = voice_decks(&snapshot.observed, deck_step.as_deref());
+    // PRD #1195 M3: the decks the Deck selector lists, read from the same
+    // document the selector renders — not only the ones the app observes,
+    // which under a single-deck selection is the one deck already shown.
+    let selections = selector_voice_decks(
+        crate::settings::load_snapshot().settings.endpoints.as_ref(),
+        &mut decks,
+        deck_step.as_deref(),
+    );
+    let mut result = voice::handle_utterance_with(
         resolver.as_ref(),
         voice::table(),
         screen,
@@ -2919,7 +2927,110 @@ async fn desktop_voice_resolve(
         // offers nor dispatches the way there while it is hidden.
         dot_agent_deck::features::show_desktop_deck(),
     )
-    .await)
+    .await;
+    voice::address_deck_switch(&mut result.outcome, |deck_id| {
+        selections.get(deck_id).cloned()
+    });
+    Ok(result)
+}
+
+/// PRD #1195 M3 — the Deck selector's decks, for `switch_deck`: every deck it
+/// lists that [`voice_decks`] did not already take from the observed fleet is
+/// appended to `decks`, and the answer maps EVERY deck in `decks` that the
+/// selector lists to the token the selector stores for it.
+///
+/// # Why the observed fleet is not enough
+///
+/// [`voice_decks`] reads `snapshot.observed`, which is what the app CONNECTS
+/// to — and under a single-deck selection that is exactly one deck, the one on
+/// screen (`EndpointSettings::connectable_endpoints`). Resolving a switch
+/// against it would leave "switch deck to the build box" one answer, "no deck
+/// matches", for every deck but the current one. The selector lists `local`
+/// and every `[[endpoints.remote]]` row (`deckChoices` in
+/// `desktop/src/lib/endpoints.ts`), so that is the list read here, from the
+/// same settings document the webview's selector renders.
+///
+/// # Keys and labels
+///
+/// Each appended deck is keyed the way the fleet would key it — the endpoint's
+/// wire id, or [`crate::dto::unconfigured_deck_id`] for a row with no socket
+/// path — so a deck that later connects keeps its key, and labelled the way the
+/// overview labels it. It is appended as unable to take a new agent, since the
+/// New agent dialog lists only decks the app is connected to: with the deck
+/// step's own reason when the step names one, otherwise
+/// [`voice::DECK_NOT_CONNECTED`], or the fleet view's "not configured"
+/// sentence for a row with no address. That keeps the New agent flow exactly
+/// as it was — it never offers or preselects such a deck — while
+/// `switch_deck`, which ignores that reason, can switch to it.
+///
+/// **All Decks is not in here.** It is a selection rather than a deck, so a
+/// `deck_ref` naming it would also be a deck the New agent dialog is asked
+/// about; see `commands.toml`'s `switch_deck` row.
+fn selector_voice_decks(
+    endpoints: Option<&crate::settings::EndpointSettings>,
+    decks: &mut Vec<voice::VoiceDeck>,
+    deck_step: Option<&[voice::VoiceDeckChoice]>,
+) -> HashMap<String, String> {
+    use dot_agent_deck::daemon_client::Endpoint;
+    let step_reason = |deck_id: &str| {
+        deck_step
+            .and_then(|step| step.iter().find(|choice| choice.deck_id == deck_id))
+            .and_then(|choice| choice.reason.clone())
+    };
+    let local = crate::dto::deck_wire_id(&Endpoint::local());
+    let mut listed: Vec<(voice::VoiceDeck, String)> = vec![(
+        voice::VoiceDeck {
+            unavailable: Some(
+                step_reason(&local).unwrap_or_else(|| voice::DECK_NOT_CONNECTED.to_string()),
+            ),
+            id: local,
+            label: "Local deck".to_string(),
+            local: true,
+        },
+        crate::settings::LOCAL_SELECTION_TOKEN.to_string(),
+    )];
+    for row in endpoints
+        .map(|section| section.remote.as_slice())
+        .unwrap_or_default()
+    {
+        let (id, label, fallback) = match row.endpoint() {
+            Some(remote) => {
+                let endpoint = Endpoint::Remote(remote);
+                (
+                    crate::dto::deck_wire_id(&endpoint),
+                    crate::dto::deck_path_text(&endpoint),
+                    voice::DECK_NOT_CONNECTED,
+                )
+            }
+            None => (
+                crate::dto::unconfigured_deck_id(&row.id),
+                crate::dto::safe_display_text(row.describe()),
+                crate::dto::UNCONFIGURED_DECK_REASON,
+            ),
+        };
+        let unavailable = Some(step_reason(&id).unwrap_or_else(|| fallback.to_string()));
+        listed.push((
+            voice::VoiceDeck {
+                label: if label.trim().is_empty() {
+                    "Remote deck".to_string()
+                } else {
+                    label
+                },
+                id,
+                local: false,
+                unavailable,
+            },
+            row.id.as_str().to_string(),
+        ));
+    }
+    let mut selections = HashMap::new();
+    for (deck, token) in listed {
+        if !decks.iter().any(|known| known.id == deck.id) {
+            decks.push(deck.clone());
+        }
+        selections.entry(deck.id).or_insert(token);
+    }
+    selections
 }
 
 /// The decks a spoken `deck_ref` resolves against (PRD #1223): the snapshot's
@@ -4626,6 +4737,105 @@ mod tests {
         long_path.form.as_mut().expect("a form").path =
             "/".repeat(MAX_VOICE_DIRECTORY_PATH_BYTES + 1);
         assert!(validate_voice_new_agent(&long_path).is_err());
+    }
+
+    /// Scenario: the app shows the local deck (a single-deck selection, so it
+    /// observes only that one) and Settings holds a connectable build box and
+    /// a new box with no socket path yet. Voice's decks gain both — keyed the
+    /// way the fleet keys them and unable to take a new agent, for the reason
+    /// that fits each — and every deck maps to the token the Deck selector
+    /// stores for it. "Switch deck to the build box" then dispatches that
+    /// row's token, which is what the selector's write takes.
+    #[tokio::test]
+    async fn selector_voice_decks_add_the_decks_the_selector_lists() {
+        use crate::settings::{EndpointId, EndpointSettings, RemoteEndpointSettings, Selection};
+        use dot_agent_deck::daemon_client::Endpoint;
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+
+        let row = |id: &str, host: &str, socket: bool| {
+            let mut row = RemoteEndpointSettings::new(
+                EndpointId::parse(id).expect("a valid id"),
+                Hostname::parse(host).expect("a valid host"),
+            );
+            if socket {
+                row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+            }
+            row
+        };
+        let endpoints = EndpointSettings {
+            remote: vec![
+                row("buildbox01", "build-box", true),
+                row("newbox01", "new-box", false),
+            ],
+            selection: Selection::Local,
+        };
+        let build_key = crate::dto::deck_wire_id(&Endpoint::Remote(
+            endpoints.remote[0].endpoint().expect("connectable"),
+        ));
+        let local_key = crate::dto::deck_wire_id(&Endpoint::local());
+        let observed = [crate::dto::ObservedDeckDto {
+            deck_id: local_key.clone(),
+            label: "/run/deck.sock".to_string(),
+            deck_kind: "local",
+        }];
+        let step: Vec<voice::VoiceDeckChoice> =
+            serde_json::from_value(serde_json::json!([{ "deckId": local_key }]))
+                .expect("the webview's shape parses");
+
+        let mut decks = voice_decks(&observed, Some(&step));
+        let selections = selector_voice_decks(Some(&endpoints), &mut decks, Some(&step));
+        let find = |id: &str| decks.iter().find(|deck| deck.id == id).expect("listed");
+        assert_eq!(decks.len(), 3, "{decks:?}");
+        assert_eq!(
+            find(&local_key).unavailable,
+            None,
+            "the observed deck keeps its step"
+        );
+        assert_eq!(
+            find(&build_key).unavailable.as_deref(),
+            Some(voice::DECK_NOT_CONNECTED)
+        );
+        assert_eq!(find(&build_key).label, "build-box");
+        assert_eq!(
+            find("unconfigured-newbox01").unavailable.as_deref(),
+            Some(crate::dto::UNCONFIGURED_DECK_REASON)
+        );
+        assert_eq!(
+            selections.get(&local_key).map(String::as_str),
+            Some("local")
+        );
+        assert_eq!(
+            selections.get(&build_key).map(String::as_str),
+            Some("buildbox01")
+        );
+        assert_eq!(
+            selections.get("unconfigured-newbox01").map(String::as_str),
+            Some("newbox01")
+        );
+
+        let said = "switch deck to the build box";
+        let resolver = voice::StubResolver::new().answering(
+            said,
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+        );
+        let mut result = voice::handle_utterance(
+            &resolver,
+            voice::table(),
+            voice::Screen::Deck,
+            &[],
+            &decks,
+            None,
+            None,
+            voice::Transcript::new(said),
+        )
+        .await;
+        voice::address_deck_switch(&mut result.outcome, |id| selections.get(id).cloned());
+        assert!(
+            matches!(&result.outcome, voice::VoiceOutcome::Dispatch { invoke, params, .. }
+                if invoke == "switchDeck" && params[0].value == "buildbox01"),
+            "{:?}",
+            result.outcome
+        );
     }
 
     /// Scenario: the webview declares the New agent dialog's deck step with an

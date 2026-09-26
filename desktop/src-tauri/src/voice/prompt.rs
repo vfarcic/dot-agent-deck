@@ -486,6 +486,8 @@ pub(crate) mod tests {
 
     // -- the enum and the param union --------------------------------------
 
+    /// Scenario: give the prompt the shipped table and check that the model
+    /// sees deck switching among the exact action ids and the no-match escape.
     #[test]
     fn voice_prompt_action_enum_is_the_listed_ids_plus_the_escape() {
         assert_eq!(
@@ -496,6 +498,7 @@ pub(crate) mod tests {
                 "open_deck".to_string(),
                 "close".to_string(),
                 "open_settings".to_string(),
+                "switch_deck".to_string(),
                 "voice_off".to_string(),
                 "list_commands".to_string(),
                 "dictate_to_agent".to_string(),
@@ -526,10 +529,12 @@ pub(crate) mod tests {
     fn voice_prompt_param_names_are_the_union_in_table_order() {
         assert_eq!(
             param_names(&commands()),
+            // `deck` ahead of `prefix` since PRD #1195's `switch_deck` row,
+            // which sits above the dictation pair in the table.
             vec![
                 "agent".to_string(),
-                "prefix".to_string(),
                 "deck".to_string(),
+                "prefix".to_string(),
                 "dir".to_string(),
                 "mode".to_string(),
                 "agent_type".to_string(),

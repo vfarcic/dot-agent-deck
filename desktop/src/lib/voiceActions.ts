@@ -220,6 +220,19 @@ export type VoiceActionContext = {
    */
   closeNewAgent: () => string | undefined;
   /**
+   * Store `selection` — the Deck selector's token: `local`, or a configured
+   * deck's row id — as the deck the app shows (PRD #1195 M3), through the
+   * selector's own write. Answers `undefined` when it did, or when that deck
+   * was already the one shown, which writes nothing; otherwise the sentence
+   * saying why not (a token the selector no longer lists).
+   *
+   * **Served by the SHELL**, like {@link closeSettings}: the selector sits on
+   * the deck and on the overview, and the settings document it writes is the
+   * shell's. The menu itself builds the same member over the same function
+   * (`chooseDeckSelection` in `DeckSelector.tsx`).
+   */
+  switchDeck: (selection: string) => string | undefined;
+  /**
    * Close the Settings sheet (issue #1197).
    *
    * **Served by the SHELL, and only while Settings is OPEN**, for
@@ -526,6 +539,27 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "showVoiceCommands">) => context.showVoiceCommands(),
   },
 
+  /**
+   * PRD #1195 M3 — the Deck selector at the top of the deck and the overview.
+   * The menu dispatches here, and so does the `switch_deck` row, whose
+   * `deck_ref` the app turns into the selector's token before it arrives
+   * (`voice::address_deck_switch`). Choosing the deck already shown is a no-op
+   * and not an error.
+   *
+   * `reportRefused` is read through `?.` rather than declared, for
+   * `openAgent`'s reason about `selectAgent`: the menu serves no voice surface
+   * and never produces a refusal, since it offers only listed decks.
+   */
+  switchDeck: {
+    label: "Switch which deck the app is showing",
+    voice: true,
+    needs: ["switchDeck"],
+    run: (context: Pick<VoiceActionContext, "switchDeck"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: { deckSelection?: string }) => {
+      const refused = context.switchDeck(target.deckSelection ?? "");
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
   // -- the rest of the rail and the palette -------------------------------
 
   openProjects: {
@@ -824,6 +858,14 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    */
   preselectDeckId?: string;
   /**
+   * The Deck selector token a `switch_deck` row's `deck_ref` resolved to (PRD
+   * #1195 M3) — `local` or a configured deck's row id, which the app
+   * substitutes for the fleet key Rust-side (`voice::address_deck_switch`),
+   * and empty when the deck had none. Its own member rather than
+   * {@link preselectDeckId}, which is a fleet key.
+   */
+  deckSelection?: string;
+  /**
    * The child directory to open — the deck's own path a row's `dir_ref` param
    * resolved to, against the browser's children on screen (PRD #1223).
    */
@@ -964,10 +1006,11 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
 /**
  * The members only the SHELL serves (issue #1197): closing Settings, which is
  * the shell's overlay rather than a screen's, since it opens over the overview
- * as well as the deck. Published only while the sheet is open — see
- * {@link VoiceActionContext.closeSettings}.
+ * as well as the deck — published only while the sheet is open, see
+ * {@link VoiceActionContext.closeSettings} — and switching deck (PRD #1195),
+ * whose selector sits on both screens and writes the shell's settings.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings">;
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "switchDeck">;
 
 /**
  * The members only the OVERVIEW serves (PRD #1223): opening the New agent

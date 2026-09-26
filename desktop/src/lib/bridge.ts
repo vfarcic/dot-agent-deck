@@ -744,9 +744,11 @@ export interface VoiceNewAgentDto {
  * * `agent_ref` resolves against **live state** — `spoken` is what the user
  *   called an agent, `value` is that agent's id, and `label` is the name the
  *   deck shows for it.
- * * `deck_ref` resolves against **the observed fleet** (PRD #1223) — `spoken`
- *   is what the user called a deck, `value` is that deck's `deckId`, and
- *   `label` is what the overview calls it ("Local deck", or `user@host`).
+ * * `deck_ref` resolves against **the observed fleet plus every deck the Deck
+ *   selector lists** (PRD #1223, #1195) — `spoken` is what the user called a
+ *   deck, `value` is that deck's `deckId`, and `label` is what the overview
+ *   calls it ("Local deck", or `user@host`). On `switch_deck` alone `value` is
+ *   the selector's stored token instead (`VoiceDispatchTarget.deckSelection`).
  * * `dir_ref` resolves against **the directory browser's children on screen**
  *   ({@link VoiceDirectoriesDto}, PRD #1223) — `spoken` is what the user called
  *   one, `value` is the deck's own path for it, and `label` its `displayName`.

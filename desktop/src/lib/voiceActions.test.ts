@@ -149,6 +149,7 @@ describe("VOICE_ACTIONS", () => {
       "openAgent",
       "openOverview",
       "openDeck",
+      "switchDeck",
       // `closeAgentView` is deliberately NOT here any more: `close` names
       // `closeTopmost`, which decides between the overlay and the pane and then
       // calls the context member. The entry keeps a `no_voice` reason saying
@@ -188,6 +189,53 @@ describe("VOICE_ACTIONS", () => {
         `${actionId} cannot be both voice-enabled and excluded from voice`,
       ).toBe(false);
     }
+  });
+
+  /**
+   * Scenario: choose a configured remote deck in the header selector. The
+   * selected name changes and the settings document records that deck through
+   * the same switchDeck action voice can dispatch.
+   */
+  it("dispatches a header deck selection through switchDeck", async () => {
+    const remoteId = "a1b2c3d4e5f60718";
+    const saveSettings = vi.fn(async (next: DesktopSettingsDto) => structuredClone(next));
+    renderDeck({
+      getSettings: vi.fn(async () => ({
+        settings: {
+          ...structuredClone(DEFAULT_DESKTOP_SETTINGS),
+          endpoints: {
+            selection: "local",
+            remote: [{ id: remoteId, host: "build-box.example.com", user: "vf", port: 22 }],
+          },
+        },
+      })),
+      saveSettings,
+    });
+    fireEvent.click(screen.getByTestId("deck-selector-toggle"));
+    const menu = await screen.findByTestId("deck-selector-menu");
+    fireEvent.click(within(menu).getByTestId(`deck-selector-option-${remoteId}`));
+
+    await waitFor(() => expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("vf@build-box.example.com"));
+    expect(saveSettings).toHaveBeenCalledTimes(1);
+    expect(saveSettings.mock.calls[0][0].endpoints?.selection).toBe(remoteId);
+    expectOneRegistryDispatch("switchDeck");
+  });
+
+  /**
+   * Scenario: choose the already selected local deck in the header selector.
+   * The name stays put and the switchDeck action reports a no-op by leaving
+   * the settings document unwritten.
+   */
+  it("dispatches the selected deck through switchDeck without rewriting settings", async () => {
+    const saveSettings = vi.fn(async (next: DesktopSettingsDto) => structuredClone(next));
+    renderDeck({ saveSettings });
+    fireEvent.click(screen.getByTestId("deck-selector-toggle"));
+    const menu = await screen.findByTestId("deck-selector-menu");
+    fireEvent.click(within(menu).getByTestId("deck-selector-option-local"));
+
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("This machine");
+    expect(saveSettings).not.toHaveBeenCalled();
+    expectOneRegistryDispatch("switchDeck");
   });
 
   /**

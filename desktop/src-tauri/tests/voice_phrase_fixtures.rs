@@ -674,18 +674,38 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 // unasked preselections the fixtures cannot pin are covered too.
                 // Every fixture, too: a deck the dialog shows disabled is never
                 // what voice preselects, whatever the model answered.
-                let deck_eligible = resolved_deck(&answer.outcome).is_none_or(|id| {
-                    decks
+                //
+                // Both are claims about the New agent dialog's deck, so neither
+                // applies to `switch_deck` (PRD #1195): the Deck selector
+                // switches to a deck the dialog disables, and its report is
+                // "Showing <deck>." rather than a preselection. The first is
+                // scoped to the rows that append "Preselected deck:" at all —
+                // an OPTIONAL `deck_ref` — which also stops it failing every
+                // `choose_deck` fixture, whose report is "Deck: <deck>.".
+                let dispatched = match &answer.outcome {
+                    VoiceOutcome::Dispatch { action, .. } => table().row(action),
+                    _ => None,
+                };
+                let preselects = dispatched.is_some_and(|row| {
+                    row.params
                         .iter()
-                        .any(|deck| deck.id == id && deck.unavailable.is_none())
+                        .any(|param| param.kind == ParamKind::DeckRef && param.optional)
                 });
+                let for_new_agent = dispatched
+                    .is_none_or(|row| row.id != dot_agent_deck_desktop::voice::SWITCH_DECK_ROW);
+                let deck_eligible = !for_new_agent
+                    || resolved_deck(&answer.outcome).is_none_or(|id| {
+                        decks
+                            .iter()
+                            .any(|deck| deck.id == id && deck.unavailable.is_none())
+                    });
                 let unavailable_named = !fixture.names_unavailable_deck
                     || answer.outcome.sentence().contains(&format!(
                         "Deck ci@stale-box cannot take a new agent, so none is preselected: {}",
                         STALE_BOX_REASON.trim_end_matches('.')
                     ));
-                let deck_named =
-                    resolved_label(&answer.outcome, ParamKind::DeckRef).is_none_or(|label| {
+                let deck_named = !preselects
+                    || resolved_label(&answer.outcome, ParamKind::DeckRef).is_none_or(|label| {
                         answer
                             .outcome
                             .sentence()

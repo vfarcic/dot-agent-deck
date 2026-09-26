@@ -35,7 +35,7 @@ import { AgentOverview } from "./components/AgentOverview";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
-import { DeckSelector } from "./components/DeckSelector";
+import { DeckSelector, chooseDeckSelection } from "./components/DeckSelector";
 import { HandoffRail } from "./components/HandoffRail";
 import { SelectDeckNote } from "./components/SelectDeckNote";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
@@ -129,6 +129,13 @@ const DECK_OVERLAYS = Object.keys({ projects: true, prompts: true, profiles: tru
  * registry, so renaming the entry breaks this rather than the gate below.
  */
 const OPEN_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "openDeck";
+
+/**
+ * The registry entry voice's `switch_deck` row invokes (PRD #1195 M3), whose
+ * `deck_ref` value is the Deck selector's token rather than a fleet key — see
+ * `VoiceDispatchTarget.deckSelection`.
+ */
+const SWITCH_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "switchDeck";
 
 /**
  * Issue #1198 — what a view that names the deck is shown as while the deck is
@@ -652,7 +659,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       agentLabel: agent?.label ?? paneAgent?.displayName,
       text: dictated?.value,
       agentViewOpen: agentView !== undefined,
-      ...(namedDeck ? { preselectDeckId: namedDeck.value } : {}),
+      ...(namedDeck ? outcome.invoke === SWITCH_DECK_INVOKE ? { deckSelection: namedDeck.value } : { preselectDeckId: namedDeck.value } : {}),
       ...(namedDirectory ? { directoryPath: namedDirectory.value } : {}),
       /* What the utterance was judged against, so a directory move can refuse
          a browser that has moved on since (see the member's own comment). */
@@ -677,6 +684,8 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       closeOverlays: railContext.closeOverlays,
       /* Only while Settings is open, so `close` reads its presence (#1197). */
       ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
+      /* The Deck selector's own write, which its menu calls too (PRD #1195). */
+      switchDeck: (selection) => chooseDeckSelection(settings, selection),
       navigate: (next) => { moved = true; setView(next); },
       closeAgentView: () => { moved = true; closeAgent(); },
     };
@@ -689,7 +698,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, features.showDeck, overlaysOpen.settings, paneAgent, railContext, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, features.showDeck, overlaysOpen.settings, paneAgent, railContext, screen, selectedDeckId, setOverlay, settings, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */

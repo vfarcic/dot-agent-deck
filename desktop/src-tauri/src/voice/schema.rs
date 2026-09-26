@@ -122,7 +122,10 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the deck action the user asked for. Pi
     used and let the app resolve them. `decks` lists every deck a new agent \
     can be started on, named the way the screen names it; a `deck_ref` param is a \
     reference to one of those decks — \"local\" means this machine's — and is \
-    answered with the words the user used for it, never with an agent. A param marked \
+    answered with the words the user used for it, never with an agent. \
+    `switch_deck`'s `deck_ref` is the one exception to \"one of those decks\": it may \
+    name any deck the user has configured, listed there or not, and is answered with \
+    the user's words all the same. A param marked \
     `optional` is left out when the user named nothing for it. `directories`, \
     when present, is the New agent dialog's directory browser: `entries` are the \
     directories on screen, and a `dir_ref` param names one of THOSE, answered with \
@@ -330,6 +333,8 @@ mod tests {
     use super::*;
     use crate::voice::table::{CommandTable, table};
 
+    /// Scenario: build the action enum from the shipped table and keep the
+    /// deck-switch row among the exact actions the model may choose.
     #[test]
     fn voice_schema_action_enum_is_exactly_the_ids_plus_the_escape() {
         let enumeration = action_enum(table());
@@ -341,6 +346,7 @@ mod tests {
                 "open_deck".to_string(),
                 "close".to_string(),
                 "open_settings".to_string(),
+                "switch_deck".to_string(),
                 "voice_off".to_string(),
                 "list_commands".to_string(),
                 "dictate_to_agent".to_string(),
@@ -390,6 +396,8 @@ mod tests {
         assert_eq!(enumeration.len(), table.rows().len() + 1);
     }
 
+    /// Scenario: serialize the complete tool schema and confirm the action
+    /// enum includes deck switching in table order.
     #[test]
     fn voice_schema_tool_schema_carries_the_enum_and_the_escape() {
         let schema = tool_schema(table(), Screen::Deck);
@@ -409,6 +417,7 @@ mod tests {
                 "open_deck",
                 "close",
                 "open_settings",
+                "switch_deck",
                 "voice_off",
                 "list_commands",
                 "dictate_to_agent",
@@ -554,8 +563,8 @@ mod tests {
         }
     }
 
-    /// Scenario: describe the commands offered on each screen. Navigation and
-    /// Settings are callable from both screens that display the shared rail.
+    /// Scenario: annotate the shipped commands on each screen; deck switching
+    /// is callable on deck and overview, and unavailable behind the agent pane.
     #[test]
     fn voice_schema_annotates_callable_per_screen() {
         let flags = |screen: Screen| {
@@ -572,6 +581,7 @@ mod tests {
                 ("open_deck".to_string(), true),
                 ("close".to_string(), true),
                 ("open_settings".to_string(), true),
+                ("switch_deck".to_string(), true),
                 ("voice_off".to_string(), true),
                 ("list_commands".to_string(), true),
                 // The dictation pair is `agent`-only: with no pane on screen
@@ -604,6 +614,7 @@ mod tests {
                 ("close".to_string(), true),
                 // The shared rail offers Settings from the overview too.
                 ("open_settings".to_string(), true),
+                ("switch_deck".to_string(), true),
                 // Callable everywhere: stopping must never be unavailable,
                 // and neither must the phrase that lists what can be said.
                 ("voice_off".to_string(), true),
@@ -636,6 +647,7 @@ mod tests {
                 ("open_deck".to_string(), false),
                 ("close".to_string(), true),
                 ("open_settings".to_string(), false),
+                ("switch_deck".to_string(), false),
                 ("voice_off".to_string(), true),
                 ("list_commands".to_string(), true),
                 ("dictate_to_agent".to_string(), true),
@@ -735,6 +747,21 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!([{ "name": "deck", "kind": "deck_ref", "optional": true }])
+        );
+    }
+
+    /// Scenario: annotate the shipped deck-switch row and send its one required
+    /// deck reference to the model in the table's spelling.
+    #[test]
+    fn voice_schema_switch_deck_carries_a_required_deck_ref() {
+        let row = annotate(table(), Screen::Deck)
+            .into_iter()
+            .find(|command| command.id == "switch_deck")
+            .expect("switch_deck in schema");
+        assert!(row.callable);
+        assert_eq!(
+            serde_json::to_value(&row.params).expect("serializes"),
+            serde_json::json!([{ "name": "deck", "kind": "deck_ref" }])
         );
     }
 

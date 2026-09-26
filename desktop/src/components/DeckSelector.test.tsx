@@ -14,7 +14,9 @@ import { createFixtureSnapshot } from "../data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto, type EndpointSettingsDto } from "../lib/bridge";
 import type { DeckRuntimeState, DeckSnapshot } from "../types";
 import { DeckShell } from "../App";
-import { deckStateNote } from "./DeckSelector";
+import { chooseDeckSelection, deckStateNote } from "./DeckSelector";
+import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
+import { VOICE_ACTIONS } from "../lib/voiceActions";
 
 vi.mock("./TerminalViewport", () => ({
   TerminalViewport: ({ agentId }: { agentId: string }) => <pre data-testid={`terminal-${agentId}`}>terminal</pre>,
@@ -265,6 +267,61 @@ describe("DeckSelector", () => {
     // it is written in the form that holds in both from the start.
     expect(menu.querySelector("legend")).toBeNull();
     expect(menu.querySelector("fieldset")).toBeNull();
+  });
+});
+
+/*
+ * PRD #1195 M3 — `switchDeck`, as voice dispatches it: a token the app put on
+ * the `switch_deck` row's `deck_ref`, reaching the selector's own write.
+ */
+describe("switchDeck", () => {
+  function state(endpoints: EndpointSettingsDto) {
+    const save = vi.fn();
+    const settings = { settings: settingsWith(endpoints), loaded: true, save } as unknown as DesktopSettingsState;
+    return { settings, save };
+  }
+  function dispatch(settings: DesktopSettingsState, deckSelection: string) {
+    const reportRefused = vi.fn();
+    VOICE_ACTIONS.switchDeck.run({ switchDeck: (token) => chooseDeckSelection(settings, token), reportRefused }, { deckSelection });
+    return reportRefused;
+  }
+
+  /**
+   * Scenario: voice resolves "switch deck to the build box" to that row's
+   * token while the local deck is shown. The selection is written exactly as
+   * the menu writes it, rows untouched, and nothing is reported as refused.
+   */
+  it("stores a listed deck's token through the selector's write", () => {
+    const { settings, save } = state(twoDecks("local"));
+    const refused = dispatch(settings, BUILD_BOX);
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(save.mock.calls[0][0].endpoints).toEqual({ ...twoDecks("local"), selection: BUILD_BOX });
+    expect(refused).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: voice asks for the deck already shown. Nothing is written and
+   * nothing is refused — the report, "Showing <deck>.", is still true.
+   */
+  it("treats the deck already shown as a no-op, not an error", () => {
+    const { settings, save } = state(twoDecks(BUILD_BOX));
+    const refused = dispatch(settings, BUILD_BOX);
+    expect(save).not.toHaveBeenCalled();
+    expect(refused).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: the deck voice resolved was removed in Settings during the round
+   * trip, or the app had no token for it (an empty value). Nothing is written,
+   * and the refusal says the deck is not in the selector any more.
+   */
+  it("refuses a token the selector does not list", () => {
+    for (const token of ["removed0000000001", ""]) {
+      const { settings, save } = state(twoDecks("local"));
+      const refused = dispatch(settings, token);
+      expect(save).not.toHaveBeenCalled();
+      expect(refused).toHaveBeenCalledWith("That deck is not in the Deck selector any more.");
+    }
   });
 });
 

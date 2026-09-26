@@ -285,6 +285,8 @@ mod tests {
         assert_eq!(format["json_schema"]["schema"]["type"], "object");
     }
 
+    /// Scenario: build an OpenAI-compatible request and check that its strict
+    /// action enum includes the shipped deck-switch command.
     #[test]
     fn voice_openai_request_constrains_the_action_to_the_table_plus_the_escape() {
         let schema = &body("show me the tester")["response_format"]["json_schema"]["schema"];
@@ -302,6 +304,7 @@ mod tests {
                 "open_deck",
                 "close",
                 "open_settings",
+                "switch_deck",
                 "voice_off",
                 "list_commands",
                 "dictate_to_agent",
@@ -386,10 +389,12 @@ mod tests {
         );
         assert_eq!(
             schema["properties"]["params"]["required"],
+            // `deck` ahead of `prefix` since PRD #1195's `switch_deck` row,
+            // which sits above the dictation pair in the table.
             json!([
                 "agent",
-                "prefix",
                 "deck",
+                "prefix",
                 "dir",
                 "mode",
                 "agent_type",

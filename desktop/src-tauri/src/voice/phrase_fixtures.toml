@@ -13,6 +13,38 @@ action = "open_agent"
 outcome = "dispatch"
 resolved_agent = "agent-tester"
 
+# PRD #1195 M3: the selector itself, on a base screen, not the New agent form.
+[[fixtures]]
+name = "switch-deck-build-box"
+utterance = "switch deck to the build box"
+screen = "deck"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "switch-deck-ambiguous-box"
+utterance = "switch deck to the box"
+screen = "overview"
+action = "switch_deck"
+outcome = "param_ambiguous"
+
+[[fixtures]]
+name = "switch-deck-unknown"
+utterance = "switch deck to the ghost box"
+screen = "deck"
+action = "switch_deck"
+outcome = "param_unresolved"
+
+[[fixtures]]
+name = "choose-new-agent-deck-not-switch"
+utterance = "set the new agent's deck to local"
+screen = "overview"
+dialog = true
+action = "choose_deck"
+outcome = "dispatch"
+resolved_deck = "deck-local"
+
 [[fixtures]]
 name = "open-agent-isolate"
 utterance = "get rid of everything except the tester"

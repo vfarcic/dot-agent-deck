@@ -71,6 +71,18 @@ const DICTATE_ROW: &str = "dictate_to_agent";
 const DICTATE_PARAM: &str = "prefix";
 /// The row a whole-utterance submit phrase dispatches.
 const SUBMIT_ROW: &str = "submit_prompt";
+/// PRD #1195 M3 — the Deck selector's row, and the one `deck_ref` row that is
+/// not about the New agent dialog.
+///
+/// Named because two things depend on it that no column carries.
+/// [`VoiceDeck::unavailable`] is the dialog's reason a deck cannot take a new
+/// agent, which is no reason not to SHOW that deck — switching to it is how it
+/// becomes one that can — so this row resolves a disabled deck like any other
+/// ([`resolve_param`]). And its value is the selector's stored token rather
+/// than the fleet's deck key, which the app substitutes after resolution
+/// ([`address_deck_switch`]), because only the app knows the settings
+/// document the selector reads.
+pub const SWITCH_DECK_ROW: &str = "switch_deck";
 
 /// One param, resolved against live state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -82,8 +94,10 @@ pub struct ResolvedParam {
     pub spoken: String,
     /// What it resolved to, and what the frontend dispatches with: an agent id
     /// for [`ParamKind::AgentRef`], a deck id (`deckId`) for
-    /// [`ParamKind::DeckRef`], and the deck's own path for the child directory
-    /// a [`ParamKind::DirRef`] named.
+    /// [`ParamKind::DeckRef`] — except on [`SWITCH_DECK_ROW`], where the app
+    /// replaces it with the Deck selector's token ([`address_deck_switch`]) —
+    /// and the deck's own path for the child directory a [`ParamKind::DirRef`]
+    /// named.
     pub value: String,
     /// The name the deck shows for it, which is what the report sentence
     /// says. Derived the same way the webview derives it, so the sentence names
@@ -676,6 +690,7 @@ pub async fn handle_utterance_with(
                 decks,
                 directories,
                 new_agent,
+                row.id != SWITCH_DECK_ROW,
             )
         };
         match step {
@@ -990,6 +1005,11 @@ fn capitalised(text: &str) -> String {
 /// The ACTION is still held against the transcript, for every row, before this
 /// runs ([`action_grounded`]) — that is a different question, and it is what
 /// stops a hostile label turning "open docs" into a prompt submission.
+///
+/// `for_new_agent` is whether a `deck_ref` here is a deck for the New agent
+/// dialog, which refuses one the dialog disables. It is false for
+/// [`SWITCH_DECK_ROW`] alone: the Deck selector switches to any deck it lists.
+#[allow(clippy::too_many_arguments)]
 fn resolve_param(
     spec: &super::table::ParamSpec,
     spoken: &str,
@@ -998,6 +1018,7 @@ fn resolve_param(
     decks: &[VoiceDeck],
     directories: Option<&VoiceDirectories>,
     new_agent: Option<&VoiceNewAgent>,
+    for_new_agent: bool,
 ) -> Result<ResolvedParam, Unmet> {
     let param = |value: String, label: String| ResolvedParam {
         name: spec.name.clone(),
@@ -1035,12 +1056,14 @@ fn resolve_param(
         // "no agent matches" are the same situation about different things.
         // A deck the dialog shows disabled resolves too — the user named it —
         // and is then answered with the reason the deck step gives, never
-        // preselected ([`VoiceDeck::unavailable`]).
+        // preselected ([`VoiceDeck::unavailable`]). Only for the dialog: the
+        // Deck selector switches to a disabled deck as readily as to any other
+        // (PRD #1195, [`SWITCH_DECK_ROW`]).
         ParamKind::DeckRef => match resolve_deck_ref(spoken, decks) {
             DeckRefMatch::One { id, label } => {
                 match decks
                     .iter()
-                    .find(|deck| deck.id == id)
+                    .find(|deck| for_new_agent && deck.id == id)
                     .and_then(|deck| deck.unavailable.as_ref().map(|reason| (deck, reason)))
                 {
                     Some((deck, reason)) => Err(Unmet::DeckUnavailable {
@@ -1806,6 +1829,39 @@ pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
     }
 }
 
+/// PRD #1195 M3 — put the Deck selector's token on a [`SWITCH_DECK_ROW`]
+/// dispatch, in place of the deck key it resolved to.
+///
+/// The pipeline resolves every `deck_ref` against one list keyed the way the
+/// fleet keys decks (`deckId`), because that is what the New agent dialog
+/// preselects by. The selector stores something else — `local`, or a
+/// `[[endpoints.remote]]` row's id — and the webview has no map from one to
+/// the other: the key is minted Rust-side from an endpoint identity, for a
+/// deck the app may not be connected to at all. The app, which built the list
+/// from the settings document, does have it, and hands it in as
+/// `selection_of`.
+///
+/// A deck with no token is dispatched with an EMPTY value, which the webview's
+/// `switchDeck` refuses, rather than with its key, which a row id could in
+/// principle spell. Every other outcome is left exactly as it was.
+pub fn address_deck_switch(
+    outcome: &mut VoiceOutcome,
+    selection_of: impl Fn(&str) -> Option<String>,
+) {
+    let VoiceOutcome::Dispatch { action, params, .. } = outcome else {
+        return;
+    };
+    if action != SWITCH_DECK_ROW {
+        return;
+    }
+    for param in params
+        .iter_mut()
+        .filter(|param| param.kind == ParamKind::DeckRef)
+    {
+        param.value = selection_of(&param.value).unwrap_or_default();
+    }
+}
+
 /// What a spoken directory reference resolved to — [`DeckRefMatch`]'s shape
 /// over the browser's children on screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2433,6 +2489,56 @@ mod tests {
     }
 
     // -- deck_ref (PRD #1223) ---------------------------------------------
+
+    /// Scenario: ask to switch to one observed deck, to an ambiguous deck
+    /// name, and to a deck absent from the fleet. The first dispatches the
+    /// resolved id; the others show the existing deck-specific refusal text.
+    #[tokio::test]
+    async fn voice_outcome_switch_deck_resolves_or_reports_the_deck_reference() {
+        let cases = [
+            ("switch deck to the build box", "build box"),
+            ("switch deck to build", "build"),
+            ("switch deck to the ghost box", "ghost box"),
+        ];
+        for (said, spoken) in cases {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("switch_deck").with_param("deck", spoken),
+            );
+            let outcome = run(&resolver, Screen::Deck, &fleet(), said).await;
+            match spoken {
+                "build box" => {
+                    let VoiceOutcome::Dispatch {
+                        invoke,
+                        params,
+                        sentence,
+                        ..
+                    } = outcome
+                    else {
+                        panic!("expected a deck switch dispatch, got {outcome:?}");
+                    };
+                    assert_eq!(invoke, "switchDeck");
+                    assert_eq!(params[0].kind, ParamKind::DeckRef);
+                    assert_eq!(params[0].value, "deck-build");
+                    assert!(
+                        sentence.contains("deploy@build-box.example.com:2222"),
+                        "{sentence}"
+                    );
+                }
+                "build" => assert!(
+                    matches!(&outcome, VoiceOutcome::ParamAmbiguous { action, sentence, .. }
+                        if action == "switch_deck" && sentence.contains("matches more than one deck")),
+                    "{outcome:?}"
+                ),
+                "ghost box" => assert!(
+                    matches!(&outcome, VoiceOutcome::ParamUnresolved { action, sentence, .. }
+                        if action == "switch_deck" && sentence.contains("no deck matches")),
+                    "{outcome:?}"
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
 
     #[test]
     fn voice_outcome_deck_ref_resolves_one_deck_by_host_label_or_local() {
@@ -6634,6 +6740,103 @@ mod tests {
         )
         .await
         .outcome
+    }
+
+    // -- switch_deck (PRD #1195 M3) -----------------------------------------
+
+    /// Scenario: the build box is a deck the New agent dialog disables — here
+    /// because the app is not connected to it, as for every deck but the one
+    /// on screen under a single-deck selection. "Switch deck to the build box"
+    /// still switches to it, because showing a deck is how it becomes one a
+    /// new agent can start on; "new agent on the build box" is still refused
+    /// with the dialog's reason, exactly as before.
+    #[tokio::test]
+    async fn voice_outcome_switch_deck_reaches_a_deck_the_new_agent_dialog_disables() {
+        let decks = [
+            deck("deck-local", "Local deck", true),
+            unavailable_deck(
+                "deck-build",
+                "deploy@build-box.example.com:2222",
+                false,
+                crate::voice::DECK_NOT_CONNECTED,
+            ),
+        ];
+        let over = |said: &'static str, answer: IntentAnswer| {
+            let decks = decks.clone();
+            async move {
+                let resolver = StubResolver::new().answering(said, answer);
+                handle_utterance(
+                    &resolver,
+                    table(),
+                    Screen::Overview,
+                    &fleet(),
+                    &decks,
+                    None,
+                    None,
+                    Transcript::new(said),
+                )
+                .await
+                .outcome
+            }
+        };
+        let switched = over(
+            "switch deck to the build box",
+            IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+        )
+        .await;
+        assert!(
+            matches!(&switched, VoiceOutcome::Dispatch { params, sentence, .. }
+                if params[0].value == "deck-build"
+                    && sentence == "Showing deploy@build-box.example.com:2222."),
+            "{switched:?}"
+        );
+        let refused = over(
+            "new agent on the build box",
+            IntentAnswer::new("open_new_agent").with_param("deck", "build box"),
+        )
+        .await;
+        assert!(
+            refused.sentence().contains("cannot take a new agent"),
+            "{refused:?}"
+        );
+    }
+
+    /// Scenario: a `switch_deck` dispatch leaves the pipeline carrying the
+    /// fleet key it resolved; the app swaps in the Deck selector's token, and
+    /// a key with no token becomes empty rather than passing through. Any
+    /// other dispatch, including one with a `deck_ref`, is untouched.
+    #[test]
+    fn voice_outcome_address_deck_switch_substitutes_the_selector_token() {
+        let dispatch = |action: &str| VoiceOutcome::Dispatch {
+            sentence: "s".to_string(),
+            transcript: Transcript::new("t"),
+            action: action.to_string(),
+            invoke: "x".to_string(),
+            params: vec![ResolvedParam {
+                name: "deck".to_string(),
+                kind: ParamKind::DeckRef,
+                spoken: "build box".to_string(),
+                value: "deck-build".to_string(),
+                label: "deploy@build-box".to_string(),
+            }],
+        };
+        let value = |outcome: &VoiceOutcome| match outcome {
+            VoiceOutcome::Dispatch { params, .. } => params[0].value.clone(),
+            other => panic!("{other:?}"),
+        };
+        let token = |key: &str| (key == "deck-build").then(|| "a1b2c3".to_string());
+
+        let mut switched = dispatch(SWITCH_DECK_ROW);
+        address_deck_switch(&mut switched, token);
+        assert_eq!(value(&switched), "a1b2c3");
+
+        let mut unknown = dispatch(SWITCH_DECK_ROW);
+        address_deck_switch(&mut unknown, |_| None);
+        assert_eq!(value(&unknown), "", "no token, no value — never the key");
+
+        let mut new_agent = dispatch("open_new_agent");
+        address_deck_switch(&mut new_agent, token);
+        assert_eq!(value(&new_agent), "deck-build");
     }
 
     // -- the deck field and Discard (#1263, #1247) ---------------------------

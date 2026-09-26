@@ -1090,6 +1090,10 @@ mod tests {
         }
     }
 
+    /// Scenario: scan the checked-in command table and action registry. The
+    /// deck-switch row's deck reference resolves through the closed kind set,
+    /// while the planted unknown-kind test below still produces a finding.
+    ///
     /// The tree itself. This is what makes the four planted-input tests below
     /// mean something: they prove the scanner CAN fail, and this proves the
     /// checked-in sources do not.
@@ -1097,6 +1101,18 @@ mod tests {
     fn the_checked_in_table_and_registry_resolve_against_each_other() {
         let findings = check(&checked_in());
         assert!(findings.is_empty(), "rule 14: {}", findings.join("\n"));
+        let sources = checked_in();
+        let mut parse_findings = Vec::new();
+        let rows = command_rows(&sources.commands_toml, &mut parse_findings);
+        assert!(parse_findings.is_empty(), "{}", parse_findings.join("\n"));
+        let deck = rows
+            .iter()
+            .find(|row| row.id == "switch_deck")
+            .expect("switch_deck row");
+        assert_eq!(
+            deck.params,
+            vec![("deck".to_string(), "deck_ref".to_string())]
+        );
     }
 
     /// And that the scan is not vacuous: a rule that found no rows, no entries

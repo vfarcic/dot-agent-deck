@@ -31,6 +31,9 @@
  * function precisely so that dropping the links, releasing the tunnels, telling
  * the watcher and emitting a fresh snapshot cannot be done by halves. A second
  * route from here — a bespoke "switch deck" command — would be a second half.
+ * Voice's `switch_deck` (PRD #1195 M3) is not one: the menu and the spoken
+ * command dispatch the same registry entry, `switchDeck`, which calls
+ * {@link chooseDeckSelection} and so this same write.
  *
  * # An unreachable deck shows its state; it never blanks the screen
  *
@@ -59,6 +62,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronsUpDown, Server } from "lucide-react";
 import { LOCAL_ENDPOINT_SELECTION } from "../lib/bridge";
+import { VOICE_ACTIONS } from "../lib/voiceActions";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
   type DeckSelection,
@@ -98,6 +102,49 @@ function noteIsProblem(connection: ConnectionView): boolean {
   return Boolean(connection.selectionFallback) || connection.status === "disconnected" || connection.status === "error";
 }
 
+/**
+ * What {@link VOICE_ACTIONS}' `switchDeck` does, for the menu and for voice
+ * alike (PRD #1195 M3): store `token` as the selection, through the one write
+ * this file has always made. Answers `undefined` when it did, or when `token`
+ * is already the selection — the no-op guard below writes nothing then, and
+ * "Showing <deck>." is still true — or the sentence saying why it did not.
+ *
+ * The one refusal is a token the selector does not list. A click cannot
+ * produce one; a voice answer can, because the list it resolved against was
+ * read before the round trip and a deck can be removed in Settings meanwhile.
+ * Storing a token naming no row would put the app on the local deck under an
+ * "Unknown deck" label, which is a worse answer than saying so.
+ */
+export function chooseDeckSelection(settings: DesktopSettingsState, token: string): string | undefined {
+  const section = settings.settings.endpoints;
+  const next = deckChoices(section).find((choice) => choice.token === token);
+  if (!next) return "That deck is not in the Deck selector any more.";
+  /*
+    The no-op guard, which is shared with `EndpointsPanel` since PRD #742 M6
+    and is a data safety property rather than a tidiness one.
+
+    The claim it used to carry here was that when the document has NO
+    `[endpoints]` section the only choice is the local deck and it is already
+    selected, so every click lands on the guard and the section below is only
+    ever built from one that already exists. **All Decks is a second choice
+    that needs no configuration**, so that stopped being true at M1.
+
+    What an unguarded click costs: the webview's section is ordinarily absent
+    because the DOCUMENT's is, so writing `{ remote: [], selection }` deletes
+    nothing. It is also absent when `desktop.toml` failed to parse and
+    `load_from` fell back to defaults — and there `remote: []` merges over
+    rows that are still on disk. `endpointSectionToSave` is where that is
+    refused for every write site at once, and its doc comment carries the rest
+    of the reasoning, including what it deliberately does not close.
+  */
+  const write = endpointSectionToSave(section, {
+    remote: section?.remote ?? [],
+    selection: selectionToken(next.selection),
+  });
+  if (write) settings.save({ ...settings.settings, endpoints: write });
+  return undefined;
+}
+
 export function DeckSelector({ settings, connection }: { settings: DesktopSettingsState; connection: ConnectionView }) {
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
@@ -130,32 +177,14 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
     return () => document.removeEventListener("pointerdown", dismiss);
   }, [open]);
 
+  /*
+    PRD #1195 M3: the menu dispatches through the registry entry voice's
+    `switch_deck` row names, so the drop-down and the spoken command are one
+    control by two routes rather than two writes that agree today.
+  */
   const choose = (next: DeckSelection) => {
     setOpen(false);
-    /*
-      The no-op guard, which is shared with `EndpointsPanel` since PRD #742 M6
-      and is a data safety property rather than a tidiness one.
-
-      The claim it used to carry here was that when the document has NO
-      `[endpoints]` section the only choice is the local deck and it is already
-      selected, so every click lands on the guard and the section below is only
-      ever built from one that already exists. **All Decks is a second choice
-      that needs no configuration**, so that stopped being true at M1.
-
-      What an unguarded click costs: the webview's section is ordinarily absent
-      because the DOCUMENT's is, so writing `{ remote: [], selection }` deletes
-      nothing. It is also absent when `desktop.toml` failed to parse and
-      `load_from` fell back to defaults — and there `remote: []` merges over
-      rows that are still on disk. `endpointSectionToSave` is where that is
-      refused for every write site at once, and its doc comment carries the rest
-      of the reasoning, including what it deliberately does not close.
-    */
-    const write = endpointSectionToSave(section, {
-      remote: section?.remote ?? [],
-      selection: selectionToken(next),
-    });
-    if (!write) return;
-    settings.save({ ...settings.settings, endpoints: write });
+    VOICE_ACTIONS.switchDeck.run({ switchDeck: (token) => chooseDeckSelection(settings, token) }, { deckSelection: selectionToken(next) });
   };
 
   return (
