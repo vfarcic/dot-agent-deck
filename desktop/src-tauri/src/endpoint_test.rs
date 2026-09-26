@@ -26,8 +26,9 @@
 //!    the panel to write into the row, so the next connection needs no probe.
 //!    **The write-back is the webview's**, deliberately: `useDesktopSettings`
 //!    already serialises the document's read-modify-write, and a second writer
-//!    in Rust would be the two-process race [#828](https://github.com/vfarcic/dot-agent-deck/issues/828)
-//!    tracks, created on purpose.
+//!    in Rust would race it. Since [#828](https://github.com/vfarcic/dot-agent-deck/issues/828)
+//!    such a race loses only a genuine same-field conflict, but one writer
+//!    per process is still the simpler thing to reason about.
 //!
 //! 2. **The `ssh -G` disclosure.** `remote_tunnel`'s audit **A3** is a residual
 //!    the argv cannot close: `ClearAllForwardings` would clear our own `-L`, and

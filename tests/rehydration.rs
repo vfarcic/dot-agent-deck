@@ -1445,14 +1445,28 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
     let role_names = ["orchestrator", "coder"];
     // Tab A and Tab B carry distinct per-tab tokens; the third pair carries
     // none, standing in for a client that predates PRD #140.
-    let tabs: [(&str, Option<&str>); 3] = [
-        ("a", Some("orch-inst-aaaa1111")),
-        ("b", Some("orch-inst-bbbb2222")),
-        ("legacy", None),
+    //
+    // Issue #555: the two tokened tabs carry distinct run TITLES, as the
+    // `Ctrl+n` form's `<folder>-orchestrator-N` suggestion gives them. Two tabs
+    // under one resolved title in one directory are two indistinguishable tab
+    // labels, which the daemon now refuses; what this test is about is the
+    // per-tab token, and the titles are no part of the identity it checks.
+    let tabs: [(&str, Option<&str>, Option<&str>); 3] = [
+        (
+            "a",
+            Some("orch-inst-aaaa1111"),
+            Some("route-iso-orchestrator-1"),
+        ),
+        (
+            "b",
+            Some("orch-inst-bbbb2222"),
+            Some("route-iso-orchestrator-2"),
+        ),
+        ("legacy", None, None),
     ];
 
     let mut spawned_ids: Vec<String> = Vec::new();
-    for (tab_tag, orchestration_id) in tabs {
+    for (tab_tag, orchestration_id, display_title) in tabs {
         for (role_index, role_name) in role_names.iter().enumerate() {
             let id = client
                 .start_agent(StartAgentOptions {
@@ -1469,7 +1483,7 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
                         role_name: (*role_name).to_string(),
                         is_start_role: role_index == 0,
                         orchestration_cwd: Some(cwd.clone()),
-                        display_title: None,
+                        display_title: display_title.map(str::to_string),
                         orchestration_id: orchestration_id.map(str::to_string),
                     }),
                     ..Default::default()

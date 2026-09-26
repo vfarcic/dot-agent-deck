@@ -417,8 +417,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .control-deck.with-evidence .deck-main { margin-right: var(--drawer-width); }
 
 .rail { position: fixed; z-index: 40; inset: 0 auto 0 0; width: var(--rail-width); padding: 14px 10px; display: flex; flex-direction: column; align-items: center; background: var(--shell); color: var(--shell-ink); border-right: 1px solid var(--shell-line-deep); }
-.brand-mark { width: 42px; height: 42px; display: grid; place-items: center; position: relative; border: 1px solid var(--shell-edge); border-radius: 6px; font-size: 11px; font-weight: 750; letter-spacing: .08em; }
-.brand-mark i { position: absolute; right: -3px; bottom: -3px; width: 9px; height: 9px; border: 2px solid var(--shell); border-radius: 50%; background: var(--shell-teal); }
+.brand-mark { width: 36px; height: 36px; display: block; }
 .rail nav { width: 100%; margin-top: 28px; display: grid; gap: 7px; }
 .rail nav button, .rail-bottom button { width: 52px; height: 48px; margin: auto; padding: 0; display: grid; place-items: center; border: 1px solid transparent; border-radius: 5px; color: var(--shell-muted); background: transparent; cursor: pointer; }
 .rail nav button span { position: fixed; left: 67px; padding: 6px 9px; pointer-events: none; opacity: 0; transform: translateX(-4px); color: var(--shell-ink-bright); background: var(--shell); border: 1px solid var(--shell-edge); border-radius: 4px; white-space: nowrap; font-size: 12px; transition: opacity .12s, transform .12s; }
