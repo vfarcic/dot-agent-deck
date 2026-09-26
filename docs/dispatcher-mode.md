@@ -53,6 +53,22 @@ Each dispatched unit appears on your deck like any other work: a card for a sing
 
 The unit works in `../<your-repo>-dispatch-<name>` — a sibling directory of your project, never inside it.
 
+### What "dispatched" actually tells you
+
+Starting a unit happens in three steps, and each one tells you something different. Your dispatcher is taught to wait for the second before telling you a unit has started, and for the third before treating its task as received.
+
+| What you see | What it means | What it does not mean |
+| --- | --- | --- |
+| The `dot-agent-deck dispatch` command succeeds (exit status 0) | The deck received the request and accepted it — or gave no answer the command could check, which an older deck does | That a worktree was created, that a unit started, or that it got its task. The deck answers the command before doing any of that work |
+| A turn in the dispatcher beginning `dispatch: spawned isolated` | The worktree exists and the unit's agent was started in it. The turn names what was started and where | That the agent received its task. The deck may still be checking that the agent submitted it — for up to a minute after this turn — and nothing that check finds is sent to your dispatcher |
+| A turn beginning `dispatch: a unit you dispatched has completed` | The unit is reporting back — finished, or stuck and unable to continue. This is the first sign that its task arrived | That the work is correct; read the report. The deck does not check the report against the task's delivery, so it is a sign rather than proof |
+
+Any other turn beginning `dispatch:` is a failure — a name already in use, an orchestration your project does not define, a worktree that could not be created — and says why. The unit did not start. In the rare case where some of an orchestration's agents were already running when it failed, the deck leaves them and their directory in place rather than deleting it under them, and the turn says so.
+
+A command that fails (non-zero exit status) never reached that point. Either no deck was reachable, the deck refused the request, or the command itself was unusable: it was run outside a deck pane, or its `--task-file` could not be read. The command prints which.
+
+If the unit's agent never reports submitting its task, the deck gives up after a minute and puts a notice on **the unit's own card** saying the task may never have arrived. That notice is not sent to your dispatcher, and a unit that never got its task has nothing to report back — so a unit that stays quiet for a long time is worth opening. Do not wait for the notice, though: it is not the only way a task goes missing, and not every way leaves one. Some agents cannot report a submitted prompt at all; the deck types the task into those once, has nothing to check, and shows no notice either way. And if the deck could not type the task in at all — the pane went away, or its agent was replaced, before the write — it records that in its log and not on the card, and the dispatcher is still told the unit started. A notice does appear when the write is held back because someone had started typing into the unit's pane. The command's exit status is 0 in all of these cases: it was decided before any of them could happen.
+
 ## Hearing back from a unit
 
 When a unit finishes, it reports back to the pane that started it. The report arrives in your dispatcher conversation as a turn — as though you had typed it yourself — opening with `dispatch: a unit you dispatched has completed`, then the unit's name, then its own account of what it did. Your dispatcher reads it and can act on it, so if you want something done with each result — collect them, compare them, start the next thing — say so in that conversation and it will.
