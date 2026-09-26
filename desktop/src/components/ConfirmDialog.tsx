@@ -4,7 +4,7 @@ import { CircleStop } from "lucide-react";
 /**
  * One irreversible-enough act, described in the terms the user needs to decide.
  * Every consumer of this dialog states the RISK in `body` rather than restating
- * the button — Start daemon, Launch live loop, stop-agent and Connect anyway all
+ * the button — Start daemon, Activate orchestration, stop-agent and Connect anyway all
  * do, and a body that only repeats the label is the sign a confirmation is
  * ceremony rather than a decision.
  */

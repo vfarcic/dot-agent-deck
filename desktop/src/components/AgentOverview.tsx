@@ -1110,7 +1110,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           </div>
         )}
 
-        <section className="overview-body" aria-label="Agent overview">
+        <section className="overview-body" aria-label="Agent dashboard">
           {newAgentNotice && (
             <div className="overview-banner" role="status" data-testid="overview-new-agent-notice">
               <span>{newAgentNotice}</span>
@@ -1192,12 +1192,12 @@ interface FleetDeck {
  *
  * The instrument prints `2/3`, which is the compact reading; this is the hover,
  * and it is where the thing a ratio cannot say gets said — that the counts
- * beside it are over the decks that answered and not over the fleet.
+ * beside it are over the daemons that answered and not over the fleet.
  */
 function decksUpTitle(up: number, total: number): string {
-  if (total === 1) return up === 1 ? "The deck is answering." : "The deck is not answering, so nothing can be counted.";
+  if (total === 1) return up === 1 ? "The daemon is answering." : "The daemon is not answering, so nothing can be counted.";
   if (up === total) return `All ${total} daemons are answering.`;
-  if (up === 0) return `No deck is answering, so nothing can be counted. ${total} are configured.`;
+  if (up === 0) return `No daemon is answering, so nothing can be counted. ${total} are configured.`;
   return `${up} of ${total} daemons are answering. Every count beside this one is over those ${up}; the daemons that are not answering say so in their own group.`;
 }
 

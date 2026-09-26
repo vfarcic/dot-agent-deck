@@ -176,7 +176,7 @@ const evidence: EvidenceItem[] = [
     at: "14:37:09",
     command: "pnpm test -- bridge",
     exitCode: 1,
-    reason: "A failed transition returns to the owning role with precise evidence, not a pasted transcript.",
+    reason: "A failed transition returns to the owning role with precise events, not a pasted transcript.",
     acknowledged: true,
   },
   {
@@ -242,7 +242,7 @@ const agents: AgentSession[] = [
     cols: 110,
     activeTool: "cargo check",
     toolCount: 18,
-    transcript: "\u001b[2m14:34:02\u001b[0m  added desktop workspace scaffold\r\n\u001b[2m14:36:41\u001b[0m  wired daemon snapshot + terminal events\r\n\u001b[31mFAIL\u001b[0m  bridge test: listener disposed twice\r\n\u001b[33mRETRY 2/3\u001b[0m  isolating failed subscription case\r\n\u001b[2m14:40:58\u001b[0m  fixed idempotent detach cleanup\r\n\u001b[32mPASS\u001b[0m  24 tests · 0 warnings\r\n\r\nWaiting for reviewer evidence…\r\n",
+    transcript: "\u001b[2m14:34:02\u001b[0m  added desktop workspace scaffold\r\n\u001b[2m14:36:41\u001b[0m  wired daemon snapshot + terminal events\r\n\u001b[31mFAIL\u001b[0m  bridge test: listener disposed twice\r\n\u001b[33mRETRY 2/3\u001b[0m  isolating failed subscription case\r\n\u001b[2m14:40:58\u001b[0m  fixed idempotent detach cleanup\r\n\u001b[32mPASS\u001b[0m  24 tests · 0 warnings\r\n\r\nWaiting for reviewer events…\r\n",
     diff: ["+ desktop/src/App.tsx", "+ desktop/src/lib/bridge.ts", "+ desktop/src/styles.css", "~ Cargo.toml"],
     checks: [
       { id: "typecheck", name: "TypeScript", status: "passed", duration: "2.1s", command: "pnpm tsc" },
@@ -261,7 +261,7 @@ const agents: AgentSession[] = [
     cli: "codex",
     model: "gpt-5.6-sol",
     status: "running",
-    task: "Audit terminal lifecycle, unsafe actions, and evidence integrity.",
+    task: "Audit terminal lifecycle, unsafe actions, and event integrity.",
     cwd: "/dev/active/dot-agent-deck-gui",
     attempt: 1,
     duration: "02:26",
