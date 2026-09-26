@@ -42,7 +42,7 @@ Issue [#530](https://github.com/vfarcic/dot-agent-deck/issues/530), settled by d
 | CLI outcome | What it asserts |
 | --- | --- |
 | exit 0, `accepted: true` | the daemon admitted the request past the provenance gate. Nothing about shape resolution, the worktree, the spawn, the prompt's write, or its confirmation |
-| exit 0, no reply or an unparseable one (`SocketReply::NoReply`) | nothing checkable — a daemon older than #1129, no reply within `SIGNAL_ACK_TIMEOUT`, or a write that broke partway. Reported as success so a mixed-version pair does not fail every dispatch |
+| exit 0, no checkable reply — `SocketReply::NoReply`, or a `SocketReply::Line` that `parse_signal_ack` does not recognise as a `SignalAck` | nothing checkable — a daemon older than #1129, no reply within `SIGNAL_ACK_TIMEOUT`, a write that broke partway, or a line that is not an ack. Reported as success so a mixed-version pair does not fail every dispatch |
 | non-zero | the request never reached the handler: `SocketReply::Unreachable`, a gate refusal (reason printed), or a local error (no `DOT_AGENT_DECK_PANE_ID`, an unusable `--task-file`) |
 
 Pinned by `daemon::hook_ingestion_tests::a_dispatch_its_handler_rejects_is_still_acknowledged_as_accepted`: an attested dispatch naming an orchestration the directory does not define is acknowledged `accepted`, the ack is the only line on the connection, and the rejection reaches the caller's PTY instead.
@@ -50,7 +50,7 @@ Pinned by `daemon::hook_ingestion_tests::a_dispatch_its_handler_rejects_is_still
 **The outcome is two later messages into the caller's pane, and neither is the confirmation #424 tracks either.**
 
 - `handle_dispatch`'s reply, delivered by `deliver_dispatch_result` once `spawn` returns. `dispatch` passes `detach_delivery = false`, so that is after the readiness wait and the first write — but `deliver` hands confirmation to a detached `spawn_confirmation_task` whatever the flag says, and a refused first write still returns `Ok`. So a reply opening `dispatch::SPAWNED_OPENING` means "a unit was spawned", not "its task arrived". Every other reply opening is a failure.
-- The completion report, when the unit runs `work-done --done`. It is the first message to the caller that implies the unit received its task.
+- The completion report, when the unit runs `work-done --done`. It is the first message to the caller that implies the unit received its task — implies, not proves: `return_dispatch_completion` checks for a terminal `work-done` and a retained route, and ties neither to the prompt's delivery, so any authorised process in that pane can send it.
 
 What confirmation finds goes nowhere near the caller. Abandonment publishes a `DeliveryNotice` on the **unit's** card; an unconfirmable producer and a `lagged-event-stream` / `event-stream-closed` stop are log lines only (`crate::prompt_delivery`'s `log_prompt_*`). The same holds before confirmation starts: a first write refused by `guarded_submit` (`Refused`, `Failed`) or stopped by the pre-write drain is logged and nothing more, and only `RefusedUserInput` publishes a notice (`report_user_input_stop`). All of these still return `Ok` from `spawn`, so the caller gets `SPAWNED_OPENING` regardless.
 

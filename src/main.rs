@@ -135,8 +135,9 @@ enum Commands {
     /// with any other opening is a failure and says why. A spawned unit has
     /// still not been confirmed to have received its task. The report it sends
     /// later, when it finishes, beginning `dispatch: a unit you dispatched has
-    /// completed`, is the only thing delivered to this pane that confirms it
-    /// did.
+    /// completed`, is the first thing delivered to this pane that indicates it
+    /// did — an indication, not proof, since the deck does not tie that report
+    /// to the task's delivery.
     ///
     /// With --list-targets the exit status means something else: 0 means the
     /// listing was printed, and non-zero means no listing could be trusted —

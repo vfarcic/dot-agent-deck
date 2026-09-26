@@ -61,7 +61,7 @@ Starting a unit happens in three steps, and each one tells you something differe
 | --- | --- | --- |
 | The `dot-agent-deck dispatch` command succeeds (exit status 0) | The deck received the request and accepted it — or gave no answer the command could check, which an older deck does | That a worktree was created, that a unit started, or that it got its task. The deck answers the command before doing any of that work |
 | A turn in the dispatcher beginning `dispatch: spawned isolated` | The worktree exists and the unit's agent was started in it. The turn names what was started and where | That the agent received its task. The deck may still be checking that the agent submitted it — for up to a minute after this turn — and nothing that check finds is sent to your dispatcher |
-| A turn beginning `dispatch: a unit you dispatched has completed` | The unit got its task and is reporting back — finished, or stuck and unable to continue | That the work is correct; read the report |
+| A turn beginning `dispatch: a unit you dispatched has completed` | The unit is reporting back — finished, or stuck and unable to continue. This is the first sign that its task arrived | That the work is correct; read the report. The deck does not check the report against the task's delivery, so it is a sign rather than proof |
 
 Any other turn beginning `dispatch:` is a failure — a name already in use, an orchestration your project does not define, a worktree that could not be created — and says why. The unit did not start. In the rare case where some of an orchestration's agents were already running when it failed, the deck leaves them and their directory in place rather than deleting it under them, and the turn says so.
 
