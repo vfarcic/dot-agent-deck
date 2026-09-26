@@ -2987,12 +2987,12 @@ mod tests {
     /// (or nothing) and failed, while CI, which installs no deck, stayed green.
     #[cfg(unix)]
     fn run_socket_probe(snippet: &str, env: &[(&str, &str)]) -> String {
+        let (_shim, path) = deckless_path();
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(snippet)
             .env_clear()
-            // The fallback rungs call `id -u`.
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", &path)
             .envs(env.iter().copied())
             .output()
             .expect("run the discovery probe under /bin/sh");
@@ -3002,6 +3002,22 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A `PATH` holding `id` and nothing else, and the directory keeping it
+    /// alive. The fallback rungs call `id -u`, so the probe needs a PATH; a
+    /// system one such as `/usr/bin:/bin` would still let a deck installed
+    /// there answer the resolver rung instead of the rung under test.
+    #[cfg(unix)]
+    pub(super) fn deckless_path() -> (tempfile::TempDir, String) {
+        let shim = tempfile::tempdir().expect("a PATH shim directory");
+        let id = ["/usr/bin/id", "/bin/id"]
+            .into_iter()
+            .find(|candidate| std::path::Path::new(candidate).exists())
+            .expect("an `id` binary at /usr/bin/id or /bin/id");
+        std::os::unix::fs::symlink(id, shim.path().join("id")).expect("link `id` into the shim");
+        let path = shim.path().to_str().expect("a UTF-8 temp path").to_string();
+        (shim, path)
     }
 
     #[cfg(unix)]
@@ -5708,8 +5724,10 @@ mod tunnel_tests {
         command.arg("-c").arg(snippet);
         command.env_clear();
         // The fallback rungs call `id -u`, so the child needs a PATH even
-        // when the test is about there being no deck on it.
-        command.env("PATH", "/usr/bin:/bin");
+        // when the test is about there being no deck on it — and one no deck
+        // can be on, which `/usr/bin:/bin` is not ([`deckless_path`]).
+        let (_shim, path) = super::tests::deckless_path();
+        command.env("PATH", &path);
         command.envs(env.iter().copied());
         let output = command.output().expect("run the discovery probe");
         assert!(

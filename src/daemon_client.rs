@@ -2213,10 +2213,13 @@ impl DaemonClient {
     /// would drop them and answer as though they were never asked, and a
     /// filtered request answered unfiltered is a wrong answer, not a degraded
     /// one. The cached set is enough here, unlike the starts that decide from a
-    /// fresh handshake: the residual — a cache outliving a daemon replaced by
-    /// an older build — gets the PRD #1223 listing that build has always given
-    /// (or, from a build older still, its `malformed request` refusal), and a
-    /// caller re-filters what it shows anyway.
+    /// fresh handshake, because the residual — a cache outliving a daemon
+    /// replaced by an older build — is caught on the reply instead: that build
+    /// drops the options and answers without
+    /// [`crate::directory_listing::DirectoryListing::options_applied`], and
+    /// such an answer is withheld as [`GatedQuery::Unsupported`] (and the cache
+    /// dropped) rather than returned as though the options were honoured. A
+    /// build older still refuses the verb with `malformed request`.
     ///
     /// `path` must be one this daemon returned — a listing's `path`, `parent`
     /// or an entry's `path` — or one the user typed. `None` lists the daemon
@@ -2256,9 +2259,19 @@ impl DaemonClient {
                     .unwrap_or_else(|| "list-directories failed".into()),
             ));
         }
-        resp.directories
-            .map(GatedQuery::Answered)
-            .ok_or_else(|| ClientError::Malformed("list-directories ok but no listing".into()))
+        let listing = resp
+            .directories
+            .ok_or_else(|| ClientError::Malformed("list-directories ok but no listing".into()))?;
+        // Issue #1240: a daemon that applied the options says so. One that
+        // answered without saying so is an older build behind a capability
+        // cache that outlived its predecessor — it dropped the options and
+        // listed plainly — so the answer is withheld, and the cache dropped
+        // so the next call asks the daemon that is actually there.
+        if !options.is_default() && !listing.options_applied {
+            self.invalidate_capabilities();
+            return Ok(GatedQuery::Unsupported);
+        }
+        Ok(GatedQuery::Answered(listing))
     }
 
     /// PRD #1223 M2 — what a new-agent form needs to know about this deck: its
@@ -4017,6 +4030,7 @@ mod tests {
                                 parent: None,
                                 entries: Vec::new(),
                                 truncated: false,
+                                options_applied: false,
                             });
                             resp
                         }
@@ -4062,6 +4076,44 @@ mod tests {
                 listings.load(Ordering::SeqCst),
                 1,
                 "only the default listing reached the socket"
+            );
+
+            // The residual: a cache captured from a daemon at this build, as if
+            // that daemon was since replaced by the older one answering here.
+            // The request is sent — the cache says it may be — and the older
+            // daemon's plain listing, which does not say it applied the
+            // filter, is withheld rather than returned as a filtered one.
+            client.store_capabilities_from_hello(
+                &AttachResponse::hello(PROTOCOL_VERSION).with_capabilities(),
+            );
+            let filtered = crate::daemon_protocol::DirectoryListingOptions {
+                filter: Some("needle".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                client
+                    .list_directories(Some("/"), &filtered)
+                    .await
+                    .expect("a withhold is not an error"),
+                GatedQuery::Unsupported,
+                "an answer that does not confirm the options is not an answer to them"
+            );
+            assert_eq!(
+                listings.load(Ordering::SeqCst),
+                2,
+                "fixture: that one was sent"
+            );
+            assert_eq!(
+                client
+                    .list_directories(Some("/"), &filtered)
+                    .await
+                    .expect("a withhold is not an error"),
+                GatedQuery::Unsupported,
+            );
+            assert_eq!(
+                listings.load(Ordering::SeqCst),
+                2,
+                "the stale cache was dropped, so the next call re-handshook and withheld"
             );
 
             drop(client);

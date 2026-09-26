@@ -157,6 +157,19 @@ pub struct DirectoryListing {
     /// [`Self::entries`] names.
     #[serde(default)]
     pub truncated: bool,
+    /// Issue #1240: this daemon read and applied the request's
+    /// [`DirectoryListingOptions`]. Set whenever they were not the default,
+    /// and omitted otherwise, so a PRD #1223 listing's shape is unchanged.
+    ///
+    /// It is how a client tells an answer to its options from an older
+    /// daemon's answer to the same frame: a build that predates them drops the
+    /// fields and replies with an ordinary listing, which carries no such
+    /// key. [`crate::daemon_client::DaemonClient::list_directories`] refuses to
+    /// return a reply without it for a request that set any option, so a
+    /// capability cache that outlived the daemon it came from fails closed
+    /// rather than passing an unfiltered listing off as a filtered one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub options_applied: bool,
 }
 
 /// One subdirectory in a [`DirectoryListing`].
@@ -221,7 +234,10 @@ pub fn list_directories(
     // refuses a canonical form that is not UTF-8 — the three things a listed
     // path has to be before it can cross this JSON wire and come back.
     let dir = crate::project_resolve::canonicalize_project_dir(&target).map_err(|_| refusal())?;
-    list_canonical_dir(&dir, options, MAX_DIRECTORY_ENTRIES, deadline).map_err(|()| refusal())
+    let mut listing = list_canonical_dir(&dir, options, MAX_DIRECTORY_ENTRIES, deadline)
+        .map_err(|()| refusal())?;
+    listing.options_applied = !options.is_default();
+    Ok(listing)
 }
 
 /// One name the scan kept: ordered by name first, so the heap displaces the
@@ -423,6 +439,7 @@ fn list_canonical_dir_between(
         parent: dir.parent().and_then(Path::to_str).map(str::to_owned),
         entries,
         truncated,
+        options_applied: false,
     })
 }
 
@@ -818,6 +835,7 @@ mod tests {
                 },
             ],
             truncated: false,
+            options_applied: false,
         };
         let json = serde_json::to_value(&listing).unwrap();
         assert_eq!(
@@ -839,10 +857,23 @@ mod tests {
             parent: None,
             entries: Vec::new(),
             truncated: false,
+            options_applied: true,
         };
         assert!(
             serde_json::to_value(&root).unwrap().get("parent").is_none(),
             "the root's absent parent is omitted, not null"
+        );
+        assert_eq!(
+            serde_json::to_value(&root).unwrap()["options_applied"],
+            true,
+            "issue #1240: an applied-options listing says so"
+        );
+        assert!(
+            serde_json::to_value(&listing)
+                .unwrap()
+                .get("options_applied")
+                .is_none(),
+            "and a PRD #1223 listing carries no such key"
         );
         let back: DirectoryListing = serde_json::from_value(json).unwrap();
         assert_eq!(back, listing);
@@ -1059,6 +1090,27 @@ mod tests {
             ..DirectoryListingOptions::default()
         };
         assert!(list_directories(Some("/"), &options).is_ok());
+    }
+
+    /// Issue #1240: the reply says whether it applied the request's options —
+    /// the marker a client requires before trusting a filtered answer.
+    #[test]
+    fn a_listing_says_whether_it_applied_the_options() {
+        let (_guard, root) = scratch();
+        assert!(
+            !list_directories(Some(&wire(&root)), &plain())
+                .unwrap()
+                .options_applied
+        );
+        let filtered = DirectoryListingOptions {
+            filter: Some("x".into()),
+            ..DirectoryListingOptions::default()
+        };
+        assert!(
+            list_directories(Some(&wire(&root)), &filtered)
+                .unwrap()
+                .options_applied
+        );
     }
 
     #[test]

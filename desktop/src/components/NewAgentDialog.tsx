@@ -99,6 +99,26 @@ type ListingOutcome = { kind: "listed"; listing: Listing } | { kind: "failed" } 
  */
 export const DECK_SEARCH_DEBOUNCE_MS = 250;
 
+/**
+ * Which row a listing that lands should put the cursor on: a path, and — for
+ * a row the user was on — its name too. Issue #1240 made the name matter: a
+ * symlink is listed by its target, so a link and the directory it leads to (or
+ * two links to one place) share a path and differ only by name.
+ */
+type Focus = { path: string; name?: string };
+
+/**
+ * The index in `entries` of `focus`, or -1: the exact row when a name is
+ * given, and otherwise the real directory at that path before any link to it —
+ * the directory just left, when going up, is the real one.
+ */
+function focusIndex(entries: readonly DeckDirectoryEntry[], focus: Focus | undefined): number {
+  if (!focus) return -1;
+  if (focus.name !== undefined) return entries.findIndex((entry) => entry.path === focus.path && entry.displayName === focus.name);
+  const real = entries.findIndex((entry) => entry.path === focus.path && !entry.isSymlink);
+  return real >= 0 ? real : entries.findIndex((entry) => entry.path === focus.path);
+}
+
 /** Issue #1240 — the truncation hints, in the dialog's own words. */
 export const TRUNCATED_NO_SEARCH = "Not every subdirectory is listed: the deck stopped at its limit, and the ones past it cannot be chosen here.";
 export const TRUNCATED_SEARCHABLE = "Not every subdirectory is listed: the deck stopped at its limit. Filter by name and the deck searches all of them.";
@@ -585,8 +605,10 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     hidden is on — rewritten every render, and by `toggleHidden` directly so a
     reload it starts sees the new value before the next render does.
   */
-  const browse = useRef({ showHidden, supports: new Set<string>() });
-  browse.current = { showHidden, supports: new Set(choices.flatMap((choice) => (choice.listingOptions ? [choice.deckId] : []))) };
+  const browse = useRef({ showHidden, filter, supports: new Set<string>() });
+  browse.current = { showHidden, filter, supports: new Set(choices.flatMap((choice) => (choice.listingOptions ? [choice.deckId] : []))) };
+  /** Issue #1240: where a search that lands after a Show hidden reload should put the cursor. */
+  const searchFocus = useRef<Focus | undefined>(undefined);
 
   /**
    * List `path` on the captured deck (its home when absent), then put the
@@ -605,7 +627,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    * The answer is what became of the request, for a caller that has more to
    * do once it lands; every other caller ignores it.
    */
-  const loadListing = useCallback(async (deckId: string, path?: string, focusPath?: string, onFailure: "report" | "home" | "quiet" = "report"): Promise<ListingOutcome> => {
+  const loadListing = useCallback(async (deckId: string, path?: string, focusPath?: string | Focus, onFailure: "report" | "home" | "quiet" = "report", keepFilter = false): Promise<ListingOutcome> => {
     const seq = ++listingSeq.current;
     setListingError(undefined);
     setListingState((current) => (current === "ready" ? current : "loading"));
@@ -621,13 +643,20 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
       for (const entry of reply.entries) projectMarks.current.set(entry.path, entry.isProject);
       setListing(reply);
       setListingState("ready");
-      setFilter("");
+      // Issue #1240: a Show hidden reload keeps the filter the user typed —
+      // and, on a truncated listing, the deck search re-runs for it with the
+      // new setting — so the cursor is placed among the rows it leaves.
+      const kept = keepFilter ? browse.current.filter : "";
+      if (!keepFilter) setFilter("");
       searchSeq.current += 1;
       setSearched(undefined);
       setSearchError(undefined);
+      const focus = typeof focusPath === "string" ? { path: focusPath } : focusPath;
+      searchFocus.current = keepFilter ? focus : undefined;
+      const shown = filterDirectoryEntries(reply.entries, kept);
       const offset = reply.parent === undefined ? 0 : 1;
-      const focused = focusPath === undefined ? -1 : reply.entries.findIndex((entry) => entry.path === focusPath);
-      setCursor(focused >= 0 ? focused + offset : reply.entries.length > 0 ? offset : 0);
+      const focused = focusIndex(shown, focus);
+      setCursor(focused >= 0 ? focused + offset : shown.length > 0 ? offset : 0);
       return { kind: "listed", listing: reply };
     } catch (cause) {
       if (seq !== listingSeq.current) return { kind: "stale" };
@@ -864,15 +893,17 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   /**
    * Issue #1240 — Show hidden, on a deck that honours listing options: the
    * directory on screen is listed again with `.`-named directories included
-   * (or left out), keeping the cursor on the row it was on when that row is
-   * still listed.
+   * (or left out). The filter stays, a deck search it had made is made again
+   * with the new setting, and the cursor stays on the row it was on — by
+   * name as well as path — when that row is still listed.
    */
   const toggleHidden = (next: boolean) => {
     if (!deck?.listingOptions || busy) return;
     setShowHidden(next);
     browse.current = { ...browse.current, showHidden: next };
     const current = rows[cursor];
-    if (listing) void loadListing(deck.deckId, listing.path, current?.kind === "entry" ? current.entry.path : undefined);
+    const focus = current?.kind === "entry" ? { path: current.entry.path, name: current.entry.displayName } : undefined;
+    if (listing) void loadListing(deck.deckId, listing.path, focus, "report", true);
   };
 
   /*
@@ -884,8 +915,21 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     listing that was not truncated is complete, so the filter keeps narrowing
     it here with no round trip. A deck without listing options is never asked.
   */
+  /*
+    Read through a ref rather than depended on: a fleet snapshot can replace
+    both every 150 ms on a busy deck, and a dependency on either would restart
+    the debounce each time, so the search might never be sent.
+  */
+  const searchDeps = useRef({ runtime, deckGone });
+  searchDeps.current = { runtime, deckGone };
   useEffect(() => {
-    if (!deck?.listingOptions || !listing?.truncated || filter === "") return;
+    if (!deck?.listingOptions || !listing?.truncated || filter === "") {
+      // Nothing to search for (the filter was cleared, say): a request still
+      // in flight answers nothing on screen, including its failure.
+      searchSeq.current += 1;
+      setSearchError(undefined);
+      return;
+    }
     if (searched && searched.path === listing.path && searched.filter === filter) return;
     const seq = ++searchSeq.current;
     const deckId = deck.deckId;
@@ -895,22 +939,28 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
       void (async () => {
         try {
           const options = directoryListingOptions(true, browse.current.showHidden, wanted);
-          const reply = await runtime.listDirectories(deckId, path, options);
+          const reply = await searchDeps.current.runtime.listDirectories(deckId, path, options);
           if (seq !== searchSeq.current || reply.kind !== "listing") return;
           for (const entry of reply.entries) projectMarks.current.set(entry.path, entry.isProject);
           setSearchError(undefined);
           setSearched({ path, filter: wanted, listing: reply });
-          setCursor((current) => Math.min(current, reply.entries.length + (listing.parent === undefined ? 0 : 1)));
+          const offset = listing.parent === undefined ? 0 : 1;
+          const shown = filterDirectoryEntries(reply.entries, wanted);
+          const focused = focusIndex(shown, searchFocus.current);
+          searchFocus.current = undefined;
+          // On the row a Show hidden reload was on, or else where the cursor
+          // was, kept inside the rows this answer leaves.
+          setCursor((current) => (focused >= 0 ? focused + offset : Math.max(0, Math.min(current, shown.length + offset - 1))));
         } catch (cause) {
           if (seq !== searchSeq.current) return;
           const message = messageOf(cause);
-          if (isDeckGoneError(message)) deckGone(message);
+          if (isDeckGoneError(message)) searchDeps.current.deckGone(message);
           else setSearchError(message);
         }
       })();
     }, DECK_SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [deck, deckGone, filter, listing, runtime, searched]);
+  }, [deck, filter, listing, searched]);
   /** A search is on its way: the filter is on a truncated listing and the deck has not answered for it yet. */
   const searching = deck?.listingOptions === true && listing?.truncated === true && filter !== "" && searchedHere === undefined && searchError === undefined;
 
@@ -1598,7 +1648,8 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
           >
             {rows.map((row, index) => (
               <li
-                key={row.kind === "up" ? ".." : row.entry.path}
+                // Name and path: a symlink shares its target's path (issue #1240).
+                key={row.kind === "up" ? ".." : `${row.entry.displayName}\u0000${row.entry.path}`}
                 id={`${titleId}-row-${index}`}
                 role="option"
                 aria-selected={index === cursor}
