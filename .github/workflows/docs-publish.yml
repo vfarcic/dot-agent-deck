@@ -30,6 +30,9 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.tag.outputs.sha }}
     steps:
       # Fail here, not at the "Commit chart changes" push. This job pushes the
       # chart bump straight to `main`, which only an admin identity may do:
@@ -91,8 +94,8 @@ jobs:
             ORIGIN="manual"
           fi
           # `sha` is the commit the image is built from. "Commit chart changes"
-          # pulls `main` forward, so the Netlify build at the end checks this
-          # out again to publish exactly what the image holds.
+          # pulls `main` forward, so the Netlify jobs below check this out
+          # rather than `main` to publish exactly what the image holds.
           {
             echo "tag=${TAG}"
             echo "origin=${ORIGIN}"
@@ -251,20 +254,27 @@ jobs:
             echo "- **Trigger**: ${ORIGIN}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Netlify production deploy, running ALONGSIDE the image + chart path
-      # above while agent-deck.devopstoolkit.ai still points at the cluster.
-      # Every Netlify step comes after "Commit chart changes" and "Summary", so
-      # a Netlify failure cannot stop the cluster from rolling forward.
-      #
-      # `--force --detach` returns to the commit the image was built from: the
-      # chart commit above pulled `main` forward, and anything merged under
-      # docs/ or site/ in the meantime belongs in the NEXT publish, not a copy
-      # of the site that differs from the image. The chart bump itself is
-      # already pushed, so nothing is lost by leaving the branch.
-      - name: Check out the image's source commit for the Netlify build
-        env:
-          SOURCE_SHA: ${{ steps.tag.outputs.sha }}
-        run: git -c advice.detachedHead=false checkout --force --detach "${SOURCE_SHA}"
+  # Netlify production deploy, running ALONGSIDE the image + chart path above
+  # while agent-deck.devopstoolkit.ai still points at the cluster. Both jobs
+  # need `publish`, so a Netlify failure cannot stop the cluster rolling forward.
+  #
+  # SEPARATE JOBS, ON PURPOSE. `publish` holds the admin RELEASE_TOKEN (its
+  # checkout persists it for the push) and `packages: write`; the image's
+  # `npm ci` never saw either, because it ran inside the Docker build. Running
+  # `npm ci` and `npm run build` on that job's host would hand both to every
+  # install script and build plugin in site/'s dependency tree. So the build
+  # runs here with a read-only token and no secrets, and the deploy job -- the
+  # only one holding the Netlify token -- runs no npm code at all.
+  netlify-build:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.publish.outputs.sha }}
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
@@ -272,13 +282,39 @@ jobs:
           cache: 'npm'
           cache-dependency-path: site/package-lock.json
 
-      - name: Build site for Netlify
+      # --ignore-scripts: the build needs none (core-js's banner is the only
+      # install script in the tree), and this job has nothing to steal anyway.
+      - name: Build site
         working-directory: site
         run: |
-          npm ci
+          npm ci --ignore-scripts
           npm run build
 
-      # netlify-cli is pinned in devbox.json.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docs-site
+          path: site/build
+          if-no-files-found: error
+          retention-days: 1
+
+  netlify-deploy:
+    needs: [publish, netlify-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # For devbox.json (netlify-cli's pin) and site/netlify.toml, at the same
+      # commit the site was built from.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.publish.outputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: docs-site
+          path: site/build
+
       - uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0
         with:
           enable-cache: true
@@ -296,10 +332,10 @@ jobs:
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
-          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+          IMAGE_TAG: ${{ needs.publish.outputs.tag }}
         run: |
           set -euo pipefail
           URL=$(devbox run -- netlify deploy --cwd site --prod --no-build --dir=build \
             --message "docs-${IMAGE_TAG}" --json | jq -r '.url // .deploy_url')
           echo "Netlify production: ${URL}"
-          echo "- **Netlify**: ${URL} (\`docs-${IMAGE_TAG}\`)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Netlify production: ${URL} (\`docs-${IMAGE_TAG}\`)" >> "$GITHUB_STEP_SUMMARY"

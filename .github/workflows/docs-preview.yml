@@ -1,0 +1,108 @@
+name: Docs Preview
+
+# Deploys the docs site a PR built to pr-<N>--agent-deck-devopstoolkit-ai.netlify.app.
+#
+# WHY THIS IS A SEPARATE `workflow_run` WORKFLOW rather than a step in docs.yml:
+# NETLIFY_AUTH_TOKEN is a personal token over the whole Netlify account, and a
+# `pull_request` job runs the PR's code -- its copy of the workflow, the init
+# hook in its devbox.json (which sources `.env`), every install script and
+# build plugin in site/'s npm tree. Excluding forks does not change that for a
+# same-repository branch, and this repo's branches are pushed by dispatched
+# agents and Renovate as well as by people. So docs.yml builds with no secret
+# and uploads only the static output, and this workflow -- which GitHub always
+# runs from the DEFAULT BRANCH, whatever the PR changed -- downloads it and
+# deploys it. Nothing from the PR is executed here: `netlify deploy --no-build`
+# uploads the files as data.
+#
+# What the PR still controls is the content of its own preview, including any
+# `_headers`/`_redirects` file in the build output; an alias deploy never
+# becomes the production deploy, so that stays confined to the preview URL. It
+# does NOT control site/netlify.toml here, which is read from `main`: a PR that
+# changes it previews with `main`'s headers until it merges.
+#
+# Because `workflow_run` runs the default branch's copy, a change to THIS file
+# takes effect only after it merges.
+
+on:
+  workflow_run:
+    workflows: [Docs]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read      # download the artifact from the PR's run
+  statuses: write    # link the preview from the PR's checks
+
+concurrency:
+  group: docs-preview-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    # Same-repository PRs only: docs.yml uploads no artifact for a fork, and
+    # this condition keeps a fork's run from reaching the token even if it did.
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      # From GitHub's event, never from the artifact the PR uploaded. Checked
+      # to be a bare number before it is used in an alias or an API path.
+      - name: Resolve PR number
+        id: pr
+        env:
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${PR_NUMBER}" =~ ^[0-9]+$ ]]; then
+            echo "::error::workflow_run carried no usable PR number ('${PR_NUMBER}'); not deploying a preview."
+            exit 1
+          fi
+          echo "number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      # `main`, for devbox.json (netlify-cli's pin) and site/netlify.toml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: docs-site
+          path: site/build
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0
+        with:
+          enable-cache: true
+
+      # `--cwd site` and the space-free arguments are load-bearing for the same
+      # reasons given on the production deploy in docs-publish.yml: without the
+      # former, site/netlify.toml's headers are silently dropped.
+      - name: Deploy preview to Netlify
+        id: deploy
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          URL=$(devbox run -- netlify deploy --cwd site --no-build --dir=build \
+            --alias "pr-${PR_NUMBER}" --message "pr-${PR_NUMBER}" --json | jq -r '.deploy_url')
+          echo "Preview: ${URL}"
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+          echo "### Netlify preview for #${PR_NUMBER}: ${URL}" >> "$GITHUB_STEP_SUMMARY"
+
+      # This run is not attached to the PR, so without a status on its head
+      # commit the preview URL would be visible only in this run's summary.
+      - name: Link the preview from the PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          gh api "repos/${REPO}/statuses/${HEAD_SHA}" \
+            -f state=success -f context=docs-preview \
+            -f target_url="${URL}" -f description="Netlify preview of the docs site"
