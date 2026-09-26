@@ -721,6 +721,54 @@
         }
       }
     },
+    "netlify-cli@23.15.0": {
+      "last_modified": "2026-08-27T07:16:00Z",
+      "resolved": "github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410#netlify-cli",
+      "source": "devbox-search",
+      "version": "23.15.0",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/ry0qbjxif8119qfrimxsy7sjy2a934hq-netlify-cli-23.15.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/ry0qbjxif8119qfrimxsy7sjy2a934hq-netlify-cli-23.15.0"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/i9kallpaxqy6x1mccg5kx7h5xid85fln-netlify-cli-23.15.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/i9kallpaxqy6x1mccg5kx7h5xid85fln-netlify-cli-23.15.0"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/2g2ijc875qs40clzwdyydff3lv3q68bv-netlify-cli-23.15.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/2g2ijc875qs40clzwdyydff3lv3q68bv-netlify-cli-23.15.0"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/d79i9kb33mci1in8r7rww2sgl9bka9rc-netlify-cli-23.15.0",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/d79i9kb33mci1in8r7rww2sgl9bka9rc-netlify-cli-23.15.0"
+        }
+      }
+    },
     "nodejs@24.12.0": {
       "last_modified": "2025-12-27T12:56:01Z",
       "plugin_version": "0.0.4",
