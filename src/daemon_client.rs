@@ -439,14 +439,17 @@ impl LocalEndpoint {
 
     /// May this address be unlinked, bound or lazy-spawned at?
     ///
-    /// False only for the pre-#1121 compatibility spelling — see
-    /// [`crate::platform::paths::ResolvedEndpoint::is_primary`], which this
-    /// forwards to.
+    /// False for the two addresses only discovery reaches — the pre-#1121
+    /// compatibility spelling and a relocated endpoint directory (issue
+    /// #1173) — see [`crate::platform::paths::ResolvedEndpoint::is_primary`],
+    /// whose rule this forwards to.
     pub fn is_primary(&self) -> bool {
-        !matches!(
-            self.source,
-            crate::platform::paths::EndpointSource::LegacyCompat
-        )
+        self.source.is_primary()
+    }
+
+    /// Which arm produced [`Self::path`].
+    pub fn source(&self) -> crate::platform::paths::EndpointSource {
+        self.source
     }
 }
 
@@ -3061,7 +3064,7 @@ mod tests {
         // because that variable is process-global and `cargo test` runs these
         // as threads in one process.
         let resolved = crate::endpoint_resolve::client_attach_endpoint();
-        if resolved.source() != crate::platform::paths::EndpointSource::LegacyCompat {
+        if resolved.is_primary() {
             assert_eq!(
                 resolved.path(),
                 crate::config::attach_socket_path(),
