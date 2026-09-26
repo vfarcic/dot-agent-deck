@@ -475,6 +475,23 @@ fn dispatch_prompt(
     prompt
 }
 
+/// How the daemon's reply to a dispatch that STARTED something opens — the
+/// message typed into the caller's pane once the spawn returns. Every refusal
+/// or failure [`handle_dispatch`] reports opens `dispatch:` with anything else.
+///
+/// Issue #530: a constant because callers are taught to branch on it. The CLI's
+/// exit status is the provenance gate's acknowledgement, written before this
+/// handler runs, so this message is the first thing that says whether a unit
+/// exists at all — and `dispatch --help` and the dispatcher seed both quote it.
+/// Tests pin both quotes against this value, so rewording the reply cannot leave
+/// them teaching an opening nothing sends.
+///
+/// It says a unit was spawned, not that its task arrived: the prompt's first
+/// write can still be refused, and its confirmation runs in a detached task
+/// that can run for up to a minute after this message is sent (see
+/// [`crate::spawn::spawn`]).
+pub const SPAWNED_OPENING: &str = "dispatch: spawned isolated";
+
 pub async fn handle_dispatch(
     ctx: &DispatchContext,
     name: &str,
@@ -681,11 +698,11 @@ pub async fn handle_dispatch(
                 message: {
                     let opened = match &handle.kind {
                         SpawnKind::Orchestration { name: orch } => format!(
-                            "dispatch: spawned isolated orchestration '{orch}' for '{name}' in {}",
+                            "{SPAWNED_OPENING} orchestration '{orch}' for '{name}' in {}",
                             paths.worktree_dir.display()
                         ),
                         SpawnKind::SingleAgent => format!(
-                            "dispatch: spawned isolated agent for '{name}' in {}",
+                            "{SPAWNED_OPENING} agent for '{name}' in {}",
                             paths.worktree_dir.display()
                         ),
                     };
