@@ -86,10 +86,12 @@ pub fn installed_claude_accepts_stop_failure() -> (bool, Option<String>) {
 /// the direct child while keeping stdout open, and this runs at TUI start with
 /// [`SETTINGS_LOCK`] held. So stdout is drained on a thread, which stops at the
 /// first newline, at EOF or after 4 KiB, and hands back what it read; the
-/// probe waits for that hand-off until the deadline. Past the deadline the
-/// probe answers unknown, kills the child — on Unix its whole process group,
-/// which it was given at spawn, so a helper holding the pipe dies with it —
-/// reaps it, and abandons the reader thread, which ends when the pipe closes.
+/// probe waits for that hand-off until the deadline. The line is accepted only
+/// when the child has also exited on its own by then. Past the deadline,
+/// whether or not a line arrived, the probe answers unknown, kills the child
+/// (on Unix its whole process group, which it was given at spawn, so a helper
+/// holding the pipe dies with it), reaps it, and abandons the reader thread,
+/// which ends when the pipe closes.
 /// A descendant that moved itself to another group keeps the pipe, and with it
 /// that one detached thread; the probe still returns on time.
 fn probe_claude_version(
@@ -137,7 +139,11 @@ fn probe_claude_version(
         kill_probe(&mut child);
         return (false, None);
     };
-    // The line is in; reap the child within what is left of the deadline.
+    // The line is in; it counts only if the child also exits on its own
+    // within what is left of the deadline. A version command that prints a
+    // plausible line and then hangs is killed and answers unknown, like one
+    // that never printed: the line alone does not prove which Claude Code
+    // `PATH` resolves to, and a wrong `true` disables every deck hook.
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -146,7 +152,7 @@ fn probe_claude_version(
             }
             _ => {
                 kill_probe(&mut child);
-                break;
+                return (false, None);
             }
         }
     }
@@ -1602,6 +1608,33 @@ mod tests {
             }
             assert!(gone(helper), "the helper holding stdout outlived the probe");
         }
+    }
+
+    /// Issue #714: a stand-in `claude` that prints a full, accepted version
+    /// line and then hangs in the foreground. The line alone is not enough: the
+    /// probe kills the child at its bound and answers unknown, so a wrapper
+    /// that stalls never gets `StopFailure` installed.
+    #[cfg(unix)]
+    #[test]
+    fn the_version_probe_answers_unknown_when_the_child_hangs_after_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = stand_in_claude(
+            dir.path(),
+            "#!/bin/sh\necho '2.1.300 (Claude Code)'\nsleep 30\n",
+        );
+        let bound = std::time::Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        let outcome = probe_claude_version(claude.as_os_str(), bound);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            outcome,
+            (false, None),
+            "a line from a child killed at the deadline is unknown"
+        );
+        assert!(
+            elapsed < bound + std::time::Duration::from_millis(1500),
+            "the probe waited {elapsed:?} against a {bound:?} bound"
+        );
     }
 
     /// Issue #714 (audit A2): the probe needs the version LINE, not EOF — a
