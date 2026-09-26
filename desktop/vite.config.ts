@@ -23,7 +23,12 @@ export default defineConfig({
     // the app. Spread rather than replace: the defaults are
     // `**/node_modules/**` and `**/.git/**` (verified identical in vitest 4.1.11
     // and 5.0.0), and dropping them would collect specs out of `node_modules`.
-    exclude: [...configDefaults.exclude, "e2e/**"],
+    //
+    // `driver/` is the same shape one rung up (issue #953): its `*.test.ts`
+    // files are `node:test` suites that launch the real window through
+    // tauri-driver, run by `pnpm test:driver`, and vitest would find no suite in
+    // them.
+    exclude: [...configDefaults.exclude, "e2e/**", "driver/**"],
     setupFiles: ["./src/test/setup.ts"],
     css: true,
   },

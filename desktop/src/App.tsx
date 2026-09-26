@@ -43,6 +43,7 @@ import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel } from "./components/VoiceControlPanel";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
+import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
@@ -1116,6 +1117,16 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     enabled: mode === "live" && snapshot.connection.status === "connected" && !allDecks,
   });
   const activeProject = allDecks ? undefined : projectState.selected;
+  // Issue #1044 — the selected deck's live orchestrations, which the Runs
+  // launch's Run name is suggested against and checked for collisions in, the
+  // way the New agent dialog reads the deck it targets.
+  const orchestrationDeckId = snapshot.connection.deckId;
+  const orchestrationLiveTitles = useMemo(() => (orchestrationDeckId ? liveOrchestrationTitles(runtime.fleet, orchestrationDeckId) : []), [runtime.fleet, orchestrationDeckId]);
+  const orchestrationLiveDirectories = useMemo(() => (orchestrationDeckId ? liveOrchestrationDirectories(runtime.fleet, orchestrationDeckId) : []), [runtime.fleet, orchestrationDeckId]);
+  // Read at CONFIRM time, not when the dialog was built: the confirmation can
+  // sit open while another run takes the title (PR #1333 review).
+  const orchestrationLiveTitlesRef = useRef(orchestrationLiveTitles);
+  orchestrationLiveTitlesRef.current = orchestrationLiveTitles;
   const { prompts, addPrompt, updatePrompt, removePrompt } = usePromptLibrary();
   const [profileOrder, setProfileOrder] = useState<string[]>([]);
 
@@ -1484,7 +1495,9 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       : "";
     setConfirm({
       title: `Activate ${config.displayName}?`,
-      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and sends your task prompt to the orchestrator. ${commandCopy}${accessCopy} Activating does not rewrite project TOML.`,
+      // Issue #1044: the task is optional. Without one the orchestrator is still
+      // briefed — the daemon's context names its role and team — and then waits.
+      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and ${config.taskPrompt ? "sends your task prompt to the orchestrator" : "briefs the orchestrator with no task, so it waits for you to type one into its pane"}.${config.displayTitle ? ` The run is named ${displayText(config.displayTitle, DISPLAY_LIMITS.name)}.` : ""} ${commandCopy}${accessCopy} Activating does not rewrite project TOML.`,
       label: "Activate orchestration",
       busyLabel: "Activating…",
       action: async () => {
@@ -1493,6 +1506,14 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           // dialog and the notice, and the daemon gets the identities alone
           // (PRD #819 audit fix).
           const { customCommandCount: _customCommandCount, generatedFullAccessCount: _generatedFullAccessCount, displayName: _displayName, displayPath: _displayPath, ...launch } = config;
+          // `displayTitle` is NOT a display twin: it rides along as the run's
+          // title (issue #1044), absent when the Name was left empty. The
+          // sheet's collision check ran when Activate was pressed; it runs again
+          // here, against the titles live now, with the same refusal.
+          if (orchestrationLiveTitlesRef.current.includes(config.displayTitle ?? config.name)) {
+            setNotice(`Nothing was started: ${ORCHESTRATION_TITLE_TAKEN}`);
+            return;
+          }
           await runtime.runAction({ type: "activate_orchestration", ...launch });
           setOrchestrationOpen(false);
           await runtime.reconnect();
@@ -1816,7 +1837,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         onRemove={(id) => { removePrompt(id); setNotice("Prompt removed from this device's library."); }}
       />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOrchestrationOpen(false); setProjectsOpen(true); }} onClose={() => setOrchestrationOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={orchestrationPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} />
+      <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOrchestrationOpen(false); setProjectsOpen(true); }} onClose={() => setOrchestrationOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={orchestrationPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} liveTitles={orchestrationLiveTitles} liveDirectories={orchestrationLiveDirectories} deckId={orchestrationDeckId} />
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}

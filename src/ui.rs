@@ -34125,6 +34125,7 @@ mod tests {
         let delivered = crate::dispatch_return::compose_completion_report(
             "drift-probe",
             "The unit's own account of what it did.",
+            None,
         );
         assert!(
             delivered.starts_with(QUOTED_OPENING),

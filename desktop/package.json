@@ -15,6 +15,8 @@
     "test:watch": "vitest",
     "test:browser": "playwright test",
     "test:browser:types": "tsc -p tsconfig.e2e.json",
+    "test:driver": "node --test --test-concurrency=1 \"driver/**/*.test.ts\"",
+    "test:driver:types": "tsc -p tsconfig.driver.json",
     "tauri": "tauri"
   },
   "dependencies": {

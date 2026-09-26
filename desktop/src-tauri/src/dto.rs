@@ -303,6 +303,13 @@ pub struct DesktopConnection {
     /// the wire when `None`, for [`Self::project_actions_reason`]'s reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_agent_reason: Option<String>,
+    /// Whether the deck honours the New agent directory browser's listing
+    /// options (issue #1240): it advertises `list-directories-options`, so the
+    /// browser offers Show hidden, lists symlinked directories and sends its
+    /// filter to the deck when the deck's own cap cut a listing short. Always on
+    /// the wire, like [`Self::build_stamp_mismatch_only`]: the dialog branches
+    /// on it to decide whether a control EXISTS.
+    pub listing_options: bool,
 }
 
 /// The three endpoint-shaped fields of [`DesktopConnection`], **for one deck**.
@@ -556,8 +563,8 @@ pub enum DesktopAction {
     /// project config gives it — on the deck, which reads the config there.
     ///
     /// Not [`Self::ActivateOrchestration`], which is the Runs screen's launch and keeps
-    /// its own form rules (a required task, desktop profile commands, no Pi
-    /// coordinator). The two share the daemon verbs and the bridge's rollback
+    /// its own form rules (desktop profile commands, no Pi coordinator). The
+    /// two share the daemon verbs and the bridge's rollback
     /// and coordinator-delivery machinery, and none of those form rules.
     StartOrchestration {
         /// The target deck's wire id, required for [`Self::StartAgent`]'s
@@ -583,6 +590,13 @@ pub enum DesktopAction {
         /// The orchestration name, as offered by the daemon's
         /// `resolve-project` reply for `cwd`.
         name: String,
+        /// The run's title — the form's Name (issue #1044). Absent when the
+        /// Name is empty, which is the TUI's rule and
+        /// [`Self::StartOrchestration`]'s: the tab then takes the
+        /// orchestration's name. `#[serde(default)]`, so a webview built before
+        /// the field existed still launches, untitled.
+        #[serde(default)]
+        display_title: Option<String>,
         /// The daemon-**canonical** project path, exactly as
         /// `resolve-project` or `list-projects` spelled it. PRD #819 M6: the
         /// webview never derives this from its own environment and never
@@ -590,6 +604,9 @@ pub enum DesktopAction {
         /// basename and an empty orchestration name is derived from that
         /// basename (PRD #220).
         cwd: String,
+        /// The coordinator's task, which may be empty (issue #1044): the
+        /// daemon then composes the context without a task section and the
+        /// coordinator waits for the user's instructions, as under the TUI.
         task_prompt: String,
         roles: Vec<OrchestrationRoleInput>,
         rows: Option<u16>,
@@ -1071,6 +1088,22 @@ pub struct DesktopDirectoryEntry {
     pub display_name: String,
     /// It holds a `.dot-agent-deck.toml` the daemon's project reader would open.
     pub is_project: bool,
+    /// Issue #1240: the entry is a symlink the daemon listed by its target, so
+    /// [`Self::path`] is where it leads and need not lie under the listing.
+    pub is_symlink: bool,
+}
+
+/// Issue #1240: what the New agent dialog asks a deck to widen or narrow about
+/// one listing. Every field defaults to off, which is the PRD #1223 listing.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DesktopListingOptions {
+    /// List `.`-named directories too.
+    pub include_hidden: bool,
+    /// List symlinks to directories too, by their targets.
+    pub include_symlinks: bool,
+    /// Keep only directories whose name contains this, before the deck's cap.
+    pub filter: Option<String>,
 }
 
 impl DesktopDirectoryListing {
@@ -1083,7 +1116,7 @@ impl DesktopDirectoryListing {
     pub(crate) fn listing(
         path: String,
         parent: Option<String>,
-        entries: impl IntoIterator<Item = (String, String, bool)>,
+        entries: impl IntoIterator<Item = (String, String, bool, bool)>,
         truncated: bool,
     ) -> Self {
         Self::Listing {
@@ -1092,11 +1125,14 @@ impl DesktopDirectoryListing {
             parent,
             entries: entries
                 .into_iter()
-                .map(|(name, path, is_project)| DesktopDirectoryEntry {
-                    path,
-                    display_name: display_only(&name),
-                    is_project,
-                })
+                .map(
+                    |(name, path, is_project, is_symlink)| DesktopDirectoryEntry {
+                        path,
+                        display_name: display_only(&name),
+                        is_project,
+                        is_symlink,
+                    },
+                )
                 .collect(),
             truncated,
         }
@@ -2155,6 +2191,7 @@ pub(crate) fn disconnected_snapshot(
             // screen is already saying the only thing there is to say.
             project_actions_reason: None,
             new_agent_reason: None,
+            listing_options: false,
         },
         agents: Vec::new(),
         // Issue #887: nothing answered, so this daemon reported no revision.

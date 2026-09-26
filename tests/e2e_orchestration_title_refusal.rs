@@ -46,7 +46,7 @@ fn identity_010_a_title_taken_by_another_client_after_the_form_opened_is_refused
     let deck = TuiDeck::builder()
         .with_pty_size(160, 45)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // The deck's picker starts at its process cwd, which the kernel reports
     // with symlinks resolved — so the orchestration cwd the TUI will send is
