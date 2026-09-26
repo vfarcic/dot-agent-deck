@@ -91,12 +91,16 @@ pub fn installed_claude_accepts_stop_failure() -> (bool, Option<String>) {
 /// first newline, at EOF or after 4 KiB, and hands back what it read; the
 /// probe waits for that hand-off until the deadline. The line is accepted only
 /// when the child has also exited on its own by then. Past the deadline,
-/// whether or not a line arrived, the probe answers unknown, kills the child
-/// (on Unix its whole process group, which it was given at spawn, so a helper
-/// holding the pipe dies with it), reaps it, and abandons the reader thread,
-/// which ends when the pipe closes.
-/// A descendant that moved itself to another group keeps the pipe, and with it
-/// that one detached thread; the probe still returns on time.
+/// whether or not a line arrived, the probe answers unknown, kills the child's
+/// whole tree — on Unix its process group, which it was given at spawn, and on
+/// Windows the Job Object it is adopted into right after spawn — reaps it, and
+/// abandons the reader thread, which ends when the pipe closes because a
+/// helper holding it died with the tree. What escapes the tree keeps the pipe,
+/// and with it that one detached thread: on Unix a descendant that moved itself
+/// to another group, on Windows one spawned in the instant between
+/// `CreateProcess` and the job assignment
+/// ([`crate::platform::proc::AgentProcessGroup::adopt`] documents that window).
+/// Either way the probe still returns on time.
 fn probe_claude_version(
     program: &std::ffi::OsStr,
     timeout: std::time::Duration,
@@ -117,6 +121,13 @@ fn probe_claude_version(
         Ok(child) => child,
         Err(_) => return (false, None),
     };
+    // Windows has no process group to spawn into: contain the tree in a Job
+    // Object instead, so `kill_probe` reaps a launcher's helpers too (Qodo on
+    // PR #1346). Adoption failure degrades to killing the direct child only.
+    #[cfg(windows)]
+    let tree = crate::platform::proc::AgentProcessGroup::adopt(Some(child.id()));
+    #[cfg(not(windows))]
+    let tree = ProbeTree;
     let deadline = std::time::Instant::now() + timeout;
     let (tx, rx) = std::sync::mpsc::channel();
     if let Some(mut stdout) = child.stdout.take() {
@@ -139,7 +150,7 @@ fn probe_claude_version(
     let Ok(output) = rx.recv_timeout(remaining) else {
         // Deadline passed with no line. The child is not reaped yet (a zombie
         // at worst), so its pid still names its group.
-        kill_probe(&mut child);
+        kill_probe(&mut child, &tree);
         return (false, None);
     };
     // The line is in; it counts only if the child also exits on its own
@@ -154,7 +165,7 @@ fn probe_claude_version(
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             _ => {
-                kill_probe(&mut child);
+                kill_probe(&mut child, &tree);
                 return (false, None);
             }
         }
@@ -168,10 +179,16 @@ fn probe_claude_version(
     )
 }
 
-/// Kill a version probe that outlived its deadline — on Unix its whole process
-/// group first — and reap it. Must run before the child is reaped, while its
-/// pid still names its group.
-fn kill_probe(child: &mut std::process::Child) {
+/// Off Windows the probe's tree is its process group, named by the child's pid,
+/// so there is nothing to hold.
+#[cfg(not(windows))]
+struct ProbeTree;
+
+/// Kill a version probe that outlived its deadline — its whole tree first (the
+/// process group on Unix, the Job Object on Windows) — and reap it. Must run
+/// before the child is reaped, while its pid still names its group.
+#[cfg(not(windows))]
+fn kill_probe(child: &mut std::process::Child, _tree: &ProbeTree) {
     #[cfg(unix)]
     // SAFETY: `kill(2)` with a negative pid signals the process group that
     // `process_group(0)` gave the child, whose id is the child's pid. The
@@ -179,6 +196,16 @@ fn kill_probe(child: &mut std::process::Child) {
     unsafe {
         libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
     }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// [`kill_probe`] on Windows: terminate the Job Object the probe was adopted
+/// into, which reaps every process that joined it, then the direct child in
+/// case adoption failed.
+#[cfg(windows)]
+fn kill_probe(child: &mut std::process::Child, tree: &crate::platform::proc::AgentProcessGroup) {
+    tree.terminate_tree("claude version probe");
     let _ = child.kill();
     let _ = child.wait();
 }
