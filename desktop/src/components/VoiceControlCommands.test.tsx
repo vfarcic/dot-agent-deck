@@ -5,6 +5,7 @@ import {
   DEFAULT_DESKTOP_SETTINGS,
   fixtureDesktopFeatures,
   type DesktopSettingsDto,
+  type EndpointSettingsDto,
   type VoiceCommandDto,
   type VoiceDirectoriesDto,
   type VoiceNewAgentDto,
@@ -2708,5 +2709,211 @@ describe("the New agent deck field and Discard, by voice (issues 1263 and 1247)"
     expect(chosenDeck()).toBeUndefined();
     expect(screen.getByTestId("new-agent-name")).toHaveValue("");
     expect(screen.queryByTestId("new-agent-restored")).toBeNull();
+  });
+});
+
+/**
+ * PRD #1195 — a `switch_deck` answer lands AFTER the user changed Settings
+ * during its round trip (audit of `d57cf7d`). The switch has to be judged
+ * against, and written over, the settings as they are when it lands: the
+ * callback captured when the utterance began closes over the document of that
+ * render, and writing from it would silently undo whatever was edited since.
+ */
+describe("switch deck by voice, against settings edited mid-flight", () => {
+  const ROW_ID = "deck0000000000aa";
+  const buildBox = { id: ROW_ID, host: "build-box", user: "deploy", port: 22, socket: "/run/deck.sock" };
+  const SAID = "switch deck to the build box";
+
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A settings document with the build box configured and the local deck shown. */
+  function storeWithBuildBox() {
+    let document: DesktopSettingsDto = {
+      ...DEFAULT_DESKTOP_SETTINGS,
+      endpoints: { remote: [structuredClone(buildBox)], selection: "local" },
+    };
+    return {
+      get current() { return document; },
+      getSettings: vi.fn(async () => ({ settings: structuredClone(document), path: undefined })),
+      saveSettings: vi.fn(async (next: DesktopSettingsDto) => {
+        document = structuredClone(next);
+        return structuredClone(document);
+      }),
+    };
+  }
+
+  /** What Rust answers for SAID, with the row's address as it was when resolved. */
+  function switched(): VoiceResultDto {
+    return dispatch("switch_deck", "switchDeck", "Showing deploy@build-box.", SAID, [{
+      name: "deck",
+      kind: "deck_ref",
+      spoken: "build box",
+      value: ROW_ID,
+      label: "deploy@build-box",
+      deckIdentity: { host: "build-box", user: "deploy", port: 22, socket: "/run/deck.sock" },
+    }]);
+  }
+
+  /** Voice on, the utterance taken, and its resolve left pending. */
+  async function pendingSwitch() {
+    let answer!: (result: VoiceResultDto) => void;
+    const resolveVoice: ResolveVoice = vi.fn(() => new Promise<VoiceResultDto>((resolve) => { answer = resolve; }));
+    const store = storeWithBuildBox();
+    render(<DeckShell runtime={runtime(resolveVoice, microphone([SAID]), { getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(resolveVoice).toHaveBeenCalledWith(SAID);
+    return { store, answer: async () => { await act(async () => { answer(switched()); }); await flush(); } };
+  }
+
+  /**
+   * Scenario: say "switch deck to the build box"; while it resolves, open
+   * Settings → Decks, choose the build box, change its host to `other-box`,
+   * and choose the local deck again. The answer then lands: it is refused as a
+   * deck that changed in Settings, and the edited host and the local selection
+   * are what the settings still hold — not the document from before the edit.
+   */
+  it("refuses a switch whose row changed address while it resolved, and keeps the edit", async () => {
+    const { store, answer } = await pendingSwitch();
+
+    fireEvent.click(screen.getByTestId("open-settings"));
+    fireEvent.click(screen.getByTestId("settings-section-decks"));
+    fireEvent.click(screen.getByTestId(`deck-choice-${ROW_ID}`).querySelector("input")!);
+    await flush();
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "other-box" } });
+    await flush();
+    fireEvent.click(screen.getByTestId("deck-choice-local").querySelector("input")!);
+    await flush();
+    expect(store.current.endpoints?.remote[0].host).toBe("other-box");
+    expect(store.current.endpoints?.selection).toBe("local");
+
+    await answer();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("That deck changed in Settings since you asked for it — try again.");
+    expect(store.current.endpoints?.remote[0].host).toBe("other-box");
+    expect(store.current.endpoints?.selection).toBe("local");
+  });
+
+  /**
+   * Scenario: say "switch deck to the build box"; while it resolves, choose
+   * the Dark appearance in Settings. The answer lands and switches — the build
+   * box's address did not change — and the Dark choice made meanwhile is still
+   * in the settings beside the new selection.
+   */
+  it("switches over an unrelated edit made while it resolved, and keeps that edit", async () => {
+    const { store, answer } = await pendingSwitch();
+
+    fireEvent.click(screen.getByTestId("open-settings"));
+    fireEvent.click(screen.getByTestId("settings-section-appearance"));
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    await flush();
+    expect(store.current.appearance.mode).toBe("dark");
+
+    await answer();
+
+    expect(store.current.endpoints?.selection).toBe(ROW_ID);
+    expect(store.current.endpoints?.remote[0].host).toBe("build-box");
+    expect(store.current.appearance.mode).toBe("dark");
+  });
+
+  /**
+   * Scenario: say "switch deck to the build box"; while it resolves, change
+   * the build box's host in Settings. The answer lands and is refused — and the
+   * voice report shows only that refusal, never "Showing deploy@build-box."
+   * beside it, and offers no Undo, since nothing ran to undo (Greptile on
+   * PR #1340).
+   */
+  it("shows only the refusal when a switch is refused mid-flight, not the success sentence", async () => {
+    const { answer } = await pendingSwitch();
+
+    fireEvent.click(screen.getByTestId("open-settings"));
+    fireEvent.click(screen.getByTestId("settings-section-decks"));
+    fireEvent.click(screen.getByTestId(`deck-choice-${ROW_ID}`).querySelector("input")!);
+    await flush();
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "other-box" } });
+    await flush();
+
+    await answer();
+
+    const report = screen.getByTestId("voice-report");
+    expect(report).toHaveTextContent("That deck changed in Settings since you asked for it — try again.");
+    expect(report).not.toHaveTextContent("Showing deploy@build-box.");
+    expect(within(report).queryByRole("button", { name: /Undo/ })).toBeNull();
+  });
+
+  /**
+   * Scenario: say "switch deck to the build box" with nothing edited while it
+   * resolves. The answer lands, the switch runs, and the report says
+   * "Showing deploy@build-box." with no refusal beside it.
+   */
+  /**
+   * Scenario: add a deck `new-box` in Settings → Decks while the settings
+   * write never reaches disk, then say "switch deck to the new box". The
+   * utterance is declared with the Deck selector's section as it is on screen —
+   * `new-box` in it — so the switch resolves and runs, and the report says
+   * "Showing new-box." rather than refusing a deck the selector shows (Qodo on
+   * PR #1340).
+   */
+  it("resolves a switch to a deck added in Settings whose save has not reached disk", async () => {
+    const said = "switch deck to the new box";
+    let declared: EndpointSettingsDto | undefined;
+    const declareVoiceScreen = vi.fn((_screen: string, _directories?: VoiceDirectoriesDto, _newAgent?: VoiceNewAgentDto, endpoints?: EndpointSettingsDto) => {
+      declared = endpoints;
+    });
+    /* Rust's half, reduced to the one fact under test: it can only name a deck
+       the declaration listed. */
+    const resolveVoice: ResolveVoice = vi.fn(async (utterance: string) => {
+      const row = declared?.remote.find((candidate) => candidate.host === "new-box");
+      if (!row) return { resolveMs: 21, backend: "stub", outcome: { kind: "no_match", transcript: utterance, sentence: "No deck matches “new box”." } } as VoiceResultDto;
+      return dispatch("switch_deck", "switchDeck", "Showing new-box.", utterance, [{
+        name: "deck",
+        kind: "deck_ref",
+        spoken: "new box",
+        value: row.id,
+        label: "new-box",
+        deckIdentity: { host: "new-box", port: row.port, user: undefined, socket: undefined },
+      }]);
+    });
+    // The pending-save seam: every write is queued and none ever settles.
+    const saveSettings = vi.fn(() => new Promise<DesktopSettingsDto>(() => undefined));
+    const getSettings = vi.fn(async () => ({ settings: structuredClone(DEFAULT_DESKTOP_SETTINGS), path: undefined }));
+    render(<DeckShell runtime={runtime(resolveVoice, microphone([said]), { getSettings, saveSettings, declareVoiceScreen })} />);
+    await flush();
+
+    fireEvent.click(screen.getByTestId("open-settings"));
+    fireEvent.click(screen.getByTestId("settings-section-decks"));
+    fireEvent.click(screen.getByTestId("add-deck"));
+    await flush();
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "new-box" } });
+    await flush();
+    expect(saveSettings).toHaveBeenCalled();
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(declared?.remote.map((row) => row.host)).toContain("new-box");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Showing new-box.");
+    const added = declared!.remote.find((row) => row.host === "new-box")!;
+    expect(saveSettings).toHaveBeenLastCalledWith(expect.objectContaining({
+      endpoints: expect.objectContaining({ selection: added.id }),
+    }));
+  });
+
+  it("still shows the success sentence when a switch runs", async () => {
+    const { store, answer } = await pendingSwitch();
+
+    await answer();
+
+    expect(store.current.endpoints?.selection).toBe(ROW_ID);
+    const report = screen.getByTestId("voice-report");
+    expect(report).toHaveTextContent("Showing deploy@build-box.");
+    expect(report).not.toHaveTextContent("try again");
   });
 });

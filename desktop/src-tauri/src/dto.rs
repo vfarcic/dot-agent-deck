@@ -2067,7 +2067,8 @@ pub(crate) fn observed_fleet_decks() -> Vec<ObservedDeckDto> {
 /// [`crate::settings::SelectionFallback::NoRemoteSocket`] states in the
 /// selector's — deliberately the settings panel's own vocabulary rather than a
 /// third one, because a user who sees this is being sent to that panel.
-const UNCONFIGURED_DECK_REASON: &str = "Not configured yet — press Test connection in Settings.";
+pub(crate) const UNCONFIGURED_DECK_REASON: &str =
+    "Not configured yet — press Test connection in Settings.";
 
 /// The observed fleet as [`DesktopSnapshot::fleet`] carries it — every observed
 /// deck's [`deck_wire_id`], selected deck first, never empty (PRD #742 M5).

@@ -1,4 +1,5 @@
 import type { DeckView } from "../types";
+import type { VoiceDeckIdentityDto } from "./bridge";
 
 /**
  * PRD #802 M2 — the frontend action registry, and the app's one dispatch seam
@@ -32,35 +33,37 @@ import type { DeckView } from "../types";
  * this PR added more. The heading no longer counts them for the reason the
  * paragraph above gives about numbers in comments.)
  *
- * **Not "one capability, one dispatch path", which is what M2's commit body and
- * an earlier draft of this comment said and is not true.** Five `no_voice`
- * capabilities also have a second, in-panel `setState` path in `App.tsx`, and
- * naming them here is the point — a rediscovered list is a finding, a written
- * one is a known residual:
+ * **It used to say "one capability, one dispatch path" while that was false**,
+ * and then carried a list of the `no_voice` capabilities with a second,
+ * in-panel `setState` path in `App.tsx` (PRD #802's deferred D10): the agent
+ * tile's own selection (`focusAgent`), the workspace header's Evidence button
+ * and an evidence row's select-and-open (`toggleEvidenceDrawer`), the run
+ * graph's Edit loop controls and Projects' Configure workflow
+ * (`openWorkflowOrder`), the workflow editor's Choose one (`openProjects`), and
+ * the empty deck's Configure agents (`openAgentProfiles`).
  *
- * - `focusAgent` — the agent tile's own `onSelect` calls `setSelectedAgentId`;
- * - `toggleEvidenceDrawer` — the workspace header's Evidence button, and the
- *   evidence row's select-and-open;
- * - `openWorkflowOrder` — the run-graph "Edit loop" button (twice) and
- *   `ProjectsPanel`'s `onConfigureWorkflow`;
- * - `openProjects` — `WorkflowPanel`'s `onChooseProject`;
- * - `openAgentProfiles` — `EmptyDeck`'s `onProfiles`.
+ * **PRD #1195 M1 closed that residual**: every one of those controls now
+ * dispatches through `VOICE_ACTIONS[id].run(...)`, and `voiceActions.test.ts`
+ * proves each one crosses the registry and still has its visible effect. It
+ * was done not to make any of them voice-reachable — each keeps its `no_voice`
+ * reason — but because "a user-facing control dispatches through the registry"
+ * is only a rule a build can check once it has no sanctioned exceptions.
  *
- * (`grep -n 'setSelectedAgentId\|setEvidenceOpen\|setWorkflowOpen\|setProjectsOpen\|setProfilesOpen' desktop/src/App.tsx`
- * finds them; line numbers are deliberately not quoted, since they rot.)
+ * Where a call site needed more than an entry offered, the entry was widened
+ * rather than the control narrowed: an evidence row SHOWS the drawer on the
+ * item it selects and never hides it, so `toggleEvidenceDrawer` takes an
+ * optional direction instead of the row becoming a flip.
  *
- * **The load-bearing property survives the narrowing, which is why the code was
- * not re-routed to make the wider claim true.** None of those five is
- * voice-reachable — each carries a `no_voice` reason — so voice has exactly one
- * execution path, {@link dispatchVoiceAction}, and acquires no second one. What
- * is false is only the stronger claim that every capability in this file has a
- * single dispatch site. Re-routing eight call sites to recover it would be
- * regression risk for no functional gain.
- *
- * **If a later PRD gives any of those five a table row, closing its second path
- * is that PRD's work** — and it has to be, because the moment a capability is
- * voice-reachable, a second path is a behaviour voice cannot see. That is the
- * cost of leaving them, stated rather than discovered.
+ * **What still writes that state directly is a dismissal or an invariant, not
+ * a control opening a capability**: a panel's own close, the launch flow
+ * closing the editor it launched from, the deck keeping its selection on a
+ * live agent. That line is drawn by `xtask/linkage-check` rule 18
+ * (`voice_capability_state.rs`, PRD #1195 M2): a setter named in an action
+ * context may be written elsewhere in the app shell only as a dismissal or
+ * under a written `voice-registry-exempt:` reason, and every `useState` there
+ * is registry-owned or carries one. Its own doc comment says what it cannot
+ * see — state outside the files it scans, and a capability reached through
+ * anything other than a `set*` identifier.
  *
  * # What the guard needs from this file, and what it will refuse
  *
@@ -135,8 +138,12 @@ export type VoiceActionContext = {
   openOverlay: (overlay: DeckOverlay) => void;
   /** Close every overlay, leaving the deck itself. */
   closeOverlays: () => void;
-  /** Flip the evidence drawer. */
-  toggleEvidence: () => void;
+  /**
+   * Flip the evidence drawer — or, given `open`, put it that way round. The
+   * direction is what an evidence row's select-and-open needs: it shows the
+   * drawer whichever way it was pointing, which a bare flip cannot promise.
+   */
+  toggleEvidence: (open?: boolean) => void;
   /** Make one agent the deck's selected tile. */
   selectAgent: (agentId: string) => void;
   /** Select an agent, show its terminal, and ask that terminal for the caret. */
@@ -213,6 +220,24 @@ export type VoiceActionContext = {
    * dialog — that is `openNewAgent`, the `open_new_agent` row.
    */
   closeNewAgent: () => string | undefined;
+  /**
+   * Store `selection` — the Deck selector's token: `local`, or a configured
+   * deck's row id — as the deck the app shows (PRD #1195 M3), through the
+   * selector's own write. Answers `undefined` when it did, or when that deck
+   * was already the one shown, which writes nothing; otherwise the sentence
+   * saying why not (a token the selector no longer lists).
+   *
+   * **Served by the SHELL**, like {@link closeSettings}: the selector sits on
+   * the deck and on the overview, and the settings document it writes is the
+   * shell's. The menu itself builds the same member over the same function
+   * (`chooseDeckSelection` in `DeckSelector.tsx`).
+   *
+   * `identity` is the row's address as voice resolved it
+   * ({@link VoiceDispatchTarget.deckIdentity}); a row whose address no longer
+   * matches is refused rather than switched to. The menu passes none: it reads
+   * the row it writes in the same render.
+   */
+  switchDeck: (selection: string, identity?: VoiceDeckIdentityDto) => string | undefined;
   /**
    * Close the Settings sheet (issue #1197).
    *
@@ -520,32 +545,53 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "showVoiceCommands">) => context.showVoiceCommands(),
   },
 
+  /**
+   * PRD #1195 M3 — the Deck selector at the top of the deck and the overview.
+   * The menu dispatches here, and so does the `switch_deck` row, whose
+   * `deck_ref` the app turns into the selector's token before it arrives
+   * (`voice::address_deck_switch`). Choosing the deck already shown is a no-op
+   * and not an error.
+   *
+   * `reportRefused` is read through `?.` rather than declared, for
+   * `openAgent`'s reason about `selectAgent`: the menu serves no voice surface
+   * and never produces a refusal, since it offers only listed decks.
+   */
+  switchDeck: {
+    label: "Switch which deck the app is showing",
+    voice: true,
+    needs: ["switchDeck"],
+    run: (context: Pick<VoiceActionContext, "switchDeck"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: Pick<VoiceDispatchTarget, "deckSelection" | "deckIdentity">) => {
+      const refused = context.switchDeck(target.deckSelection ?? "", target.deckIdentity);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
   // -- the rest of the rail and the palette -------------------------------
 
   openProjects: {
     label: "Manage projects",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it opens a picker over daemon-supplied project paths, and the table has no resolver kind that can turn a spoken phrase into one — a row could open the panel and then leave the user inside a list voice cannot choose from, which is a worse dead end than having no command",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it opens a picker over project paths the daemon supplies, and no resolver kind in the table can name one of them — a row could open the panel and then leave the user inside a list voice cannot choose from, which is a worse dead end than having no command. It becomes a candidate once a `project_ref` kind exists (PRD #1195 M4)",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("projects"),
   },
 
   openPromptLibrary: {
     label: "Open the prompt library",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it is a browse-and-edit surface: choosing, adding, editing and removing a stored prompt are all beyond this PRD's navigation-only slice, so the command would open a panel and stop",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it is a browse-and-edit surface whose operations — choosing, adding, editing and removing a stored prompt — have no rows in the table, so the command would open a panel and stop (PRD #1195 M4)",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("prompts"),
   },
 
   openAgentProfiles: {
     label: "Open agent profiles",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it opens the form that sets each role's model and permissions — the configuration surface PRD #802 D5 puts behind confirmation, so exposing the door before the confirmation flow exists would invite the misfire D5 is about",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), and voice has no per-panel flag gate — `schema::hidden_by_flag` and `DeckShell`'s dispatch gate know only `open_deck`'s — so a row today would be a spoken door to a panel the flag is meant to hide. That gate is the whole reason: opening the form changes nothing until the user edits and saves a profile, so this gets a row when the panel graduates from the flag or the gate is generalised to a per-row feature (PRD #1195 M4, deferred D3)",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("profiles"),
   },
 
   openWorkflowOrder: {
     label: "Edit workflow order",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, the editor it opens enables, skips, reorders and LAUNCHES roles; launching an orchestration starts agents, and nothing in this slice starts anything",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), and voice has no per-panel flag gate — `schema::hidden_by_flag` and `DeckShell`'s dispatch gate know only `open_deck`'s — so a row today would be a spoken door to a panel the flag is meant to hide. That gate is the whole reason: opening the editor launches nothing, since only its own Launch starts an orchestration, so this gets a row on the same terms as `openAgentProfiles`; launching by voice would be a separate row, weighed against PRD #802 D5 (PRD #1195 M4, deferred D3)",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("workflow"),
   },
@@ -568,7 +614,10 @@ export const VOICE_ACTIONS = {
     label: "Show or hide the evidence drawer",
     no_voice: "a toggle, and the table cannot see which way it is pointing — the drawer is a `ControlDeck` boolean rather than a screen — so \"show the evidence\" and \"hide the evidence\" would both flip it and one of the two would be wrong every time",
     needs: ["toggleEvidence"],
-    run: (context: Pick<VoiceActionContext, "toggleEvidence">) => context.toggleEvidence(),
+    /** No target flips it: the header's Evidence button and the palette entry.
+        `{ open: true }` is an evidence row, which shows the drawer on the item
+        it has just selected and never hides it. */
+    run: (context: Pick<VoiceActionContext, "toggleEvidence">, target?: { open?: boolean }) => context.toggleEvidence(target?.open),
   },
 
   focusAgent: {
@@ -815,6 +864,23 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    */
   preselectDeckId?: string;
   /**
+   * The Deck selector token a `switch_deck` row's `deck_ref` resolved to (PRD
+   * #1195 M3) — `local` or a configured deck's row id, which the app
+   * substitutes for the fleet key Rust-side (`voice::address_deck_switch`),
+   * and empty when the deck had none. Its own member rather than
+   * {@link preselectDeckId}, which is a fleet key.
+   */
+  deckSelection?: string;
+  /**
+   * The address of the remote row {@link deckSelection} named when Rust
+   * resolved the switch (PRD #1195) — absent for the local deck, which has
+   * none. A row id survives Settings editing any of the row's address fields
+   * (`REMOTE_ADDRESS_FIELDS`), so the switch compares this with the row before
+   * writing and refuses one that now reaches a different machine or deck, or
+   * the same deck by a different route.
+   */
+  deckIdentity?: VoiceDeckIdentityDto;
+  /**
    * The child directory to open — the deck's own path a row's `dir_ref` param
    * resolved to, against the browser's children on screen (PRD #1223).
    */
@@ -955,10 +1021,11 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
 /**
  * The members only the SHELL serves (issue #1197): closing Settings, which is
  * the shell's overlay rather than a screen's, since it opens over the overview
- * as well as the deck. Published only while the sheet is open — see
- * {@link VoiceActionContext.closeSettings}.
+ * as well as the deck — published only while the sheet is open, see
+ * {@link VoiceActionContext.closeSettings} — and switching deck (PRD #1195),
+ * whose selector sits on both screens and writes the shell's settings.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings">;
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "switchDeck">;
 
 /**
  * The members only the OVERVIEW serves (PRD #1223): opening the New agent

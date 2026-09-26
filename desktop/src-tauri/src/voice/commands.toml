@@ -349,6 +349,71 @@ asks_to     = "open settings"
 try_saying  = "open settings"
 heard_as    = ["settings", "preferences", "options", "configuration", "api key"]
 
+# PRD #1195 M3 — the Deck selector at the top of the deck and the overview, by
+# voice. The drop-down dispatches through the same registry entry
+# (`switchDeck`), so this row exposes the click rather than a second route to
+# the settings write behind it.
+#
+# **`screens = ["deck", "overview"]`** because those are the two screens that
+# carry the selector; it is inert on the agent pane (the pane is modal over its
+# screen — `desktop/e2e/agent-pane-modal.spec.ts` asserts it), so voice there
+# would reach a control no click can. **`requires = ["new_agent_dialog_closed"]`
+# for the same rule**: the New agent dialog is modal over the overview's top
+# bar, and while it is open a request that names a deck means the dialog's own
+# Deck field, which is `choose_deck`. Both descriptions say so, but the
+# precondition is what makes it hold rather than a tie the model breaks — the
+# fixture `choose-new-agent-deck-not-switch` is the guard on it.
+#
+# **`deck_ref`, the kind PRD #1223 added for the New agent flow — not a new
+# one.** What differs is the SET it resolves against and what a disabled deck
+# means. The Deck selector lists every configured deck, including ones the app
+# is not connected to (under a single-deck selection the app observes exactly
+# one), so the app builds voice's decks from the selector's list
+# (`selector_voice_decks` in `lib.rs`). A deck the New agent dialog disables is
+# still one the selector switches to — switching is how it becomes one a new
+# agent can start on — so this row alone ignores `VoiceDeck::unavailable`
+# (`outcome::SWITCH_DECK_ROW`). The model is shown only the decks a new agent
+# can start on (a disabled deck is withheld from every row, which this row
+# cannot change without a second list in the prompt), so the description tells
+# it that the deck may be one `decks` does not list; the app resolves the
+# user's words against the full list either way. **All Decks is not
+# voice-reachable**: it is a selection rather than a deck, and "show every
+# agent" is `open_overview`'s.
+#
+# **Switching to the deck already shown is a no-op with the same report**,
+# which is still true — it IS showing that deck — and no settings write
+# (`chooseDeckSelection` in `DeckSelector.tsx`, shared with the click).
+#
+# `heard_as` carries `deck` because the selector's own visible label is
+# "Deck" (the label rule, `docs/develop/voice-first-design.md`). Switching is
+# undone by one more switch and stops nothing, so the residual every
+# `heard_as` row carries — "deck" said for another reason while a steered
+# pick is in flight — reaches a visible, reversible change.
+[[commands]]
+id          = "switch_deck"
+description = """Switch which deck the app is showing — the Deck selector at the top of the deck
+and of the agent overview. Use for switch deck to the build box, switch to the build box deck,
+change the deck to local, change deck to ci, select the build box deck, or choose deck build box.
+Set `deck` to the words the user used for the deck. It may name a configured deck that `decks`
+does not list, because `decks` lists only the decks a new agent can start on; answer with the
+user's words all the same. This is not `open_deck`, which only moves from the overview to the deck
+screen without changing which deck is shown, and it is not `open_overview`. While the New agent
+dialog is open this cannot run: a request that names a deck then means the dialog's Deck field,
+which is `choose_deck`. It changes which deck is shown and nothing else — it starts, stops and
+closes nothing."""
+invoke      = "switchDeck"
+screens     = ["deck", "overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "switching deck works from the deck or the agent overview, once the agent's pane and the New agent dialog are closed"
+report      = "Showing {deck}."
+asks_to     = "switch deck"
+try_saying  = "switch deck to {deck}"
+heard_as    = ["switch", "deck", "change", "select", "choose"]
+
+  [[commands.params]]
+  name = "deck"
+  kind = "deck_ref"
+
 # PRD #802 — the first row with NO `screens` key, which means callable
 # everywhere, and that is the requirement rather than an oversight: stopping
 # must never be unavailable. Every other row narrows because the behaviour it

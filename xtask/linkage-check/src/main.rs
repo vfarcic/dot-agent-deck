@@ -215,6 +215,12 @@ mod unit_test_endpoint_pin;
 /// only — there is no runtime rule here, the scripts enforce themselves.
 #[cfg(test)]
 mod verify_pr_stream;
+/// PRD #1195 M2: the React state behind a voice registry capability is written
+/// only where the registry's action context is built, and every `useState` in
+/// the app shell is registry-owned or classified. Rule 14's sibling — it proves
+/// the capability side rule 14 cannot see — and like it a live rule, rule 18
+/// in [`RULES`], with its own planted-bad-input tests.
+mod voice_capability_state;
 /// PRD #802 M3: the voice command table (`commands.toml`) against the frontend
 /// action registry (`desktop/src/lib/voiceActions.ts`), plus the two closed sets
 /// the table's columns draw from. Like `desktop_project_boundary` this one
@@ -977,6 +983,19 @@ const RULES: &[Rule] = &[
                   proof; see `unit_test_endpoint_pin`.",
         check: rule_unit_test_emitter_pins_endpoints,
     },
+    Rule {
+        number: 18,
+        name: "voice-capability-state",
+        summary: "The state behind a voice registry capability is reached through `VOICE_ACTIONS` \
+                  — PRD #1195 M2. A `set*` setter named in an action context construction site \
+                  (an object literal typed by a type built from `VoiceActionContext`) is written \
+                  nowhere else in `desktop/src/App.tsx` or `desktop/src/hooks/useShellOverlays.ts` \
+                  unless the write is a dismissal (last argument `false`) or carries a \
+                  `voice-registry-exempt: <reason>` comment, and every `useState` there is \
+                  registry-owned or carries that comment. It sees only those two files and only \
+                  `set*` identifiers; see `voice_capability_state`.",
+        check: rule_voice_capability_state,
+    },
 ];
 
 /// Everything the rules read, resolved once before any of them runs.
@@ -1165,6 +1184,16 @@ fn rule_desktop_project_boundary(inputs: &Inputs) -> Vec<String> {
 /// the rule.
 fn rule_git_program_literal(inputs: &Inputs) -> Vec<String> {
     git_program_literal::run(&inputs.root)
+}
+
+/// Rule 18 (PRD #1195 M2). Its own walk of `desktop/src/` — the context types
+/// and construction sites are derived from the whole production tree, the
+/// owned setters are then checked in the app shell's files — with a TSX lexer
+/// of its own, for rule 12's reason as well: a different tree, and an input
+/// going missing (the shell files, `VoiceActionContext`, a construction site)
+/// must be reported rather than quietly emptying the rule.
+fn rule_voice_capability_state(inputs: &Inputs) -> Vec<String> {
+    voice_capability_state::run(&inputs.root)
 }
 
 /// Rule 14 (PRD #802 M3). Read straight off its own four files for rule 12's

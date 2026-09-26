@@ -2978,14 +2978,32 @@ mod tests {
     /// point: this constant is a *program*, its whole job is to answer with a
     /// path, and a string assertion would pass over a syntax error or an
     /// inverted `-S` test alike.
+    ///
+    /// `env_clear` rather than removing only the three fallback variables,
+    /// for `tunnel_tests::run_probe_under`'s reason. Issue #1174 put a resolver
+    /// rung in front of the fallbacks that runs whatever deck `HOME` and
+    /// `PATH` lead to, so an inherited pair let a developer machine's own
+    /// installed `dot-agent-deck` answer first: measured on 2026-09-26, four
+    /// of the tests below failed on a host with `~/.local/bin/dot-agent-deck`,
+    /// the probe printing that binary's answer (an empty one) instead of the
+    /// path under test. CI has no deck installed, which is why it stayed green.
+    ///
+    /// **`PATH` is private, not `/usr/bin:/bin`**, and `HOME` points into the
+    /// same empty directory: a deck installed system-wide (`/usr/bin/dot-agent-deck`,
+    /// a distro package) is found by the rung's `command -v` exactly as a
+    /// per-user one is by `HOME`, and would pre-empt the rungs under test the
+    /// same way. The fallback rungs need `id` and nothing else external, so the
+    /// child's `PATH` is a directory holding a link to `id` alone
+    /// ([`probe_tools`]).
     #[cfg(unix)]
     fn run_socket_probe(snippet: &str, env: &[(&str, &str)]) -> String {
+        let tools = probe_tools();
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(snippet)
-            .env_remove("DOT_AGENT_DECK_ATTACH_SOCKET")
-            .env_remove("XDG_RUNTIME_DIR")
-            .env_remove("TMPDIR")
+            .env_clear()
+            .env("PATH", tools.path())
+            .env("HOME", tools.path())
             .envs(env.iter().copied())
             .output()
             .expect("run the discovery probe under /bin/sh");
@@ -2995,6 +3013,23 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A fresh directory holding one entry, a link to the system's `id` —
+    /// the only external command [`REMOTE_SOCKET_PROBE`]'s fallback rungs run
+    /// — to serve as a probe's whole `PATH`, so no `dot-agent-deck` installed
+    /// anywhere on this machine can answer in the snippet's place.
+    #[cfg(unix)]
+    pub(super) fn probe_tools() -> tempfile::TempDir {
+        let tools = tempfile::tempdir().expect("a directory for the probe's PATH");
+        let id = ["/usr/bin/id", "/bin/id"]
+            .into_iter()
+            .map(std::path::Path::new)
+            .find(|candidate| candidate.exists())
+            .expect("an `id` in /usr/bin or /bin for the probe's fallback rungs");
+        std::os::unix::fs::symlink(id, tools.path().join("id"))
+            .expect("link `id` into the probe's PATH");
+        tools
     }
 
     #[cfg(unix)]
@@ -5693,16 +5728,21 @@ mod tunnel_tests {
     /// `env_clear` rather than `env_remove` of the three variables the snippet
     /// reads: `HOME` and `PATH` are what select the resolver, so a leaked
     /// ambient one would let this machine's own installed deck answer and the
-    /// test would pass while proving nothing about the snippet.
+    /// test would pass while proving nothing about the snippet. The default
+    /// `PATH` is private for `tests::run_socket_probe`'s reason — a
+    /// system-wide deck in `/usr/bin` is ambient too — and a test that needs a
+    /// deck on `PATH` passes its own.
     #[cfg(unix)]
     fn run_probe_under(shell: &[String], snippet: &str, env: &[(&str, &str)]) -> String {
+        let tools = super::tests::probe_tools();
         let mut command = std::process::Command::new(&shell[0]);
         command.args(&shell[1..]);
         command.arg("-c").arg(snippet);
         command.env_clear();
-        // The fallback rungs call `id -u`, so the child needs a PATH even
-        // when the test is about there being no deck on it.
-        command.env("PATH", "/usr/bin:/bin");
+        // The fallback rungs call `id -u`, so the child needs a PATH that
+        // reaches it — and nothing else, when the test is about there being no
+        // deck on it.
+        command.env("PATH", tools.path());
         command.envs(env.iter().copied());
         let output = command.output().expect("run the discovery probe");
         assert!(

@@ -330,11 +330,55 @@ describe("TauriDeckBridge", () => {
     const deckStep = [{ deckId: "deck-local" }, { deckId: "deck-build", reason: "No deck is listening on the configured socket." }];
     bridge.declareVoiceScreen("overview", undefined, undefined, deckStep);
     await bridge.resolveVoice("new agent on the build box");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent on the build box", screen: "overview", directories: null, newAgent: null, deckStep });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent on the build box", screen: "overview", directories: null, newAgent: null, deckStep, endpoints: null });
 
     bridge.declareVoiceScreen("overview");
     await bridge.resolveVoice("new agent");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent", screen: "overview", directories: null, newAgent: null, deckStep: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent", screen: "overview", directories: null, newAgent: null, deckStep: null, endpoints: null });
+  });
+
+  /**
+   * Scenario (PRD #1195): the Deck selector's section declared with an
+   * utterance travels to `desktop_voice_resolve` as `endpoints`, which is what
+   * Rust resolves "switch deck to …" against instead of reading `desktop.toml`,
+   * so a deck added and not yet written is still one voice can name.
+   */
+  it("sends the declared Deck selector section with the utterance it was declared for", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    invoke.mockResolvedValue({ outcome: { kind: "no_match", sentence: "", transcript: "" } });
+
+    const endpoints = { remote: [{ id: "newbox01", host: "new-box", port: 22 }], selection: "local" };
+    bridge.declareVoiceScreen("deck", undefined, undefined, undefined, endpoints);
+    await bridge.resolveVoice("switch deck to the new box");
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "switch deck to the new box", screen: "deck", directories: null, newAgent: null, deckStep: null, endpoints });
+  });
+
+  /**
+   * Scenario (PRD #1195): Rust resolves "switch deck to the build box", whose
+   * row reaches it through a jump host, and omits the row's absent SSH user,
+   * socket and key from the deck identity. The bridge hands the webview every
+   * address key, the absent ones as `undefined` and the jump host as sent, and
+   * leaves a param with no identity as it came.
+   */
+  it("gives a switch's deck identity every address key", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const plain = { name: "agent", kind: "agent_ref", spoken: "coder", value: "a-1", label: "coder" };
+    invoke.mockResolvedValue({
+      outcome: {
+        kind: "dispatch", transcript: "switch deck to the build box", action: "switch_deck", invoke: "switchDeck", sentence: "Showing build-box.",
+        params: [{ name: "deck", kind: "deck_ref", spoken: "build box", value: "buildbox01", label: "build-box", deckIdentity: { host: "build-box", port: 22, jump: "bastion" } }, plain],
+      },
+      resolveMs: 1,
+      backend: "stub",
+    });
+    const result = await bridge.resolveVoice("switch deck to the build box");
+    if (result.outcome.kind !== "dispatch") throw new Error(result.outcome.kind);
+    const identity = result.outcome.params[0].deckIdentity!;
+    expect(identity).toEqual({ host: "build-box", user: undefined, port: 22, socket: undefined, identity: undefined, jump: "bastion" });
+    expect(Object.keys(identity).sort()).toEqual(["host", "identity", "jump", "port", "socket", "user"]);
+    expect(result.outcome.params[1]).toEqual(plain);
   });
 
   /**

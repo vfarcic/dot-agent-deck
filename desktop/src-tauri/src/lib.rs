@@ -2816,6 +2816,34 @@ fn validate_voice_deck_step(deck_step: &[voice::VoiceDeckChoice]) -> Result<(), 
     Ok(())
 }
 
+/// How many `[[endpoints.remote]]` rows of the Deck selector's section voice
+/// adds to the decks a switch resolves against (PRD #1195). Past it
+/// [`selector_voice_decks`] adds none of them, and a switch naming a deck only
+/// the selector lists is refused with a sentence that says so
+/// ([`voice::refuse_switch_beyond_selector`]).
+///
+/// It bounds what one utterance hands the intent backend, not what the
+/// webview may send: every deck voice resolves against is a label in the
+/// backend's state block (`voice::prompt::state`), so an unbounded section is
+/// an unbounded prompt on every command. It does not bound the IPC payload —
+/// Tauri has deserialized the whole section before this is read — and it is
+/// not a boundary check: the section is still the app's own settings, and the
+/// utterance resolves whatever its size (Qodo on PR #1340, where refusing an
+/// oversized section refused every voice command, though neither the schema
+/// nor the selector caps rows). It bounds the selector's contribution only:
+/// the observed fleet ([`voice_decks`]) is taken whole, as it was before.
+const MAX_VOICE_SELECTOR_ROWS: usize = 256;
+
+/// The row count of a Deck selector section voice does not take decks from —
+/// `None` when it is within [`MAX_VOICE_SELECTOR_ROWS`] or absent.
+fn selector_rows_beyond_voice(
+    endpoints: Option<&crate::settings::EndpointSettings>,
+) -> Option<usize> {
+    endpoints
+        .map(|section| section.remote.len())
+        .filter(|rows| *rows > MAX_VOICE_SELECTOR_ROWS)
+}
+
 /// PRD #802 M6: take one utterance to an outcome carrying the sentence to show.
 ///
 /// # What it does NOT do
@@ -2856,6 +2884,24 @@ fn validate_voice_deck_step(deck_step: &[voice::VoiceDeckChoice]) -> Result<(), 
 /// only annotates the decks read here ([`voice_decks`]), bounded by
 /// [`validate_voice_deck_step`], and never reaches the daemon either.
 ///
+/// **`endpoints` is the fifth** (PRD #1195): the `[endpoints]` section the Deck
+/// selector is rendering, which is `useDesktopSettings`' React state. That
+/// state is applied the moment the user edits it and written to disk behind
+/// it, so reading `desktop.toml` here instead would refuse "switch deck to"
+/// a deck the selector already shows (Qodo on PR #1340) — and would keep
+/// refusing it if that write failed, since the edit stays applied on screen.
+/// It crosses as the settings schema's own [`crate::settings::EndpointSettings`],
+/// so every row is held to the same field types a saved document is, and
+/// [`MAX_VOICE_SELECTOR_ROWS`] bounds how many of its rows voice takes decks
+/// from — a larger section still resolves every command, and only a switch to
+/// a deck the selector alone lists is refused. It is trusted no further
+/// than that: it only decides which decks a spoken name can resolve to and
+/// which selector token each maps to, and the webview's
+/// `chooseDeckSelection` re-checks the token and the row's address against
+/// its current settings before writing any switch. Like the other four it is
+/// an IPC argument between this app's own webview and its own Rust half, in
+/// one binary, and never reaches the daemon.
+///
 /// # One `ListAgents` per utterance
 ///
 /// [`get_snapshot`] fetches rather than reading a cache, which is one daemon
@@ -2871,6 +2917,9 @@ fn validate_voice_deck_step(deck_step: &[voice::VoiceDeckChoice]) -> Result<(), 
 /// selected deck's, and a fleet-wide list would let a spoken name resolve to an
 /// agent on a machine the user is not looking at.
 #[tauri::command]
+// Eight, for `desktop_terminal_attach`'s reason: Tauri deserialises each wire
+// field by NAME, so each declaration piece has to be a parameter.
+#[allow(clippy::too_many_arguments)]
 async fn desktop_voice_resolve(
     webview: Webview,
     state: State<'_, DesktopState>,
@@ -2879,6 +2928,7 @@ async fn desktop_voice_resolve(
     directories: Option<voice::VoiceDirectories>,
     new_agent: Option<voice::VoiceNewAgent>,
     deck_step: Option<Vec<voice::VoiceDeckChoice>>,
+    endpoints: Option<crate::settings::EndpointSettings>,
 ) -> Result<voice::VoiceResult, String> {
     ensure_main_webview(&webview)?;
     if utterance.len() > MAX_UTTERANCE_BYTES {
@@ -2904,22 +2954,216 @@ async fn desktop_voice_resolve(
         .unwrap_or_default();
     let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
     let snapshot = get_snapshot(&state.daemon).await;
-    let decks = voice_decks(&snapshot.observed, deck_step.as_deref());
-    Ok(voice::handle_utterance_with(
+    resolve_declared_utterance(
         resolver.as_ref(),
-        voice::table(),
         screen,
         &snapshot.agents,
-        &decks,
-        directories.as_ref(),
-        new_agent.as_ref(),
+        &snapshot.observed,
+        VoiceDeclaration {
+            directories: directories.as_ref(),
+            new_agent: new_agent.as_ref(),
+            deck_step: deck_step.as_deref(),
+            endpoints: endpoints.as_ref(),
+        },
         voice::Transcript::new(utterance),
         settings.labels,
         // Issue #1198: the deck is an experimental surface, so voice neither
         // offers nor dispatches the way there while it is hidden.
         dot_agent_deck::features::show_desktop_deck(),
     )
-    .await)
+    .await
+}
+
+/// The webview-declared pieces [`desktop_voice_resolve`] resolves an utterance
+/// against, each already through its boundary check.
+struct VoiceDeclaration<'a> {
+    directories: Option<&'a voice::VoiceDirectories>,
+    new_agent: Option<&'a voice::VoiceNewAgent>,
+    deck_step: Option<&'a [voice::VoiceDeckChoice]>,
+    endpoints: Option<&'a crate::settings::EndpointSettings>,
+}
+
+/// [`desktop_voice_resolve`] once the live state is read: the decks voice
+/// resolves against, the utterance's outcome, and a switch addressed to the
+/// Deck selector's token. Separate so it runs without a webview or a daemon.
+// Eight: each piece `desktop_voice_resolve` reads or is sent, as `handle_utterance_with` takes them.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_declared_utterance(
+    resolver: &dyn voice::IntentResolver,
+    screen: voice::Screen,
+    agents: &[voice::DesktopAgent],
+    observed: &[crate::dto::ObservedDeckDto],
+    declared: VoiceDeclaration<'_>,
+    transcript: voice::Transcript,
+    labels: crate::settings::LabelSharing,
+    show_deck: bool,
+) -> Result<voice::VoiceResult, String> {
+    let mut decks = voice_decks(observed, declared.deck_step);
+    // PRD #1195 M3: the decks the Deck selector lists, as the webview sent
+    // them — the section the selector is rendering, not `desktop.toml`, which
+    // lags it by a queued write — rather than only the ones the app observes,
+    // which under a single-deck selection is the one deck already shown.
+    let selections = selector_voice_decks(declared.endpoints, &mut decks, declared.deck_step);
+    let mut result = voice::handle_utterance_with(
+        resolver,
+        voice::table(),
+        screen,
+        agents,
+        &decks,
+        declared.directories,
+        declared.new_agent,
+        transcript,
+        labels,
+        show_deck,
+    )
+    .await;
+    voice::address_deck_switch(&mut result.outcome, |deck_id| {
+        selections.get(deck_id).cloned()
+    });
+    if let Some(listed) = selector_rows_beyond_voice(declared.endpoints) {
+        voice::refuse_switch_beyond_selector(
+            &mut result.outcome,
+            &decks,
+            listed,
+            MAX_VOICE_SELECTOR_ROWS,
+        );
+    }
+    Ok(result)
+}
+
+/// PRD #1195 M3 — the Deck selector's decks, for `switch_deck`: every deck it
+/// lists that [`voice_decks`] did not already take from the observed fleet is
+/// appended to `decks`, and the answer maps EVERY deck in `decks` that the
+/// selector lists to the token the selector stores for it — and, for a remote
+/// row, the address it had when read ([`voice::VoiceDeckIdentity`]), which the
+/// webview compares with the row before it writes the switch.
+///
+/// # Why the observed fleet is not enough
+///
+/// [`voice_decks`] reads `snapshot.observed`, which is what the app CONNECTS
+/// to — and under a single-deck selection that is exactly one deck, the one on
+/// screen (`EndpointSettings::connectable_endpoints`). Resolving a switch
+/// against it would leave "switch deck to the build box" one answer, "no deck
+/// matches", for every deck but the current one. The selector lists `local`
+/// and every `[[endpoints.remote]]` row (`deckChoices` in
+/// `desktop/src/lib/endpoints.ts`), so that is the list read here, from the
+/// section the webview's selector is rendering, sent with the utterance (see
+/// [`desktop_voice_resolve`]'s `endpoints`). `None` — a webview that sent none —
+/// lists the local deck alone.
+///
+/// # Keys and labels
+///
+/// Each appended deck is keyed the way the fleet would key it — the endpoint's
+/// wire id, or [`crate::dto::unconfigured_deck_id`] for a row with no socket
+/// path — so a deck that later connects keeps its key, and labelled the way the
+/// overview labels it. It is appended as unable to take a new agent, since the
+/// New agent dialog lists only decks the app is connected to: with the deck
+/// step's own reason when the step names one, otherwise
+/// [`voice::DECK_NOT_CONNECTED`], or the fleet view's "not configured"
+/// sentence for a row with no address. That keeps the New agent flow exactly
+/// as it was — it never offers or preselects such a deck — while
+/// `switch_deck`, which ignores that reason, can switch to it.
+///
+/// # Past [`MAX_VOICE_SELECTOR_ROWS`]
+///
+/// A section with more remote rows than that adds none of them — the local
+/// deck is still added — while every row still maps a deck already in `decks`
+/// to its token, so a switch to an observed deck is addressed as before. A
+/// switch to a deck only the selector lists then matches nothing, and
+/// [`resolve_declared_utterance`] says why.
+///
+/// **All Decks is not in here.** It is a selection rather than a deck, so a
+/// `deck_ref` naming it would also be a deck the New agent dialog is asked
+/// about; see `commands.toml`'s `switch_deck` row.
+fn selector_voice_decks(
+    endpoints: Option<&crate::settings::EndpointSettings>,
+    decks: &mut Vec<voice::VoiceDeck>,
+    deck_step: Option<&[voice::VoiceDeckChoice]>,
+) -> HashMap<String, voice::VoiceDeckSelection> {
+    use dot_agent_deck::daemon_client::Endpoint;
+    let step_reason = |deck_id: &str| {
+        deck_step
+            .and_then(|step| step.iter().find(|choice| choice.deck_id == deck_id))
+            .and_then(|choice| choice.reason.clone())
+    };
+    let local = crate::dto::deck_wire_id(&Endpoint::local());
+    // The local deck carries no identity: it has no remote address that
+    // Settings can change under its token.
+    let mut listed: Vec<(voice::VoiceDeck, voice::VoiceDeckSelection)> = vec![(
+        voice::VoiceDeck {
+            unavailable: Some(
+                step_reason(&local).unwrap_or_else(|| voice::DECK_NOT_CONNECTED.to_string()),
+            ),
+            id: local,
+            label: "Local deck".to_string(),
+            local: true,
+        },
+        voice::VoiceDeckSelection {
+            token: crate::settings::LOCAL_SELECTION_TOKEN.to_string(),
+            identity: None,
+        },
+    )];
+    for row in endpoints
+        .map(|section| section.remote.as_slice())
+        .unwrap_or_default()
+    {
+        let (id, label, fallback) = match row.endpoint() {
+            Some(remote) => {
+                let endpoint = Endpoint::Remote(remote);
+                (
+                    crate::dto::deck_wire_id(&endpoint),
+                    crate::dto::deck_path_text(&endpoint),
+                    voice::DECK_NOT_CONNECTED,
+                )
+            }
+            None => (
+                crate::dto::unconfigured_deck_id(&row.id),
+                crate::dto::safe_display_text(row.describe()),
+                crate::dto::UNCONFIGURED_DECK_REASON,
+            ),
+        };
+        let unavailable = Some(step_reason(&id).unwrap_or_else(|| fallback.to_string()));
+        listed.push((
+            voice::VoiceDeck {
+                label: if label.trim().is_empty() {
+                    "Remote deck".to_string()
+                } else {
+                    label
+                },
+                id,
+                local: false,
+                unavailable,
+            },
+            voice::VoiceDeckSelection {
+                token: row.id.as_str().to_string(),
+                identity: Some(voice::VoiceDeckIdentity {
+                    host: row.host.as_str().to_string(),
+                    user: row.user.as_ref().map(|user| user.as_str().to_string()),
+                    port: row.port.get(),
+                    socket: row
+                        .socket
+                        .as_ref()
+                        .map(|socket| socket.as_str().to_string()),
+                    identity: row
+                        .identity
+                        .as_ref()
+                        .map(|identity| identity.as_str().to_string()),
+                    jump: row.jump.as_ref().map(|jump| jump.as_str().to_string()),
+                }),
+            },
+        ));
+    }
+    // Past the bound the remote rows still MAP the decks already here — an
+    // observed deck the selector lists keeps its token — but none is added.
+    let adds_remote = selector_rows_beyond_voice(endpoints).is_none();
+    let mut selections = HashMap::new();
+    for (deck, selection) in listed {
+        if (deck.local || adds_remote) && !decks.iter().any(|known| known.id == deck.id) {
+            decks.push(deck.clone());
+        }
+        selections.entry(deck.id).or_insert(selection);
+    }
+    selections
 }
 
 /// The decks a spoken `deck_ref` resolves against (PRD #1223): the snapshot's
@@ -4626,6 +4870,396 @@ mod tests {
         long_path.form.as_mut().expect("a form").path =
             "/".repeat(MAX_VOICE_DIRECTORY_PATH_BYTES + 1);
         assert!(validate_voice_new_agent(&long_path).is_err());
+    }
+
+    /// Scenario: the user adds a deck `new-box` in Settings → Decks and says
+    /// "switch deck to the new box" before the write reaches disk. The Deck
+    /// selector's section arrives with the utterance in the webview's own
+    /// shape, and the switch resolves against THAT list — the new row is a
+    /// deck voice can name and maps to its selector token — rather than
+    /// against `desktop.toml`, which does not have it yet (Qodo on PR #1340).
+    /// A row the settings schema refuses is refused at the boundary; a section
+    /// with more rows than voice takes adds none of them.
+    #[test]
+    fn selector_voice_decks_come_from_the_section_the_webview_sends() {
+        use crate::settings::EndpointSettings;
+
+        let sent: EndpointSettings = serde_json::from_value(serde_json::json!({
+            "remote": [{ "id": "newbox01", "host": "new-box", "port": 22, "socket": "/run/deck.sock" }],
+            "selection": "local",
+        }))
+        .expect("the webview's EndpointSettingsDto parses");
+        assert_eq!(selector_rows_beyond_voice(Some(&sent)), None);
+
+        let mut decks = voice_decks(&[], None);
+        let selections = selector_voice_decks(Some(&sent), &mut decks, None);
+        let new_box = decks
+            .iter()
+            .find(|deck| deck.label == "new-box")
+            .expect("the unflushed deck is one voice can name");
+        assert_eq!(
+            selections
+                .get(&new_box.id)
+                .map(|selection| selection.token.as_str()),
+            Some("newbox01")
+        );
+
+        let row = |index: usize| serde_json::json!({ "id": format!("row{index:08}"), "host": "box", "port": 22 });
+        let oversized: EndpointSettings = serde_json::from_value(serde_json::json!({
+            "remote": (0..=MAX_VOICE_SELECTOR_ROWS).map(row).collect::<Vec<_>>(),
+            "selection": "local",
+        }))
+        .expect("parses; the schema caps no row count");
+        let mut decks = voice_decks(&[], None);
+        let selections = selector_voice_decks(Some(&oversized), &mut decks, None);
+        assert_eq!(
+            decks
+                .iter()
+                .map(|deck| deck.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Local deck"],
+            "an oversized section adds no remote deck to what voice resolves against"
+        );
+        assert_eq!(
+            selections
+                .get(&decks[0].id)
+                .map(|selection| selection.token.as_str()),
+            Some("local")
+        );
+
+        assert!(
+            serde_json::from_value::<EndpointSettings>(serde_json::json!({
+                "remote": [{ "id": "evil01", "host": "-oProxyCommand=x", "port": 22 }],
+                "selection": "local",
+            }))
+            .is_err(),
+            "a row the settings schema refuses never reaches the resolver"
+        );
+    }
+
+    /// A Deck selector section with one row more than voice takes: a build box
+    /// first, then plain boxes.
+    fn oversized_selector_section() -> crate::settings::EndpointSettings {
+        let row = |index: usize| {
+            let host = if index == 0 {
+                "build-box".to_string()
+            } else {
+                format!("box{index}")
+            };
+            serde_json::json!({ "id": format!("row{index:08}"), "host": host, "port": 22, "socket": "/run/deck.sock" })
+        };
+        serde_json::from_value(serde_json::json!({
+            "remote": (0..=MAX_VOICE_SELECTOR_ROWS).map(row).collect::<Vec<_>>(),
+            "selection": "local",
+        }))
+        .expect("parses; the schema caps no row count")
+    }
+
+    async fn resolve_with_section(
+        endpoints: &crate::settings::EndpointSettings,
+        said: &str,
+        answer: voice::IntentAnswer,
+    ) -> Result<voice::VoiceResult, String> {
+        let resolver = voice::StubResolver::new().answering(said, answer);
+        resolve_declared_utterance(
+            &resolver,
+            voice::Screen::Deck,
+            &[],
+            &[],
+            VoiceDeclaration {
+                directories: None,
+                new_agent: None,
+                deck_step: None,
+                endpoints: Some(endpoints),
+            },
+            voice::Transcript::new(said),
+            crate::settings::LabelSharing::Shared,
+            true,
+        )
+        .await
+    }
+
+    /// Scenario: the user keeps more remote decks in Settings than voice takes
+    /// as switch targets, and says "show everything". The Deck selector's
+    /// section rides along with the utterance as always, and the overview
+    /// still opens — the section's size is no reason to refuse a command that
+    /// never reads it (Qodo on PR #1340).
+    #[tokio::test]
+    async fn oversized_selector_section_still_dispatches_other_commands() {
+        let section = oversized_selector_section();
+        let result = resolve_with_section(
+            &section,
+            "show everything",
+            voice::IntentAnswer::new("open_overview"),
+        )
+        .await
+        .expect("an oversized section does not fail the utterance");
+        assert!(
+            matches!(&result.outcome, voice::VoiceOutcome::Dispatch { invoke, .. }
+                if invoke == "openOverview"),
+            "{:?}",
+            result.outcome
+        );
+    }
+
+    /// Scenario: with that same oversized Deck selector, the user says "switch
+    /// deck to the build box", a row voice therefore does not reach. The switch
+    /// is refused with a sentence saying why — the selector lists more decks
+    /// than voice resolves a switch against, so choose it there — rather than
+    /// a bare "no deck matches". "Switch deck to local" still switches.
+    #[tokio::test]
+    async fn oversized_selector_section_refuses_a_switch_beyond_it_honestly() {
+        let section = oversized_selector_section();
+        let said = "switch deck to the build box";
+        let result = resolve_with_section(
+            &section,
+            said,
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+        )
+        .await
+        .expect("an oversized section does not fail the utterance");
+        let voice::VoiceOutcome::ParamUnresolved {
+            action, sentence, ..
+        } = &result.outcome
+        else {
+            panic!("a refusal: {:?}", result.outcome);
+        };
+        assert_eq!(action, "switch_deck");
+        let listed = (MAX_VOICE_SELECTOR_ROWS + 1).to_string();
+        assert!(
+            sentence.contains("Deck selector")
+                && sentence.contains(&listed)
+                && sentence.contains(&MAX_VOICE_SELECTOR_ROWS.to_string()),
+            "{sentence}"
+        );
+
+        let said = "switch deck to local";
+        let result = resolve_with_section(
+            &section,
+            said,
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "local"),
+        )
+        .await
+        .expect("resolves");
+        assert!(
+            matches!(&result.outcome, voice::VoiceOutcome::Dispatch { params, .. }
+                if params[0].value == "local"),
+            "{:?}",
+            result.outcome
+        );
+    }
+
+    /// Scenario: with that same oversized Deck selector, the user says "switch
+    /// decks, avoid the build box" — a row voice does not reach — and the model
+    /// answers with the build box. The switch is refused for the word "avoid",
+    /// as it would be with any selector, and the sentence still says so: it is
+    /// never replaced by advice to choose the build box in the Deck selector,
+    /// which is the deck the user just excluded (Qodo on PR #1340).
+    #[tokio::test]
+    async fn oversized_selector_section_keeps_a_contrast_refusal_its_own_sentence() {
+        let section = oversized_selector_section();
+        let said = "switch decks, avoid the build box";
+        let result = resolve_with_section(
+            &section,
+            said,
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+        )
+        .await
+        .expect("an oversized section does not fail the utterance");
+        let voice::VoiceOutcome::ParamUnresolved {
+            action, sentence, ..
+        } = &result.outcome
+        else {
+            panic!("a refusal: {:?}", result.outcome);
+        };
+        assert_eq!(action, "switch_deck");
+        assert!(
+            sentence.contains("\u{201c}avoid\u{201d}")
+                && sentence.contains("say just the deck you want")
+                && !sentence.contains("Deck selector"),
+            "{sentence}"
+        );
+    }
+
+    /// Scenario: with that same oversized Deck selector, the user says "switch
+    /// deck to the build box" and the model answers with a deck the user never
+    /// said, "staging box", which no deck voice holds either. The refusal says
+    /// it did not catch which deck, as it would with any selector — it does
+    /// not quote the model's "staging box" back inside a sentence pointing at
+    /// the Deck selector (Qodo on PR #1340).
+    #[tokio::test]
+    async fn oversized_selector_section_keeps_a_not_said_refusal_its_own_sentence() {
+        let section = oversized_selector_section();
+        let said = "switch deck to the build box";
+        let result = resolve_with_section(
+            &section,
+            said,
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "staging box"),
+        )
+        .await
+        .expect("an oversized section does not fail the utterance");
+        let voice::VoiceOutcome::ParamUnresolved {
+            action, sentence, ..
+        } = &result.outcome
+        else {
+            panic!("a refusal: {:?}", result.outcome);
+        };
+        assert_eq!(action, "switch_deck");
+        assert!(
+            sentence.contains("I did not catch which deck")
+                && !sentence.contains("staging box")
+                && !sentence.contains("Deck selector"),
+            "{sentence}"
+        );
+    }
+
+    /// Scenario: the app shows the local deck (a single-deck selection, so it
+    /// observes only that one) and Settings holds a connectable build box,
+    /// reached with an SSH key through a jump host, and a new box with no
+    /// socket path yet. Voice's decks gain both — keyed the
+    /// way the fleet keys them and unable to take a new agent, for the reason
+    /// that fits each — and every deck maps to the token the Deck selector
+    /// stores for it. "Switch deck to the build box" then dispatches that
+    /// row's token, which is what the selector's write takes.
+    #[tokio::test]
+    async fn selector_voice_decks_add_the_decks_the_selector_lists() {
+        use crate::settings::{EndpointId, EndpointSettings, RemoteEndpointSettings, Selection};
+        use dot_agent_deck::daemon_client::Endpoint;
+        use dot_agent_deck::remote_tunnel::{HostAlias, Hostname, KeyPath, RemoteSocketPath};
+
+        let row = |id: &str, host: &str, socket: bool| {
+            let mut row = RemoteEndpointSettings::new(
+                EndpointId::parse(id).expect("a valid id"),
+                Hostname::parse(host).expect("a valid host"),
+            );
+            if socket {
+                row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+            }
+            row
+        };
+        let mut build_box = row("buildbox01", "build-box", true);
+        build_box.identity = Some(KeyPath::parse("~/.ssh/id_ed25519").expect("a key path"));
+        build_box.jump = Some(HostAlias::parse("bastion").expect("a jump alias"));
+        let endpoints = EndpointSettings {
+            remote: vec![build_box, row("newbox01", "new-box", false)],
+            selection: Selection::Local,
+        };
+        let build_key = crate::dto::deck_wire_id(&Endpoint::Remote(
+            endpoints.remote[0].endpoint().expect("connectable"),
+        ));
+        let local_key = crate::dto::deck_wire_id(&Endpoint::local());
+        let observed = [crate::dto::ObservedDeckDto {
+            deck_id: local_key.clone(),
+            label: "/run/deck.sock".to_string(),
+            deck_kind: "local",
+        }];
+        let step: Vec<voice::VoiceDeckChoice> =
+            serde_json::from_value(serde_json::json!([{ "deckId": local_key }]))
+                .expect("the webview's shape parses");
+
+        let mut decks = voice_decks(&observed, Some(&step));
+        let selections = selector_voice_decks(Some(&endpoints), &mut decks, Some(&step));
+        let find = |id: &str| decks.iter().find(|deck| deck.id == id).expect("listed");
+        assert_eq!(decks.len(), 3, "{decks:?}");
+        assert_eq!(
+            find(&local_key).unavailable,
+            None,
+            "the observed deck keeps its step"
+        );
+        assert_eq!(
+            find(&build_key).unavailable.as_deref(),
+            Some(voice::DECK_NOT_CONNECTED)
+        );
+        assert_eq!(find(&build_key).label, "build-box");
+        assert_eq!(
+            find("unconfigured-newbox01").unavailable.as_deref(),
+            Some(crate::dto::UNCONFIGURED_DECK_REASON)
+        );
+        let token = |key: &str| {
+            selections
+                .get(key)
+                .map(|selection| selection.token.as_str())
+        };
+        assert_eq!(token(&local_key), Some("local"));
+        assert_eq!(token(&build_key), Some("buildbox01"));
+        assert_eq!(token("unconfigured-newbox01"), Some("newbox01"));
+        assert_eq!(
+            selections[&local_key].identity, None,
+            "local has no address"
+        );
+        assert_eq!(
+            selections[&build_key].identity,
+            Some(voice::VoiceDeckIdentity {
+                host: "build-box".to_string(),
+                user: None,
+                port: 22,
+                socket: Some("/run/deck.sock".to_string()),
+                identity: Some("~/.ssh/id_ed25519".to_string()),
+                jump: Some("bastion".to_string()),
+            }),
+            "the key and the jump host are part of the address"
+        );
+        // The address is the row less its id — the set the webview's
+        // `REMOTE_ADDRESS_FIELDS` names — so a field added to the row without
+        // one here reddens this rather than slipping past the rebind guard.
+        let keys = |value: serde_json::Value| {
+            let mut keys: Vec<String> = value
+                .as_object()
+                .expect("an object")
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        };
+        let every_field = voice::VoiceDeckIdentity {
+            host: "h".to_string(),
+            user: Some("u".to_string()),
+            port: 22,
+            socket: Some("/s".to_string()),
+            identity: Some("~/k".to_string()),
+            jump: Some("j".to_string()),
+        };
+        let mut row_fields = keys(serde_json::to_value(&endpoints.remote[0]).expect("serializes"));
+        row_fields.retain(|field| field != "id");
+        assert_eq!(
+            keys(serde_json::to_value(&every_field).expect("serializes")),
+            row_fields
+        );
+        assert_eq!(
+            selections["unconfigured-newbox01"]
+                .identity
+                .as_ref()
+                .map(|identity| identity.socket.clone()),
+            Some(None),
+            "a row with no socket still has an address to compare"
+        );
+
+        let said = "switch deck to the build box";
+        let resolver = voice::StubResolver::new().answering(
+            said,
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+        );
+        let mut result = voice::handle_utterance(
+            &resolver,
+            voice::table(),
+            voice::Screen::Deck,
+            &[],
+            &decks,
+            None,
+            None,
+            voice::Transcript::new(said),
+        )
+        .await;
+        voice::address_deck_switch(&mut result.outcome, |id| selections.get(id).cloned());
+        assert!(
+            matches!(&result.outcome, voice::VoiceOutcome::Dispatch { invoke, params, .. }
+                if invoke == "switchDeck" && params[0].value == "buildbox01"
+                    && params[0].deck_identity.as_ref().map(|identity| identity.host.as_str())
+                        == Some("build-box")),
+            "{:?}",
+            result.outcome
+        );
     }
 
     /// Scenario: the webview declares the New agent dialog's deck step with an

@@ -474,6 +474,24 @@ export interface RemoteEndpointDto {
   user?: string;
 }
 
+/**
+ * The {@link RemoteEndpointDto} fields that make up a row's ADDRESS — every one
+ * but its `id` — in the order {@link endpointsFingerprint} reads them. A change
+ * to any of them names a different deck or a different route to it: `host`,
+ * `user` and `port` pick the machine, `socket` the deck on it, and `identity`
+ * and `jump` how SSH gets there. One list, so the fingerprint, a spoken
+ * switch's {@link VoiceDeckIdentityDto} and the Deck selector's comparison of
+ * that identity with its row (`sameDeckIdentity`) cannot disagree about what an
+ * address is. Rust's `voice::VoiceDeckIdentity` carries the same set by hand:
+ * `selector_voice_decks_add_the_decks_the_selector_lists` holds it to the
+ * settings row's fields less `id`, and `bridge.test.ts` holds the keys a
+ * switch's identity reaches the webview with to this list.
+ */
+export const REMOTE_ADDRESS_FIELDS = ["host", "user", "port", "socket", "identity", "jump"] as const satisfies readonly (keyof RemoteEndpointDto)[];
+
+/** One of {@link REMOTE_ADDRESS_FIELDS}. */
+export type RemoteAddressField = (typeof REMOTE_ADDRESS_FIELDS)[number];
+
 /** How the app picks its light/dark palette. What it does is PRD #743's. */
 export type AppearanceMode = "system" | "light" | "dark";
 
@@ -744,9 +762,11 @@ export interface VoiceNewAgentDto {
  * * `agent_ref` resolves against **live state** — `spoken` is what the user
  *   called an agent, `value` is that agent's id, and `label` is the name the
  *   deck shows for it.
- * * `deck_ref` resolves against **the observed fleet** (PRD #1223) — `spoken`
- *   is what the user called a deck, `value` is that deck's `deckId`, and
- *   `label` is what the overview calls it ("Local deck", or `user@host`).
+ * * `deck_ref` resolves against **the observed fleet plus every deck the Deck
+ *   selector lists** (PRD #1223, #1195) — `spoken` is what the user called a
+ *   deck, `value` is that deck's `deckId`, and `label` is what the overview
+ *   calls it ("Local deck", or `user@host`). On `switch_deck` alone `value` is
+ *   the selector's stored token instead (`VoiceDispatchTarget.deckSelection`).
  * * `dir_ref` resolves against **the directory browser's children on screen**
  *   ({@link VoiceDirectoriesDto}, PRD #1223) — `spoken` is what the user called
  *   one, `value` is the deck's own path for it, and `label` its `displayName`.
@@ -774,6 +794,51 @@ export interface VoiceResolvedParamDto {
   spoken: string;
   value: string;
   label: string;
+  /**
+   * On `switch_deck` alone, and only for a remote deck: the address the Deck
+   * selector's row had when Rust resolved the switch (PRD #1195,
+   * `voice::VoiceDeckIdentity`), which `chooseDeckSelection` compares with the
+   * row before writing. Absent for the local deck, which has no remote address.
+   */
+  deckIdentity?: VoiceDeckIdentityDto;
+}
+
+/**
+ * A `[[endpoints.remote]]` row's address — its {@link REMOTE_ADDRESS_FIELDS} —
+ * as Rust read it when resolving a spoken deck switch (PRD #1195). Rust omits
+ * an optional field the row does not set, and {@link withDeckIdentityKeys}
+ * gives every key back, as `undefined`, on the way in.
+ *
+ * `identity` and `jump` stay optional, as the row declares them, although that
+ * function always sets them: they joined the address after a test typed its
+ * identity against the other four, and optional keeps it compiling. The
+ * guard it is carried to, `sameDeckIdentity`, compares an absent key and an
+ * `undefined` one alike.
+ */
+export interface VoiceDeckIdentityDto extends Pick<RemoteEndpointDto, RemoteAddressField> {
+  user: string | undefined;
+  socket: string | undefined;
+}
+
+/**
+ * {@link VoiceResultDto} with every `deckIdentity` given every
+ * {@link VoiceDeckIdentityDto} key, an absent or `null` one as `undefined`.
+ * Everything else passes through untouched.
+ *
+ * The guard that reads it (`sameDeckIdentity`) compares with `===`, so the one
+ * spelling of "unset" matters: a `null` would never equal the row's absent
+ * field and would refuse every switch to that row.
+ */
+function withDeckIdentityKeys(result: VoiceResultDto): VoiceResultDto {
+  if (result.outcome.kind !== "dispatch") return result;
+  const params = result.outcome.params.map((param) => {
+    const identity = param.deckIdentity;
+    if (!identity) return param;
+    const sent = identity as Partial<Record<RemoteAddressField, unknown>>;
+    const deckIdentity = Object.fromEntries(REMOTE_ADDRESS_FIELDS.map((field) => [field, sent[field] ?? undefined])) as unknown as VoiceDeckIdentityDto;
+    return { ...param, deckIdentity };
+  });
+  return { ...result, outcome: { ...result.outcome, params } };
 }
 
 /**
@@ -998,7 +1063,7 @@ function endpointsFingerprint(settings: DesktopSettingsDto): string {
   if (!endpoints) return UNSPECIFIED_ENDPOINTS;
   return JSON.stringify([
     endpoints.selection,
-    endpoints.remote.map((row) => [row.id, row.host, row.user, row.port, row.socket, row.identity, row.jump]),
+    endpoints.remote.map((row) => [row.id, ...REMOTE_ADDRESS_FIELDS.map((field) => row[field])]),
   ]);
 }
 
@@ -1481,9 +1546,13 @@ export interface DeckBridge {
    * dialog is open ({@link VoiceNewAgentDto}). `deckStep` is the fourth: the
    * dialog's deck step for the fleet as it stands ({@link VoiceDeckChoiceDto}),
    * which the runtime adds to every declaration because the row it matters to
-   * opens the dialog.
+   * opens the dialog. `endpoints` is the fifth (PRD #1195): the `[endpoints]`
+   * section the Deck selector is rendering. `useDesktopSettings.save` applies
+   * an edit at once and writes it behind, so this — not `desktop.toml` — is
+   * the list "switch deck to …" has to resolve against, or a deck the selector
+   * already shows is refused until the write lands.
    */
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[]): void;
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto): void;
   /**
    * Take one utterance — transcribed from the microphone — to an outcome
    * carrying the sentence to show (PRD #802 M6).
@@ -3950,17 +4019,20 @@ export class TauriDeckBridge implements DeckBridge {
   private voiceNewAgent: VoiceNewAgentDto | undefined;
   /** PRD #1223 — the dialog's deck step for the fleet as it stood. */
   private voiceDeckStep: VoiceDeckChoiceDto[] | undefined;
+  /** PRD #1195 — the Deck selector's section as it was rendered. */
+  private voiceEndpoints: EndpointSettingsDto | undefined;
 
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[]): void {
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto): void {
     this.voiceScreen = screen;
     this.voiceDirectories = directories;
     this.voiceNewAgent = newAgent;
     this.voiceDeckStep = deckStep;
+    this.voiceEndpoints = endpoints;
   }
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     const invoke = await this.getInvoke();
-    return invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null });
+    return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null }));
   }
 
   /**
