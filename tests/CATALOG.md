@@ -584,7 +584,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### status/blocked/013 — Codex rollout tailing is bounded and path safe (issue #714).
 - **Layer:** L1 unit (src/codex_rollout_tail.rs).
 - **Agent:** none.
-- **Asserts:** only a live owner arms a regular rollout file, malformed or oversized lines are bounded, and exit or restart drops the tailer.
+- **Asserts:** an armed regular rollout file reports its matching failure once, malformed or oversized lines are bounded, and a dead owner drops the tailer. The FIFO and symlink refusal checks run on Unix only.
 - **Does not assert:** a live Codex process.
 - **Platform coverage:** mac+linux+windows.
 
@@ -600,7 +600,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none.
 - **Asserts:** session.error forwards typed fields, capped provider body and allow-listed headers.
 - **Does not assert:** a real OpenCode process.
-- **Platform coverage:** mac+linux+windows when Node is available.
+- **Platform coverage:** mac+linux when Node is available (the recorder is a Unix shell script).
 
 ##### status/blocked/017 — Claude StopFailure blocks a live card, and work clears it (issue #714).
 - **Layer:** L2, lane 1, PTY-attached.
@@ -628,6 +628,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** synthetic Claude executable using the installed hook; no provider credential.
 - **Asserts:** pane restart gives the replacement worker a non-Blocked card.
 - **Does not assert:** account quota recovery.
+- **Platform coverage:** mac+linux.
+
+##### status/blocked/022 — A real Claude API failure ends as Error (issue #714).
+- **Layer:** L2, lane 2, PTY-attached (`tests/e2e_quota_blocked_live.rs`).
+- **Agent:** real interactive Claude Code with a retired model that the provider rejects; developer credentials required.
+- **Asserts:** a submitted prompt produces an Error event and a rendered Error card rather than leaving Thinking or showing Blocked.
+- **Does not assert:** a real quota-exhausted account.
+- **Platform coverage:** mac+linux.
+
+##### status/blocked/023 — A real OpenCode API failure ends as Error (issue #714).
+- **Layer:** L2, lane 2, PTY-attached (`tests/e2e_quota_blocked_live.rs`).
+- **Agent:** real interactive OpenCode with a listed model that this account's provider rejects with HTTP 400; developer credentials required.
+- **Asserts:** a submitted prompt produces an Error event through the installed plugin and a rendered Error card, never Blocked.
+- **Does not assert:** a real quota-exhausted account.
 - **Platform coverage:** mac+linux.
 
 #### status/agent-event
