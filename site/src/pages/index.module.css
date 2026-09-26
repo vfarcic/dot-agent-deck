@@ -147,8 +147,9 @@
  * desktop section's `gh attestation verify ...`: 1105px of content in a 932px
  * box from 1120px up, so it rendered cut at "/.github/wo" and the rest was
  * reachable only by scrolling inside the pill. That is the command this page
- * gives a reader for checking a binary it has just told them is unsigned, so
- * the whole of it has to be ON the page.
+ * gives a reader for checking a download before they open it -- for the
+ * unsigned `.deb`, the only check anybody makes -- so the whole of it has to
+ * be ON the page.
  *
  * Each word is its own inline-block (`InstallPill` in `index.js` does the
  * split), so a line ends at a space wherever the words fit. Letting the text

@@ -3,19 +3,22 @@
 //!
 //! # Why this exists
 //!
-//! `cargo build --locked --bin dot-agent-deck` runs in the build clone on the
-//! host, outside the namespace, as the operator — like any local build of the
-//! branch. Whatever that command executes runs with the operator's files,
-//! processes, sockets and network: the package's build scripts, every proc
-//! macro, and any compiler wrapper or linker the cargo configuration names. So
-//! a branch that supplies build-time code of its own gets that authority the
-//! moment the harness builds it, before the namespace exists.
+//! `cargo build --locked --offline --bin dot-agent-deck` executes the
+//! package's build scripts, every proc macro, and any compiler wrapper or
+//! linker the cargo configuration names. Since issue #1212 it does so in a
+//! build namespace of its own (`buildns.rs`) — no network, the operator's home
+//! masked, the build clone read-only — and no longer on the host as the
+//! operator. What it can still write is the target dir it is given, and what
+//! it produces is the binary the runtime scenario then executes.
 //!
 //! This module compares the branch with its merge-base with `main` of `--repo`
 //! and classifies every changed path against the build-time surface. A branch
 //! that changes any of it is refused before `cargo build` runs, unless the
 //! caller opts in with `--allow-build-changes`; either way the evidence file
-//! records the answer.
+//! records the answer. The answer also picks the build's trust domain
+//! (`outer.rs`'s `Domain`): a branch with unchanged build-time code builds in
+//! the shared target dir, and an opted-in one in a target dir of its own, so its
+//! build scripts cannot leave artifacts a later build reuses.
 //!
 //! # What counts
 //!
@@ -33,8 +36,9 @@
 //!     local dependency graph from the package that owns the
 //!     `dot-agent-deck` bin, over normal and build edges (never dev), finds
 //!     each reached package's build script and every reached package that
-//!     executes on the host — a proc macro, a build-dependency, or anything
-//!     those depend on — whose whole directory then counts;
+//!     executes at build time (Cargo's "host" artifacts) — a proc macro, a
+//!     build-dependency, or anything those depend on — whose whole directory
+//!     then counts;
 //!   * each build script's module closure: the files it pulls in with `mod`,
 //!     `#[path]`, `include!`, `include_str!` or `include_bytes!` and a literal
 //!     path (the root's `build.rs` pulls in `build_version_resolve.rs`);
@@ -58,16 +62,16 @@
 //!
 //! # What this does not do
 //!
-//! It detects **changes**. The merge-base's own build-time code runs on every
-//! build and is trusted by construction; registry crates pinned by an unchanged
-//! `Cargo.lock` are unchanged; and a build the caller opts into runs the
-//! branch's code with exactly the authority described above. It also trusts
+//! It detects **changes**; the build namespace is what contains the build. The
+//! merge-base's own build-time code runs on every build and is trusted by
+//! construction; registry crates pinned by an unchanged `Cargo.lock` are
+//! unchanged; and a build the caller opts into runs the branch's code with the
+//! authority the build namespace leaves it (`buildns.rs`). It also trusts
 //! `main` of `--repo`: with the default repository that is mainline, with
 //! another it is whatever that repository's `main` holds. And compiling ordinary
-//! source reads host files too — `include_str!` can name any path the operator
-//! can read, past the runtime namespace's home mask — which is not execution
-//! and not classified here. Building inside a namespace of its own is the fix
-//! for all of that; this is detection.
+//! source reads files — `include_str!` can name any path visible in the build
+//! namespace (the read-only root minus its masks) — which is not execution and
+//! not classified here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -240,15 +244,18 @@ pub fn decide(
     if allow {
         return Ok(format!(
             "**the branch CHANGES build-time code** relative to {}: {list}. The caller opted in \
-             with `--allow-build-changes`, so `cargo build` executed those changes on the host, \
-             outside the namespace, with the operator's files, processes, sockets and network",
+             with `--allow-build-changes`, so `cargo build` executed those changes — in the build \
+             namespace, into a target dir of this branch's own (the Build section says what that \
+             namespace measured)",
             cmp.base()
         ));
     }
     Err(format!(
         "refusing before `cargo build` — nothing was compiled. Branch `{branch}` changes \
-         build-time code relative to {}: {list}. `cargo build` would execute that code on this \
-         host, outside the namespace, as you: with your files, processes, sockets and network. \
+         build-time code relative to {}: {list}. `cargo build` would execute that code. It would \
+         run in the build namespace — no network, your home masked, the clone read-only — into a \
+         target dir of this branch's own, and the binary it produced would then run in the \
+         runtime namespace; docs/develop/cross-version-harness.md says what neither contains. \
          Review those changes, then re-run with `--allow-build-changes` to build them anyway.",
         cmp.base()
     ))
@@ -564,7 +571,8 @@ pub fn named_paths(value: &toml::Value, base: &str, tree: &dyn Tree) -> Vec<(Str
 pub struct MetaFacts {
     /// `(build script path, owning package)`.
     pub build_scripts: Vec<(String, String)>,
-    /// Package directories that execute on the host, with why.
+    /// Package directories that execute at build time (Cargo's "host"
+    /// artifacts), with why.
     pub host_dirs: BTreeMap<String, String>,
 }
 
@@ -867,11 +875,17 @@ pub trait Steps {
     fn metadata(&self, dir: &Path) -> Result<Vec<u8>, String>;
 }
 
-/// [`Steps`] for real: `git` in the build clone, `cargo` in the extraction.
+/// Runs `cargo <args>` in a directory and returns its stdout — for real, in a
+/// build namespace; the gate itself does not care where.
+pub type MetadataRunner<'a> = dyn Fn(&Path, &[String]) -> Result<Vec<u8>, String> + 'a;
+
+/// [`Steps`] for real: `git` in the build clone, and `cargo metadata` in the
+/// extraction through `metadata`, which runs it in a build namespace
+/// (`buildns::metadata_plan`) and returns its stdout.
 struct Host<'a> {
     clone: &'a Path,
     git: &'a dyn Fn(&Path) -> Command,
-    cargo: &'a dyn Fn(&Path) -> Command,
+    metadata: &'a MetadataRunner<'a>,
 }
 
 impl Steps for Host<'_> {
@@ -936,17 +950,18 @@ impl Steps for Host<'_> {
     }
 
     fn metadata(&self, dir: &Path) -> Result<Vec<u8>, String> {
-        run_ok(
-            (self.cargo)(dir).args([
-                "metadata",
-                "--no-deps",
-                "--offline",
-                "--locked",
-                "--format-version",
-                "1",
-            ]),
-            "cargo metadata --no-deps at the merge-base",
+        (self.metadata)(
+            dir,
+            &[
+                "metadata".to_string(),
+                "--no-deps".to_string(),
+                "--offline".to_string(),
+                "--locked".to_string(),
+                "--format-version".to_string(),
+                "1".to_string(),
+            ],
         )
+        .map_err(|e| format!("cargo metadata --no-deps at the merge-base: {e}"))
     }
 }
 
@@ -1093,10 +1108,14 @@ pub fn evaluate(
     head_sha: &str,
     scratch_parent: &Path,
     git: &dyn Fn(&Path) -> Command,
-    cargo: &dyn Fn(&Path) -> Command,
+    metadata: &MetadataRunner<'_>,
 ) -> Result<(Comparison, Vec<(String, String)>), String> {
     evaluate_with(
-        &Host { clone, git, cargo },
+        &Host {
+            clone,
+            git,
+            metadata,
+        },
         repo,
         base_sha,
         head_sha,

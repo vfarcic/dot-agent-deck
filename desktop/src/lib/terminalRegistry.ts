@@ -175,3 +175,23 @@ const ANSI_PATTERN = new RegExp(
 export function stripAnsi(raw: string): string {
   return raw.replace(ANSI_PATTERN, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
+
+// Issue #953 — the driver tier's one read into the app, and it is compiled out
+// of every other build.
+//
+// The WebGL renderer draws the terminal into a canvas and leaves no row text in
+// the DOM, and a classic WebDriver session has no pre-load script to reach this
+// module's private map the way the browser tier's `addInitScript` does. So the
+// driver tier asks for this at BUILD time: `VITE_DAD_DRIVER_SEAM=1` in the
+// environment of the `tauri build` that produces the binary under test. Vite
+// replaces `import.meta.env.VITE_DAD_DRIVER_SEAM` with a literal, the branch is
+// then constant-false in any other build and the minifier drops it, and
+// `desktop-web` greps its own `pnpm build` output for `__dadDriver` so a bundle
+// built the ordinary way cannot quietly start carrying it. It exposes the same
+// text the Reader overlay already shows a user, and it writes nothing.
+if (import.meta.env.VITE_DAD_DRIVER_SEAM === "1") {
+  (window as Window & { __dadDriver?: unknown }).__dadDriver = {
+    terminalTexts: () =>
+      [...terminals.entries()].map(([key, terminal]) => ({ key, text: terminalSnapshotText(terminal) })),
+  };
+}

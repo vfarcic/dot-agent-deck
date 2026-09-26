@@ -71,12 +71,13 @@ use crate::daemon_bridge::{
 };
 use crate::dto::{
     BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionError,
-    DesktopActionResult, DesktopAgentOption, DesktopDirectoryListing, DesktopNewAgentOptions,
-    DesktopNewAgentOrchestrations, DesktopProjectListing, DesktopResolvedProject, DesktopSnapshot,
-    TerminalAttachResult, WorkflowRoleInput, desktop_agent_registry,
-    ensure_desktop_workflow_platform_supported, map_project_listing, map_resolved_project,
-    mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id, validate_dimensions,
-    validate_pasted_project_path, validate_start_fields, validate_workflow_shape,
+    DesktopActionResult, DesktopAgentOption, DesktopDirectoryListing, DesktopListingOptions,
+    DesktopNewAgentOptions, DesktopNewAgentOrchestrations, DesktopProjectListing,
+    DesktopResolvedProject, DesktopSnapshot, TerminalAttachResult, WorkflowRoleInput,
+    desktop_agent_registry, ensure_desktop_workflow_platform_supported, map_project_listing,
+    map_resolved_project, mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id,
+    validate_dimensions, validate_pasted_project_path, validate_start_fields,
+    validate_workflow_shape,
 };
 use crate::secrets::{
     KeychainSecretStore, Secret, SecretError, SecretId, SecretStatus, SecretStore,
@@ -201,10 +202,13 @@ async fn prepare_workflow_launch<D: WorkflowDaemon + Sync>(
     requested: &[WorkflowRoleInput],
     config_revision: Option<&str>,
 ) -> Result<(Vec<WorkflowRoleInput>, PreparedWorkflow), String> {
+    // An EMPTY task is allowed (issue #1044), as it is by the daemon and by the
+    // TUI's `Ctrl+n`: the user starts the orchestration as-is and types the task
+    // into the coordinator's own input. What the coordinator context looks like
+    // without one is the daemon's call — it omits the whole `## Your task`
+    // section and sends the "wait for instructions" pointer — so the empty
+    // string goes to it verbatim and nothing here composes a stand-in.
     let task_prompt = task_prompt.trim();
-    if task_prompt.is_empty() {
-        return Err("task prompt must not be empty".into());
-    }
     // A UI affordance, not the bound: the daemon applies its own
     // `bounded_read::MAX_TASK_BYTES` before it touches a filesystem, and it is
     // not entitled to trust this one.
@@ -303,9 +307,13 @@ fn validate_desktop_coordinator(roles: &[WorkflowRoleInput]) -> Result<&Workflow
     Ok(start_role)
 }
 
+/// One role of the Runs launch. `display_title` is the run's name (issue
+/// #1044), absent when the form's Name is empty so the tab falls back to the
+/// orchestration's name — the TUI's rule, and [`configured_role_start_options`]'s.
 #[allow(clippy::too_many_arguments)]
 fn workflow_start_options(
     name: &str,
+    display_title: Option<&str>,
     cwd: &str,
     role: &WorkflowRoleInput,
     role_index: usize,
@@ -327,7 +335,7 @@ fn workflow_start_options(
             role_name: role.role.clone(),
             is_start_role: role.start,
             orchestration_cwd: Some(cwd.to_string()),
-            display_title: Some(name.to_string()),
+            display_title: display_title.map(str::to_string),
             orchestration_id: Some(orchestration_id.to_string()),
         }),
         agent_type: AgentType::from_command(Some(&role.command)),
@@ -993,6 +1001,7 @@ async fn deliver_coordinator_prompt<D: WorkflowDaemon + Sync>(
 async fn launch_workflow<D: WorkflowDaemon + Sync>(
     daemon: &D,
     name: &str,
+    display_title: Option<&str>,
     cwd: &str,
     roles: &[WorkflowRoleInput],
     rows: u16,
@@ -1028,6 +1037,7 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
         let pane_id = mint_desktop_pane_id();
         let options = workflow_start_options(
             name,
+            display_title,
             cwd,
             role,
             role_index,
@@ -1967,16 +1977,27 @@ async fn desktop_resolve_project(
 /// A deck that predates the verb answers [`DesktopDirectoryListing::Unsupported`]
 /// rather than an error. The dialog does not ask one: the connection's
 /// `new_agent_reason` disables it at the deck step (PRD #1223 U1).
+///
+/// `options` (issue #1240) are sent only to a deck that honours them; the
+/// dialog asks only such a deck (the connection's `listing_options`), and a
+/// deck that does not is refused here in a sentence rather than answered as
+/// though it could not list at all.
 #[tauri::command]
 async fn desktop_list_directories(
     webview: Webview,
     state: State<'_, DesktopState>,
     deck_id: String,
     path: Option<String>,
+    options: Option<DesktopListingOptions>,
 ) -> Result<DesktopDirectoryListing, String> {
     ensure_main_webview(&webview)?;
-    list_directories_on(&state, &deck_id, path).await
+    list_directories_on(&state, &deck_id, path, options.unwrap_or_default()).await
 }
+
+/// Issue #1240: the refusal for listing options sent to a deck that does not
+/// advertise them. Unreachable from the dialog, which offers the options only
+/// where the connection says the deck honours them.
+const LISTING_OPTIONS_UNSUPPORTED: &str = "This deck cannot show hidden or symlinked directories, or filter a listing past its limit. Upgrade the deck to use them.";
 
 /// PRD #1223 M4: what the New agent form needs to know about the deck
 /// `deck_id` names — its default command, its agent registry, its experimental
@@ -2014,6 +2035,7 @@ async fn list_directories_on(
     state: &DesktopState,
     deck_id: &str,
     path: Option<String>,
+    options: DesktopListingOptions,
 ) -> Result<DesktopDirectoryListing, String> {
     if let Some(path) = path.as_deref() {
         validate_pasted_project_path(path)?;
@@ -2021,23 +2043,45 @@ async fn list_directories_on(
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
+    let options = dot_agent_deck::daemon_protocol::DirectoryListingOptions {
+        include_hidden: options.include_hidden,
+        include_symlinks: options.include_symlinks,
+        // An empty filter filters nothing, so it is not sent: it would ask a
+        // deck without the options for something it could answer anyway.
+        filter: options.filter.filter(|filter| !filter.is_empty()),
+    };
     let answer = daemon
         .client
-        .list_directories(path.as_deref())
+        .list_directories(path.as_deref(), &options)
         .await
         .map_err(|error| safe_message(error.to_string()))?;
-    Ok(match answer {
-        GatedQuery::Answered(listing) => DesktopDirectoryListing::listing(
-            listing.path,
-            listing.parent,
-            listing
-                .entries
-                .into_iter()
-                .map(|entry| (entry.name, entry.path, entry.is_project)),
-            listing.truncated,
-        ),
-        GatedQuery::Unsupported => DesktopDirectoryListing::Unsupported,
-    })
+    let listing = match answer {
+        GatedQuery::Answered(listing) => listing,
+        GatedQuery::Unsupported => {
+            // The verb is there and the options are not: say so, rather than
+            // reporting a deck that lists as one that cannot.
+            let lists = daemon
+                .client
+                .capabilities()
+                .await
+                .is_ok_and(|capabilities| {
+                    capabilities.supports(dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES)
+                });
+            if lists && !options.is_default() {
+                return Err(LISTING_OPTIONS_UNSUPPORTED.to_string());
+            }
+            return Ok(DesktopDirectoryListing::Unsupported);
+        }
+    };
+    Ok(DesktopDirectoryListing::listing(
+        listing.path,
+        listing.parent,
+        listing
+            .entries
+            .into_iter()
+            .map(|entry| (entry.name, entry.path, entry.is_project, entry.is_symlink)),
+        listing.truncated,
+    ))
 }
 
 /// [`desktop_new_agent_options`] minus the webview. Resolves its deck exactly
@@ -3722,6 +3766,8 @@ struct StartedOrchestration {
 /// [`start_workflow_action`].
 struct StartWorkflowRequest {
     name: String,
+    /// The run's name (issue #1044), absent when the form's Name is empty.
+    display_title: Option<String>,
     cwd: String,
     task_prompt: String,
     roles: Vec<WorkflowRoleInput>,
@@ -3749,6 +3795,7 @@ async fn start_workflow_action(
 ) -> Result<WorkflowLaunchResult, DesktopActionError> {
     let StartWorkflowRequest {
         name,
+        display_title,
         cwd,
         task_prompt,
         roles,
@@ -3759,6 +3806,14 @@ async fn start_workflow_action(
     ensure_desktop_workflow_platform_supported(std::env::consts::OS)?;
     let (rows, cols) =
         validate_workflow_shape(&name, &cwd, &roles, rows.unwrap_or(32), cols.unwrap_or(120))?;
+    // The New agent launch's rule for the same field (`start_orchestration_action`):
+    // an empty name never reaches here — the webview omits it — and anything
+    // sent must be a name a tab can carry.
+    if let Some(title) = display_title.as_deref()
+        && !is_valid_display_name(title)
+    {
+        return Err("the run name is invalid, oversized, or contains control characters".into());
+    }
     // PRD #819 M6: the connection comes FIRST now. Resolution used to
     // run two lines above the first daemon contact, against this
     // process's own filesystem; it now runs on the daemon's, so a
@@ -3782,6 +3837,7 @@ async fn start_workflow_action(
     launch_workflow(
         daemon.client.as_ref(),
         &name,
+        display_title.as_deref(),
         // The daemon's CANONICAL spelling, not the one that was sent.
         // An alias or a symlink resolves elsewhere, canonicalising
         // changes the basename, and an empty orchestration name is
@@ -3812,14 +3868,15 @@ async fn start_workflow_action(
 ///
 /// # What it deliberately does not inherit from the Runs launch
 ///
-/// The Runs screen's [`DesktopAction::StartWorkflow`] refuses an empty task,
-/// builds each role's command from desktop agent profiles, refuses a Pi
-/// coordinator (its desktop-side delivery needs an acknowledgement Pi's native
-/// seed cannot give) and refuses Windows (its profile commands are POSIX-quoted).
-/// None of those reasons holds here: there is no task, the deck runs its own
-/// configured commands, and a Pi coordinator is seeded by the deck exactly as
-/// the TUI's is — see [`launch_configured_orchestration`]. The Runs screen keeps
-/// all four.
+/// The Runs screen's [`DesktopAction::StartWorkflow`] builds each role's
+/// command from desktop agent profiles, refuses a Pi coordinator (its
+/// desktop-side delivery needs an acknowledgement Pi's native seed cannot give)
+/// and refuses Windows (its profile commands are POSIX-quoted). None of those
+/// reasons holds here: the deck runs its own configured commands, and a Pi
+/// coordinator is seeded by the deck exactly as the TUI's is — see
+/// [`launch_configured_orchestration`]. The Runs screen keeps all three. It
+/// used to refuse an empty task as well; issue #1044 removed that, so on the
+/// task and the run's name the two launches now follow the same TUI rules.
 ///
 /// # Before preparing
 ///
@@ -4303,6 +4360,7 @@ async fn desktop_run_action(
         }
         DesktopAction::StartWorkflow {
             name,
+            display_title,
             cwd,
             task_prompt,
             roles,
@@ -4314,6 +4372,7 @@ async fn desktop_run_action(
                 &state,
                 StartWorkflowRequest {
                     name,
+                    display_title,
                     cwd,
                     task_prompt,
                     roles,
@@ -6922,6 +6981,7 @@ command = "configured-planner"
         launch_workflow(
             &daemon,
             "loop",
+            None,
             &prepared.path,
             &roles,
             32,
@@ -6959,6 +7019,98 @@ command = "configured-planner"
                 Some("prep-token-1".to_string())
             ]
         );
+    }
+
+    /// Issue #1044. Scenario: the Runs form submits a blank task — nothing
+    /// typed, or only whitespace. The preparation must go to the daemon with
+    /// the empty string rather than being refused here, because the daemon and
+    /// the TUI allow it and the daemon decides what a task-less coordinator
+    /// context looks like; the launch then proceeds on the daemon's answer.
+    #[tokio::test]
+    async fn a_blank_task_is_prepared_by_the_daemon_rather_than_refused() {
+        for blank in ["", "  \n\t "] {
+            let daemon = FakeWorkflowDaemon::new(
+                Ok(Some("unused-session")),
+                std::iter::empty(),
+                Ok(SendResult::Applied),
+            );
+            let (roles, prepared) = prepare_workflow_launch(
+                &daemon,
+                "loop",
+                "/home/dev/project",
+                blank,
+                &launch_roles("claude"),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("a blank task {blank:?} was refused: {error}"));
+
+            assert_eq!(
+                *daemon.prepare_requests.lock().unwrap(),
+                [PrepareRequest {
+                    cwd: "/home/dev/project".into(),
+                    orchestration: "loop".into(),
+                    task: String::new(),
+                    config_revision: None,
+                }],
+                "a blank task reaches the daemon as the empty string"
+            );
+            assert_eq!(roles.len(), 2);
+            assert_eq!(prepared.prompt, prepared_workflow().prompt);
+        }
+    }
+
+    /// Issue #1044. Scenario: launch from the Runs form once with a run name
+    /// and once with the Name cleared. Every role carries the name as its
+    /// orchestration membership's title in the first launch; in the second
+    /// none carries a title at all, so the tab falls back to the
+    /// orchestration's name — the TUI's rule, rather than the orchestration
+    /// name repeated as a title, which is what this launch used to send.
+    #[tokio::test]
+    async fn the_run_name_is_every_roles_title_and_an_empty_one_sends_none() {
+        for (title, expected) in [
+            (
+                Some("project-orchestrator-2"),
+                Some("project-orchestrator-2"),
+            ),
+            (None, None),
+        ] {
+            let daemon = FakeWorkflowDaemon::new(
+                Ok(Some("session-planner")),
+                [Ok(SendResult::Applied)],
+                Ok(SendResult::Applied),
+            );
+            launch_workflow(
+                &daemon,
+                "loop",
+                title,
+                "/canonical/project",
+                &launch_roles("claude"),
+                32,
+                120,
+                "orchestration-1044",
+                "Read the context.",
+                None,
+            )
+            .await
+            .unwrap();
+
+            let started = daemon.started.lock().unwrap();
+            assert_eq!(started.len(), 2);
+            for options in started.iter() {
+                match options.tab_membership.as_ref() {
+                    Some(TabMembership::Orchestration {
+                        name,
+                        display_title,
+                        ..
+                    }) => {
+                        assert_eq!(name, "loop", "the orchestration identity is unchanged");
+                        assert_eq!(display_title.as_deref(), expected);
+                    }
+                    other => panic!("an orchestration role's membership, got {other:?}"),
+                }
+            }
+        }
     }
 
     /// PRD #819 audit follow-up. Scenario: prepare a workflow, then launch it
@@ -7013,6 +7165,7 @@ command = "configured-planner"
         let failure = launch_workflow(
             &daemon,
             "loop",
+            None,
             &prepared.path,
             &roles,
             32,
@@ -7062,6 +7215,7 @@ command = "configured-planner"
         launch_workflow(
             &daemon,
             "loop",
+            None,
             "/canonical/project",
             &launch_roles("claude"),
             32,
@@ -7352,6 +7506,7 @@ command = "configured-planner"
         let launched = launch_workflow(
             &daemon,
             "loop",
+            None,
             "/tmp/project",
             &launch_roles("claude"),
             32,
@@ -7883,6 +8038,7 @@ command = "configured-planner"
         let failure = launch_workflow(
             &daemon,
             "loop",
+            None,
             "/tmp/project",
             &launch_roles("claude"),
             32,
@@ -8109,6 +8265,7 @@ command = "configured-planner"
         let failure = launch_workflow(
             &daemon,
             "loop",
+            None,
             "/tmp/project",
             &launch_roles("claude"),
             32,
@@ -8167,6 +8324,7 @@ command = "configured-planner"
         let failure = launch_workflow(
             &daemon,
             "loop",
+            None,
             "/tmp/project",
             &launch_roles("pi"),
             32,
@@ -8195,6 +8353,7 @@ command = "configured-planner"
         launch_workflow(
             &daemon,
             "loop",
+            None,
             "/tmp/project",
             &launch_roles("opencode"),
             32,
@@ -8227,6 +8386,7 @@ command = "configured-planner"
         let failure = launch_workflow(
             &daemon,
             "loop",
+            None,
             "/tmp/project",
             &launch_roles("claude"),
             32,
@@ -8281,6 +8441,7 @@ command = "configured-planner"
         let failure = launch_workflow(
             &daemon,
             "loop",
+            None,
             "/tmp/project",
             &roles,
             32,
@@ -8336,6 +8497,7 @@ command = "configured-planner"
         let failure = launch_workflow(
             &daemon,
             "loop",
+            None,
             "/tmp/project",
             &launch_roles("claude"),
             32,
