@@ -436,7 +436,7 @@ fn orchestrator_prompt_line(has_task: bool) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedContext {
     /// The file the coordinator will read — the path the daemon reports back on
-    /// [`crate::event::PreparedWorkflow::context_path`].
+    /// [`crate::event::PreparedOrchestration::context_path`].
     pub context_path: std::path::PathBuf,
     /// The one-liner to inject into the coordinator's PTY.
     pub prompt: String,
@@ -518,7 +518,7 @@ pub fn prepare_orchestrator_prompt(
     match prepare_orchestrator_context(config, std::path::Path::new(cwd), task, attendance) {
         Ok(prepared) => Some(prepared.prompt),
         Err(e) => {
-            tracing::warn!(reason = %e, "could not publish the coordinator context");
+            tracing::warn!(reason = %e, "could not publish the orchestrator context");
             None
         }
     }
@@ -617,14 +617,14 @@ pub fn reassert_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> 
 // directory nor the destination. Those are what the code below is about.
 // ---------------------------------------------------------------------------
 
-/// The per-project directory the coordinator context is published in.
+/// The per-project directory the orchestrator context is published in.
 pub const CONTEXT_DIR_NAME: &str = ".dot-agent-deck";
 
 /// The file inside it. Matched by `read_back_context` and by every agent-facing
 /// instruction `build_orchestrator_context` emits.
 pub const CONTEXT_FILE_NAME: &str = "orchestrator-context.md";
 
-/// Upper bound on a composed coordinator context this process will write.
+/// Upper bound on a composed orchestrator context this process will write.
 ///
 /// **4 MiB.** The task is already bounded at the wire boundary
 /// ([`crate::bounded_read::MAX_TASK_BYTES`], 1 MiB) but the *composed* output is
@@ -638,7 +638,7 @@ pub const CONTEXT_FILE_NAME: &str = "orchestrator-context.md";
 /// still capped at a quarter of the protocol's own `MAX_FRAME_LEN`.
 ///
 /// Refused rather than truncated, for [`crate::bounded_read::read_capped`]'s
-/// reason: a silently shortened coordinator context is a wrong brief that looks
+/// reason: a silently shortened orchestrator context is a wrong brief that looks
 /// like a right one, and the agent acting on it has no way to tell.
 ///
 /// **Be honest about which caller this actually stops.** For the daemon verb it
@@ -667,7 +667,7 @@ pub struct PublishedContext {
     pub identity: Option<crate::prep_token::InodeIdentity>,
 }
 
-/// Why a coordinator context was not published.
+/// Why an orchestrator context was not published.
 ///
 /// Replaces the `Option` the old publish returned. The caller needs to know
 /// *why* — the daemon has to answer a client, and the daemon log needs the
@@ -727,22 +727,22 @@ impl ContextPublishError {
     pub fn detail(&self) -> String {
         match self {
             Self::ContextTooLarge(n) => format!(
-                "the composed coordinator context is {n} bytes; at most {MAX_CONTEXT_BYTES} can \
+                "the composed orchestrator context is {n} bytes; at most {MAX_CONTEXT_BYTES} can \
                  be published"
             ),
             Self::ContextDirIsSymlink => format!(
-                "{CONTEXT_DIR_NAME} is a symlink; the coordinator context must be published into \
+                "{CONTEXT_DIR_NAME} is a symlink; the orchestrator context must be published into \
                  a real directory in the project itself"
             ),
             Self::ContextDirGroupOrWorldWritable { mode, repair } => {
                 let why = match repair {
-                    Some(e) => format!("the deck could not chmod it: {e}"),
-                    None => "the deck cleared those bits and something put them straight back"
+                    Some(e) => format!("the daemon could not chmod it: {e}"),
+                    None => "the daemon cleared those bits and something put them straight back"
                         .to_string(),
                 };
                 format!(
                     "{CONTEXT_DIR_NAME} is mode {mode:04o}, which grants write to group or other; \
-                     another local account could replace the coordinator context's directory \
+                     another local account could replace the orchestrator context's directory \
                      entry after it is published, and {why}, so publishing is refused — \
                      `chmod go-w` the directory"
                 )
@@ -751,11 +751,11 @@ impl ContextPublishError {
                 format!("{CONTEXT_DIR_NAME} could not be created or opened as a directory: {e}")
             }
             Self::ContextDirReplaced => format!(
-                "{CONTEXT_DIR_NAME} was replaced while the coordinator context was being written"
+                "{CONTEXT_DIR_NAME} was replaced while the orchestrator context was being written"
             ),
             Self::TempCreate(e) => format!("could not create the temporary context file: {e}"),
             Self::TempWrite(e) => format!("could not write the temporary context file: {e}"),
-            Self::Publish(e) => format!("could not publish the coordinator context: {e}"),
+            Self::Publish(e) => format!("could not publish the orchestrator context: {e}"),
         }
     }
 
@@ -773,13 +773,13 @@ impl ContextPublishError {
     /// **Naming the path here discloses nothing the caller cannot already
     /// obtain, and that is checkable rather than a judgement call.** Every
     /// variant is reached only *after* the caller's path canonicalised and
-    /// resolved as a project — [`crate::project_resolve::prepare_workflow_for_wire`]
+    /// resolved as a project — [`crate::project_resolve::prepare_orchestration_for_wire`]
     /// publishes last, after the resolve, the revision gate and the orchestration
     /// lookup have all passed. A caller that reached this point can send the same
     /// path to `ResolveProject` and get the canonical spelling back in
     /// [`crate::event::ResolvedProject::path`], which is exactly the directory
     /// named here with `.dot-agent-deck` appended; on success the same string
-    /// comes back as [`crate::event::PreparedWorkflow::path`]. So the disclosure
+    /// comes back as [`crate::event::PreparedOrchestration::path`]. So the disclosure
     /// boundary this respects is unchanged — it is
     /// [`crate::project_resolve::generic_refusal`]'s, and that one guards
     /// **resolve failures**, where an arbitrary pasted path must not learn
@@ -806,28 +806,28 @@ impl ContextPublishError {
         );
         match self {
             Self::ContextTooLarge(n) => format!(
-                "the composed coordinator context is {n} bytes; at most {MAX_CONTEXT_BYTES} can \
+                "the composed orchestrator context is {n} bytes; at most {MAX_CONTEXT_BYTES} can \
                  be published"
             ),
             Self::ContextDirIsSymlink => format!(
-                "{dir} is a symlink, which is refused; the coordinator context must be published \
+                "{dir} is a symlink, which is refused; the orchestrator context must be published \
                  into a real directory in the project itself"
             ),
             Self::ContextDirGroupOrWorldWritable { mode, .. } => format!(
                 "{dir} is mode {mode:04o}, which grants write to group or other — another local \
-                 account could replace the coordinator context's directory entry after it is \
-                 published. The deck tried to clear those bits and could not, so publishing is \
-                 refused. On the machine running the deck, run: chmod go-w {}",
+                 account could replace the orchestrator context's directory entry after it is \
+                 published. The daemon tried to clear those bits and could not, so publishing is \
+                 refused. On the machine running the daemon, run: chmod go-w {}",
                 posix_single_quote(&dir)
             ),
             Self::ContextDirUnusable(_) => {
                 format!("{dir} could not be created or opened as a directory")
             }
             Self::ContextDirReplaced => {
-                format!("{dir} was replaced while the coordinator context was being written")
+                format!("{dir} was replaced while the orchestrator context was being written")
             }
             Self::TempCreate(_) | Self::TempWrite(_) | Self::Publish(_) => {
-                format!("the coordinator context could not be written to {dir}")
+                format!("the orchestrator context could not be written to {dir}")
             }
         }
     }
@@ -951,7 +951,7 @@ fn create_context_dir(dir: &std::path::Path) -> Result<(), ContextPublishError> 
 /// which is not the same claim.
 ///
 /// So the gap is closed at the boundary instead of being argued away:
-/// [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`] — the one verb
+/// [`crate::daemon_protocol::AttachRequest::PrepareOrchestration`] — the one verb
 /// that lets a **peer** name the directory this publish writes into — is refused
 /// on non-Unix with [`crate::daemon_protocol::PROJECT_ERR_UNSUPPORTED_PLATFORM`],
 /// and `crate::daemon_protocol::DAEMON_CAPABILITIES` does not advertise it
@@ -1218,7 +1218,7 @@ pub(crate) fn repair_context_dir_mode(
 /// process cannot collide, and two processes cannot either. It is only ever
 /// half of the guarantee — the create is `create_new`, so a collision fails
 /// loudly rather than clobbering — and it is hidden and suffixed so it can never
-/// be mistaken for a coordinator context by [`read_back_context`], which reads
+/// be mistaken for an orchestrator context by [`read_back_context`], which reads
 /// exactly [`CONTEXT_FILE_NAME`].
 fn temp_context_file_name() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1266,7 +1266,7 @@ fn temp_context_file_name() -> String {
 ///   so a concurrent reader sees either the previous context or the new one and
 ///   never a prefix of the new one. This is atomicity, **not durability**: no
 ///   `fsync` is issued, so a machine that loses power immediately afterwards may
-///   come back to either version. Publishing a coordinator context is
+///   come back to either version. Publishing an orchestrator context is
 ///   worth-redoing work, not a ledger.
 /// * **A destination symlink is replaced, not followed.** `rename(2)` operates
 ///   on the directory entry, so a `orchestrator-context.md` that is a symlink to
@@ -1278,7 +1278,7 @@ fn temp_context_file_name() -> String {
 /// A failure leaves the previous context — if any — exactly as it was, and
 /// removes the temp file. That, not the absence of a partially written
 /// destination alone, is what "a partial write must never be observable as a
-/// coordinator context" means.
+/// orchestrator context" means.
 ///
 /// **Blocking.** Async callers go through [`crate::project_resolve::run_bounded`].
 pub fn publish_orchestrator_context(
@@ -1601,7 +1601,7 @@ pub struct SweepReport {
 ///   which are removed on a failed publish but survive a process killed between
 ///   the create and the rename.
 ///
-/// [`CONTEXT_FILE_NAME`] is excluded by name: it is the live coordinator context,
+/// [`CONTEXT_FILE_NAME`] is excluded by name: it is the live orchestrator context,
 /// republished rather than accumulated, and an orchestration reads it long after
 /// its mtime stops moving.
 ///
@@ -1632,7 +1632,7 @@ pub(crate) fn is_sweepable_coordination_name(name: &str) -> bool {
 /// that ran backwards must not read as "ancient".
 ///
 /// **Best-effort by construction.** Every failure is counted and none is
-/// returned: the caller has just published a coordinator context successfully,
+/// returned: the caller has just published an orchestrator context successfully,
 /// and housekeeping that could not run is not a reason to fail a launch that
 /// did.
 pub fn sweep_coordination_files(
@@ -2791,7 +2791,7 @@ mod hygiene_tests {
             "the remedy must be a command the operator can paste: {sentence}"
         );
         assert!(
-            sentence.contains("machine running the deck"),
+            sentence.contains("machine running the daemon"),
             "a remote operator must be told WHICH machine to run it on: {sentence}"
         );
         assert!(
@@ -2861,7 +2861,7 @@ mod hygiene_tests {
     /// different expected string. The remedy is a POSIX command, and off Unix
     /// the check that produces this variant is a no-op —
     /// [`ensure_context_dir_owner_writable_only`] has no mode model to inspect
-    /// there, and `PrepareWorkflow` is refused outright with
+    /// there, and `PrepareOrchestration` is refused outright with
     /// `unsupported-platform` — so there is no Windows path on which this
     /// sentence is generated at all.
     #[cfg(unix)]
@@ -3055,7 +3055,7 @@ mod hygiene_tests {
     /// This is a deletion tool, so each rule gets a fixture that would be
     /// destroyed if the rule were dropped: a fresh file (inside the window), a
     /// non-`.md` file, a subdirectory, a symlink pointing at a file outside the
-    /// directory, and the live coordinator context itself.
+    /// directory, and the live orchestrator context itself.
     #[test]
     fn the_sweep_removes_only_aged_coordination_documents() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3111,7 +3111,7 @@ mod hygiene_tests {
         assert!(!aged_temp.exists(), "…and a leftover publish temp file");
         assert!(
             live_context.exists(),
-            "the live coordinator context is never swept"
+            "the live orchestrator context is never swept"
         );
         assert!(not_markdown.exists(), "a non-.md file is never swept");
         assert!(fresh.exists(), "a file inside the window is never swept");

@@ -1,5 +1,5 @@
 /**
- * The Decks section (PRD #741 M7) — add a remote deck, choose which one the app
+ * The Daemons section (PRD #741 M7) — add a remote daemon, choose which one the app
  * talks to, remove one, and test the connection (M10).
  *
  * It implements `SettingsPanelProps` and nothing else. The sheet does not know
@@ -358,7 +358,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
         `<label for>`, which is an ordinary grid item in both engines.)
       */}
       <div className="settings-row">
-        <span className="settings-row-label" id="deck-chooser-label">Deck</span>
+        <span className="settings-row-label" id="deck-chooser-label">Daemon</span>
         <div className="deck-choices" role="radiogroup" aria-labelledby="deck-chooser-label" data-testid="deck-choices">
           {choices.map((choice) => (
             <DeckChoice
@@ -371,15 +371,15 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
             />
           ))}
           <button className="add-deck" data-testid="add-deck" onClick={addDeck}>
-            <Plus size={13} /> Add a deck
+            <Plus size={13} /> Add a daemon
           </button>
         </div>
       </div>
 
       {fleetSelected && (
         <p className="settings-hint" data-testid="deck-fleet-note">
-          All Decks is every deck at once, so it has no settings and nothing to test. Choose a deck to
-          change or test that deck.
+          All daemons is every daemon at once, so it has no settings and nothing to test. Choose a daemon to
+          change or test that daemon.
         </p>
       )}
 
@@ -432,7 +432,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
           />
           <TextRow
             id={`deck-socket-${selected.id}`}
-            label="Deck socket"
+            label="Daemon socket"
             value={selected.socket ?? ""}
             placeholder={FIELD_PLACEHOLDERS.socket}
             problem={socketProblem(selected.socket ?? "")}
@@ -586,7 +586,7 @@ function TestResult({ report, mode }: { report: EndpointTestReportDto | undefine
           <>
             {report.forwards.length > 0 ? (
               <>
-                <p>This deck's tunnel will also carry, from your ssh config:</p>
+                <p>This daemon's tunnel will also carry, from your ssh config:</p>
                 {/* Keyed by position, not by text: `ssh -G` accumulates
                     forwards, so two matching `Host` blocks carrying the same
                     directive print the same line twice — and two unreadable
@@ -598,7 +598,7 @@ function TestResult({ report, mode }: { report: EndpointTestReportDto | undefine
                 </ul>
               </>
             ) : (
-              <p data-testid="deck-result-no-forwards">Your ssh config adds no forwards to this deck's tunnel.</p>
+              <p data-testid="deck-result-no-forwards">Your ssh config adds no forwards to this daemon's tunnel.</p>
             )}
             {/* Additive, so absence asserts nothing: ssh naming no host-key
                 source at all is what a local deck looks like, and claiming
@@ -606,7 +606,7 @@ function TestResult({ report, mode }: { report: EndpointTestReportDto | undefine
                 other direction. */}
             {report.knownHosts.length > 0 && (
               <>
-                <p>Host keys for this deck are checked against:</p>
+                <p>Host keys for this daemon are checked against:</p>
                 <ul data-testid="deck-result-known-hosts">
                   {report.knownHosts.map((source, index) => (
                     <li key={`${index}-${source}`}>{displayText(source, DISPLAY_LIMITS.path)}</li>
@@ -617,13 +617,13 @@ function TestResult({ report, mode }: { report: EndpointTestReportDto | undefine
           </>
         ) : (
           <p data-testid="deck-result-forwards-unknown">
-            This test could not read your resolved ssh config, so it cannot say what forwards this deck's
+            This test could not read your resolved ssh config, so it cannot say what forwards this daemon's
             tunnel will inherit or where its host keys are checked.
           </p>
         )}
       </div>
       {mode === "fixture" && (
-        <p className="settings-hint">Open the packaged app to reach a deck.</p>
+        <p className="settings-hint">Open the packaged app to reach a daemon.</p>
       )}
     </div>
   );

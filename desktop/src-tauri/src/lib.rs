@@ -49,7 +49,7 @@ use dot_agent_deck::daemon_client::{
 };
 use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{
-    AgentType, BroadcastMsg, EventType, PreparedWorkflow, ProjectRole, SendResult,
+    AgentType, BroadcastMsg, EventType, PreparedOrchestration, ProjectRole, SendResult,
 };
 use dot_agent_deck::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE;
 
@@ -73,10 +73,10 @@ use crate::dto::{
     BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionError,
     DesktopActionResult, DesktopAgentOption, DesktopDirectoryListing, DesktopNewAgentOptions,
     DesktopNewAgentOrchestrations, DesktopProjectListing, DesktopResolvedProject, DesktopSnapshot,
-    TerminalAttachResult, WorkflowRoleInput, desktop_agent_registry,
-    ensure_desktop_workflow_platform_supported, map_project_listing, map_resolved_project,
+    OrchestrationRoleInput, TerminalAttachResult, desktop_agent_registry,
+    ensure_desktop_orchestration_platform_supported, map_project_listing, map_resolved_project,
     mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id, validate_dimensions,
-    validate_pasted_project_path, validate_start_fields, validate_workflow_shape,
+    validate_orchestration_shape, validate_pasted_project_path, validate_start_fields,
 };
 use crate::secrets::{
     KeychainSecretStore, Secret, SecretError, SecretId, SecretStatus, SecretStore,
@@ -120,14 +120,14 @@ const SNAPSHOT_COALESCE_INTERVAL: Duration = Duration::from_millis(150);
 /// refuse any disagreement about the role set.
 ///
 /// PRD #819 M6: `configured` is now the daemon's projected role list
-/// ([`dot_agent_deck::event::ProjectRole`], off `prepare-workflow`) rather than
+/// ([`dot_agent_deck::event::ProjectRole`], off `prepare-orchestration`) rather than
 /// an `OrchestrationConfig` this process read off its own filesystem. The rule
 /// is unchanged — same names, same order, same start marker — but the authority
 /// for it moved to the machine the agents will actually run on.
-fn order_workflow_roles(
+fn order_orchestration_roles(
     configured: &[ProjectRole],
-    requested: &[WorkflowRoleInput],
-) -> Result<Vec<WorkflowRoleInput>, String> {
+    requested: &[OrchestrationRoleInput],
+) -> Result<Vec<OrchestrationRoleInput>, String> {
     let mut config_names = HashSet::with_capacity(configured.len());
     for role in configured {
         if !config_names.insert(role.name.as_str()) {
@@ -142,7 +142,7 @@ fn order_workflow_roles(
         .map(|role| (role.role.as_str(), role))
         .collect::<HashMap<_, _>>();
     if requested_by_name.len() != requested.len() {
-        return Err("workflow request contains duplicate role names".into());
+        return Err("orchestration request contains duplicate role names".into());
     }
 
     let mut ordered = Vec::with_capacity(configured.len());
@@ -151,13 +151,13 @@ fn order_workflow_roles(
             .remove(config_role.name.as_str())
             .ok_or_else(|| {
                 format!(
-                    "workflow is missing configured role: {}",
+                    "orchestration is missing configured role: {}",
                     safe_message(&config_role.name)
                 )
             })?;
         if requested_role.start != config_role.start {
             return Err(format!(
-                "workflow start marker for role {} does not match the orchestration the deck prepared",
+                "orchestration start marker for role {} does not match the orchestration the daemon prepared",
                 safe_message(&config_role.name)
             ));
         }
@@ -165,7 +165,7 @@ fn order_workflow_roles(
     }
     if let Some(extra) = requested_by_name.keys().next() {
         return Err(format!(
-            "workflow role is not present in the configured orchestration: {}",
+            "orchestration role is not present in the configured orchestration: {}",
             safe_message(extra)
         ));
     }
@@ -174,8 +174,8 @@ fn order_workflow_roles(
 
 /// PRD #819 M6: the launch preparation, performed **by the daemon**.
 ///
-/// What this replaced was `validate_workflow_against_project` plus
-/// `prepare_workflow_launch`: a `load_project_config` against the desktop's own
+/// What this replaced was `validate_orchestration_against_project` plus
+/// `prepare_orchestration_launch`: a `load_project_config` against the desktop's own
 /// filesystem, and a `prepare_orchestrator_prompt` that created a directory and
 /// wrote a file there. Against a remote daemon both read and wrote the WRONG
 /// machine, and neither errored — the launch validated against a config no agent
@@ -193,14 +193,14 @@ fn order_workflow_roles(
 /// Returns the roles in the orchestration's own order alongside the daemon's
 /// preparation, whose `path` is the canonical spelling the spawn must use and
 /// whose `prompt` is the one-liner the coordinator receives.
-async fn prepare_workflow_launch<D: WorkflowDaemon + Sync>(
+async fn prepare_orchestration_launch<D: OrchestrationDaemon + Sync>(
     daemon: &D,
     name: &str,
     cwd: &str,
     task_prompt: &str,
-    requested: &[WorkflowRoleInput],
+    requested: &[OrchestrationRoleInput],
     config_revision: Option<&str>,
-) -> Result<(Vec<WorkflowRoleInput>, PreparedWorkflow), String> {
+) -> Result<(Vec<OrchestrationRoleInput>, PreparedOrchestration), String> {
     let task_prompt = task_prompt.trim();
     if task_prompt.is_empty() {
         return Err("task prompt must not be empty".into());
@@ -214,7 +214,7 @@ async fn prepare_workflow_launch<D: WorkflowDaemon + Sync>(
         ));
     }
     let prepared = daemon
-        .prepare_workflow(cwd, name, task_prompt, config_revision)
+        .prepare_orchestration(cwd, name, task_prompt, config_revision)
         .await?;
     // Both are `#[serde(default)]` response fields, so an absent one decodes to
     // the empty string rather than failing to parse. Empty means "this daemon
@@ -223,26 +223,29 @@ async fn prepare_workflow_launch<D: WorkflowDaemon + Sync>(
     // close, and the prompt names a project-state file only the daemon wrote.
     if prepared.path.is_empty() {
         return Err(
-            "the deck prepared the workflow but reported no canonical project path; refusing to spawn against an unconfirmed directory"
+            "the daemon prepared the orchestration but reported no canonical project path; refusing to spawn against an unconfirmed directory"
                 .into(),
         );
     }
     if prepared.prompt.trim().is_empty() {
         return Err(
-            "the deck prepared the workflow but reported no coordinator prompt; the context would never be read"
+            "the daemon prepared the orchestration but reported no orchestrator prompt; the context would never be read"
                 .into(),
         );
     }
-    let roles = order_workflow_roles(&prepared.roles, requested)?;
-    validate_desktop_coordinator(&roles)?;
+    let roles = order_orchestration_roles(&prepared.roles, requested)?;
+    validate_desktop_orchestrator(&roles)?;
     Ok((roles, prepared))
 }
 
-/// PRD #819 audit fix: turn a **withheld** `prepare-workflow` into the outcome
-/// it actually is, rather than letting the launch fail on
-/// `DaemonCapabilities::require`'s uniform withhold sentence.
+/// PRD #819 audit fix: turn a **withheld** `prepare-orchestration` into the
+/// outcome it actually is, rather than letting the launch fail on
+/// `DaemonCapabilities::prepare_orchestration_spelling`'s uniform withhold
+/// sentence.
 ///
-/// The daemon strikes `prepare-workflow` from `DAEMON_CAPABILITIES` where the
+/// The daemon strikes both spellings of the prepare verb (`prepare-orchestration`
+/// and its legacy `prepare-workflow`, issue #1045) from `DAEMON_CAPABILITIES`
+/// where the
 /// publish cannot deliver the owner-only guarantee it documents — the mode
 /// bits, the `O_NOFOLLOW | O_DIRECTORY` open and the group/other-write refusal
 /// are all Unix, and the constant is `#[cfg(not(unix))]`-narrowed to the two
@@ -268,35 +271,36 @@ async fn prepare_workflow_launch<D: WorkflowDaemon + Sync>(
 fn ensure_daemon_can_prepare(
     capabilities: Option<&dot_agent_deck::daemon_client::DaemonCapabilities>,
 ) -> Result<(), String> {
-    use dot_agent_deck::daemon_protocol::{
-        CAP_LIST_PROJECTS, CAP_PREPARE_WORKFLOW, PROJECT_ERR_UNSUPPORTED_PLATFORM,
-    };
+    use dot_agent_deck::daemon_protocol::{CAP_LIST_PROJECTS, PROJECT_ERR_UNSUPPORTED_PLATFORM};
 
     let Some(capabilities) = capabilities else {
         return Ok(());
     };
     if !capabilities.is_advertised()
-        || capabilities.supports(CAP_PREPARE_WORKFLOW)
+        || capabilities.supports_prepare_orchestration()
         || !capabilities.supports(CAP_LIST_PROJECTS)
     {
         return Ok(());
     }
     Err(format!(
-        "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this deck offers the project verbs but withholds \
-         `{CAP_PREPARE_WORKFLOW}`, which is what a deck does when its platform cannot give the \
-         published coordinator context an owner-only guarantee. Nothing was started. Launch this \
-         workflow from the TUI on that deck's own host, or point the app at a deck on a Unix host."
+        "{PROJECT_ERR_UNSUPPORTED_PLATFORM}: this daemon offers the project verbs but cannot \
+         prepare an orchestration, which is what a daemon does when its platform cannot give the \
+         published orchestrator context an owner-only guarantee. Nothing was started. Activate this \
+         orchestration from the TUI on that daemon's own host, or point the app at a daemon on a Unix \
+         host."
     ))
 }
 
-fn validate_desktop_coordinator(roles: &[WorkflowRoleInput]) -> Result<&WorkflowRoleInput, String> {
+fn validate_desktop_orchestrator(
+    roles: &[OrchestrationRoleInput],
+) -> Result<&OrchestrationRoleInput, String> {
     let start_role = roles
         .iter()
         .find(|role| role.start)
-        .ok_or_else(|| "validated workflow has no start role".to_string())?;
+        .ok_or_else(|| "validated orchestration has no start role".to_string())?;
     if AgentType::from_command(Some(&start_role.command)) == Some(AgentType::Pi) {
         return Err(
-            "Pi cannot be the desktop workflow coordinator in this preview because its native seed delivery has no acknowledgement; choose a non-Pi coordinator or launch the orchestration from the TUI"
+            "Pi cannot be the desktop orchestration's orchestrator in this preview because its native seed delivery has no acknowledgement; choose a non-Pi orchestrator or activate the orchestration from the TUI"
                 .into(),
         );
     }
@@ -304,10 +308,10 @@ fn validate_desktop_coordinator(roles: &[WorkflowRoleInput]) -> Result<&Workflow
 }
 
 #[allow(clippy::too_many_arguments)]
-fn workflow_start_options(
+fn orchestration_start_options(
     name: &str,
     cwd: &str,
-    role: &WorkflowRoleInput,
+    role: &OrchestrationRoleInput,
     role_index: usize,
     orchestration_id: &str,
     pane_id: String,
@@ -331,33 +335,33 @@ fn workflow_start_options(
             orchestration_id: Some(orchestration_id.to_string()),
         }),
         agent_type: AgentType::from_command(Some(&role.command)),
-        // Desktop workflow coordinators always use the acknowledged delivery
+        // Desktop orchestrators always use the acknowledged delivery
         // path below. Pi coordinators are rejected before this builder runs.
         seed: None,
     }
 }
 
 #[allow(async_fn_in_trait)]
-trait WorkflowDaemon {
+trait OrchestrationDaemon {
     type ReadinessWatch;
 
     /// PRD #819 M6: ask the daemon to resolve the project, compose the
     /// coordinator context and publish it. The only step of a launch that
     /// writes, and it happens on the daemon's filesystem rather than this one's.
-    async fn prepare_workflow(
+    async fn prepare_orchestration(
         &self,
         cwd: &str,
         orchestration: &str,
         task: &str,
         config_revision: Option<&str>,
-    ) -> Result<PreparedWorkflow, String>;
+    ) -> Result<PreparedOrchestration, String>;
 
     /// `prep_token` is the one the preparation handed back. A token routes the
     /// spawn onto `start-prepared-agent`, where the token is a required field,
     /// so a daemon that does not know that verb refuses the request outright and
     /// the launch fails closed with nothing started. It is a staleness check and
     /// not an authorization — see `dot_agent_deck::prep_token`'s module doc.
-    async fn start_workflow_agent(
+    async fn start_orchestration_agent(
         &self,
         options: StartAgentOptions,
         prep_token: Option<&str>,
@@ -374,8 +378,8 @@ trait WorkflowDaemon {
     /// The agent type the deck recorded for `agent_id` at spawn — for a
     /// configured role, the role's resolved type. `None` when it recorded none.
     async fn launched_agent_type(&self, agent_id: &str) -> Result<Option<AgentType>, String>;
-    async fn stop_workflow_agent(&self, agent_id: &str) -> Result<(), String>;
-    async fn reconcile_workflow_agent(
+    async fn stop_orchestration_agent(&self, agent_id: &str) -> Result<(), String>;
+    async fn reconcile_orchestration_agent(
         &self,
         pane_id: &str,
         orchestration_id: &str,
@@ -402,25 +406,25 @@ trait WorkflowDaemon {
     fn now(&self) -> std::time::Instant;
 }
 
-impl WorkflowDaemon for DaemonClient {
+impl OrchestrationDaemon for DaemonClient {
     /// Issue #1028: the cancel-safe end of a drained
     /// [`EventSubscription`], not the subscription itself. See
     /// [`Self::begin_coordinator_readiness`].
     type ReadinessWatch = tokio::sync::mpsc::Receiver<BroadcastMsg>;
 
-    async fn prepare_workflow(
+    async fn prepare_orchestration(
         &self,
         cwd: &str,
         orchestration: &str,
         task: &str,
         config_revision: Option<&str>,
-    ) -> Result<PreparedWorkflow, String> {
-        DaemonClient::prepare_workflow(self, cwd, orchestration, task, config_revision)
+    ) -> Result<PreparedOrchestration, String> {
+        DaemonClient::prepare_orchestration(self, cwd, orchestration, task, config_revision)
             .await
             .map_err(|error| safe_message(error.to_string()))
     }
 
-    async fn start_workflow_agent(
+    async fn start_orchestration_agent(
         &self,
         options: StartAgentOptions,
         prep_token: Option<&str>,
@@ -442,7 +446,7 @@ impl WorkflowDaemon for DaemonClient {
 
     async fn launched_agent_type(&self, agent_id: &str) -> Result<Option<AgentType>, String> {
         let records = crate::daemon_bridge::bounded_reply(
-            "ListAgents for the coordinator's agent type",
+            "ListAgents for the orchestrator's agent type",
             self.list_agents(),
         )
         .await?;
@@ -450,16 +454,18 @@ impl WorkflowDaemon for DaemonClient {
             .into_iter()
             .find(|record| record.id == agent_id)
             .map(|record| record.agent_type)
-            .ok_or_else(|| "the deck no longer lists the coordinator it just started".to_string())
+            .ok_or_else(|| {
+                "the daemon no longer lists the orchestrator it just started".to_string()
+            })
     }
 
-    async fn stop_workflow_agent(&self, agent_id: &str) -> Result<(), String> {
+    async fn stop_orchestration_agent(&self, agent_id: &str) -> Result<(), String> {
         self.stop_agent(agent_id)
             .await
             .map_err(|error| safe_message(error.to_string()))
     }
 
-    async fn reconcile_workflow_agent(
+    async fn reconcile_orchestration_agent(
         &self,
         pane_id: &str,
         orchestration_id: &str,
@@ -468,7 +474,7 @@ impl WorkflowDaemon for DaemonClient {
         let records = match tokio::time::timeout(timeout, self.list_agents()).await {
             Ok(Ok(records)) => records,
             Ok(Err(error)) => return Err(safe_message(error.to_string())),
-            Err(_) => return Err("workflow spawn reconciliation RPC timed out".into()),
+            Err(_) => return Err("orchestration spawn reconciliation RPC timed out".into()),
         };
         Ok(records
             .into_iter()
@@ -500,7 +506,7 @@ impl WorkflowDaemon for DaemonClient {
         // frames that follow — those are read inside that task, under no
         // deadline.
         let mut subscription = crate::daemon_bridge::bounded_reply(
-            "SubscribeEvents for coordinator readiness",
+            "SubscribeEvents for orchestrator readiness",
             self.subscribe_events(),
         )
         .await?;
@@ -570,7 +576,7 @@ impl WorkflowDaemon for DaemonClient {
                     // unchanged, because `deliver_coordinator_prompt` treats
                     // every `Err` the same way: wait out the rest of the
                     // readiness budget and deliver the seed with no session id.
-                    None => return Err("coordinator readiness stream ended".to_string()),
+                    None => return Err("orchestrator readiness stream ended".to_string()),
                 }
             }
         };
@@ -603,7 +609,7 @@ impl WorkflowDaemon for DaemonClient {
         {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => Err(safe_message(error.to_string())),
-            Err(_) => Err("coordinator prompt delivery RPC timed out".into()),
+            Err(_) => Err("orchestrator prompt delivery RPC timed out".into()),
         }
     }
 
@@ -617,7 +623,7 @@ impl WorkflowDaemon for DaemonClient {
 }
 
 #[derive(Debug)]
-struct WorkflowLaunchResult {
+struct OrchestrationLaunchResult {
     start_agent_id: String,
     agent_ids: Vec<String>,
 }
@@ -634,12 +640,12 @@ struct WorkflowLaunchResult {
 /// connection and never answered left the roles already started running for as
 /// long as the peer held the socket, with the rollback that would stop them
 /// queued behind the wait.
-const WORKFLOW_ROLE_START_TIMEOUT: Duration = crate::daemon_bridge::DECK_REPLY_TIMEOUT;
+const ORCHESTRATION_ROLE_START_TIMEOUT: Duration = crate::daemon_bridge::DECK_REPLY_TIMEOUT;
 
 /// PRD #1223 audit F4: how long ONE rollback stop may take. Each stop is
 /// bounded on its own, so a stop the deck never answers costs this and the
 /// rollback moves on to the next role instead of waiting behind it.
-const WORKFLOW_ROLE_STOP_TIMEOUT: Duration = crate::daemon_bridge::DECK_REPLY_TIMEOUT;
+const ORCHESTRATION_ROLE_STOP_TIMEOUT: Duration = crate::daemon_bridge::DECK_REPLY_TIMEOUT;
 
 /// A role a launch started (or found started by reconciliation), which a
 /// rollback must stop.
@@ -656,7 +662,7 @@ struct UnconfirmedStop {
     reason: String,
 }
 
-/// What [`rollback_workflow_agents`] did: how many roles it was asked to stop,
+/// What [`rollback_orchestration_agents`] did: how many roles it was asked to stop,
 /// and EVERY one whose stop it could not confirm.
 #[derive(Debug)]
 struct RollbackOutcome {
@@ -685,11 +691,11 @@ impl RollbackOutcome {
 
 /// Stop every started role, newest first.
 ///
-/// Each stop is bounded by [`WORKFLOW_ROLE_STOP_TIMEOUT`] on its own (PRD #1223
+/// Each stop is bounded by [`ORCHESTRATION_ROLE_STOP_TIMEOUT`] on its own (PRD #1223
 /// audit F4), and a stop that fails or times out is recorded and the rollback
 /// CONTINUES — the roles behind a wedged stop are still stopped, and the
 /// outcome names every role whose stop was not confirmed rather than the first.
-async fn rollback_workflow_agents<D: WorkflowDaemon + Sync>(
+async fn rollback_orchestration_agents<D: OrchestrationDaemon + Sync>(
     daemon: &D,
     started: &[StartedRole],
 ) -> RollbackOutcome {
@@ -705,26 +711,26 @@ async fn rollback_workflow_agents<D: WorkflowDaemon + Sync>(
     }
 }
 
-/// One role's stop under [`WORKFLOW_ROLE_STOP_TIMEOUT`]: `None` when the deck
+/// One role's stop under [`ORCHESTRATION_ROLE_STOP_TIMEOUT`]: `None` when the deck
 /// confirmed it, otherwise the role and why it is not confirmed — refused, or
 /// not answered within the bound. Shared by the rollback, which stops roles
 /// one after another, and by [`stop_roles_concurrently`].
-async fn bounded_role_stop<D: WorkflowDaemon + Sync>(
+async fn bounded_role_stop<D: OrchestrationDaemon + Sync>(
     daemon: &D,
     role: &StartedRole,
 ) -> Option<UnconfirmedStop> {
     let reason = match tokio::time::timeout(
-        WORKFLOW_ROLE_STOP_TIMEOUT,
-        daemon.stop_workflow_agent(&role.agent_id),
+        ORCHESTRATION_ROLE_STOP_TIMEOUT,
+        daemon.stop_orchestration_agent(&role.agent_id),
     )
     .await
     {
         Ok(Ok(())) => return None,
         Ok(Err(error)) => format!("{}: {}", safe_message(&role.agent_id), safe_message(error)),
         Err(_) => format!(
-            "{}: the deck did not answer the stop within {}s",
+            "{}: the daemon did not answer the stop within {}s",
             safe_message(&role.agent_id),
-            WORKFLOW_ROLE_STOP_TIMEOUT.as_secs()
+            ORCHESTRATION_ROLE_STOP_TIMEOUT.as_secs()
         ),
     };
     Some(UnconfirmedStop {
@@ -734,13 +740,13 @@ async fn bounded_role_stop<D: WorkflowDaemon + Sync>(
 }
 
 /// PRD #1223 U4 — stop every one of `roles` at once, each under its own
-/// [`WORKFLOW_ROLE_STOP_TIMEOUT`], and return one outcome per role, aligned
+/// [`ORCHESTRATION_ROLE_STOP_TIMEOUT`], and return one outcome per role, aligned
 /// with `roles`: `None` for a confirmed stop, otherwise why it is not.
 ///
 /// Concurrent, as the TUI's Ctrl+W closes a tab's panes
 /// (`close_panes_concurrently`): the stops are independent, so a wedged one
 /// costs one bound for the whole close rather than one per role behind it.
-async fn stop_roles_concurrently<D: WorkflowDaemon + Sync>(
+async fn stop_roles_concurrently<D: OrchestrationDaemon + Sync>(
     daemon: &D,
     roles: &[StartedRole],
 ) -> Vec<Option<UnconfirmedStop>> {
@@ -784,20 +790,20 @@ async fn join_ordered<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output>
         .collect()
 }
 
-/// One role's start under [`WORKFLOW_ROLE_START_TIMEOUT`], with the elapsed
+/// One role's start under [`ORCHESTRATION_ROLE_START_TIMEOUT`], with the elapsed
 /// case reported as an ordinary — and INDETERMINATE — start failure, which is
 /// what sends it through the caller's reconciliation, so a start that landed
 /// although its reply never arrived is found and stopped with the rest.
 async fn bounded_role_start<T>(
     start: impl std::future::Future<Output = Result<T, RoleStartFailure>>,
 ) -> Result<T, RoleStartFailure> {
-    match tokio::time::timeout(WORKFLOW_ROLE_START_TIMEOUT, start).await {
+    match tokio::time::timeout(ORCHESTRATION_ROLE_START_TIMEOUT, start).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(failure)) => Err(failure),
         Err(_) => Err(RoleStartFailure {
             message: format!(
-                "the deck did not answer the start within {}s",
-                WORKFLOW_ROLE_START_TIMEOUT.as_secs()
+                "the daemon did not answer the start within {}s",
+                ORCHESTRATION_ROLE_START_TIMEOUT.as_secs()
             ),
             indeterminate: true,
         }),
@@ -856,7 +862,7 @@ impl RoleStartFailure {
     }
 }
 
-/// Why [`launch_configured_orchestration`] or [`launch_workflow`] failed: the
+/// Why [`launch_configured_orchestration`] or [`launch_orchestration`] failed: the
 /// whole sentence, and — as data, not prose (PRD #1223 audits F6 and V2) —
 /// every role it could not confirm is stopped, which
 /// [`crate::dto::DesktopActionError::launch`] carries to the webview.
@@ -896,7 +902,7 @@ impl From<String> for LaunchFailure {
     }
 }
 
-async fn deliver_coordinator_prompt<D: WorkflowDaemon + Sync>(
+async fn deliver_coordinator_prompt<D: OrchestrationDaemon + Sync>(
     daemon: &D,
     readiness: &mut D::ReadinessWatch,
     pane_id: &str,
@@ -944,7 +950,7 @@ async fn deliver_coordinator_prompt<D: WorkflowDaemon + Sync>(
         let elapsed = daemon.now().saturating_duration_since(created_at);
         if elapsed >= AUTOMATIC_PROMPT_DEADLINE {
             return Err(format!(
-                "coordinator context was not delivered before the {}s deadline{}",
+                "orchestrator context was not delivered before the {}s deadline{}",
                 AUTOMATIC_PROMPT_DEADLINE.as_secs(),
                 last_failure
                     .as_deref()
@@ -968,7 +974,7 @@ async fn deliver_coordinator_prompt<D: WorkflowDaemon + Sync>(
             Ok(SendResult::Applied | SendResult::Queued) => return Ok(()),
             Ok(result) if is_terminal_send_result(result) => {
                 return Err(format!(
-                    "coordinator context delivery was terminal: {}",
+                    "orchestrator context delivery was terminal: {}",
                     describe_send_result(result)
                 ));
             }
@@ -990,18 +996,18 @@ async fn deliver_coordinator_prompt<D: WorkflowDaemon + Sync>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn launch_workflow<D: WorkflowDaemon + Sync>(
+async fn launch_orchestration<D: OrchestrationDaemon + Sync>(
     daemon: &D,
     name: &str,
     cwd: &str,
-    roles: &[WorkflowRoleInput],
+    roles: &[OrchestrationRoleInput],
     rows: u16,
     cols: u16,
     orchestration_id: &str,
     orchestrator_seed: &str,
     prep_token: Option<&str>,
-) -> Result<WorkflowLaunchResult, LaunchFailure> {
-    validate_desktop_coordinator(roles)?;
+) -> Result<OrchestrationLaunchResult, LaunchFailure> {
+    validate_desktop_orchestrator(roles)?;
     let created_at = daemon.now();
     // Subscribe before the first spawn so a fast Claude SessionStart cannot be
     // lost between process creation and readiness observation.
@@ -1026,7 +1032,7 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
         // has already started. A token-less start is byte-for-byte unchanged and
         // spends no extra round trip on a preparation it does not have.
         let pane_id = mint_desktop_pane_id();
-        let options = workflow_start_options(
+        let options = orchestration_start_options(
             name,
             cwd,
             role,
@@ -1039,7 +1045,7 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
         // PRD #1223 audit F4: bounded, as the New agent flow's configured
         // starts are — the rollback below is shared, and a wedged start would
         // otherwise hold every role already started running behind it.
-        match bounded_role_start(daemon.start_workflow_agent(options, prep_token)).await {
+        match bounded_role_start(daemon.start_orchestration_agent(options, prep_token)).await {
             Ok(agent_id) => {
                 if role.start {
                     start_target = Some((pane_id, agent_id.clone()));
@@ -1067,7 +1073,7 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
                     .as_ref()
                     .map(|stop| format!("; cleanup uncertainty: {}", stop.reason))
                     .unwrap_or_default();
-                let rollback = rollback_workflow_agents(daemon, &started).await;
+                let rollback = rollback_orchestration_agents(daemon, &started).await;
                 // PRD #1223 audit V2: the roles it could not confirm travel as
                 // data, as the New agent launch's do, so the Runs screen puts
                 // the cleanup warning ahead of any refusal code this sentence
@@ -1075,7 +1081,7 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
                 // started is exactly such a composite.
                 return Err(LaunchFailure::after_rollback(
                     format!(
-                        "failed to start workflow role {}: {}; {}{reconciliation_note}",
+                        "failed to activate orchestration role {}: {}; {}{reconciliation_note}",
                         safe_message(&role.role),
                         safe_message(failure.message),
                         rollback.describe(),
@@ -1088,10 +1094,10 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
     }
 
     let Some((start_pane_id, start_agent_id)) = start_target else {
-        let rollback = rollback_workflow_agents(daemon, &started).await;
+        let rollback = rollback_orchestration_agents(daemon, &started).await;
         return Err(LaunchFailure::after_rollback(
             format!(
-                "validated workflow did not start a coordinator; {}",
+                "validated orchestration did not start an orchestrator; {}",
                 rollback.describe()
             ),
             &rollback,
@@ -1108,10 +1114,10 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
     )
     .await
     {
-        let rollback = rollback_workflow_agents(daemon, &started).await;
+        let rollback = rollback_orchestration_agents(daemon, &started).await;
         return Err(LaunchFailure::after_rollback(
             format!(
-                "workflow coordinator context delivery failed: {}; {}",
+                "orchestration orchestrator context delivery failed: {}; {}",
                 safe_message(error),
                 rollback.describe()
             ),
@@ -1120,7 +1126,7 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
         ));
     }
 
-    Ok(WorkflowLaunchResult {
+    Ok(OrchestrationLaunchResult {
         start_agent_id,
         agent_ids: started.into_iter().map(|role| role.agent_id).collect(),
     })
@@ -1136,7 +1142,7 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
 /// have reached the deck — it found nothing although the deck may still spawn
 /// the role once whatever held its reply clears. Either way the rollback will
 /// not stop it, so the caller reports it as cleanup it could not confirm.
-async fn reconcile_failed_start<D: WorkflowDaemon + Sync>(
+async fn reconcile_failed_start<D: OrchestrationDaemon + Sync>(
     daemon: &D,
     started: &mut Vec<StartedRole>,
     pane_id: &str,
@@ -1145,7 +1151,7 @@ async fn reconcile_failed_start<D: WorkflowDaemon + Sync>(
     indeterminate: bool,
 ) -> Option<UnconfirmedStop> {
     match daemon
-        .reconcile_workflow_agent(pane_id, orchestration_id, COORDINATOR_DELIVERY_RPC_TIMEOUT)
+        .reconcile_orchestration_agent(pane_id, orchestration_id, COORDINATOR_DELIVERY_RPC_TIMEOUT)
         .await
     {
         Ok(Some(agent_id)) => {
@@ -1160,8 +1166,8 @@ async fn reconcile_failed_start<D: WorkflowDaemon + Sync>(
         Ok(None) if !indeterminate => None,
         Ok(None) => Some(UnconfirmedStop {
             role: role.to_string(),
-            reason: "the role's start was not answered, so the deck may have received it, and \
-                     the deck did not list the role afterwards; if it starts late it will not \
+            reason: "the role's start was not answered, so the daemon may have received it, and \
+                     the daemon did not list the role afterwards; if it starts late it will not \
                      be stopped"
                 .to_string(),
         }),
@@ -1178,7 +1184,7 @@ async fn reconcile_failed_start<D: WorkflowDaemon + Sync>(
 /// What an orchestration launch aimed at a deck that cannot start a role with
 /// its configured command answers (PRD #1223 M6), and the reason the New agent
 /// form shows in place of the orchestration chips on such a deck.
-const CONFIGURED_ROLE_COMMAND_UNSUPPORTED: &str = "This deck cannot start orchestration roles with their configured commands, so its orchestrations are not offered here. Nothing was started. Launch them from the TUI on that deck's host, or upgrade the deck.";
+const CONFIGURED_ROLE_COMMAND_UNSUPPORTED: &str = "This daemon cannot start orchestration roles with their configured commands, so its orchestrations are not offered here. Nothing was started. Activate them from the TUI on that daemon's host, or upgrade the daemon.";
 
 /// One role of a configured orchestration launch (PRD #1223 M6), as
 /// `StartPreparedAgent` with `use_configured_command` receives it: no
@@ -1227,7 +1233,7 @@ fn configured_role_start_options(
 /// does — every role with the command its project config gives it, started on
 /// the deck in the order the preparation listed them.
 ///
-/// It is [`launch_workflow`]'s sibling rather than a mode of it, because the
+/// It is [`launch_orchestration`]'s sibling rather than a mode of it, because the
 /// Runs launch's form rules are exactly what this flow must not inherit: that
 /// one builds each role's command from desktop agent profiles and refuses a Pi
 /// coordinator. What they share is the machinery around the spawns — the
@@ -1252,24 +1258,24 @@ fn configured_role_start_options(
 /// failure. A deck that does not advertise `prepared-role-command` is answered
 /// by the client library without sending anything, and is reported as that.
 #[allow(clippy::too_many_arguments)]
-async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
+async fn launch_configured_orchestration<D: OrchestrationDaemon + Sync>(
     daemon: &D,
     orchestration: &str,
     display_title: Option<&str>,
-    prepared: &PreparedWorkflow,
+    prepared: &PreparedOrchestration,
     rows: u16,
     cols: u16,
     orchestration_id: &str,
-) -> Result<WorkflowLaunchResult, LaunchFailure> {
+) -> Result<OrchestrationLaunchResult, LaunchFailure> {
     if prepared.roles.iter().filter(|role| role.start).count() != 1 {
         return Err(
-            "the deck prepared an orchestration without exactly one start role; nothing was started"
+            "the daemon prepared an orchestration without exactly one start role; nothing was started"
                 .to_string()
                 .into(),
         );
     }
     let created_at = daemon.now();
-    // Subscribed before the first spawn, for `launch_workflow`'s reason: a fast
+    // Subscribed before the first spawn, for `launch_orchestration`'s reason: a fast
     // SessionStart must not be lost between the spawn and the wait.
     let mut readiness = daemon.begin_coordinator_readiness().await?;
     let mut started: Vec<StartedRole> = Vec::with_capacity(prepared.roles.len());
@@ -1342,7 +1348,7 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
                 (safe_message(failure.message), uncertain)
             }
         };
-        let rollback = rollback_workflow_agents(daemon, &started).await;
+        let rollback = rollback_orchestration_agents(daemon, &started).await;
         let reconciliation_note = uncertain
             .as_ref()
             .map(|stop| format!("; cleanup uncertainty: {}", stop.reason))
@@ -1359,10 +1365,10 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
     }
 
     let Some((start_pane_id, start_agent_id)) = start_target else {
-        let rollback = rollback_workflow_agents(daemon, &started).await;
+        let rollback = rollback_orchestration_agents(daemon, &started).await;
         return Err(LaunchFailure::after_rollback(
             format!(
-                "the orchestration started no coordinator; {}",
+                "the orchestration started no orchestrator; {}",
                 rollback.describe()
             ),
             &rollback,
@@ -1372,10 +1378,10 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
     let delivered_by_deck = match daemon.launched_agent_type(&start_agent_id).await {
         Ok(agent_type) => agent_type == Some(AgentType::Pi),
         Err(error) => {
-            let rollback = rollback_workflow_agents(daemon, &started).await;
+            let rollback = rollback_orchestration_agents(daemon, &started).await;
             return Err(LaunchFailure::after_rollback(
                 format!(
-                    "could not tell how the coordinator receives its context: {}; {}",
+                    "could not tell how the orchestrator receives its context: {}; {}",
                     safe_message(error),
                     rollback.describe()
                 ),
@@ -1395,10 +1401,10 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
         )
         .await
     {
-        let rollback = rollback_workflow_agents(daemon, &started).await;
+        let rollback = rollback_orchestration_agents(daemon, &started).await;
         return Err(LaunchFailure::after_rollback(
             format!(
-                "orchestration coordinator context delivery failed: {}; {}",
+                "orchestrator context delivery failed: {}; {}",
                 safe_message(error),
                 rollback.describe()
             ),
@@ -1407,7 +1413,7 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
         ));
     }
 
-    Ok(WorkflowLaunchResult {
+    Ok(OrchestrationLaunchResult {
         start_agent_id,
         agent_ids: started.into_iter().map(|role| role.agent_id).collect(),
     })
@@ -1440,7 +1446,7 @@ fn ensure_explicit_start_connected(
         .connection
         .error
         .clone()
-        .unwrap_or_else(|| "the local deck did not become connected".into()))
+        .unwrap_or_else(|| "the local daemon did not become connected".into()))
 }
 
 async fn refresh_and_emit(app: &AppHandle, links: &DaemonLinks) -> DesktopSnapshot {
@@ -2746,7 +2752,7 @@ fn validate_voice_directories(directories: &voice::VoiceDirectories) -> Result<(
         })
     {
         return Err(
-            "the directory listing sent with that command is larger than any deck lists"
+            "the directory listing sent with that command is larger than any daemon lists"
                 .to_string(),
         );
     }
@@ -2810,7 +2816,7 @@ fn validate_voice_deck_step(deck_step: &[voice::VoiceDeckChoice]) -> Result<(), 
         })
     {
         return Err(
-            "the deck list sent with that command is larger than any fleet shows".to_string(),
+            "the daemon list sent with that command is larger than any fleet shows".to_string(),
         );
     }
     Ok(())
@@ -2957,7 +2963,12 @@ fn voice_decks(
             voice::VoiceDeck {
                 id: deck.deck_id.clone(),
                 label: if local || deck.label.trim().is_empty() {
-                    if local { "Local deck" } else { "Remote deck" }.to_string()
+                    if local {
+                        "Local daemon"
+                    } else {
+                        "Remote daemon"
+                    }
+                    .to_string()
                 } else {
                     deck.label.clone()
                 },
@@ -3134,7 +3145,7 @@ async fn apply_selection(app: &AppHandle, state: &DesktopState, settings: &Deskt
 /// deck. An id the app no longer observes is refused with the resolve error,
 /// before anything is asked of any deck.
 ///
-/// The stop is bounded by [`WORKFLOW_ROLE_STOP_TIMEOUT`], so a deck that takes
+/// The stop is bounded by [`ORCHESTRATION_ROLE_STOP_TIMEOUT`], so a deck that takes
 /// the connection and never answers ends the action with a sentence rather
 /// than holding the confirmation open.
 async fn stop_agent_action(
@@ -3147,7 +3158,7 @@ async fn stop_agent_action(
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
     match tokio::time::timeout(
-        WORKFLOW_ROLE_STOP_TIMEOUT,
+        ORCHESTRATION_ROLE_STOP_TIMEOUT,
         daemon.client.stop_agent(agent_id),
     )
     .await
@@ -3156,8 +3167,8 @@ async fn stop_agent_action(
         Ok(Err(error)) => return Err(safe_message(error.to_string())),
         Err(_) => {
             return Err(format!(
-                "the deck did not answer the stop within {}s",
-                WORKFLOW_ROLE_STOP_TIMEOUT.as_secs()
+                "the daemon did not answer the stop within {}s",
+                ORCHESTRATION_ROLE_STOP_TIMEOUT.as_secs()
             ));
         }
     }
@@ -3272,9 +3283,9 @@ struct StartAgentRequest {
 /// and stays open: the deck is fine, it simply cannot compose the seed.
 fn authoring_unsupported_message(kind: AuthoringKind) -> String {
     format!(
-        "This deck cannot start a `{}` agent: it predates daemon-composed authoring seeds, and \
-         would start a plain agent with no seed. Nothing was started. Start it from the TUI on \
-         that deck's host, or upgrade the deck.",
+        "This daemon cannot start a `{}` agent: it predates daemon-composed authoring seeds, and \
+         would start a plain agent with no seed. Nothing was started. Create it from the TUI on \
+         that daemon's host, or upgrade the daemon.",
         kind.as_str()
     )
 }
@@ -3363,7 +3374,7 @@ async fn start_agent_action(
     if let Some(kind) = authoring_kind {
         if command.is_none() {
             return Err(format!(
-                "a `{}` agent needs a command that starts an agent; an empty one would start the deck's default shell",
+                "a `{}` agent needs a command that starts an agent; an empty one would start the daemon's default shell",
                 kind.as_str()
             ));
         }
@@ -3413,19 +3424,19 @@ async fn start_agent_action(
     Ok(StartedAgent { agent_id, scope })
 }
 
-/// One plain or authoring start under [`WORKFLOW_ROLE_START_TIMEOUT`] (PRD #1223
+/// One plain or authoring start under [`ORCHESTRATION_ROLE_START_TIMEOUT`] (PRD #1223
 /// audit F4). The elapsed case says what it is: the deck may still start the
 /// agent, so the user is told to look before starting a second one.
 async fn bounded_plain_start<T, E: std::fmt::Display>(
     start: impl std::future::Future<Output = Result<T, E>>,
 ) -> Result<T, String> {
-    match tokio::time::timeout(WORKFLOW_ROLE_START_TIMEOUT, start).await {
+    match tokio::time::timeout(ORCHESTRATION_ROLE_START_TIMEOUT, start).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(safe_message(error.to_string())),
         Err(_) => Err(format!(
-            "the deck did not answer the start within {}s; the agent may still appear, so check \
-             the deck before starting it again",
-            WORKFLOW_ROLE_START_TIMEOUT.as_secs()
+            "the daemon did not answer the start within {}s; the agent may still appear, so check \
+             the daemon before starting it again",
+            ORCHESTRATION_ROLE_START_TIMEOUT.as_secs()
         )),
     }
 }
@@ -3450,19 +3461,19 @@ struct StartedOrchestration {
     scope: crate::dto::DeckScope,
 }
 
-/// [`DesktopAction::StartWorkflow`]'s fields, unpacked for
-/// [`start_workflow_action`].
-struct StartWorkflowRequest {
+/// [`DesktopAction::ActivateOrchestration`]'s fields, unpacked for
+/// [`activate_orchestration_action`].
+struct ActivateOrchestrationRequest {
     name: String,
     cwd: String,
     task_prompt: String,
-    roles: Vec<WorkflowRoleInput>,
+    roles: Vec<OrchestrationRoleInput>,
     rows: Option<u16>,
     cols: Option<u16>,
     config_revision: Option<String>,
 }
 
-/// The Runs screen's workflow launch ([`DesktopAction::StartWorkflow`]).
+/// The Runs screen's orchestration launch ([`DesktopAction::ActivateOrchestration`]).
 ///
 /// # It launches on the SELECTED deck, and never under All Decks
 ///
@@ -3475,11 +3486,11 @@ struct StartWorkflowRequest {
 /// state; this is the backstop. Split out of the action arm so that property
 /// can be driven against a real daemon
 /// (`daemon_bridge::tests::a_runs_launch_under_all_decks_never_reaches_the_local_deck`).
-async fn start_workflow_action(
+async fn activate_orchestration_action(
     state: &DesktopState,
-    request: StartWorkflowRequest,
-) -> Result<WorkflowLaunchResult, DesktopActionError> {
-    let StartWorkflowRequest {
+    request: ActivateOrchestrationRequest,
+) -> Result<OrchestrationLaunchResult, DesktopActionError> {
+    let ActivateOrchestrationRequest {
         name,
         cwd,
         task_prompt,
@@ -3488,20 +3499,20 @@ async fn start_workflow_action(
         cols,
         config_revision,
     } = request;
-    ensure_desktop_workflow_platform_supported(std::env::consts::OS)?;
+    ensure_desktop_orchestration_platform_supported(std::env::consts::OS)?;
     let (rows, cols) =
-        validate_workflow_shape(&name, &cwd, &roles, rows.unwrap_or(32), cols.unwrap_or(120))?;
+        validate_orchestration_shape(&name, &cwd, &roles, rows.unwrap_or(32), cols.unwrap_or(120))?;
     // PRD #819 M6: the connection comes FIRST now. Resolution used to
     // run two lines above the first daemon contact, against this
     // process's own filesystem; it now runs on the daemon's, so a
     // connection has to exist before a launch can be prepared at all.
     // The supported non-Pi coordinator still uses the readiness-gated,
-    // identity-bound retry path in `launch_workflow`; Pi is rejected
+    // identity-bound retry path in `launch_orchestration`; Pi is rejected
     // inside the preparation, before anything is spawned.
     let daemon = trusted_daemon(&state.daemon).await?;
     daemon.require_compatible()?;
     ensure_daemon_can_prepare(daemon.client.cached_capabilities().as_ref())?;
-    let (roles, prepared) = prepare_workflow_launch(
+    let (roles, prepared) = prepare_orchestration_launch(
         daemon.client.as_ref(),
         &name,
         &cwd,
@@ -3511,7 +3522,7 @@ async fn start_workflow_action(
     )
     .await?;
     let orchestration_id = mint_orchestration_id();
-    launch_workflow(
+    launch_orchestration(
         daemon.client.as_ref(),
         &name,
         // The daemon's CANONICAL spelling, not the one that was sent.
@@ -3544,7 +3555,7 @@ async fn start_workflow_action(
 ///
 /// # What it deliberately does not inherit from the Runs launch
 ///
-/// The Runs screen's [`DesktopAction::StartWorkflow`] refuses an empty task,
+/// The Runs screen's [`DesktopAction::ActivateOrchestration`] refuses an empty task,
 /// builds each role's command from desktop agent profiles, refuses a Pi
 /// coordinator (its desktop-side delivery needs an acknowledgement Pi's native
 /// seed cannot give) and refuses Windows (its profile commands are POSIX-quoted).
@@ -3556,7 +3567,7 @@ async fn start_workflow_action(
 /// # Before preparing
 ///
 /// A deck that cannot start a role with its configured command is refused
-/// before `prepare-workflow` — see [`orchestration_launch_unavailable`] — so it
+/// before `prepare-orchestration` — see [`orchestration_launch_unavailable`] — so it
 /// is not asked to publish a coordinator context nothing will read.
 async fn start_orchestration_action(
     state: &DesktopState,
@@ -3603,7 +3614,7 @@ async fn start_orchestration_action(
     // reason for both). A start that elapses is reported as INDETERMINATE and
     // goes through the pane-and-orchestration reconciliation, so one that
     // landed anyway is found and stopped. A stop that elapses is reconciled
-    // against nothing at all: `rollback_workflow_agents` records it as an
+    // against nothing at all: `rollback_orchestration_agents` records it as an
     // unconfirmed stop and the launch's error names the role, which is a
     // report to the user rather than a remedy — but it does bound what the
     // rollback costs and lets it reach the roles behind a wedged stop. A
@@ -3611,20 +3622,20 @@ async fn start_orchestration_action(
     // says anything useful, so it is waited out instead.
     let prepared = daemon
         .client
-        .prepare_workflow(&path, &orchestration, "", config_revision.as_deref())
+        .prepare_orchestration(&path, &orchestration, "", config_revision.as_deref())
         .await
         .map_err(|error| safe_message(error.to_string()))?;
     // Both are `#[serde(default)]` on the reply, and neither may be invented
-    // here — see `prepare_workflow_launch`.
+    // here — see `prepare_orchestration_launch`.
     if prepared.path.is_empty() {
         return Err(
-            "the deck prepared the orchestration but reported no canonical project path; nothing was started"
+            "the daemon prepared the orchestration but reported no canonical project path; nothing was started"
                 .into(),
         );
     }
     if prepared.prompt.trim().is_empty() {
         return Err(
-            "the deck prepared the orchestration but reported no coordinator prompt; nothing was started"
+            "the daemon prepared the orchestration but reported no orchestrator prompt; nothing was started"
                 .into(),
         );
     }
@@ -3661,7 +3672,7 @@ fn ambiguous_orchestration_refusal(orchestration: &str) -> String {
 /// PRD #1223 audit V4: refuse a launch whose orchestration name names MORE
 /// than one of the project's orchestrations on that deck.
 ///
-/// `PrepareWorkflow` takes the FIRST role-bearing definition with the name
+/// `PrepareOrchestration` takes the FIRST role-bearing definition with the name
 /// (`project_resolve.rs`, the same rule the TUI's spawn uses), so launching a
 /// namesake would run the other definition's roles and commands under the name
 /// the user chose. Config validation only warns about the duplicate, and the
@@ -3672,12 +3683,12 @@ fn ambiguous_orchestration_refusal(orchestration: &str) -> String {
 /// crosses — the main webview's own action, a frontend regression, a fixture
 /// caller — so the invariant is checked where the launch is decided.
 ///
-/// **Desktop-side only, deliberately.** Changing `PrepareWorkflow`'s
+/// **Desktop-side only, deliberately.** Changing `PrepareOrchestration`'s
 /// first-match rule would change an existing verb that older desktops and the
 /// TUI already call, which is not this PR's to do; see issue #1233.
 ///
 /// A name the project defines NO orchestration under is deliberately left to
-/// the deck: its `PrepareWorkflow` refuses that before it composes or publishes
+/// the deck: its `PrepareOrchestration` refuses that before it composes or publishes
 /// anything, in its own words and with its own stable code, so refusing it here
 /// would only be a second copy of that sentence in a crate that is not allowed
 /// to resolve projects itself (`xtask/linkage-check` rule 12). The roleless
@@ -4033,7 +4044,7 @@ async fn desktop_run_action(
             result_agent_id = Some(started.start_agent_id);
             result_agent_ids = started.agent_ids;
         }
-        DesktopAction::StartWorkflow {
+        DesktopAction::ActivateOrchestration {
             name,
             cwd,
             task_prompt,
@@ -4042,9 +4053,9 @@ async fn desktop_run_action(
             cols,
             config_revision,
         } => {
-            let launched = start_workflow_action(
+            let launched = activate_orchestration_action(
                 &state,
-                StartWorkflowRequest {
+                ActivateOrchestrationRequest {
                     name,
                     cwd,
                     task_prompt,
@@ -4058,7 +4069,7 @@ async fn desktop_run_action(
             result_agent_id = Some(launched.start_agent_id);
             result_agent_ids = launched.agent_ids;
             result_message = Some(
-                "Workflow started from the configured orchestration. Commands were applied for this launch only; profile/model command write-back is not implemented."
+                "Orchestration activated from its configuration. Commands were applied for this activation only; profile/model command write-back is not implemented."
                     .into(),
             );
         }
@@ -4095,7 +4106,7 @@ async fn desktop_run_action(
             // the same explanation rather than a failed action.)
             let endpoint = selected_endpoint();
             let local = endpoint
-                .require_local("Stop deck")
+                .require_local("Stop daemon")
                 .map_err(|error| safe_message(error.to_string()))?;
             let outcome = run_daemon_stop(local, force)
                 .await
@@ -4111,9 +4122,9 @@ async fn desktop_run_action(
             // touched.
             terminal::detach_deck(&state, &endpoint).await;
             result_message = Some(match outcome {
-                StopOutcome::NoDaemonRunning => "No deck was running.".into(),
-                StopOutcome::Stopped { pid } => format!("Deck stopped gracefully (pid {pid})."),
-                StopOutcome::ForceKilled { pid } => format!("Deck force-killed (pid {pid})."),
+                StopOutcome::NoDaemonRunning => "No daemon was running.".into(),
+                StopOutcome::Stopped { pid } => format!("Daemon stopped gracefully (pid {pid})."),
+                StopOutcome::ForceKilled { pid } => format!("Daemon force-killed (pid {pid})."),
             });
         }
         DesktopAction::RestartDaemon => {
@@ -4123,7 +4134,7 @@ async fn desktop_run_action(
             // then start a LOCAL daemon and report success. Refused by type.
             let endpoint = selected_endpoint();
             let local = endpoint
-                .require_local("Replace deck")
+                .require_local("Replace daemon")
                 .map_err(|error| safe_message(error.to_string()))?;
             run_daemon_stop(local, false)
                 .await
@@ -4150,7 +4161,7 @@ async fn desktop_run_action(
                 agent_ids: Vec::new(),
                 send_result: None,
                 terminal: None,
-                message: Some("Deck replaced with the desktop's matching bundled build.".into()),
+                message: Some("Daemon replaced with the desktop's matching bundled build.".into()),
                 snapshot,
             });
         }
@@ -5776,7 +5787,7 @@ mod tests {
         delivery_id: String,
     }
 
-    /// One `prepare-workflow` request, recorded verbatim. PRD #819 M6's whole
+    /// One `prepare-orchestration` request, recorded verbatim. PRD #819 M6's whole
     /// point is that the client ASKS, so what it asked is the assertion.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct PrepareRequest {
@@ -5804,10 +5815,10 @@ mod tests {
         })
     }
 
-    struct FakeWorkflowDaemon {
+    struct FakeOrchestrationDaemon {
         now: Mutex<std::time::Instant>,
         prepare_requests: Mutex<Vec<PrepareRequest>>,
-        prepare_results: Mutex<VecDeque<Result<PreparedWorkflow, String>>>,
+        prepare_results: Mutex<VecDeque<Result<PreparedOrchestration, String>>>,
         /// Every spawn this fake was asked for, in order and by role name.
         /// `started` records the options; this records the sequence, which is
         /// what a rollback assertion needs to say WHICH role a launch died on.
@@ -5846,7 +5857,7 @@ mod tests {
         stop_errors: Mutex<HashMap<String, String>>,
     }
 
-    impl FakeWorkflowDaemon {
+    impl FakeOrchestrationDaemon {
         fn new(
             readiness: Result<Option<&str>, &str>,
             outcomes: impl IntoIterator<Item = Result<SendResult, String>>,
@@ -5891,16 +5902,16 @@ mod tests {
         }
     }
 
-    impl WorkflowDaemon for FakeWorkflowDaemon {
+    impl OrchestrationDaemon for FakeOrchestrationDaemon {
         type ReadinessWatch = ();
 
-        async fn prepare_workflow(
+        async fn prepare_orchestration(
             &self,
             cwd: &str,
             orchestration: &str,
             task: &str,
             config_revision: Option<&str>,
-        ) -> Result<PreparedWorkflow, String> {
+        ) -> Result<PreparedOrchestration, String> {
             self.prepare_requests.lock().unwrap().push(PrepareRequest {
                 cwd: cwd.to_string(),
                 orchestration: orchestration.to_string(),
@@ -5917,10 +5928,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| Ok(prepared_workflow()))
+                .unwrap_or_else(|| Ok(prepared_orchestration()))
         }
 
-        async fn start_workflow_agent(
+        async fn start_orchestration_agent(
             &self,
             options: StartAgentOptions,
             prep_token: Option<&str>,
@@ -5958,7 +5969,7 @@ mod tests {
             if self.configured_unsupported.load(Ordering::SeqCst) {
                 return Ok(GatedQuery::Unsupported);
             }
-            self.start_workflow_agent(options, Some(prep_token))
+            self.start_orchestration_agent(options, Some(prep_token))
                 .await
                 .map(GatedQuery::Answered)
         }
@@ -5971,7 +5982,7 @@ mod tests {
             Ok(self.launched_type.lock().unwrap().clone())
         }
 
-        async fn stop_workflow_agent(&self, agent_id: &str) -> Result<(), String> {
+        async fn stop_orchestration_agent(&self, agent_id: &str) -> Result<(), String> {
             self.stop_attempts
                 .lock()
                 .unwrap()
@@ -5988,7 +5999,7 @@ mod tests {
             Ok(())
         }
 
-        async fn reconcile_workflow_agent(
+        async fn reconcile_orchestration_agent(
             &self,
             pane_id: &str,
             orchestration_id: &str,
@@ -6065,12 +6076,12 @@ mod tests {
         }
     }
 
-    /// The daemon's default answer to `prepare-workflow`: a canonical path that
+    /// The daemon's default answer to `prepare-orchestration`: a canonical path that
     /// deliberately DIFFERS from every spelling the tests send, so a spawn that
     /// reuses the caller's string instead of the daemon's is a failed assertion
     /// rather than a coincidence.
-    fn prepared_workflow() -> PreparedWorkflow {
-        PreparedWorkflow {
+    fn prepared_orchestration() -> PreparedOrchestration {
+        PreparedOrchestration {
             context_path: "/canonical/project/.dot-agent-deck/orchestrator-context.md".into(),
             path: "/canonical/project".into(),
             token: "prep-token-1".into(),
@@ -6080,21 +6091,21 @@ mod tests {
     }
 
     #[test]
-    fn workflow_roles_follow_config_order_but_keep_launch_commands() {
+    fn orchestration_roles_follow_config_order_but_keep_launch_commands() {
         let config = [config_role("planner", true), config_role("builder", false)];
         let requested = vec![
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "builder".into(),
                 command: "codex --model gpt-5.6-sol".into(),
                 start: false,
             },
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "planner".into(),
                 command: "claude".into(),
                 start: true,
             },
         ];
-        let ordered = order_workflow_roles(&config, &requested).unwrap();
+        let ordered = order_orchestration_roles(&config, &requested).unwrap();
         assert_eq!(ordered[0].role, "planner");
         assert_eq!(ordered[0].command, "claude");
         assert_eq!(ordered[1].role, "builder");
@@ -6102,35 +6113,35 @@ mod tests {
     }
 
     #[test]
-    fn workflow_roles_reject_missing_or_mismatched_start_role() {
+    fn orchestration_roles_reject_missing_or_mismatched_start_role() {
         let config = [config_role("planner", true), config_role("builder", false)];
-        let missing = vec![WorkflowRoleInput {
+        let missing = vec![OrchestrationRoleInput {
             role: "planner".into(),
             command: "claude".into(),
             start: true,
         }];
-        assert!(order_workflow_roles(&config, &missing).is_err());
+        assert!(order_orchestration_roles(&config, &missing).is_err());
 
         let wrong_start = vec![
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "planner".into(),
                 command: "claude".into(),
                 start: false,
             },
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "builder".into(),
                 command: "codex".into(),
                 start: true,
             },
         ];
-        assert!(order_workflow_roles(&config, &wrong_start).is_err());
+        assert!(order_orchestration_roles(&config, &wrong_start).is_err());
     }
 
     /// PRD #819 M6 rewrote this test rather than deleting it, because the
     /// migration destroys its premise rather than its subject.
     ///
     /// What it used to do: write a real `.dot-agent-deck.toml` into a temp
-    /// directory, call the old `prepare_workflow_launch`, and read the
+    /// directory, call the old `prepare_orchestration_launch`, and read the
     /// coordinator context back **off this machine's disk**. Every one of those
     /// steps is now a defect — the client neither reads a project config nor
     /// writes a context, and against a remote daemon doing either was silently
@@ -6143,13 +6154,13 @@ mod tests {
     /// daemon answers, precisely so a reintroduced local read fails the test
     /// instead of passing it by agreeing with itself.
     #[tokio::test]
-    async fn workflow_launch_asks_the_daemon_and_reads_no_project_from_disk() {
+    async fn orchestration_launch_asks_the_daemon_and_reads_no_project_from_disk() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let project_dir = std::env::temp_dir().join(format!(
-            "dot-agent-deck-desktop-workflow-{}-{unique}",
+            "dot-agent-deck-desktop-orchestration-{}-{unique}",
             std::process::id()
         ));
         std::fs::create_dir(&project_dir).unwrap();
@@ -6175,25 +6186,25 @@ command = "configured-planner"
         .unwrap();
 
         let requested = vec![
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "builder".into(),
                 command: "codex --model gpt-5.6-sol".into(),
                 start: false,
             },
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "planner".into(),
                 command: "claude --model opus".into(),
                 start: true,
             },
         ];
         let cwd = project_dir.to_str().unwrap().to_string();
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("unused-session")),
             std::iter::empty(),
             Ok(SendResult::Applied),
         );
 
-        let (roles, prepared) = prepare_workflow_launch(
+        let (roles, prepared) = prepare_orchestration_launch(
             &daemon,
             "loop",
             &cwd,
@@ -6224,7 +6235,7 @@ command = "configured-planner"
         assert_eq!(roles[1].role, "builder");
         assert_eq!(roles[1].command, "codex --model gpt-5.6-sol");
         // The coordinator prompt is the daemon's, not a sentence composed here.
-        assert_eq!(prepared.prompt, prepared_workflow().prompt);
+        assert_eq!(prepared.prompt, prepared_orchestration().prompt);
         assert_eq!(prepared.token, "prep-token-1");
 
         // And nothing was written to this machine. The old test read this exact
@@ -6242,12 +6253,12 @@ command = "configured-planner"
     /// uses, not the spelling the caller sent.
     #[tokio::test]
     async fn the_prepared_canonical_path_is_the_spawn_cwd() {
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("session-planner")),
             [Ok(SendResult::Applied)],
             Ok(SendResult::Applied),
         );
-        let (roles, prepared) = prepare_workflow_launch(
+        let (roles, prepared) = prepare_orchestration_launch(
             &daemon,
             "loop",
             // A symlinked alias, whose basename differs from the canonical
@@ -6261,7 +6272,7 @@ command = "configured-planner"
         .await
         .unwrap();
 
-        launch_workflow(
+        launch_orchestration(
             &daemon,
             "loop",
             &prepared.path,
@@ -6303,7 +6314,7 @@ command = "configured-planner"
         );
     }
 
-    /// PRD #819 audit follow-up. Scenario: prepare a workflow, then launch it
+    /// PRD #819 audit follow-up. Scenario: prepare an orchestration, then launch it
     /// against a daemon that does not know the prepared-start verb — it answers
     /// the structured `malformed request: unknown variant
     /// \`start-prepared-agent\`` such a daemon replies with, on the spawn's own
@@ -6324,7 +6335,7 @@ command = "configured-planner"
     /// launch can leave nothing behind to roll back.
     ///
     /// **Honest about what it discriminates:** the desktop reaches the daemon
-    /// through `WorkflowDaemon`, which hides the op, so this test would also
+    /// through `OrchestrationDaemon`, which hides the op, so this test would also
     /// pass before the verb existed with a different scripted string. It is here
     /// to name the scenario at the layer a user meets it. The evidence that the
     /// op actually changed is `the_client_routes_a_presented_token_onto_the_prepared_verb`
@@ -6332,7 +6343,7 @@ command = "configured-planner"
     /// in the root crate, each verified by removing its fix.
     #[tokio::test]
     async fn a_daemon_without_the_prepared_verb_fails_the_launch_closed() {
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("session-planner")),
             [Ok(SendResult::Applied)],
             Ok(SendResult::Applied),
@@ -6341,7 +6352,7 @@ command = "configured-planner"
             "malformed request: unknown variant `start-prepared-agent`, expected one of \
              `list-agents`, `start-agent`, `hello`",
         ));
-        let (roles, prepared) = prepare_workflow_launch(
+        let (roles, prepared) = prepare_orchestration_launch(
             &daemon,
             "loop",
             "/home/dev/project",
@@ -6352,7 +6363,7 @@ command = "configured-planner"
         .await
         .unwrap();
 
-        let failure = launch_workflow(
+        let failure = launch_orchestration(
             &daemon,
             "loop",
             &prepared.path,
@@ -6395,13 +6406,13 @@ command = "configured-planner"
     /// so it stays on plain `start-agent` and nothing about it changed.
     #[tokio::test]
     async fn a_token_less_launch_presents_no_token() {
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("session-planner")),
             [Ok(SendResult::Applied)],
             Ok(SendResult::Applied),
         );
 
-        launch_workflow(
+        launch_orchestration(
             &daemon,
             "loop",
             "/canonical/project",
@@ -6420,7 +6431,7 @@ command = "configured-planner"
 
     /// PRD #819 audit fix. Scenario: connect to a daemon that speaks this exact
     /// protocol version, offers the read-only project verbs and withholds
-    /// `prepare-workflow`. The launch must stop with the daemon's own
+    /// `prepare-orchestration` (and its legacy `prepare-workflow`). The launch must stop with the daemon's own
     /// `unsupported-platform` code and a sentence a user can act on, instead of
     /// the uniform capability-withhold sentence that says nothing about why.
     ///
@@ -6429,11 +6440,11 @@ command = "configured-planner"
     /// advertise the verb, and a set that is not a platform-narrowed one all
     /// keep the generic path.
     #[test]
-    fn a_withheld_prepare_workflow_reads_as_an_unsupported_platform() {
+    fn a_withheld_prepare_orchestration_reads_as_an_unsupported_platform() {
         use dot_agent_deck::daemon_client::DaemonCapabilities;
         use dot_agent_deck::daemon_protocol::{
-            AttachResponse, CAP_LIST_PROJECTS, CAP_PREPARE_WORKFLOW, CAP_RESOLVE_PROJECT,
-            PROJECT_ERR_UNSUPPORTED_PLATFORM,
+            AttachResponse, CAP_LIST_PROJECTS, CAP_PREPARE_ORCHESTRATION, CAP_PREPARE_WORKFLOW,
+            CAP_RESOLVE_PROJECT, PROJECT_ERR_UNSUPPORTED_PLATFORM,
         };
 
         fn advertising(capabilities: &[&str]) -> DaemonCapabilities {
@@ -6457,11 +6468,25 @@ command = "configured-planner"
             error.contains("owner-only") && error.contains("Nothing was started"),
             "the sentence must say what happened and why: {error}"
         );
+        assert!(
+            !error.contains(CAP_PREPARE_WORKFLOW),
+            "the sentence must not print the legacy capability string: {error}"
+        );
 
         // Not classified: nothing captured, nothing advertised, the verb present,
         // and a set that says nothing about a platform.
         assert!(ensure_daemon_can_prepare(None).is_ok());
         assert!(ensure_daemon_can_prepare(Some(&DaemonCapabilities::absent())).is_ok());
+        // Issue #1045: either spelling of the verb counts as advertising it —
+        // the current one, or only the legacy one a pre-#1045 daemon sends.
+        assert!(
+            ensure_daemon_can_prepare(Some(&advertising(&[
+                CAP_LIST_PROJECTS,
+                CAP_RESOLVE_PROJECT,
+                CAP_PREPARE_ORCHESTRATION,
+            ])))
+            .is_ok()
+        );
         assert!(
             ensure_daemon_can_prepare(Some(&advertising(&[
                 CAP_LIST_PROJECTS,
@@ -6478,7 +6503,7 @@ command = "configured-planner"
     /// were put back.
     ///
     /// Every other deck call a launch makes is bounded at
-    /// [`WORKFLOW_ROLE_START_TIMEOUT`], and the reason this one is not is
+    /// [`ORCHESTRATION_ROLE_START_TIMEOUT`], and the reason this one is not is
     /// integrity rather than patience: the deck resolves, composes, issues the
     /// token and publishes `orchestrator-context.md` on its blocking pool, and
     /// dropping the client's future stops none of that — so a preparation
@@ -6490,14 +6515,14 @@ command = "configured-planner"
     /// wrapped around this call.
     #[tokio::test(start_paused = true)]
     async fn a_slow_preparation_is_waited_out_rather_than_timed_out() {
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("unused-session")),
             std::iter::empty(),
             Ok(SendResult::Applied),
         );
-        *daemon.prepare_delay.lock().unwrap() = Some(WORKFLOW_ROLE_START_TIMEOUT * 4);
+        *daemon.prepare_delay.lock().unwrap() = Some(ORCHESTRATION_ROLE_START_TIMEOUT * 4);
 
-        let (roles, prepared) = prepare_workflow_launch(
+        let (roles, prepared) = prepare_orchestration_launch(
             &daemon,
             "loop",
             "/home/dev/repo",
@@ -6519,7 +6544,7 @@ command = "configured-planner"
     /// rather than as an error.
     #[tokio::test]
     async fn a_refused_preparation_starts_no_roles() {
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("unused-session")),
             std::iter::empty(),
             Ok(SendResult::Applied),
@@ -6528,7 +6553,7 @@ command = "configured-planner"
             "unresolved: that path is not a project this daemon can offer".into(),
         ));
 
-        let error = prepare_workflow_launch(
+        let error = prepare_orchestration_launch(
             &daemon,
             "loop",
             "/home/dev/gone",
@@ -6554,21 +6579,21 @@ command = "configured-planner"
     async fn an_unreported_path_or_prompt_refuses_the_launch() {
         for (mutate, expected) in [
             (
-                Box::new(|prepared: &mut PreparedWorkflow| prepared.path.clear())
-                    as Box<dyn Fn(&mut PreparedWorkflow)>,
+                Box::new(|prepared: &mut PreparedOrchestration| prepared.path.clear())
+                    as Box<dyn Fn(&mut PreparedOrchestration)>,
                 "canonical project path",
             ),
             (
-                Box::new(|prepared: &mut PreparedWorkflow| prepared.prompt = "   ".into()),
-                "coordinator prompt",
+                Box::new(|prepared: &mut PreparedOrchestration| prepared.prompt = "   ".into()),
+                "orchestrator prompt",
             ),
         ] {
-            let daemon = FakeWorkflowDaemon::new(
+            let daemon = FakeOrchestrationDaemon::new(
                 Ok(Some("unused-session")),
                 std::iter::empty(),
                 Ok(SendResult::Applied),
             );
-            let mut prepared = prepared_workflow();
+            let mut prepared = prepared_orchestration();
             mutate(&mut prepared);
             daemon
                 .prepare_results
@@ -6576,7 +6601,7 @@ command = "configured-planner"
                 .unwrap()
                 .push_back(Ok(prepared));
 
-            let error = prepare_workflow_launch(
+            let error = prepare_orchestration_launch(
                 &daemon,
                 "loop",
                 "/home/dev/project",
@@ -6608,11 +6633,11 @@ command = "configured-planner"
     async fn a_publish_refusal_reaches_the_caller_with_its_path_and_remedy_intact() {
         let sentence = "publish-failed: /home/dev/project/.dot-agent-deck is mode 0775, which \
                         grants write to group or other — another local account could replace the \
-                        coordinator context's directory entry after it is published. The deck \
-                        tried to clear those bits and could not, so publishing is refused. On the \
-                        machine running the deck, run: chmod go-w \
+                        orchestrator context's directory entry after it is published. The \
+                        daemon tried to clear those bits and could not, so publishing is refused. \
+                        On the machine running the daemon, run: chmod go-w \
                         '/home/dev/project/.dot-agent-deck'";
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("unused-session")),
             std::iter::empty(),
             Ok(SendResult::Applied),
@@ -6623,7 +6648,7 @@ command = "configured-planner"
             .unwrap()
             .push_back(Err(sentence.to_string()));
 
-        let error = prepare_workflow_launch(
+        let error = prepare_orchestration_launch(
             &daemon,
             "loop",
             "/home/dev/project",
@@ -6646,13 +6671,13 @@ command = "configured-planner"
     /// on the way.
     #[tokio::test]
     async fn a_pi_coordinator_is_refused_during_preparation() {
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("unused-session")),
             std::iter::empty(),
             Ok(SendResult::Applied),
         );
 
-        let error = prepare_workflow_launch(
+        let error = prepare_orchestration_launch(
             &daemon,
             "loop",
             "/home/dev/project",
@@ -6663,18 +6688,18 @@ command = "configured-planner"
         .await
         .unwrap_err();
 
-        assert!(error.contains("Pi cannot be the desktop workflow coordinator"));
+        assert!(error.contains("Pi cannot be the desktop orchestration's orchestrator"));
         assert!(daemon.started.lock().unwrap().is_empty());
     }
 
-    fn launch_roles(start_command: &str) -> Vec<WorkflowRoleInput> {
+    fn launch_roles(start_command: &str) -> Vec<OrchestrationRoleInput> {
         vec![
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "planner".into(),
                 command: start_command.into(),
                 start: true,
             },
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "builder".into(),
                 command: "codex".into(),
                 start: false,
@@ -6684,14 +6709,14 @@ command = "configured-planner"
 
     #[tokio::test]
     async fn non_pi_launch_waits_for_readiness_and_retries_with_one_identity() {
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("session-planner")),
             [Ok(SendResult::NoLiveTarget), Ok(SendResult::Applied)],
             Ok(SendResult::Applied),
         );
         let seed = "Read .dot-agent-deck/orchestrator-context.md and wait.";
 
-        let launched = launch_workflow(
+        let launched = launch_orchestration(
             &daemon,
             "loop",
             "/tmp/project",
@@ -6745,13 +6770,13 @@ command = "configured-planner"
     /// role's pane through the acknowledged Runs delivery.
     #[tokio::test]
     async fn a_configured_launch_starts_every_role_and_delivers_to_a_non_pi_coordinator() {
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("session-planner")),
             [Ok(SendResult::Applied)],
             Ok(SendResult::Applied),
         );
         *daemon.launched_type.lock().unwrap() = Some(AgentType::ClaudeCode);
-        let prepared = prepared_workflow();
+        let prepared = prepared_orchestration();
 
         let launched = launch_configured_orchestration(
             &daemon,
@@ -6841,14 +6866,14 @@ command = "configured-planner"
     /// Runs screen's refusal of a Pi coordinator is not inherited.
     #[tokio::test]
     async fn a_configured_launch_leaves_a_pi_coordinators_prompt_to_the_deck() {
-        let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
         *daemon.launched_type.lock().unwrap() = Some(AgentType::Pi);
 
         let launched = launch_configured_orchestration(
             &daemon,
             "loop",
             None,
-            &prepared_workflow(),
+            &prepared_orchestration(),
             32,
             120,
             "orchestration-pi",
@@ -6881,7 +6906,7 @@ command = "configured-planner"
     /// which the dialog shows inline.
     #[tokio::test]
     async fn a_configured_launch_stops_the_started_roles_when_a_later_role_is_refused() {
-        let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
         daemon
             .start_results
             .lock()
@@ -6892,7 +6917,7 @@ command = "configured-planner"
             &daemon,
             "loop",
             Some("run"),
-            &prepared_workflow(),
+            &prepared_orchestration(),
             32,
             120,
             "orchestration-partial",
@@ -6924,14 +6949,14 @@ command = "configured-planner"
     /// started, nothing is stopped, and the refusal says why.
     #[tokio::test]
     async fn a_configured_launch_on_a_deck_without_the_capability_starts_nothing() {
-        let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
         daemon.configured_unsupported.store(true, Ordering::SeqCst);
 
         let failure = launch_configured_orchestration(
             &daemon,
             "loop",
             Some("run"),
-            &prepared_workflow(),
+            &prepared_orchestration(),
             32,
             120,
             "orchestration-older",
@@ -6951,14 +6976,14 @@ command = "configured-planner"
     }
 
     /// A preparation with `names.len()` roles, the first the start role.
-    fn prepared_with_roles(names: &[&str]) -> PreparedWorkflow {
-        PreparedWorkflow {
+    fn prepared_with_roles(names: &[&str]) -> PreparedOrchestration {
+        PreparedOrchestration {
             roles: names
                 .iter()
                 .enumerate()
                 .map(|(index, name)| config_role(name, index == 0))
                 .collect(),
-            ..prepared_workflow()
+            ..prepared_orchestration()
         }
     }
 
@@ -6969,7 +6994,7 @@ command = "configured-planner"
     /// it along with the one already running.
     #[tokio::test(start_paused = true)]
     async fn a_configured_launch_bounds_a_start_the_deck_never_answers_and_stops_what_landed() {
-        let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
         daemon.start_hangs.lock().unwrap().insert(1);
         daemon
             .reconciliation_results
@@ -6982,7 +7007,7 @@ command = "configured-planner"
             &daemon,
             "loop",
             Some("run"),
-            &prepared_workflow(),
+            &prepared_orchestration(),
             32,
             120,
             "orchestration-wedged-start",
@@ -6993,11 +7018,11 @@ command = "configured-planner"
 
         assert_eq!(
             began.elapsed(),
-            WORKFLOW_ROLE_START_TIMEOUT,
+            ORCHESTRATION_ROLE_START_TIMEOUT,
             "the start bound is what ended the wait"
         );
         assert!(
-            error.contains("failed to start orchestration role builder: the deck did not answer the start within 15s"),
+            error.contains("failed to start orchestration role builder: the daemon did not answer the start within 15s"),
             "{error}"
         );
         assert!(error.contains("roles already started: planner"), "{error}");
@@ -7022,14 +7047,14 @@ command = "configured-planner"
     /// rather than reporting a clean rollback.
     #[tokio::test(start_paused = true)]
     async fn a_configured_launch_reports_a_timed_out_start_it_cannot_find() {
-        let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
         daemon.start_hangs.lock().unwrap().insert(1);
 
         let failure = launch_configured_orchestration(
             &daemon,
             "loop",
             Some("run"),
-            &prepared_workflow(),
+            &prepared_orchestration(),
             32,
             120,
             "orchestration-unlisted",
@@ -7065,7 +7090,7 @@ command = "configured-planner"
     /// and the error names EVERY role whose stop it could not confirm.
     #[tokio::test(start_paused = true)]
     async fn a_rollback_bounds_each_stop_and_names_every_role_it_could_not_confirm() {
-        let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
         daemon.start_results.lock().unwrap().extend([
             Ok("agent-0".to_string()),
             Ok("agent-1".to_string()),
@@ -7105,7 +7130,7 @@ command = "configured-planner"
         assert_eq!(*daemon.stopped.lock().unwrap(), ["agent-1"]);
         assert_eq!(
             began.elapsed(),
-            WORKFLOW_ROLE_STOP_TIMEOUT,
+            ORCHESTRATION_ROLE_STOP_TIMEOUT,
             "one wedged stop costs one stop bound, not the rollback"
         );
         assert!(
@@ -7113,7 +7138,7 @@ command = "configured-planner"
             "{error}"
         );
         assert!(
-            error.contains("reviewer (agent-2: the deck did not answer the stop within 15s)"),
+            error.contains("reviewer (agent-2: the daemon did not answer the stop within 15s)"),
             "{error}"
         );
         assert!(error.contains("planner (agent-0: stop refused)"), "{error}");
@@ -7133,7 +7158,7 @@ command = "configured-planner"
     /// not.
     #[tokio::test(start_paused = true)]
     async fn closing_an_orchestration_stops_every_role_at_once_and_names_the_unconfirmed() {
-        let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
         daemon
             .stop_hangs
             .lock()
@@ -7168,7 +7193,7 @@ command = "configured-planner"
         assert_eq!(stopped, ["agent-0", "agent-3"]);
         assert_eq!(
             began.elapsed(),
-            WORKFLOW_ROLE_STOP_TIMEOUT,
+            ORCHESTRATION_ROLE_STOP_TIMEOUT,
             "concurrent: one wedged stop costs one bound for the whole close"
         );
         assert_eq!(outcomes.len(), 4, "one outcome per role, aligned");
@@ -7177,7 +7202,7 @@ command = "configured-planner"
             outcomes[1],
             Some(UnconfirmedStop {
                 role: "builder".into(),
-                reason: "agent-1: the deck did not answer the stop within 15s".into(),
+                reason: "agent-1: the daemon did not answer the stop within 15s".into(),
             })
         );
         assert_eq!(
@@ -7215,14 +7240,14 @@ command = "configured-planner"
     /// answers ends the launch at the start bound and the first is stopped.
     #[tokio::test(start_paused = true)]
     async fn a_runs_launch_bounds_a_start_the_deck_never_answers() {
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("unused-session")),
             std::iter::empty(),
             Ok(SendResult::Applied),
         );
         daemon.start_hangs.lock().unwrap().insert(1);
 
-        let failure = launch_workflow(
+        let failure = launch_orchestration(
             &daemon,
             "loop",
             "/tmp/project",
@@ -7238,7 +7263,7 @@ command = "configured-planner"
         let error = &failure.message;
 
         assert!(
-            error.contains("failed to start workflow role builder: the deck did not answer the start within 15s"),
+            error.contains("failed to activate orchestration role builder: the daemon did not answer the start within 15s"),
             "{error}"
         );
         assert!(
@@ -7335,12 +7360,14 @@ command = "configured-planner"
             seed: None,
         };
 
-        let dropped = WorkflowDaemon::start_configured_role(&client, options(), "prep-token-1")
-            .await
-            .expect_err("a dropped connection is a failed start");
-        let answered = WorkflowDaemon::start_configured_role(&client, options(), "prep-token-1")
-            .await
-            .expect_err("the deck refused this one");
+        let dropped =
+            OrchestrationDaemon::start_configured_role(&client, options(), "prep-token-1")
+                .await
+                .expect_err("a dropped connection is a failed start");
+        let answered =
+            OrchestrationDaemon::start_configured_role(&client, options(), "prep-token-1")
+                .await
+                .expect_err("the deck refused this one");
         deck.abort();
 
         assert!(
@@ -7380,7 +7407,7 @@ command = "configured-planner"
             (lost("the connection closed before the reply"), true),
             (refused("builder refused"), false),
         ] {
-            let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+            let daemon = FakeOrchestrationDaemon::new(Ok(None), [], Ok(SendResult::Applied));
             daemon
                 .start_results
                 .lock()
@@ -7391,7 +7418,7 @@ command = "configured-planner"
                 &daemon,
                 "loop",
                 Some("run"),
-                &prepared_workflow(),
+                &prepared_orchestration(),
                 32,
                 120,
                 "orchestration-indeterminate",
@@ -7430,7 +7457,7 @@ command = "configured-planner"
     /// for the screen to put the cleanup warning first.
     #[tokio::test]
     async fn a_runs_launch_carries_the_roles_its_rollback_could_not_stop_as_data() {
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("unused-session")),
             std::iter::empty(),
             Ok(SendResult::Applied),
@@ -7448,7 +7475,7 @@ command = "configured-planner"
             .unwrap()
             .insert("agent-0".to_string(), "stop refused".to_string());
 
-        let failure = launch_workflow(
+        let failure = launch_orchestration(
             &daemon,
             "loop",
             "/tmp/project",
@@ -7491,22 +7518,22 @@ command = "configured-planner"
 
     #[test]
     fn desktop_coordinator_guard_rejects_pi_launch_forms() {
-        let error = validate_desktop_coordinator(&launch_roles("pi")).unwrap_err();
-        assert!(error.contains("Pi cannot be the desktop workflow coordinator"));
-        let wrapped_error = validate_desktop_coordinator(&launch_roles("sh -c 'pi'")).unwrap_err();
+        let error = validate_desktop_orchestrator(&launch_roles("pi")).unwrap_err();
+        assert!(error.contains("Pi cannot be the desktop orchestration's orchestrator"));
+        let wrapped_error = validate_desktop_orchestrator(&launch_roles("sh -c 'pi'")).unwrap_err();
         assert!(wrapped_error.contains("native seed delivery has no acknowledgement"));
-        assert!(validate_desktop_coordinator(&launch_roles("claude")).is_ok());
+        assert!(validate_desktop_orchestrator(&launch_roles("claude")).is_ok());
     }
 
     #[tokio::test]
     async fn pi_coordinator_is_rejected_before_subscription_or_spawn() {
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("unused-session")),
             std::iter::empty(),
             Ok(SendResult::Applied),
         );
 
-        let failure = launch_workflow(
+        let failure = launch_orchestration(
             &daemon,
             "loop",
             "/tmp/project",
@@ -7521,7 +7548,7 @@ command = "configured-planner"
         .unwrap_err();
         let error = &failure.message;
 
-        assert!(error.contains("Pi cannot be the desktop workflow coordinator"));
+        assert!(error.contains("Pi cannot be the desktop orchestration's orchestrator"));
         assert_eq!(daemon.begin_readiness_count.load(Ordering::SeqCst), 0);
         assert!(daemon.started.lock().unwrap().is_empty());
         assert!(daemon.reconciliation_requests.lock().unwrap().is_empty());
@@ -7531,10 +7558,13 @@ command = "configured-planner"
 
     #[tokio::test]
     async fn hookless_coordinator_uses_timeout_fallback_without_session_guard() {
-        let daemon =
-            FakeWorkflowDaemon::new(Ok(None), [Ok(SendResult::Applied)], Ok(SendResult::Applied));
+        let daemon = FakeOrchestrationDaemon::new(
+            Ok(None),
+            [Ok(SendResult::Applied)],
+            Ok(SendResult::Applied),
+        );
 
-        launch_workflow(
+        launch_orchestration(
             &daemon,
             "loop",
             "/tmp/project",
@@ -7560,13 +7590,13 @@ command = "configured-planner"
 
     #[tokio::test]
     async fn delivery_deadline_rolls_back_every_started_role_in_reverse_order() {
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("session-planner")),
             std::iter::empty(),
             Ok(SendResult::NoLiveTarget),
         );
 
-        let failure = launch_workflow(
+        let failure = launch_orchestration(
             &daemon,
             "loop",
             "/tmp/project",
@@ -7592,7 +7622,7 @@ command = "configured-planner"
 
     #[tokio::test]
     async fn lost_start_response_reconciles_failed_pane_before_rollback() {
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("unused-session")),
             std::iter::empty(),
             Ok(SendResult::Applied),
@@ -7608,19 +7638,19 @@ command = "configured-planner"
             .unwrap()
             .push_back(Ok(Some("agent-planner".to_string())));
         let roles = vec![
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "builder".into(),
                 command: "codex".into(),
                 start: false,
             },
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "planner".into(),
                 command: "claude".into(),
                 start: true,
             },
         ];
 
-        let failure = launch_workflow(
+        let failure = launch_orchestration(
             &daemon,
             "loop",
             "/tmp/project",
@@ -7659,7 +7689,7 @@ command = "configured-planner"
 
     #[tokio::test]
     async fn failed_start_reconciliation_reports_cleanup_uncertainty() {
-        let daemon = FakeWorkflowDaemon::new(
+        let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("unused-session")),
             std::iter::empty(),
             Ok(SendResult::Applied),
@@ -7675,7 +7705,7 @@ command = "configured-planner"
             .unwrap()
             .push_back(Err("list-agents unavailable".to_string()));
 
-        let failure = launch_workflow(
+        let failure = launch_orchestration(
             &daemon,
             "loop",
             "/tmp/project",

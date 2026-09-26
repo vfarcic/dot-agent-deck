@@ -334,7 +334,7 @@ describe("TerminalViewport agent pane geometry", () => {
     expect({ cols: terminal.cols, rows: terminal.rows }).toEqual(APPLIED_GRID);
     resizeTerminal.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "Close Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
     triggerResize("planner");
     expect(resizeTerminal).toHaveBeenCalledTimes(1);
     expect(resizeTerminal).toHaveBeenLastCalledWith({ deckId: FIXTURE_DAEMON_ID, agentId: "planner" }, tileCols, tileRows);

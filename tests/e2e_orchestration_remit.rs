@@ -782,14 +782,14 @@ fn open_and_confirm_initial_delivery(
     std::path::PathBuf,
     usize,
 ) {
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     write_executable(
         &deck.workdir().join("orchestrator-remit.sh"),
         ORCHESTRATOR_REMIT_SCRIPT,
     );
 
     open_orchestration(deck);
-    deck.wait_for_absence("New Agent");
+    deck.wait_for_absence("┌ New Agent");
 
     let socket = deck.attach_socket_path().to_path_buf();
     let record = role_agent_record(&socket, "orchestrator");

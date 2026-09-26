@@ -218,7 +218,7 @@ fn card_stats_005_real_agent_card_narrows_without_restructuring() {
         .with_pty_size(RECORDING_COLS, RECORDING_ROWS)
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let attach_socket = deck.attach_socket_path().to_string_lossy().into_owned();
     let hook_socket = deck.hook_socket_path().to_string_lossy().into_owned();
@@ -228,7 +228,7 @@ fn card_stats_005_real_agent_card_narrows_without_restructuring() {
         .with_env("DOT_AGENT_DECK_SOCKET", hook_socket)
         .without_success_recording()
         .launch_with_fixture("minimal");
-    control.wait_for_string("No active sessions");
+    control.wait_for_string("No active agents");
 
     std::fs::write(control.workdir().join(SENTINEL), "reel fixture\n")
         .expect("write card-layout sentinel");
@@ -247,7 +247,7 @@ fn card_stats_005_real_agent_card_narrows_without_restructuring() {
     control.send_keys(b"\x0e");
     control.wait_for_string("Select Directory");
     control.send_keys(b" ");
-    control.wait_for_string("New Agent");
+    control.wait_for_string("┌ New Agent");
     control.send_keys(b"\t");
     control.send_keys(PANE_NAME_SUFFIX.as_bytes());
     control.send_keys(b"\t");

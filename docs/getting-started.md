@@ -50,7 +50,7 @@ Once the dashboard is running, press `?` inside the app to see all shortcuts. Th
 
 Running `dot-agent-deck` opens a two-column layout with native embedded terminal panes:
 
-- **Left (1/3)** — the dashboard, displaying a card grid of agent sessions
+- **Left (1/3)** — the dashboard, displaying a card grid of agents
 - **Right (2/3)** — agent panes where Claude Code, OpenCode, Pi, Codex, or Devin instances run (stacked by default — only the focused pane is shown, at full height; toggle to tiled with `Ctrl+t` to see every pane at once)
 
 ![Two-column layout showing the dashboard card on the left and a Claude Code agent pane on the right](./img/getting-started-launching.jpg)
@@ -66,7 +66,7 @@ About 30 seconds after both the TUI and every managed agent are gone, the daemon
 ## Basic Workflow
 
 1. Launch the dashboard with `dot-agent-deck`
-2. Press `Ctrl+n` to open a new pane — pick a directory, give the pane a name, and enter the command to run (typically `claude`, `opencode`, `pi`, `codex`, or `devin`)
+2. Press `Ctrl+n` to open the **New Agent** form — pick a directory, give the agent a name, and enter the command to run (typically `claude`, `opencode`, `pi`, `codex`, or `devin`)
 3. Watch the agent's status, tool calls, and prompts update on the dashboard in real-time
 4. To type into an agent, move keyboard focus into its pane: press `Ctrl+d` to enter command mode, then either `j`/`k` (or `Down`/`Up`) to cycle through cards or `1`–`9` to jump directly to a card
 5. To close a pane, press `Ctrl+d` to leave it, then `Ctrl+w` on the selected card and choose **Close** in the confirmation. While you're typing inside a pane, `Ctrl+w` is the shell's ordinary delete-previous-word — it never closes anything. The dashboard tab itself can't be closed.
@@ -94,7 +94,7 @@ For the full reference, examples, and configuration options, see [Orchestration]
 
 ## Working with Modes
 
-Modes let you pair an agent session with live command output in a tabbed workspace — useful for keeping test runners, log streams, or kubectl output visible alongside your agent. They are defined per-project in `.dot-agent-deck.toml`.
+Modes let you pair an agent with live command output in a tabbed workspace — useful for keeping test runners, log streams, or kubectl output visible alongside your agent. They are defined per-project in `.dot-agent-deck.toml`.
 
 ![A mode tab in action — agent pane on the left, with live Git status, kubectl pods, and kubectl events stacked on the right](./img/modes.png)
 
@@ -110,10 +110,10 @@ Press `Ctrl+n`, navigate to the project directory, cycle the **Mode** field to *
 
 For the full reference — choosing one agent or a team, watching the units, and cleanup, see [Dispatcher Mode](dispatcher-mode.md).
 
-## Scheduled Tasks
+## Schedules
 
-Scheduled tasks let the daemon spawn an agent (or run a command) on a cron schedule — a nightly review, a recurring digest, a periodic health check — without you being at the keyboard. They are defined globally, so they apply across every project.
+Schedules let the daemon spawn an agent (or run a command) on a cron schedule — a nightly review, a recurring digest, a periodic health check — without you being at the keyboard. They are defined globally, so they apply across every project.
 
-The fastest way to create one is to let an agent author it: press `Ctrl+n`, cycle the **Mode** field to **schedule**, and the throwaway pane walks you through building the entry. Or press `s` on the dashboard to open the **Scheduled Tasks** manager and choose `[Add a]`. Every schedule needs a command that launches a `claude`, `opencode`, `pi`, `codex`, or `devin` agent — directly (`claude`, `opencode`, `pi`, `codex`, `devin`) or via a wrapper like `devbox run agent-new` — which is what gives the run full status tracking.
+The fastest way to create one is to let an agent author it: press `Ctrl+n`, cycle the **Mode** field to **schedule**, and the throwaway pane walks you through building the entry. Or press `s` on the dashboard to open the **Schedules** manager and choose `[Add a]`. Every schedule needs a command that launches a `claude`, `opencode`, `pi`, `codex`, or `devin` agent — directly (`claude`, `opencode`, `pi`, `codex`, `devin`) or via a wrapper like `devbox run agent-new` — which is what gives the run full status tracking.
 
-For the full reference — cron syntax, the global config file, tab reuse, and supervisor recipes — see [Scheduled Tasks](scheduled-tasks.md).
+For the full reference — cron syntax, the global config file, tab reuse, and supervisor recipes — see [Schedules](scheduled-tasks.md).

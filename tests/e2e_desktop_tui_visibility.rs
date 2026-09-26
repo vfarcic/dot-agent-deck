@@ -364,7 +364,7 @@ fn launch_tui_against_sockets(attach_socket: &Path, hook_socket: &Path) -> TuiDe
 /// Use the real TUI new-agent form to start a named plain pane. This is the
 /// control for the desktop's direct `StartAgent` request.
 fn start_plain_from_tui(deck: &TuiDeck) {
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // confirm the fixture cwd
@@ -379,7 +379,7 @@ fn start_plain_from_tui(deck: &TuiDeck) {
 /// Use the real TUI new-agent form to launch the fixture's orchestration. This
 /// is the control for the desktop's PrepareWorkflow + StartPreparedAgent loop.
 fn start_orchestration_from_tui(deck: &TuiDeck) {
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // confirm the fixture cwd
@@ -413,7 +413,7 @@ fn missing_roles(grid: &str) -> Vec<&'static str> {
 /// The single-tab dashboard has a session-count header, one bordered card per
 /// plain agent, and the command-mode dashboard controls along the bottom.
 fn plain_dashboard_shows(grid: &str, labels: &[&str]) -> bool {
-    grid.lines().next() == Some(format!(" dot-agent-deck — {} session(s)", labels.len()).as_str())
+    grid.lines().next() == Some(format!(" dot-agent-deck — {} agent(s)", labels.len()).as_str())
         && labels.iter().all(|label| grid.contains(label))
         && grid.matches('┌').count() + grid.matches('┏').count() == labels.len()
         && grid.matches('└').count() + grid.matches('┗').count() == labels.len()
@@ -421,7 +421,7 @@ fn plain_dashboard_shows(grid: &str, labels: &[&str]) -> bool {
         && grid
             .lines()
             .any(|line| line.starts_with(" COMMAND  [Back to Pane Ctrl+D]"))
-        && grid.contains("[Filter /] [Rename r] [Generate g] [Scheduled Tasks s]")
+        && grid.contains("[Filter /] [Rename r] [Generate g] [Schedules s]")
 }
 
 /// Send the plain `StartAgent` shape built by the desktop action. The explicit
@@ -769,7 +769,7 @@ fn visibility_001_desktop_started_plain_agent_surfaces_into_attached_dashboard()
 
     let daemon = common::spawn_daemon_serve(None, "0");
     let deck = launch_tui_against(&daemon);
-    deck.wait_for_string("No active sessions. Press Ctrl+n to create a pane.");
+    deck.wait_for_string("No active agents. Press Ctrl+n to create an agent.");
     assert!(
         daemon.agent_records().is_empty(),
         "precondition: the attached TUI's empty dashboard must correspond to a daemon with zero agents"
@@ -804,7 +804,7 @@ fn visibility_001_desktop_started_plain_agent_surfaces_into_attached_dashboard()
     // The third start reaches a TUI that has never selected or focused a card.
     let daemon = common::spawn_daemon_serve(None, "0");
     let deck = launch_tui_against(&daemon);
-    deck.wait_for_string("No active sessions. Press Ctrl+n to create a pane.");
+    deck.wait_for_string("No active agents. Press Ctrl+n to create an agent.");
     start_plain_from_desktop(
         &daemon,
         canonical_cwd.clone(),
@@ -850,7 +850,7 @@ fn visibility_001_desktop_started_plain_agent_surfaces_into_attached_dashboard()
 fn visibility_001_second_subscriber_start_reaches_attached_tui() {
     let daemon = common::spawn_daemon_serve(None, "0");
     let deck = launch_tui_against(&daemon);
-    deck.wait_for_string("No active sessions. Press Ctrl+n to create a pane.");
+    deck.wait_for_string("No active agents. Press Ctrl+n to create an agent.");
 
     let mut desktop = DesktopAttachClient::connect(&daemon.attach_socket);
     let cwd = common::harness_tempdir().expect("create two-client desktop-selected cwd");
@@ -883,7 +883,7 @@ fn visibility_001_tui_spawner_receives_second_client_first_start() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions. Press Ctrl+n to create a pane.");
+    deck.wait_for_string("No active agents. Press Ctrl+n to create an agent.");
 
     let mut desktop = DesktopAttachClient::connect(deck.attach_socket_path());
     let cwd = common::harness_tempdir().expect("create lazy-spawn desktop-selected cwd");
@@ -922,7 +922,7 @@ fn visibility_001_desktop_refetch_after_first_start_keeps_tui_visible() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions. Press Ctrl+n to create a pane.");
+    deck.wait_for_string("No active agents. Press Ctrl+n to create an agent.");
 
     let mut desktop = DesktopAttachClient::connect(deck.attach_socket_path());
     let cwd = common::harness_tempdir().expect("create post-start-refetch desktop-selected cwd");
@@ -1049,7 +1049,7 @@ fn visibility_002_desktop_prepared_orchestration_surfaces_into_attached_tui_as_o
 
     let daemon = common::spawn_daemon_serve(None, "0");
     let deck = launch_tui_against(&daemon);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     let project = write_orchestration_project();
     let project_path = canonical_string(project.path());
     start_orchestration_from_desktop(&daemon, &project_path);
@@ -1067,7 +1067,7 @@ fn visibility_002_desktop_prepared_orchestration_surfaces_into_attached_tui_as_o
             let grid = deck.snapshot_grid();
             grid.lines().next().is_some_and(|tabs| {
                 tabs.contains("Dashboard") && tabs.contains(ORCHESTRATION_TITLE)
-            }) && grid.contains("3 session(s)")
+            }) && grid.contains("3 agent(s)")
                 && grid.contains("ClaudeCode · coordinator")
                 && grid.contains("OpenCode · builder")
                 && grid.contains("Pi · reviewer")
@@ -1090,7 +1090,7 @@ fn visibility_003_desktop_stop_removes_plain_agent_from_attached_dashboard() {
     // Ctrl+W path. This proves the card and pane can be removed normally.
     let control_daemon = common::spawn_daemon_serve(None, "0");
     let control_deck = launch_tui_against(&control_daemon);
-    control_deck.wait_for_string("No active sessions");
+    control_deck.wait_for_string("No active agents");
     let control_cwd = common::harness_tempdir().expect("create control cwd");
     start_plain_from_desktop(
         &control_daemon,
@@ -1102,11 +1102,11 @@ fn visibility_003_desktop_stop_removes_plain_agent_from_attached_dashboard() {
     let (label_col, label_row) = control_deck.wait_for_in_grid(PLAIN_LABEL);
     control_deck.click(label_col, label_row);
     control_deck.send_keys(b"\x17"); // Ctrl+W -> close confirmation
-    control_deck.wait_for_string("Close selected pane?");
+    control_deck.wait_for_string("Close selected agent?");
     control_deck.send_keys(b"\x1b[B"); // Down -> Close
     control_deck.send_keys(b"\r");
     control_deck.wait_until_grid("TUI-native stop removes the desktop-started card", |grid| {
-        grid.contains("No active sessions") && !grid.contains(PLAIN_LABEL)
+        grid.contains("No active agents") && !grid.contains(PLAIN_LABEL)
     });
     assert!(
         common::wait_until(Duration::from_secs(10), || control_daemon
@@ -1120,7 +1120,7 @@ fn visibility_003_desktop_stop_removes_plain_agent_from_attached_dashboard() {
     // Reproduction: the TUI stays untouched after the desktop-shaped stop.
     let daemon = common::spawn_daemon_serve(None, "0");
     let deck = launch_tui_against(&daemon);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     let cwd = common::harness_tempdir().expect("create desktop-selected cwd");
     start_plain_from_desktop(
         &daemon,
@@ -1144,7 +1144,7 @@ fn visibility_003_desktop_stop_removes_plain_agent_from_attached_dashboard() {
     });
     let card_disappeared = common::wait_until(Duration::from_secs(15), || {
         let grid = deck.snapshot_grid();
-        grid.contains("No active sessions") && !grid.contains(PLAIN_LABEL)
+        grid.contains("No active agents") && !grid.contains(PLAIN_LABEL)
     });
     let final_grid = deck.snapshot_grid();
     let published_events = stop_events.snapshot();
@@ -1174,7 +1174,7 @@ fn visibility_004_desktop_close_removes_orchestration_tab_from_attached_tui() {
     // native path stops all roles concurrently and removes a clean tab.
     let control_daemon = common::spawn_daemon_serve(None, "0");
     let control_deck = launch_tui_against(&control_daemon);
-    control_deck.wait_for_string("No active sessions");
+    control_deck.wait_for_string("No active agents");
     let control_project = write_orchestration_project();
     let control_project_path = canonical_string(control_project.path());
     start_orchestration_from_desktop(&control_daemon, &control_project_path);
@@ -1184,13 +1184,13 @@ fn visibility_004_desktop_close_removes_orchestration_tab_from_attached_tui() {
             .is_some_and(|tabs| tabs.contains(ORCHESTRATION_TITLE))
     });
     control_deck.send_keys(b"\x1b[C"); // Right -> Desktop prepared run
-    control_deck.wait_for_string("3 session(s)");
+    control_deck.wait_for_string("3 agent(s)");
     control_deck.send_keys(b"\x17"); // Ctrl+W -> whole-tab confirmation
-    control_deck.wait_for_string("Close this tab and all its panes?");
+    control_deck.wait_for_string("Close this tab and all its agents?");
     control_deck.send_keys(b"\x1b[B"); // Down -> Close
     control_deck.send_keys(b"\r");
     control_deck.wait_until_grid("TUI-native close removes the orchestration tab", |grid| {
-        grid.contains("No active sessions") && !grid.contains(ORCHESTRATION_TITLE)
+        grid.contains("No active agents") && !grid.contains(ORCHESTRATION_TITLE)
     });
     assert!(
         common::wait_until(Duration::from_secs(10), || control_daemon
@@ -1205,7 +1205,7 @@ fn visibility_004_desktop_close_removes_orchestration_tab_from_attached_tui() {
     // desktop action does, while leaving the attached TUI untouched.
     let daemon = common::spawn_daemon_serve(None, "0");
     let deck = launch_tui_against(&daemon);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     let project = write_orchestration_project();
     let project_path = canonical_string(project.path());
     start_orchestration_from_desktop(&daemon, &project_path);
@@ -1240,7 +1240,7 @@ fn visibility_004_desktop_close_removes_orchestration_tab_from_attached_tui() {
     });
     let tab_disappeared = common::wait_until(Duration::from_secs(15), || {
         let grid = deck.snapshot_grid();
-        grid.contains("No active sessions") && !grid.contains(ORCHESTRATION_TITLE)
+        grid.contains("No active agents") && !grid.contains(ORCHESTRATION_TITLE)
     });
     let final_grid = deck.snapshot_grid();
     let published_events = stop_events.snapshot();

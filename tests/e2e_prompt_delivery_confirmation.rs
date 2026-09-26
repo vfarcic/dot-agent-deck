@@ -76,7 +76,7 @@ fn dispatch_worktree_of(deck: &TuiDeck, name: &str) -> PathBuf {
 fn open_cat_caller_pane(deck: &TuiDeck) -> String {
     deck.send_keys(b"\x0e");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(b"caller");
     deck.send_keys(b"\t");
@@ -483,7 +483,7 @@ fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
         // lane 2 (CLAUDE.md rule 5).
         .impersonating_pane_signals()
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     commit_fixture_repo(deck.workdir());
     let caller_pane = open_cat_caller_pane(&deck);
 
@@ -675,7 +675,7 @@ fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
         .impersonating_pane_signals()
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let cases = [
         (

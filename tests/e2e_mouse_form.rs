@@ -22,11 +22,13 @@ use spec::spec;
 /// Open the new-pane form: Ctrl+N → directory picker → Space confirms the
 /// launch cwd → the form. Synchronizes on the form's ` New Agent ` title.
 fn open_form(deck: &TuiDeck) {
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     deck.send_bytes(b"\x0e"); // Ctrl+N → directory picker
     deck.wait_for_string("Select Directory");
     deck.send_bytes(b" "); // Space → confirm current dir → new-pane form
-    deck.wait_for_string("New Agent");
+    // The dashboard button bar also says "New Agent". Wait for the form's
+    // bordered title so a following click cannot target the picker instead.
+    deck.wait_for_string("┌ New Agent");
 }
 
 /// Click the button/affordance whose label text is `needle`.
@@ -88,11 +90,11 @@ fn form_001_click_submit_creates_pane() {
 
     click_target(&deck, "[Submit]");
 
-    // Submitted like Enter: the form closes ("New Agent" gone) and the named
+    // Submitted like Enter: the form closes (its title gone) and the named
     // pane was created (the "subm5" card remains). The combined wait is the
     // assertion.
     deck.wait_until_grid("form closed and subm5 pane created", |g| {
-        !g.contains("New Agent") && g.contains("subm5")
+        !g.contains("┌ New Agent") && g.contains("subm5")
     });
 }
 
@@ -112,7 +114,7 @@ fn form_001_click_cancel_discards() {
     click_target(&deck, "[Cancel]");
 
     // Cancelled like Esc: back to the empty dashboard, no pane created.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     assert!(
         !deck.snapshot_grid().contains("canc9"),
         "cancel must not create a pane with the typed name:\n{}",

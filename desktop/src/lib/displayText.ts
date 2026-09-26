@@ -478,6 +478,6 @@ function uptimeLabel(elapsed: number): string {
  * already uses.
  */
 export function deckName(connection: Pick<ConnectionView, "deckKind" | "socketPath">): string {
-  if (connection.deckKind !== "remote") return "Local deck";
-  return connection.socketPath ? displayIdentity(connection.socketPath, DISPLAY_LIMITS.path, "Remote deck") : "Remote deck";
+  if (connection.deckKind !== "remote") return "Local daemon";
+  return connection.socketPath ? displayIdentity(connection.socketPath, DISPLAY_LIMITS.path, "Remote daemon") : "Remote daemon";
 }

@@ -99,7 +99,7 @@ async function reachForm() {
 describe("New agent dialog — one surface (PRD #1223, the voice-first redesign)", () => {
   /**
    * Scenario: open the dialog over a fleet with one eligible deck. Every
-   * control is on screen at once — the deck field, the directory browser, and
+   * control is on screen at once — the daemon field, the directory browser, and
    * Mode, Name, Command and Start — with no Next, no Back and no step to
    * pass. The deck is chosen already and its home is listed without a key;
    * the form's fields wait, disabled, until a directory is chosen.
@@ -133,22 +133,22 @@ describe("New agent dialog — one surface (PRD #1223, the voice-first redesign)
 
   /**
    * Scenario: open the dialog over two eligible decks. Nothing is chosen for
-   * the user, nothing is listed, the directory panel says to choose a deck
-   * first, and focus is on the deck field — the first control left unsatisfied.
+   * the user, nothing is listed, the directory panel says to choose a daemon
+   * first, and focus is on the daemon field — the first control left unsatisfied.
    */
-  it("focuses the deck field and lists nothing while no deck is chosen", async () => {
+  it("focuses the daemon field and lists nothing while no deck is chosen", async () => {
     const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE)] });
     renderDialog(runtime);
 
     await waitFor(() => expect(deckList()).toHaveFocus());
-    expect(screen.getByTestId("new-agent-directory-idle")).toHaveTextContent("Choose a deck");
+    expect(screen.getByTestId("new-agent-directory-idle")).toHaveTextContent("Choose a daemon");
     expect(screen.queryByTestId("new-agent-directory-list")).toBeNull();
     expect(runtime.listDirectories).not.toHaveBeenCalled();
     expect(runtime.newAgentOptions).not.toHaveBeenCalled();
   });
 
   /**
-   * Scenario: the focus order, as the wizard's steps had it. With the deck
+   * Scenario: the focus order, as the wizard's steps had it. With the daemon
    * preselected, focus opens on the directory browser; confirming a directory
    * moves it to Name. The tab stops run deck → directory → Mode → Name →
    * Command → Start in document order — no Agent picker (PRD #1223 removed it
@@ -206,7 +206,7 @@ describe("New agent dialog — one surface (PRD #1223, the voice-first redesign)
   });
 
   /**
-   * Scenario: with the deck preselected and listed, press Enter on the deck
+   * Scenario: with the daemon preselected and listed, press Enter on the daemon
    * field — the wizard's one keystroke. The deck is already chosen, so nothing
    * is asked again: focus just moves on to the browser.
    */
@@ -285,7 +285,7 @@ describe("New agent dialog — deck field (PRD #1223 M4)", () => {
     expect(options[0]).not.toHaveAttribute("aria-disabled");
     expect(options[1]).toHaveAttribute("aria-disabled", "true");
     expect(options[1]).toHaveTextContent("Connection refused");
-    expect(options[2]).toHaveTextContent("This deck has not reported yet.");
+    expect(options[2]).toHaveTextContent("This daemon has not reported yet.");
     expect(options[3]).toHaveTextContent("Protocol handshake failed.");
     fireEvent.click(options[1]);
     expect(runtime.listDirectories).toHaveBeenCalledTimes(1);
@@ -310,7 +310,7 @@ describe("New agent dialog — deck field (PRD #1223 M4)", () => {
    * Scenario: two decks can take a spawn and the flow was opened from the
    * remote one's header. That deck is chosen and its home listed.
    */
-  it("chooses the deck the flow was opened from", async () => {
+  it("chooses the daemon the flow was opened from", async () => {
     const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE)] });
     renderDialog(runtime, { initialDeckId: REMOTE });
 
@@ -323,7 +323,7 @@ describe("New agent dialog — deck field (PRD #1223 M4)", () => {
   /**
    * Scenario: two decks can take a spawn and a disconnected one sits between
    * them. Nothing is preselected; `j` moves to the first eligible deck and
-   * again past the disconnected one to the second, and Enter chooses the deck
+   * again past the disconnected one to the second, and Enter chooses the daemon
    * the cursor is on — moving the cursor alone chooses nothing.
    */
   it("preselects nothing between two eligible decks and moves over disabled ones", async () => {
@@ -349,7 +349,7 @@ describe("New agent dialog — directory browser (PRD #1223 M4)", () => {
   /**
    * Scenario: browse with the TUI picker's keys. The home listing opens with
    * the cursor on its first subdirectory, the project marked; `j` moves to
-   * `beta` and Enter lists it by the path the deck gave. Left goes up by the
+   * `beta` and Enter lists it by the path the daemon gave. Left goes up by the
    * reply's `parent` and lands the cursor back on `beta`; Backspace goes up
    * again by home's `parent` — a path no trimming of home produces. Space then
    * uses that directory, and the form names it after its last component.
@@ -383,7 +383,7 @@ describe("New agent dialog — directory browser (PRD #1223 M4)", () => {
 
   /**
    * Scenario: enter a directory that has no subdirectories and press Enter.
-   * That directory is confirmed — the form opens on it and asks the deck for
+   * That directory is confirmed — the form opens on it and asks the daemon for
    * its options — rather than Enter doing nothing.
    */
   it("confirms a directory with no subdirectories on Enter", async () => {
@@ -418,7 +418,7 @@ describe("New agent dialog — directory browser (PRD #1223 M4)", () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
-  /** Scenario: a listing the deck cut short says so. */
+  /** Scenario: a listing the daemon cut short says so. */
   it("shows that a truncated listing is incomplete", async () => {
     const runtime = fakeRuntime({
       listDirectories: vi.fn(async (): Promise<DeckDirectoryListing> => ({ ...structuredClone(TREE[""]), truncated: true })),
@@ -463,7 +463,7 @@ describe("New agent dialog — going up (PRD #1223 U3)", () => {
 
     const flow = screen.getByTestId("new-agent-dialog");
     expect(within(flow).queryByRole("button", { name: /^up$/i })).toBeNull();
-    expect(within(flow.querySelector("footer")!).getAllByRole("button").map((button) => button.textContent?.trim())).toEqual(["Discard", "Start agent"]);
+    expect(within(flow.querySelector("footer")!).getAllByRole("button").map((button) => button.textContent?.trim())).toEqual(["Discard", "Create agent"]);
     expect(within(screen.getByTestId("new-agent-directory-panel")).getAllByRole("button").map((button) => button.textContent?.trim())).toEqual(["Use this directory"]);
     const up = within(directoryList()).getAllByRole("option")[0];
     expect(up).toHaveTextContent("..");
@@ -473,13 +473,13 @@ describe("New agent dialog — going up (PRD #1223 U3)", () => {
   });
 });
 
-describe("New agent dialog — the deck's default directory (PRD #1223)", () => {
+describe("New agent dialog — the daemon's default directory (PRD #1223)", () => {
   /**
-   * Scenario: the deck's config names `default_dir = "/home/dev/beta"`. The
+   * Scenario: the daemon's config names `default_dir = "/home/dev/beta"`. The
    * browser opens THERE — not in home, and without listing home first — and
    * its `..` row still walks above it, back to home and beyond.
    */
-  it("opens the browser in the deck's default directory, and .. still walks above it", async () => {
+  it("opens the browser in the daemon's default directory, and .. still walks above it", async () => {
     const runtime = fakeRuntime({ newAgentOptions: vi.fn(async (): Promise<NewAgentOptions> => ({ ...structuredClone(DECK_OPTIONS), defaultDir: "/home/dev/beta" })) });
     renderDialog(runtime);
 
@@ -496,13 +496,13 @@ describe("New agent dialog — the deck's default directory (PRD #1223)", () => 
   });
 
   /**
-   * Scenario: no default directory is configured — or the deck is older than
+   * Scenario: no default directory is configured — or the daemon is older than
    * the setting and never names one. The browser opens in the daemon user's
    * home, as it always has.
    */
   it.each([
     ["no default directory is configured", DECK_OPTIONS],
-    ["the deck is older than the options query", { kind: "unsupported", desktopAgents: [] } as NewAgentOptions],
+    ["the daemon is older than the options query", { kind: "unsupported", desktopAgents: [] } as NewAgentOptions],
   ])("opens in home when %s", async (_case, options) => {
     const runtime = fakeRuntime({ newAgentOptions: vi.fn(async (): Promise<NewAgentOptions> => structuredClone(options)) });
     renderDialog(runtime);
@@ -513,7 +513,7 @@ describe("New agent dialog — the deck's default directory (PRD #1223)", () => 
   });
 
   /**
-   * Scenario: the deck named a default directory that is gone by the time it
+   * Scenario: the daemon named a default directory that is gone by the time it
    * is listed. The browser falls back to home rather than opening on an error.
    */
   it("falls back to home when the default directory no longer lists", async () => {
@@ -526,7 +526,7 @@ describe("New agent dialog — the deck's default directory (PRD #1223)", () => 
   });
 
   /**
-   * Scenario: the options query itself fails (the deck's query pool is busy).
+   * Scenario: the options query itself fails (the daemon's query pool is busy).
    * The browser still opens, in home, so it never waits on a setting.
    */
   it("still lists home when the options query fails", async () => {
@@ -542,7 +542,7 @@ describe("New agent dialog — form (PRD #1223 M4)", () => {
   /**
    * Scenario: reach the form against three decks' options. Command is the
    * deck's configured default command when it has one — ahead of the last
-   * command — then the last command started on that deck, then blank.
+   * command — then the last command started on that daemon, then blank.
    */
   it.each([
     ["the default command", { defaultCommand: "opencode", lastCommand: "claude" }, "opencode"],
@@ -578,9 +578,9 @@ describe("New agent dialog — form (PRD #1223 M4)", () => {
   });
 
   /**
-   * Scenario: submit the form. The start names the deck captured at the deck
-   * step, the directory the deck returned, and the Name and Command as they
-   * stand; a blank Command sends no command at all, which starts the deck's
+   * Scenario: submit the form. The start names the daemon captured at the daemon
+   * step, the directory the daemon returned, and the Name and Command as they
+   * stand; a blank Command sends no command at all, which starts the daemon's
    * default shell.
    */
   it("starts on the captured deck with the form's values, and a blank Command sends none", async () => {
@@ -633,7 +633,7 @@ describe("New agent dialog — form (PRD #1223 M4)", () => {
   });
 
   /**
-   * Scenario: the deck refuses the start. The dialog stays open on the form
+   * Scenario: the daemon refuses the start. The dialog stays open on the form
    * with the refusal inline, the Name and Command exactly as entered, Start
    * available again — and the runtime's global copy of the error is dropped.
    */
@@ -655,19 +655,19 @@ describe("New agent dialog — form (PRD #1223 M4)", () => {
   });
 });
 
-describe("New agent dialog — a deck that leaves mid-flow (PRD #1223 M4)", () => {
-  const GONE = `that deck is not one this app is observing: ${LOCAL}`;
+describe("New agent dialog — a daemon that leaves mid-flow (PRD #1223 M4)", () => {
+  const GONE = `that daemon is not one this app is observing: ${LOCAL}`;
 
   /**
    * Scenario: the chosen deck leaves the fleet before its home is listed. The
-   * refusal is shown at the deck field, focus goes back there, nothing is
+   * refusal is shown at the daemon field, focus goes back there, nothing is
    * chosen in its place, and no other deck is asked for anything.
    */
-  it("clears the flow back to the deck field when the listing is refused for a departed deck", async () => {
+  it("clears the flow back to the daemon field when the listing is refused for a departed deck", async () => {
     const runtime = fakeRuntime({ listDirectories: vi.fn(async (): Promise<DeckDirectoryListing> => { throw new Error(GONE); }) });
     renderDialog(runtime);
 
-    expect(await screen.findByTestId("new-agent-deck-notice")).toHaveTextContent("that deck is not one this app is observing");
+    expect(await screen.findByTestId("new-agent-deck-notice")).toHaveTextContent("that daemon is not one this app is observing");
     await waitFor(() => expect(deckList()).toHaveFocus());
     expect(deckList().querySelector("[data-chosen='true']")).toBeNull();
     expect(screen.queryByTestId("new-agent-chosen-deck")).toBeNull();
@@ -679,7 +679,7 @@ describe("New agent dialog — a deck that leaves mid-flow (PRD #1223 M4)", () =
   /**
    * Scenario: the chosen deck leaves between choosing a directory and the
    * start. The start's refusal clears the directory panel and the form — no
-   * listing, no chosen directory, a blank Name — refocuses the deck field and
+   * listing, no chosen directory, a blank Name — refocuses the daemon field and
    * shows the refusal there. It is the wizard's return to its deck step, with
    * no navigation.
    */
@@ -691,7 +691,7 @@ describe("New agent dialog — a deck that leaves mid-flow (PRD #1223 M4)", () =
 
     fireEvent.click(screen.getByTestId("new-agent-start"));
 
-    expect(await screen.findByTestId("new-agent-deck-notice")).toHaveTextContent("that deck is not one this app is observing");
+    expect(await screen.findByTestId("new-agent-deck-notice")).toHaveTextContent("that daemon is not one this app is observing");
     await waitFor(() => expect(deckList()).toHaveFocus());
     expect(screen.queryByTestId("new-agent-directory-list")).toBeNull();
     expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("No directory chosen yet");
@@ -700,7 +700,7 @@ describe("New agent dialog — a deck that leaves mid-flow (PRD #1223 M4)", () =
     expect(screen.queryByTestId("new-agent-error")).toBeNull();
     expect(runtime.runAction).toHaveBeenCalledTimes(1);
 
-    // Choosing the deck again starts over on it.
+    // Choosing the daemon again starts over on it.
     fireEvent.keyDown(deckList(), { key: "Enter" });
     await currentPath("/home/dev");
     expect(screen.queryByTestId("new-agent-deck-notice")).toBeNull();
@@ -714,8 +714,8 @@ describe("New agent dialog — older decks (PRD #1223 M5)", () => {
    * with that reason, is not chosen even when the flow was opened from it —
    * the one eligible deck is — and neither a click nor the keys choose it.
    */
-  it("disables a deck without the listing verb in the deck field, with the crate's reason", async () => {
-    const reason = "This deck does not advertise list-directories, so it cannot be browsed for a directory to start in. Start agents on it from the TUI on its host, or upgrade the deck.";
+  it("disables a daemon without the listing verb in the daemon field, with the crate's reason", async () => {
+    const reason = "This deck does not advertise list-directories, so it cannot be browsed for a directory to start in. Create agents on it from the TUI on its host, or upgrade the daemon.";
     const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE, { newAgentReason: reason })] });
     renderDialog(runtime, { initialDeckId: REMOTE });
 
@@ -734,16 +734,16 @@ describe("New agent dialog — older decks (PRD #1223 M5)", () => {
   });
 
   /**
-   * Scenario: a deck that answers the listing `unsupported` anyway — replaced
+   * Scenario: a daemon that answers the listing `unsupported` anyway — replaced
    * by an older build between its handshake and the request — says it cannot be
-   * browsed, offers no way to type a path, and puts focus back on the deck
+   * browsed, offers no way to type a path, and puts focus back on the daemon
    * field, since another deck is the one thing left to do. There is no Back.
    */
-  it("points back at the deck field when a deck answers the listing unsupported", async () => {
+  it("points back at the daemon field when a daemon answers the listing unsupported", async () => {
     const runtime = fakeRuntime({ listDirectories: vi.fn(async (): Promise<DeckDirectoryListing> => ({ kind: "unsupported" })) });
     renderDialog(runtime);
 
-    expect(await screen.findByTestId("new-agent-no-browse")).toHaveTextContent("Choose another deck");
+    expect(await screen.findByTestId("new-agent-no-browse")).toHaveTextContent("Choose another daemon");
     expect(screen.queryByTestId("new-agent-directory-list")).toBeNull();
     expect(screen.queryByTestId("new-agent-path")).toBeNull();
     expect(screen.queryByTestId("new-agent-directory-back")).toBeNull();
@@ -753,11 +753,11 @@ describe("New agent dialog — older decks (PRD #1223 M5)", () => {
   });
 
   /**
-   * Scenario: the deck has no options query. Command is prefilled from this
-   * app's memory of the deck's last command. (The fallback registry is still
+   * Scenario: the daemon has no options query. Command is prefilled from this
+   * app's memory of the daemon's last command. (The fallback registry is still
    * this app's own, for voice's "use codex"; there is no picker to label.)
    */
-  it("falls back to this app's memory and registry on a deck without the options query", async () => {
+  it("falls back to this app's memory and registry on a daemon without the options query", async () => {
     const runtime = fakeRuntime({
       newAgentOptions: vi.fn(async (): Promise<NewAgentOptions> => ({ kind: "unsupported", desktopAgents: [{ id: "codex", displayName: "Codex", defaultCommand: "codex" }], lastCommand: "codex --model gpt-5.6-sol" })),
     });
@@ -772,7 +772,7 @@ describe("New agent dialog — older decks (PRD #1223 M5)", () => {
 
 describe("New agent dialog — after the start (PRD #1223 M5)", () => {
   /**
-   * Scenario: the deck accepts the start and returns agent `7`. The other deck
+   * Scenario: the daemon accepts the start and returns agent `7`. The other deck
    * already runs an agent `7`, and the target deck does not list its own yet —
    * so nothing opens and the dialog says it is waiting. When the target deck's
    * fleet entry lists `7`, the pane is asked for exactly once, by the
@@ -794,8 +794,8 @@ describe("New agent dialog — after the start (PRD #1223 M5)", () => {
   });
 
   /**
-   * Scenario: the deck accepts the start and never lists the agent. Once the
-   * bound passes, the flow reports the agent as started on that deck and not
+   * Scenario: the daemon accepts the start and never lists the agent. Once the
+   * bound passes, the flow reports the agent as started on that daemon and not
    * yet listed — and a listing that arrives afterwards opens nothing.
    */
   it("gives up after the bound and reports the agent as started but not listed", async () => {
@@ -807,7 +807,7 @@ describe("New agent dialog — after the start (PRD #1223 M5)", () => {
     fireEvent.click(screen.getByTestId("new-agent-start"));
 
     await waitFor(() => expect(onNotAppeared).toHaveBeenCalledTimes(1));
-    expect(onNotAppeared).toHaveBeenCalledWith({ deckName: "Local deck", agentName: "worker" });
+    expect(onNotAppeared).toHaveBeenCalledWith({ deckName: "Local daemon", agentName: "worker" });
     await act(async () => {
       rerenderWith({ ...runtime, fleet: [deck(LOCAL, { deckKind: "local" }, [createFixtureStartedAgent({ id: "7", daemonId: LOCAL })]), runtime.fleet[1]] });
     });
@@ -824,28 +824,28 @@ describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
   }
 
   /**
-   * Scenario: Start is pressed and the deck has not answered. The header's
+   * Scenario: Start is pressed and the daemon has not answered. The header's
    * close button is disabled and says why, and neither Esc nor a backdrop
-   * click closes the dialog. Once the deck refuses the start, the
+   * click closes the dialog. Once the daemon refuses the start, the
    * refusal is shown and every way out works again.
    */
-  it("cannot be closed until the deck answers the start", async () => {
+  it("cannot be closed until the daemon answers the start", async () => {
     const held = heldStart();
     const runtime = fakeRuntime({ runAction: held.runAction });
     const { onClose } = renderDialog(runtime);
     await reachForm();
 
     fireEvent.click(screen.getByTestId("new-agent-start"));
-    expect(await screen.findByTestId("new-agent-starting")).toHaveTextContent("Waiting for the deck to answer the start");
+    expect(await screen.findByTestId("new-agent-starting")).toHaveTextContent("Waiting for the daemon to answer the start");
     const close = screen.getByRole("button", { name: "Close new agent" });
     expect(close).toBeDisabled();
-    expect(close).toHaveAttribute("title", expect.stringContaining("Waiting for the deck to answer the start"));
+    expect(close).toHaveAttribute("title", expect.stringContaining("Waiting for the daemon to answer the start"));
     fireEvent.click(close);
     fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" });
     fireEvent.mouseDown(screen.getByTestId("new-agent-backdrop"));
     expect(onClose).not.toHaveBeenCalled();
 
-    await act(async () => held.settle().reject(new Error("the deck did not answer the start within 15s")));
+    await act(async () => held.settle().reject(new Error("the daemon did not answer the start within 15s")));
 
     expect(await screen.findByTestId("new-agent-error")).toHaveTextContent("did not answer the start within 15s");
     expect(screen.queryByTestId("new-agent-starting")).toBeNull();
@@ -857,7 +857,7 @@ describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
   });
 
   /**
-   * Scenario (Greptile's review of PR #1235): press Start and let the deck hold
+   * Scenario (Greptile's review of PR #1235): press Start and let the daemon hold
    * its answer. Every control in the dialog is disabled at once, so no tab stop
    * is left inside it and none outside either — the background is inert — and
    * the dialog itself is the focus target that is left. The sentence explaining
@@ -893,7 +893,7 @@ describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
     expect(flow).toHaveAttribute("tabindex", "-1");
     expect(flow.contains(document.activeElement)).toBe(true);
 
-    await act(async () => held.settle().reject(new Error("the deck did not answer the start within 15s")));
+    await act(async () => held.settle().reject(new Error("the daemon did not answer the start within 15s")));
     await screen.findByTestId("new-agent-error");
     expect(screen.getByRole("button", { name: "Close new agent" })).toBeEnabled();
   });
@@ -945,7 +945,7 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
   const modeLabels = () => within(screen.getByTestId("new-agent-modes")).getAllByRole("button").map((chip) => chip.textContent);
 
   /**
-   * Scenario: reach the form on a deck that lists all three authoring kinds
+   * Scenario: reach the form on a daemon that lists all three authoring kinds
    * with its experimental flag off. The Mode row offers No mode, schedule and
    * dispatcher — not `schedule: issues`, which the TUI shows only with the
    * flag. With the flag on, it is offered between the other two.
@@ -953,7 +953,7 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
   it.each([
     ["off", false, ["No mode", "schedule", "dispatcher"]],
     ["on", true, ["No mode", "schedule", "schedule: issues", "dispatcher"]],
-  ])("offers the authoring chips the deck lists, schedule: issues only with the deck's flag %s", async (_flag, experimental, expected) => {
+  ])("offers the authoring chips the daemon lists, schedule: issues only with the daemon's flag %s", async (_flag, experimental, expected) => {
     renderDialog(fakeRuntime({ newAgentOptions: optionsOf({ experimental }) }));
     await reachForm();
 
@@ -970,7 +970,7 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
    */
   it.each([
     ["an older deck", vi.fn(async (): Promise<NewAgentOptions> => ({ kind: "unsupported", desktopAgents: DECK_OPTIONS.kind === "deck" ? DECK_OPTIONS.agents : [] })), "does not report which authoring agents"],
-    ["a deck that composes no seed", optionsOf({ authoringKinds: [], experimental: true }), "cannot compose authoring seeds"],
+    ["a daemon that composes no seed", optionsOf({ authoringKinds: [], experimental: true }), "cannot compose authoring seeds"],
   ])("withholds every authoring chip on %s and says why", async (_case, newAgentOptions, reason) => {
     renderDialog(fakeRuntime({ newAgentOptions }));
     await reachForm();
@@ -980,10 +980,10 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
   });
 
   /**
-   * Scenario: on a deck with no configured default command, choose schedule
+   * Scenario: on a daemon with no configured default command, choose schedule
    * and leave Command blank. The start carries the authoring kind and
    * resolves the blank Command to `claude` — the TUI's fallback — rather than
-   * sending none, which would start the deck's default shell. The Command
+   * sending none, which would start the daemon's default shell. The Command
    * field still shows what the user left there.
    */
   it("resolves a blank Command to claude for an authoring agent", async () => {
@@ -1002,12 +1002,12 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
   });
 
   /**
-   * Scenario: on a deck whose host configures `default_command`, clear the
+   * Scenario: on a daemon whose host configures `default_command`, clear the
    * prefilled Command, move to dispatcher with the Right arrow and start. The
    * blank Command resolves to the configured command, trimmed; a typed
    * command, by contrast, is sent as it stands.
    */
-  it("resolves a blank Command to the deck's default command, and sends a typed one as it is", async () => {
+  it("resolves a blank Command to the daemon's default command, and sends a typed one as it is", async () => {
     const runtime = fakeRuntime({ newAgentOptions: optionsOf({ defaultCommand: "  opencode --model mini  " }) });
     renderDialog(runtime);
     await reachForm();
@@ -1038,7 +1038,7 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
   });
 
   /**
-   * Scenario: the deck refuses the authoring start — here as an older deck
+   * Scenario: the daemon refuses the authoring start — here as an older deck
    * that cannot compose the seed would. The dialog stays open on the form with
    * the refusal inline, and the Mode, Name and Command are all as they were,
    * so Start can be pressed again.
@@ -1065,11 +1065,11 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
   });
 
   /**
-   * Scenario: an authoring start the deck accepts. The pane opens only once
+   * Scenario: an authoring start the daemon accepts. The pane opens only once
    * the target deck's fleet entry lists the new agent — the same wait a plain
    * agent gets.
    */
-  it("opens the authoring agent's pane once the deck lists it", async () => {
+  it("opens the authoring agent's pane once the daemon lists it", async () => {
     const runtime = fakeRuntime({ newAgentOptions: optionsOf() });
     const { onAppeared, rerenderWith } = renderDialog(runtime);
     await reachForm();
@@ -1086,7 +1086,7 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
    * Scenario: choose schedule, type Pi's command, then go up in the browser
    * and use that directory instead. The Mode goes back to No mode, as every
    * fresh TUI form does, and the Name follows the new directory — while
-   * Command, which hangs off the deck rather than the directory, stays.
+   * Command, which hangs off the daemon rather than the directory, stays.
    */
   it("re-derives Mode and Name from a newly confirmed directory, keeping Command", async () => {
     renderDialog(fakeRuntime({ newAgentOptions: optionsOf() }));
@@ -1129,7 +1129,7 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
   const orchestrationsOf = (answer: NewAgentOrchestrations = PROJECT_ORCHESTRATIONS) =>
     vi.fn(async (_deckId: string, _path: string): Promise<NewAgentOrchestrations> => structuredClone(answer));
 
-  /** A live orchestration role on a deck, carrying `title` (or none) and running in `cwd`. */
+  /** A live orchestration role on a daemon, carrying `title` (or none) and running in `cwd`. */
   function orchestrationRole(id: string, daemonId: string, title: string | undefined, name = "loop", cwd?: string): AgentSession {
     return {
       ...createFixtureStartedAgent({ id, daemonId }),
@@ -1183,12 +1183,12 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
   /**
    * Scenario: two decks expose the SAME path, and only the second holds a
    * project there. Browse to it on the first deck — no orchestrations asked,
-   * the listing marked it as no project — then switch to a deck whose HOME is
+   * the listing marked it as no project — then switch to a daemon whose HOME is
    * that path, so nothing re-lists it. The second deck is still asked, and its
-   * modes appear. The markers come from a deck's own listings, so carrying
-   * them across a deck switch hid modes the user does have (Qodo on PR #1235).
+   * modes appear. The markers come from a daemon's own listings, so carrying
+   * them across a daemon switch hid modes the user does have (Qodo on PR #1235).
    */
-  it("re-asks for orchestrations after a deck switch, rather than trusting the old deck's marker", async () => {
+  it("re-asks for orchestrations after a daemon switch, rather than trusting the old deck's marker", async () => {
     const SHARED = "/home/dev/shared";
     const listing = (path: string, entries: { path: string; displayName: string; isProject: boolean }[], parent?: string) =>
       ({ kind: "listing", path, displayPath: path, parent, entries, truncated: false }) as DeckDirectoryListing;
@@ -1223,9 +1223,9 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
   /**
    * Scenario: the chosen deck cannot launch an orchestration from this flow —
    * it lacks the project verbs or cannot start a role with its configured
-   * command. No chip is offered and the deck's own reason is shown instead.
+   * command. No chip is offered and the daemon's own reason is shown instead.
    */
-  it("withholds the chips with the deck's reason", async () => {
+  it("withholds the chips with the daemon's reason", async () => {
     const reason = "This deck cannot start orchestration roles with their configured commands, so its orchestrations are not offered here.";
     renderDialog(fakeRuntime({ newAgentOrchestrations: orchestrationsOf({ kind: "unsupported", reason }) }));
     await reachProjectForm();
@@ -1257,7 +1257,7 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
     fireEvent.click(await chip());
     expect(screen.getByTestId("new-agent-name")).toHaveValue("Alpha-project-orchestrator-2");
     expect(screen.queryByTestId("new-agent-command")).toBeNull();
-    expect(screen.getByTestId("new-agent-start")).toHaveTextContent("Start orchestration");
+    expect(screen.getByTestId("new-agent-start")).toHaveTextContent("Activate orchestration");
 
     fireEvent.click(screen.getByTestId("new-agent-mode-none"));
     expect(screen.getByTestId("new-agent-name")).toHaveValue("Alpha-project");
@@ -1275,7 +1275,7 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
    * take the orchestration's own name, `loop` — is refused the same way; any
    * other Name clears the refusal. Nothing is sent while it stands.
    */
-  it("refuses a Name that is a live orchestration's title on that deck", async () => {
+  it("refuses a Name that is a live orchestration's title on that daemon", async () => {
     const runtime = fakeRuntime({
       newAgentOrchestrations: orchestrationsOf(),
       fleet: [
@@ -1303,9 +1303,9 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
 
   /**
    * Scenario: launch the orchestration. One `start_orchestration` goes to the
-   * captured deck with the deck's own project path and orchestration name,
+   * captured deck with the daemon's own project path and orchestration name,
    * the Name as the run's title, the resolved config revision, and no command
-   * or task. Once that deck lists the START role the reply named, its pane is
+   * or task. Once that daemon lists the START role the reply named, its pane is
    * opened.
    */
   it("launches on the captured deck and opens the start role's pane once it is listed", async () => {
@@ -1376,11 +1376,11 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
     for (const namesake of namesakes) {
       expect(namesake).toBeDisabled();
       expect(namesake).toHaveTextContent("Orch: loop");
-      expect(namesake).toHaveAttribute("title", "This project defines more than one orchestration named loop; rename one to launch it here.");
+      expect(namesake).toHaveAttribute("title", "This project defines more than one orchestration named loop; rename one to activate it here.");
       fireEvent.click(namesake);
     }
     expect(screen.getAllByTestId("new-agent-orchestration-ambiguous")).toHaveLength(1);
-    expect(screen.getByTestId("new-agent-orchestration-ambiguous")).toHaveTextContent("rename one to launch it here");
+    expect(screen.getByTestId("new-agent-orchestration-ambiguous")).toHaveTextContent("rename one to activate it here");
     expect(screen.queryByTestId("new-agent-mode-orch:loop")).toBeNull();
     expect(screen.getByTestId("new-agent-mode-none")).toHaveAttribute("aria-pressed", "true");
 
@@ -1406,10 +1406,11 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
    * own, ABOVE the clamped sentence, from the roles the crate sent as data —
    * and more of the sentence stays readable behind "Detail".
    */
+  /** Scenario: Shows a cleanup warning ahead of the clamped error, and the full sentence on demand. */
   it("shows a cleanup warning ahead of the clamped error, and the full sentence on demand", async () => {
     const long = (prefix: string) => `${prefix}${"x".repeat(128 - prefix.length)}`;
     const [planner, builder, reviewer] = [long("planner-"), long("builder-"), long("reviewer-")];
-    const refusal = `failed to start orchestration role tester: refused; roles already started: ${planner}, ${builder}, ${reviewer}; cleanup could not confirm stop for 2 of 3 already-started role(s): ${reviewer} (agent-2: the deck did not answer the stop within 15s), ${planner} (agent-0: stop refused)`;
+    const refusal = `failed to start orchestration role tester: refused; roles already started: ${planner}, ${builder}, ${reviewer}; cleanup could not confirm stop for 2 of 3 already-started role(s): ${reviewer} (agent-2: the daemon did not answer the stop within 15s), ${planner} (agent-0: stop refused)`;
     const runtime = fakeRuntime({
       newAgentOrchestrations: orchestrationsOf(),
       runAction: vi.fn(async () => { throw new LaunchCleanupError(refusal, [reviewer, planner]); }),
@@ -1422,7 +1423,7 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
 
     const warning = await screen.findByTestId("new-agent-cleanup-warning");
     const error = screen.getByTestId("new-agent-error");
-    expect(warning).toHaveTextContent("2 roles may still be running on this deck");
+    expect(warning).toHaveTextContent("2 roles may still be running on this daemon");
     expect(warning).toHaveTextContent("reviewer-");
     expect(warning.compareDocumentPosition(error) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(error.textContent).not.toContain("cleanup could not confirm");
@@ -1435,11 +1436,12 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
    * Scenario (PRD #1223 audit V3): the project's roles are named after the
    * crate's "deck left the fleet" refusal, which the crate interpolates into
    * the launch's failure sentence. That sentence must not be classified as
-   * deck loss: the flow would clear the form, the deck field renders prose
+   * deck loss: the flow would clear the form, the daemon field renders prose
    * only, and the roles that may still be running would be dropped on the way.
    */
-  it("keeps the cleanup warning when a role name quotes the deck-gone refusal", async () => {
-    const hostile = "that deck is not one this app is observing";
+  /** Scenario: Keeps the cleanup warning when a role name quotes the daemon-gone refusal. */
+  it("keeps the cleanup warning when a role name quotes the daemon-gone refusal", async () => {
+    const hostile = "that daemon is not one this app is observing";
     const refusal = `failed to start orchestration role builder: refused; roles already started: ${hostile}; cleanup could not confirm stop for 1 of 1 already-started role(s): ${hostile} (agent-0: stop refused)`;
     const runtime = fakeRuntime({
       newAgentOrchestrations: orchestrationsOf(),
@@ -1452,10 +1454,10 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
     fireEvent.click(screen.getByTestId("new-agent-start"));
 
     const warning = await screen.findByTestId("new-agent-cleanup-warning");
-    expect(warning).toHaveTextContent("1 role may still be running on this deck");
+    expect(warning).toHaveTextContent("1 role may still be running on this daemon");
     expect(warning).toHaveTextContent(hostile);
-    // The failure stays beside the values — not cleared back to the deck
-    // field, which would have said the deck had left.
+    // The failure stays beside the values — not cleared back to the daemon
+    // field, which would have said the daemon had left.
     expect(screen.getByTestId("new-agent-error")).toHaveTextContent("failed to start orchestration role builder");
     expect(screen.queryByTestId("new-agent-deck-notice")).toBeNull();
     expect(screen.getByTestId("new-agent-dir")).toHaveTextContent(PROJECT);
@@ -1468,6 +1470,7 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
    * once-clamped sentence it replaced dropped the later identities with nothing
    * saying it had.
    */
+  /** Scenario: Lists the unconfirmed roles and counts the ones past the cap. */
   it("lists the unconfirmed roles and counts the ones past the cap", async () => {
     const stops = Array.from({ length: 12 }, (_, index) => `role-${index}`);
     const runtime = fakeRuntime({
@@ -1481,7 +1484,7 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
     fireEvent.click(screen.getByTestId("new-agent-start"));
 
     const warning = await screen.findByTestId("new-agent-cleanup-warning");
-    expect(warning).toHaveTextContent("12 roles may still be running on this deck");
+    expect(warning).toHaveTextContent("12 roles may still be running on this daemon");
     expect(within(warning).getAllByRole("listitem").map((item) => item.textContent)).toEqual(stops.slice(0, 8));
     expect(screen.getByTestId("new-agent-cleanup-warning-overflow")).toHaveTextContent("…and 4 more");
   });
@@ -1516,7 +1519,7 @@ describe("New agent dialog — a draft that survives a close (issue 1247)", () =
   /** A draft on the local deck, with `leaf` chosen and both fields edited. */
   const saved = (patch: Partial<NewAgentDraft> = {}): NewAgentDraft => ({
     deckId: LOCAL,
-    deckName: "Local deck",
+    deckName: "Local daemon",
     browsing: LEAF.path,
     directory: LEAF,
     mode: "none",

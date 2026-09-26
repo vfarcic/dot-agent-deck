@@ -137,7 +137,7 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: open the Decks section on a fresh install — a document with no
+   * Scenario: open the Daemons section on a fresh install — a document with no
    * `[endpoints]` section at all. The local deck is listed and chosen, and
    * nothing had to be configured for that to be true.
    */
@@ -152,13 +152,13 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: press "Add a deck". A row appears, focused, with its fields ready
-   * to fill in — and **nothing is saved yet**, because a deck with no host is
+   * Scenario: press "Add a daemon". A row appears, focused, with its fields ready
+   * to fill in — and **nothing is saved yet**, because a daemon with no host is
    * not a document Rust will accept (PRD #741, Greptile P2 on #1035). Writing
    * it immediately meant the row lived only in this component's optimistic
    * state and that every unrelated settings save failed while it sat there.
    */
-  it("adds a deck as a local draft, saving nothing until it is valid", () => {
+  it("adds a daemon as a local draft, saving nothing until it is valid", () => {
     const { onSave } = renderPanel({}, { testEndpoint: async () => report() });
     fireEvent.click(screen.getByTestId("add-deck"));
 
@@ -166,7 +166,7 @@ describe("EndpointsPanel", () => {
     // Present, focused, and named for what it is until it has a host.
     expect(screen.getByTestId("deck-detail")).toBeInTheDocument();
     expect(screen.getByLabelText("Host")).toHaveValue("");
-    expect(screen.getByText("New deck")).toBeInTheDocument();
+    expect(screen.getByText("New daemon")).toBeInTheDocument();
     // And it cannot be probed while it is unusable.
     expect(screen.getByTestId("test-connection")).toBeDisabled();
   });
@@ -174,7 +174,7 @@ describe("EndpointsPanel", () => {
   /**
    * Scenario: fill the draft's Host in. The moment the row is storable it stops
    * being a draft — it goes into the document with a freshly minted id and
-   * becomes the selection, which is what pressing "Add a deck" was asking for.
+   * becomes the selection, which is what pressing "Add a daemon" was asking for.
    */
   it("stores a draft and selects it as soon as it is valid", () => {
     const { onSave } = renderPanel();
@@ -194,13 +194,13 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: press "Add a deck" and then remove the row again without typing
+   * Scenario: press "Add a daemon" and then remove the row again without typing
    * anything. Nothing was ever written, so nothing has to be unwritten.
    */
   it("drops an abandoned draft without touching the document", () => {
     const { onSave } = renderPanel();
     fireEvent.click(screen.getByTestId("add-deck"));
-    const remove = screen.getByLabelText("Remove New deck");
+    const remove = screen.getByLabelText("Remove New daemon");
     fireEvent.click(remove);
 
     expect(onSave).not.toHaveBeenCalled();
@@ -225,13 +225,13 @@ describe("EndpointsPanel", () => {
   */
 
   /**
-   * Scenario: a document with no `[endpoints]` section. Press "Add a deck",
-   * then abandon the draft by clicking back onto **This machine** — the deck
+   * Scenario: a document with no `[endpoints]` section. Press "Add a daemon",
+   * then abandon the draft by clicking back onto **This machine** — the daemon
    * that was already in force. Nothing about the document changed, so nothing
    * may be written: the section this panel would write is a stand-in it
    * invented, and it would delete rows it was never shown.
    */
-  it("a client that CAN render endpoints does not delete them by re-choosing the deck already in force", () => {
+  it("a client that CAN render endpoints does not delete them by re-choosing the daemon already in force", () => {
     const { onSave } = renderPanel();
     fireEvent.click(screen.getByTestId("add-deck"));
     expect(screen.getByTestId("deck-detail")).toBeInTheDocument();
@@ -246,7 +246,7 @@ describe("EndpointsPanel", () => {
 
   /**
    * Scenario: the same click against a document that DOES declare a section,
-   * with a deck stored and selected. Re-choosing it is still a no-op, so the
+   * with a daemon stored and selected. Re-choosing it is still a no-op, so the
    * rows are never rewritten — the guard is about the change being empty, not
    * about the section being absent.
    */
@@ -266,7 +266,7 @@ describe("EndpointsPanel", () => {
     -------------------------------------------------------------------------
     PRD 742 M6 — a stored fleet selection.
 
-    M1 added **All Decks** to `deckChoices`, which the top bar's Deck selector
+    M1 added **All daemons** to `deckChoices`, which the top bar's Deck selector
     is built from. This panel had a chooser of its own, so with `all` stored its
     `shown` matched no row: no radio checked, no detail form, and a **Test
     connection** button still enabled for a token no probe can answer.
@@ -275,7 +275,7 @@ describe("EndpointsPanel", () => {
 
   /**
    * Scenario: the document stores the fleet selection. The chooser shows **All
-   * Decks** checked and says why there are no fields under it, rather than
+   * Daemons** checked and says why there are no fields under it, rather than
    * rendering a chooser with nothing chosen.
    */
   it("shows a stored fleet selection as chosen, with a reason there are no fields", () => {
@@ -286,7 +286,7 @@ describe("EndpointsPanel", () => {
     expect(screen.getByTestId("deck-choice-deck0000000000aa").querySelector("input")).not.toBeChecked();
     // No fields, and a sentence saying that is correct rather than missing.
     expect(screen.queryByTestId("deck-detail")).toBeNull();
-    expect(screen.getByTestId("deck-fleet-note")).toHaveTextContent("All Decks is every deck at once");
+    expect(screen.getByTestId("deck-fleet-note")).toHaveTextContent("All daemons is every daemon at once");
     // The fleet is not a row, so there is nothing to remove.
     expect(screen.queryByTestId("remove-deck-all")).toBeNull();
   });
@@ -308,7 +308,7 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: choose **All Decks** from this panel on a document that already
+   * Scenario: choose **All daemons** from this panel on a document that already
    * declares a section. It is a real change, so it is written — and the stored
    * rows travel with it rather than being replaced by the chooser's own idea of
    * the list.
@@ -344,11 +344,11 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: remove the deck currently in use. The row goes and the selection
-   * falls back to the local deck — the app always has a deck, and picking a
+   * Scenario: remove the daemon currently in use. The row goes and the selection
+   * falls back to the local deck — the app always has a daemon, and picking a
    * different remote one on the user's behalf is a decision they did not make.
    */
-  it("removes a deck and falls back to local when it was the one in use", () => {
+  it("removes a daemon and falls back to local when it was the one in use", () => {
     const row = deck();
     const { onSave } = renderPanel({ endpoints: { remote: [row], selection: row.id } });
 
@@ -360,11 +360,11 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: a deck is named by its address, because there is no display name
+   * Scenario: a daemon is named by its address, because there is no display name
    * to give it — a user-chosen label would be exactly the arbitrary `String`
    * the settings field-type guard refuses.
    */
-  it("labels a deck from its address, port included when it is not 22", () => {
+  it("labels a daemon from its address, port included when it is not 22", () => {
     renderPanel({
       endpoints: {
         remote: [deck({ user: "deploy", port: 2222 })],
@@ -377,9 +377,9 @@ describe("EndpointsPanel", () => {
   /**
    * Scenario: a settings document supplies a host carrying a right-to-left
    * override. The label renders without it, so the character cannot reorder the
-   * text around the deck's name.
+   * text around the daemon's name.
    */
-  it("strips a bidi override from a deck label", () => {
+  it("strips a bidi override from a daemon label", () => {
     renderPanel({
       endpoints: { remote: [deck({ host: "build‮box" })], selection: "local" },
     });
@@ -425,9 +425,9 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: press Test connection against a deck nothing answers on. The
+   * Scenario: press Test connection against a daemon nothing answers on. The
    * panel reports the state and the reason **in place** — the section it is
-   * in is still there, the deck list is still there, and the fields are still
+   * in is still there, the daemon list is still there, and the fields are still
    * editable. A screen that blanked would be the one thing a user cannot
    * recover from without restarting the app.
    */
@@ -514,11 +514,11 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: the user removes the deck while its probe is still running. The
-   * write-back must not resurrect it — a deck that is no longer in the document
+   * Scenario: the user removes the daemon while its probe is still running. The
+   * write-back must not resurrect it — a daemon that is no longer in the document
    * has no socket to learn (PRD #741, Greptile P1 on #1035).
    */
-  it("does not resurrect a deck removed while its probe was running", async () => {
+  it("does not resurrect a daemon removed while its probe was running", async () => {
     let settle: (value: EndpointTestReportDto) => void = () => {};
     const testEndpoint = vi.fn(
       () => new Promise<EndpointTestReportDto>((resolve) => { settle = resolve; }),

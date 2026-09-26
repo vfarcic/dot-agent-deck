@@ -43,7 +43,7 @@ fn pane_input_022_ctrl_w_does_not_tear_down_interactive_claude() {
         .with_pty_size(160, 45)
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let cwd = deck.workdir().to_path_buf();
     let mut trust_paths = vec![cwd.to_string_lossy().into_owned()];
@@ -59,7 +59,7 @@ fn pane_input_022_ctrl_w_does_not_tear_down_interactive_claude() {
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(CLAUDE_PANE_NAME_SUFFIX.as_bytes());
     deck.send_keys(b"\t");
@@ -110,11 +110,11 @@ fn pane_input_022_ctrl_w_does_not_tear_down_interactive_claude() {
 
     deck.wait_until_grid(
         "the Claude pane still visible after returning to command mode",
-        |grid| !grid.contains("No active sessions"),
+        |grid| !grid.contains("No active agents"),
     );
     let grid = deck.snapshot_grid();
     assert!(
-        !grid.contains("No active sessions"),
+        !grid.contains("No active agents"),
         "Ctrl+W must not tear down the real Claude pane\nFinal grid:\n{grid}"
     );
     assert!(
@@ -135,7 +135,7 @@ fn pane_input_038_erase_burst_undoes_a_payload_in_a_live_claude_prompt() {
         .with_pty_size(160, 45)
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let cwd = deck.workdir().to_path_buf();
     let mut trust_paths = vec![cwd.to_string_lossy().into_owned()];
@@ -151,7 +151,7 @@ fn pane_input_038_erase_burst_undoes_a_payload_in_a_live_claude_prompt() {
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(ERASE_PANE_NAME_SUFFIX.as_bytes());
     deck.send_keys(b"\t");
@@ -250,7 +250,7 @@ fn pane_input_038_erase_burst_undoes_a_payload_in_a_live_claude_prompt() {
     deck.send_keys(b"\x04");
     deck.wait_until_grid(
         "the Claude pane still visible after returning to command mode",
-        |grid| !grid.contains("No active sessions"),
+        |grid| !grid.contains("No active agents"),
     );
     assert!(
         common::agent_records_on(deck.attach_socket_path())

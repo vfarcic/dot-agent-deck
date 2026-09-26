@@ -50,14 +50,14 @@ fn click_button(deck: &TuiDeck, needle: &str) {
 /// Scenario: From the empty dashboard, press Ctrl+C to open the quit-confirm
 /// modal, then click its `[Cancel]` button. The modal must dismiss and the
 /// app must stay running — the same outcome as Esc / selecting Cancel — so
-/// the dashboard's `No active sessions` empty state is shown again. RED
+/// the dashboard's `No active agents` empty state is shown again. RED
 /// until M5 renders the modal's clickable buttons (today the `[Cancel]`
 /// lookup fails).
 #[spec("mouse/modal/001")]
 #[test]
 fn modal_001_quit_confirm_cancel_dismisses() {
     let deck = TuiDeck::launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     deck.send_bytes(b"\x03"); // Ctrl+C → quit-confirm modal
     deck.wait_for_string("Quit dot-agent-deck?");
@@ -65,7 +65,7 @@ fn modal_001_quit_confirm_cancel_dismisses() {
     click_button(&deck, "[Cancel]");
 
     // Modal dismissed, app still running → dashboard empty state returns.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 }
 
 /// Scenario: With a session card present, press `g` to open the config-gen
@@ -77,7 +77,7 @@ fn modal_001_quit_confirm_cancel_dismisses() {
 #[test]
 fn modal_001_config_gen_never_resolves() {
     let deck = TuiDeck::launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     send_session_start(&deck, "alpha", "pane-alpha", "/tmp");
     deck.wait_for_string("alpha");
 
@@ -92,13 +92,13 @@ fn modal_001_config_gen_never_resolves() {
 
 /// Scenario: From the dashboard, press `?` to open the help overlay, then
 /// click its `[Close]` button. The overlay must close — the same outcome as
-/// `?` / Esc / `q` — so the dashboard's `No active sessions` empty state is
+/// `?` / Esc / `q` — so the dashboard's `No active agents` empty state is
 /// shown again. RED until M5 renders the help overlay's `[Close]` button.
 #[spec("mouse/modal/001")]
 #[test]
 fn modal_001_help_close_closes_overlay() {
     let deck = TuiDeck::launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     deck.send_bytes(b"?"); // open help overlay
     deck.wait_for_string("Press ? or Esc to close");
@@ -106,11 +106,11 @@ fn modal_001_help_close_closes_overlay() {
     click_button(&deck, "[Close]");
 
     // Overlay closed → dashboard empty state visible again.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 }
 
 /// Scenario: Seed a global `schedules.toml` (one enabled task, `delrow`) via
-/// `DOT_AGENT_DECK_SCHEDULES`, open the "Scheduled Tasks" manager dialog with
+/// `DOT_AGENT_DECK_SCHEDULES`, open the "Schedules" manager dialog with
 /// `S` (the existing, already-working open key — so this test isolates the
 /// in-dialog modal-click behaviour from the separate open-shortcut parity
 /// work), then click the dialog's Delete action button. The definition-only
@@ -144,11 +144,11 @@ fn modal_001_scheduler_delete_button_confirms() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Open the manager via the existing `S` (Shift+S) key, then click Delete.
     deck.send_bytes(b"S");
-    deck.wait_for_string("Scheduled Tasks");
+    deck.wait_for_string("┌ Schedules");
     deck.wait_for_string("delrow"); // row present + auto-selected
 
     click_button(&deck, "[Delete d]");

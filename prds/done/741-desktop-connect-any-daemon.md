@@ -171,6 +171,8 @@ This is not scaffolding, which is the objection it has to answer. A selector is 
 
 ### Naming: the UI says Deck, the code says daemon
 
+> **Superseded by issue #1045.** The desktop's rendered text now says **daemon** for the process and for a configured endpoint, matching the TUI; "deck" is kept for the product and its binary. The canonical words live in [`docs/develop/glossary.md`](../docs/develop/glossary.md). The decision below is kept as the record of what M15 did.
+
 **DECIDED by the user: no user-visible surface calls it a "daemon".** It is an **Agent Deck**, or a **Deck**.
 
 The rule, stated so it is applicable without re-deriving it: **rendered text says Deck; code, protocol, CLI, docs, CSS class names and `data-testid`s keep `daemon`.** `dot-agent-deck daemon serve` is unchanged, `DaemonClient` is unchanged, and renaming testids would churn tests for no reader's benefit.

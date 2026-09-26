@@ -102,7 +102,7 @@ pub const DESKTOP_BOUNDARY_RULE: &str = "client-side project resolution in the d
      against a filesystem (PRD #819). This is a regression TRIPWIRE, not enforcement and not a \
      security boundary: the desktop path-depends on the whole root crate, so a wrapper with an \
      innocuous name bypasses it. Ask the daemon (list-projects / resolve-project / \
-     prepare-workflow) instead of reading the project here";
+     prepare-orchestration) instead of reading the project here";
 
 /// The **positive** boundary: root-crate modules the production desktop may
 /// reach across.
@@ -304,9 +304,10 @@ impl Finding {
 /// and `prepare_orchestrator_prompt` calls behind them, the
 /// `.dot-agent-deck.toml` and `orchestrator-context.md` literals they spelled,
 /// and `desktop_project_cwd()`'s `std::env::current_dir` guess. M6 replaced the
-/// pair with the daemon's `prepare-workflow` verb and deleted the function, so
-/// every one of them matched nothing and the forcing function below took the
-/// check red until they went with it — which is exactly what it is for.
+/// pair with the daemon's `prepare-workflow` verb (since #1045
+/// `prepare-orchestration`) and deleted the function, so every one of them
+/// matched nothing and the forcing function below took the check red until they
+/// went with it — which is exactly what it is for.
 ///
 /// **Keep it empty.** A new entry is a new client-side project read being
 /// excused rather than fixed, and the excuse outlives whoever wrote it. If a

@@ -69,7 +69,7 @@ The position is stored with the rest of your saved workspace, so it is per-machi
 
 ### Your setup stays up to date
 
-Agent Deck keeps your saved workspace current as you work — after every new pane, rename, tab, and agent change, and again whenever you disconnect — so what it brings back is your most recent setup, never a stale copy from the last time you happened to quit. That is what makes recovery worthwhile after an unexpected shutdown: you return to where you actually were, not to a workspace from days ago.
+Agent Deck keeps your saved workspace current as you work — after every new agent, rename, tab, and agent change, and again whenever you disconnect — so what it brings back is your most recent setup, never a stale copy from the last time you happened to quit. That is what makes recovery worthwhile after an unexpected shutdown: you return to where you actually were, not to a workspace from days ago.
 
 ### Mode and orchestration tabs come back too
 

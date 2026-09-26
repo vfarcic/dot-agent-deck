@@ -1486,7 +1486,7 @@ pub struct KnownProject {
 pub struct ResolvedProject {
     /// The daemon-canonical path this resolved to, which may differ from the
     /// spelling the caller sent (an alias or a symlink resolves elsewhere).
-    /// This is the string a later `PrepareWorkflow` and `StartAgent` must use.
+    /// This is the string a later `PrepareOrchestration` and `StartAgent` must use.
     pub path: String,
     #[serde(default)]
     pub orchestrations: Vec<ProjectOrchestration>,
@@ -1494,7 +1494,7 @@ pub struct ResolvedProject {
     /// resolution was computed from.
     ///
     /// The client echoes it back on
-    /// [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`], and a
+    /// [`crate::daemon_protocol::AttachRequest::PrepareOrchestration`], and a
     /// mismatch is refused — which is what closes the window between the
     /// picker's resolve and the launch's write. Derived from the config
     /// **content** as read (see
@@ -1528,7 +1528,7 @@ pub struct ProjectOrchestration {
 /// One role of a [`ProjectOrchestration`].
 ///
 /// `name` and `start` are the complete set the desktop reads
-/// (`order_workflow_roles` in `desktop/src-tauri/src/lib.rs`). The rest of
+/// (`order_orchestration_roles` in `desktop/src-tauri/src/lib.rs`). The rest of
 /// `OrchestrationRoleConfig` — `command`, `description`, `prompt_template`,
 /// `agent`, `clear` — is consumed only inside
 /// [`crate::orchestrator_context::prepare_orchestrator_prompt`], which moves
@@ -1542,10 +1542,13 @@ pub struct ProjectRole {
     pub start: bool,
 }
 
-/// PRD #819 M2: the daemon's reply to [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`].
+/// PRD #819 M2: the daemon's reply to
+/// [`crate::daemon_protocol::AttachRequest::PrepareOrchestration`] (and to its
+/// legacy spelling, `PrepareWorkflow` — the struct is the same for both; only
+/// the response field it rides on differs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PreparedWorkflow {
-    /// Where the coordinator context was published, daemon-side.
+pub struct PreparedOrchestration {
+    /// Where the orchestrator context was published, daemon-side.
     pub context_path: String,
     /// PRD #819 M6: the daemon-**canonical** project directory this preparation
     /// resolved to — the same string [`ResolvedProject::path`] carries, restated
@@ -1582,7 +1585,7 @@ pub struct PreparedWorkflow {
     pub token: String,
     #[serde(default)]
     pub roles: Vec<ProjectRole>,
-    /// PRD #819 M6: the one-liner to inject into the coordinator's PTY, as
+    /// PRD #819 M6: the one-liner to inject into the orchestrator's PTY, as
     /// composed by
     /// [`crate::orchestrator_context::prepare_orchestrator_context`].
     ///

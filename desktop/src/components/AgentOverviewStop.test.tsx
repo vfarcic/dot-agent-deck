@@ -7,7 +7,7 @@ import { AgentOverview, agentKey } from "./AgentOverview";
 /**
  * PRD #1223 U4 — closing what the New agent flow creates, from the overview:
  * one agent from its row, and a whole orchestration from its card. Both ask for
- * confirmation first and name the deck the agent is ON, never the selected one.
+ * confirmation first and name the daemon the agent is ON, never the selected one.
  */
 
 /** A role of the `loop` orchestration on `deckId`. */
@@ -56,25 +56,26 @@ const confirmation = () => screen.queryByRole("alertdialog");
 describe("stopping from the overview (PRD #1223 U4)", () => {
   /**
    * Scenario: on the fleet, press the stop control on the planner role's row —
-   * an agent on the REMOTE deck. A confirmation names the agent and that deck;
+   * an agent on the REMOTE deck. A confirmation names the agent and that daemon;
    * Cancel sends nothing. Pressed again and confirmed, it sends one
    * `stop_agent` naming the remote deck and the agent's own id.
    */
-  it("confirms a stop and sends it to the deck the agent is on", async () => {
+  it("confirms a stop and sends it to the daemon the agent is on", async () => {
     const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
     render(<AgentOverview runtime={runtime(runAction)} onNavigate={vi.fn()} />);
 
     const stop = within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByTestId("overview-stop-agent");
-    expect(stop).toHaveAccessibleName("Stop planner agent");
+    expect(stop).toHaveAccessibleName("Close planner agent");
+    expect(stop).toHaveAttribute("title", "Close planner");
     fireEvent.click(stop);
-    expect(confirmation()).toHaveTextContent("Stop planner?");
+    expect(confirmation()).toHaveTextContent("Close planner?");
     expect(confirmation()).toHaveTextContent("dev@build-box");
     fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
     expect(confirmation()).toBeNull();
     expect(runAction).not.toHaveBeenCalled();
 
     fireEvent.click(stop);
-    await act(async () => fireEvent.click(within(confirmation()!).getByRole("button", { name: "Stop agent" })));
+    await act(async () => fireEvent.click(within(confirmation()!).getByRole("button", { name: "Close agent" })));
 
     expect(runAction).toHaveBeenCalledTimes(1);
     expect(runAction).toHaveBeenCalledWith({ type: "stop_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: "41" });
@@ -104,7 +105,7 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     const dialog = confirmation()!;
     expect(dialog).toHaveTextContent("Close demo-project-orchestrator-1?");
     expect(dialog).toHaveTextContent("This stops every role of this orchestration on dev@build-box — all 2 of its roles: planner, builder.");
-    await act(async () => fireEvent.click(within(dialog).getByRole("button", { name: "Stop all 2 roles" })));
+    await act(async () => fireEvent.click(within(dialog).getByRole("button", { name: "Close all 2 roles" })));
 
     expect(runAction).toHaveBeenCalledWith({
       type: "stop_orchestration",
@@ -114,9 +115,9 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
   });
 
   /**
-   * Scenario: confirm a stop the deck takes its time over. While it is in
+   * Scenario: confirm a stop the daemon takes its time over. While it is in
    * flight the confirmation's button is disabled and reads Stopping…, so a
-   * second press sends nothing; once the deck answers the dialog closes. A
+   * second press sends nothing; once the daemon answers the dialog closes. A
    * refusal closes it too — the runtime files it under its global error — and
    * nothing is thrown out of the screen.
    */
@@ -128,7 +129,7 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     render(<AgentOverview runtime={runtime(runAction)} onNavigate={vi.fn()} />);
 
     fireEvent.click(within(row(FIXTURE_DAEMON_ID, "planner")).getByTestId("overview-stop-agent"));
-    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Stop agent" }));
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Close agent" }));
     const busy = within(confirmation()!).getByRole("button", { name: "Stopping…" });
     expect(busy).toBeDisabled();
     fireEvent.click(busy);

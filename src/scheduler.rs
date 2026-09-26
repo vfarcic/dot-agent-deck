@@ -169,7 +169,7 @@ impl Notifier for StderrNotifier {
 pub enum SchedulerError {
     #[error("invalid cron expression {expr:?}: {message}")]
     InvalidCron { expr: String, message: String },
-    #[error("no scheduled task named {0:?}")]
+    #[error("no schedule named {0:?}")]
     UnknownTask(String),
 }
 

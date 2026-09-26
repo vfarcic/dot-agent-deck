@@ -49,7 +49,7 @@ test.describe("voice off, said out loud", () => {
    * beside it, which is the whole loop — resolve, dispatch, release — driven
    * with no microphone and no credential anywhere near it.
    */
-  test("turns the Voice button off from the deck", async ({ page }) => {
+  test("turns the Voice button off from the daemon", async ({ page }) => {
     await openSpeaking(page, ["voice off"]);
     const trigger = voiceButton(page);
 
@@ -110,7 +110,7 @@ test.describe("Settings from the overview by voice", () => {
 
 test.describe("what can I say?", () => {
   /**
-   * Scenario: ask the preview what can be said. An overlay opens over the deck
+   * Scenario: ask the preview what can be said. An overlay opens over the daemon
    * listing the rows the browser fixture can actually resolve, split by whether
    * this screen can run them, and its Close button dismisses it — all of it
    * generated from the same vocabulary the fixture resolves against.

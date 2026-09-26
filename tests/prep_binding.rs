@@ -59,7 +59,8 @@ use dot_agent_deck::orchestrator_context::{CONTEXT_DIR_NAME, CONTEXT_FILE_NAME};
 use dot_agent_deck::prep_token::PrepBinding;
 use dot_agent_deck::project_resolve::{
     PreparationMismatch, PreparationStale, PreparedStartMembership, PreparedStartRefusal,
-    PreparedStartRequest, prepare_workflow_for_wire, revalidate_preparation, verify_prepared_start,
+    PreparedStartRequest, prepare_orchestration_for_wire, revalidate_preparation,
+    verify_prepared_start,
 };
 
 // Issue #322 / linkage-check rule 8: the self-contained scratch-dir resolver,
@@ -98,12 +99,12 @@ fn context_file(project: &Path) -> PathBuf {
 
 /// Prepare a workflow in `project` and hand back the binding its token carries.
 ///
-/// Going through `prepare_workflow_for_wire` rather than constructing a
+/// Going through `prepare_orchestration_for_wire` rather than constructing a
 /// `PrepBinding` by hand is the point: a hand-built binding would prove the
 /// checker consistent with the test author's idea of a preparation, not with
 /// what the launch verb actually records.
 fn prepare(project: &Path, task: &str) -> (String, PrepBinding) {
-    let prepared = prepare_workflow_for_wire(
+    let prepared = prepare_orchestration_for_wire(
         project.to_str().expect("utf-8 project path"),
         "loop",
         task,
@@ -325,7 +326,7 @@ fn identity_of(path: &Path) -> (u64, u64) {
 /// The preparation canonicalises once and records the result, so its recorded
 /// path is real by construction. Turning that path into a symlink afterwards —
 /// to another perfectly valid project — is how the canonical identity moves
-/// without the string changing, and it is the case `PreparedWorkflow::path`'s
+/// without the string changing, and it is the case `PreparedOrchestration::path`'s
 /// "the canonical path is the string the spawn uses" contract is worthless
 /// without.
 #[test]

@@ -689,7 +689,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                         answer
                             .outcome
                             .sentence()
-                            .contains(&format!("Preselected deck: {label}."))
+                            .contains(&format!("Preselected daemon: {label}."))
                     });
                 let hidden_deck_explained = !fixture.deck_hidden
                     || fixture.action != "open_deck"

@@ -1821,12 +1821,12 @@ impl EndpointId {
         }
         if raw.eq_ignore_ascii_case(LOCAL_SELECTION_TOKEN) {
             return Err(format!(
-                "'{LOCAL_SELECTION_TOKEN}' is reserved: it is how a selection names the local deck"
+                "'{LOCAL_SELECTION_TOKEN}' is reserved: it is how a selection names the local daemon"
             ));
         }
         if raw.eq_ignore_ascii_case(ALL_SELECTION_TOKEN) {
             return Err(format!(
-                "'{ALL_SELECTION_TOKEN}' is reserved: it is how a selection names every deck at once"
+                "'{ALL_SELECTION_TOKEN}' is reserved: it is how a selection names every daemon at once"
             ));
         }
         Ok(Self(raw.to_string()))
@@ -2014,11 +2014,11 @@ impl std::fmt::Display for SelectionFallback {
         match self {
             Self::UnknownDeck { id } => write!(
                 f,
-                "the selected deck {id} is no longer configured; using the local deck"
+                "the selected daemon {id} is no longer configured; using the local daemon"
             ),
             Self::NoRemoteSocket { id } => write!(
                 f,
-                "the selected deck {id} has no remote socket path yet; using the local deck"
+                "the selected daemon {id} has no remote socket path yet; using the local daemon"
             ),
         }
     }
@@ -7275,7 +7275,7 @@ level = 1.0
                 .fallback
                 .unwrap()
                 .to_string()
-                .contains("local deck"),
+                .contains("local daemon"),
             "the reason has to be renderable by M7, not just distinguishable"
         );
     }

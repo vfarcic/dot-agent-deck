@@ -495,8 +495,8 @@ dictate_prefix = "tell it to"
 # removed as a premise change. Measured the run it was found: "spawn an
 # agent" came back with the local deck in one run of two. What replaces it is
 # checked on EVERY fixture by the harness rather than by a field: whenever the
-# model's answer preselects a deck, the report must name it ("Preselected deck:
-# Local deck."), so an unasked guess is heard rather than silent.
+# model's answer preselects a deck, the report must name it ("Preselected daemon:
+# Local daemon."), so an unasked guess is heard rather than silent.
 [[fixtures]]
 name = "open-new-agent-bare"
 utterance = "start a new agent"

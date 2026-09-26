@@ -23,7 +23,7 @@ use spec::spec;
 
 /// Scenario: Build the Ctrl+N key event and run it through the keyboard
 /// mapper `global_action`; separately build a synthetic
-/// `[New Pane Ctrl+N]` button carrying `Action::NewPane`, record its rect
+/// `[New Agent Ctrl+N]` button carrying `Action::NewPane`, record its rect
 /// in a `button_rects` vec, and hit-test a click landing inside that rect
 /// via `hit_test_button`. Both paths must produce the same `Action` variant
 /// (`Action::NewPane`) — proving key and click funnel into one action
@@ -31,7 +31,7 @@ use spec::spec;
 #[spec("mouse/dispatch/001")]
 #[test]
 fn dispatch_001_key_and_click_map_to_same_action() {
-    // Keyboard path: Ctrl+N maps to the New Pane command.
+    // Keyboard path: Ctrl+N maps to the New Agent command.
     let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
     let key_action =
         global_action(&KeybindingConfig::default(), &ctrl_n).expect("Ctrl+N must map to an Action");
@@ -43,10 +43,10 @@ fn dispatch_001_key_and_click_map_to_same_action() {
     // Click path: a synthetic New-Pane button carrying the SAME action,
     // recorded the way the M2 button bar will record it, then a click
     // landing inside its rect hit-tests back to that action.
-    let button = Button::new("New Pane", "Ctrl+N", Action::NewPane, true);
+    let button = Button::new("New Agent", "Ctrl+N", Action::NewPane, true);
     assert_eq!(
         button.display_label(),
-        "[New Pane Ctrl+N]",
+        "[New Agent Ctrl+N]",
         "the inline shortcut must be part of the on-screen label"
     );
     let rect = Rect::new(10, 24, button.display_label().len() as u16, 1);
@@ -70,7 +70,7 @@ fn dispatch_001_key_and_click_map_to_same_action() {
     assert!(hit_test_button(&button_rects, rect.x + rect.width, rect.y).is_none());
 }
 
-/// Scenario: Render an enabled `[New Pane Ctrl+N]` button into a
+/// Scenario: Render an enabled `[New Agent Ctrl+N]` button into a
 /// `ratatui::buffer::Buffer`, then a disabled `[Close Ctrl+W]` button. The
 /// enabled button's cells carry the full inline-shortcut label and are not
 /// dimmed; the disabled button renders the same label shape but with the DIM
@@ -82,14 +82,14 @@ fn button_001_render_label_and_disabled_dim() {
     let area = Rect::new(0, 0, 20, 1);
 
     // Enabled button: full label, not dimmed, returns its action+rect pair.
-    let enabled = Button::new("New Pane", "Ctrl+N", Action::NewPane, true);
+    let enabled = Button::new("New Agent", "Ctrl+N", Action::NewPane, true);
     let mut buf = Buffer::empty(area);
     let (action, rect) = enabled.render(area, &mut buf);
     assert!(matches!(action, Action::NewPane));
     assert_eq!(rect, area);
     let rendered: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
     assert!(
-        rendered.contains("[New Pane Ctrl+N]"),
+        rendered.contains("[New Agent Ctrl+N]"),
         "enabled button must render its inline-shortcut label, got {rendered:?}"
     );
     assert!(

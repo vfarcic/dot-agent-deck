@@ -227,7 +227,7 @@ fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
         .with_pty_size(120, 40)
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "1500")
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     open_orchestration(&deck);
     deck.wait_for_string("worker");
 

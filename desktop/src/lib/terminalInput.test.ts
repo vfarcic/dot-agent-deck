@@ -145,16 +145,16 @@ describe("unreachableDeckTerminalState", () => {
   /**
    * Scenario: the pane's deck has no live link and nothing is being held for
    * it — the app has never had a record for this agent. The sentence names the
-   * deck, repeats that deck's own account of the failure, and says what would
+   * deck, repeats that daemon's own account of the failure, and says what would
    * change it. It claims nothing about a record, because there is none.
    */
-  it("names the deck and repeats its own failure, with no staleness clause", () => {
-    const state = unreachableDeckTerminalState(DECK, "No deck is listening on the configured socket.");
+  it("names the daemon and repeats its own failure, with no staleness clause", () => {
+    const state = unreachableDeckTerminalState(DECK, "No daemon is listening on the configured socket.");
 
     expect(state.reason).toBe("unreachable-deck");
     expect(state.notice).toBe(
       "No terminal here: the desktop has no live connection to dev@build-box, so there is nothing to attach to. " +
-        "No deck is listening on the configured socket. The terminal appears on its own once that deck answers again.",
+        "No daemon is listening on the configured socket. The terminal appears on its own once that daemon answers again.",
     );
     // No age to date, so no hover either: a `title` with nothing behind it is a
     // hover that opens on an empty tooltip.
@@ -163,25 +163,25 @@ describe("unreachableDeckTerminalState", () => {
   });
 
   /**
-   * Scenario: the deck reported nothing at all about why it is not answering.
+   * Scenario: the daemon reported nothing at all about why it is not answering.
    * The sentence drops the detail rather than leaving a dangling gap, and the
    * rest is unchanged.
    */
-  it("drops the deck's detail when it gave none", () => {
+  it("drops the daemon's detail when it gave none", () => {
     expect(unreachableDeckTerminalState(DECK).notice).toBe(
       "No terminal here: the desktop has no live connection to dev@build-box, so there is nothing to attach to. " +
-        "The terminal appears on its own once that deck answers again.",
+        "The terminal appears on its own once that daemon answers again.",
     );
   });
 
   /**
-   * Scenario: the pane is rendering a record the deck gave at three different
+   * Scenario: the pane is rendering a record the daemon gave at three different
    * distances in the past. Each reads as a past report in the app's own
    * relative vocabulary — the same buckets the overview's last-activity column
    * uses, rather than a second set — and carries the exact instant for the
    * hover.
    *
-   * `just now` is in the table on purpose: it is the reading a deck that has
+   * `just now` is in the table on purpose: it is the reading a daemon that has
    * only this second stopped answering produces, and the sentence has to parse
    * for it as well as for `2h ago`.
    */

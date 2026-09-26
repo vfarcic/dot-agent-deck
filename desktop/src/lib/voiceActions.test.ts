@@ -191,14 +191,14 @@ describe("VOICE_ACTIONS", () => {
   });
 
   /**
-   * Scenario: click each control in the deck's primary rail from a state where
+   * Scenario: click each control in the daemon's primary rail from a state where
    * its result is visible. Every click crosses the shared registry once and
    * still opens or closes the same screen or overlay the user sees today.
    */
   it.each([
     ["Projects", "projects-panel"],
     ["Prompts", "prompt-library-panel"],
-    ["Workflows", "workflow-editor"],
+    ["Orchestrations", "orchestration-editor"],
     ["Agent Profiles", "agent-profiles-panel"],
     ["Settings", "settings-panel"],
   ])("dispatches the %s deck-rail button through the registry", (label, testId) => {
@@ -210,17 +210,18 @@ describe("VOICE_ACTIONS", () => {
   });
 
   /**
-   * Scenario: open a deck overlay and then click Deck in the primary rail. The
-   * overlay disappears, the deck remains visible, and the reset action crossed
-   * the registry rather than closing the booleans beside it.
+   * Scenario: open a panel over the Daemons screen and then click Daemons in
+   * the primary rail. The panel disappears, the Daemons screen remains visible,
+   * and the reset action crossed the registry rather than closing the booleans
+   * beside it.
    */
-  it("dispatches the Deck deck-rail button through the registry", () => {
+  it("dispatches the Daemons rail button through the registry", () => {
     renderDeck();
     fireEvent.click(screen.getByRole("button", { name: "Projects" }));
     expect(screen.getByTestId("projects-panel")).toBeVisible();
     registryDispatch.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "Deck" }));
+    fireEvent.click(screen.getByRole("button", { name: "Daemons" }));
 
     expect(screen.queryByTestId("projects-panel")).not.toBeInTheDocument();
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
@@ -228,13 +229,13 @@ describe("VOICE_ACTIONS", () => {
   });
 
   /**
-   * Scenario: click Overview in the deck rail. The agent grid is replaced by
+   * Scenario: click Overview in the daemon rail. The agent grid is replaced by
    * the fleet overview, and the transition is the openOverview registry action
    * that voice will dispatch too.
    */
   it("dispatches the Overview deck-rail button through openOverview", () => {
     renderDeck();
-    fireEvent.click(screen.getByRole("button", { name: "Overview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Dashboard" }));
 
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
     expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
@@ -247,8 +248,8 @@ describe("VOICE_ACTIONS", () => {
    * while Deck returns to the terminal grid through openDeck.
    */
   it.each([
-    ["Overview", "openOverview", "overview-table-region"],
-    ["Deck", "openDeck", "agent-tile-planner"],
+    ["Dashboard", "openOverview", "overview-table-region"],
+    ["Daemons", "openDeck", "agent-tile-planner"],
   ])("dispatches the %s overview-rail button through %s", (label, actionId, resultTestId) => {
     render(createElement(DeckShell, { runtime: runtime(), initialView: { kind: "overview" } }));
     fireEvent.click(screen.getByRole("button", { name: label }));
@@ -266,7 +267,7 @@ describe("VOICE_ACTIONS", () => {
     [/Manage projects/, "projects-panel"],
     [/Open prompt library/, "prompt-library-panel"],
     [/Open agent profiles/, "agent-profiles-panel"],
-    [/Edit workflow order/, "workflow-editor"],
+    [/Edit orchestration order/, "orchestration-editor"],
     [/Open settings/, "settings-panel"],
   ])("dispatches the %s palette entry through the registry", (label, testId) => {
     renderDeck();
@@ -279,7 +280,7 @@ describe("VOICE_ACTIONS", () => {
   });
 
   /**
-   * Scenario: choose Show evidence drawer from a deck whose drawer starts
+   * Scenario: choose Show events drawer from a daemon whose drawer starts
    * closed. The evidence appears after the palette closes and the toggle is
    * performed by one registry action.
    */
@@ -287,7 +288,7 @@ describe("VOICE_ACTIONS", () => {
     renderDeck();
     expect(screen.queryByTestId("evidence-drawer")).not.toBeInTheDocument();
     openPalette();
-    clickPaletteEntry(/Show evidence drawer/);
+    clickPaletteEntry(/Show events drawer/);
 
     expect(screen.getByTestId("evidence-drawer")).toBeVisible();
     expectOneRegistryDispatch();
@@ -319,13 +320,13 @@ describe("VOICE_ACTIONS", () => {
    * coordinator from the palette while Planner is selected. Builder's terminal
    * becomes selected through one registry dispatch and no message is sent.
    */
-  it("dispatches the Message coordinator palette entry through the registry", () => {
+  it("dispatches the Message orchestrator palette entry through the registry", () => {
     const snapshot = createFixtureSnapshot("connected");
     snapshot.agents = snapshot.agents.map((agent) => ({ ...agent, isStartRole: agent.id === "builder" }));
     renderDeck({ mode: "live", snapshot, fleet: [snapshot] });
     expect(screen.getByTestId("agent-tile-planner").className).toContain("is-selected");
     openPalette();
-    clickPaletteEntry(/Message coordinator/);
+    clickPaletteEntry(/Message orchestrator/);
 
     expect(screen.getByTestId("agent-tile-builder").className).toContain("is-selected");
     expect(screen.getByTestId("terminal-builder")).toBeVisible();
@@ -347,7 +348,7 @@ describe("VOICE_ACTIONS", () => {
   });
 
   /**
-   * Scenario: open Planner's pane from the deck and close it from the pane.
+   * Scenario: open Planner's pane from the daemon and close it from the pane.
    * The same visible round trip now used by clicks dispatches openAgent and
    * closeAgentView. Only the first is named by a command-table row; the second
    * is the pane's X, which `close` reaches through `closeTopmost` once it has
@@ -363,7 +364,7 @@ describe("VOICE_ACTIONS", () => {
     expectOneRegistryDispatch("openAgent");
     registryDispatch.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "Close Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
     expectOneRegistryDispatch("closeAgentView");
@@ -372,7 +373,7 @@ describe("VOICE_ACTIONS", () => {
   /**
    * Scenario: start on the fleet overview and click Planner's row. The pane
    * opens over the overview through openAgent, preserving the second existing
-   * click path rather than only routing the deck tile through the registry.
+   * click path rather than only routing the daemon tile through the registry.
    */
   it("dispatches an overview-row open through openAgent", () => {
     const snapshot = createFixtureSnapshot("connected");

@@ -53,8 +53,9 @@
  *
  * # Vocabulary
  *
- * Rendered text says **Deck**, never "daemon". The sweep of the existing strings
- * is M15's; nothing new is written in the old vocabulary.
+ * Rendered text says **daemon**, never "Deck" (issue #1045 reversed PRD #741
+ * M15; `docs/develop/glossary.md` has the canonical words). Identifiers keep
+ * their `deck` spelling.
  */
 import { useEffect, useId, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronsUpDown, Server } from "lucide-react";
@@ -83,7 +84,7 @@ export function deckStateNote(connection: ConnectionView): string | undefined {
   // CONNECTED — to the local deck, while the selector names another one — so a
   // check on `status` alone would find nothing wrong and say nothing.
   if (connection.selectionFallback) return connection.selectionFallback;
-  if (connection.status === "loading") return "Connecting to this deck…";
+  if (connection.status === "loading") return "Connecting to this daemon…";
   if (connection.status !== "connected") return connection.message;
   // Connected, with a caveat the app is required to keep on screen for the whole
   // session (issue #801, PRD #741 M8). For a remote deck the build stamp is an
@@ -173,7 +174,7 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
         data-testid="deck-selector-toggle"
         aria-expanded={open}
         aria-haspopup="true"
-        title="Choose which deck these screens are showing."
+        title="Choose which daemon these screens are showing."
         onClick={() => setOpen((wasOpen) => !wasOpen)}
       >
         <span className={`connection-lamp connection-${connection.status}`} aria-hidden="true" />
@@ -199,7 +200,7 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
       )}
       {open && (
         <div className="deck-selector-menu" data-testid="deck-selector-menu">
-          <span className="deck-selector-menu-label" id={labelId}>Deck</span>
+          <span className="deck-selector-menu-label" id={labelId}>Daemon</span>
           <div role="radiogroup" aria-labelledby={labelId}>
             {choices.map((choice) => {
               const chosen = sameSelection(choice.selection, selection);
@@ -218,7 +219,7 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
               );
             })}
           </div>
-          <p>Decks are added and removed in Settings.</p>
+          <p>Daemons are added and removed in Settings.</p>
         </div>
       )}
     </div>

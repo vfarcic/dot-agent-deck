@@ -104,7 +104,7 @@ const NO_MODE = { id: "none", label: "No mode" } as const;
 type ModeId = typeof NO_MODE.id | AuthoringKind | ReturnType<typeof orchestrationModeId>;
 
 /** Why the dialog cannot be closed during a start (PRD #1223 audit F5). */
-export const STARTING_CLOSE_BLOCKED = "Waiting for the deck to answer the start. The dialog can be closed once it has.";
+export const STARTING_CLOSE_BLOCKED = "Waiting for the daemon to answer the start. The dialog can be closed once it has.";
 
 /*
   Issue #1247 — what a reopened dialog says about the form it put back. Each
@@ -114,13 +114,13 @@ export const STARTING_CLOSE_BLOCKED = "Waiting for the deck to answer the start.
 /** Something the user chose or typed was put back. */
 export const DRAFT_RESTORED = "Restored what was entered when this form was last closed. Discard clears it.";
 /** The saved directory could not be listed again on its deck. */
-export const DRAFT_DIRECTORY_GONE = "The directory chosen last time could not be listed on this deck any more, so it was not chosen again.";
+export const DRAFT_DIRECTORY_GONE = "The directory chosen last time could not be listed on this daemon any more, so it was not chosen again.";
 /** The saved Mode chip is not offered on the restored form. */
 export const DRAFT_MODE_GONE = "The Mode chosen last time is not offered on this form any more, so the form is back to No mode.";
 /** The form was opened for a deck other than the saved one, which wins. */
-export const draftOtherDeck = (savedDeck: string) => `This form was opened for another deck, so the directory chosen on ${savedDeck} last time was not restored.`;
+export const draftOtherDeck = (savedDeck: string) => `This form was opened for another daemon, so the directory chosen on ${savedDeck} last time was not restored.`;
 /** The saved deck cannot take a new agent now, or has left the fleet. */
-export const draftDeckGone = (savedDeck: string, hadDirectory: boolean) => `${savedDeck}, the deck chosen last time, cannot take a new agent now, so ${hadDirectory ? "it and its directory were" : "it was"} not restored.`;
+export const draftDeckGone = (savedDeck: string, hadDirectory: boolean) => `${savedDeck}, the daemon chosen last time, cannot take a new agent now, so ${hadDirectory ? "it and its directory were" : "it was"} not restored.`;
 
 /*
   Issue #1263 — the deck field by voice, in the dialog's own words. Rust
@@ -129,13 +129,13 @@ export const draftDeckGone = (savedDeck: string, hadDirectory: boolean) => `${sa
   dialog that changed during the round trip.
 */
 /** A start is in flight, when the deck field is disabled. */
-export const DECK_CHANGE_IN_FLIGHT = "A start is under way, so the deck was not changed.";
+export const DECK_CHANGE_IN_FLIGHT = "A start is under way, so the daemon was not changed.";
 /** The deck is not in the field's list any more. */
-export const DECK_NOT_LISTED = "That deck is not in the New agent dialog's deck list any more, so the deck was not changed.";
+export const DECK_NOT_LISTED = "That daemon is not in the New agent dialog's daemon list any more, so the daemon was not changed.";
 /** The deck is listed, disabled. */
-export const DECK_CANNOT_TAKE_AGENT = "That deck cannot take a new agent now, so the deck was not changed.";
+export const DECK_CANNOT_TAKE_AGENT = "That daemon cannot take a new agent now, so the daemon was not changed.";
 /** The dialog closed during the round trip (served by the overview). */
-export const NO_DIALOG_FOR_DECK = "The New agent dialog is not open, so no deck was chosen.";
+export const NO_DIALOG_FOR_DECK = "The New agent dialog is not open, so no daemon was chosen.";
 /** The dialog closed during the round trip, so there was nothing to discard. */
 export const NO_DIALOG_TO_DISCARD = "The New agent dialog is not open, so nothing was discarded.";
 
@@ -161,13 +161,13 @@ export const NO_PARENT_DIRECTORY = "This directory has no parent to go up to.";
   the round trip.
 */
 /** No live form: the dialog is closed, has no deck or directory chosen, or is starting. */
-export const NO_NEW_AGENT_FORM = "The New agent form has no deck and directory chosen yet, so nothing was changed.";
+export const NO_NEW_AGENT_FORM = "The New agent form has no daemon and directory chosen yet, so nothing was changed.";
 /** The form moved to another deck or directory between the utterance and its answer. */
 export const FORM_MOVED_ON = "The New agent form moved on while that was being worked out, so nothing was changed. Say it again.";
 /** The chip is not in the Mode row any more. */
 export const MODE_NOT_OFFERED = "That mode is not offered on this form any more, so the mode was not changed.";
 /** The agent is not among the ones this deck offers any more. */
-export const AGENT_TYPE_NOT_OFFERED = "That agent is not offered on this deck any more, so the Command was not changed.";
+export const AGENT_TYPE_NOT_OFFERED = "That agent is not offered on this daemon any more, so the Command was not changed.";
 /** An orchestration is selected, so there is no Command field to fill. */
 export const COMMAND_HIDDEN_BY_ORCHESTRATION = "An orchestration is selected and each of its roles runs its own command, so the Command was not changed.";
 /** The words after "name it" were only punctuation. */
@@ -181,7 +181,7 @@ export const NO_NAME_HEARD = "No name was heard after that, so the Name was not 
 /** The dialog is not open (it closed during the round trip). */
 export const NO_NEW_AGENT_DIALOG = "The New agent dialog is not open, so nothing was started.";
 /** No deck chosen yet. */
-export const START_NEEDS_DECK = "Nothing was started: choose a deck first.";
+export const START_NEEDS_DECK = "Nothing was started: choose a daemon first.";
 /** A deck, but no directory chosen yet. */
 export const START_NEEDS_DIRECTORY = "Nothing was started: choose a directory first — the agent needs one to start in.";
 /** A start is already in flight or waiting for the deck to list it. */
@@ -454,7 +454,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    * said "every deck call a start makes is bounded", which audit V1 had
    * deliberately made false): each role start, each rollback stop, and the two
    * reads an orchestration launch makes before it prepares anything get
-   * `DECK_REPLY_TIMEOUT`, but `PrepareWorkflow` gets no client-side deadline at
+   * `DECK_REPLY_TIMEOUT`, but `PrepareOrchestration` gets no client-side deadline at
    * all, because dropping that future cannot stop the publish the deck has
    * already begun. So a deck that takes the connection and never answers a
    * PREPARATION does hold this dialog open — which is the trade audit V1 made,
@@ -747,7 +747,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
       }
       const notes = draftHasEdits(saved) ? [DRAFT_RESTORED] : [];
       if (saved.deckId !== undefined) {
-        const savedName = displayText(saved.deckName ?? "The deck", DISPLAY_LIMITS.name);
+        const savedName = displayText(saved.deckName ?? "The daemon", DISPLAY_LIMITS.name);
         if (eligible && preselected.deckId === saved.deckId) {
           resume = {
             ...(saved.browsing !== undefined ? { browsing: saved.browsing } : {}),
@@ -1405,7 +1405,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
 
   const deckField = (
     <section className="new-agent-section" aria-labelledby={`${titleId}-deck`} data-testid="new-agent-deck-field">
-      <h3 id={`${titleId}-deck`}>Deck</h3>
+      <h3 id={`${titleId}-deck`}>Daemon</h3>
       {deckNotice && <p className="new-agent-error" role="alert" data-testid="new-agent-deck-notice">{displayText(deckNotice, DISPLAY_LIMITS.message)}</p>}
       <ul
         ref={deckListRef}
@@ -1444,15 +1444,15 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
           );
         })}
       </ul>
-      {choices.length === 0 && <p className="new-agent-hint">No deck is configured.</p>}
+      {choices.length === 0 && <p className="new-agent-hint">No daemon is configured.</p>}
     </section>
   );
 
   const directoryPanel = (
     <section className="new-agent-section" aria-labelledby={`${titleId}-directory`} data-testid="new-agent-directory-panel">
       <h3 id={`${titleId}-directory`}>Directory</h3>
-      {!deck && <p className="new-agent-hint" data-testid="new-agent-directory-idle">Choose a deck to browse its directories.</p>}
-      {listingState === "unsupported" && <p className="new-agent-hint" data-testid="new-agent-no-browse">This deck cannot list directories, so no directory can be chosen on it here. Choose another deck.</p>}
+      {!deck && <p className="new-agent-hint" data-testid="new-agent-directory-idle">Choose a daemon to browse its directories.</p>}
+      {listingState === "unsupported" && <p className="new-agent-hint" data-testid="new-agent-no-browse">This daemon cannot list directories, so no directory can be chosen on it here. Choose another daemon.</p>}
       {listingError && <p className="new-agent-error" role="alert" data-testid="new-agent-directory-error">{displayText(listingError, DISPLAY_LIMITS.message)}</p>}
       {listingState === "loading" && <p className="new-agent-hint"><Loader2 className="spin" size={12} /> Listing…</p>}
       {listing && (
@@ -1515,7 +1515,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
             ))}
           </ul>
           {noSubdirectories && <p className="new-agent-hint">No subdirectories. Enter or Space uses this directory.</p>}
-          {listing.truncated && <p className="new-agent-hint" data-testid="new-agent-truncated">Not every subdirectory is listed: the deck stopped at its limit, and the ones past it cannot be chosen here.</p>}
+          {listing.truncated && <p className="new-agent-hint" data-testid="new-agent-truncated">Not every subdirectory is listed: the daemon stopped at its limit, and the ones past it cannot be chosen here.</p>}
           <div className="new-agent-current">
             <p className="new-agent-keys">j/k move · l or Enter opens · h or Backspace goes up · Space uses this directory · / filters · q closes</p>
             <button type="button" className="button secondary" data-testid="new-agent-use-directory" disabled={busy} onClick={confirmCurrent}><Check size={14} /> Use this directory</button>
@@ -1598,7 +1598,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
           data-testid="new-agent-command"
           value={command}
           disabled={formDisabled}
-          placeholder={authoringKind ? `Empty starts ${resolveAuthoringCommand("", defaultCommand, agents)}` : "Empty starts the deck's default shell"}
+          placeholder={authoringKind ? `Empty starts ${resolveAuthoringCommand("", defaultCommand, agents)}` : "Empty starts the daemon's default shell"}
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"
@@ -1635,7 +1635,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
           control that throws the form away, which the X does not.
       */}
       {starting && <p className="new-agent-hint" role="status" data-testid="new-agent-starting"><Loader2 className="spin" size={12} /> {STARTING_CLOSE_BLOCKED}</p>}
-      {phase === "waiting" && <p className="new-agent-hint" data-testid="new-agent-waiting"><Loader2 className="spin" size={12} /> Started. Waiting for the deck to list it…</p>}
+      {phase === "waiting" && <p className="new-agent-hint" data-testid="new-agent-waiting"><Loader2 className="spin" size={12} /> Started. Waiting for the daemon to list it…</p>}
     </form>
   );
 
@@ -1682,7 +1682,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
             <Trash2 size={14} /> Discard
           </button>
           <button type="submit" form={`${titleId}-form`} className="button primary" data-testid="new-agent-start" disabled={formDisabled || titleTaken}>
-            {phase === "idle" ? <><Plus size={14} /> {selectedOrchestration ? "Start orchestration" : "Start agent"}</> : phase === "starting" ? "Starting…" : "Opening…"}
+            {phase === "idle" ? <><Plus size={14} /> {selectedOrchestration ? "Activate orchestration" : "Create agent"}</> : phase === "starting" ? "Starting…" : "Opening…"}
           </button>
         </footer>
       </section>

@@ -26,7 +26,7 @@ import { enterDeck } from "./support/overview";
  * in both projects.
  *
  * Nothing here needs a daemon or a credential: the browser preview keeps its
- * settings document in `localStorage`, so a spec can seed the decks it wants.
+ * settings document in `localStorage`, so a spec can seed the daemons it wants.
  */
 
 /** `FIXTURE_SETTINGS_KEY` — deliberately unscoped, because a theme is global. */
@@ -116,8 +116,8 @@ function expectNoPageOverflow(metrics: Awaited<ReturnType<typeof pageMetrics>>) 
 
 /** The two shells the selector appears on, driven identically. */
 const SCREENS = [
-  { name: "the deck", open: openDeck },
-  { name: "the overview", open: openOverviewScreen },
+  { name: "the daemon", open: openDeck },
+  { name: "the dashboard", open: openOverviewScreen },
 ] as const;
 
 for (const screen of SCREENS) {
@@ -127,10 +127,10 @@ for (const screen of SCREENS) {
       await expect(page.getByTestId("deck-selector-current")).toHaveText("This machine");
 
       const menu = await openMenu(page);
-      // All Decks leads (PRD #742 M1) and is rendered in the house vocabulary —
-      // **Decks**, never "daemons" — while the testid keeps the stored token.
+      // All daemons leads (PRD #742 M1) and is rendered in the house vocabulary —
+      // **Daemons**, never "daemons" — while the testid keeps the stored token.
       await expect(menu.getByRole("radio")).toHaveText([
-        "All Decks",
+        "All daemons",
         "This machine",
         "vf@build-box.example.com",
         "relay.example.com:2222",
@@ -140,25 +140,26 @@ for (const screen of SCREENS) {
       await expect(page.getByTestId("deck-selector-option-all")).toHaveAttribute("aria-checked", "false");
     });
 
-    test("All Decks is selectable and stores the reserved fleet token", async ({ page }) => {
+    /** Scenario: All daemons is selectable and stores the reserved fleet token. */
+    test("All daemons is selectable and stores the reserved fleet token", async ({ page }) => {
       await screen.open(page);
       const menu = await openMenu(page);
 
       await menu.getByTestId("deck-selector-option-all").click();
 
       await expect(menu).toBeHidden();
-      await expect(page.getByTestId("deck-selector-current")).toHaveText("All Decks");
+      await expect(page.getByTestId("deck-selector-current")).toHaveText("All daemons");
 
       /*
         The built bundle, in both engines, is where this is worth asserting: M1
         ships the stored VALUE and the option, and the merged view is M4 — so the
         only thing a browser can check now is that the option is genuinely
         reachable by a click and that the document comes back holding `all`
-        rather than a deck id or the `local` default.
+        rather than a daemon id or the `local` default.
       */
       await expect.poll(() => storedSelection(page)).toBe("all");
       await page.reload();
-      await expect(page.getByTestId("deck-selector-current")).toHaveText("All Decks");
+      await expect(page.getByTestId("deck-selector-current")).toHaveText("All daemons");
       await openMenu(page);
       await expect(page.getByTestId("deck-selector-option-all")).toHaveAttribute("aria-checked", "true");
     });
@@ -240,6 +241,7 @@ for (const screen of SCREENS) {
       await expect(page.getByTestId("deck-selector-menu")).toBeVisible();
     });
 
+    /** Scenario: Groups its options with a span rather than a legend (issue 1032). */
     test("groups its options with a span rather than a legend (issue 1032)", async ({ page }) => {
       await screen.open(page);
       const menu = await openMenu(page);
@@ -251,7 +253,7 @@ for (const screen of SCREENS) {
         control positions itself, and that there is no fieldset in the subtree
         for an engine to have an opinion about.
       */
-      await expect(menu.getByRole("radiogroup")).toHaveAccessibleName("Deck");
+      await expect(menu.getByRole("radiogroup")).toHaveAccessibleName("Daemon");
       expect(await menu.locator("legend").count()).toBe(0);
       expect(await menu.locator("fieldset").count()).toBe(0);
     });
@@ -268,7 +270,7 @@ test.describe("the Deck selector's state line", () => {
     await expect(state).toBeVisible();
     expect((await state.innerText()).trim().length, "the state line rendered no text").toBeGreaterThan(0);
 
-    // Not blanked: the deck is still named, the selector still opens, and the
+    // Not blanked: the daemon is still named, the selector still opens, and the
     // rest of the shell is still there.
     await expect(page.getByTestId("deck-selector-current")).toHaveText("vf@build-box.example.com");
     const menu = await openMenu(page);
@@ -278,19 +280,19 @@ test.describe("the Deck selector's state line", () => {
 });
 
 /**
- * Scenario (#1083): on the deck screen with the crowded fixture, choose All
- * Decks. The body says "Select a deck to see its runs" and no agent tile is on
- * screen. Then choose build-box in the same selector, and the tiles are back.
- * (The Workflows sheet's note is live-mode only — the fixture preview has no
+ * Scenario (#1083): on the Daemons screen with the crowded fixture, choose All
+ * daemons. The body says "Select a daemon to see its runs" and no agent tile
+ * is on screen. Then choose build-box in the same selector, and the tiles are
+ * back. (The Orchestrations sheet's note is live-mode only — the fixture preview has no
  * launch form — so it is covered in `App.test.tsx`, not here.)
  */
-test("the deck screen asks for a deck under All Decks, and the selector brings it back", async ({ page }) => {
+test("the Daemons screen asks for a daemon under All daemons, and the selector brings it back", async ({ page }) => {
   await openDeck(page);
   await expect(page.locator(".agent-tile").first()).toBeVisible();
 
   await (await openMenu(page)).getByTestId("deck-selector-option-all").click();
 
-  await expect(page.getByTestId("deck-select-deck")).toContainText("Select a deck to see its runs");
+  await expect(page.getByTestId("deck-select-deck")).toContainText("Select a daemon to see its runs");
   await expect(page.locator(".agent-tile")).toHaveCount(0);
 
   await (await openMenu(page)).getByTestId(`deck-selector-option-${BUILD_BOX}`).click();

@@ -2,7 +2,7 @@ import { ArrowRight, CheckCircle2, CircleDashed, RefreshCw, Send, XCircle } from
 import type { HandoffEdge } from "../types";
 
 const STATUS_LABEL: Record<HandoffEdge["status"], string> = {
-  dispatched: "dispatched",
+  delegated: "delegated",
   delivered: "delivered · working",
   failed: "FAILED",
   done: "work-done",
@@ -16,18 +16,19 @@ function StatusIcon({ status }: { status: HandoffEdge["status"] }) {
 }
 
 /**
- * Live handoff chain (handoff-visibility PRD D2): one row per delegation,
- * newest first, driven entirely by the daemon's handoff events. A failed edge
- * shows its reason inline — the whole point is that a dropped handoff is
- * impossible to miss.
+ * Live delegation chain (handoff-visibility PRD D2): one row per delegation,
+ * newest first, driven entirely by the daemon's delegation events. A failed
+ * edge shows its reason inline — the whole point is that a dropped delegation
+ * is impossible to miss. The UI says "delegation" (issue #1045); the
+ * `Handoff*` identifiers and `handoff-*` classes keep their original names.
  */
 export function HandoffRail({ handoffs }: { handoffs: HandoffEdge[] }) {
   if (!handoffs.length) return null;
   return (
-    <section className="handoff-rail" aria-label="Live handoffs" data-testid="handoff-rail">
+    <section className="handoff-rail" aria-label="Live delegations" data-testid="handoff-rail">
       <header>
-        <span className="section-kicker">HANDOFFS</span>
-        <small>Delegations live from the deck — dispatched → delivered → work-done</small>
+        <span className="section-kicker">DELEGATIONS</span>
+        <small>Delegations live from the daemon — delegated → delivered → work-done</small>
       </header>
       <div className="handoff-list">
         {handoffs.slice(0, 12).map((edge) => (

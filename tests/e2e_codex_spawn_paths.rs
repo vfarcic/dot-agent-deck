@@ -91,7 +91,7 @@ fn path_with_binary_dir() -> String {
 }
 
 fn open_form(deck: &TuiDeck) {
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
@@ -199,7 +199,7 @@ fn spawn_009_declared_orchestration_launcher_wraps_and_badges_codex() {
         .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
         .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     std::fs::write(
         deck.workdir().join(".dot-agent-deck.toml"),
         "[[orchestrations]]\n\
@@ -221,7 +221,7 @@ fn spawn_009_declared_orchestration_launcher_wraps_and_badges_codex() {
 
     let launched = wait_for_declared_launcher(&record);
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("[New Agent Ctrl+N]");
     let codex_badge = deck.wait_for_grid_string_within("Codex ·", Duration::from_secs(5));
     let grid = deck.snapshot_grid();
 
@@ -247,7 +247,7 @@ fn spawn_011_declared_mode_launcher_wraps_and_badges_codex() {
         .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
         .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     std::fs::write(
         deck.workdir().join(".dot-agent-deck.toml"),
         "[[modes]]\n\
@@ -267,7 +267,7 @@ fn spawn_011_declared_mode_launcher_wraps_and_badges_codex() {
     let launched = wait_for_declared_launcher(&record);
     deck.send_bytes(b"\x04");
     deck.send_bytes(b"\x1b[D");
-    deck.wait_for_string("session(s)");
+    deck.wait_for_string("agent(s)");
     let codex_badge = deck.wait_for_grid_string_within("Codex ·", Duration::from_secs(5));
     let grid = deck.snapshot_grid();
 
@@ -299,7 +299,7 @@ fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
         .with_env("REAL_CODEX_BIN", real_codex.to_string_lossy())
         .with_imported_codex_credentials()
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let work = deck.workdir().to_path_buf();
     let launch_record = work.join("real-script-codex.log");
@@ -336,7 +336,7 @@ fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
         .unwrap_or_else(|state| panic!("the bespoke real-Codex launcher never executed: {state}"));
 
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("[New Agent Ctrl+N]");
     let codex_badge = deck.wait_for_grid_string_within("Codex ·", Duration::from_secs(5));
     let grid = deck.snapshot_grid();
     let real_launch =

@@ -340,7 +340,7 @@ fn dispatch_011_card_surfaces_live_in_tui() {
         .with_env("GHSTUB_DIR", ghdir)
         .with_env("DOT_AGENT_DECK_CONFIG", cfg_str)
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Fire the dispatch into the SAME daemon this TUI is attached to.
     run_now(&deck, "github-issues");

@@ -9,7 +9,7 @@
 //!
 //! The bug: in external-daemon mode the TUI never queried the daemon for
 //! existing agents on startup, so an ssh-reconnect via `dot-agent-deck
-//! connect` showed "No active sessions" even though the daemon had live
+//! connect` showed "No active agents" even though the daemon had live
 //! agents from the previous TUI session. `DaemonClient::list_agents` had
 //! zero production callers.
 //!
@@ -500,7 +500,7 @@ async fn hydrate_creates_panes_for_existing_agents() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hydrate_returns_empty_when_no_agents_exist() {
     // Empty `list_agents` result: dashboard should fall through to its
-    // normal "No active sessions..." view. The hydrate call must not error
+    // normal "No active agents..." view. The hydrate call must not error
     // and must not create any panes.
     let server = start_real_server().await;
     let ctrl = Arc::new(EmbeddedPaneController::new(

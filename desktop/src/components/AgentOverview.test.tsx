@@ -84,7 +84,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
       deck: selection,
       state: "ssh_unavailable" as const,
       ok: false,
-      message: "No deck is reachable from this test runtime.",
+      message: "No daemon is reachable from this test runtime.",
       disclosureKnown: false,
       forwards: [],
       knownHosts: [],
@@ -222,27 +222,30 @@ describe("AgentOverview", () => {
 
   afterEach(() => vi.unstubAllGlobals());
 
-  it("renders an orchestration as one unit, in role order, with the coordinator identifiable", () => {
+  /** Scenario: Renders an orchestration as one unit, in role order, with the orchestrator identifiable. */
+  it("renders an orchestration as one unit, in role order, with the orchestrator identifiable", () => {
     renderOverview();
 
     const prd = groupCard("orchestration", "orc-745");
     expect(prd).toHaveAttribute("data-group-kind", "orchestration");
-    expect(within(prd).getByRole("heading", { name: "PRD 745 · agent overview" })).toBeVisible();
+    expect(within(prd).getByRole("heading", { name: "PRD 745 · agent dashboard" })).toBeVisible();
     // The fixture declares these six out of role order on purpose.
     expect(rowNames(prd)).toEqual(["orchestrator", "coder", "tester", "reviewer", "docs", "release"]);
-    const coordinator = within(prd).getByText("COORDINATOR");
-    expect(within(prd).getAllByText("COORDINATOR")).toHaveLength(1);
+    const coordinator = within(prd).getByText("ORCHESTRATOR");
+    expect(within(prd).getAllByText("ORCHESTRATOR")).toHaveLength(1);
     expect(rows(prd)[0]).toContainElement(coordinator);
   });
 
+  /** Scenario: Marks the start role as coordinator even when it is not the first role. */
   it("marks the start role as coordinator even when it is not the first role", () => {
     renderOverview();
 
     const dotAi = groupCard("orchestration", "orc-dot-ai");
     expect(rowNames(dotAi)).toEqual(["writer", "reviewer", "orchestrator", "publisher"]);
-    expect(rows(dotAi)[2]).toContainElement(within(dotAi).getByText("COORDINATOR"));
+    expect(rows(dotAi)[2]).toContainElement(within(dotAi).getByText("ORCHESTRATOR"));
   });
 
+  /** Scenario: Buckets mode tabs and untabbed panes into their own groups. */
   it("buckets mode tabs and untabbed panes into their own groups", () => {
     renderOverview();
 
@@ -253,7 +256,7 @@ describe("AgentOverview", () => {
     const standalone = groupCard("standalone", "standalone");
     expect(standalone).toHaveAttribute("data-group-kind", "standalone");
     expect(rows(standalone)).toHaveLength(3);
-    expect(within(standalone).queryByText("COORDINATOR")).not.toBeInTheDocument();
+    expect(within(standalone).queryByText("ORCHESTRATOR")).not.toBeInTheDocument();
   });
 
   /**
@@ -317,11 +320,11 @@ describe("AgentOverview", () => {
    * with no hover text, rather than carrying a generic word or a name looked up
    * locally from its agent type (issue #856).
    *
-   * The agent left in the snapshot is one the deck knows perfectly well: the
+   * The agent left in the snapshot is one the daemon knows perfectly well: the
    * fixture's first, whose type a local table has an answer for. So the empty
    * cell is a property of the absent field and not of an unrecognisable agent —
    * which is what makes this the regression guard for the fallback the issue
-   * forbids. An empty cell says "the deck did not say"; a word says something
+   * forbids. An empty cell says "the daemon did not say"; a word says something
    * about the agent that nothing reported.
    */
   it("leaves the CLI cell empty when the daemon named no binary", () => {
@@ -365,7 +368,7 @@ describe("AgentOverview", () => {
     expect(rows(prd).map((row) => row.querySelector(".overview-cwd")?.textContent)).toEqual(["", "", "", "", "", ""]);
 
     // The standalone bucket is the case that makes this a DIFFERENCES column
-    // rather than a shared-value one: two of its three agents work in the deck
+    // rather than a shared-value one: two of its three agents work in the daemon
     // checkout and one does not, so the common directory is hoisted and the one
     // row that differs is the only thing printed down the column.
     const standalone = groupCard("standalone", "standalone");
@@ -398,7 +401,7 @@ describe("AgentOverview", () => {
     const { container } = renderOverview();
 
     const header = screen.getByTestId("daemon-group");
-    expect(header).toHaveTextContent("Local deck");
+    expect(header).toHaveTextContent("Local daemon");
     // Not shortened, not abbreviated — absent. No segment of the socket path is
     // on screen, and neither is the uid the old label leaked.
     expect(container.textContent ?? "").not.toContain(".sock");
@@ -981,7 +984,7 @@ describe("AgentOverview", () => {
 
     const cell = document.querySelector(".overview-activity");
     expect(cell).toHaveTextContent("2h ago");
-    expect(cell?.getAttribute("title")).toBe(`Last activity reported by the deck: ${new Date(twoHours).toISOString()}`);
+    expect(cell?.getAttribute("title")).toBe(`Last activity reported by the daemon: ${new Date(twoHours).toISOString()}`);
     unmount();
 
     // The RESTARTED-daemon case, and the one that made this field shippable
@@ -1034,7 +1037,7 @@ describe("AgentOverview", () => {
     const cell = document.querySelector(".overview-uptime");
     expect(cell).toHaveTextContent("3h");
     expect(cell?.textContent).not.toContain("ago");
-    expect(cell?.getAttribute("title")).toBe(`Spawned by the deck at: ${new Date(threeHours).toISOString()}`);
+    expect(cell?.getAttribute("title")).toBe(`Spawned by the daemon at: ${new Date(threeHours).toISOString()}`);
     unmount();
 
     // The case a daemon that did not spawn the agent produces — an id-only
@@ -1216,7 +1219,7 @@ describe("AgentOverview", () => {
 
   /**
    * Scenario: render an agent for each write lease the daemon can report, then
-   * one whose lease is the deck's `"unknown"` sentinel. The three reported
+   * one whose lease is the daemon's `"unknown"` sentinel. The three reported
    * values print; the sentinel prints nothing, and in particular does not print
    * the word "unknown" on a screen that promises no placeholders.
    */
@@ -1233,7 +1236,7 @@ describe("AgentOverview", () => {
   });
 
   /**
-   * Scenario: `toOverviewAgent` is the boundary that reverses the deck's one
+   * Scenario: `toOverviewAgent` is the boundary that reverses the daemon's one
    * remaining sentinel. A `"unknown"` lease becomes absent — no daemon value
    * spells it, so the reversal can only ever remove a placeholder — while an
    * absent cwd arrives absent and needs no reversal at all.
@@ -1247,13 +1250,13 @@ describe("AgentOverview", () => {
   });
 
   /**
-   * Scenario: the daemon reports a working directory whose name is the deck's
+   * Scenario: the daemon reports a working directory whose name is the daemon's
    * own stand-in word. `src/agent_pty.rs` accepts any non-empty, bounded,
    * control-free cwd, so that is a real directory and not an absence — and this
    * boundary, which used to reverse the word into `undefined`, now carries it
    * through to a cell with the path in it and a hover to match.
    */
-  it("keeps a reported working directory that happens to spell the deck's stand-in word", () => {
+  it("keeps a reported working directory that happens to spell the daemon's stand-in word", () => {
     expect(toOverviewAgent({ ...(createFixtureSnapshot("crowded").agents[0] as AgentSession), cwd: UNREPORTED }))
       .toMatchObject({ cwd: UNREPORTED });
 
@@ -1445,7 +1448,7 @@ describe("AgentOverview", () => {
    * Scenario: render the whole fleet and click each agent's row away from its
    * open control — on the status, the name, the prompt, and the row's own
    * padding. Every click opens that agent's pane with its own deck, including
-   * agents on a deck that is not selected, and the row still is not a button.
+   * agents on a daemon that is not selected, and the row still is not a button.
    */
   it("opens the pane from a click anywhere on a row, on every deck", () => {
     const onNavigate = vi.fn();
@@ -1649,13 +1652,14 @@ describe("AgentOverview", () => {
     expect(screen.queryByTestId("overview-incompatible")).not.toBeInTheDocument();
   });
 
+  /** Scenario: Says what happened when the daemon is unreachable. */
   it("says what happened when the daemon is unreachable", () => {
     renderOverview({ snapshot: createFixtureSnapshot("disconnected") });
 
     const note = screen.getByTestId("overview-disconnected");
     expect(note).toBeVisible();
-    expect(within(note).getByRole("heading", { name: "Deck disconnected" })).toBeVisible();
-    expect(within(note).getByText(/No deck is listening/)).toBeVisible();
+    expect(within(note).getByRole("heading", { name: "Daemon disconnected" })).toBeVisible();
+    expect(within(note).getByText(/No daemon is listening/)).toBeVisible();
     expect(screen.queryByTestId("overview-first-run")).not.toBeInTheDocument();
   });
 
@@ -1687,13 +1691,14 @@ describe("AgentOverview", () => {
     expect(screen.getByTestId("overview-loading")).toBeVisible();
   });
 
+  /** Scenario: Refuses to imply a fleet it cannot read from an incompatible daemon. */
   it("refuses to imply a fleet it cannot read from an incompatible daemon", () => {
     const snapshot = createFixtureSnapshot("error");
     snapshot.connection = { ...snapshot.connection, daemonDetected: true, runningAgentCount: 3 };
     renderOverview({ snapshot });
 
     expect(screen.getByTestId("overview-incompatible")).toBeVisible();
-    expect(screen.getByRole("heading", { name: "Incompatible deck" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Incompatible daemon" })).toBeVisible();
     expect(screen.getByText(/reports 3 running agents/)).toBeVisible();
     expect(rows(document.body)).toHaveLength(0);
     expect(screen.queryByTestId("overview-first-run")).not.toBeInTheDocument();
@@ -1706,15 +1711,16 @@ describe("AgentOverview", () => {
   /**
    * Issue #801. The overview is the screen a user lands on to see the fleet, so
    * a daemon it refuses for a stamp difference alone has to offer the same way
-   * out the deck does — not a pointer to another screen.
+   * out the daemon does — not a pointer to another screen.
    */
+  /** Scenario: Offers Connect anyway on the overview when only the build stamps differ. */
   it("offers Connect anyway on the overview when only the build stamps differ", async () => {
     const snapshot = createFixtureSnapshot("error");
     snapshot.connection = {
       ...snapshot.connection,
       daemonDetected: true,
       runningAgentCount: 9,
-      message: "build mismatch: desktop is v0.38.0-50-gf118e99, deck is v0.39.0. The deck reports 9 live agents; stop them individually before replacing the deck, or Connect anyway to keep this one.",
+      message: "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. The deck reports 9 live agents; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
       buildStampMismatchOnly: true,
     };
     const runAction = vi.fn(async () => ({ ok: true }) as import("../types").DeckActionResult);
@@ -1732,7 +1738,7 @@ describe("AgentOverview", () => {
     await waitFor(() => expect(reconnect).toHaveBeenCalled());
   });
 
-  /** The same load-bearing negative as on the deck: the wire check is not negotiable. */
+  /** The same load-bearing negative as on the daemon: the wire check is not negotiable. */
   it("never offers Connect anyway on the overview for a protocol mismatch", () => {
     const snapshot = createFixtureSnapshot("error");
     snapshot.connection = {
@@ -1753,6 +1759,7 @@ describe("AgentOverview", () => {
    * its own — the daemon card's state line is where the connection message
    * lives, and it renders whatever the crate kept in it.
    */
+  /** Scenario: Keeps the build-mismatch caveat on the daemon card after connecting anyway. */
   it("keeps the build-mismatch caveat on the daemon card after connecting anyway", () => {
     const snapshot = createFixtureSnapshot("crowded");
     snapshot.connection = {
@@ -1760,7 +1767,7 @@ describe("AgentOverview", () => {
       status: "connected",
       daemonDetected: true,
       runningAgentCount: 9,
-      message: "build mismatch: desktop is v0.38.0-50-gf118e99, deck is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.",
+      message: "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.",
       buildStampMismatchOnly: true,
     };
     render(<AgentOverview runtime={runtime({ mode: "live", snapshot })} onNavigate={vi.fn()} />);
@@ -1777,14 +1784,14 @@ describe("AgentOverview", () => {
 
   /**
    * Scenario: a healthy connection. The lamp beside the daemon's name is green
-   * and the line that read `Deck responding` next to it is gone — two
+   * and the line that read `Daemon responding` next to it is gone — two
    * renderings of one bit, and the screen narrating its own state (PRD #745).
    */
   it("says nothing beside the lamp when the daemon is simply responding", () => {
     renderOverview();
 
     expect(screen.queryByTestId("daemon-state")).not.toBeInTheDocument();
-    expect(document.body.textContent ?? "").not.toContain("Deck responding");
+    expect(document.body.textContent ?? "").not.toContain("Daemon responding");
     // The lamp is what says it, and it still does.
     expect(screen.getByTestId("daemon-group").querySelector(".connection-lamp.connection-connected")).not.toBeNull();
   });
@@ -1809,12 +1816,13 @@ describe("AgentOverview", () => {
    * banner recreating the noise this removed. The stamps are still reachable —
    * on the state line's `title`, which is a hover and not an alert.
    */
+  /** Scenario: Shows the fleet with no alert when the differing stamps name the same release. */
   it("shows the fleet with no alert when the differing stamps name the same release", () => {
     const snapshot = createFixtureSnapshot("crowded");
     snapshot.connection = {
       ...snapshot.connection,
       status: "connected",
-      message: "Deck responding",
+      message: "Daemon responding",
       daemonDetected: true,
       runningAgentCount: 9,
       buildStampMismatchOnly: false,
@@ -1825,7 +1833,7 @@ describe("AgentOverview", () => {
 
     expect(screen.queryByTestId("overview-incompatible")).not.toBeInTheDocument();
     expect(screen.queryByTestId("overview-connect-anyway")).not.toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Incompatible deck" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Incompatible daemon" })).not.toBeInTheDocument();
     expect(rows(document.body).length).toBeGreaterThan(0);
 
     // The connection is healthy, so its message says nothing the lamp does not
@@ -1834,16 +1842,17 @@ describe("AgentOverview", () => {
     // reader can actually find because it is a thing they can see.
     expect(screen.queryByTestId("daemon-state")).not.toBeInTheDocument();
     expect(screen.getByTestId("daemon-identity"))
-      .toHaveAttribute("title", `${FIXTURE_DAEMON_ID} · Built from different commits — desktop 0.39.0-49-ga0165f8, deck 0.39.0-g1ea0fe7.`);
+      .toHaveAttribute("title", `${FIXTURE_DAEMON_ID} · Built from different commits — desktop 0.39.0-49-ga0165f8, daemon 0.39.0-g1ea0fe7.`);
   });
 
   /** Matching stamps have nothing to disclose, so only the socket path is on hover. */
+  /** Scenario: Discloses nothing but the socket path when both builds report the same stamp. */
   it("discloses nothing but the socket path when both builds report the same stamp", () => {
     const snapshot = createFixtureSnapshot("crowded");
     snapshot.connection = {
       ...snapshot.connection,
       status: "connected",
-      message: "Deck responding",
+      message: "Daemon responding",
       daemonDetected: true,
       clientBuildVersion: "0.39.0-g1ea0fe7",
       daemonBuildVersion: "0.39.0-g1ea0fe7",
@@ -1865,7 +1874,7 @@ describe("AgentOverview", () => {
    * Scenario: land on the overview against the crowded fifteen-agent fleet and
    * watch what the app tells the bridge. Its header claims "no terminals
    * attached", and this is that claim as an instruction rather than as prose:
-   * declaring the empty shown set is what detaches whatever the deck left warm
+   * declaring the empty shown set is what detaches whatever the daemon left warm
    * on the way here (PRD #745 M7). Rendering no terminal is NOT the same as
    * attaching none — mounting nothing was already true before M7 and the
    * sockets stayed open.
@@ -2046,13 +2055,13 @@ describe("DeckShell", () => {
 
   /**
    * Scenario: launch the shipped desktop with the experimental flag absent.
-   * The overview is the landing screen and the only rail destinations are Overview and Settings.
+   * The dashboard is the landing screen and the only rail destinations are Dashboard and Settings.
    */
   it("hides every experimental destination from the shipped rail", async () => {
     window.history.replaceState({}, "", "/?fixture=1");
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
 
-    await waitFor(() => expect(railEntries()).toEqual(["Overview", "Settings"]));
+    await waitFor(() => expect(railEntries()).toEqual(["Dashboard", "Settings"]));
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
     expect(screen.queryByTestId("open-deck")).not.toBeInTheDocument();
     expect(screen.queryByTestId("overview-open-deck")).not.toBeInTheDocument();
@@ -2067,7 +2076,7 @@ describe("DeckShell", () => {
     const state = runtime({ snapshot: createFixtureSnapshot("connected"), ...{ desktopFeatures: undefined } });
     render(<DeckShell runtime={state} />);
 
-    await waitFor(() => expect(railEntries()).toEqual(["Overview", "Settings"]));
+    await waitFor(() => expect(railEntries()).toEqual(["Dashboard", "Settings"]));
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
   });
 
@@ -2080,7 +2089,7 @@ describe("DeckShell", () => {
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
 
     await waitFor(() => expect(railEntries()).toEqual([
-      "Overview", "Deck", "Projects", "Prompts", "Workflows", "Agent Profiles", "Settings",
+      "Dashboard", "Daemons", "Projects", "Prompts", "Orchestrations", "Agent Profiles", "Settings",
     ]));
   });
 
@@ -2095,7 +2104,7 @@ describe("DeckShell", () => {
     await waitFor(() => expect(screen.getByTestId("overview-table-region")).toBeVisible());
     expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
     expect(screen.queryByTestId("overview-open-deck")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Open deck" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open daemons" })).not.toBeInTheDocument();
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
     expect(screen.queryByRole("dialog", { name: "Command menu" })).not.toBeInTheDocument();
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
@@ -2119,11 +2128,11 @@ describe("DeckShell", () => {
   });
 
   /**
-   * Scenario: start directly in a deck-origin agent view, with no navigation
+   * Scenario: start directly in a daemon-origin agent view, with no navigation
    * history to consult. The deck grid stays mounted below the named dialog,
-   * and its close control returns to the deck recorded in the view value.
+   * and its close control returns to the daemon recorded in the view value.
    */
-  it("renders a deck-origin agent view over the mounted deck and closes back to it", () => {
+  it("renders a daemon-origin agent view over the mounted deck and closes back to it", () => {
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={agentView("deck")} />);
 
     const overlay = screen.getByTestId("agent-pane-overlay");
@@ -2135,7 +2144,7 @@ describe("DeckShell", () => {
     expect(screen.getByTestId("agent-tile-builder")).toBeInTheDocument();
     expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();
 
-    fireEvent.click(within(overlay).getByRole("button", { name: "Close Planner agent" }));
+    fireEvent.click(within(overlay).getByRole("button", { name: "Back to dashboard" }));
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(document.querySelector(".agent-grid")).toBeVisible();
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
@@ -2159,7 +2168,7 @@ describe("DeckShell", () => {
     expect(terminalMounted).toHaveBeenCalledWith("planner");
     expect(screen.queryByTestId("agent-tile-builder")).not.toBeInTheDocument();
 
-    fireEvent.click(within(overlay).getByRole("button", { name: "Close Planner agent" }));
+    fireEvent.click(within(overlay).getByRole("button", { name: "Back to dashboard" }));
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
     expect(screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "planner" })}`)).toBeVisible();
@@ -2209,7 +2218,7 @@ describe("DeckShell", () => {
    * and the rail can take the user to the deck and back without attaching a
    * terminal on the overview.
    */
-  it("opens on the overview and reaches the deck from the rail without mounting a terminal", () => {
+  it("opens on the overview and reaches the daemon from the rail without mounting a terminal", () => {
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
 
     expect(screen.getByTestId("daemon-group")).toBeVisible();
@@ -2237,7 +2246,7 @@ describe("DeckShell", () => {
 
     expect(rail()).toHaveLength(1);
     const deckEntries = entries();
-    expect(deckEntries[0]).toBe("Overview");
+    expect(deckEntries[0]).toBe("Dashboard");
     expect(deckEntries).toContain("Settings");
     fireEvent.click(screen.getByTestId("open-overview"));
     expect(rail()).toHaveLength(1);
@@ -2256,12 +2265,12 @@ describe("DeckShell", () => {
   it("marks the deck or overview as current, preserving overview under an agent pane", () => {
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={{ kind: "deck" }} />);
     const current = () => document.querySelector("aside.rail nav [aria-current='page']")?.textContent?.trim();
-    expect(current()).toBe("Deck");
+    expect(current()).toBe("Daemons");
 
     fireEvent.click(screen.getByTestId("open-overview"));
-    expect(current()).toBe("Overview");
+    expect(current()).toBe("Dashboard");
     fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
-    expect(current()).toBe("Overview");
+    expect(current()).toBe("Dashboard");
   });
 
   /**
@@ -2284,12 +2293,13 @@ describe("DeckShell", () => {
    * same two seams still need covering, because either one left alone would
    * leave the screen half-reachable.
    */
+  /** Scenario: Offers the overview in live mode. */
   it("offers the overview in live mode", () => {
     render(<DeckShell runtime={runtime({ mode: "live", snapshot: createFixtureSnapshot("connected") })} initialView={{ kind: "deck" }} />);
 
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
     expect(screen.getByTestId("open-overview")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Overview" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Dashboard" })).toBeVisible();
 
     terminalMounted.mockClear();
     fireEvent.click(screen.getByTestId("open-overview"));
@@ -2302,7 +2312,7 @@ describe("DeckShell", () => {
   /**
    * The other seam: a live session that already holds an `overview` view state
    * — restored, or navigated to before a re-render — renders the overview
-   * rather than falling back to the deck.
+   * rather than falling back to the daemon.
    */
   it("renders the overview when a live session is already holding an overview view state", () => {
     render(<DeckShell runtime={runtime({ mode: "live", snapshot: createFixtureSnapshot("connected") })} initialView={{ kind: "overview" }} />);
@@ -2321,11 +2331,11 @@ describe("DeckShell", () => {
    * second can be true while the first is not. Live mode, because that is
    * where zoom is bound at all.
    *
-   * The control is the deck case below it: the same keystroke, the same
+   * The control is the daemon case below it: the same keystroke, the same
    * runtime, the other screen. Without that pair, a red here cannot
    * distinguish "the overview does not bind zoom" from "zoom is broken".
    */
-  it("zooms on the overview, not only on the deck", () => {
+  it("zooms on the overview, not only on the daemon", () => {
     const state = runtime({ mode: "live", snapshot: createFixtureSnapshot("connected") });
     render(<DeckShell runtime={state} initialView={{ kind: "overview" }} />);
     expect(screen.getByTestId("daemon-group")).toBeVisible();
@@ -2334,7 +2344,7 @@ describe("DeckShell", () => {
     expect(state.setZoom).toHaveBeenCalledWith(1.1);
   });
 
-  it("zooms on the deck (the control for the overview case above)", () => {
+  it("zooms on the daemon (the control for the overview case above)", () => {
     const state = runtime({ mode: "live", snapshot: createFixtureSnapshot("connected") });
     render(<DeckShell runtime={state} initialView={{ kind: "deck" }} />);
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
@@ -2356,7 +2366,7 @@ describe("DeckShell", () => {
  *
  * Two questions, and they are genuinely different. The first is STRUCTURE: does
  * one deck per observed deck reach the screen, with each deck's agents inside
- * its own section and `groupAgents` still bucketing WITHIN a deck rather than
+ * its own section and `groupAgents` still bucketing WITHIN a daemon rather than
  * across the fleet. The second is HONESTY: what the header says when only some
  * of the fleet is answering, which is the state the whole PRD is about — a
  * disconnected deck's agent count is unknown, and the failure to avoid is
@@ -2396,7 +2406,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     expect(sections.map((section) => section.getAttribute("data-daemon-id")))
       .toEqual([FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID, FIXTURE_PENDING_DAEMON_ID]);
 
-    // Siblings, not nested: a deck inside another deck would still satisfy
+    // Siblings, not nested: a daemon inside another deck would still satisfy
     // every count above it.
     for (const section of sections) {
       expect(section.parentElement).toBe(sections[0].parentElement);
@@ -2404,11 +2414,11 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     }
 
     /*
-      Each ANSWERING deck's rows are in that deck's section and in no other,
+      Each ANSWERING deck's rows are in that daemon's section and in no other,
       addressed by the composite key — which is the assertion the colliding ids
       make real. The deck that is down lists none of its last-known agents, and
       that is the pre-existing rule rather than a fleet one: nothing can be said
-      about a fleet a deck is no longer vouching for, so the list is blank
+      about a fleet a daemon is no longer vouching for, so the list is blank
       rather than stale.
     */
     for (const [index, deck] of fleet.entries()) {
@@ -2425,7 +2435,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     expect(fleet[1].agents.some((agent) => localIds.has(agent.id))).toBe(true);
   });
 
-  // Test-plan item 13, second half: the grouping INSIDE a deck is unchanged.
+  // Test-plan item 13, second half: the grouping INSIDE a daemon is unchanged.
   it("groups within each deck by tab membership and never across decks", () => {
     const { fleet } = renderFleet();
     const sections = deckSections();
@@ -2446,7 +2456,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
   });
 
   // Test-plan item 14.
-  it("counts over the decks that answered, says how many did, and never counts a silent deck as zero", () => {
+  it("counts over the daemons that answered, says how many did, and never counts a silent deck as zero", () => {
     const { fleet } = renderFleet();
 
     const up = fleet.filter((deck) => deck.connection.status === "connected");
@@ -2471,7 +2481,8 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
   });
 
   // Test-plan item 14, the degraded half.
-  it("renders a deck that is down as a degraded group with an em dash, never as a group with zero agents", () => {
+  /** Scenario: Renders a daemon that is down as a degraded group with an em dash, never as a group with zero agents. */
+  it("renders a daemon that is down as a degraded group with an em dash, never as a group with zero agents", () => {
     renderFleet();
     const down = deckSections()[2];
 
@@ -2479,21 +2490,22 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     expect(down.className).toContain("is-degraded");
     expect(within(down).getByTestId("daemon-unknown")).toHaveTextContent("—");
     expect(within(down).getByTestId("overview-disconnected")).toBeVisible();
-    expect(within(down).getByTestId("daemon-state")).toHaveTextContent("No deck is listening on the configured socket.");
+    expect(within(down).getByTestId("daemon-state")).toHaveTextContent("No daemon is listening on the configured socket.");
     // Not a table with nothing in it, and not a pip saying "0".
     expect(down.querySelectorAll(".overview-row")).toHaveLength(0);
     expect(down.querySelector(".daemon-pips")).toBeNull();
     expect(down.textContent).not.toMatch(/\b0 (running|waiting|failed|queued|passed|stopped)\b/);
   });
 
-  it("names a remote deck by its address and the local one 'Local deck', and says 'daemon' nowhere a reader can see", () => {
+  /** Scenario: Name a remote daemon by its address and the local one by its canonical label. The rendered screen uses daemon terminology. */
+  it("names remote daemons by address and the local one as Local daemon", () => {
     renderFleet();
     const sections = deckSections();
 
-    expect(within(sections[0]).getByTestId("daemon-identity")).toHaveTextContent("Local deck");
+    expect(within(sections[0]).getByTestId("daemon-identity")).toHaveTextContent("Local daemon");
     expect(within(sections[1]).getByTestId("daemon-identity")).toHaveTextContent(FIXTURE_REMOTE_DAEMON_ID);
     expect(within(sections[2]).getByTestId("daemon-identity")).toHaveTextContent(FIXTURE_UNREACHABLE_DAEMON_ID);
-    expect(document.querySelector(".overview-screen")?.textContent ?? "").not.toMatch(/daemon/i);
+    expect(document.querySelector(".overview-screen")?.textContent ?? "").toMatch(/daemon/i);
   });
 
   /**
@@ -2502,19 +2514,20 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
    * worth pinning is that a fleet of one still reads exactly as it did before
    * the fleet existed.
    */
+  /** Scenario: Still renders one section and a 1/1 deck count for a single-deck fleet. */
   it("still renders one section and a 1/1 deck count for a single-deck fleet", () => {
     renderOverview();
 
     expect(screen.getAllByTestId("daemon-group")).toHaveLength(1);
     expect(screen.getByTestId("overview-count-decks").querySelector("strong")).toHaveTextContent("1/1");
-    expect(screen.getByTestId("daemon-identity")).toHaveTextContent("Local deck");
+    expect(screen.getByTestId("daemon-identity")).toHaveTextContent("Local daemon");
   });
 
   /*
     -------------------------------------------------------------------------
     PRD #742 M12 — a configured deck with no socket path is VISIBLE and
     COUNTED, and the PRD's Success Criterion 4 is what it answers: "a
-    disconnected deck is visible as a degraded group rather than as zero
+    disconnected daemon is visible as a degraded group rather than as zero
     agents, and the number of decks up out of the total is stated."
 
     Open Question 3 recorded the gap at M1 and M4 did not close it. The
@@ -2555,17 +2568,17 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
 
     expect(screen.getByTestId("overview-count-decks").querySelector("strong")).toHaveTextContent("2/3");
     expect(screen.getByTestId("overview-count-decks").querySelector("strong"))
-      .toHaveAttribute("title", expect.stringContaining("2 of 3 decks are answering") as unknown as string);
+      .toHaveAttribute("title", expect.stringContaining("2 of 3 daemons are answering") as unknown as string);
   });
 
   /**
    * Scenario: the same fleet, looking at the third deck's section. It is a
    * group of its own, named by its address, saying it is not configured — not
-   * absent, and not a deck reporting zero agents.
+   * absent, and not a daemon reporting zero agents.
    *
    * The words are the settings panel's rather than the disconnected note's:
    * nothing stopped answering and Reconnect cannot help, so "no deck is
-   * listening on the configured socket" and "start one from the deck screen"
+   * listening on the configured socket" and "start one from the daemon screen"
    * would both be false.
    */
   it("renders the unconfigured deck as its own group saying what is missing", () => {
@@ -2579,14 +2592,14 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     expect(within(halfway).getByTestId("daemon-identity")).toHaveTextContent("relay.example.com");
 
     const note = within(halfway).getByTestId("overview-unconfigured");
-    expect(note).toHaveTextContent("Deck not configured");
+    expect(note).toHaveTextContent("Daemon not configured");
     expect(note).toHaveTextContent("press Test connection");
     // Not the disconnected note, whose remedy is Reconnect — a button that
-    // cannot help a deck with no address.
+    // cannot help a daemon with no address.
     expect(within(halfway).queryByTestId("overview-disconnected")).toBeNull();
     expect(within(halfway).queryByRole("button", { name: /Reconnect/ })).toBeNull();
 
-    // And never a deck running nothing: the pips read as UNKNOWN.
+    // And never a daemon running nothing: the pips read as UNKNOWN.
     expect(within(halfway).getByTestId("daemon-unknown")).toBeInTheDocument();
     expect(within(halfway).queryByTestId(/^overview-agent-/)).toBeNull();
   });
@@ -2601,7 +2614,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
 
   /*
     -------------------------------------------------------------------------
-    PRD #742 M14 — a deck that HAS NOT REPORTED YET is visible, and the total
+    PRD #742 M14 — a daemon that HAS NOT REPORTED YET is visible, and the total
     is right from the first frame.
 
     The same Success Criterion 4 M12 answers, reached by the other route: a
@@ -2636,24 +2649,24 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
    * answered — and it never reads `1/1`, which is the bug: the denominator
    * used to climb to 2 only once the second deck arrived.
    */
-  it("counts a deck that has not reported yet in the total and never among those that answered", () => {
+  it("counts a daemon that has not reported yet in the total and never among those that answered", () => {
     const fleet = fleetWithPending();
     render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={vi.fn()} />);
 
     const decks = screen.getByTestId("overview-count-decks").querySelector("strong");
     expect(decks).toHaveTextContent("1/2");
     expect(decks).not.toHaveTextContent("1/1");
-    expect(decks).toHaveAttribute("title", expect.stringContaining("1 of 2 decks are answering") as unknown as string);
+    expect(decks).toHaveAttribute("title", expect.stringContaining("1 of 2 daemons are answering") as unknown as string);
   });
 
   /**
    * Scenario: the same two decks, looking at the agent instruments. They are
-   * computed over the decks that ANSWERED, so a deck nothing has been heard
+   * computed over the daemons that ANSWERED, so a daemon nothing has been heard
    * from contributes nothing — exactly as a disconnected deck does not, and for
    * the same reason: what it is running is unknown, and adding zero for it
    * would be a wrong number that looks like a right one.
    */
-  it("leaves a deck that has not reported out of every agent count beside the deck count", () => {
+  it("leaves a daemon that has not reported out of every agent count beside the daemon count", () => {
     const fleet = fleetWithPending();
     render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={vi.fn()} />);
 
@@ -2662,9 +2675,9 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     expect(screen.getByTestId("overview-count-agents").querySelector("strong")).toHaveTextContent(String(answered.length));
     expect(fleet[1].agents).toHaveLength(0);
     /*
-      And the substantive half, which the totals above cannot show: a deck with
+      And the substantive half, which the totals above cannot show: a daemon with
       no agent list adds ZERO to every instrument whether it is counted or not,
-      so the assertion that has teeth is what the deck's own row says. It reads
+      so the assertion that has teeth is what the daemon's own row says. It reads
       as UNKNOWN — an em dash where its neighbours print pips — and never as a
       deck running nothing.
     */
@@ -2678,14 +2691,14 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
   /**
    * Scenario: the same fleet, looking at the second deck's section. It is a
    * group of its own, named by its address, saying it is being waited for —
-   * not absent, not an error, and not a deck reporting zero agents.
+   * not absent, not an error, and not a daemon reporting zero agents.
    *
    * The words are the empty state's register rather than the disconnected
    * note's: nothing stopped answering, so "no deck is listening on the
    * configured socket" is false, and there is no action for the reader to take,
    * so the note offers no button at all.
    */
-  it("renders the deck that has not reported as its own group saying it is being waited for", () => {
+  it("renders the daemon that has not reported as its own group saying it is being waited for", () => {
     const fleet = fleetWithPending();
     render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={vi.fn()} />);
 
@@ -2695,11 +2708,11 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     expect(waiting).toHaveAttribute("data-daemon-id", "deck-00000000000e0d03");
     expect(waiting).toHaveAttribute("data-deck-connected", "no");
     // Named by its address. Without the crate's `observed` list this would read
-    // "Local deck" — `deckName` has only `deckKind` to go on.
+    // "Local daemon" — `deckName` has only `deckKind` to go on.
     expect(within(waiting).getByTestId("daemon-identity")).toHaveTextContent("ops@edge-3");
 
     const note = within(waiting).getByTestId("overview-pending");
-    expect(note).toHaveTextContent("Waiting for this deck");
+    expect(note).toHaveTextContent("Waiting for this daemon");
     expect(note).toHaveTextContent(PENDING_DECK_MESSAGE);
     // Not the disconnected note, and not the app's own pre-connect one.
     expect(within(waiting).queryByTestId("overview-disconnected")).toBeNull();
@@ -2722,10 +2735,10 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
    *
    * The pair worth pinning is the last two: both render a degraded group with
    * an em dash, and they must not render the same NOTE. Reusing `disconnected`
-   * for a deck nothing was asked of is the shortcut this milestone exists to
+   * for a daemon nothing was asked of is the shortcut this milestone exists to
    * refuse, and it would leave every count assertion above green.
    */
-  it("keeps a deck that has not reported distinct from one that stopped answering", () => {
+  it("keeps a daemon that has not reported distinct from one that stopped answering", () => {
     renderFleet();
     const sections = deckSections();
     expect(sections).toHaveLength(4);
@@ -2770,9 +2783,9 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
    * pointing at in the first place.
    *
    * The deck decides what the PANE can do, not whether it opens: it comes up
-   * with an explicit no-terminal state naming the deck
+   * with an explicit no-terminal state naming the daemon
    * (`desktop/src/AgentPaneDeckIdentity.test.tsx` has that half). What stays
-   * withdrawn is the deck SWITCH — this screen moves no selection, and
+   * withdrawn is the daemon SWITCH — this screen moves no selection, and
    * `writes no settings document when a pane opens or closes` is its guard.
    */
   it("offers an open control on every row, whichever deck the agent is on", () => {

@@ -1115,7 +1115,11 @@ fn scenario(
         rows: 55,
         stream_log: sb.artifacts.join(format!("{setup_label}.stream.txt")),
     })?;
-    if !setup_tui.wait_for_grid_string("No active sessions", UI_TIMEOUT) {
+    // Either TUI can be the setup TUI (forward: the previous release; reverse:
+    // the branch), and #1045 renamed this empty-state sentence, so accept both.
+    if !setup_tui.wait_for_grid(UI_TIMEOUT, |g| {
+        g.contains("No active agents") || g.contains("No active sessions")
+    }) {
         return Err(Abort::Scenario(format!(
             "{}: never reached an empty dashboard.\n=== grid ===\n{}",
             setup_tui.label,

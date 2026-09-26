@@ -1,7 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
 /**
- * The Decks settings section, driven in an engine that lays out and paints
+ * The Daemons settings section, driven in an engine that lays out and paints
  * (PRD #741 M7).
  *
  * Two of these are here rather than in the vitest suite because jsdom cannot
@@ -13,7 +13,7 @@ import { expect, test, type Page } from "@playwright/test";
  *   panel of settings reads as two columns rather than a ragged stack. jsdom
  *   computes no boxes, so the only thing it could assert is that a class name
  *   was written.
- * - **A bidi override reordering the deck label** is TEXT SHAPING. jsdom can say
+ * - **A bidi override reordering the daemon label** is TEXT SHAPING. jsdom can say
  *   the codepoint was stripped from a string; whether the glyphs a reader sees
  *   run left to right is a question only a real engine answers, and the answer
  *   is the whole reason the strip exists.
@@ -32,8 +32,8 @@ const SETTINGS_KEY = "dot-agent-deck.desktop-settings";
 /** A right-to-left override: one character, and the reason this file exists. */
 const RLO = "‮";
 
-/** Seed the preview's settings document, then open the Decks section. */
-async function openDecks(page: Page, endpoints?: unknown) {
+/** Seed the preview's settings document, then open the Daemons section. */
+async function openDaemons(page: Page, endpoints?: unknown) {
   await page.addInitScript(
     ([key, document]) => {
       window.localStorage.setItem(key as string, JSON.stringify(document));
@@ -72,10 +72,10 @@ async function glyphAdvance(page: Page, testId: string): Promise<number> {
   }, testId);
 }
 
-test.describe("the Decks settings section", () => {
+test.describe("the Daemons settings section", () => {
   test("is reachable from the settings sheet and shows the local deck without configuration", async ({ page }) => {
     // No `endpoints` in the seeded document at all — the fresh-install case.
-    await openDecks(page);
+    await openDaemons(page);
 
     await expect(page.getByTestId("deck-choice-local")).toBeVisible();
     await expect(page.getByTestId("deck-choice-local")).toContainText("This machine");
@@ -84,8 +84,8 @@ test.describe("the Decks settings section", () => {
     await expect(page.getByTestId("settings-layout")).not.toHaveClass(/is-single/);
   });
 
-  test("lays a deck's fields out as the house two-column row", async ({ page }) => {
-    await openDecks(page, {
+  test("lays a daemon's fields out as the house two-column row", async ({ page }) => {
+    await openDaemons(page, {
       remote: [{ host: "build-box", id: "deck0000000000aa", port: 22 }],
       selection: "deck0000000000aa",
     });
@@ -143,8 +143,8 @@ test.describe("the Decks settings section", () => {
     }
   });
 
-  test("a bidi override in a settings-supplied host cannot reverse the deck label", async ({ page }) => {
-    await openDecks(page, {
+  test("a bidi override in a settings-supplied host cannot reverse the daemon label", async ({ page }) => {
+    await openDaemons(page, {
       remote: [{ host: `build${RLO}xob`, id: "deck0000000000aa", port: 22 }],
       selection: "local",
     });
@@ -199,7 +199,7 @@ test.describe("the Decks settings section", () => {
   });
 
   test("says what it cannot do here rather than inventing a verdict", async ({ page }) => {
-    await openDecks(page, {
+    await openDaemons(page, {
       remote: [{ host: "build-box", id: "deck0000000000aa", port: 22 }],
       selection: "deck0000000000aa",
     });
@@ -214,7 +214,7 @@ test.describe("the Decks settings section", () => {
     await expect(result).toBeVisible();
     await expect(result).toHaveAttribute("data-state", "ssh_unavailable");
     await expect(page.getByTestId("deck-result-message")).toContainText("Browser preview");
-    // The panel is still a panel: the deck list and the fields are where they
+    // The panel is still a panel: the daemon list and the fields are where they
     // were, which is the property a screen that blanked on a failure would lose.
     await expect(page.getByTestId("deck-choices")).toBeVisible();
     await expect(page.getByLabel("Host", { exact: true })).toHaveValue("build-box");
@@ -228,13 +228,14 @@ test.describe("the Decks settings section", () => {
    * explanatory line under it are the kind of thing worth confirming in the two
    * engines the app ships on.
    */
+  /** Scenario: Paints a stored fleet selection as a choice rather than as nothing. */
   test("paints a stored fleet selection as a choice rather than as nothing", async ({ page }) => {
-    await openDecks(page, {
+    await openDaemons(page, {
       remote: [{ host: "build-box", id: "deck0000000000aa", port: 22 }],
       selection: "all",
     });
 
-    await expect(page.getByTestId("deck-choice-all")).toContainText("All Decks");
+    await expect(page.getByTestId("deck-choice-all")).toContainText("All daemons");
     await expect(page.getByTestId("deck-choice-all").locator("input")).toBeChecked();
     await expect(page.getByTestId("deck-choice-local").locator("input")).not.toBeChecked();
     await expect(page.getByTestId("deck-choice-deck0000000000aa").locator("input")).not.toBeChecked();
@@ -246,7 +247,7 @@ test.describe("the Decks settings section", () => {
     // And nothing to probe: a probe tests one deck.
     await expect(page.getByTestId("test-connection")).toBeDisabled();
 
-    // Choosing a deck gets the form and the button back, which is what the
+    // Choosing a daemon gets the form and the button back, which is what the
     // sentence told the reader to do.
     await page.getByTestId("deck-choice-deck0000000000aa").locator("input").click();
     await expect(page.getByLabel("Host", { exact: true })).toHaveValue("build-box");

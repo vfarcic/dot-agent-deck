@@ -91,7 +91,7 @@ fn run_now(deck: &TuiDeck, name: &str) {
 /// LIVE on the rendered dashboard. Pins live surfacing for a bare (hookless)
 /// command: green since `ed0c3bf` publishes a synthetic `SessionStart` for
 /// single-agent fires. When written this was RED — the daemon had the agent but
-/// the attached TUI stayed on "No active sessions", because no broadcast
+/// the attached TUI stayed on "No active agents", because no broadcast
 /// triggered live hydration.
 #[spec("scheduler/live/001")]
 #[test]
@@ -112,7 +112,7 @@ fn live_001_scheduled_card_surfaces_to_attached_tui() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Fire the schedule into the SAME daemon this TUI is attached to.
     run_now(&deck, "livecard");
@@ -170,7 +170,7 @@ fn live_002_focusing_scheduled_card_does_not_delete_it() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Fire the schedule; the daemon spawns the agent.
     run_now(&deck, "schedfocus");
@@ -263,7 +263,7 @@ fn live_003_scheduled_card_title_shows_friendly_name() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Fire the schedule into the SAME daemon this TUI is attached to.
     run_now(&deck, "morning-digest");
@@ -364,7 +364,7 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Fire the schedule into the SAME daemon this TUI is attached to.
     run_now(&deck, "morning-digest");

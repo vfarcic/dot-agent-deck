@@ -44,7 +44,7 @@ fn policy_003_a_live_agent_keeps_working_after_another_client_shrinks_it() {
         .with_pty_size(160, 45)
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let cwd = deck.workdir().to_path_buf();
     std::fs::write(cwd.join(SENTINEL_FILE), "size policy sentinel\n")
@@ -63,7 +63,7 @@ fn policy_003_a_live_agent_keeps_working_after_another_client_shrinks_it() {
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(PANE_NAME_SUFFIX.as_bytes());
     deck.send_keys(b"\t");

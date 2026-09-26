@@ -31,7 +31,7 @@ import {
 
 describe("New agent rules (PRD #1223 M4)", () => {
   /**
-   * Scenario: a deck in each state the overview distinguishes is asked whether
+   * Scenario: a daemon in each state the overview distinguishes is asked whether
    * it can take a spawn. Only a connected deck can — including one connected
    * through Connect anyway — and every other one gives its own message, or the
    * overview's sentence for its state when it carries none.
@@ -43,7 +43,7 @@ describe("New agent rules (PRD #1223 M4)", () => {
     expect(deckUnavailableReason(connection({ status: "disconnected" }))).toBe(DECK_STATE_FALLBACK.disconnected);
     expect(deckUnavailableReason(connection({ status: "disconnected", message: "ssh: connect to host build-box port 22: refused" }))).toBe("ssh: connect to host build-box port 22: refused");
     expect(deckUnavailableReason(connection({ status: "error" }))).toBe(DECK_STATE_FALLBACK.incompatible);
-    expect(deckUnavailableReason(connection({ status: "error", buildStampMismatchOnly: true, message: "The deck was built from another commit." }))).toBe("The deck was built from another commit.");
+    expect(deckUnavailableReason(connection({ status: "error", buildStampMismatchOnly: true, message: "The daemon was built from another commit." }))).toBe("The daemon was built from another commit.");
     expect(deckUnavailableReason(connection({ status: "loading", pending: true }))).toBe(DECK_STATE_FALLBACK.pending);
     expect(deckUnavailableReason(connection({ status: "disconnected", unconfigured: true }))).toBe(DECK_STATE_FALLBACK.unconfigured);
     expect(deckUnavailableReason(connection({ status: "loading" }))).toBe(DECK_STATE_FALLBACK.loading);
@@ -52,11 +52,11 @@ describe("New agent rules (PRD #1223 M4)", () => {
   /**
    * Scenario (PRD #1223 U1): a connected deck that does not advertise
    * `list-directories` carries the crate's `newAgentReason`. Browsing is the
-   * only way the flow chooses a directory, so that deck is ineligible with
-   * the crate's sentence — and a deck without the reason stays eligible.
+   * only way the flow chooses a directory, so that daemon is ineligible with
+   * the crate's sentence — and a daemon without the reason stays eligible.
    */
   it("makes a connected deck without the listing verb ineligible with the crate's reason", () => {
-    const reason = "This deck does not advertise list-directories, so it cannot be browsed for a directory to start in. Start agents on it from the TUI on its host, or upgrade the deck.";
+    const reason = "This deck does not advertise list-directories, so it cannot be browsed for a directory to start in. Create agents on it from the TUI on its host, or upgrade the daemon.";
     expect(deckUnavailableReason({ status: "connected", deckId: "deck-a", newAgentReason: reason })).toBe(reason);
     const fleet: DeckFleet = createFixtureFleet("fleet").map((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID ? { ...deck, connection: { ...deck.connection, newAgentReason: reason } } : deck);
     const choices = deckChoices(fleet);
@@ -68,7 +68,7 @@ describe("New agent rules (PRD #1223 M4)", () => {
   /**
    * Scenario: the four-deck fleet preview becomes deck-step rows. Every deck
    * with an identity is listed in fleet order; the unreachable and pending
-   * decks carry reasons; a placeholder entry with no `deckId` is not a deck
+   * decks carry reasons; a placeholder entry with no `deckId` is not a daemon
    * and is left out.
    */
   it("lists every identified deck in fleet order with the ineligible ones' reasons", () => {
@@ -77,30 +77,30 @@ describe("New agent rules (PRD #1223 M4)", () => {
     expect(choices.map((choice) => choice.deckId)).toEqual([FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID, FIXTURE_PENDING_DAEMON_ID]);
     expect(choices.map((choice) => choice.reason === undefined)).toEqual([true, true, false, false]);
     expect(choices[1]).toMatchObject({ deckKind: "remote" });
-    expect(choices[2].reason).toBe("No deck is listening on the configured socket.");
+    expect(choices[2].reason).toBe("No daemon is listening on the configured socket.");
   });
 
   /**
-   * Scenario: what voice is told about the deck step (PRD #1223) is the step
+   * Scenario: what voice is told about the daemon step (PRD #1223) is the step
    * itself — every listed deck by id, and each one it disables with the exact
-   * sentence it shows — so a spoken "new agent" can only preselect a deck the
+   * sentence it shows — so a spoken "new agent" can only preselect a daemon the
    * dialog would, and names a disabled one in the step's own words.
    */
-  it("declares the deck step to voice as ids and the step's own reasons", () => {
+  it("declares the daemon step to voice as ids and the step's own reasons", () => {
     const reason = "This deck does not advertise list-directories, so it cannot be browsed for a directory to start in.";
     const fleet: DeckFleet = createFixtureFleet("fleet").map((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID ? { ...deck, connection: { ...deck.connection, newAgentReason: reason } } : deck);
     const step = voiceDeckStep(fleet);
     expect(step.map((row) => row.deckId)).toEqual(deckChoices(fleet).map((choice) => choice.deckId));
     expect(step).toContainEqual({ deckId: FIXTURE_DAEMON_ID });
     expect(step).toContainEqual({ deckId: FIXTURE_REMOTE_DAEMON_ID, reason });
-    expect(step).toContainEqual({ deckId: FIXTURE_UNREACHABLE_DAEMON_ID, reason: "No deck is listening on the configured socket." });
+    expect(step).toContainEqual({ deckId: FIXTURE_UNREACHABLE_DAEMON_ID, reason: "No daemon is listening on the configured socket." });
     expect(step.find((row) => row.deckId === FIXTURE_PENDING_DAEMON_ID)?.reason).toBe(deckChoices(fleet).find((choice) => choice.deckId === FIXTURE_PENDING_DAEMON_ID)?.reason);
     expect(Object.keys(step[0])).toEqual(["deckId"]);
   });
 
   /**
-   * Scenario: the deck step opens on the deck named by a header's affordance
-   * when that deck can take a spawn; otherwise on the only eligible deck when
+   * Scenario: the daemon step opens on the daemon named by a header's affordance
+   * when that daemon can take a spawn; otherwise on the only eligible deck when
    * there is exactly one; otherwise on nothing, so the user chooses.
    */
   it("preselects the requested deck, else the only eligible one, else none", () => {
@@ -115,11 +115,11 @@ describe("New agent rules (PRD #1223 M4)", () => {
   });
 
   /**
-   * Scenario: the Name prefill is the last component of the deck's canonical
+   * Scenario: the Name prefill is the last component of the daemon's canonical
    * path — for a Unix path, one with a trailing separator, a Windows path, and
    * the root, which has none.
    */
-  it("labels a directory by the last component of the deck's path", () => {
+  it("labels a directory by the last component of the daemon's path", () => {
     expect(directoryLabel("/home/dev/scratch")).toBe("scratch");
     expect(directoryLabel("/home/dev/scratch/")).toBe("scratch");
     expect(directoryLabel("\\\\?\\C:\\Users\\dev\\repo")).toBe("repo");
@@ -127,8 +127,8 @@ describe("New agent rules (PRD #1223 M4)", () => {
   });
 
   /**
-   * Scenario: Command is prefilled in the TUI's order — the deck's configured
-   * default command, then the last command started on that deck, then blank.
+   * Scenario: Command is prefilled in the TUI's order — the daemon's configured
+   * default command, then the last command started on that daemon, then blank.
    * A whitespace-only last command counts as none.
    */
   it("prefills Command from the default command, then the last command, then blank", () => {
@@ -139,9 +139,9 @@ describe("New agent rules (PRD #1223 M4)", () => {
     expect(seedCommand()).toBe("");
   });
 
-  /** Scenario: the crate's resolve refusal reads as "the deck left"; a connection error or a daemon refusal does not. */
+  /** Scenario: the crate's resolve refusal reads as "the daemon left"; a connection error or a daemon refusal does not. */
   it("recognises the resolve refusal and nothing else as a departed deck", () => {
-    expect(isDeckGoneError("that deck is not one this app is observing: deck-1234")).toBe(true);
+    expect(isDeckGoneError("that daemon is not one this app is observing: deck-1234")).toBe(true);
     expect(isDeckGoneError("I/O error talking to daemon: Connection refused")).toBe(false);
     expect(isDeckGoneError("daemon returned error: unresolved: that path did not resolve")).toBe(false);
   });
@@ -154,7 +154,7 @@ describe("New agent rules (PRD #1223 M4)", () => {
    * counts.
    */
   it("does not read a refusal that merely quotes the resolve wording as a departed deck", () => {
-    const hostile = "that deck is not one this app is observing";
+    const hostile = "that daemon is not one this app is observing";
     expect(isDeckGoneError(`failed to start orchestration role ${hostile}: refused; stopped 1 already-started role(s)`)).toBe(false);
     expect(isDeckGoneError(`roles already started: ${hostile}: deck-1234`)).toBe(false);
     expect(isDeckGoneError(`${hostile}: deck-1234`)).toBe(true);
@@ -165,7 +165,7 @@ describe("New agent rules (PRD #1223 M4)", () => {
    * the same id on another deck does not count, and neither does the right
    * deck before it lists the agent.
    */
-  it("finds a started agent only on the deck it was started on", () => {
+  it("finds a started agent only on the daemon it was started on", () => {
     const withAgents = (deckId: string, ids: string[]) => ({
       ...createFixtureSnapshot("connected"),
       connection: { status: "connected" as const, deckId },
@@ -214,12 +214,12 @@ describe("New agent rules — authoring agents (PRD #1223 M7)", () => {
   const kinds = (options: NewAgentOptions | undefined) => authoringModes(options).offered.map((mode) => mode.kind);
 
   /**
-   * Scenario: the chips a deck's options offer. Nothing while the options are
-   * loading; the kinds the deck lists, in the TUI's order whatever order it
-   * lists them in; `schedule-issues` only under the deck's experimental flag;
+   * Scenario: the chips a daemon's options offer. Nothing while the options are
+   * loading; the kinds the daemon lists, in the TUI's order whatever order it
+   * lists them in; `schedule-issues` only under the daemon's experimental flag;
    * and a kind this app does not know is ignored rather than offered.
    */
-  it("offers the kinds the deck lists, in the TUI's order, schedule-issues only under its flag", () => {
+  it("offers the kinds the daemon lists, in the TUI's order, schedule-issues only under its flag", () => {
     expect(authoringModes(undefined)).toEqual({ offered: [] });
     expect(kinds(deckOptions(["dispatcher", "schedule-issues", "schedule"], false))).toEqual(["schedule", "dispatcher"]);
     expect(kinds(deckOptions(["dispatcher", "schedule-issues", "schedule"], true))).toEqual(["schedule", "schedule-issues", "dispatcher"]);
@@ -228,12 +228,12 @@ describe("New agent rules — authoring agents (PRD #1223 M7)", () => {
   });
 
   /**
-   * Scenario: the decks that offer no authoring chip say why — an older deck
-   * that has no options query, and a deck that lists no kind this app knows,
+   * Scenario: the daemons that offer no authoring chip say why — an older deck
+   * that has no options query, and a daemon that lists no kind this app knows,
    * each in its own words. A deck that lists only `schedule-issues` with its
    * flag off offers nothing and gives no reason, because it can compose one.
    */
-  it("gives an older deck and a deck that composes nothing their reason", () => {
+  it("gives an older deck and a daemon that composes nothing their reason", () => {
     expect(authoringModes({ kind: "unsupported", desktopAgents: [] })).toEqual({ offered: [], withheld: AUTHORING_WITHHELD.unsupported });
     expect(authoringModes(deckOptions([], true))).toEqual({ offered: [], withheld: AUTHORING_WITHHELD.none });
     expect(authoringModes(deckOptions(["future-kind"], true))).toEqual({ offered: [], withheld: AUTHORING_WITHHELD.none });
@@ -242,8 +242,8 @@ describe("New agent rules — authoring agents (PRD #1223 M7)", () => {
 
   /**
    * Scenario: the TUI's `resolve_authoring_command`. A typed command is used
-   * as it stands; a blank or whitespace one resolves to the deck host's
-   * default command, trimmed, then to the deck's own `claude` registry entry,
+   * as it stands; a blank or whitespace one resolves to the daemon host's
+   * default command, trimmed, then to the daemon's own `claude` registry entry,
    * then to `claude` itself.
    */
   it("resolves a blank authoring Command the way the TUI does", () => {
@@ -271,7 +271,7 @@ describe("New agent orchestration rules (PRD #1223 M6)", () => {
    * orchestration's name when it does not; a run's several roles count once;
    * a dashboard agent and another deck's orchestrations do not count at all.
    */
-  it("reads the chosen deck's live titles and directories, and only that deck's", () => {
+  it("reads the chosen deck's live titles and directories, and only that daemon's", () => {
     const fleet = fleetOf({
       "deck-a": [role("1", "loop", "night-run", "/p"), role("2", "loop", "night-run", "/p"), role("3", "review"), createFixtureStartedAgent({ id: "4", daemonId: "deck-a" })],
       "deck-b": [role("1", "loop", "other-deck-run", "/q")],
@@ -295,8 +295,8 @@ describe("New agent orchestration rules (PRD #1223 M6)", () => {
     expect(orchestrationRunTitle(" ", "loop")).toBe(" ");
   });
 
-  /** Scenario: what each deck answer offers — chips for a project, nothing for an ordinary directory or a pending answer, the deck's reason for one that cannot launch. */
-  it("offers a project's orchestrations and withholds with the deck's reason", () => {
+  /** Scenario: what each deck answer offers — chips for a project, nothing for an ordinary directory or a pending answer, the daemon's reason for one that cannot launch. */
+  it("offers a project's orchestrations and withholds with the daemon's reason", () => {
     const loop = { name: "loop", displayName: "loop", default: true, roles: [] };
     expect(orchestrationModes(undefined)).toEqual({ offered: [] });
     expect(orchestrationModes({ kind: "not_project" })).toEqual({ offered: [] });
@@ -307,7 +307,7 @@ describe("New agent orchestration rules (PRD #1223 M6)", () => {
 
   /**
    * Scenario (PRD #1223 audit F2): a project defines `loop` twice and `solo`
-   * once. The launch identifies an orchestration by name and the deck takes
+   * once. The launch identifies an orchestration by name and the daemon takes
    * the first definition, so only `solo` is offered; both `loop`s come back as
    * ambiguous, in the project's order, with a reason that says what to do.
    * Names compare exactly — `Loop` is not a namesake of `loop`.
@@ -320,7 +320,7 @@ describe("New agent orchestration rules (PRD #1223 M6)", () => {
     const cased = orchestration("Loop", ["other"]);
 
     expect(orchestrationModes({ kind: "project", path: "/p", displayPath: "/p", displayName: "p", orchestrations: [first, solo, second, cased] })).toEqual({ offered: [solo, cased], ambiguous: [first, second] });
-    expect(ambiguousOrchestrationReason("loop")).toBe("This project defines more than one orchestration named loop; rename one to launch it here.");
+    expect(ambiguousOrchestrationReason("loop")).toBe("This project defines more than one orchestration named loop; rename one to activate it here.");
     expect(ambiguousOrchestrationReason("lo\u202Eop")).toContain("named loop;");
   });
 });
@@ -336,26 +336,26 @@ describe("New agent rules — cleanup the launch could not confirm (PRD #1223 au
     const long = (prefix: string) => `${prefix}${"r".repeat(128 - prefix.length)}`;
     const warning = cleanupWarning([long("reviewer-"), long("planner-")]);
 
-    expect(warning.summary).toBe("2 roles may still be running on this deck: their stops could not be confirmed. Check the deck and stop them there.");
+    expect(warning.summary).toBe("2 roles may still be running on this daemon: their stops could not be confirmed. Check the daemon and stop them there.");
     expect(Array.from(warning.summary).length).toBeLessThanOrEqual(240);
     expect(warning.names).toEqual([long("reviewer-"), long("planner-")]);
     expect(warning.names.every((name) => Array.from(name).length <= 128)).toBe(true);
     expect(warning.overflow).toBe(0);
     expect(cleanupWarning(["builder"])).toEqual({
-      summary: "1 role may still be running on this deck: its stop could not be confirmed. Check the deck and stop it there.",
+      summary: "1 role may still be running on this daemon: its stop could not be confirmed. Check the daemon and stop it there.",
       names: ["builder"],
       overflow: 0,
     });
     expect(cleanupWarning(["plan\u202Ener"]).names).toEqual(["planner"]);
-    // Issue #1234: a warning that outlives its screen names its deck instead.
-    expect(cleanupWarning(["builder"], "Local deck").summary).toBe("1 role may still be running on Local deck: its stop could not be confirmed. Check the deck and stop it there.");
+    // Issue #1234: a warning that outlives its screen names its daemon instead.
+    expect(cleanupWarning(["builder"], "Local daemon").summary).toBe("1 role may still be running on Local daemon: its stop could not be confirmed. Check the daemon and stop it there.");
   });
 
   /**
    * Scenario (PRD #1223 audit W5): a rollback could not confirm two roles, and
    * one of them is named entirely of characters that render as nothing. Its
    * list item must say something — a blank `<li>` under "2 roles may still be
-   * running on this deck" leaves the reader counting bullets to find out that
+   * running on this daemon" leaves the reader counting bullets to find out that
    * a role was named at all, which is the moment they most need the name.
    *
    * `displayText` retains those characters on purpose (stripping them would

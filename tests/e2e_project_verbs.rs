@@ -542,7 +542,7 @@ fn project_launch_001_publishes_the_context_and_a_failed_preparation_starts_no_r
     );
     let prepared = resp
         .workflow_prepared
-        .expect("a successful PrepareWorkflow must carry a PreparedWorkflow");
+        .expect("a successful PrepareWorkflow must carry a PreparedOrchestration");
 
     let expected_context = project
         .join(".dot-agent-deck")
@@ -631,7 +631,7 @@ fn project_launch_001_publishes_the_context_and_a_failed_preparation_starts_no_r
     );
     assert!(
         resp.workflow_prepared.is_none(),
-        "a refused preparation must carry no PreparedWorkflow"
+        "a refused preparation must carry no PreparedOrchestration"
     );
     let error = resp.error.unwrap_or_default();
     assert!(
@@ -737,7 +737,7 @@ fn project_launch_002_the_canonical_path_resolve_returns_is_the_string_the_launc
     );
     let prepared = resp
         .workflow_prepared
-        .expect("a successful PrepareWorkflow must carry a PreparedWorkflow");
+        .expect("a successful PrepareWorkflow must carry a PreparedOrchestration");
 
     let expected_context = project
         .join(".dot-agent-deck")
@@ -790,7 +790,7 @@ fn project_launch_004_empty_task_omits_the_task_section_and_preserves_the_run_ti
     );
     let empty_prepared = empty_response
         .workflow_prepared
-        .expect("a successful empty-task preparation must carry a PreparedWorkflow");
+        .expect("a successful empty-task preparation must carry a PreparedOrchestration");
     let context_path = PathBuf::from(&empty_prepared.context_path);
     let empty_context = std::fs::read_to_string(&context_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", context_path.display()));
@@ -910,7 +910,7 @@ fn project_launch_004_empty_task_omits_the_task_section_and_preserves_the_run_ti
     );
     let control_prepared = control_response
         .workflow_prepared
-        .expect("the non-empty control must carry a PreparedWorkflow");
+        .expect("the non-empty control must carry a PreparedOrchestration");
     let control_context = std::fs::read_to_string(&control_prepared.context_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", control_prepared.context_path));
     for needle in ["\n## Your task\n", "\n## Task precedence\n", CONTROL_TASK] {
@@ -976,7 +976,7 @@ fn project_launch_005_prepared_roles_use_their_daemon_configured_commands() {
     );
     let prepared = prepare_response
         .workflow_prepared
-        .expect("a successful preparation must carry a PreparedWorkflow");
+        .expect("a successful preparation must carry a PreparedOrchestration");
     assert_eq!(
         prepared.roles.len(),
         2,

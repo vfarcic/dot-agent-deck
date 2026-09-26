@@ -16,7 +16,7 @@ function readStoredProfiles(): AgentProfile[] | undefined {
       typeof (profile as AgentProfile).id === "string" &&
       typeof (profile as AgentProfile).role === "string" &&
       typeof (profile as AgentProfile).command === "string" &&
-      // PR #416 review Part C finding 3: roleId reaches StartWorkflow as the
+      // PR #416 review Part C finding 3: roleId reaches ActivateOrchestration as the
       // role name; a persisted non-string yields an opaque serde error with no
       // correctable UI field. Absent is fine (derived below); wrong-typed is not.
       ["string", "undefined"].includes(typeof (profile as AgentProfile).roleId)

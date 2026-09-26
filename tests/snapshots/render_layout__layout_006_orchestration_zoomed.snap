@@ -30,5 +30,5 @@ expression: zoomed
 ┃                                                                                                  ┃
 ┃                                                                                                  ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
- COMMAND  [Back to Pane Ctrl+D] [New Pane Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?]    
-[Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Scheduled Tasks s]
+ COMMAND  [Back to Pane Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?]   
+[Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]

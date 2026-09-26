@@ -1165,7 +1165,7 @@ async fn project_verbs_are_reachable_and_none_report_unimplemented() {
     );
     assert!(
         resp.workflow_prepared.is_none(),
-        "a refusal carries no PreparedWorkflow"
+        "a refusal carries no PreparedOrchestration"
     );
     let error = resp.error.unwrap_or_default();
     assert!(
@@ -1418,7 +1418,7 @@ async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
     assert!(!resp.ok, "a stale revision must be refused");
     assert!(
         resp.workflow_prepared.is_none(),
-        "a refused preparation carries no PreparedWorkflow"
+        "a refused preparation carries no PreparedOrchestration"
     );
     let error = resp.error.unwrap_or_default();
     assert!(
@@ -1581,7 +1581,7 @@ enum PreVerbAttachRequest {
 /// role, and whether that role is the orchestration's start role.
 ///
 /// A real launch always sends one (`desktop/src-tauri/src/lib.rs`'s
-/// `workflow_start_options`), and since PRD #819's Greptile P1(a) fix the daemon
+/// `orchestration_start_options`), and since PRD #819's Greptile P1(a) fix the daemon
 /// compares it against the token's binding — so a payload carrying `None` here
 /// can no longer produce a spawn. The cases below that pass `None` are the ones
 /// refused before the identity check is reached: an unknown token, and a payload
@@ -1870,6 +1870,9 @@ async fn a_prepared_start_refuses_an_unknown_token_and_spawns_on_a_live_one() {
         "a refused prepared start must not have spawned a pane"
     );
 
+    // Issue #1045: deliberately the LEGACY spelling — a desktop built before
+    // the rename still sends `prepare-workflow` and reads `workflow_prepared`,
+    // and the token it gets back must spawn exactly as the new op's does.
     let resp = issue_json_request(
         &server,
         serde_json::json!({
@@ -1881,7 +1884,13 @@ async fn a_prepared_start_refuses_an_unknown_token_and_spawns_on_a_live_one() {
     )
     .await;
     assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
-    let prepared = resp.workflow_prepared.expect("a PreparedWorkflow");
+    assert!(
+        resp.orchestration_prepared.is_none(),
+        "a legacy request is answered on the legacy field only"
+    );
+    let prepared = resp
+        .workflow_prepared
+        .expect("the legacy field carries the PreparedOrchestration");
 
     let resp = issue_json_request(
         &server,
@@ -1929,7 +1938,7 @@ async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() 
             let resp = issue_json_request(
                 server,
                 serde_json::json!({
-                    "op": "prepare-workflow",
+                    "op": "prepare-orchestration",
                     "path": path,
                     "orchestration": "loop",
                     "task": task,
@@ -1937,7 +1946,8 @@ async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() 
             )
             .await;
             assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
-            resp.workflow_prepared.expect("a PreparedWorkflow")
+            resp.orchestration_prepared
+                .expect("a PreparedOrchestration")
         }
     };
 
@@ -2051,7 +2061,7 @@ async fn a_prepared_start_refuses_spawn_fields_from_another_project() {
             let resp = issue_json_request(
                 server,
                 serde_json::json!({
-                    "op": "prepare-workflow",
+                    "op": "prepare-orchestration",
                     "path": path,
                     "orchestration": "loop",
                     "task": task,
@@ -2059,7 +2069,8 @@ async fn a_prepared_start_refuses_spawn_fields_from_another_project() {
             )
             .await;
             assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
-            resp.workflow_prepared.expect("a PreparedWorkflow")
+            resp.orchestration_prepared
+                .expect("a PreparedOrchestration")
         }
     };
 
@@ -2222,7 +2233,7 @@ async fn the_client_routes_a_presented_token_onto_the_prepared_verb() {
     // that refuses to send anything at all: a real preparation's token spawns
     // through the same method, capability gate included.
     let prepared = client
-        .prepare_workflow(
+        .prepare_orchestration(
             project.to_str().expect("utf-8 project path"),
             "loop",
             "Mint a token to spawn with.",
@@ -2315,11 +2326,14 @@ fn configured_role_payload(
     payload
 }
 
-async fn prepare_loop(server: &Server, project: &Path) -> dot_agent_deck::event::PreparedWorkflow {
+async fn prepare_loop(
+    server: &Server,
+    project: &Path,
+) -> dot_agent_deck::event::PreparedOrchestration {
     let resp = issue_json_request(
         server,
         serde_json::json!({
-            "op": "prepare-workflow",
+            "op": "prepare-orchestration",
             "path": project.to_str().unwrap(),
             "orchestration": "loop",
             "task": "",
@@ -2327,7 +2341,8 @@ async fn prepare_loop(server: &Server, project: &Path) -> dot_agent_deck::event:
     )
     .await;
     assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
-    resp.workflow_prepared.expect("a PreparedWorkflow")
+    resp.orchestration_prepared
+        .expect("a PreparedOrchestration")
 }
 
 /// PRD #1223 M6: an opted-in prepared start takes its command, agent type and

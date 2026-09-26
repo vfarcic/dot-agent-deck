@@ -79,11 +79,9 @@ pub fn add(tasks: &mut Vec<ScheduledTask>, args: AddArgs) -> Result<(), String> 
         match &args.command {
             Some(cmd) if !cmd.trim().is_empty() => {}
             _ => {
-                return Err(
-                    "--command is required: a scheduled task needs an agent command \
+                return Err("--command is required: a schedule needs an agent command \
                      (e.g. claude) to act on its prompt"
-                        .to_string(),
-                );
+                    .to_string());
             }
         }
     }
@@ -317,7 +315,7 @@ pub fn write_atomic(path: &Path, tasks: &[ScheduledTask]) -> Result<(), String> 
 /// not happen for a writer-produced file) renders as `next: <invalid cron>`.
 pub fn format_list(tasks: &[ScheduledTask]) -> String {
     if tasks.is_empty() {
-        return "No scheduled tasks.".to_string();
+        return "No schedules.".to_string();
     }
     use chrono::Local;
     let mut out = String::new();

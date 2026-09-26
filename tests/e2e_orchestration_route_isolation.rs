@@ -325,7 +325,7 @@ fn route_001_two_tabs_same_cwd_do_not_cross_deliver() {
         // wins over the harness's env scrub).
         .with_env("PATH", path_with_binary_dir())
         .launch_with_fixture("orchestration-route");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let socket = deck.attach_socket_path().to_path_buf();
     let cwd = deck.workdir().to_path_buf();

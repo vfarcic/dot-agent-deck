@@ -337,7 +337,7 @@ pub enum UiMode {
     /// with Stop still selected so the user can pick a different option
     /// without restarting the Ctrl+C sequence.
     StopConfirm,
-    /// PRD #127 M3.3: the "Scheduled Tasks" manager dialog — a
+    /// PRD #127 M3.3: the "Schedules" manager dialog — a
     /// read-only-plus-actions list of the configured schedules (status +
     /// next-fire) with add/edit (seeded authoring agent), delete-with-confirm
     /// (definition only), and run-now actions.
@@ -634,7 +634,7 @@ fn build_dispatcher_mode(working_dir: &std::path::Path) -> ModeConfig {
 }
 
 // ---------------------------------------------------------------------------
-// "Scheduled Tasks" management dialog (PRD #127 M3.3)
+// "Schedules" management dialog (PRD #127 M3.3)
 // ---------------------------------------------------------------------------
 
 /// Status of a schedule as shown in the manager dialog. "disabled" when
@@ -2450,7 +2450,7 @@ struct UiState {
     /// so every (re)delivery carries the same agent identity + stable delivery
     /// id. Keyed by pane id; cleared when the prompt is delivered or abandoned.
     prompt_delivery: HashMap<String, PromptDelivery>,
-    /// PRD #127 M3.3: schedules listed in the "Scheduled Tasks" manager dialog,
+    /// PRD #127 M3.3: schedules listed in the "Schedules" manager dialog,
     /// loaded from the global config when the dialog opens.
     scheduled_tasks: Vec<config::ScheduledTask>,
     /// Selected row in the manager dialog.
@@ -6074,8 +6074,8 @@ pub enum Action {
     DetachAndQuit,
     Focus,
     /// PRD #80: open the directory picker to start a new pane (Ctrl+N). This
-    /// is the global "New Pane" command and the target of the M2 button bar's
-    /// `[New Pane Ctrl+N]` button — distinct from [`Action::SpawnPane`], which
+    /// is the global "New Agent" command and the target of the M2 button bar's
+    /// `[New Agent Ctrl+N]` button — distinct from [`Action::SpawnPane`], which
     /// is the *result* of submitting the new-pane form.
     NewPane,
     /// PRD #80: close the selected pane — or the entire mode/orchestration tab
@@ -6267,8 +6267,8 @@ pub enum Action {
     /// agent and exits), and breaks the TUI's main loop.
     StopAndQuit,
     ForwardToPane(Vec<u8>),
-    /// PRD #127 finding #4: open the "Scheduled Tasks" manager dialog. Shared by
-    /// the dashboard `s`/`S` key and the `[Scheduled Tasks s]` button-bar button
+    /// PRD #127 finding #4: open the "Schedules" manager dialog. Shared by
+    /// the dashboard `s`/`S` key and the `[Schedules s]` button-bar button
     /// (PRD #80 parity), so both funnel through one dispatch path that loads the
     /// schedules and switches into [`UiMode::ScheduledTasks`].
     OpenScheduledTasks,
@@ -7039,8 +7039,8 @@ fn close_confirm_options(scope: CloseScope) -> [(&'static str, &'static str); 2]
 /// The dialog's question, phrased for what the close will actually take.
 fn close_confirm_header(scope: CloseScope) -> &'static str {
     match scope {
-        CloseScope::Pane => "  Close selected pane?",
-        CloseScope::Tab => "  Close this tab and all its panes?",
+        CloseScope::Pane => "  Close selected agent?",
+        CloseScope::Tab => "  Close this tab and all its agents?",
     }
 }
 
@@ -7957,7 +7957,7 @@ fn focus_deck(
                 Err(PaneError::CommandFailed(ref msg)) => {
                     state.blocking_write().sessions.remove(*sid);
                     ui.status_message = Some((
-                        format!("Removed stale session: {msg}"),
+                        format!("Removed stale agent: {msg}"),
                         std::time::Instant::now(),
                     ));
                 }
@@ -7968,7 +7968,7 @@ fn focus_deck(
             }
         } else {
             ui.status_message = Some((
-                format!("No pane linked to session {sid}"),
+                format!("No pane linked to agent {sid}"),
                 std::time::Instant::now(),
             ));
         }
@@ -8552,9 +8552,9 @@ fn handle_normal_key(
     {
         return Action::SendPermissionResponse(false);
     }
-    // PRD #127 finding #4: open the "Scheduled Tasks" manager dialog. Routed
+    // PRD #127 finding #4: open the "Schedules" manager dialog. Routed
     // through the keybinding registry (default `s`) so it is remappable and
-    // shares one dispatch path with the `[Scheduled Tasks s]` button-bar button
+    // shares one dispatch path with the `[Schedules s]` button-bar button
     // (PRD #80 parity). The legacy uppercase `S` (Shift+s) stays a hardcoded
     // non-configurable alias — mirroring the Down/Up aliases kept beside j/k —
     // so existing muscle memory keeps working while lowercase `s` is added.
@@ -8702,7 +8702,7 @@ fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> Action {
     Action::Continue
 }
 
-/// Issue #142: one step of the Scheduled Tasks manager selection, WRAPPING at
+/// Issue #142: one step of the Schedules manager selection, WRAPPING at
 /// both ends. Extracted so the mouse wheel and the keyboard (`j`/Down,
 /// `k`/Up) share one definition of "next/previous row" and cannot drift apart —
 /// the wheel has no independent scroll offset, it moves `scheduled_selected` and
@@ -8719,7 +8719,7 @@ fn step_scheduled_selection(selected: usize, len: usize, forward: bool) -> usize
     }
 }
 
-/// PRD #127 M3.3: key handling for the "Scheduled Tasks" manager dialog.
+/// PRD #127 M3.3: key handling for the "Schedules" manager dialog.
 /// Read-only-plus-actions: `j`/`k` move the selection, `a` adds, `Enter`/`e`
 /// edits the selected row (both spawn the seeded authoring agent), `d` asks to
 /// confirm a definition-only delete (`y` confirms, `n`/Esc cancels), `r`
@@ -9737,7 +9737,7 @@ fn mode_tab_nav_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> 
 }
 
 /// PRD #80: a clickable affordance that carries its keyboard shortcut inline
-/// (e.g. `[New Pane Ctrl+N]`) plus the [`Action`] it triggers. Render and
+/// (e.g. `[New Agent Ctrl+N]`) plus the [`Action`] it triggers. Render and
 /// hit-test live together (see [`Button::render`] and [`hit_test_button`]) so
 /// they cannot drift. From M2 the button bar renders these and records each
 /// one's screen rect in `UiState::button_rects`; a mouse Down hit-tested
@@ -9745,7 +9745,7 @@ fn mode_tab_nav_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> 
 /// to, which is what makes the mouse/keyboard parity self-evident in code.
 #[derive(Debug, Clone)]
 pub struct Button {
-    /// Human-readable command name, e.g. `New Pane`.
+    /// Human-readable command name, e.g. `New Agent`.
     pub label: String,
     /// The keyboard shortcut shown inline, e.g. `Ctrl+N`. Empty for buttons
     /// that have no keyboard equivalent (none in the parity-only PRD #80).
@@ -9788,7 +9788,7 @@ impl Button {
     }
 
     /// The narrow-terminal fallback label: just the bracketed shortcut, e.g.
-    /// `[Ctrl+N]` (or `[New Pane]` if the button has no shortcut). Used by the
+    /// `[Ctrl+N]` (or `[New Agent]` if the button has no shortcut). Used by the
     /// button bar when the full `[Label Shortcut]` set doesn't fit, so every
     /// command stays identifiable without a mid-label truncation.
     pub fn shortcut_only_label(&self) -> String {
@@ -9862,7 +9862,7 @@ pub fn hit_test_button(button_rects: &[(Action, Rect)], col: u16, row: u16) -> O
 ///
 /// Deliberately an EXHAUSTIVE `match` with no `_` arm: this guard was originally
 /// a local `bool` in [`run_tui`], and `ScheduledTasks` — added long after — was
-/// simply forgotten, so wheeling over the Scheduled Tasks dialog scrolled the
+/// simply forgotten, so wheeling over the Schedules dialog scrolled the
 /// mode-tab side pane behind it (issue #142). A wildcard arm would let the next
 /// new `UiMode` repeat that silently; without one, adding a variant fails to
 /// COMPILE until its modality is declared here.
@@ -9879,7 +9879,7 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         | UiMode::Help
         | UiMode::DirPicker
         | UiMode::NewPaneForm
-        // Issue #142: the Scheduled Tasks manager is a topmost modal as well.
+        // Issue #142: the Schedules manager is a topmost modal as well.
         // The wheel over it belongs to ITS list (handled before this guard),
         // never to whatever pane the centered dialog happens to cover.
         | UiMode::ScheduledTasks => true,
@@ -10495,8 +10495,10 @@ fn dispatch_action(
                             drop(st);
                             ui.pane_metadata.remove(&pane_id);
                             ui.pane_declared_agent.remove(&pane_id);
-                            ui.status_message =
-                                Some((format!("Closed pane {pane_id}"), std::time::Instant::now()));
+                            ui.status_message = Some((
+                                format!("Closed agent {pane_id}"),
+                                std::time::Instant::now(),
+                            ));
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -10866,7 +10868,7 @@ fn dispatch_action(
                         Err(PaneError::CommandFailed(ref msg)) => {
                             state.blocking_write().sessions.remove(sid);
                             ui.status_message = Some((
-                                format!("Removed stale session: {msg}"),
+                                format!("Removed stale agent: {msg}"),
                                 std::time::Instant::now(),
                             ));
                         }
@@ -10879,7 +10881,7 @@ fn dispatch_action(
                     }
                 } else {
                     ui.status_message = Some((
-                        format!("No pane linked to session {sid}"),
+                        format!("No pane linked to agent {sid}"),
                         std::time::Instant::now(),
                     ));
                 }
@@ -10896,7 +10898,7 @@ fn dispatch_action(
                 ui.mode = UiMode::ConfigGenPrompt;
             } else {
                 ui.status_message = Some((
-                    "No active agent session to send prompt to.".to_string(),
+                    "No active agent to send prompt to.".to_string(),
                     std::time::Instant::now(),
                 ));
             }
@@ -11538,7 +11540,7 @@ fn dispatch_action(
                                     capture_prompt_delivery(ui, &new_id, pane);
                                 }
                                 ui.status_message = Some((
-                                    format!("Created pane {new_id} in {dir_str}"),
+                                    format!("Created agent {new_id} in {dir_str}"),
                                     std::time::Instant::now(),
                                 ));
                                 // PRD #196: the plain card was genuinely created on
@@ -11549,7 +11551,7 @@ fn dispatch_action(
                         }
                         Err(e) => {
                             ui.status_message =
-                                Some((format!("New pane failed: {e}"), std::time::Instant::now()));
+                                Some((format!("New agent failed: {e}"), std::time::Instant::now()));
                         }
                     }
                 } // close else (non-orchestration path)
@@ -11781,7 +11783,7 @@ fn dispatch_action(
             }
         }
         // PRD #127 finding #4: open the manager dialog. Shared by the dashboard
-        // `s`/`S` key and the `[Scheduled Tasks s]` button-bar button. Loads the
+        // `s`/`S` key and the `[Schedules s]` button-bar button. Loads the
         // schedules from the global config and snapshots which currently have a
         // live tab/agent (for the status indicator), then switches mode.
         Action::OpenScheduledTasks => {
@@ -12902,7 +12904,7 @@ pub fn run_tui(
     // and reconnected via `dot-agent-deck connect`). Ask the daemon for its
     // agent list and rebuild stream-backed panes for each one before the
     // event loop starts so the dashboard shows the live sessions instead of
-    // "No active sessions". `hydrate_from_daemon` is a no-op for the
+    // "No active agents". `hydrate_from_daemon` is a no-op for the
     // in-process (`LocalDeck`) controller — the in-process daemon shares
     // the TUI's registry directly. Errors during list_agents/attach are
     // absorbed so a transient daemon hiccup doesn't block startup.
@@ -14838,7 +14840,7 @@ pub fn run_tui(
             // the card is already gone), so the warning arrives on this queue
             // instead of the `Result`. Show it on the same status line the close
             // path uses for its other outcomes; queued after the handler's
-            // "Closed pane N", so the warning is what the user is left reading.
+            // "Closed agent N", so the warning is what the user is left reading.
             // A single status line holds one message, so if several blind closes
             // land in the same frame the last one is displayed — every one of them
             // is also logged at WARN by `close_pane`.
@@ -14991,7 +14993,7 @@ pub fn run_tui(
                         | crossterm::event::MouseEventKind::ScrollDown
                 );
 
-                // Issue #142: the Scheduled Tasks manager owns the wheel while
+                // Issue #142: the Schedules manager owns the wheel while
                 // it is open — handled BEFORE the generic overlay swallow below
                 // so the wheel scrolls the manager's own list instead of merely
                 // being eaten (and instead of leaking to the side pane the
@@ -15176,7 +15178,7 @@ pub fn run_tui(
                         | UiMode::ConfigGenPrompt
                         | UiMode::StarPrompt
                         | UiMode::Help
-                        // PRD #127 finding #4: the Scheduled Tasks dialog is a
+                        // PRD #127 finding #4: the Schedules dialog is a
                         // topmost modal too — its [Add]/[Edit]/[Delete]/[Run now]
                         // buttons live in `modal_button_rects` and any miss is
                         // consumed here rather than reaching the pane behind it.
@@ -16623,9 +16625,9 @@ pub(crate) fn build_pane_status_for_gate(state: &AppState) -> HashMap<&str, Sess
 /// and the everything-filtered-out branch) and only one of them can overflow.
 fn deck_title_line(showing: usize, total_sessions: usize, scroll_hint: &str) -> Line<'static> {
     let title_text = if showing < total_sessions {
-        format!("— {showing}/{total_sessions} session(s)")
+        format!("— {showing}/{total_sessions} agent(s)")
     } else {
-        format!("— {total_sessions} session(s)")
+        format!("— {total_sessions} agent(s)")
     };
     let mut spans = vec![
         Span::styled(
@@ -17063,7 +17065,7 @@ fn render_frame(
             ])
             .split(dashboard_area);
             let msg = Paragraph::new(format!(
-                "No active sessions. Press {MOD_KEY}+n to create a pane."
+                "No active agents. Press {MOD_KEY}+n to create an agent."
             ))
             .style(text_primary())
             .centered();
@@ -17115,7 +17117,7 @@ fn render_frame(
             .split(dashboard_area);
             frame.render_widget(title, vertical[0]);
 
-            let msg = Paragraph::new("No sessions match filter.")
+            let msg = Paragraph::new("No agents match filter.")
                 .style(text_primary())
                 .centered();
             let inner = Layout::vertical([
@@ -18308,7 +18310,7 @@ fn render_stats_bar(
         ),
         (
             stats.waiting,
-            "waiting",
+            "needs input",
             Style::default().fg(palette::status_color(&SessionStatus::WaitingForInput)),
         ),
         (
@@ -18359,7 +18361,7 @@ fn render_stats_bar(
 
 /// PRD #80 M2: the five global commands the persistent button bar exposes,
 /// each carrying its inline keyboard shortcut (so the bar doubles as the
-/// legend it replaced). The pane-dependent commands (New Pane / Close /
+/// legend it replaced). The pane-dependent commands (New Agent / Close /
 /// Toggle Layout) are disabled — rendered dimmed — when no pane controller is
 /// available; Help and Quit are always actionable. Shortcuts mirror the
 /// keyboard handlers: `global_ctrl_action` (Ctrl+N/W/T), `?` → Help,
@@ -18449,10 +18451,10 @@ fn global_bar_buttons(
             Action::DetachToNormal,
             true,
         ),
-        // PRD #80 review FIX 3: New Pane is ALWAYS enabled — you can always
+        // PRD #80 review FIX 3: New Agent is ALWAYS enabled — you can always
         // create the first pane, even with no panes / controller yet.
         Button::new(
-            "New Pane",
+            "New Agent",
             button_shortcut_label(keybindings, KbAction::NewPane),
             Action::NewPane,
             true,
@@ -18510,18 +18512,18 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
             has_cards,
         ),
     ];
-    // PRD #80 / PRD #127 finding #4 / PRD #144: the `[Scheduled Tasks s]` open
+    // PRD #80 / PRD #127 finding #4 / PRD #144: the `[Schedules s]` open
     // button is always shown — it opens the manager, which is itself how you
     // CREATE the first schedule (its `[Add a]` action works on an empty list),
     // so gating it on a non-empty schedule list would hide the only entry
     // point. The notation is folded into `label` with an EMPTY shortcut field;
     // since PRD #144 the bar always renders every button's full label and wraps
     // any overflow onto a fresh row (no shortcut-only chips), so this renders
-    // `[Scheduled Tasks s]` in full like every other button. The notation is
+    // `[Schedules s]` in full like every other button. The notation is
     // config-derived so a remap of `open_scheduled_tasks` is reflected.
     buttons.push(Button::new(
         format!(
-            "Scheduled Tasks {}",
+            "Schedules {}",
             display_notation(keybindings, KbAction::OpenScheduledTasks)
         ),
         "",
@@ -19649,7 +19651,7 @@ fn render_help_overlay(
         // outbound trip, so a user already in command mode read it as dead
         // text and could not find the way back to their pane (issue #88).
         help_key_line(&n(KbAction::Dashboard), "Toggle command / pane"),
-        help_key_line(&n(KbAction::NewPane), "Create new pane"),
+        help_key_line(&n(KbAction::NewPane), "Create new agent"),
         // PRD #241 review F6: `close_pane` is NOT global any more — M1 scoped it
         // to command mode so the chord reaches the PTY as word-delete while you
         // are typing in a pane. It is listed under "Dashboard (command mode)"
@@ -19687,10 +19689,10 @@ fn render_help_overlay(
             &format!("{} / Up", n(KbAction::MoveUp)),
             "Select previous card",
         ),
-        help_key_line(&jump_range_notation(keybindings), "Jump to pane N"),
+        help_key_line(&jump_range_notation(keybindings), "Jump to card N"),
         help_key_line(&n(KbAction::FocusPane), "Focus selected pane"),
         // PRD #241: command-mode only, and it asks before it destroys anything.
-        help_key_line(&n(KbAction::ClosePane), "Close selected pane (confirms)"),
+        help_key_line(&n(KbAction::ClosePane), "Close selected agent (confirms)"),
         // PRD #336: command-mode only and orchestration-tab only, so it sits
         // here rather than under "Global" (see the note there). The description
         // names the tab scope, and stays within the ~30 columns this field
@@ -19703,9 +19705,9 @@ fn render_help_overlay(
         // tab), so it sits in the same place. The description names the tab
         // scope and stays inside the ~30 columns this field renders.
         help_key_line(&n(KbAction::ToggleZoom), "Zoom focused pane"),
-        help_key_line(&n(KbAction::Filter), "Filter sessions"),
+        help_key_line(&n(KbAction::Filter), "Filter agents"),
         help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
-        help_key_line(&n(KbAction::Rename), "Rename session"),
+        help_key_line(&n(KbAction::Rename), "Rename agent"),
         help_key_line(
             &n(KbAction::GenerateConfig),
             "Generate .dot-agent-deck.toml",
@@ -19718,7 +19720,7 @@ fn render_help_overlay(
             ),
             "Approve / deny permission",
         ),
-        help_key_line(&n(KbAction::OpenScheduledTasks), "Scheduled Tasks manager"),
+        help_key_line(&n(KbAction::OpenScheduledTasks), "Schedules manager"),
         // PRD #341 M5: command mode is a real read-only inspect mode — the wheel
         // and these keys scroll the focused pane's own scrollback without ever
         // reaching the agent.
@@ -19751,7 +19753,7 @@ fn render_help_overlay(
         Line::from("  Esc             Deselect side pane"),
         Line::from("  Mouse click     Focus pane"),
         Line::from("  Ctrl+click      Open hyperlink"),
-        help_key_line(&n(KbAction::Dashboard), "Return to Normal mode"),
+        help_key_line(&n(KbAction::Dashboard), "Return to command mode"),
         Line::from(""),
         Line::styled("  New Agent Form", cyan),
         Line::from(""),
@@ -19813,8 +19815,17 @@ fn render_help_overlay(
 
     let halves = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(columns_area);
-    frame.render_widget(Paragraph::new(left), halves[0]);
+    // Every right-column row opens with `help_key_line`'s two-space indent, so
+    // the left column may spill ONE cell into it and still leave a one-space
+    // gutter. Issue #1045's "Close selected agent (confirms)" needs exactly
+    // that cell at the default width; clipping it would hide the word the
+    // row exists to name. Right first, so the spill is drawn over its indent.
     frame.render_widget(Paragraph::new(right), halves[1]);
+    let left_area = Rect {
+        width: (halves[0].width + 1).min(columns_area.width),
+        ..halves[0]
+    };
+    frame.render_widget(Paragraph::new(left), left_area);
 
     let footer = Paragraph::new(vec![
         Line::from(""),
@@ -20032,7 +20043,7 @@ fn new_pane_form_footer_hint(
 /// its index into `scheduled_tasks` (recorded in `UiState::scheduled_row_rects`).
 type ScheduledTasksClickTargets = (Vec<(Action, Rect)>, Vec<(usize, Rect)>);
 
-/// PRD #127 M3.3: render the "Scheduled Tasks" manager dialog — a
+/// PRD #127 M3.3: render the "Schedules" manager dialog — a
 /// read-only-plus-actions list of the configured schedules, each row showing
 /// name, status (live/idle/disabled), and next-fire. Shows a delete
 /// confirmation when armed.
@@ -20136,7 +20147,7 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
         BUTTON_ROW_W,
         count_chars("  Esc close"),
         empty_w,
-        count_chars(" Scheduled Tasks "),
+        count_chars(" Schedules "),
     ]
     .into_iter()
     .max()
@@ -20257,7 +20268,7 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
     // own background shows through.
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Scheduled Tasks ")
+        .title(" Schedules ")
         .border_style(Style::default().fg(Color::Cyan));
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
@@ -20288,7 +20299,7 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
         .unwrap_or(Action::Continue);
     // PRD #127: each button advertises its shortcut key alongside the label —
     // `[Add a]` / `[Edit e]` / `[Delete d]` / `[Run now r]` — mirroring the
-    // `[Scheduled Tasks s]` button-bar button so a keyboard user can tell which
+    // `[Schedules s]` button-bar button so a keyboard user can tell which
     // key drives each action. These in-dialog keys are matched as literals in
     // `handle_scheduled_tasks_key` (not remappable `KbAction`s), so the literal
     // key is the shortcut.
@@ -20917,7 +20928,7 @@ fn scroll_focused_agent_pane(
 /// dropped**, exactly as a click that lands on no hit-testable rect is dropped.
 ///
 /// Two earlier layers in the same arm keep their own precedence and are not
-/// affected: the Scheduled Tasks manager takes the wheel for its own list and
+/// affected: the Schedules manager takes the wheel for its own list and
 /// [`overlay_blocks_mouse`] swallows it behind every other modal, both before
 /// this is reached; and the mode-tab side panes hit-test their own rects through
 /// the `side_scrolled` short-circuit, so "the pane under the pointer" holds there
@@ -22248,7 +22259,7 @@ pub fn render_button_bar_with_bindings_to_buffer(
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     // Seam renders the full global+context bar (including the always-on
-    // Scheduled Tasks button) so every remappable label is exercised.
+    // Schedules button) so every remappable label is exercised.
     let ctx_buttons = dashboard_context_buttons(keybindings, true);
     let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
     terminal
@@ -24069,6 +24080,28 @@ mod tests {
 
     fn default_ui() -> UiState {
         UiState::default()
+    }
+
+    /// Scenario: Open the schedule manager with no configured entries and
+    /// inspect its rendered title. The dialog must call the collection
+    /// "Schedules" even when the list is empty.
+    #[test]
+    fn schedule_manager_title_uses_glossary_word() {
+        let ui = default_ui();
+        let buffer = draw_to_buffer(80, 24, |frame| {
+            render_scheduled_tasks(frame, &ui);
+        });
+        let area = buffer.area();
+        let mut rendered = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                rendered.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        assert!(
+            rendered.contains(" Schedules "),
+            "schedule manager must render the Schedules title: {rendered}"
+        );
     }
 
     /// Issue #945 made the star prompt's repo identity a one-line seam a fork
@@ -34176,7 +34209,7 @@ mod tests {
         );
     }
 
-    // --- PRD #127 M3.3: "Scheduled Tasks" manager dialog pure-data helpers ---
+    // --- PRD #127 M3.3: "Schedules" manager dialog pure-data helpers ---
 
     fn make_scheduled_task(name: &str, enabled: bool) -> config::ScheduledTask {
         config::ScheduledTask {

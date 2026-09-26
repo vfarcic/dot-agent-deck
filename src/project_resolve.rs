@@ -156,7 +156,7 @@ pub const MAX_PROJECTED_NAME_BYTES: usize = 512;
 ///   launchable set, which is the property the picker's whole existence rests
 ///   on.
 /// * **Loosening the consumer** was the alternative and does not work: the
-///   desktop's own `validate_workflow_shape` is not the binding limit — the
+///   desktop's own `validate_orchestration_shape` is not the binding limit — the
 ///   daemon's is. Raising the desktop's check to 512 would have moved the same
 ///   refusal one hop later, into the spawn, where it arrives as a failed launch
 ///   with roles already started instead of as a project that cannot be offered.
@@ -999,7 +999,7 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
 // ---------------------------------------------------------------------------
 
 /// Resolve, compose and **publish** — the whole of
-/// [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`] behind one
+/// [`crate::daemon_protocol::AttachRequest::PrepareOrchestration`] behind one
 /// blocking call.
 ///
 /// The ordering is the point, and it is what makes "a failed preparation starts
@@ -1013,7 +1013,7 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
 /// **What the returned token binds, and why that is not a detail.** PRD #819's
 /// original design had this issue a token recording only its issuance time, and
 /// the audit of the finished branch showed that binds nothing usable: the
-/// coordinator context is published at a path fixed per project, so a second
+/// orchestrator context is published at a path fixed per project, so a second
 /// preparation in the same project replaces the first's artifact while the
 /// first's token is still inside its TTL. The record now carries the canonical
 /// directory and its inode identity, the config revision, the orchestration and
@@ -1033,16 +1033,16 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
 /// from one spelling and a launch built from another disagree about the name.
 ///
 /// **Blocking** — the caller goes through [`run_bounded`]. Returns either the
-/// prepared workflow or the exact `error` string the refusal carries; the
+/// prepared orchestration or the exact `error` string the refusal carries; the
 /// detail is logged daemon-locally on every failure, whichever refusal goes
 /// back.
-pub fn prepare_workflow_for_wire(
+pub fn prepare_orchestration_for_wire(
     path: &str,
     orchestration: &str,
     task: &str,
     expected_revision: Option<&str>,
     seeds: &[ProjectCandidate],
-) -> Result<crate::event::PreparedWorkflow, String> {
+) -> Result<crate::event::PreparedOrchestration, String> {
     // --- resolve. Failures here take the disclosure split, exactly as
     // `resolve_for_wire`'s do: a path the daemon already knows gets the detail,
     // and every other path gets one fixed sentence.
@@ -1068,7 +1068,7 @@ pub fn prepare_workflow_for_wire(
     let (dir, config, revision) = match outcome {
         Ok(resolved) => resolved,
         Err(err) => {
-            warn!(reason = %err, "prepare-workflow refused: the project did not resolve");
+            warn!(reason = %err, "prepare-orchestration refused: the project did not resolve");
             return Err(split(&err, canonical.as_deref()));
         }
     };
@@ -1079,7 +1079,7 @@ pub fn prepare_workflow_for_wire(
     if let Some(expected) = expected_revision
         && expected != revision
     {
-        warn!("prepare-workflow refused: the client's config revision is stale");
+        warn!("prepare-orchestration refused: the client's config revision is stale");
         return Err(stale_revision_refusal());
     }
 
@@ -1106,7 +1106,7 @@ pub fn prepare_workflow_for_wire(
         })
     else {
         warn!(
-            "prepare-workflow refused: the project defines no orchestration under the requested name"
+            "prepare-orchestration refused: the project defines no orchestration under the requested name"
         );
         return Err(no_such_orchestration_refusal());
     };
@@ -1115,7 +1115,7 @@ pub fn prepare_workflow_for_wire(
     // rather than its own code. Answering it differently here would hand an
     // arbitrary caller a role cardinality that the resolve verb withholds.
     let roles = project_roles_onto_wire(orch).map_err(|err| {
-        warn!(reason = %err, "prepare-workflow refused: the orchestration exceeds a projection bound");
+        warn!(reason = %err, "prepare-orchestration refused: the orchestration exceeds a projection bound");
         split(&err, Some(dir.as_path()))
     })?;
 
@@ -1135,7 +1135,7 @@ pub fn prepare_workflow_for_wire(
     // the person who typed it watching the panes it opens. A later off-box or
     // headless caller (#741) is the point at which this stops being derivable
     // here and the attendance has to travel on
-    // `AttachRequest::PrepareWorkflow` — a wire change, with CLAUDE.md rule 12's
+    // `AttachRequest::PrepareOrchestration` — a wire change, with CLAUDE.md rule 12's
     // cross-version test attached to it. It is deliberately not pre-built.
     let prepared = crate::orchestrator_context::prepare_orchestrator_context(
         orch,
@@ -1154,7 +1154,7 @@ pub fn prepare_workflow_for_wire(
         warn!(
             project = %dir.display(),
             reason = %err,
-            "prepare-workflow refused: the coordinator context was not published"
+            "prepare-orchestration refused: the orchestrator context was not published"
         );
         publish_refusal(&err, &dir)
     })?;
@@ -1181,18 +1181,18 @@ pub fn prepare_workflow_for_wire(
         coordinator_prompt: prepared.prompt.clone(),
     });
 
-    Ok(crate::event::PreparedWorkflow {
+    Ok(crate::event::PreparedOrchestration {
         context_path: prepared.context_path.to_string_lossy().into_owned(),
         // The canonical directory this preparation actually resolved to, so the
         // spawn does not have to trust the caller's spelling — see
-        // `PreparedWorkflow::path`.
+        // `PreparedOrchestration::path`.
         path: dir.to_string_lossy().into_owned(),
         token,
         roles,
         // The composer already built the pointer line and until PRD #819 M6 it
         // was dropped on the floor here. The client spawning the roles is the
         // party that delivers it, and it may not compose its own copy — see
-        // `PreparedWorkflow::prompt`.
+        // `PreparedOrchestration::prompt`.
         prompt: prepared.prompt,
     })
 }
@@ -1388,7 +1388,7 @@ pub enum PreparationStale {
     ConfigChanged,
     /// The prepared orchestration is no longer defined with roles.
     OrchestrationGone,
-    /// The published coordinator context could not be read back.
+    /// The published orchestrator context could not be read back.
     ContextUnreadable,
     /// Something other than a regular file now sits at the published path.
     ContextNotRegularFile,
@@ -1413,15 +1413,15 @@ impl PreparationStale {
             Self::ConfigUnreadable => "the prepared project's config no longer reads",
             Self::ConfigChanged => "the project config changed after the preparation",
             Self::OrchestrationGone => "the prepared orchestration is no longer defined with roles",
-            Self::ContextUnreadable => "the published coordinator context could not be read back",
+            Self::ContextUnreadable => "the published orchestrator context could not be read back",
             Self::ContextNotRegularFile => {
-                "the published coordinator context is no longer a regular file"
+                "the published orchestrator context is no longer a regular file"
             }
             Self::ContextTooLarge => {
-                "the published coordinator context is larger than this daemon publishes"
+                "the published orchestrator context is larger than this daemon publishes"
             }
-            Self::ContextReplaced => "the published coordinator context has been replaced",
-            Self::ContextRewritten => "the published coordinator context has been rewritten",
+            Self::ContextReplaced => "the published orchestrator context has been replaced",
+            Self::ContextRewritten => "the published orchestrator context has been rewritten",
         }
     }
 }
@@ -1592,7 +1592,7 @@ impl std::fmt::Display for PreparedStartRefusal {
 ///
 /// * the submitted `cwd` is the daemon's own canonical spelling of the prepared
 ///   project directory. Compared as the string this daemon minted and handed
-///   back on [`crate::event::PreparedWorkflow::path`] — **not** re-canonicalised,
+///   back on [`crate::event::PreparedOrchestration::path`] — **not** re-canonicalised,
 ///   because re-resolving here would ask the filesystem the question again and
 ///   accept any other spelling that happens to land on the same directory, which
 ///   is the class of drift PRD #220 is about;
@@ -1622,7 +1622,7 @@ impl std::fmt::Display for PreparedStartRefusal {
 /// Nor are `rows`, `cols`, `display_name`, `env`, `agent_type`, `seed`,
 /// `role_index`, `display_title` or `orchestration_id`: each is either
 /// presentation, per-launch shape, or an identity the client mints for itself,
-/// and none of them names the project or the workflow this token approved.
+/// and none of them names the project or the orchestration this token approved.
 ///
 /// **This is still not an authorization check.** It stops a request from
 /// consuming a preparation that was made for something else; it stops nothing a
@@ -1661,7 +1661,7 @@ pub fn verify_prepared_start_role(
     use PreparedStartRefusal::{Mismatch, Stale};
 
     // The prepared directory as the daemon spelled it. `canonicalize_project_dir`
-    // refuses a non-UTF-8 path, so a binding minted by `prepare_workflow_for_wire`
+    // refuses a non-UTF-8 path, so a binding minted by `prepare_orchestration_for_wire`
     // always has one; a `None` here could only come from a hand-built binding and
     // is treated as "nothing the caller could have matched".
     let approved_dir = binding.project_dir.to_str();
@@ -1746,7 +1746,7 @@ fn read_published_context(
 pub fn stale_preparation_refusal() -> String {
     format!(
         "{}: that preparation no longer matches the project it was made against; prepare the \
-         workflow again",
+         orchestration again",
         crate::daemon_protocol::PROJECT_ERR_STALE_PREPARATION
     )
 }
@@ -1785,7 +1785,7 @@ pub fn stale_revision_refusal() -> String {
     )
 }
 
-/// The refusal a `PrepareWorkflow` naming an orchestration the project does not
+/// The refusal a `PrepareOrchestration` naming an orchestration the project does not
 /// define gets.
 ///
 /// It deliberately lists nothing. The available names are config *content* for
@@ -2523,7 +2523,7 @@ command = "cat"
         );
     }
 
-    /// A resolve carries the revision a later `PrepareWorkflow` echoes back.
+    /// A resolve carries the revision a later `PrepareOrchestration` echoes back.
     /// Without it the launch verb has nothing to compare against and the
     /// staleness check is unreachable from a client.
     #[test]
@@ -2561,7 +2561,7 @@ command = "cat"
             .join(crate::orchestrator_context::CONTEXT_FILE_NAME);
 
         let stale = config_revision("something else entirely");
-        let refusal = prepare_workflow_for_wire(
+        let refusal = prepare_orchestration_for_wire(
             project.to_str().expect("utf-8 scratch path"),
             "loop",
             "a task",
@@ -2584,7 +2584,7 @@ command = "cat"
         let current = read_project_config_with_revision(&project)
             .expect("read the config")
             .1;
-        let prepared = prepare_workflow_for_wire(
+        let prepared = prepare_orchestration_for_wire(
             project.to_str().expect("utf-8 scratch path"),
             "loop",
             "a task",
@@ -2610,7 +2610,7 @@ command = "cat"
         std::fs::create_dir_all(&project).expect("create the project dir");
         write_project(&project, SMALL_PROJECT);
 
-        let refusal = prepare_workflow_for_wire(
+        let refusal = prepare_orchestration_for_wire(
             project.to_str().expect("utf-8 scratch path"),
             "no-such-orchestration",
             "a task",
@@ -2649,7 +2649,7 @@ command = "cat"
         let alias = root.join("current");
         std::os::unix::fs::symlink(&project, &alias).expect("symlink");
 
-        let prepared = prepare_workflow_for_wire(
+        let prepared = prepare_orchestration_for_wire(
             alias.to_str().expect("utf-8 scratch path"),
             // The CANONICAL basename, because that is the name the resolve
             // offers; `current` is the spelling that must never name anything.
@@ -2668,7 +2668,7 @@ command = "cat"
             "the context must land under the canonical directory, not under the alias"
         );
         assert!(
-            prepare_workflow_for_wire(
+            prepare_orchestration_for_wire(
                 alias.to_str().expect("utf-8 scratch path"),
                 "current",
                 "a task",
@@ -2683,7 +2683,7 @@ command = "cat"
     /// The launch verb's *resolve* refusals discloses exactly what the resolve
     /// verb's do — no more.
     ///
-    /// Prepare-workflow does filesystem work on a caller-supplied path just as
+    /// Prepare-orchestration does filesystem work on a caller-supplied path just as
     /// resolve-project does, so a refusal from that half must be
     /// indistinguishable in the same way: one code, one sentence, no parser
     /// source line, no raw OS error, no echo of the caller's path. A second
@@ -2696,7 +2696,7 @@ command = "cat"
         std::fs::create_dir(&project).expect("mkdir");
         write_project(&project, MALFORMED);
 
-        let refusal = prepare_workflow_for_wire(
+        let refusal = prepare_orchestration_for_wire(
             project.to_str().expect("utf-8 scratch path"),
             "loop",
             "a task",
@@ -2723,7 +2723,7 @@ command = "cat"
             "no raw OS error may escape: {refusal}"
         );
 
-        let missing = prepare_workflow_for_wire(
+        let missing = prepare_orchestration_for_wire(
             &format!("{}/no-such-dir", root.display()),
             "loop",
             "a task",
@@ -2755,7 +2755,7 @@ command = "cat"
         write_project(&project, &toml);
         let path = project.to_str().expect("utf-8 scratch path");
 
-        let prepare_refusal = prepare_workflow_for_wire(path, "loop", "a task", None, &[])
+        let prepare_refusal = prepare_orchestration_for_wire(path, "loop", "a task", None, &[])
             .expect_err("too many roles must be refused");
         let resolve_refusal =
             resolve_for_wire(path, &[]).expect_err("and the resolve refuses it too");

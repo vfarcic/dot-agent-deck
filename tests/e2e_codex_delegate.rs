@@ -351,7 +351,7 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
         // swallow the injected delegate prompt.
         .with_imported_codex_credentials()
         .launch_with_fixture("codex-delegate");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Written BEFORE the new-pane form picks the directory:
     // `load_project_config` runs at directory-pick time, and the daemon
@@ -379,7 +379,7 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     // positive confirmation, so the digit below can never be typed into the
     // orchestrator's stdin instead of being consumed by the deck.
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("[New Agent Ctrl+N]");
     // Jump into the SECOND role card — the `coder` worker — exactly as a user
     // does to watch a worker boot. This focuses its pane and expands it, so the
     // real Codex TUI is the visible surface.
@@ -407,7 +407,7 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     // Detach again so the orchestration deck's role cards (and their live
     // status badges) are the visible surface while the delegate runs.
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("[New Agent Ctrl+N]");
 
     // Release the orchestrator: it runs the real `dot-agent-deck delegate`.
     //
