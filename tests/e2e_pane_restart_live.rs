@@ -119,7 +119,7 @@ fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
     deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_absence("┌ New Agent"); // form closed -> tab up, orchestrator focused
     deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode, orchestrator focused
 
     assert!(

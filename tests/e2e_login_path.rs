@@ -164,7 +164,7 @@ fn login_path_001_new_pane_resolves_login_shell_command() {
     // default_command — the bare stub).
     deck.send_keys(b"\x0e"); // Ctrl+n
     deck.send_keys(b" "); // Space → confirm dir → new-pane form
-    deck.wait_for_string("New Agent"); // the form is up
+    deck.wait_for_string("┌ New Agent"); // the form is up
 
     // Submit via the [Submit] button (layout-robust: located on the grid, so the
     // PRD #170 agent-command picker addition can't break this drive).

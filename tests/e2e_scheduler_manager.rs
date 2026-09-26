@@ -220,7 +220,7 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
     deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Schedules");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"e"); // edit the auto-selected `digest` row → opens the dir picker
 
     // PRD #170 unify: Edit now reuses the Ctrl+n flow. `e` opens the directory
@@ -304,7 +304,7 @@ fn manager_003_delete_removes_definition_but_keeps_open_tab() {
 
     // Delete the definition via the manager.
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Schedules");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"d"); // delete the auto-selected row → confirmation
     deck.send_keys(b"y"); // confirm
 
@@ -360,7 +360,7 @@ fn manager_005_delete_confirm_contained_within_modal() {
     deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Schedules");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"d"); // arm the delete confirmation for the auto-selected row
     deck.wait_for_string("Delete schedule"); // the (left-aligned) prefix is always visible
 
@@ -413,7 +413,7 @@ fn manager_004_run_now_fires_selected_task() {
     );
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Schedules");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"r"); // run-now the auto-selected row
 
     assert!(
@@ -642,7 +642,7 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
     deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Schedules");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"a"); // ADD → opens the dir picker (blank-context add)
 
     // PRD #170 unify: `a` opens the dir picker; confirm the dir with Space to
@@ -965,7 +965,7 @@ fn form_002_add_spawns_authoring_agent_in_picked_dir() {
         .into_owned();
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Schedules");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"a"); // ADD → opens the dir picker
 
     deck.wait_for_string("Select Directory");
@@ -1076,7 +1076,7 @@ fn form_003_edit_prefills_seed_and_spawns_in_row_working_dir() {
     deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Schedules");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"e"); // EDIT the auto-selected `digest` row → opens the dir picker
 
     // The picker for Edit STARTS at the row's working_dir; confirm it with Space
@@ -1381,7 +1381,7 @@ fn form_006_edit_repick_different_dir_wins_in_seed() {
     deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Schedules");
+    deck.wait_for_string("┌ Schedules");
     deck.send_keys(b"e"); // EDIT the auto-selected `digest` row → opens the dir picker
 
     // The Edit picker STARTS at the row's working_dir (A = ROWDIRALPHA). Re-pick a
@@ -1573,7 +1573,7 @@ fn manager_018_toggle_pauses_and_resumes_without_losing_the_definition() {
     deck.wait_for_string("No active agents");
 
     deck.send_keys(MANAGER_KEY);
-    deck.wait_for_string("Schedules");
+    deck.wait_for_string("┌ Schedules");
     // The dialog renders the state but, before issue #914, had no key to change
     // it — `t` is that key.
     deck.send_keys(b"t");

@@ -165,7 +165,7 @@ fn focus_007_lock_governed_focus_contract_on_real_binary() {
     deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_absence("┌ New Agent"); // form closed -> tab up, orchestrator focused
 
     let socket = deck.attach_socket_path().to_path_buf();
     let alpha_record = role_agent_record(&socket, "alpha");

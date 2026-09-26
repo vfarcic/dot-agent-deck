@@ -247,7 +247,7 @@ fn card_stats_005_real_agent_card_narrows_without_restructuring() {
     control.send_keys(b"\x0e");
     control.wait_for_string("Select Directory");
     control.send_keys(b" ");
-    control.wait_for_string("New Agent");
+    control.wait_for_string("┌ New Agent");
     control.send_keys(b"\t");
     control.send_keys(PANE_NAME_SUFFIX.as_bytes());
     control.send_keys(b"\t");

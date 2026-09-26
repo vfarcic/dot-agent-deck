@@ -135,7 +135,7 @@ fn lock_008_forwarding_gated_by_lock_state() {
     deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_absence("┌ New Agent"); // form closed -> tab up, orchestrator focused
 
     // The orchestrator pane is NEVER gated: even though the deck starts LOCKED
     // by default, typing into the currently-focused orchestrator role must
@@ -194,7 +194,7 @@ fn lock_009_ctrl_e_scoped_to_command_mode_on_real_panes() {
     deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_absence("┌ New Agent"); // form closed -> tab up, orchestrator focused
     deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode
 
     // --- Part 1: in PaneInput the chord must reach the PTY, observed in the
@@ -290,7 +290,7 @@ fn lock_010_global_chord_unaffected_by_lock_state() {
     deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent");
+    deck.wait_for_absence("┌ New Agent");
 
     // Focus the non-orchestrator worker role — still LOCKED, the default.
     focus_worker_role(&deck);
@@ -429,7 +429,7 @@ fn lock_011_waiting_carve_out_on_real_panes() {
     deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_absence("┌ New Agent"); // form closed -> tab up, orchestrator focused
 
     let socket = deck.attach_socket_path().to_path_buf();
     let worker_record = worker_agent_record(&socket);
@@ -567,7 +567,7 @@ fn lock_012_real_agent_gated_by_lock_state() {
     let cwd = deck.workdir().to_path_buf();
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_absence("┌ New Agent"); // form closed -> tab up, orchestrator focused
 
     let worker_id = worker_agent_record(&socket).id;
     if !common::wait_until_panes_settled(
@@ -649,7 +649,7 @@ fn lock_014_flag_off_leaves_worker_input_ungated() {
     deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent");
+    deck.wait_for_absence("┌ New Agent");
 
     focus_worker_role(&deck);
 

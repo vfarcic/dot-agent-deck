@@ -142,7 +142,7 @@ fn dispatch_worktree_of(deck: &TuiDeck, unit: &str) -> PathBuf {
 fn open_probe_caller(deck: &TuiDeck) -> PaneRef {
     deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
     deck.send_keys(b" "); // confirm current dir -> new-pane form
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t"); // Mode -> Name
     deck.send_keys(&[0x7f; 96]); // clear the cwd-derived default name
     deck.send_keys(b"caller");

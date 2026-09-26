@@ -148,7 +148,7 @@ fn modal_001_scheduler_delete_button_confirms() {
 
     // Open the manager via the existing `S` (Shift+S) key, then click Delete.
     deck.send_bytes(b"S");
-    deck.wait_for_string("Schedules");
+    deck.wait_for_string("┌ Schedules");
     deck.wait_for_string("delrow"); // row present + auto-selected
 
     click_button(&deck, "[Delete d]");

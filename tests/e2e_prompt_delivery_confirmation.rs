@@ -76,7 +76,7 @@ fn dispatch_worktree_of(deck: &TuiDeck, name: &str) -> PathBuf {
 fn open_cat_caller_pane(deck: &TuiDeck) -> String {
     deck.send_keys(b"\x0e");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(b"caller");
     deck.send_keys(b"\t");

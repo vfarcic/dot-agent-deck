@@ -59,7 +59,7 @@ fn pane_input_022_ctrl_w_does_not_tear_down_interactive_claude() {
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(CLAUDE_PANE_NAME_SUFFIX.as_bytes());
     deck.send_keys(b"\t");
@@ -151,7 +151,7 @@ fn pane_input_038_erase_burst_undoes_a_payload_in_a_live_claude_prompt() {
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(ERASE_PANE_NAME_SUFFIX.as_bytes());
     deck.send_keys(b"\t");

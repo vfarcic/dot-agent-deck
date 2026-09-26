@@ -90,11 +90,11 @@ fn form_001_click_submit_creates_pane() {
 
     click_target(&deck, "[Submit]");
 
-    // Submitted like Enter: the form closes ("New Agent" gone) and the named
+    // Submitted like Enter: the form closes (its title gone) and the named
     // pane was created (the "subm5" card remains). The combined wait is the
     // assertion.
     deck.wait_until_grid("form closed and subm5 pane created", |g| {
-        !g.contains("New Agent") && g.contains("subm5")
+        !g.contains("┌ New Agent") && g.contains("subm5")
     });
 }
 
