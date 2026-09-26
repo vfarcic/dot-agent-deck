@@ -37,6 +37,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
+import logoUrl from "../assets/logo.svg";
 import { agentDomKey, agentKey, AgentOverview, ALL_OVERVIEW_COLUMNS, OVERVIEW_CLOCK_TICK_MS, anonymousOrchestrationKey, DEFAULT_OVERVIEW_COLUMNS, gridTemplateFor, groupAgents, groupKey, hoistedCwdOf, orderedColumns, OVERVIEW_COLUMNS_STORAGE_KEY, PERMANENT_COLUMN, readStoredColumns, type OverviewAgent, type OverviewColumnId, type OverviewGroupKind, toOverviewAgent } from "./AgentOverview";
 
 /**
@@ -2138,6 +2139,27 @@ describe("DeckShell", () => {
     fireEvent.click(screen.getByTestId("open-deck"));
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
     expect(screen.queryByTestId("daemon-group")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Issue #746: both screens carry the project mark at the top of the rail, and
+   * it is the one asset both share rather than the old `AD` text badge each
+   * spelled out for itself. At this size Vite inlines it as a `data:` URI, which
+   * the CSP's `img-src data:` allows, so the comparison is against the import
+   * rather than a filename. Asserted by accessible name, so a mark that lost its
+   * alt text — and with it the only name the rail's top has — fails here too.
+   */
+  it("shows the project mark at the top of the rail on both the deck and the overview", () => {
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
+    const markIn = () => within(screen.getByRole("complementary", { name: "Primary navigation" })).getByRole("img", { name: "Agent Deck" });
+
+    expect(markIn()).toHaveAttribute("src", logoUrl);
+    expect(screen.queryByText("AD")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("open-overview"));
+    expect(screen.getByTestId("daemon-group")).toBeVisible();
+    expect(markIn()).toHaveAttribute("src", logoUrl);
+    expect(screen.queryByText("AD")).not.toBeInTheDocument();
   });
 
   /**

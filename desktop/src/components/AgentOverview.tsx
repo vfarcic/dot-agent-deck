@@ -7,6 +7,7 @@ import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { NewAgentDialog, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
 import { DeckSelector } from "./DeckSelector";
+import { BrandMark } from "./BrandMark";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 
@@ -1048,7 +1049,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const overviewScreen = (
     <div className="control-deck overview-screen">
       <aside className="rail" aria-label="Primary navigation">
-        <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
+        <BrandMark />
         <nav>
           <OverviewRailButton icon={SquareTerminal} label="Deck" onClick={openDeck} testId="open-deck" />
           <OverviewRailButton icon={LayoutList} label="Overview" active onClick={() => VOICE_ACTIONS.openOverview.run(voiceContext)} testId="open-overview" />

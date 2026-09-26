@@ -35,6 +35,7 @@ import {
 } from "lucide-react";
 import { AgentOverview } from "./components/AgentOverview";
 import { AgentTile, type AgentTileProps } from "./components/AgentTile";
+import { BrandMark } from "./components/BrandMark";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
 import { DeckSelector } from "./components/DeckSelector";
 import { HandoffRail } from "./components/HandoffRail";
@@ -1494,7 +1495,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   return (
     <div className={`control-deck ${evidenceOpen ? "with-evidence" : ""}`}>
       <aside className="rail" aria-label="Primary navigation">
-        <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
+        <BrandMark />
         <nav>
           {/* PRD #802 M2: every one of these dispatches through the action registry. */}
           <RailButton icon={FolderGit2} label="Projects" active={projectsOpen} onClick={() => VOICE_ACTIONS.openProjects.run(voiceContext)} testId="open-projects" />
