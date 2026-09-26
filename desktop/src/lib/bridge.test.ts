@@ -116,6 +116,63 @@ describe("TauriDeckBridge", () => {
     expect(invoke).toHaveBeenCalledWith("desktop_terminal_detach", { sessionId: "session-7" });
   });
 
+  // Issue #953's driver tier caught this in the real window: typing
+  // `echo dad-driver-…` reached bash as `echo dadd-river-…`. Every keystroke is
+  // its own `desktop_terminal_write` command, and Tauri runs each async command
+  // as its own task, so two in flight at once reach the terminal writer's lock
+  // in whichever order the runtime schedules them. The model here is exactly
+  // that: a write lands on the PTY when ITS command runs, and the test runs the
+  // second keystroke's command first — the scheduling that garbled the line.
+  it("delivers keystrokes to the PTY in the order they were typed, however the commands are scheduled", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const pty: string[] = [];
+    const inFlight: { data: number[]; run: () => void }[] = [];
+    invoke.mockImplementation(async (command: string, args?: { data?: number[] }) => {
+      if (command === "desktop_bootstrap") return snapshot;
+      if (command === "desktop_terminal_attach") return { sessionId: "session-7", agentId: "agent-1", generation: 7, reused: false };
+      if (command === "desktop_terminal_write") {
+        const data = args?.data ?? [];
+        return new Promise<void>((resolve) => {
+          inFlight.push({ data, run: () => { pty.push(String.fromCharCode(...data)); resolve(); } });
+        });
+      }
+      return { ok: true };
+    });
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    await bridge.setShownTerminals([on("agent-1")]);
+
+    // Typed faster than a command round trip, as xterm delivers a quick typist.
+    const typed = [bridge.sendTerminalInput(on("agent-1"), "-"), bridge.sendTerminalInput(on("agent-1"), "d")];
+    // Run whatever is in flight, newest first, until everything has landed.
+    for (let turn = 0; turn < 10 && pty.length < 2; turn += 1) {
+      await vi.waitFor(() => expect(inFlight.length).toBeGreaterThan(0));
+      inFlight.splice(0).reverse().forEach(({ run }) => run());
+    }
+    await Promise.all(typed);
+
+    expect(pty.join("")).toBe("-d");
+    await bridge.dispose();
+  });
+
+  it("keeps later keystrokes flowing after one write fails", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    await bridge.setShownTerminals([on("agent-1")]);
+    invoke.mockImplementationOnce(async () => {
+      throw new Error("pipe closed");
+    });
+
+    await expect(bridge.sendTerminalInput(on("agent-1"), "a")).rejects.toThrow("pipe closed");
+    await bridge.sendTerminalInput(on("agent-1"), "b");
+
+    expect(invoke).toHaveBeenLastCalledWith("desktop_terminal_write", { sessionId: "session-7", data: [98] });
+    await bridge.dispose();
+  });
+
   it("clears sessions synchronously so StrictMode replay can reattach while detach is pending", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
