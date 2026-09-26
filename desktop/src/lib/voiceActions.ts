@@ -564,28 +564,28 @@ export const VOICE_ACTIONS = {
 
   openProjects: {
     label: "Manage projects",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it opens a picker over daemon-supplied project paths, and the table has no resolver kind that can turn a spoken phrase into one — a row could open the panel and then leave the user inside a list voice cannot choose from, which is a worse dead end than having no command",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it opens a picker over project paths the daemon supplies, and no resolver kind in the table can name one of them — a row could open the panel and then leave the user inside a list voice cannot choose from, which is a worse dead end than having no command. It becomes a candidate once a `project_ref` kind exists (PRD #1195 M4)",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("projects"),
   },
 
   openPromptLibrary: {
     label: "Open the prompt library",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it is a browse-and-edit surface: choosing, adding, editing and removing a stored prompt are all beyond this PRD's navigation-only slice, so the command would open a panel and stop",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it is a browse-and-edit surface whose operations — choosing, adding, editing and removing a stored prompt — have no rows in the table, so the command would open a panel and stop (PRD #1195 M4)",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("prompts"),
   },
 
   openAgentProfiles: {
     label: "Open agent profiles",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it opens the form that sets each role's model and permissions — the configuration surface PRD #802 D5 puts behind confirmation, so exposing the door before the confirmation flow exists would invite the misfire D5 is about",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), and voice has no per-panel flag gate — `schema::hidden_by_flag` and `DeckShell`'s dispatch gate know only `open_deck`'s — so a row today would be a spoken door to a panel the flag is meant to hide. That gate is the whole reason: opening the form changes nothing until the user edits and saves a profile, so this gets a row when the panel graduates from the flag or the gate is generalised to a per-row feature (PRD #1195 M4, deferred D3)",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("profiles"),
   },
 
   openWorkflowOrder: {
     label: "Edit workflow order",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, the editor it opens enables, skips, reorders and LAUNCHES roles; launching an orchestration starts agents, and nothing in this slice starts anything",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), and voice has no per-panel flag gate — `schema::hidden_by_flag` and `DeckShell`'s dispatch gate know only `open_deck`'s — so a row today would be a spoken door to a panel the flag is meant to hide. That gate is the whole reason: opening the editor launches nothing, since only its own Launch starts an orchestration, so this gets a row on the same terms as `openAgentProfiles`; launching by voice would be a separate row, weighed against PRD #802 D5 (PRD #1195 M4, deferred D3)",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("workflow"),
   },
