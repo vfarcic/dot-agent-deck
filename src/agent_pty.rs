@@ -9637,15 +9637,39 @@ impl AgentPtyRegistry {
         .unwrap_or(false)
     }
 
-    /// Issue #714: whether the clear a [`crate::quota_detect::ProbeOutcome::Cleared`]
-    /// reported with `epoch` may still be applied — `agent_id` still owns
-    /// `pane_id` and no work event or new confirmation has moved its detector
-    /// since ([`crate::quota_detect::QuotaDetector::clear_is_current`]). Checked
-    /// under the daemon's `AppState` write lock, which work events are
-    /// credited under too.
-    pub fn quota_clear_current(&self, pane_id: &str, agent_id: &str, epoch: u64) -> bool {
-        self.with_owner_quota(pane_id, agent_id, |quota| quota.clear_is_current(epoch))
-            .unwrap_or(false)
+    /// Issue #714: claim the clear a [`crate::quota_detect::ProbeOutcome::Cleared`]
+    /// reported for the published block `epoch` from the probe of screen
+    /// `revision` — `true`, with the latch lifted, only while `agent_id` still
+    /// owns `pane_id`, no work event has moved its detector since, AND the pane
+    /// has written nothing and not been resized since that probe
+    /// ([`crate::quota_detect::QuotaDetector::claim_clear`]). A refused clear
+    /// leaves the published block latched, to be decided by the next quiet
+    /// probe.
+    ///
+    /// Race-free only under the daemon's `AppState` WRITE lock, held by the
+    /// caller from this claim through applying the clear: work events are
+    /// credited under that same lock, and output is ordered by the bus lock
+    /// this takes — output before the claim refuses it, output after it is
+    /// screen the next probe will read.
+    pub fn quota_claim_clear(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        epoch: u64,
+        revision: u64,
+    ) -> bool {
+        self.with_owner_quota(pane_id, agent_id, |quota| {
+            quota.claim_clear(epoch, revision)
+        })
+        .unwrap_or(false)
+    }
+
+    /// Issue #714: the epoch of the block currently PUBLISHED for `pane_id`,
+    /// while `agent_id` is its live owner
+    /// ([`crate::quota_detect::QuotaDetector::published_epoch`]).
+    pub fn quota_published_epoch(&self, pane_id: &str, agent_id: &str) -> Option<u64> {
+        self.with_owner_quota(pane_id, agent_id, |quota| quota.published_epoch())
+            .flatten()
     }
 
     /// Issue #714: the screen revision of `agent_id`'s quota detector — the
@@ -9674,9 +9698,21 @@ impl AgentPtyRegistry {
         worker_pane_id: &str,
         worker_agent_id: &str,
     ) -> Option<WorkerBlockedNotice> {
+        self.claim_worker_blocked_notice_of(worker_pane_id, worker_agent_id, None)
+    }
+
+    /// [`Self::claim_worker_blocked_notice`], restricted to the delegation of
+    /// generation `seq` when one is given.
+    fn claim_worker_blocked_notice_of(
+        &self,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
+        seq: Option<u64>,
+    ) -> Option<WorkerBlockedNotice> {
         let mut tracker = self.delegations.lock().unwrap();
         let record = tracker.records.get_mut(worker_pane_id)?;
         if record.blocked_reported
+            || seq.is_some_and(|seq| record.seq != seq)
             || record.orchestrator_pane_id == worker_pane_id
             || record.worker_agent_id.as_deref() != Some(worker_agent_id)
         {
@@ -9696,13 +9732,16 @@ impl AgentPtyRegistry {
     /// [`Self::claim_worker_blocked_notice`] whose write was refused with
     /// nothing written, so a later confirmed block of the SAME delegation can
     /// still report. Only the record of generation `seq` is touched: a record
-    /// that was retired or superseded since keeps its own flag.
-    pub fn release_worker_blocked_notice(&self, worker_pane_id: &str, seq: u64) {
+    /// that was retired or superseded since keeps its own flag. Returns whether
+    /// the claim was released.
+    pub fn release_worker_blocked_notice(&self, worker_pane_id: &str, seq: u64) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
-        if let Some(record) = tracker.records.get_mut(worker_pane_id)
-            && record.seq == seq
-        {
-            record.blocked_reported = false;
+        match tracker.records.get_mut(worker_pane_id) {
+            Some(record) if record.seq == seq => {
+                record.blocked_reported = false;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -9725,13 +9764,60 @@ impl AgentPtyRegistry {
     /// nothing (`WrongSession`, `Stale`, `NoLiveTarget`) releases the claim
     /// ([`Self::release_worker_blocked_notice`]); an ambiguous or failed write
     /// does not, since bytes may have reached the orchestrator.
+    ///
+    /// A released claim is then offered to a NEWER block of the same worker and
+    /// the SAME delegation: a block published while this write was waiting on
+    /// the orchestrator's writer found the notice claimed and skipped it, and
+    /// nothing else would retry it. If the worker's published block is no
+    /// longer `epoch`, the notice is claimed afresh for that delegation and
+    /// delivered the same way — still one claim at a time, and at most one
+    /// successful notice, per delegation.
     pub async fn deliver_worker_blocked_notice(
         self: &Arc<Self>,
         worker_pane_id: &str,
         worker_agent_id: &str,
-        epoch: u64,
-        notice: WorkerBlockedNotice,
+        mut epoch: u64,
+        mut notice: WorkerBlockedNotice,
     ) {
+        loop {
+            if !self
+                .deliver_worker_blocked_notice_once(worker_pane_id, worker_agent_id, epoch, &notice)
+                .await
+            {
+                return;
+            }
+            let Some(newer) = self
+                .quota_published_epoch(worker_pane_id, worker_agent_id)
+                .filter(|&current| current != epoch)
+            else {
+                return;
+            };
+            let Some(claimed) = self.claim_worker_blocked_notice_of(
+                worker_pane_id,
+                worker_agent_id,
+                Some(notice.seq),
+            ) else {
+                return;
+            };
+            tracing::debug!(
+                worker_pane_id = %worker_pane_id,
+                role = %claimed.role,
+                "quota: a newer block of the worker was published while a refused notice held \
+                 the claim; delivering its notice"
+            );
+            (epoch, notice) = (newer, claimed);
+        }
+    }
+
+    /// One attempt of [`Self::deliver_worker_blocked_notice`]. Returns whether
+    /// the write was refused with nothing written and the claim released.
+    async fn deliver_worker_blocked_notice_once(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
+        epoch: u64,
+        notice: &WorkerBlockedNotice,
+    ) -> bool {
         let text = crate::state::compose_worker_blocked_notice(worker_pane_id);
         let orchestrator_pane_id = notice.orchestrator_pane_id.clone();
         let expected_agent_id = notice.orchestrator_agent_id.clone();
@@ -9764,19 +9850,26 @@ impl AgentPtyRegistry {
             )
             .await;
         match outcome {
-            Ok(GuardedSend::Applied) => tracing::info!(
-                worker_pane_id = %worker_pane_id,
-                role = %notice.role,
-                "quota: reported a delegated worker blocked by a provider usage limit to the \
-                 orchestrator"
-            ),
-            Ok(GuardedSend::Ambiguous) => tracing::warn!(
-                pane_id = %orchestrator_pane_id,
-                role = %notice.role,
-                "quota: blocked-worker notice delivery was ambiguous (partial write); not retried"
-            ),
+            Ok(GuardedSend::Applied) => {
+                tracing::info!(
+                    worker_pane_id = %worker_pane_id,
+                    role = %notice.role,
+                    "quota: reported a delegated worker blocked by a provider usage limit to the \
+                     orchestrator"
+                );
+                false
+            }
+            Ok(GuardedSend::Ambiguous) => {
+                tracing::warn!(
+                    pane_id = %orchestrator_pane_id,
+                    role = %notice.role,
+                    "quota: blocked-worker notice delivery was ambiguous (partial write); not \
+                     retried"
+                );
+                false
+            }
             Ok(refused) => {
-                self.release_worker_blocked_notice(worker_pane_id, notice.seq);
+                let released = self.release_worker_blocked_notice(worker_pane_id, notice.seq);
                 tracing::debug!(
                     pane_id = %orchestrator_pane_id,
                     role = %notice.role,
@@ -9784,14 +9877,18 @@ impl AgentPtyRegistry {
                     outcome = ?refused,
                     "quota: re-validation refused the blocked-worker notice (orchestrator changed, \
                      or the worker is no longer blocked); nothing written, notice still owed"
-                )
+                );
+                released
             }
-            Err(e) => tracing::warn!(
-                pane_id = %orchestrator_pane_id,
-                role = %notice.role,
-                error = %e,
-                "quota: failed to write the blocked-worker notice into the orchestrator pane"
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    pane_id = %orchestrator_pane_id,
+                    role = %notice.role,
+                    error = %e,
+                    "quota: failed to write the blocked-worker notice into the orchestrator pane"
+                );
+                false
+            }
         }
     }
 

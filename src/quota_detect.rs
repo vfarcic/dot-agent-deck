@@ -479,10 +479,11 @@ pub enum ProbeOutcome {
     /// shows the quota line: the block stands, nothing is re-published.
     StillBlocked,
     /// A published block was re-probed after later output and the quota line is
-    /// no longer among the bottom [`QUOTA_TAIL_ROWS`] rows: the latch is lifted.
-    /// Carries the detector epoch the clear left behind, which a publisher
-    /// compares again when it applies the clear
-    /// ([`QuotaDetector::clear_is_current`]).
+    /// no longer among the bottom [`QUOTA_TAIL_ROWS`] rows. Carries the epoch of
+    /// the block the probe found gone. The latch is NOT lifted yet: the
+    /// publisher lifts it with [`QuotaDetector::claim_clear`] at the moment it
+    /// applies the clear, which refuses when the screen has changed since the
+    /// probe — a fresh quota line may be what changed it.
     Cleared(u64),
     /// The pane wrote output (or was resized) after the probed snapshot was
     /// taken, so the result describes a screen that may no longer be showing.
@@ -503,7 +504,8 @@ pub enum ProbeOutcome {
 /// detector stays silent until a work event re-arms it or, once the block is
 /// published, until the pane writes output and goes quiet again: then it
 /// re-probes, rate limited like any other probe, to learn whether the quota line
-/// has left the bottom rows ([`ProbeOutcome::Cleared`]).
+/// has left the bottom rows ([`ProbeOutcome::Cleared`], lifted by the
+/// publisher through [`QuotaDetector::claim_clear`]).
 #[derive(Debug, Clone, Default)]
 pub struct QuotaDetector {
     timings: QuotaTimings,
@@ -528,6 +530,9 @@ pub struct QuotaDetector {
     /// quiet probe asks whether the quota line is still on screen — see
     /// [`Self::should_probe`].
     output_since_publication: bool,
+    /// The screen revision of the probe that found a published block's line
+    /// gone ([`ProbeOutcome::Cleared`]), until [`Self::claim_clear`] settles it.
+    clear_pending: Option<u64>,
 }
 
 impl QuotaDetector {
@@ -592,21 +597,49 @@ impl QuotaDetector {
         self.confirmed = false;
         self.unpublished = false;
         self.output_since_publication = false;
+        self.clear_pending = None;
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    /// Whether the clear a [`ProbeOutcome::Cleared`] reported with `epoch` still
-    /// describes the detector: nothing is latched and no work event or new
-    /// confirmation has moved the epoch since. A publisher checks it at the
-    /// moment it applies the clear, so a clear overtaken by a work event (which
-    /// has already moved the card on) is not applied over it.
-    pub fn clear_is_current(&self, epoch: u64) -> bool {
-        !self.confirmed && self.epoch == epoch
+    /// Lift the published block `epoch` whose line the probe of screen
+    /// `revision` found gone ([`ProbeOutcome::Cleared`]) — `true` only while
+    /// that block is still the latched, published one AND the screen is still
+    /// the one that probe copied. Called once, by the publisher, at the moment it
+    /// applies the clear.
+    ///
+    /// `false` when a work event lifted the block since (it has already moved the
+    /// card on), or when the pane wrote output or was resized after the probe:
+    /// the miss described a screen that is no longer showing, and the new one may
+    /// carry a fresh quota line. The published latch then stays exactly as it
+    /// was — no re-publication, no second notice — and the next quiet probe
+    /// decides again, output or not.
+    pub fn claim_clear(&mut self, epoch: u64, revision: u64) -> bool {
+        let pending = self.clear_pending.take();
+        if !self.confirmed || self.unpublished || self.epoch != epoch {
+            return false;
+        }
+        if pending != Some(revision) || self.revision != revision {
+            self.output_since_publication = true;
+            return false;
+        }
+        self.confirmed = false;
+        self.hint_at = None;
+        self.candidate_at = None;
+        self.output_since_publication = false;
+        self.epoch = self.epoch.wrapping_add(1);
+        true
     }
 
     /// Whether a confirmed block is currently latched.
     pub fn is_confirmed(&self) -> bool {
         self.confirmed
+    }
+
+    /// The identity of the latched confirmation once it has been PUBLISHED
+    /// ([`Self::claim_publication`]); `None` when none is latched or the latched
+    /// one is still unpublished.
+    pub fn published_epoch(&self) -> Option<u64> {
+        (self.confirmed && !self.unpublished).then_some(self.epoch)
     }
 
     /// The identity of the latched confirmation, `None` when none is latched.
@@ -702,21 +735,20 @@ impl QuotaDetector {
     /// For a PUBLISHED block ([`Self::should_probe`]'s re-probe after later
     /// output) a match is [`ProbeOutcome::StillBlocked`] and changes nothing —
     /// a blocked agent's idle redraws keep its line on screen — while a miss is
-    /// [`ProbeOutcome::Cleared`]: the latch, hint and candidate are dropped, so
-    /// a later block needs a fresh hint and a fresh confirmation. Clearing on one
-    /// miss is safe in the only direction that matters: at worst it is a missed
-    /// block, which is the pre-#714 behaviour, never a false `Blocked`.
+    /// [`ProbeOutcome::Cleared`]: the publisher then lifts the latch with
+    /// [`Self::claim_clear`], dropping the hint and candidate too, so a later
+    /// block needs a fresh hint and a fresh confirmation. Clearing on one miss is
+    /// safe in the only direction that matters: at worst it is a missed block,
+    /// which is the pre-#714 behaviour, never a false `Blocked`.
     pub fn record_probe(&mut self, now: Instant, found: Option<BlockedKind>) -> ProbeOutcome {
         self.last_probe_at = Some(now);
         if self.confirmed && !self.unpublished {
             self.output_since_publication = false;
             if found.is_some() {
+                self.clear_pending = None;
                 return ProbeOutcome::StillBlocked;
             }
-            self.confirmed = false;
-            self.hint_at = None;
-            self.candidate_at = None;
-            self.epoch = self.epoch.wrapping_add(1);
+            self.clear_pending = Some(self.revision);
             return ProbeOutcome::Cleared(self.epoch);
         }
         let Some(kind) = found else {
@@ -1234,9 +1266,9 @@ mod tests {
 
     /// Issue #714 (audit R1): a published block is re-probed only after later
     /// output, once the pane is quiet again and the rate limit has elapsed. A
-    /// match keeps it; a miss lifts it with a clear that stays current until a
-    /// work event or a new confirmation moves the epoch. A resize alone asks
-    /// for nothing, and an unpublished confirmation is never re-probed.
+    /// match keeps it; a miss reports a clear the publisher claims, which a work
+    /// event in between refuses. A resize alone asks for nothing, and an
+    /// unpublished confirmation is never re-probed.
     #[test]
     fn a_published_block_clears_once_later_output_hides_the_line() {
         let timings = QuotaTimings::default();
@@ -1275,8 +1307,15 @@ mod tests {
             ProbeOutcome::Cleared(epoch) => epoch,
             other => panic!("expected a clear, got {other:?}"),
         };
+        assert_eq!(
+            d.published_epoch(),
+            Some(cleared),
+            "lifted before the claim"
+        );
+        assert!(!d.should_probe(t2 + 10 * timings.probe_interval));
+        assert!(d.claim_clear(cleared, rev));
         assert!(!d.is_confirmed());
-        assert!(d.clear_is_current(cleared));
+        assert!(!d.claim_clear(cleared, rev), "a clear claimed twice");
         assert!(!d.hint_pending(), "a cleared block kept its hint");
         assert!(!d.should_probe(t2 + 10 * timings.probe_interval));
 
@@ -1295,10 +1334,89 @@ mod tests {
         let t1 = published(&mut d);
         d.note_output(t1);
         let t2 = t1 + timings.quiet.max(timings.probe_interval);
+        let rev = d.revision();
         let ProbeOutcome::Cleared(cleared) = d.record_probe(t2, None) else {
             panic!("expected a clear");
         };
         d.note_work_event(t2);
-        assert!(!d.clear_is_current(cleared));
+        assert!(!d.claim_clear(cleared, rev));
+        assert!(!d.is_confirmed());
+    }
+
+    /// Issue #714 (audit F-A1): a probe finds a published block's line gone,
+    /// then the pane writes again — a fresh quota line, or anything else, or a
+    /// resize — before the publisher claims the clear. The claim is refused and
+    /// the block stays published with its epoch (no re-publication, no second
+    /// notice owed), and the next quiet probe decides again: a screen still
+    /// showing a quota line keeps it, one that does not clears it.
+    #[test]
+    fn a_clear_of_a_screen_written_over_since_the_probe_is_refused() {
+        let timings = QuotaTimings::default();
+        let usage = Some(BlockedKind::UsageLimit);
+        let t0 = Instant::now();
+        let published = |d: &mut QuotaDetector| -> (u64, Instant) {
+            d.note_hint(t0);
+            assert_eq!(d.record_probe(t0, usage), ProbeOutcome::Candidate);
+            assert!(matches!(
+                d.record_probe(t0 + timings.confirm, usage),
+                ProbeOutcome::Confirmed(_)
+            ));
+            let epoch = d.confirmed_epoch().expect("latched");
+            assert!(d.claim_publication(epoch));
+            let out = t0 + timings.confirm + Duration::from_secs(1);
+            d.note_output(out);
+            (epoch, out + timings.quiet.max(timings.probe_interval))
+        };
+        let gap = timings.quiet.max(timings.probe_interval);
+
+        for (label, write) in [
+            ("fresh quota line", Some(true)),
+            ("ordinary output", Some(false)),
+            ("resize", None),
+        ] {
+            let mut d = QuotaDetector::new(timings);
+            let (epoch, t1) = published(&mut d);
+            let rev = d.revision();
+            assert_eq!(
+                d.record_snapshot_probe(rev, t1, None),
+                ProbeOutcome::Cleared(epoch),
+                "{label}"
+            );
+            match write {
+                Some(true) => d.note_hint(t1),
+                Some(false) => d.note_output(t1),
+                None => d.note_screen_changed(),
+            }
+            assert!(!d.claim_clear(epoch, rev), "{label}: stale clear claimed");
+            assert_eq!(d.published_epoch(), Some(epoch), "{label}: latch moved");
+            assert!(
+                !d.claim_publication(epoch),
+                "{label}: the kept block was offered for re-publication"
+            );
+
+            // The next quiet probe re-evaluates — even after a resize alone.
+            let t2 = t1 + gap;
+            assert!(
+                d.should_probe(t2),
+                "{label}: no re-probe after a stale clear"
+            );
+            let rev = d.revision();
+            if write == Some(true) {
+                assert_eq!(
+                    d.record_snapshot_probe(rev, t2, usage),
+                    ProbeOutcome::StillBlocked,
+                    "{label}"
+                );
+                assert_eq!(d.published_epoch(), Some(epoch), "{label}");
+            } else {
+                assert_eq!(
+                    d.record_snapshot_probe(rev, t2, None),
+                    ProbeOutcome::Cleared(epoch),
+                    "{label}"
+                );
+                assert!(d.claim_clear(epoch, rev), "{label}: settled clear refused");
+                assert!(!d.is_confirmed(), "{label}");
+            }
+        }
     }
 }
