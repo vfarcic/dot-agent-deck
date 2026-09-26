@@ -343,6 +343,53 @@ fn desktop_sign_pins_apple_intermediate_before_import() {
     );
 }
 
+/// The two notarization steps each call this script instead of `notarytool
+/// submit --wait`, which fails the job on one timed-out status request.
+const NOTARY_POLLER_CALLS: [(&str, &str); 2] = [
+    (
+        "Notarize and staple the app",
+        "bash \"$RUNNER_TEMP/notarize.sh\" \"$RUNNER_TEMP/app-for-notary.zip\" \"the app\"",
+    ),
+    (
+        "Sign, notarize and staple the disk image",
+        "bash \"$RUNNER_TEMP/notarize.sh\" \"$DMG\" \"the disk image\"",
+    ),
+];
+
+/// Issue #1325: `--wait` turned one timed-out status poll into a failed
+/// release while Apple was still processing, and later accepted, the upload.
+/// Scenario: Neither notarization step waits inside notarytool; both submit
+/// through the poller, which is written before either runs, and that poller
+/// polls with `notarytool info` rather than waiting.
+#[test]
+fn desktop_sign_polls_notarization_instead_of_waiting() {
+    let all = jobs(&workflow());
+    let sign = job(&all, "desktop-sign");
+    assert!(
+        !code(sign).contains("--wait"),
+        "`desktop-sign` must not run `notarytool submit --wait`: one failed status poll ends it (issue #1325)"
+    );
+    let poller = named_step(sign, "Write the notarization poller");
+    let poller_code = code(poller);
+    assert!(
+        poller_code.contains("xcrun notarytool submit")
+            && poller_code.contains("xcrun notarytool info")
+            && poller_code.contains("> \"$RUNNER_TEMP/notarize.sh\""),
+        "the poller step must write a script that submits and then polls with `notarytool info`"
+    );
+    for (name, call) in NOTARY_POLLER_CALLS {
+        let step = named_step(sign, name);
+        assert!(
+            code(step).lines().any(|line| line.trim() == call),
+            "`{name}` must notarize through the poller: {call}"
+        );
+        assert!(
+            sign.find(poller).unwrap() < sign.find(step).unwrap(),
+            "the poller must be written before `{name}` runs"
+        );
+    }
+}
+
 /// Scenario: Every third-party action executed beside the signing key is held
 /// for manual review by the final matching Renovate rule.
 #[test]
@@ -563,9 +610,27 @@ fn desktop_sign_guards_reject_unsafe_workflow_mutations() {
             xattr_outside,
             Some("desktop_note_offers_quarantine_bypass_only_when_unsigned"),
         ),
+        (
+            "disk image notarization waits again",
+            replace_once(
+                &original,
+                NOTARY_POLLER_CALLS[1].1,
+                "xcrun notarytool submit \"$DMG\" --wait --timeout 75m --output-format json",
+            ),
+            Some("desktop_sign_polls_notarization_instead_of_waiting"),
+        ),
+        (
+            "app notarization bypasses the poller",
+            replace_once(
+                &original,
+                NOTARY_POLLER_CALLS[0].1,
+                "xcrun notarytool submit \"$RUNNER_TEMP/app-for-notary.zip\" --output-format json",
+            ),
+            Some("desktop_sign_polls_notarization_instead_of_waiting"),
+        ),
     ];
 
-    let guards: [(&str, fn()); 11] = [
+    let guards: [(&str, fn()); 12] = [
         (
             "desktop_sign_is_between_bundle_and_publish_off_the_cli_path",
             desktop_sign_is_between_bundle_and_publish_off_the_cli_path,
@@ -609,6 +674,10 @@ fn desktop_sign_guards_reject_unsafe_workflow_mutations() {
         (
             "desktop_sign_actions_are_held_for_manual_review",
             desktop_sign_actions_are_held_for_manual_review,
+        ),
+        (
+            "desktop_sign_polls_notarization_instead_of_waiting",
+            desktop_sign_polls_notarization_instead_of_waiting,
         ),
     ];
     for (label, mutated, expected) in cases {
@@ -906,6 +975,251 @@ zip_case('fifo', lambda z: add(z, base + 'pipe', b'', stat.S_IFIFO | 0o644))
             "{name}: missing {marker:?}; log:\n{log}"
         );
     }
+}
+
+/// The submission id the stubbed `xcrun` hands back from `notarytool submit`.
+#[cfg(unix)]
+const STUB_SUBMISSION_ID: &str = "9d0a17b7-6528-4123-92d0-f0f8e4391817";
+
+/// Stands in for `xcrun notarytool` on a Linux host. Each `info` call answers
+/// with the next line of `responses` (the last line repeats): `timeout` fails
+/// the request the way run 36209188544's did, `garbage` exits 0 with output
+/// that is not JSON, and anything else is reported as the status.
+#[cfg(unix)]
+const STUB_XCRUN: &str = r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_DIR/calls"
+[ "$1" = notarytool ] || exit 64
+case "$2" in
+  submit)
+    case "$(cat "$STUB_DIR/submit")" in
+      ok) printf '{"id":"%s","message":"Successfully uploaded file"}\n' "$STUB_ID" ;;
+      no-id) printf '{"message":"Successfully uploaded file"}\n' ;;
+      *) echo 'Error: upload failed' >&2; exit 1 ;;
+    esac
+    ;;
+  info)
+    n=$(( $(cat "$STUB_DIR/polls" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$STUB_DIR/polls"
+    line=$(sed -n "${n}p" "$STUB_DIR/responses")
+    [ -n "$line" ] || line=$(tail -n 1 "$STUB_DIR/responses")
+    case "$line" in
+      timeout)
+        echo 'Error: Error Domain=NSURLErrorDomain Code=-1001 "The request timed out."' >&2
+        exit 69
+        ;;
+      garbage) echo 'not json' ;;
+      *) printf '{"id":"%s","status":"%s"}\n' "$3" "$line" ;;
+    esac
+    ;;
+  log) echo "notary log for $3" ;;
+  *) exit 64 ;;
+esac
+"#;
+
+#[cfg(unix)]
+struct NotaryRun {
+    ok: bool,
+    log: String,
+    calls: Vec<String>,
+}
+
+/// Write the real poller with the workflow's own step, then run it against the
+/// stubbed `xcrun`, the way both notarization steps call it. `None` when bash
+/// or python3 cannot run here.
+#[cfg(unix)]
+fn run_notarization(submit: &str, responses: &[&str], deadline_secs: u32) -> Option<NotaryRun> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let usable = Command::new("bash")
+        .args(["-c", "command -v python3"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !usable {
+        return None;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner_temp = dir.path().join("runner-temp");
+    let stub_dir = dir.path().join("stub");
+    let bin = dir.path().join("bin");
+    for d in [&runner_temp, &stub_dir, &bin] {
+        fs::create_dir_all(d).expect("create fixture directory");
+    }
+    let written = Command::new("bash")
+        .arg("-c")
+        .arg(step_script("Write the notarization poller"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("RUNNER_TEMP", &runner_temp)
+        .output()
+        .expect("run the poller-writing step");
+    assert!(
+        written.status.success(),
+        "writing the poller failed: {}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+    let xcrun = bin.join("xcrun");
+    fs::write(&xcrun, STUB_XCRUN).expect("write stub xcrun");
+    fs::set_permissions(&xcrun, fs::Permissions::from_mode(0o755)).expect("chmod stub xcrun");
+    fs::write(stub_dir.join("submit"), submit).expect("seed submit outcome");
+    fs::write(stub_dir.join("responses"), responses.join("\n") + "\n").expect("seed responses");
+    let out = Command::new("bash")
+        .arg(runner_temp.join("notarize.sh"))
+        .arg(dir.path().join("app-for-notary.zip"))
+        .arg("the app")
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("RUNNER_TEMP", &runner_temp)
+        .env("STUB_DIR", &stub_dir)
+        .env("STUB_ID", STUB_SUBMISSION_ID)
+        .env("APPLE_API_KEY", "key-id-marker-51d0")
+        .env("APPLE_API_ISSUER", "issuer-marker-0c7e")
+        .env("NOTARY_POLL_SECS", "0")
+        .env("NOTARY_DEADLINE_SECS", deadline_secs.to_string())
+        .output()
+        .expect("run the poller");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !log.contains("key-id-marker-51d0") && !log.contains("issuer-marker-0c7e"),
+        "the poller printed a credential value:\n{log}"
+    );
+    let calls = fs::read_to_string(stub_dir.join("calls"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    Some(NotaryRun {
+        ok: out.status.success(),
+        log,
+        calls,
+    })
+}
+
+#[cfg(unix)]
+fn count_calls(run: &NotaryRun, verb: &str) -> usize {
+    let prefix = format!("notarytool {verb} ");
+    run.calls.iter().filter(|c| c.starts_with(&prefix)).count()
+}
+
+/// Scenario: The real notarization poller, run against a stubbed xcrun, keeps
+/// polling through a timed-out request and an unparseable answer and passes
+/// once Apple reports Accepted. Invalid and Rejected fail with the notary log,
+/// no verdict by the deadline fails naming the submission, and a failed upload
+/// fails without polling.
+#[cfg(unix)]
+#[test]
+fn desktop_sign_notarization_poller_retries_until_a_verdict() {
+    let Some(run) = run_notarization(
+        "ok",
+        &["timeout", "In Progress", "garbage", "Accepted"],
+        600,
+    ) else {
+        println!("SKIP: bash or python3 is unavailable");
+        return;
+    };
+    assert!(
+        run.ok,
+        "transient failures then Accepted must pass:\n{}",
+        run.log
+    );
+    assert_eq!(count_calls(&run, "submit"), 1, "{:?}", run.calls);
+    assert_eq!(count_calls(&run, "info"), 4, "{:?}", run.calls);
+    assert_eq!(count_calls(&run, "log"), 0, "{:?}", run.calls);
+    assert!(
+        run.calls.iter().all(|c| !c.contains("--wait")),
+        "{:?}",
+        run.calls
+    );
+    assert!(
+        run.calls
+            .iter()
+            .filter(|c| c.starts_with("notarytool info "))
+            .all(|c| c.starts_with(&format!("notarytool info {STUB_SUBMISSION_ID} "))),
+        "every poll must ask about the submitted id: {:?}",
+        run.calls
+    );
+    assert!(!run.log.contains("::error::"), "{}", run.log);
+
+    for verdict in ["Invalid", "Rejected"] {
+        let run = run_notarization("ok", &["timeout", verdict], 600).expect("tools checked above");
+        assert!(!run.ok, "{verdict} must fail:\n{}", run.log);
+        assert!(
+            run.log.contains(&format!("returned status '{verdict}'"))
+                && run.log.contains(STUB_SUBMISSION_ID)
+                && run
+                    .log
+                    .contains(&format!("notary log for {STUB_SUBMISSION_ID}")),
+            "{verdict} must name the submission and print its notary log:\n{}",
+            run.log
+        );
+        assert_eq!(count_calls(&run, "info"), 2, "{:?}", run.calls);
+    }
+
+    let run = run_notarization("ok", &["In Progress"], 0).expect("tools checked above");
+    assert!(
+        !run.ok,
+        "no verdict by the deadline must fail:\n{}",
+        run.log
+    );
+    assert!(
+        run.log.contains("::error::no notarization verdict")
+            && run
+                .log
+                .contains(&format!("xcrun notarytool info {STUB_SUBMISSION_ID}")),
+        "the deadline failure must name the submission and how to check it:\n{}",
+        run.log
+    );
+    assert_eq!(count_calls(&run, "log"), 0, "{:?}", run.calls);
+
+    for submit in ["fail", "no-id"] {
+        let run = run_notarization(submit, &["Accepted"], 600).expect("tools checked above");
+        assert!(!run.ok, "submit outcome {submit} must fail:\n{}", run.log);
+        assert!(run.log.contains("::error::"), "{}", run.log);
+        assert_eq!(
+            count_calls(&run, "info"),
+            0,
+            "{submit}: nothing to poll without a submission id: {:?}",
+            run.calls
+        );
+    }
+}
+
+/// Scenario: A workflow whose poller treats a failed status request as a
+/// verdict, the pre-#1325 behaviour, fails the retry test above.
+#[cfg(unix)]
+#[test]
+fn desktop_sign_notarization_poller_mutation_without_retry_is_caught() {
+    let original = workflow();
+    let mutated = replace_once(
+        &original,
+        "              status=$(field \"$work/info.json\" status)\n            fi\n",
+        "              status=$(field \"$work/info.json\" status)\n            else\n              exit 1\n            fi\n",
+    );
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(mutated));
+    let run = run_notarization("ok", &["timeout", "Accepted"], 600);
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    let Some(run) = run else {
+        println!("SKIP: bash or python3 is unavailable");
+        return;
+    };
+    assert!(
+        !run.ok,
+        "a poller that stops on a failed request must not pass the transient-failure case:\n{}",
+        run.log
+    );
+    let control =
+        run_notarization("ok", &["timeout", "Accepted"], 600).expect("tools checked above");
+    assert!(
+        control.ok,
+        "the unmutated poller must pass:\n{}",
+        control.log
+    );
 }
 
 #[test]
