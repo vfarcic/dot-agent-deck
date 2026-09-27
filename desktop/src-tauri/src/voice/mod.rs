@@ -138,6 +138,13 @@ pub struct VoiceDeckChoice {
 /// reported to it yet.
 pub const DECK_NOT_REPORTED: &str = "This deck has not reported yet.";
 
+/// What a deck the Deck selector lists but the app is not connected to says
+/// about itself (PRD #1195 M3). Under a single-deck selection that is every
+/// deck but the one shown, and the New agent dialog does not list them: a new
+/// agent starts on a deck the app is talking to, so the way to one is to
+/// switch to it first — which is what the sentence says.
+pub const DECK_NOT_CONNECTED: &str = "The app is not connected to this deck; switch to it first.";
+
 /// What the New agent dialog's directory browser is showing, as the webview
 /// DECLARED it for one utterance (PRD #1223) — the set a spoken
 /// [`ParamKind::DirRef`] resolves against.
@@ -253,8 +260,9 @@ pub use capture::{
 };
 pub use hold::VoiceHold;
 pub use outcome::{
-    ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, VoiceOutcome, VoiceResult,
-    handle_utterance, handle_utterance_with, resolve_agent_type_ref, resolve_deck_ref,
+    ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, SWITCH_DECK_ROW, VoiceDeckIdentity,
+    VoiceDeckSelection, VoiceOutcome, VoiceResult, address_deck_switch, handle_utterance,
+    handle_utterance_with, refuse_switch_beyond_selector, resolve_agent_type_ref, resolve_deck_ref,
     resolve_dir_ref, resolve_mode_ref,
 };
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};

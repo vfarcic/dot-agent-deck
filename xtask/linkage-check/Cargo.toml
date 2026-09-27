@@ -2,6 +2,7 @@
 name = "xtask-linkage-check"
 version = "0.0.0"
 edition = "2024"
+rust-version.workspace = true
 publish = false
 
 # PRD #77 Decision 7: enforces the catalog↔test linkage and Decision 21's
