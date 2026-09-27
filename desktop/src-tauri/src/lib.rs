@@ -3169,7 +3169,7 @@ fn selector_voice_decks(
                 step_reason(&local).unwrap_or_else(|| voice::DECK_NOT_CONNECTED.to_string()),
             ),
             id: local,
-            label: "Local deck".to_string(),
+            label: "Local daemon".to_string(),
             local: true,
         },
         voice::VoiceDeckSelection {
@@ -3200,7 +3200,7 @@ fn selector_voice_decks(
         listed.push((
             voice::VoiceDeck {
                 label: if label.trim().is_empty() {
-                    "Remote deck".to_string()
+                    "Remote daemon".to_string()
                 } else {
                     label
                 },
@@ -5011,7 +5011,7 @@ mod tests {
                 .iter()
                 .map(|deck| deck.label.as_str())
                 .collect::<Vec<_>>(),
-            ["Local deck"],
+            ["Local daemon"],
             "an oversized section adds no remote deck to what voice resolves against"
         );
         assert_eq!(
@@ -5121,7 +5121,7 @@ mod tests {
         assert_eq!(action, "switch_deck");
         let listed = (MAX_VOICE_SELECTOR_ROWS + 1).to_string();
         assert!(
-            sentence.contains("Deck selector")
+            sentence.contains("Daemon selector")
                 && sentence.contains(&listed)
                 && sentence.contains(&MAX_VOICE_SELECTOR_ROWS.to_string()),
             "{sentence}"
@@ -5169,8 +5169,8 @@ mod tests {
         assert_eq!(action, "switch_deck");
         assert!(
             sentence.contains("\u{201c}avoid\u{201d}")
-                && sentence.contains("say just the deck you want")
-                && !sentence.contains("Deck selector"),
+                && sentence.contains("say just the daemon you want")
+                && !sentence.contains("Daemon selector"),
             "{sentence}"
         );
     }
@@ -5200,9 +5200,9 @@ mod tests {
         };
         assert_eq!(action, "switch_deck");
         assert!(
-            sentence.contains("I did not catch which deck")
+            sentence.contains("I did not catch which daemon")
                 && !sentence.contains("staging box")
-                && !sentence.contains("Deck selector"),
+                && !sentence.contains("Daemon selector"),
             "{sentence}"
         );
     }

@@ -143,7 +143,7 @@ pub const DECK_NOT_REPORTED: &str = "This daemon has not reported yet.";
 /// deck but the one shown, and the New agent dialog does not list them: a new
 /// agent starts on a deck the app is talking to, so the way to one is to
 /// switch to it first — which is what the sentence says.
-pub const DECK_NOT_CONNECTED: &str = "The app is not connected to this deck; switch to it first.";
+pub const DECK_NOT_CONNECTED: &str = "The app is not connected to this daemon; switch to it first.";
 
 /// What the New agent dialog's directory browser is showing, as the webview
 /// DECLARED it for one utterance (PRD #1223) — the set a spoken

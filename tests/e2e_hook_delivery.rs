@@ -134,7 +134,7 @@ fn delivery_008_background_subagent_tool_call_does_not_flip_idle_card_to_working
         |status: &'static str| move |grid: &str| grid.contains(SESSION) && grid.contains(status);
 
     let deck = TuiDeck::launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     claude_hook_via_cli(
         &deck,

@@ -29,7 +29,9 @@ fn start_agent(control: &TuiDeck, viewer: &TuiDeck, name: &str, command: &str) -
     control.send_keys(b"\x0e");
     control.wait_for_string("Select Directory");
     control.send_keys(b" ");
-    control.wait_for_string("New Agent");
+    // The dashboard button bar also says "New Agent". Wait for the form's
+    // bordered title so the keystrokes below cannot land before it is up.
+    control.wait_for_string("┌ New Agent");
     control.send_keys(b"\t");
     control.send_keys(name.as_bytes());
     control.send_keys(b"\t");
@@ -92,9 +94,9 @@ fn status_blocked_022_real_claude_api_failure_ends_error_not_thinking() {
         .with_pty_size(120, 40)
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
-    viewer.wait_for_string("No active sessions");
+    viewer.wait_for_string("No active agents");
     let control = attached_control(&viewer);
-    control.wait_for_string("No active sessions");
+    control.wait_for_string("No active agents");
     let cwd = control.workdir().to_path_buf();
     let mut trust_paths = vec![cwd.to_string_lossy().into_owned()];
     if let Ok(canonical) = cwd.canonicalize() {
@@ -143,9 +145,9 @@ fn status_blocked_023_real_opencode_api_error_is_forwarded_not_blocked() {
         .with_pty_size(120, 40)
         .with_imported_opencode_credentials()
         .launch_with_fixture("minimal");
-    viewer.wait_for_string("No active sessions");
+    viewer.wait_for_string("No active agents");
     let control = attached_control(&viewer);
-    control.wait_for_string("No active sessions");
+    control.wait_for_string("No active agents");
 
     let events = viewer.subscribe_events();
     let name = "opencode-err";

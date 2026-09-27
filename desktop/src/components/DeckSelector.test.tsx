@@ -324,7 +324,7 @@ describe("switchDeck", () => {
       const { settings, save } = state(twoDaemons("local"));
       const refused = dispatch(settings, token);
       expect(save).not.toHaveBeenCalled();
-      expect(refused).toHaveBeenCalledWith("That deck is not in the Deck selector any more.");
+      expect(refused).toHaveBeenCalledWith("That daemon is not in the Daemon selector any more.");
     }
   });
 
@@ -365,7 +365,7 @@ describe("switchDeck", () => {
         reportRefused,
       }, target);
       expect(save, JSON.stringify(changed)).not.toHaveBeenCalled();
-      expect(reportRefused).toHaveBeenCalledWith(expect.stringMatching(/deck changed.*try again/i));
+      expect(reportRefused).toHaveBeenCalledWith(expect.stringMatching(/daemon changed.*try again/i));
     }
   });
 
@@ -398,7 +398,7 @@ describe("switchDeck", () => {
       const endpoints = routed();
       endpoints.remote![0] = { ...endpoints.remote![0], ...changed };
       const { settings, save } = state(endpoints);
-      expect(chooseDeckSelection(settings, BUILD_BOX, deckIdentity), JSON.stringify(changed)).toMatch(/deck changed.*try again/i);
+      expect(chooseDeckSelection(settings, BUILD_BOX, deckIdentity), JSON.stringify(changed)).toMatch(/daemon changed.*try again/i);
       expect(save, JSON.stringify(changed)).not.toHaveBeenCalled();
     }
   });

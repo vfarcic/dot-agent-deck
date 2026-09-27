@@ -129,9 +129,9 @@ function noteIsProblem(connection: ConnectionView): boolean {
 export function chooseDeckSelection(settings: DesktopSettingsState, token: string, identity?: VoiceDeckIdentityDto): string | undefined {
   const section = settings.settings.endpoints;
   const next = deckChoices(section).find((choice) => choice.token === token);
-  if (!next) return "That deck is not in the Deck selector any more.";
+  if (!next) return "That daemon is not in the Daemon selector any more.";
   if (identity && !sameDeckIdentity(section?.remote?.find((row) => row.id === token), identity)) {
-    return "That deck changed in Settings since you asked for it — try again.";
+    return "That daemon changed in Settings since you asked for it — try again.";
   }
   /*
     The no-op guard, which is shared with `EndpointsPanel` since PRD #742 M6

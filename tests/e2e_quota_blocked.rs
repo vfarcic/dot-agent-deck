@@ -425,7 +425,7 @@ fn status_blocked_017_claude_stop_failure_hook_shows_blocked_card() {
     write_claude_record(&transcript, false);
     install_structured_standin(&bin, "claude");
     let deck = quota_deck(&bin, &fifo, &transcript);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     write_orchestration(&deck, &[("worker", "claude", "claude")]);
     open_orchestration(&deck);
     wait_for_role(&deck, "worker");
@@ -463,7 +463,7 @@ fn status_blocked_025_subagent_hooks_keep_parent_blocked() {
     write_claude_record(&transcript, false);
     install_structured_standin(&bin, "claude");
     let deck = quota_deck(&bin, &fifo, &transcript);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     write_orchestration(&deck, &[("worker", "claude", "claude")]);
     open_orchestration(&deck);
     wait_for_role(&deck, "worker");
@@ -555,7 +555,7 @@ fn assert_transient_claude_429_is_error() {
     write_claude_record(&transcript, true);
     install_structured_standin(&bin, "claude");
     let deck = quota_deck(&bin, &fifo, &transcript);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     write_orchestration(&deck, &[("worker", "claude", "claude")]);
     open_orchestration(&deck);
     wait_for_role(&deck, "worker");
@@ -586,7 +586,7 @@ fn status_blocked_018_codex_rollout_blocks_a_launcher_started_codex() {
     install_structured_standin(&bin, "codex");
     write_agent(&bin, "launch-codex", "exec codex");
     let deck = quota_deck(&bin, &fifo, &transcript);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     write_orchestration(&deck, &[("worker", "launch-codex", "codex")]);
     open_orchestration(&deck);
     wait_for_role(&deck, "worker");
@@ -608,7 +608,7 @@ fn orchestration_delegate_037_delegate_to_blocked_worker_warns_and_delivers() {
     write_claude_record(&transcript, false);
     install_structured_standin(&bin, "claude");
     let deck = quota_deck(&bin, &fifo, &transcript);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     write_orchestration(&deck, &[("worker", "claude", "claude")]);
     open_orchestration(&deck);
     wait_for_role(&deck, "worker");
@@ -671,7 +671,7 @@ fn scheduler_idle_worker_024_blocked_worker_notices_orchestrator_once() {
     install_structured_standin(&bin, "codex");
     write_agent(&bin, "launch-codex", "exec codex");
     let deck = quota_deck(&bin, &fifo, &transcript);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     write_orchestration(&deck, &[("worker", "launch-codex", "codex")]);
     open_orchestration(&deck);
     wait_for_role(&deck, "worker");
@@ -794,7 +794,7 @@ fn status_blocked_019_opencode_plugin_error_blocks_and_bare_429_does_not() {
     trigger_fifo(&bare_fifo);
     install_opencode_standin(&bin);
     let deck = quota_deck(&bin, &fifo, &transcript);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     write_orchestration(
         &deck,
         &[
@@ -832,7 +832,7 @@ fn status_blocked_021_pane_restart_clears_a_blocked_card() {
     write_claude_record(&transcript, false);
     install_structured_standin(&bin, "claude");
     let deck = quota_deck(&bin, &fifo, &transcript);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     write_orchestration(&deck, &[("worker", "claude", "claude")]);
     open_orchestration(&deck);
     wait_for_role(&deck, "worker");

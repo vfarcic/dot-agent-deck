@@ -391,31 +391,35 @@ heard_as    = ["settings", "preferences", "options", "configuration", "api key"]
 # which is still true — it IS showing that deck — and no settings write
 # (`chooseDeckSelection` in `DeckSelector.tsx`, shared with the click).
 #
-# `heard_as` carries `deck` because the selector's own visible label is
-# "Deck" (the label rule, `docs/develop/voice-first-design.md`). Switching is
-# undone by one more switch and stops nothing, so the residual every
-# `heard_as` row carries — "deck" said for another reason while a steered
-# pick is in flight — reaches a visible, reversible change.
+# `heard_as` carries `daemon` because the selector's own visible label is
+# "Daemon" (the label rule, `docs/develop/voice-first-design.md`; issue #1045
+# renamed it from "Deck"), and keeps `deck`, the older label a user may still
+# say, as `choose_deck` does. Switching is undone by one more switch and stops
+# nothing, so the residual every `heard_as` row carries — "daemon" or "deck"
+# said for another reason while a steered pick is in flight — reaches a
+# visible, reversible change.
 [[commands]]
 id          = "switch_deck"
-description = """Switch which deck the app is showing — the Deck selector at the top of the deck
-and of the agent overview. Use for switch deck to the build box, switch to the build box deck,
-change the deck to local, change deck to ci, select the build box deck, or choose deck build box.
-Set `deck` to the words the user used for the deck. It may name a configured deck that `decks`
-does not list, because `decks` lists only the decks a new agent can start on; answer with the
-user's words all the same. This is not `open_deck`, which only moves from the overview to the deck
-screen without changing which deck is shown, and it is not `open_overview`. While the New agent
-dialog is open this cannot run: a request that names a deck then means the dialog's Deck field,
-which is `choose_deck`. It changes which deck is shown and nothing else — it starts, stops and
-closes nothing."""
+description = """Switch which daemon the app is showing — the Daemon selector at the top of the
+Daemons screen and of the agent dashboard. Use for switch daemon to the build box, switch to the
+build box daemon, change the daemon to local, change daemon to ci, select the build box daemon, or
+choose daemon build box. Users who knew the selector by its older name say deck in the same places —
+switch deck to the build box, switch to the build box deck, change the deck to local, select the
+build box deck, choose deck build box — and those mean THIS one too. Set `deck` to the words the user
+used for the daemon. It may name a configured daemon that `decks` does not list, because `decks`
+lists only the daemons a new agent can start on; answer with the user's words all the same. This is
+not `open_deck`, which only moves from the agent dashboard to the Daemons screen without changing
+which daemon is shown, and it is not `open_overview`. While the New agent dialog is open this cannot
+run: a request that names a daemon then means the dialog's Daemon field, which is `choose_deck`. It
+changes which daemon is shown and nothing else — it starts, stops and closes nothing."""
 invoke      = "switchDeck"
 screens     = ["deck", "overview"]
 requires    = ["new_agent_dialog_closed"]
-unavailable_hint = "switching deck works from the deck or the agent overview, once the agent's pane and the New agent dialog are closed"
+unavailable_hint = "switching daemon works from the Daemons screen or the agent dashboard, once the agent's pane and the New agent dialog are closed"
 report      = "Showing {deck}."
-asks_to     = "switch deck"
-try_saying  = "switch deck to {deck}"
-heard_as    = ["switch", "deck", "change", "select", "choose"]
+asks_to     = "switch daemon"
+try_saying  = "switch daemon to {deck}"
+heard_as    = ["switch", "daemon", "deck", "change", "select", "choose"]
 
   [[commands.params]]
   name = "deck"

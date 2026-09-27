@@ -2797,7 +2797,7 @@ describe("switch deck by voice, against settings edited mid-flight", () => {
 
     await answer();
 
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("That deck changed in Settings since you asked for it — try again.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("That daemon changed in Settings since you asked for it — try again.");
     expect(store.current.endpoints?.remote[0].host).toBe("other-box");
     expect(store.current.endpoints?.selection).toBe("local");
   });
@@ -2844,7 +2844,7 @@ describe("switch deck by voice, against settings edited mid-flight", () => {
     await answer();
 
     const report = screen.getByTestId("voice-report");
-    expect(report).toHaveTextContent("That deck changed in Settings since you asked for it — try again.");
+    expect(report).toHaveTextContent("That daemon changed in Settings since you asked for it — try again.");
     expect(report).not.toHaveTextContent("Showing deploy@build-box.");
     expect(within(report).queryByRole("button", { name: /Undo/ })).toBeNull();
   });

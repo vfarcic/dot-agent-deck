@@ -557,7 +557,7 @@ export const VOICE_ACTIONS = {
    * and never produces a refusal, since it offers only listed decks.
    */
   switchDeck: {
-    label: "Switch which deck the app is showing",
+    label: "Switch which daemon the app is showing",
     voice: true,
     needs: ["switchDeck"],
     run: (context: Pick<VoiceActionContext, "switchDeck"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: Pick<VoiceDispatchTarget, "deckSelection" | "deckIdentity">) => {

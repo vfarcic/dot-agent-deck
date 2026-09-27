@@ -2355,9 +2355,9 @@ pub fn refuse_switch_beyond_selector(
     *sentence = heard(
         transcript,
         &format!(
-            "no deck voice can switch to matches \u{201c}{spoken}\u{201d}: the Deck selector \
-             lists {listed} remote decks, more than the {bound} voice takes, so choose it in \
-             the Deck selector"
+            "no daemon voice can switch to matches \u{201c}{spoken}\u{201d}: the Daemon selector \
+             lists {listed} remote daemons, more than the {bound} voice takes, so choose it in \
+             the Daemon selector"
         ),
     );
 }
@@ -3012,6 +3012,9 @@ mod tests {
     async fn voice_outcome_switch_deck_resolves_or_reports_the_deck_reference() {
         let cases = [
             ("switch deck to the build box", "build box"),
+            // Issue #1045: the selector is the Daemon selector now, and the
+            // glossary word grounds the same way the older one does.
+            ("switch daemon to the build box", "build box"),
             ("switch deck to local", "local"),
             ("switch deck to this machine", "this machine"),
             ("switch deck to local", "build box"),
@@ -3025,7 +3028,10 @@ mod tests {
             );
             let outcome = run(&resolver, Screen::Deck, &fleet(), said).await;
             match (said, spoken) {
-                ("switch deck to the build box", "build box") => {
+                (
+                    "switch deck to the build box" | "switch daemon to the build box",
+                    "build box",
+                ) => {
                     let VoiceOutcome::Dispatch {
                         invoke,
                         params,
@@ -3056,12 +3062,12 @@ mod tests {
                 ),
                 (_, "build") => assert!(
                     matches!(&outcome, VoiceOutcome::ParamAmbiguous { action, sentence, .. }
-                        if action == "switch_deck" && sentence.contains("matches more than one deck")),
+                        if action == "switch_deck" && sentence.contains("matches more than one daemon")),
                     "{outcome:?}"
                 ),
                 (_, "ghost box") => assert!(
                     matches!(&outcome, VoiceOutcome::ParamUnresolved { action, sentence, .. }
-                        if action == "switch_deck" && sentence.contains("no deck matches")),
+                        if action == "switch_deck" && sentence.contains("no daemon matches")),
                     "{outcome:?}"
                 ),
                 _ => unreachable!(),
@@ -7475,7 +7481,7 @@ mod tests {
             assert_eq!(param, "deck");
             assert_eq!(matches, &labels.to_vec(), "{sentence}");
             assert!(
-                sentence.contains("you named more than one deck"),
+                sentence.contains("you named more than one daemon"),
                 "{sentence}"
             );
         };
@@ -7617,7 +7623,7 @@ mod tests {
             assert_eq!(action, "switch_deck");
             assert_eq!(matches, &both.to_vec(), "{said}: {sentence}");
             assert!(
-                sentence.contains("you named more than one deck"),
+                sentence.contains("you named more than one daemon"),
                 "{sentence}"
             );
         }
@@ -7641,7 +7647,7 @@ mod tests {
             };
             assert_eq!(action, "switch_deck");
             assert!(
-                sentence.contains("say just the deck you want"),
+                sentence.contains("say just the daemon you want"),
                 "{said}: {sentence}"
             );
             assert!(
