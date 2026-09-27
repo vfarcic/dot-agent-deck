@@ -96,10 +96,12 @@ impl SshTarget {
     /// remote themselves: the registered port and identity file included, so
     /// it reaches the endpoint the deck talks to rather than port 22 (PR
     /// #1373 review — the same wrong-endpoint defect `host_key_remedy`
-    /// records). `remote_command` is the deck's own text and is passed as-is.
-    /// The destination and the key path came from the user's `remote add`
-    /// and are quoted for a POSIX shell whenever they hold anything outside a
-    /// plain set, so pasting the line runs only `ssh` locally; a destination
+    /// records). Every word is quoted for a POSIX shell whenever it holds
+    /// anything outside a plain set. For the destination and key path, which
+    /// came from the user's `remote add`, that makes pasting the line run only
+    /// `ssh` locally. For `remote_command`, it keeps a `~` for the REMOTE shell
+    /// to expand, not the laptop's, whose home can be a different path (PR
+    /// #1373 review). A destination
     /// that starts with `-` is preceded by `--` so ssh cannot read it as an
     /// option (PR #1373 review).
     pub fn command_line(&self, remote_command: &str) -> String {
@@ -114,7 +116,11 @@ impl SshTarget {
         if destination.starts_with('-') {
             line.push_str(" --");
         }
-        line.push_str(&format!(" {} {remote_command}", shell_word(&destination)));
+        line.push_str(&format!(
+            " {} {}",
+            shell_word(&destination),
+            shell_word(remote_command)
+        ));
         line
     }
 }
@@ -2212,23 +2218,23 @@ mod tests {
     fn command_line_carries_the_registered_port_and_key() {
         assert_eq!(
             SshTarget::parse("u@h", 22, None).command_line("rm x"),
-            "ssh u@h rm x"
+            "ssh u@h 'rm x'"
         );
         assert_eq!(
             SshTarget::parse("u@h", 2222, Some(PathBuf::from("/k/it's key"))).command_line("rm x"),
-            "ssh -p 2222 -i '/k/it'\\''s key' u@h rm x"
+            "ssh -p 2222 -i '/k/it'\\''s key' u@h 'rm x'"
         );
         assert_eq!(
             SshTarget::parse("u@h", 22, Some(PathBuf::from("/home/u/.ssh/id_ed25519")))
                 .command_line("rm x"),
-            "ssh -i /home/u/.ssh/id_ed25519 u@h rm x"
+            "ssh -i /home/u/.ssh/id_ed25519 u@h 'rm x'"
         );
         // The destination is the user's own `remote add` input; pasting the
         // line must still run nothing but `ssh` locally.
         let hostile = SshTarget::parse("u@h;touch pwned", 22, None).command_line("rm x");
-        assert_eq!(hostile, "ssh 'u@h;touch pwned' rm x");
+        assert_eq!(hostile, "ssh 'u@h;touch pwned' 'rm x'");
         let option = SshTarget::parse("-oProxyCommand=id", 22, None).command_line("rm x");
-        assert_eq!(option, "ssh -- -oProxyCommand=id rm x");
+        assert_eq!(option, "ssh -- -oProxyCommand=id 'rm x'");
     }
 
     #[test]
@@ -3351,7 +3357,7 @@ mod homebrew_remote_tests {
                 && out.contains(&brew_binary)
                 && out.contains(REMOTE_INSTALL_PATH)
                 && out.contains("uses the Homebrew one")
-                && out.contains("`ssh user@mac rm ~/.local/bin/dot-agent-deck`"),
+                && out.contains("`ssh user@mac 'rm ~/.local/bin/dot-agent-deck'`"),
             "both installs, the one in use and the cleanup must be named: {out}"
         );
         assert_eq!(remote.entry().remote_binary(), brew_binary);
