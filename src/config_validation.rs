@@ -519,6 +519,16 @@ fn unknown_agent_issue(scope: &str, declared: Option<&str>) -> Option<Validation
 /// roles that take the conservative path. A declared-but-unknown name resolves
 /// to `Some(AgentType::None)` and is [`unknown_agent_issue`]'s to report, not
 /// this function's.
+///
+/// The readiness wait belongs to the `clear = true` respawn and nothing else
+/// (`dispatch_one_owned` in `src/state.rs` enters it only inside its
+/// `role.clear` branch), so the timeout is claimed only for a worker that takes
+/// it. A `clear = false` worker keeps its process and gets the task pointer
+/// written straight into it, and the `start` role is never a delegate target at
+/// all (`AppState::delegate_targets` filters out every orchestrator pane); both still get the warning, because the card still gets no agent from
+/// the config and a Codex agent behind the launcher still runs without the
+/// deck's wrapper (`spawn` resolves the wrapper from the same type), but the
+/// message says that instead of a wait they never pay.
 fn unidentified_role_agent_issue(
     scope: &str,
     role: &crate::project_config::OrchestrationRoleConfig,
@@ -527,14 +537,25 @@ fn unidentified_role_agent_issue(
         return None;
     }
     let command = bound_chars(role.command.trim(), MAX_QUOTED_VALUE_CHARS);
+    let consequence = if role.start {
+        "the card gets no agent from the config, and a Codex agent behind it runs without the \
+         deck's wrapper. It is the start role, which is never a delegate target, so it never \
+         waits on the readiness timeout"
+    } else if role.clear {
+        "the card gets no agent from the config, and a Codex, Pi or OpenCode worker behind it \
+         waits the full 30 s readiness timeout on every delegation"
+    } else {
+        "the card gets no agent from the config, and a Codex agent behind it runs without the \
+         deck's wrapper. It keeps its process across delegations (`clear = false`), so no \
+         delegation waits on the readiness timeout"
+    };
     Some(ValidationIssue {
         severity: Severity::Warning,
         scope: scope.to_string(),
         message: format!(
             "role '{}': the deck cannot tell which agent `{command}` launches and the role \
-             declares no `agent` — the card gets no agent from the config, and a Codex, Pi or \
-             OpenCode worker behind it waits the full 30 s readiness timeout on every \
-             delegation. Declare it, e.g. `agent = \"codex\"`; known agents: {}",
+             declares no `agent` — {consequence}. Declare it, e.g. `agent = \"codex\"`; \
+             known agents: {}",
             bound_chars(&role.name, MAX_QUOTED_VALUE_CHARS),
             crate::agent_registry::declarable_agent_names().join(", ")
         ),
@@ -1046,6 +1067,75 @@ mod tests {
         assert!(
             !has_errors(&validate_config(&advisory)),
             "an undeclared launcher is advisory — the role still opens and still receives work"
+        );
+    }
+
+    /// Issue #1243 (Qodo on PR #1331): the 30 s readiness claim is made only for
+    /// a role that pays it — a `clear = true` worker, whose delegate respawns it
+    /// and waits for readiness. A `clear = false` worker keeps its process and
+    /// gets its pointer written straight in, and the start role is never
+    /// delegated to, so each is still warned about (its card and wrapper are
+    /// still lost) but told what actually happens rather than a wait it never
+    /// takes.
+    #[test]
+    fn unidentified_role_warning_claims_the_timeout_only_for_a_respawned_worker() {
+        let warning_for = |role: OrchestrationRoleConfig| -> String {
+            let config = make_orch_config(vec![make_orchestration("orch", vec![role])]);
+            let warned: Vec<String> = validate_config(&config)
+                .into_iter()
+                .filter(|i| {
+                    i.severity == Severity::Warning && i.message.contains("declares no `agent`")
+                })
+                .map(|i| i.message)
+                .collect();
+            assert_eq!(
+                warned.len(),
+                1,
+                "exactly one unidentified-agent warning; got {warned:?}"
+            );
+            warned.into_iter().next().unwrap()
+        };
+
+        let mut respawned = make_role("tester", false);
+        respawned.command = "devbox run codex-big".to_string();
+        let mut persistent = respawned.clone();
+        persistent.clear = false;
+        let mut start = make_role("orchestrator", true);
+        start.command = "devbox run codex-big".to_string();
+
+        let respawned = warning_for(respawned);
+        assert!(
+            respawned.contains("30 s readiness timeout on every delegation"),
+            "a `clear = true` worker is told it pays the wait; got {respawned}"
+        );
+
+        for (label, warning) in [
+            ("`clear = false` worker", warning_for(persistent)),
+            ("start role", warning_for(start)),
+        ] {
+            assert!(
+                !warning.contains("30 s") && !warning.contains("waits the full"),
+                "a {label} never enters the readiness wait, so it must not be told it pays it; \
+                 got {warning}"
+            );
+            assert!(
+                warning.contains("never waits on the readiness timeout")
+                    || warning.contains("no delegation waits on the readiness timeout"),
+                "a {label} is told the wait does not apply to it; got {warning}"
+            );
+            assert!(
+                warning.contains("card gets no agent")
+                    && warning.contains("wrapper")
+                    && warning.contains("agent = "),
+                "a {label} is still told what it loses and how to fix it; got {warning}"
+            );
+        }
+        let mut persistent = make_role("tester", false);
+        persistent.command = "devbox run codex-big".to_string();
+        persistent.clear = false;
+        assert!(
+            warning_for(persistent).contains("`clear = false`"),
+            "the persistent-worker warning names the setting that makes it so"
         );
     }
 
