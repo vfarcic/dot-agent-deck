@@ -5,6 +5,7 @@ import {
   agents,
   agentsNote,
   audience,
+  clients,
   desktop,
   docLinks,
   installCommand,
@@ -70,6 +71,11 @@ const doorPages = [
     to: docLinks.dispatcher,
     title: 'Dispatcher mode',
     body: 'Start isolated work in its own copy of the repo, just by asking for it.',
+  },
+  {
+    to: docLinks.desktop,
+    title: 'Desktop app',
+    body: 'The dashboard over several daemons, New agent, Settings and voice control.',
   },
   {
     to: docLinks.keyboard,
@@ -202,6 +208,25 @@ export default function Home() {
             <p className={styles.agentStripNote}>{agentsNote}</p>
           </section>
 
+          <section className={styles.clients} aria-labelledby="clients-title">
+            <h2 id="clients-title" className={styles.sectionTitle}>
+              {clients.heading}
+            </h2>
+            <p className={styles.clientsIntro}>{clients.intro}</p>
+            <div className={styles.clientGrid}>
+              {clients.items.map((c) => (
+                <article key={c.title} className={styles.clientCard}>
+                  <img src={c.shot.src} alt={c.shot.alt} loading="lazy" />
+                  <h3>{c.title}</h3>
+                  <p>{c.body}</p>
+                  <p className={styles.clientLink}>
+                    <Link to={c.link.to}>{c.link.label}</Link>
+                  </p>
+                </article>
+              ))}
+            </div>
+          </section>
+
           <section className={styles.why}>
             <h2 className={styles.sectionTitle}>{why.heading}</h2>
             <p className={styles.pullQuote}>{why.paragraphs[0]}</p>
@@ -306,6 +331,8 @@ export default function Home() {
                 {desktop.provenanceScope}
               </p>
               <p className={styles.desktopLink}>
+                <Link to={docLinks.desktopInstall}>How to install it →</Link>
+                {' · '}
                 <Link href={product.releases}>Get it from the latest release →</Link>
               </p>
             </div>

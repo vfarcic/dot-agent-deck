@@ -537,6 +537,59 @@
   font-size: 0.95rem;
 }
 
+/* ---------- two clients ---------- */
+
+.clients {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 4rem 1rem 1rem;
+}
+
+.clientsIntro {
+  color: var(--c-dim);
+  max-width: 62ch;
+  margin: 0 0 1.75rem;
+}
+
+.clientGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.25rem;
+}
+
+.clientCard {
+  border: 1px solid var(--c-line);
+  border-radius: 12px;
+  padding: 1.25rem 1.4rem 1.4rem;
+  background: var(--c-bg-alt);
+}
+
+.clientCard img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--c-line);
+  border-radius: 8px;
+}
+
+.clientCard h3 {
+  font-size: 1.15rem;
+  font-weight: 700;
+  margin: 1rem 0 0.5rem;
+  letter-spacing: -0.02em;
+}
+
+.clientCard p {
+  color: var(--c-dim);
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.clientCard .clientLink {
+  margin: 0.9rem 0 0;
+  font-weight: 600;
+}
+
 /* ---------- principles ---------- */
 
 .principles {
@@ -892,13 +945,15 @@
 
 .platformStatus a,
 .installMore a,
-.desktopLink a {
+.desktopLink a,
+.clientLink a {
   color: var(--c-teal);
 }
 
 .platformStatus a:hover,
 .installMore a:hover,
-.desktopLink a:hover {
+.desktopLink a:hover,
+.clientLink a:hover {
   color: var(--c-teal);
   text-decoration: underline;
 }
@@ -956,6 +1011,7 @@
 
   .desktopGrid,
   .principleGrid,
+  .clientGrid,
   .installCols {
     grid-template-columns: minmax(0, 1fr);
   }

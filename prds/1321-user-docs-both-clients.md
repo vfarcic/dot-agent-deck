@@ -1,6 +1,6 @@
 # PRD #1321: User docs for both clients — common, TUI and desktop sections, with screenshots
 
-**Status**: In progress — M1 done (2026-09-27)
+**Status**: In progress — M1–M5 and M7 done (2026-09-27); M6 and M8 open
 **Priority**: Medium
 **Created**: 2026-09-27
 **Issue**: [#1321](https://github.com/vfarcic/dot-agent-deck/issues/1321)
@@ -257,12 +257,12 @@ Target: the release after the one carrying #1045 and #746.
 ## Milestones
 
 - [x] **M1** — Desktop feature inventory from the code, checked into this PRD
-- [ ] **M2** — Docs restructured into common / TUI / desktop, sidebar updated
-- [ ] **M3** — Desktop pages written for every graduated desktop feature
-- [ ] **M4** — Install page (absorbs #765)
-- [ ] **M5** — Home page presents both clients
+- [x] **M2** — Docs restructured into common / TUI / desktop, sidebar updated
+- [x] **M3** — Desktop pages written for every graduated desktop feature
+- [x] **M4** — Install page (absorbs #765)
+- [x] **M5** — Home page presents both clients
 - [ ] **M6** — Screenshots added across the docs via `cargo docs-screenshots`, with TUI | Desktop tabs for common features
-- [ ] **M7** — Project-local skill for evaluating screenshots on docs changes
+- [x] **M7** — Project-local skill for evaluating screenshots on docs changes
 - [ ] **M8** — Docs published (`publish-docs`)
 
 ## Risks
@@ -293,3 +293,18 @@ Document written from issue #1321's body. The desktop feature inventory is left 
 ### 2026-09-27 — M1: desktop feature inventory and docs plan
 
 The [Desktop feature inventory](#desktop-feature-inventory) was taken from `desktop/src/` and `desktop/src-tauri/src/`, with each "TUI has it?" claim checked in `src/`. It lists 17 graduated feature rows and 8 experimental ones. The five experimental surfaces are the five `show_desktop_*` wrappers (#1308–#1312), and three more features are experimental because they exist only on the deck screen (Start / Stop / Replace daemon, Rename, the Output reader). All five graduation issues were still open. #1311 still names the wrapper `show_desktop_workflows`; the code calls it `show_desktop_orchestrations`. Eight terminology questions are left open for the user. One finding changes M4: with the flag off, the desktop starts no daemon. A [Docs plan](#docs-plan) was added: how each page is classified, a sidebar that moves no URL, whether Tabs work, ten screenshot scenarios (two existing, eight new), and the facts about how docs get published. No doc page, sidebar or code was changed.
+
+### 2026-09-27 — M2, M3, M4, M5, M7: docs for both clients
+
+**M2.** `site/sidebars.js` now groups the pages as **Both Clients** / **Terminal UI** / **Desktop App**, with Getting Started, Installation, Troubleshooting and License at the top level; no page moved, so no URL changed. Tabs were proven on the first converted page (`getting-started.md`) with `npm run build` before being used elsewhere: `<Tabs groupId="client">` with `TabItem value="tui"` / `value="desktop"` compiles in the `.md` pages and renders `role="tab"` items in the static output. One gotcha found doing it: pages are compiled as MDX, so a `{name}` in prose is a JavaScript expression and fails the static render (`ReferenceError: name is not defined`); placeholders go in code spans. Desktop tabs were added where a common flow differs per client (getting-started Launching and Basic workflow, session-management statuses, orchestration's start, dispatcher's start, remote-environments' quick start); TUI-only sections are labelled in place (session-management's card details and Resuming Sessions, orchestration's tab navigation, the Schedules dialog, keyboard shortcuts, workspace modes, three troubleshooting sections), without renaming any heading, so no anchor moved. The existing `dashboard` and `dashboard-empty` images are embedded as TUI | Desktop tabs on getting-started, and `dashboard` on session-management; `dashboard-tui.png` replaced the hand capture `getting-started-launching.jpg` on the Launching section, which shows the same screen. The TUI's status for a waiting agent is written as **Needs Input** (what `status_style` shows) rather than `WaitingForInput` (the enum name, which `daemon status` prints).
+
+**M3.** Six pages under `docs/desktop/`: `index.md` (a second client of the same daemon, what the TUI has and it lacks, the experimental surfaces and how the app reads the flag), `dashboard.md`, `new-agent.md`, `daemons.md`, `settings.md` (Appearance, Zoom, the settings file, the desktop's keyboard shortcuts), `voice.md`. Labels, flows and keys were read from `desktop/src/` and `desktop/src-tauri/src/`. Two claims had to be corrected against the code while writing: `Ctrl+N` / `⌘N` works only on the Dashboard with no agent pane open (`AgentOverview.tsx`), not everywhere; and New agent's **Command** *is* pre-filled from the daemon's `default_command` or last command (`seedCommand`, `desktop/src/lib/newAgent.ts`). After a start the app opens the new agent's pane (`onAppeared`), rather than returning to the Dashboard.
+
+**M4.** `installation.md` gained a Desktop app section (absorbs #765): the two assets and which is signed, the provenance check, per-platform install and first launch, how the app gets a daemon, and keeping the app and daemon on one release. Verified for it: the `.deb` (v0.43.0, downloaded and listed with `dpkg -c`/`dpkg -I`) is package `agent-deck`, depends on `libwebkit2gtk-4.1-0` and `libgtk-3-0`, and installs `/usr/bin/dot-agent-deck-desktop` **and** `/usr/bin/dot-agent-deck`; the `.dmg` carries the daemon at `Agent Deck.app/Contents/MacOS/dot-agent-deck` (`release.yml` asserts that path) and puts nothing on `PATH`. **The daemon recipe, checked against the code:** the flag-off app only connects (`connect()` bootstraps with `startIfMissing: false`, and `bootstrap` returns early when `start_if_missing` is false). The idle monitor (`run_idle_monitor`, `src/daemon.rs`) shuts the daemon down 30 s after `clients == 0 && agents == 0 && no enabled schedules`, and arms at a fresh start too, so a `daemon serve` nothing attaches to within 30 s exits; `daemon serve` uses `Daemon::with_attach`, which takes `idle_shutdown_from_env()`, so `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0` disables it. Every accepted attach connection increments the client count (`ClientGuard`, `src/daemon_protocol.rs`), and the desktop holds a persistent `EventSubscription` per observed daemon (`daemon_bridge.rs`), so a daemon the desktop is attached to does not idle out. A TUI-started daemon survives the TUI's Detach while agents run or another client (the desktop) is attached, and otherwise exits 30 s later; the quit dialog's Stop shuts it down. Remote daemons follow the same rule on their host, so `daemons.md` and `remote-environments.md` say how to keep one up. `troubleshooting.md`'s Hooks section said the desktop app "starts only the daemon bundled inside it", which is false with the flag off; it now says the daemon the app connects to installs the hooks, however it was started. The v0.43.0 release notes carry the same claim ("it starts the background daemon bundled inside it") and are not editable here.
+
+**M5.** The home page gained a "Two clients, one daemon" section (`clients` in `site/src/data/landing-content.js`, rendered in `site/src/pages/index.js`, styled in `index.module.css`) with the `dashboard` image of each client; the tagline (also in `site/docusaurus.config.js`) and hero text name both clients; the desktop band links the install section and says the app needs a running daemon; the docs door list has a Desktop app card.
+
+**M7.** Project-local skill `.claude/skills/docs-screenshots-review/SKILL.md`, listed in CLAUDE.md rule 13. It triggers on any edit under `docs/` outside `docs/develop/`, and on a UI change that makes a docs screenshot stale; it has the agent decide whether a screenshot is warranted, produce it with `cargo docs-screenshots` (one scenario name on both clients, embedded as TUI | Desktop tabs) or `run-dot-agent-deck`, or tell the user exactly what to capture. The `docs/**` hook fallback is named and not built.
+
+**For M6.** The committed desktop images (`dashboard-desktop.png`, `dashboard-empty-desktop.png`) show older labels than the code: "Agent overview", "Local deck", "DECKS" and "The deck is healthy…", where the code now says "Agent dashboard", "DAEMONS" and "The daemon is healthy…" (#1045). The page text follows the code; regenerating those images fixes the mismatch. The pages written here reference only the four existing images; the new scenarios are embedded in M6.
+

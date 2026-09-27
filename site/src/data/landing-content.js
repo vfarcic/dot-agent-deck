@@ -167,13 +167,54 @@ export const product = {
   binary: 'dot-agent-deck',
   owner: 'DevOps Toolkit',
   tagline:
-    'A terminal dashboard for running, orchestrating and dispatching AI coding agents in parallel',
+    'A dashboard for running, orchestrating and dispatching AI coding agents in parallel — in your terminal, or in a desktop app',
   shortDefinition:
-    'A single binary that runs your AI coding agents as panes in one terminal, tracks what each of them is doing in real time, and starts new work for you — a team under one orchestrator, an isolated unit in its own copy of the repo, or a task that fires on a schedule.',
+    'Runs your AI coding agents under one background daemon, shows what each of them is doing in real time — in a terminal UI or in a desktop app, both watching the same agents — and starts new work for you: a team under one orchestrator, an isolated unit in its own copy of the repo, or a task that fires on a schedule.',
   license: 'MIT',
   repo: 'https://github.com/vfarcic/dot-agent-deck',
   issues: 'https://github.com/vfarcic/dot-agent-deck/issues',
   releases: 'https://github.com/vfarcic/dot-agent-deck/releases/latest',
+};
+
+/**
+ * The two clients (PRD #1321 M5). Both are clients of the same daemon, which
+ * is what the section says first, because it is the fact a reader needs to
+ * choose: nothing is lost by picking one, since an agent started in either
+ * shows up in the other.
+ *
+ * Every claim is checked against the code. The TUI "attaches to one daemon at
+ * a time" (`Endpoint`, `src/daemon_client.rs`); the desktop app holds several
+ * (`desktop/src-tauri/src/daemon_bridge.rs`, one link per deck) and has voice
+ * control, which the TUI does not. "Starts no daemon of its own" is the
+ * flag-off app: `connect()` bootstraps with `startIfMissing: false`
+ * (`desktop/src/lib/bridge.ts`), and the controls that start one are on the
+ * experimental deck screen. The screenshots are `cargo docs-screenshots`
+ * output (the `dashboard` scenario), one per client, of the same scene.
+ */
+export const clients = {
+  heading: 'Two clients, one daemon',
+  intro:
+    'The agents run under a small background daemon, not inside a window. The terminal UI and the desktop app are two ways of looking at it, so an agent you start in one shows up in the other, and closing either leaves the agents running.',
+  items: [
+    {
+      title: 'Terminal UI',
+      body: 'The dot-agent-deck binary, in the terminal you already use: agent cards beside their live panes, keyboard first, with workspace modes, the Schedules manager and remote hosts over ssh. It attaches to one daemon at a time.',
+      shot: {
+        src: '/img/dashboard-tui.png',
+        alt: 'The terminal UI with four agent cards on the left, each showing its status, directory and last prompt, and the focused agent’s terminal pane on the right',
+      },
+      link: {label: 'Get started with the terminal UI →', to: '/docs/getting-started'},
+    },
+    {
+      title: 'Desktop app (alpha)',
+      body: 'A native window for macOS on Apple Silicon and Linux amd64: one dashboard over several daemons at once — this machine and remote ones — with each agent’s terminal a click away, and voice control. It connects to a running daemon and starts none of its own.',
+      shot: {
+        src: '/img/dashboard-desktop.png',
+        alt: 'The desktop app’s dashboard with four agents in one daemon section, each row showing its status, name and uptime',
+      },
+      link: {label: 'Read about the desktop app →', to: '/docs/desktop'},
+    },
+  ],
 };
 
 /**
@@ -359,7 +400,7 @@ export const installRoutes = [
 export const desktop = {
   heading: 'There is a desktop app too. It is an alpha.',
   intro:
-    'The terminal deck shows you one machine’s agents at a time. The desktop app is a native window that holds several at once — the agents on your laptop and the ones on a remote box, side by side. It rides along with a release rather than gating it, so check the assets on the release you open: the CLI ships even when a desktop bundle does not.',
+    'The terminal deck shows you one machine’s agents at a time. The desktop app is a native window that holds several at once — the agents on your laptop and the ones on a remote box, side by side. It connects to a daemon that is already running, which the terminal deck starts for you, so install the CLI as well. It rides along with a release rather than gating it, so check the assets on the release you open: the CLI ships even when a desktop bundle does not.',
   artifacts: [
     {
       platform: 'macOS',
@@ -375,7 +416,7 @@ export const desktop = {
   caveats: [
     {
       title: 'Alpha, and labelled that way',
-      body: 'It ships outside the support expectations of the CLI. The terminal deck is the product; this is an early preview of a second way in.',
+      body: 'It ships outside the support expectations of the CLI. The terminal deck does more today; this is an early preview of a second way in to the same agents.',
     },
     {
       title: 'v0.42.0: signed for macOS, not for Linux',
@@ -624,4 +665,6 @@ export const docLinks = {
   configuration: '/docs/configuration',
   keyboard: '/docs/keyboard-shortcuts',
   remote: '/docs/remote-environments',
+  desktop: '/docs/desktop',
+  desktopInstall: '/docs/installation#desktop-app',
 };
