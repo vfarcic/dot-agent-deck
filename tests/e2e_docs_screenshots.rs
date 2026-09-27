@@ -818,7 +818,8 @@ fn stage_orchestration() -> DashboardScene {
 }
 
 /// Scenario: Open the Schedules manager over an empty dashboard with one
-/// configured task whose disabled state keeps its next-fire field stable.
+/// disabled nightly-triage task. Its longer name leaves a visible gap between
+/// the NAME and STATUS headers while keeping the next-fire field stable.
 #[test]
 #[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
 fn docs_screenshot_schedules() {
@@ -827,7 +828,7 @@ fn docs_screenshot_schedules() {
     let schedules = scratch.path().join("schedules.toml");
     std::fs::write(
         &schedules,
-        "[[scheduled_tasks]]\nname = \"job\"\ncron = \"0 9 * * *\"\nworking_dir = \"/home/dev/storefront\"\ncommand = \"cat\"\nprompt = \"Summarize checkout changes.\"\nenabled = false\n",
+        "[[scheduled_tasks]]\nname = \"nightly-triage\"\ncron = \"0 9 * * *\"\nworking_dir = \"/home/dev/storefront\"\ncommand = \"cat\"\nprompt = \"Summarize checkout changes.\"\nenabled = false\n",
     )
     .expect("write docs schedule");
     let deck = launch_with(|builder| {
@@ -836,7 +837,11 @@ fn docs_screenshot_schedules() {
     deck.wait_for_string("No active agents");
     deck.send_keys(b"S");
     capture(&deck, "schedules", |grid| {
-        grid.contains("NEXT FIRE") && grid.contains("job") && grid.contains("disabled")
+        grid.lines()
+            .any(|line| line.contains("NAME ") && line.contains("STATUS"))
+            && grid.contains("NEXT FIRE")
+            && grid.contains("nightly-triage")
+            && grid.contains("disabled")
     });
 }
 
