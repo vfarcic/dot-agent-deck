@@ -1224,10 +1224,13 @@ fn switch_target(
 ///
 /// **A deck whose name is itself nameless** — `ops@daemon`, whose host is the
 /// category word "daemon" — is invisible to the content words, so it is looked
-/// for among ALL the transcript's words, by [`decks_called`] alone, and only
-/// when the transcript has no content word at all: "switch daemon to daemon"
-/// names it, while in "switch daemon to staging" the "daemon" stays the
-/// selector's name and the deck named is staging's, or none.
+/// for among ALL the transcript's words, by [`decks_called`] alone, only when
+/// the transcript has no content word at all, and only in the destination
+/// slot — the run of words the utterance ENDS with. "switch daemon to daemon"
+/// and "switch deck to daemon" name it; in "switch daemon to deck" the
+/// "daemon" is the selector's heading and names nothing, and in "switch daemon
+/// to staging" the deck named is staging's, or none. A trailing "please"
+/// therefore refuses too, which costs one more utterance.
 fn decks_named<'a>(transcript: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDeck> {
     let all = spoken_words(transcript);
     let content: Vec<String> = all
@@ -1247,10 +1250,8 @@ fn decks_named<'a>(transcript: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDec
     }
     if content.is_empty() {
         for start in 0..all.len() {
-            for end in start + 1..=all.len() {
-                if let [deck] = decks_called(&all[start..end].join(" "), decks)[..] {
-                    named.insert(deck.id.clone());
-                }
+            if let [deck] = decks_called(&all[start..].join(" "), decks)[..] {
+                named.insert(deck.id.clone());
             }
         }
     }
@@ -8336,6 +8337,34 @@ mod tests {
             matches!(&open, VoiceOutcome::Dispatch { params, .. }
                 if params.len() == 1 && params[0].value == "deck-daemon"),
             "{open:?}"
+        );
+        // Said as the destination after the other selector word, it is still
+        // that daemon's name.
+        let destination = ask(
+            "switch deck to daemon",
+            IntentAnswer::new("switch_deck").with_param("deck", "daemon"),
+            Screen::Deck,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(&destination, VoiceOutcome::Dispatch { invoke, params, .. }
+                if invoke == "switchDeck" && params[0].value == "deck-daemon"),
+            "{destination:?}"
+        );
+        // Control: said as the selector's heading, before a destination that
+        // names no daemon, it is not the destination — a model reading it as
+        // the deck is refused.
+        let heading = ask(
+            "switch daemon to deck",
+            IntentAnswer::new("switch_deck").with_param("deck", "daemon"),
+            Screen::Deck,
+            false,
+        )
+        .await;
+        assert!(
+            !matches!(&heading, VoiceOutcome::Dispatch { .. }),
+            "{heading:?}"
         );
         // Control: beside another word that could be a name, "daemon" is the
         // selector's heading, so a model reading it as the deck is refused.
