@@ -691,6 +691,33 @@ pub const CLEAR_SESSION_START_METADATA_KEY: &str = "session_start_source";
 /// was caused by the user running `/clear`".
 pub const CLEAR_SESSION_START_METADATA_VALUE: &str = "clear";
 
+/// Issue #1354: the [`AgentEvent::metadata`] key naming the SUBAGENT an event
+/// came from, when the agent's hook payload says it came from one.
+///
+/// Claude Code stamps an `agent_id` on its hook input "only when the hook
+/// fires from within a subagent … Absent for the main thread, even in --agent
+/// sessions" (the schema description in 2.1.283), and Codex does the same for
+/// a thread-spawned subagent (`thread_spawn_subagent_hook_context` in
+/// `codex-rs/core/src/hook_runtime.rs`). Both keep the PARENT's `session_id`
+/// on those hooks, so without this key a subagent's tool call is
+/// indistinguishable from the main thread's and drives the one card both
+/// share — which is how a background agent's `PreToolUse` after the turn's
+/// `Stop` left a card on Working for fifteen hours. See the `ToolStart` arm of
+/// `crate::state::AppState::apply_event` for what the key changes.
+///
+/// A distinct name, not `agent_id`, because [`AgentEvent::agent_id`] already
+/// means something else entirely: the deck's own id for the spawned agent
+/// process (`DOT_AGENT_DECK_AGENT_ID`).
+///
+/// Additive on the wire in both directions, like
+/// [`CLEAR_SESSION_START_METADATA_KEY`]: it rides the free-form `metadata`
+/// map, an older daemon ignores it (and keeps today's behaviour), and an older
+/// hook CLI never sets it, so no
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump is needed. Nor is it a
+/// privilege: an event carrying it can only be kept from moving a card's
+/// status, never granted anything a plain event is not.
+pub const SUBAGENT_ID_METADATA_KEY: &str = "subagent_id";
+
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
 /// This versions the **payload shape of a single `AgentEvent` record** — the
@@ -853,6 +880,15 @@ impl AgentEvent {
         self.metadata
             .get(SESSION_START_ORIGIN_METADATA_KEY)
             .is_some_and(|origin| origin == WRAPPER_FORK_SESSION_START_ORIGIN)
+    }
+
+    /// Issue #1354: did the agent's hook say this event came from a subagent
+    /// (see [`SUBAGENT_ID_METADATA_KEY`])? `false` for every event without the
+    /// key — the main thread, an older hook CLI, and every agent whose hook
+    /// payload has no such field — so the absent-key default is today's
+    /// behaviour.
+    pub fn is_from_subagent(&self) -> bool {
+        self.metadata.contains_key(SUBAGENT_ID_METADATA_KEY)
     }
 
     /// Issue #684: was this `SessionStart` authored by the DAEMON to draw a
