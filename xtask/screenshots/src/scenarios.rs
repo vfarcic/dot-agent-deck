@@ -82,6 +82,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Tui, Client::Desktop],
     },
     Scenario {
+        name: "dashboard-fleet",
+        description: "The desktop Dashboard with agents grouped under two connected daemons.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "new-agent",
         description: "The New Agent form with a project directory selected.",
         clients: &[Client::Tui, Client::Desktop],

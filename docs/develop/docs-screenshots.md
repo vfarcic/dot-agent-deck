@@ -29,15 +29,16 @@ Each image is named `<scenario>-<client>.png`, so the `dashboard` scenario produ
 | --- | --- | --- |
 | `dashboard` | TUI, desktop | Four agents in mixed states. |
 | `dashboard-empty` | TUI, desktop | First-run empty state. |
+| `dashboard-fleet` | desktop | Agent dashboard with six agents across two connected daemons. |
 | `new-agent` | TUI, desktop | New Agent form with a project directory chosen. |
 | `orchestration` | TUI, desktop | Activated `demo-loop` with planner and builder roles. |
-| `agent-pane` | desktop | Agent pane over the Dashboard; the browser fixture does not replay terminal bytes, so its terminal is empty. |
+| `agent-pane` | desktop | Agent pane over the Dashboard, showing a fixed implementation transcript. |
 | `settings-daemons` | desktop | Daemons settings with one configured remote. The browser fixture cannot produce a successful Test connection result. |
 | `settings-voice` | desktop | Voice settings. |
 | `schedules` | TUI | Schedules manager with one disabled task, keeping the next-fire field stable. |
 | `help` | TUI | The `?` keyboard shortcut overlay. |
 
-The docs-only fleet fixture is prepared in `desktop/src/data/fixture.ts`, but `dashboard-fleet` is not registered until the browser preview accepts its state. The preview's fixture-state allowlist is in `desktop/src/lib/bridge.ts`; that file needs to admit `docs-fleet` before a capture can select it.
+The docs-only fleet fixture lives in `desktop/src/data/fixture.ts` and is selected by `/?fixture=1&state=docs-fleet`.
 
 It runs two stages:
 

@@ -8,8 +8,8 @@ import { desktopScenario } from "./support";
  * name must also be in `xtask/screenshots/src/scenarios.rs`.
  */
 
-/** Load a fixture state and open the agent overview through its rail control. */
-async function overview(page: Page, state: "docs" | "empty"): Promise<void> {
+/** Load a fixture state and open the agent dashboard through its rail control. */
+async function overview(page: Page, state: "docs" | "docs-fleet" | "empty"): Promise<void> {
   await page.goto(`/?fixture=1&state=${state}`);
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
@@ -25,6 +25,14 @@ desktopScenario("dashboard", async (page) => {
 desktopScenario("dashboard-empty", async (page) => {
   await overview(page, "empty");
   await expect(page.getByTestId("overview-first-run")).toBeVisible();
+});
+
+desktopScenario("dashboard-fleet", async (page) => {
+  await overview(page, "docs-fleet");
+  await expect(page.getByTestId("daemon-group")).toHaveCount(2);
+  await expect(page.getByTestId("overview-count-decks")).toContainText("2/2");
+  await expect(page.locator(".overview-row")).toHaveCount(6);
+  await expect(page.getByText("API implementation", { exact: true })).toBeVisible();
 });
 
 /** Select the fixture project's directory in the shared New agent form. */
