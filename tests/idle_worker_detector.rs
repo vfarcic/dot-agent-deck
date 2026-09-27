@@ -71,6 +71,10 @@ const IDLE_NEEDLE: &str = "has not responded with work-done (dot-agent-deck daem
 /// Ordinary `cat` worker stub: stays alive, never answers, dies on SIGTERM.
 const WORKER_COMMAND: &str = "cat";
 
+/// Issue #447 review: a worker stub that exits by itself once one line — the
+/// task pointer — reaches it, reporting nothing on the way out.
+const EXITS_ON_POINTER_COMMAND: &str = "read line; exit 0";
+
 /// A worker that IGNORES SIGTERM, so `close_agent` spends its full
 /// `AGENT_TERMINATE_GRACE` (3 s) in the grace loop before escalating to
 /// SIGKILL. That grace window is the interval PRD #126 M1 review finding 1
@@ -1709,7 +1713,7 @@ fn waiting_notices_for(snapshot: &str, role: &str) -> usize {
         .count()
 }
 
-/// Scenario: Delegate to eight workers of one orchestration and leave a ninth undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card, after which its own agent reports only informational events; `cleared-worker`'s agent starts a new hook session and waits in it, and then a delayed report and a delayed `session_start` from its old session arrive; `restarted-worker` waits and then genuinely starts a new hook session whose start carries an earlier timestamp; `already-waiting-worker` was waiting before it was delegated to; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first four — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other five, then or after further waiting.
+/// Scenario: Delegate to ten workers of one orchestration and leave an eleventh undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card, after which its own agent reports only informational events; `cleared-worker`'s agent starts a new hook session and waits in it, and then a delayed report and a delayed `session_start` from its old session arrive; `restarted-worker` waits and then genuinely starts a new hook session whose start carries an earlier timestamp; `already-waiting-worker` was waiting before it was delegated to; `respawned-worker` is a `clear = true` role, so its delegate replaces its agent, and the replacement waits; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; `exited-worker`'s agent exits by itself once its task pointer arrives, and a different agent that was never delegated to takes its pane and waits; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first five — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other six, then or after further waiting.
 #[spec("scheduler/idle-worker/021")]
 #[test]
 fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() {
@@ -1732,8 +1736,17 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
                 ("already-waiting-worker", WORKER_COMMAND),
                 ("cleared-worker", WORKER_COMMAND),
                 ("restarted-worker", WORKER_COMMAND),
+                // Exits by itself as soon as the task pointer's line arrives —
+                // a worker that ends without a work-done and without any close
+                // or restart path touching its commission.
+                ("exited-worker", EXITS_ON_POINTER_COMMAND),
+                ("respawned-worker", WORKER_COMMAND),
             ],
-            None,
+            Some(&format!(
+                "[[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
+                 [[orchestrations.roles]]\nname = \"respawned-worker\"\n\
+                 command = \"{WORKER_COMMAND}\"\nclear = true\n"
+            )),
         )
         .await;
         for role in [
@@ -1746,6 +1759,8 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             "already-waiting-worker",
             "cleared-worker",
             "restarted-worker",
+            "exited-worker",
+            "respawned-worker",
         ] {
             harness.manage_worker_pane(role).await;
             harness.worker_event(role, "session_start").await;
@@ -1777,10 +1792,77 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
                 "already-waiting-worker",
                 "cleared-worker",
                 "restarted-worker",
+                "exited-worker",
+                "respawned-worker",
             ])
             .await;
         // Let the task pointers land before the workers start "asking".
         tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The exited worker's agent received its pointer and exited without a
+        // work-done — nothing retires the commission it was given. A different
+        // agent then takes the pane, never delegated to, and waits for input.
+        // Its wait is not the delegation's business, so the orchestrator that
+        // delegated to its predecessor must hear nothing about it (issue #447
+        // review; Qodo finding 15 on #1347).
+        let exited_agent = harness.worker_agent_ids["exited-worker"].clone();
+        tokio::time::timeout(
+            common::load_scaled(Duration::from_secs(5)),
+            harness.registry.agent_exit_signal(&exited_agent),
+        )
+        .await
+        .expect("precondition: the exited worker never exited after its task pointer landed")
+        .ok();
+        let successor = harness
+            .registry
+            .respawn_agent_for_pane(&worker_pane("exited-worker"), WORKER_COMMAND)
+            .await
+            .unwrap_or_else(|error| panic!("put a new agent in the exited worker's pane: {error}"));
+        assert_ne!(
+            successor, exited_agent,
+            "precondition: the exited worker's pane did not get a different agent"
+        );
+        // The control for the exited worker: a `clear = true` delegate replaces
+        // the respawned worker's agent, so the commission was made to the
+        // REPLACEMENT — which stops at a prompt before its pointer lands, and
+        // must be reported.
+        let respawned_original = harness.worker_agent_ids["respawned-worker"].clone();
+        let replacement = {
+            let deadline =
+                tokio::time::Instant::now() + common::load_scaled(Duration::from_secs(5));
+            loop {
+                match harness
+                    .registry
+                    .pane_current_agent_id(&worker_pane("respawned-worker"))
+                {
+                    Some(id) if id != respawned_original => break id,
+                    _ if tokio::time::Instant::now() >= deadline => {
+                        panic!("precondition: the clear = true delegate never respawned its worker")
+                    }
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        };
+        for event_type in ["session_start", "waiting_for_input"] {
+            harness
+                .ingest(worker_hook_event(
+                    "respawned-worker",
+                    "session-respawned-worker-replacement",
+                    event_type,
+                    Some(&replacement),
+                ))
+                .await;
+        }
+        for event_type in ["session_start", "waiting_for_input"] {
+            harness
+                .ingest(worker_hook_event(
+                    "exited-worker",
+                    "session-exited-worker-successor",
+                    event_type,
+                    Some(&successor),
+                ))
+                .await;
+        }
 
         // The cleared worker's agent starts a NEW hook session — a `/clear` —
         // and waits in it. Then a report from its OLD session arrives late:
@@ -1926,6 +2008,7 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
                         "repainted-worker",
                         "already-waiting-worker",
                         "cleared-worker",
+                        "respawned-worker",
                     ]
                     .iter()
                     .all(|role| waiting_notices_for(snapshot, role) > 0)
@@ -1959,6 +2042,12 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             "a delayed report from the worker's previous hook session closed the wait of the \
              session that replaced it; snapshot = {snapshot:?}"
         );
+        assert_eq!(
+            waiting_notices_for(&snapshot, "respawned-worker"),
+            1,
+            "the agent a clear = true delegate respawned was never reported waiting, though the \
+             commission was made to it; snapshot = {snapshot:?}"
+        );
         assert!(
             snapshot.contains(&format!("{WAITING_FINAL_CLAUSE}\r")),
             "the waiting notice was not SUBMITTED with a CR, so an unattended orchestrator \
@@ -1983,8 +2072,14 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
         tokio::time::sleep(debounce * 6).await;
         let settled = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
         assert_eq!(
+            waiting_notices_for(&settled, "exited-worker"),
+            0,
+            "a never-delegated agent that took an exited worker's pane was reported as waiting \
+             to the orchestrator that delegated to its predecessor; snapshot = {settled:?}"
+        );
+        assert_eq!(
             settled.matches(WAITING_NEEDLE).count(),
-            4,
+            5,
             "exactly one waiting notice per waiting worker may reach the orchestrator; \
              snapshot = {settled:?}"
         );
