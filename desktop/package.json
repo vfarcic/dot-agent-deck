@@ -20,7 +20,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/api": "^2.12.0",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
@@ -30,7 +30,7 @@
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",
-    "@tauri-apps/cli": "^2.11.4",
+    "@tauri-apps/cli": "^2.12.0",
     "@testing-library/jest-dom": "^7.0.0",
     "@testing-library/react": "^16.3.2",
     "@types/node": "^26.5.0",

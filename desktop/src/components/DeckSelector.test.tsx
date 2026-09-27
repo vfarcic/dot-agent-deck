@@ -11,10 +11,12 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import "../styles.css";
 import { describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "../data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto, type EndpointSettingsDto } from "../lib/bridge";
+import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto, type EndpointSettingsDto, type VoiceDeckIdentityDto } from "../lib/bridge";
 import type { DeckRuntimeState, DeckSnapshot } from "../types";
 import { DeckShell } from "../App";
-import { deckStateNote } from "./DeckSelector";
+import { chooseDeckSelection, deckStateNote } from "./DeckSelector";
+import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
+import { VOICE_ACTIONS } from "../lib/voiceActions";
 
 vi.mock("./TerminalViewport", () => ({
   TerminalViewport: ({ agentId }: { agentId: string }) => <pre data-testid={`terminal-${agentId}`}>terminal</pre>,
@@ -265,6 +267,136 @@ describe("DeckSelector", () => {
     // it is written in the form that holds in both from the start.
     expect(menu.querySelector("legend")).toBeNull();
     expect(menu.querySelector("fieldset")).toBeNull();
+  });
+});
+
+/*
+ * PRD #1195 M3 — `switchDeck`, as voice dispatches it: a token the app put on
+ * the `switch_deck` row's `deck_ref`, reaching the selector's own write.
+ */
+describe("switchDeck", () => {
+  function state(endpoints: EndpointSettingsDto) {
+    const save = vi.fn();
+    const settings = { settings: settingsWith(endpoints), loaded: true, save } as unknown as DesktopSettingsState;
+    return { settings, save };
+  }
+  function dispatch(settings: DesktopSettingsState, deckSelection: string) {
+    const reportRefused = vi.fn();
+    VOICE_ACTIONS.switchDeck.run({ switchDeck: (token) => chooseDeckSelection(settings, token), reportRefused }, { deckSelection });
+    return reportRefused;
+  }
+
+  /**
+   * Scenario: voice resolves "switch deck to the build box" to that row's
+   * token while the local deck is shown. The selection is written exactly as
+   * the menu writes it, rows untouched, and nothing is reported as refused.
+   */
+  it("stores a listed deck's token through the selector's write", () => {
+    const { settings, save } = state(twoDecks("local"));
+    const refused = dispatch(settings, BUILD_BOX);
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(save.mock.calls[0][0].endpoints).toEqual({ ...twoDecks("local"), selection: BUILD_BOX });
+    expect(refused).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: voice asks for the deck already shown. Nothing is written and
+   * nothing is refused — the report, "Showing <deck>.", is still true.
+   */
+  it("treats the deck already shown as a no-op, not an error", () => {
+    const { settings, save } = state(twoDecks(BUILD_BOX));
+    const refused = dispatch(settings, BUILD_BOX);
+    expect(save).not.toHaveBeenCalled();
+    expect(refused).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: the deck voice resolved was removed in Settings during the round
+   * trip, or the app had no token for it (an empty value). Nothing is written,
+   * and the refusal says the deck is not in the selector any more.
+   */
+  it("refuses a token the selector does not list", () => {
+    for (const token of ["removed0000000001", ""]) {
+      const { settings, save } = state(twoDecks("local"));
+      const refused = dispatch(settings, token);
+      expect(save).not.toHaveBeenCalled();
+      expect(refused).toHaveBeenCalledWith("That deck is not in the Deck selector any more.");
+    }
+  });
+
+  /**
+   * Scenario: voice resolves a configured remote before Settings changes that
+   * row's host, SSH user, port, or socket under the same id. The old switch is
+   * refused with a retry message and leaves the selected deck untouched.
+   */
+  it("refuses a deck whose endpoint identity changed under the same row id", () => {
+    const original = twoDecks("local");
+    const deckIdentity = { host: original.remote![0].host, user: original.remote![0].user,
+      port: original.remote![0].port, socket: original.remote![0].socket };
+    const chooseWithIdentity = chooseDeckSelection as (
+      state: DesktopSettingsState, token: string, identity?: typeof deckIdentity,
+    ) => string | undefined;
+    const unchanged = state(twoDecks("local"));
+    const unchangedRefusal = vi.fn();
+    const unchangedTarget = { deckSelection: BUILD_BOX, deckIdentity };
+    VOICE_ACTIONS.switchDeck.run({
+      switchDeck: (token, identity?: typeof deckIdentity) => chooseWithIdentity(unchanged.settings, token, identity),
+      reportRefused: unchangedRefusal,
+    }, unchangedTarget);
+    expect(unchanged.save).toHaveBeenCalledTimes(1);
+    expect(unchangedRefusal).not.toHaveBeenCalled();
+    for (const changed of [
+      { host: "another-box.example.com" },
+      { user: "other-user" },
+      { port: 2222 },
+      { socket: "/run/other.sock" },
+    ]) {
+      const endpoints = twoDecks("local");
+      endpoints.remote![0] = { ...endpoints.remote![0], ...changed };
+      const { settings, save } = state(endpoints);
+      const reportRefused = vi.fn();
+      const target = { deckSelection: BUILD_BOX, deckIdentity };
+      VOICE_ACTIONS.switchDeck.run({
+        switchDeck: (token, identity?: typeof deckIdentity) => chooseWithIdentity(settings, token, identity),
+        reportRefused,
+      }, target);
+      expect(save, JSON.stringify(changed)).not.toHaveBeenCalled();
+      expect(reportRefused).toHaveBeenCalledWith(expect.stringMatching(/deck changed.*try again/i));
+    }
+  });
+
+  /**
+   * Scenario: voice resolved "switch deck to the build box" against a row that
+   * reaches it with an SSH key through a jump host, and Settings then changed
+   * only that key, or only that jump host, under the same row id. Either is a
+   * different route to the deck, so the switch is refused rather than written;
+   * with both unchanged it is written.
+   */
+  it("refuses a deck whose SSH key or jump host changed under the same row id", () => {
+    const routed = (): EndpointSettingsDto => {
+      const endpoints = twoDecks("local");
+      endpoints.remote![0] = { ...endpoints.remote![0], identity: "~/.ssh/id_ed25519", jump: "bastion" };
+      return endpoints;
+    };
+    const row = routed().remote![0];
+    const deckIdentity: VoiceDeckIdentityDto = {
+      host: row.host, user: row.user, port: row.port, socket: row.socket, identity: row.identity, jump: row.jump,
+    };
+    const unchanged = state(routed());
+    expect(chooseDeckSelection(unchanged.settings, BUILD_BOX, deckIdentity)).toBeUndefined();
+    expect(unchanged.save).toHaveBeenCalledTimes(1);
+    for (const changed of [
+      { identity: "~/.ssh/other_key" },
+      { identity: undefined },
+      { jump: "other-bastion" },
+      { jump: undefined },
+    ]) {
+      const endpoints = routed();
+      endpoints.remote![0] = { ...endpoints.remote![0], ...changed };
+      const { settings, save } = state(endpoints);
+      expect(chooseDeckSelection(settings, BUILD_BOX, deckIdentity), JSON.stringify(changed)).toMatch(/deck changed.*try again/i);
+      expect(save, JSON.stringify(changed)).not.toHaveBeenCalled();
+    }
   });
 });
 

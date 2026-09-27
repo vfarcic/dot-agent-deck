@@ -11087,6 +11087,18 @@ impl AppState {
                 session.active_tool = None;
                 true
             }
+            // Issue #1354: a SUBAGENT's tool call (see
+            // `SUBAGENT_ID_METADATA_KEY`) is not evidence about the main
+            // thread, which is what the card's status describes. Claude Code
+            // runs background agents under the parent's `session_id` after the
+            // turn's `Stop`, and a `ToolStart` from one of them set Working on
+            // a card whose turn was over — for good, since nothing but the next
+            // `Idle` ever takes Working away (`ToolEnd` does not, below). While
+            // a foreground subagent runs, the main thread's own call to the
+            // tool that launched it is already the card's Working/active tool,
+            // so there is nothing for the subagent's calls to add to the badge.
+            // They still reach the journal and the card's tool history.
+            EventType::ToolStart if event.is_from_subagent() => false,
             EventType::ToolStart => {
                 let asserted = session.status != SessionStatus::WaitingForInput;
                 if asserted {
@@ -11099,7 +11111,15 @@ impl AppState {
                 asserted
             }
             EventType::ToolEnd => {
-                session.active_tool = None;
+                // Issue #1354: a subagent's call ending must not clear the main
+                // thread's active tool (the call that launched the subagent is
+                // still running). It still counts, and it still answers a
+                // `WaitingForInput` — a subagent's permission prompt is resolved
+                // by exactly this event, and ignoring it would strand the card
+                // on Needs Input.
+                if !event.is_from_subagent() {
+                    session.active_tool = None;
+                }
                 session.tool_count += 1;
                 let asserted = session.status == SessionStatus::WaitingForInput;
                 if asserted {
@@ -11178,7 +11198,19 @@ impl AppState {
         // and permanently strand the session at `Working` (the `ShellIdle`
         // would see the marker already false and become a no-op) — exactly
         // the silent-break `#[serde(other)]` exists to prevent.
-        if !matches!(event.event_type, EventType::ShellBusy | EventType::Unknown) {
+        //
+        // Issue #1354 (Qodo on PR #1357): a SUBAGENT event that asserted no
+        // status is excluded for the same reason. It is deliberately not
+        // evidence about the main thread, so it must not adopt a synthetic
+        // Working as real: a background agent's `ToolStart` landing between a
+        // `ShellBusy` and its `ShellIdle` would otherwise turn that `ShellIdle`
+        // into a no-op and strand the card on Working — the #1354 symptom by
+        // another route. A subagent event that DID assert (its `ToolEnd`
+        // answering a `WaitingForInput`) wrote the current status, so it clears.
+        let subagent_left_status = event.is_from_subagent() && !asserted_status;
+        if !matches!(event.event_type, EventType::ShellBusy | EventType::Unknown)
+            && !subagent_left_status
+        {
             session.shell_synthetic_working = false;
         }
 
