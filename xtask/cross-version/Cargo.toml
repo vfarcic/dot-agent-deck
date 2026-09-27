@@ -2,6 +2,7 @@
 name = "xtask-cross-version"
 version = "0.0.0"
 edition = "2024"
+rust-version.workspace = true
 publish = false
 
 # CLAUDE.md rule 12's cross-version contract check, as a scripted PTY driver.
