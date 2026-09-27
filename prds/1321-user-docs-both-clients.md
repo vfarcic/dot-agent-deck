@@ -1,6 +1,6 @@
 # PRD #1321: User docs for both clients — common, TUI and desktop sections, with screenshots
 
-**Status**: In progress — M1–M5 and M7 done (2026-09-27); M6 and M8 open
+**Status**: In progress — M1–M7 done (2026-09-27); M8 open, delivered by the next release after this merges
 **Priority**: Medium
 **Created**: 2026-09-27
 **Issue**: [#1321](https://github.com/vfarcic/dot-agent-deck/issues/1321)
@@ -261,7 +261,7 @@ Target: the release after the one carrying #1045 and #746.
 - [x] **M3** — Desktop pages written for every graduated desktop feature
 - [x] **M4** — Install page (absorbs #765)
 - [x] **M5** — Home page presents both clients
-- [ ] **M6** — Screenshots added across the docs via `cargo docs-screenshots`, with TUI | Desktop tabs for common features
+- [x] **M6** — Screenshots added across the docs via `cargo docs-screenshots`, with TUI | Desktop tabs for common features
 - [x] **M7** — Project-local skill for evaluating screenshots on docs changes
 - [ ] **M8** — Docs published (`publish-docs`)
 
@@ -308,3 +308,8 @@ The [Desktop feature inventory](#desktop-feature-inventory) was taken from `desk
 
 **For M6.** The committed desktop images (`dashboard-desktop.png`, `dashboard-empty-desktop.png`) show older labels than the code: "Agent overview", "Local deck", "DECKS" and "The deck is healthy…", where the code now says "Agent dashboard", "DAEMONS" and "The daemon is healthy…" (#1045). The page text follows the code; regenerating those images fixes the mismatch. The pages written here reference only the four existing images; the new scenarios are embedded in M6.
 
+### 2026-09-27 — M6: screenshots embedded
+
+Every image in the Docs plan's screenshot table is on its page. **Both clients, as TUI | Desktop tabs:** `new-agent` in getting-started's Basic workflow; `orchestration` in orchestration.md's "Starting an orchestration tab". **Single images:** `new-agent-desktop.png` on `desktop/new-agent.md`; `dashboard-fleet-desktop.png` (One section per daemon) and `agent-pane-desktop.png` (The agent pane) on `desktop/dashboard.md`; `settings-daemons-desktop.png` on `desktop/daemons.md` and in remote-environments' Desktop tab; `settings-voice-desktop.png` on `desktop/voice.md`; `schedules-tui.png` on `scheduled-tasks.md`; `help-tui.png` on `keyboard-shortcuts.md`. getting-started's Orchestration section, which is not tabbed, carries both `orchestration` images one after the other. `orchestration-tui.png` replaced the hand capture `orchestration-start.png` in both places it was used (getting-started and orchestration.md); the file stays in `site/static/img/` and no page references it now. The other hand captures stay. The `settings-daemons` image shows the form before **Test connection** is pressed, and its alt text says so, because a successful result is not reachable in fixture mode. `desktop/new-agent.md`'s `default_dir` link now points at `configuration.md#default-directory`. `npm run build` in `site/` passes.
+
+**M8** needs no separate step: `release.yml`'s `docs` job (`needs: [prepare, finalize]`, no `if:`) calls `docs-publish.yml` on every release run, and that workflow's `publish` job checks out `ref: main`. So M8 is delivered by the first release cut after this PRD's branch merges to `main`; `/publish-docs` is only for publishing sooner.

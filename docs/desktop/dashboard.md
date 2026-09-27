@@ -26,6 +26,8 @@ Each daemon being shown gets its own section, headed with its name and its own *
 
 Each group header shows how many agents it holds and how many of them are in each status, and the working directory most of its agents share; a row then shows its own directory only when it differs.
 
+![The Dashboard with two daemons, each in its own section with its own New agent button: Local daemon with four agents and a remote daemon, dev@build-box, with two; the DAEMONS counter reads 2/2 and the other counters add up the agents of both](/img/dashboard-fleet-desktop.png)
+
 ## Rows and columns
 
 By default a row shows **Status**, **Agent**, **Uptime** and **Working directory**. **Columns** adds or removes any of these:
@@ -63,7 +65,7 @@ Click a row, or its open control (`Open <name> agent`), to open that agent's liv
 
 Besides **Terminal**, the pane has **Diff**, **Checks**, **Delegations** and **Artifacts** tabs. The daemon does not provide that data today, so against a real daemon each of them says so (for example "Diff data is not exposed by the daemon").
 
-![An agent's full-window pane: the agent's name and status at the top with a close control, and below them the Terminal, Diff, Checks, Delegations and Artifacts tabs, with Terminal selected](/img/agent-pane-desktop.png)
+![An agent's full-window pane: the agent's name and status at the top with a close control, the Terminal, Diff, Checks, Delegations and Artifacts tabs below them, and the Terminal tab showing the agent's live output: the files it read and edited, a test run that passed, and its summary](/img/agent-pane-desktop.png)
 
 ## Closing agents and orchestrations
 
