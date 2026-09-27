@@ -1250,6 +1250,18 @@ pub struct AppState {
     /// See #401 for the underlying reason a status report cannot be trusted on
     /// identity alone: the hook socket is unauthenticated.
     pub untagged_status_panes: HashSet<String>,
+    /// Issue #447 (Qodo, #1347): per pane, the most recent hook sessions the
+    /// pane has genuinely moved past, newest last and at most
+    /// [`WAITING_SUPERSEDED_SESSIONS_KEPT`] of them. Written and read only by
+    /// [`Self::apply_event_watching_waiting`], so it is empty in the TUI.
+    ///
+    /// It exists because `pane_hook_session`'s timestamp cannot answer "is this
+    /// report from a conversation that is over?" on its own: a `SessionStart`
+    /// naming another session moves the pane whatever its producer clock says
+    /// (issue #424 D2), so an old session's delayed start and a new session's
+    /// early-stamped one look alike by time. By NAME they do not — the old one
+    /// is a session this pane has already left.
+    waiting_superseded_sessions: HashMap<String, VecDeque<String>>,
     /// Maps pane_id → orchestration role name (set when orchestration tab opens).
     pub pane_role_map: HashMap<String, String>,
     /// Maps pane_id → working directory for orchestration panes.
@@ -3128,6 +3140,14 @@ pub(crate) fn compose_worker_waiting_notice(
     ))
 }
 
+/// Issue #447: how many superseded hook sessions per pane
+/// [`AppState::apply_event_watching_waiting`] remembers. A report from a session
+/// further back than this reads as current; the cost of that is at most one
+/// wait closed early or one notice about a wait that has ended, and the pane
+/// would have to have been cleared this many times while such a report was in
+/// flight.
+const WAITING_SUPERSEDED_SESSIONS_KEPT: usize = 8;
+
 /// What [`AppState::apply_event`] did with one event — the answer issue #447's
 /// waiting-for-input watch needs and every other caller ignores (Qodo, #1347).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3215,27 +3235,48 @@ impl AppState {
         // A report from a hook session the pane has already moved past — the
         // same agent's conversation before a `/clear`, arriving late — is about
         // a conversation that is over, so it neither opens nor closes a wait
-        // (Qodo, #1347). Judged against the generation the pane held BEFORE the
-        // event, in `pane_hook_session`: the event is current only if it is not
-        // older than that generation, and it either names it or has just
-        // advanced the pane to a new one. The age test applies to the advancing
-        // case too, because a `SessionStart` naming another session moves the
-        // pane whatever its timestamp (issue #424 D2) — so a delayed start from
-        // before the `/clear` would otherwise pass for the new conversation. A
-        // pane with no generation yet has nothing to be stale against.
-        let from_current_generation = match &generation_before {
-            None => true,
-            Some((current, current_ts)) => {
-                event_timestamp >= *current_ts
-                    && (*current == event_session_id
-                        || self
-                            .pane_hook_session
-                            .get(&pane_id)
-                            .is_some_and(|(now, _)| *now == event_session_id))
-            }
-        };
+        // (Qodo, #1347). A session is "moved past" when it is one this watch
+        // has seen the pane leave (`waiting_superseded_sessions`), which is
+        // judged by name rather than by producer timestamp — see the field's
+        // doc for why time cannot tell the two cases apart. A report from the
+        // pane's current session that is older than the latest one it has
+        // made is stale in the same sense. Anything else is current, including
+        // a new session's start whatever its clock says, and a report on a pane
+        // with no generation yet.
+        let superseded = self
+            .waiting_superseded_sessions
+            .get(&pane_id)
+            .is_some_and(|sessions| sessions.contains(&event_session_id));
+        let from_current_generation = !superseded
+            && match &generation_before {
+                Some((current, current_ts)) if *current == event_session_id => {
+                    event_timestamp >= *current_ts
+                }
+                _ => true,
+            };
         if !from_current_generation {
             return;
+        }
+        // Remember the session a current report moved the pane off. A stale
+        // one that moved it — the old session's delayed start regressing the
+        // pane under #424 D2 — records nothing, so the genuine session it
+        // displaced is not mistaken for an old one.
+        if let Some((previous, _)) = &generation_before
+            && self
+                .pane_hook_session
+                .get(&pane_id)
+                .is_none_or(|(now, _)| now != previous)
+        {
+            let sessions = self
+                .waiting_superseded_sessions
+                .entry(pane_id.clone())
+                .or_default();
+            if !sessions.contains(previous) {
+                sessions.push_back(previous.clone());
+                if sessions.len() > WAITING_SUPERSEDED_SESSIONS_KEPT {
+                    sessions.pop_front();
+                }
+            }
         }
         let live_agent_id = registry.pane_current_agent_id(&pane_id);
         if self.pane_status(&pane_id) == Some(SessionStatus::WaitingForInput) {

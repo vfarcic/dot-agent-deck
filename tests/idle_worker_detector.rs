@@ -1709,7 +1709,7 @@ fn waiting_notices_for(snapshot: &str, role: &str) -> usize {
         .count()
 }
 
-/// Scenario: Delegate to seven workers of one orchestration and leave an eighth undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card, after which its own agent reports only informational events; `cleared-worker`'s agent starts a new hook session and waits in it, and then a delayed report and a delayed `session_start` from its old session arrive; `already-waiting-worker` was waiting before it was delegated to; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first four — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other four, then or after further waiting.
+/// Scenario: Delegate to eight workers of one orchestration and leave a ninth undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card, after which its own agent reports only informational events; `cleared-worker`'s agent starts a new hook session and waits in it, and then a delayed report and a delayed `session_start` from its old session arrive; `restarted-worker` waits and then genuinely starts a new hook session whose start carries an earlier timestamp; `already-waiting-worker` was waiting before it was delegated to; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first four — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other five, then or after further waiting.
 #[spec("scheduler/idle-worker/021")]
 #[test]
 fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() {
@@ -1731,6 +1731,7 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
                 ("repainted-worker", WORKER_COMMAND),
                 ("already-waiting-worker", WORKER_COMMAND),
                 ("cleared-worker", WORKER_COMMAND),
+                ("restarted-worker", WORKER_COMMAND),
             ],
             None,
         )
@@ -1744,6 +1745,7 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             "repainted-worker",
             "already-waiting-worker",
             "cleared-worker",
+            "restarted-worker",
         ] {
             harness.manage_worker_pane(role).await;
             harness.worker_event(role, "session_start").await;
@@ -1774,6 +1776,7 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
                 "repainted-worker",
                 "already-waiting-worker",
                 "cleared-worker",
+                "restarted-worker",
             ])
             .await;
         // Let the task pointers land before the workers start "asking".
@@ -1811,6 +1814,26 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             delayed.timestamp = before_clear;
             harness.ingest(delayed).await;
         }
+
+        // The converse: the restarted worker waits, then GENUINELY starts a new
+        // hook session whose producer clock reads earlier than its last report.
+        // The pane follows a new session's start whatever its timestamp (issue
+        // #424 D2), the wait is over, and it must not be reported (Qodo,
+        // #1347).
+        let restarted_agent = harness.worker_agent_ids["restarted-worker"].clone();
+        let before_wait = chrono::Utc::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        harness
+            .worker_event("restarted-worker", "waiting_for_input")
+            .await;
+        let mut restart = worker_hook_event(
+            "restarted-worker",
+            "session-restarted-worker-new",
+            "session_start",
+            Some(&restarted_agent),
+        );
+        restart.timestamp = before_wait;
+        harness.ingest(restart).await;
 
         harness
             .worker_event("idle-bystander", "waiting_for_input")
@@ -1981,6 +2004,13 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             waiting_notices_for(&settled, "finishing-worker"),
             0,
             "a worker whose work-done retired its delegation was still reported as waiting; \
+             snapshot = {settled:?}"
+        );
+        assert_eq!(
+            waiting_notices_for(&settled, "restarted-worker"),
+            0,
+            "a worker that started a new hook session after waiting was still reported, \
+             because the new session's start carried an earlier timestamp; \
              snapshot = {settled:?}"
         );
         assert_eq!(
