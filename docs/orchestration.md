@@ -3,6 +3,9 @@ sidebar_position: 5.5
 title: Orchestration
 ---
 
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
 # Orchestration
 
 Orchestrations are multi-agent pipelines where a designated **orchestrator** agent coordinates work across one or more **worker** agents. Each worker runs in its own pane, gets tasks injected into it, and signals completion back to the orchestrator — all automatically, through the daemon.
@@ -53,7 +56,7 @@ Delegation signals travel through the daemon: no messages are lost if you detach
 
 ## Quick setup
 
-The fastest way to get an orchestration config is to let an agent generate it from your project.
+The fastest way to get an orchestration config is to let an agent generate it from your project. Generating it is a TUI feature; the config it writes is used by both clients.
 
 ![The Generate .dot-agent-deck.toml dialog with Yes / No / Never options](./img/orchestration-generate-dialog.png)
 
@@ -69,6 +72,11 @@ To write the config by hand, use the [configuration reference](#configuration-re
 
 ## Starting an orchestration tab
 
+Both clients start an orchestration from their New agent flow, by choosing the orchestration as the **Mode**. The TUI opens it as an orchestration tab; the desktop app shows it as one group on its Dashboard.
+
+<Tabs groupId="client">
+<TabItem value="tui" label="TUI">
+
 Opening an orchestration tab uses the same `Ctrl+n` flow as a regular pane, but the **Mode** field selects an orchestration instead of a workspace mode.
 
 1. Press `Ctrl+n` to open the New Agent form.
@@ -80,9 +88,24 @@ A new tab opens with one pane per role. The role cards appear on the left sideba
 
 ![Orchestration tab on launch — five role cards in the sidebar, orchestrator pane active on the right](./img/orchestration-start.png)
 
+</TabItem>
+<TabItem value="desktop" label="Desktop">
+
+1. Open **New agent** from the Dashboard (or press `Ctrl+N` / `⌘N`) and choose the daemon.
+2. Browse to the project directory that contains your `.dot-agent-deck.toml` with an `[[orchestrations]]` block (it is tagged **project**) and press **Use this directory**.
+3. Under **Mode**, pick the `Orch: <name>` chip for the orchestration. There is no **Command** field: each role is launched with its own [`command`](#configuration-reference) from the config.
+4. Optionally type a **Name** for the run, then press **Activate orchestration**.
+
+The Dashboard shows the run as an **ORCHESTRATION** group with a row per role, numbered in role order, and an **ORCHESTRATOR** badge on the start role, the one you message. Click a role's row to open its terminal. The group's **Close** stops every role, after a confirmation that lists them (**Close all N roles**). See [Desktop app → Dashboard](desktop/dashboard.md) and [New agent](desktop/new-agent.md).
+
+</TabItem>
+</Tabs>
+
 An orchestration can also be started **in an isolated copy of the repository** rather than in your working tree, by asking a dispatcher pane for it — useful for running several orchestrations in parallel without them treading on each other. See [Dispatcher Mode](dispatcher-mode.md).
 
 ### Navigating the orchestration tab
+
+*This section and the next two are about the TUI's orchestration tab.*
 
 These require command mode — press `Ctrl+d` first if you are typing in a role pane:
 

@@ -5,6 +5,8 @@ title: Installation
 
 # Installation
 
+Agent Deck has two clients of one daemon: the terminal UI (the `dot-agent-deck` binary, which also contains the daemon and the CLI) and the [desktop app](desktop/index.md). Most of this page is the binary. The desktop app is a separate download, covered in [Desktop app](#desktop-app) below; on its own it does not start a daemon, so read [How the desktop app gets a daemon](#how-the-desktop-app-gets-a-daemon) before installing it.
+
 ## Platform Support
 
 | Platform | Status |
@@ -12,6 +14,7 @@ title: Installation
 | macOS (Intel & Apple Silicon) | Supported |
 | Linux (amd64 & arm64) | Supported |
 | Windows (via WSL) | Supported (runs as Linux) |
+| Desktop app | macOS on Apple Silicon (`.dmg`) and Linux amd64 (`.deb`), as an alpha. No Intel Mac, Linux arm64 or Windows build. See [Desktop app](#desktop-app). |
 | Windows (native) | Not yet — the daemon still reports `Unsupported` on Windows and there is no `.exe` in the release artifacts. Progress is tracked in [#164](https://github.com/vfarcic/dot-agent-deck/issues/164); comment there if you need this. |
 
 ## Choose an install method
@@ -167,11 +170,80 @@ The binary will be at `target/release/dot-agent-deck`.
 dot-agent-deck --help
 ```
 
+## Desktop app
+
+The desktop app is published with every release, beside the CLI binaries, as an **alpha**: the assets are named `dot-agent-deck-desktop-alpha-*` and are not covered by the support expectations of the CLI. It is a second client of the same daemon the TUI uses, not a replacement for the TUI; see [Desktop app](desktop/index.md) for what it does.
+
+| Platform | Asset | Signed |
+|---|---|---|
+| macOS, Apple Silicon | `dot-agent-deck-desktop-alpha-macos-arm64.dmg` | Signed with the project's Apple Developer ID and notarized by Apple, starting with v0.42.0 |
+| Linux, amd64 | `dot-agent-deck-desktop-alpha-linux-amd64.deb` | Unsigned |
+
+There is no desktop build for Intel Macs, Linux arm64 or Windows. Download from the [latest release](https://github.com/vfarcic/dot-agent-deck/releases/latest), and read that release's notes: they say whether its macOS build is signed, because a release whose signing credentials were missing ships an unsigned `.dmg` rather than none.
+
+### Verify the download
+
+Every release asset carries [build provenance](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations): proof that the file was produced by this repository's release workflow, from a named commit. Check it before installing, on either platform; for the unsigned `.deb` it is the only check anybody makes.
+
+```bash
+gh attestation verify dot-agent-deck-desktop-alpha-macos-arm64.dmg \
+  --repo vfarcic/dot-agent-deck \
+  --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml
+```
+
+Use the name of the file you downloaded. If it does not report a verified attestation from this repository's release workflow, do not install the file, and do not override any warning your OS raises about it.
+
+### macOS
+
+1. Open the `.dmg` and drag **Agent Deck** to **Applications**.
+2. Launch **Agent Deck** from Applications. macOS should ask only to confirm opening an app downloaded from the internet.
+
+If macOS instead reports the app as damaged or from an unidentified developer, do not override it; [report it](https://github.com/vfarcic/dot-agent-deck/issues). The `xattr` command the CLI binary may need is not needed for a signed `.dmg`.
+
+The app bundle carries its own copy of the `dot-agent-deck` binary, at `/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck`, and does not put it on your `PATH`. To have `dot-agent-deck` in a terminal, install the CLI too ([Homebrew](#homebrew-macos--linux) or [a binary](#download-binary)), at the same version as the app.
+
+### Linux
+
+```bash
+sudo apt install ./dot-agent-deck-desktop-alpha-linux-amd64.deb
+```
+
+`apt` pulls in the two libraries the package depends on, `libwebkit2gtk-4.1-0` and `libgtk-3-0`; `sudo dpkg -i` installs it too, but leaves missing dependencies for you to fix. The package is named `agent-deck`, adds **Agent Deck** to your desktop's application menu, and installs two programs: `/usr/bin/dot-agent-deck-desktop`, the app, and `/usr/bin/dot-agent-deck`, the same binary the CLI downloads provide. So after installing the `.deb`, `dot-agent-deck` is on your `PATH`, unless another copy (say in `~/.local/bin`) comes first. Check with `command -v dot-agent-deck` and `dot-agent-deck --version` which one you get.
+
+Launch it from the application menu, or run `dot-agent-deck-desktop`. Remove it with `sudo apt remove agent-deck`.
+
+### How the desktop app gets a daemon
+
+**The desktop app connects to a daemon; it does not start one.** Opened with no daemon running on this machine, it shows **Daemon disconnected** with a **Reconnect** button. (Starting and replacing a daemon from inside the app is behind the [`experimental` flag](desktop/index.md#features-behind-the-experimental-flag).) Start one in either of these ways, then press **Reconnect**:
+
+- **Run the TUI**, `dot-agent-deck`, in a terminal. It starts the daemon on this machine if none is running, as it always does (see [How it runs](#how-it-runs)). You can use both clients side by side.
+- **Run the daemon alone**, with `dot-agent-deck daemon serve`. It runs in the foreground of that terminal until you stop it with `Ctrl+C`. On macOS without a CLI install, run the app's own copy: `"/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck" daemon serve`.
+
+**The daemon does not stay up on its own.** It exits about 30 seconds after its last client disconnects when it has no agents and no enabled [schedules](scheduled-tasks.md) — and a daemon that has just started counts as idle too. What that means in practice:
+
+- While the desktop app is connected, it is a client, so the daemon stays up whatever else happens, and so it does while any agent is running.
+- A `daemon serve` that nothing connects to within those 30 seconds exits. Open the app (or press **Reconnect**) promptly, or start it with the timer off: `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 dot-agent-deck daemon serve`. `0` keeps the daemon up until it is stopped.
+- If you started the daemon with the TUI and then quit the TUI with **Detach**, the daemon stays up while the desktop app is connected or any agent is running, and otherwise exits 30 seconds later. Quitting the TUI with **Stop** shuts the daemon down, and the desktop app then shows **Daemon disconnected**.
+- When you quit the desktop app, the same rule applies: agents keep running, and a daemon with none exits 30 seconds after its last client leaves.
+
+The app finds the daemon at the same default address the TUI uses. If you point the TUI at another socket with `DOT_AGENT_DECK_ATTACH_SOCKET`, launch the app with the same variable in its environment. A **remote** daemon must also already be running on its host; the desktop app reaches it over ssh and does not install or start it. See [Desktop app → Daemons](desktop/daemons.md#what-a-remote-daemon-must-already-have).
+
+Whichever way it starts, the daemon installs the agent hooks on startup, so agents started from the desktop app report their status like any other (see [Troubleshooting → Hooks](troubleshooting.md#hooks)).
+
+### Keep the app and the daemon on the same release
+
+The desktop app checks the daemon's build when it connects. A daemon from another release, such as one started by a Homebrew CLI you have not upgraded, can show **Incompatible daemon** on the Dashboard instead of your agents:
+
+- When the two builds speak the same protocol and only their build stamps differ, the note says so, and **Connect anyway** connects for the rest of that session.
+- When the protocols differ, the app cannot read that daemon at all. Upgrade whichever side is older and restart the daemon with the matching binary: `dot-agent-deck daemon restart`, then start it again with the TUI or `daemon serve`. The [daemon's refusal guards](#recycling-the-local-daemon) apply.
+
+So upgrade the CLI and the desktop app together.
+
 ## How it runs
 
 The first time you run `dot-agent-deck`, the binary auto-spawns a small per-user background daemon and connects to it over a Unix socket (under `$XDG_RUNTIME_DIR` when available, otherwise a per-uid path in `/tmp`). The same daemon is used for both local and remote (`dot-agent-deck connect`) sessions; there is no separate "local mode".
 
-The daemon outlives the TUI: detach the deck, your agents keep running, reattach later and they're still there. About 30 seconds after the TUI has detached *and* every managed agent is gone, the daemon exits on its own. Set `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` to override the window (`0` keeps it up indefinitely).
+The daemon outlives the TUI: detach the deck, your agents keep running, reattach later and they're still there. The desktop app is another client of the same daemon. About 30 seconds after every client has disconnected *and* every managed agent is gone (and no enabled schedule is registered), the daemon exits on its own. Set `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` to override the window (`0` keeps it up indefinitely).
 
 ## Upgrading
 

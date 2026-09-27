@@ -5,7 +5,11 @@ title: Troubleshooting
 
 # Troubleshooting
 
+Most of this page applies to both clients, the TUI and the [desktop app](desktop/index.md), because the problems live in the daemon or the agents they share. A section that applies to only one client says so under its heading. For a desktop app that shows **Daemon disconnected**, see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon).
+
 ## Shift+Enter Submits Instead of Inserting a Newline
+
+*Applies to the TUI.*
 
 Inside an embedded agent pane, **Shift+Enter** inserts a newline into the agent's draft and plain **Enter** submits it — the same behavior you get running the agent directly. This works with **no terminal configuration** on any terminal that implements the enhanced ("kitty") keyboard protocol, which the deck negotiates for you at startup.
 
@@ -28,7 +32,7 @@ Hooks are **auto-installed on every startup** — most users never need to think
 
 Auto-install is idempotent and best-effort — if an agent directory is missing the step is silently skipped, and errors are logged without blocking startup.
 
-The daemon half is what covers the desktop app: it starts only the daemon bundled inside it, never a dashboard, so a machine with the desktop app and no CLI installed gets the same hooks as one running the dashboard. Where there is no CLI install to point at, those hooks name the daemon bundled in the app, so moving or deleting the app leaves them pointing at nothing until the deck next starts and repairs them (below). The install runs when the daemon **starts**, so after upgrading the desktop app from a version that did not install these hooks, a daemon still running from before the upgrade keeps serving the app without them; they appear the next time the daemon starts.
+The daemon half is what covers the desktop app: the app never starts a dashboard, and the daemon it connects to installs the hooks whichever way that daemon was started (see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)), so a machine with the desktop app and no CLI installed gets the same hooks as one running the dashboard. When that daemon is the copy bundled in the app and there is no CLI install to point at, those hooks name the daemon bundled in the app, so moving or deleting the app leaves them pointing at nothing until the deck next starts and repairs them (below). The install runs when the daemon **starts**, so after upgrading the desktop app from a version that did not install these hooks, a daemon still running from before the upgrade keeps serving the app without them; they appear the next time the daemon starts.
 
 ### A hook fails with `not found` and names a path you never typed
 
@@ -238,6 +242,8 @@ There is no in-place recovery for a pane that is already orphaned — re-dispatc
 
 ## A pane says "disconnected" and ignores what you type
 
+*Applies to the TUI.*
+
 A pane whose title ends in `— disconnected` is no longer connected to an agent. Its last output stays on screen so you can read what happened, but the pane cannot accept input again — typing into it reports that it is disconnected rather than sending anything. Close the pane and start a new one; there is nothing to recover in place.
 
 The deck reaches this state only after it has already tried to reconnect and failed. When an agent goes away — a crash, an external `kill`, or a restart that never comes back — the deck looks the agent up again and re-attaches, which is what makes a normal respawn invisible to you. It gives up in two cases, and the status message tells you which:
@@ -308,6 +314,8 @@ Switching between the desktop app and a TUI that show the same agent changes its
 The agent's own output fills the history back in as it keeps working.
 
 ## The deck is missing cards — a role or agent I know is running has no card
+
+*Applies to the TUI.*
 
 Check the deck's title row first. If it reads something like `dot-agent-deck — 7 agent(s)  (↓2)`, nothing is wrong with the agents: the count is right, and the `(↓2)` says two cards are below the bottom of the window. `(↑2)` means two are above it, and both appear together when you are scrolled into the middle. Move the selection with `j` / `k` (or the arrow keys) to bring them into view, or give the terminal a few more rows and they all fit again.
 

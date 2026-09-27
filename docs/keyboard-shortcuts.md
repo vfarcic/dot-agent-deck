@@ -5,6 +5,8 @@ title: Keyboard Shortcuts
 
 # Keyboard Shortcuts
 
+Everything on this page is the TUI's. The desktop app has a few shortcuts of its own, listed on [Desktop app → Settings](desktop/settings.md#keyboard-shortcuts), and `keybindings.toml` does not affect it.
+
 ## Mouse
 
 Every keyboard action below is also reachable with the mouse. Every clickable control shows its keyboard shortcut inline, so the on-screen controls double as a legend. On a dashboard card, a single click selects it and a double click focuses its pane.
