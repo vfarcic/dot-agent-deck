@@ -523,6 +523,141 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the dot animation frame.
 - **Platform coverage:** mac+linux+windows.
 
+##### status/badge/002 — A quota-blocked card visibly names its depleted credits and uses the error colour (issue #714).
+- **Layer:** L1 (ratatui buffer with an insta snapshot).
+- **Agent:** none (a fixed structured `CreditsDepleted` session fixture).
+- **Asserts:** Blocked badge, credits reason line, and red border on the rendered card.
+- **Does not assert:** the daemon's quota classifier or a live agent.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/badge/003 — A blocked card shows when a provider says the limit resets (issue #714).
+- **Layer:** L1 (ratatui buffer with a fixed render clock).
+- **Agent:** none (a fixed structured usage-limit reason).
+- **Asserts:** the reason line says the usage limit resets in two hours and ten minutes; a reset at `i64::MIN` or `i64::MAX` still renders the reason, with no countdown and no panic.
+- **Does not assert:** provider classification or a live agent.
+- **Platform coverage:** mac+linux+windows.
+
+#### status/blocked
+
+##### status/blocked/005 — A structured quota block remains sticky until genuine work resumes (issue #714).
+- **Layer:** L1 unit (src/state.rs).
+- **Agent:** none.
+- **Asserts:** Blocked stores its kind and optional reset, survives Idle and Error, ignores Claude idle_prompt, and clears on a genuine prompt or tool event.
+- **Does not assert:** a provider's structured payload or a live card.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/006 — Producer quota events are admitted and normalised (issue #714).
+- **Layer:** L1 unit (src/daemon.rs).
+- **Agent:** none.
+- **Asserts:** an inbound quota_blocked reaches state while daemon-only source, invalid reset and unrelated quota metadata are stripped.
+- **Does not assert:** a provider hook or live PTY.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/007 — Older readers decode Blocked safely and its wire form stays a unit variant (issue #714).
+- **Layer:** L1 unit (src/state.rs).
+- **Agent:** none.
+- **Asserts:** an older reader maps Blocked to Unknown, while current serialization keeps Blocked as a bare string.
+- **Does not assert:** a full mixed-version daemon connection.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/010 — Claude StopFailure distinguishes quota, depleted credits and transient API errors (issue #714).
+- **Layer:** L1 unit (src/quota_signals.rs).
+- **Agent:** none.
+- **Asserts:** the final assistant transcript record and StopFailure error kind classify a rejected quota with reset, credit depletion, transient 429 and unrelated API errors.
+- **Does not assert:** installed hooks or a live agent.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/011 — Claude installs StopFailure and maps each failure to a terminal status (issue #714).
+- **Layer:** L1 unit (src/hook.rs and src/hooks_manage.rs).
+- **Agent:** none.
+- **Asserts:** installation retains other hooks; StopFailure maps to Blocked or Error; notification type is forwarded; unsafe transcript paths are refused; the bounded tail drops a first line its window cut but keeps a quota record that starts exactly at the window edge.
+- **Does not assert:** a real Claude session.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/012 — Codex rollout classification only blocks an armed matching turn (issue #714).
+- **Layer:** L1 unit (src/quota_signals.rs).
+- **Agent:** none.
+- **Asserts:** task_complete with usage_limit_exceeded uses the matching token_count kind; wrong turns, other errors and healthy has_credits:false do not block.
+- **Does not assert:** daemon polling or a real Codex session.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/013 — Codex rollout tailing is bounded and path safe (issue #714).
+- **Layer:** L1 unit (src/codex_rollout_tail.rs).
+- **Agent:** none.
+- **Asserts:** an armed regular rollout file reports its matching failure once, malformed or oversized lines are bounded, and a dead owner drops the tailer. The FIFO and symlink refusal checks run on Unix only.
+- **Does not assert:** a live Codex process.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/014 — OpenCode blocks only on exact provider error markers (issue #714).
+- **Layer:** L1 unit (src/quota_signals.rs and src/hook.rs).
+- **Agent:** none.
+- **Asserts:** structured quota and credit markers block; a bare 429, unsupported model and non-JSON response do not.
+- **Does not assert:** the generated plugin runs.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/016 — The OpenCode plugin forwards only selected structured error fields (issue #714).
+- **Layer:** L1 unit (src/opencode_manage.rs; Node stand-in).
+- **Agent:** none.
+- **Asserts:** session.error forwards typed fields, allow-listed headers and, instead of the provider body, only the body's classifier marker keys (`type`/`name`, and `error.type`/`code`/`name`/`resets_at`/`resets_in_seconds`), parsed from the whole body. The body is over 8 KiB with its marker after a long message, and the recorded payload classifies as `QuotaBlocked` through `build_opencode_event` — the regression Qodo found on PR #1346, where an 8 KiB truncation made such a body invalid JSON and it classified as `Error`.
+- **Does not assert:** a real OpenCode process.
+- **Platform coverage:** mac+linux when Node is available (the recorder is a Unix shell script).
+
+##### status/blocked/017 — Claude StopFailure blocks a live card, and work clears it (issue #714).
+- **Layer:** L2, lane 1, PTY-attached.
+- **Agent:** synthetic Claude executable reading the deck-installed hook; no provider credential.
+- **Asserts:** rejected quotaLimits yields a Blocked card and daemon status with a reset reason; UserPromptSubmit clears it. A transient 429 ends in Error.
+- **Does not assert:** a real quota-exhausted account.
+- **Platform coverage:** mac+linux.
+
+##### status/blocked/018 — A launcher-started Codex rollout blocks its card (issue #714).
+- **Layer:** L2, lane 1, PTY-attached.
+- **Agent:** synthetic Codex executable using installed hooks and writing rollout JSONL; no provider credential.
+- **Asserts:** a matching task_complete error yields Credits Blocked in the card and daemon status.
+- **Does not assert:** a real Codex API request.
+- **Platform coverage:** mac+linux.
+
+##### status/blocked/019 — OpenCode's plugin blocks on a marker, not a bare 429 (issue #714).
+- **Layer:** L2, lane 1, PTY-attached.
+- **Agent:** two synthetic OpenCode panes loading the installed plugin under Node; no provider credential.
+- **Asserts:** the marked error yields Blocked and the bare 429 yields Error.
+- **Does not assert:** a real OpenCode API request.
+- **Platform coverage:** mac+linux when Node is available.
+
+##### status/blocked/021 — Restart clears a Claude card blocked through StopFailure (issue #714).
+- **Layer:** L2, lane 1, PTY-attached.
+- **Agent:** synthetic Claude executable using the installed hook; no provider credential.
+- **Asserts:** pane restart gives the replacement worker a non-Blocked card.
+- **Does not assert:** account quota recovery.
+- **Platform coverage:** mac+linux.
+
+##### status/blocked/022 — A real Claude API failure ends as Error (issue #714).
+- **Layer:** L2, lane 2, PTY-attached (`tests/e2e_quota_blocked_live.rs`).
+- **Agent:** real interactive Claude Code with a retired model that the provider rejects; developer credentials required.
+- **Asserts:** a submitted prompt produces an Error event and a rendered Error card rather than leaving Thinking or showing Blocked.
+- **Does not assert:** a real quota-exhausted account.
+- **Platform coverage:** mac+linux.
+
+##### status/blocked/023 — A real OpenCode API failure ends as Error (issue #714).
+- **Layer:** L2, lane 2, PTY-attached (`tests/e2e_quota_blocked_live.rs`).
+- **Agent:** real interactive OpenCode with a listed model that this account's provider rejects with HTTP 400; developer credentials required.
+- **Asserts:** a submitted prompt produces an Error event through the installed plugin and a rendered Error card, never Blocked.
+- **Does not assert:** a real quota-exhausted account.
+- **Platform coverage:** mac+linux.
+
+##### status/blocked/024 — A subagent's events neither lift a Blocked card nor leave it stranded (issues #714, #1354).
+- **Layer:** L1 unit (src/state.rs).
+- **Agent:** none.
+- **Asserts:** a Blocked card stays Blocked, with its reason, through a subagent's SubagentStart, ToolStart, ToolEnd and SubagentStop (none of which is work evidence), and a main-thread ToolStart still lifts it to Working.
+- **Does not assert:** a real Claude Code or Codex subagent; the hook CLI mapping a subagent's `StopFailure` to `SubagentStop` (a plain unit test in `src/hook.rs`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/blocked/025 — Subagent hooks leave a quota-blocked Claude card Blocked (issues #714, #1354).
+- **Layer:** L2, lane 1, PTY-attached.
+- **Agent:** synthetic Claude executable using the installed hook; no provider credential.
+- **Asserts:** a rejected-quota StopFailure blocks the attached card and daemon status; subagent-tagged tool and stop hooks, including a billing-error StopFailure, leave both Blocked with the Usage reason; a main-thread prompt clears it.
+- **Does not assert:** a real quota-exhausted account or a real Claude subagent.
+- **Platform coverage:** mac+linux.
+
 #### status/agent-event
 
 ##### status/agent-event/001 — A `dot-agent-deck agent-event --type <state>` frame routes into the existing `AgentEvent` stream and drives the target pane's card status, with NO hook and no `settings.json` mutation (PRD #201 M1.2/M1.3).
@@ -3260,6 +3395,20 @@ without depending on the config struct API.
 - **Does not assert:** the other two facts that can refuse a recovery (S, no resolvable launch identity; T, a producer whose `SessionStart` follows its first prompt rather than preceding it) — both are unit-tested against `AgentStartRearm` directly, and T's population is why no Codex or OpenCode worker reaches this path at all; that a `/clear` inside a live worker is a scenario anyone has measured in production.
 - **Platform coverage:** mac+linux (unix-only, with the rest of this file).
 
+##### orchestration/delegate/037 — Delegation to a blocked worker warns but still delivers (issue #714).
+- **Layer:** L2, lane 1, PTY-attached.
+- **Agent:** synthetic Claude stand-in sending the deck-installed StopFailure hook; no provider credential.
+- **Asserts:** after the worker becomes Blocked, `delegate --to worker` exits 0, warns that it appears BLOCKED, its task pointer reaches the worker PTY, and the orchestrator receives exactly one blocked-worker notice for that new delegation (the block was published before the delegation existed).
+- **Does not assert:** whether the quota-bound agent can actually complete the task.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/038 — The delegate verdict reports blocked delivered and busy workers without agent detail (issue #714).
+- **Layer:** L1 unit (`src/main.rs`).
+- **Agent:** none.
+- **Asserts:** a blocked delivered role still exits successfully with a warning, a blocked busy role is named, and neither warning exposes agent-controlled detail.
+- **Does not assert:** actual pointer delivery or the worker's ability to complete it.
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
@@ -5955,6 +6104,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** three delegated workers each have their agent replaced in the pane by a successor that reports `WaitingForInput` and is delegated to again, which opens its episode on the already-waiting path. For two of them a hook event from the REPLACED agent enters `ingest_event` first and is held on the state lock until the replacement has happened — on a current-thread runtime, so "it has passed everything before the lock" is a fact of the schedule rather than of a sleep. `overwritten-worker`'s stale event is `waiting_for_input`; `cancelled-worker`'s is `thinking`, sent after an untagged report repainted the successor's card off the waiting status. The orchestrator receives exactly one waiting-for-input notice about each successor, and `control-worker`, replaced the same way with no stale event, is the control that shows the successor's notice is produced at all.
 - **Verified load-bearing:** red on the pre-fix code (the pane's live agent read before the state lock, and a rejected event still reaching the episode logic) with no notice for `overwritten-worker` or `cancelled-worker` and one for `control-worker`. The two halves of the fix are each sufficient on their own for these interleavings — green with only the admission gate (a rejected event touches no episode), green with only the live agent read under the state lock — and red with both removed.
 - **Does not assert:** a SUCCESSOR's own admitted report arriving while the pane's owner is being read — the window between a spawn reserving the new generation and publishing it, which no test seam can hold open; the under-lock read covers it for a successor published by the time the event is applied, and one still unpublished then opens no episode until its next report. Also not asserted: the registry-level scoping of a cancel to the episode's own agent (`agent_pty::spawn_tests::waiting_notice_episode_is_one_per_generation_and_cancellable`); a `clear = true` delegate performing the replacement itself, which this test does by hand to control the ordering; and the rendering in an attached TUI.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/024 — A blocked worker with an outstanding delegation notifies the orchestrator once without retiring the ledger (issue #714).
+- **Layer:** L2, lane 1, PTY-attached; the notice and ledger require the running daemon path.
+- **Agent:** synthetic Codex stand-in that announces its rollout through installed hooks and appends a structured task failure; no provider credential.
+- **Asserts:** one fixed blocked-worker report reaches the orchestrator pane with the worker pane id, no agent-controlled detail, and a second delegate remains busy because work-done is still owed. The report is SUBMITTED, as #708 made its worker-exited sibling: the single byte after its stable final clause (`daemon log names the role.`) is CR, not LF — exact because the orchestrator stand-in runs `cat` under `stty -echo -icanon -icrnl -opost` before its readiness marker. Verified red with the delivery on `write_notice_guarded` (`Some(10)`). The release of its payload record on `Applied`, so a byte-identical report for a later delegation is still submitted after user input, is pinned by the `agent_pty` unit test `worker_blocked_report_is_submitted_and_resubmits_after_user_input`, verified red with that settle call removed.
+- **Does not assert:** eventual worker completion or provider quota reset.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live

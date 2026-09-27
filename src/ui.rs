@@ -18378,6 +18378,12 @@ fn render_stats_bar(
             "error",
             Style::default().fg(palette::status_color(&SessionStatus::Error)),
         ),
+        // Issue #714: shown only when non-zero, like every segment here.
+        (
+            stats.blocked,
+            "blocked",
+            Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
+        ),
         (stats.idle, "idle", text_primary()),
     ];
 
@@ -21362,6 +21368,45 @@ fn render_session_card(
         )));
     }
 
+    // Issue #714: say WHY a card is Blocked, directly under `Dir:` for the same
+    // reason as the orphaned line — it is the fact that explains everything
+    // else on the card. The label is fixed daemon-authored text keyed on the
+    // kind, followed by when the provider said the limit resets (measured
+    // against the same `now` as `Last:`, shown only for a reset inside the
+    // window the daemon admits, and placed before the detail so a
+    // narrow card truncates the detail first); the detail is the agent's own
+    // error message, already scrubbed at every point it was stored
+    // (`apply_event`, `overlay_snapshot_fields`).
+    if !is_placeholder && session.status == SessionStatus::Blocked {
+        let reason = session.blocked.as_ref();
+        let label = reason
+            .map(|r| r.kind)
+            .unwrap_or(crate::state::BlockedKind::Unknown)
+            .label();
+        let now_ms = now.timestamp_millis();
+        let resets = reason
+            .and_then(|r| r.resets_at_ms)
+            .filter(|&at| crate::quota_block::reset_at_is_plausible(at, now_ms))
+            .and_then(|at| at.checked_sub(now_ms))
+            .and_then(|ms| u64::try_from(ms).ok())
+            .filter(|&ms| ms > 0)
+            .map(|ms| {
+                format!(
+                    " · resets in {}",
+                    crate::state::format_idle_elapsed(std::time::Duration::from_millis(ms))
+                )
+            })
+            .unwrap_or_default();
+        let text = match reason.and_then(|r| r.detail.as_deref()) {
+            Some(detail) => format!("⚠ {label}{resets} — {detail}"),
+            None => format!("⚠ {label}{resets}"),
+        };
+        lines.push(Line::from(Span::styled(
+            truncate_with_ellipsis(&text, w),
+            Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
+        )));
+    }
+
     if is_placeholder {
         lines.push(Line::from(Span::styled(
             "Launch an agent to get started",
@@ -21460,6 +21505,8 @@ fn status_style(status: &SessionStatus) -> (&str, Style) {
         SessionStatus::WaitingForInput => ("Needs Input", style.add_modifier(Modifier::BOLD)),
         SessionStatus::Idle => ("Idle", style),
         SessionStatus::Error => ("Error", style),
+        // Issue #714: bold like "Needs Input" — a person has to act.
+        SessionStatus::Blocked => ("Blocked", style.add_modifier(Modifier::BOLD)),
         // PRD #162 forward-compat: an unknown wire status renders with the
         // neutral idle label/color so a future daemon's status never shows as
         // a misleading active state on an older TUI.
@@ -22193,6 +22240,7 @@ pub fn render_orchestration_frame_to_buffer(
                 agent_type: AgentType::ClaudeCode,
                 cwd: None,
                 status: SessionStatus::Idle,
+                blocked: None,
                 active_tool: None,
                 started_at: last_activity,
                 last_activity,
@@ -22983,6 +23031,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 agent_type: AgentType::ClaudeCode,
                 cwd: None,
                 status: SessionStatus::Idle,
+                blocked: None,
                 active_tool: None,
                 started_at: last_activity,
                 last_activity,
@@ -24917,6 +24966,7 @@ mod tests {
                 agent_type: AgentType::ClaudeCode,
                 cwd: None,
                 status: crate::state::SessionStatus::Idle,
+                blocked: None,
                 active_tool: None,
                 started_at: Utc::now(),
                 last_activity: Utc::now(),
@@ -28291,6 +28341,7 @@ mod tests {
             agent_type: AgentType::ClaudeCode,
             cwd: None,
             status: crate::state::SessionStatus::Idle,
+            blocked: None,
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
@@ -31071,6 +31122,7 @@ mod tests {
             agent_type: AgentType::ClaudeCode,
             cwd: Some("/home/dev/x".to_string()),
             status: SessionStatus::Working,
+            blocked: None,
             active_tool: None,
             started_at: now,
             last_activity: now,
@@ -32011,6 +32063,7 @@ mod tests {
             agent_type: AgentType::ClaudeCode,
             cwd: None,
             status,
+            blocked: None,
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
@@ -32359,6 +32412,7 @@ mod tests {
             agent_type: AgentType::ClaudeCode,
             cwd: None,
             status: SessionStatus::Idle,
+            blocked: None,
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
@@ -32395,6 +32449,7 @@ mod tests {
             agent_type: AgentType::ClaudeCode,
             cwd: None,
             status: SessionStatus::Idle,
+            blocked: None,
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
@@ -32422,6 +32477,7 @@ mod tests {
             agent_type: AgentType::ClaudeCode,
             cwd: None,
             status: SessionStatus::Idle,
+            blocked: None,
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),

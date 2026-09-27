@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -2589,7 +2589,17 @@ pub struct RunningAgent {
     /// deliberately-closed/respawned one since its whole entry is removed
     /// before this could ever be set.
     pub crashed: Option<bool>,
+    /// Issue #714: the epoch of the provider quota block this agent last
+    /// reported ([`AgentPtyRegistry::note_quota_block`]), until its next work
+    /// evidence lifts it ([`AgentPtyRegistry::quota_note_work_event`]). `None`
+    /// while the agent is not blocked. Per record, so a respawn — a new record —
+    /// starts unblocked.
+    pub quota_block: Option<u64>,
 }
+
+/// Issue #714: the source of [`RunningAgent::quota_block`] epochs. Only
+/// uniqueness matters, so one process-wide counter serves every registry.
+static QUOTA_BLOCK_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 impl RunningAgent {
     /// PRD #386 M3: `true` when this pane's PTY child has a transitive
@@ -3631,6 +3641,8 @@ pub struct AgentPtyRegistry {
     /// pass covered. A `focus-gained` handler waits here for its own claim's
     /// number before answering `ok`.
     focus_applied: tokio::sync::watch::Sender<u64>,
+    /// Issue #714: see [`Self::codex_rollout_arms`].
+    codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms,
 }
 
 /// PRD #1105 — the shortest gap between two focus passes, and so the bound on
@@ -4232,6 +4244,23 @@ pub struct OutstandingDelegation {
     /// this way, an unbound record simply falls through to its own timer
     /// instead of being drained by a stranger's death.
     worker_agent_id: Option<String>,
+    /// Issue #714: whether this delegation's worker has already been reported
+    /// to the orchestrator as blocked by a provider usage limit
+    /// ([`AgentPtyRegistry::claim_worker_blocked_notice`]). Once per record, so a
+    /// block that is lifted by a work event and reported again does not
+    /// re-notify the same delegation; a new delegation is a new record. A claim
+    /// whose write was refused, with nothing written, is released
+    /// ([`AgentPtyRegistry::release_worker_blocked_notice`]), so the notice
+    /// stays owed for a later block of the same delegation.
+    blocked_reported: bool,
+    /// Issue #714 (review): the task delivering this record's claimed
+    /// blocked-worker notice, while it may still be waiting on the
+    /// orchestrator's pane writer. Dropping it — the record superseded or
+    /// retired, or a newer notice task of this record taking its place —
+    /// cancels that task if it has not yet begun its write
+    /// ([`BlockedNoticeWaiter`]), so a stalled orchestrator writer holds at most
+    /// one queued notice per worker pane instead of one per delegation.
+    blocked_notice_waiter: Option<BlockedNoticeWaiter>,
     /// PRD #126 M1 review (finding 2) / audit (finding 3): the live end of the
     /// watch task's cancellation channel. Never *sent* on — the watch task
     /// selects on it and exits as soon as it resolves, which happens when this
@@ -4262,6 +4291,86 @@ pub struct PaneOrchestration {
     pub cwd: Option<String>,
 }
 
+/// Issue #714 (review): where a blocked-worker notice task stands, so it is
+/// cancelled only while nothing of it can have reached the orchestrator.
+///
+/// `WAITING` until the task, holding the orchestrator's pane writer, has passed
+/// every re-check and is about to write; it then moves to `WRITING` and can no
+/// longer be cancelled. A cancel wins only from `WAITING`, and a task that finds
+/// itself cancelled at its write-time re-check refuses the write, so the two
+/// can never both proceed: either the write happens in full or none of it does.
+#[derive(Debug, Default)]
+struct BlockedNoticeGate(AtomicU8);
+
+impl BlockedNoticeGate {
+    const WAITING: u8 = 0;
+    const WRITING: u8 = 1;
+    const CANCELLED: u8 = 2;
+
+    /// Called writer-held, as the last re-check before the write: `false` once
+    /// the task has been cancelled.
+    fn begin_write(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::WAITING,
+                Self::WRITING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// `true` when the task had not begun its write and now never will.
+    fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::WAITING,
+                Self::CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+}
+
+/// Issue #714 (review): the handle an [`OutstandingDelegation`] keeps on the
+/// task delivering its blocked-worker notice. Dropping it aborts that task if
+/// it is still waiting — on the orchestrator's writer, or anywhere before its
+/// write-time re-check — and leaves it alone once it may be writing.
+///
+/// Nothing needs releasing on a cancel: the waiter is dropped only when its
+/// record is superseded or retired, taking the claim flag with it, or when a
+/// newer notice task of the SAME record replaces it — which could claim only
+/// because this task had already released its claim. So the cancelled task's
+/// claim is never the one keeping the delegation's notice owed.
+#[derive(Debug)]
+struct BlockedNoticeWaiter {
+    gate: Arc<BlockedNoticeGate>,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for BlockedNoticeWaiter {
+    fn drop(&mut self) {
+        if self.gate.cancel() {
+            self.task.abort();
+        }
+    }
+}
+
+/// Issue #714: what [`AgentPtyRegistry::claim_worker_blocked_notice`] hands back
+/// — where the notice goes and how to authorize it, and the role for the log.
+#[derive(Debug, Clone)]
+pub struct WorkerBlockedNotice {
+    /// The claimed delegation record's generation, so a refused write releases
+    /// the claim on that record and never on a successor
+    /// ([`AgentPtyRegistry::release_worker_blocked_notice`]).
+    pub seq: u64,
+    pub role: String,
+    pub orchestrator_pane_id: String,
+    pub orchestrator_agent_id: String,
+    pub orchestration: Option<crate::state::OrchestrationIdentity>,
+}
+
 /// PRD #126: handed back by [`AgentPtyRegistry::arm_outstanding_delegation`] to
 /// the caller that spawns the watch task: the record's generation (proof of
 /// ownership for the seq-conditional take) and the cancellation channel the
@@ -4285,8 +4394,11 @@ pub enum DelegationRetirement {
     /// pane was re-delegated to before it answered. Issue #1080: those older
     /// generations are dropped rather than carried forward as debt, so this is
     /// the only non-`Nothing` outcome a `work-done` can have.
+    ///
+    /// The record is boxed so this common `Nothing`-returning call does not
+    /// carry the whole record inline (clippy `large_enum_variant`).
     Retired {
-        delegation: OutstandingDelegation,
+        delegation: Box<OutstandingDelegation>,
         superseded_dropped: u32,
     },
 }
@@ -4840,7 +4952,16 @@ impl AgentPtyRegistry {
             focus_claims: Mutex::new(FocusClaims::default()),
             focus_pass: Mutex::new(()),
             focus_applied: tokio::sync::watch::Sender::new(0),
+            codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms::default(),
         }
+    }
+
+    /// Issue #714: the queue through which the daemon's hook loop asks its
+    /// Codex rollout monitor to arm or disarm a tailer
+    /// (`crate::codex_rollout_tail`). Held here because the registry is the one
+    /// object both already share.
+    pub fn codex_rollout_arms(&self) -> &crate::codex_rollout_tail::CodexRolloutArms {
+        &self.codex_rollout_arms
     }
 
     /// Record the hook-ingestion socket the owning daemon bound, so
@@ -4955,6 +5076,8 @@ impl AgentPtyRegistry {
                 armed_at: Instant::now(),
                 superseded,
                 worker_agent_id: None,
+                blocked_reported: false,
+                blocked_notice_waiter: None,
                 _watch_cancel: cancel_tx,
             },
         );
@@ -5755,7 +5878,7 @@ impl AgentPtyRegistry {
         };
         DelegationRetirement::Retired {
             superseded_dropped: delegation.superseded,
-            delegation,
+            delegation: Box::new(delegation),
         }
     }
 
@@ -7458,6 +7581,8 @@ impl AgentPtyRegistry {
             spawned_at: Some(spawned_at),
             // Issue #868: a fresh spawn hasn't exited yet, natural or not.
             crashed: None,
+            // Issue #714: a fresh agent has reported no quota block.
+            quota_block: None,
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -8560,6 +8685,9 @@ impl AgentPtyRegistry {
             // child hasn't crashed, and `spawn_agent` initializes its own
             // entry to `None` regardless.
             crashed: _,
+            // Issue #714: dropped — a respawned agent starts unblocked, and its
+            // next quota failure reports afresh.
+            quota_block: _,
         } = removed;
 
         // Drop this reference to the writer Arc; the slave half closes
@@ -9631,6 +9759,422 @@ impl AgentPtyRegistry {
         Ok((agent.bus.snapshot(), agent.pty_rows, agent.pty_cols))
     }
 
+    /// Issue #714: mint a new quota-block epoch for `agent_id` and latch it on
+    /// that agent's record — but only while `agent_id` is the live owner of
+    /// `pane_id`. The epoch identifies THIS report of a block, so a notice
+    /// claimed for it ([`Self::spawn_worker_blocked_notice`]) can tell whether
+    /// the block it describes still stands when it is written. `None` when the
+    /// agent is not the pane's live owner.
+    ///
+    /// Called by the daemon under its `AppState` write lock, the same lock
+    /// [`Self::quota_note_work_event`] is called under, so a work event and a
+    /// block are applied to the latch in the order they are applied to the card.
+    pub fn note_quota_block(&self, pane_id: &str, agent_id: &str) -> Option<u64> {
+        let epoch = QUOTA_BLOCK_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        self.with_owner_quota_latch(pane_id, agent_id, |latch| *latch = Some(epoch))
+            .map(|()| epoch)
+    }
+
+    /// Issue #714: record work evidence ([`crate::quota_block::is_work_evidence`])
+    /// for the live agent on `pane_id`, lifting its quota-block latch. When the
+    /// event named an `agent_id`, only that generation is credited — a
+    /// straggler from a replaced agent must not clear its successor's block. A
+    /// pane with no live agent is a no-op.
+    pub fn quota_note_work_event(&self, pane_id: &str, agent_id: Option<&str>) {
+        let mut inner = self.inner.lock().unwrap();
+        for (id, agent) in inner.agents.iter_mut() {
+            if agent.pane_id_env.as_deref() == Some(pane_id)
+                && !agent.exited.load(Ordering::SeqCst)
+                && agent_id.is_none_or(|expected| expected == id)
+            {
+                agent.quota_block = None;
+            }
+        }
+    }
+
+    /// Issue #714: run `f` on the quota-block latch of `pane_id`'s live owner,
+    /// if that owner is `agent_id`; `None` otherwise.
+    fn with_owner_quota_latch<T>(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        f: impl FnOnce(&mut Option<u64>) -> T,
+    ) -> Option<T> {
+        let mut inner = self.inner.lock().unwrap();
+        let (id, agent) = inner.agents.iter_mut().find(|(_, a)| {
+            a.pane_id_env.as_deref() == Some(pane_id) && !a.exited.load(Ordering::SeqCst)
+        })?;
+        (id == agent_id).then(|| f(&mut agent.quota_block))
+    }
+
+    /// Issue #714: whether `agent_id` is the live owner of `pane_id` — the
+    /// check the daemon makes before acting on a path or a block an event from
+    /// that pane names, so no payload can make it act for another pane.
+    pub fn is_live_owner(&self, pane_id: &str, agent_id: &str) -> bool {
+        self.with_owner_quota_latch(pane_id, agent_id, |_| ())
+            .is_some()
+    }
+
+    /// Issue #714: whether the block reported as `epoch` still stands —
+    /// `agent_id` still owns `pane_id` and no work event has lifted the latch
+    /// (and no newer block replaced it) since. The blocked-worker notice is
+    /// re-checked against this right before it is written, so a worker whose
+    /// genuine work hook cleared its block is not reported as blocked.
+    pub fn quota_block_current(&self, pane_id: &str, agent_id: &str, epoch: u64) -> bool {
+        self.with_owner_quota_latch(pane_id, agent_id, |latch| *latch == Some(epoch))
+            .unwrap_or(false)
+    }
+
+    /// Issue #714: the epoch of the block currently latched for `pane_id`,
+    /// while `agent_id` is its live owner.
+    pub fn quota_published_epoch(&self, pane_id: &str, agent_id: &str) -> Option<u64> {
+        self.with_owner_quota_latch(pane_id, agent_id, |latch| *latch)
+            .flatten()
+    }
+
+    /// Issue #714: claim the one blocked-worker notice owed for the
+    /// outstanding delegation on `worker_pane_id`, if there is one and it has
+    /// not been reported yet.
+    ///
+    /// Claimed only for a record whose worker identity is BOUND to
+    /// `worker_agent_id` — an unbound record belongs to a delegation whose
+    /// worker has not resolved yet, so the blocked agent may be the previous
+    /// occupant, the same reasoning `pump_reader`'s EOF sweep applies — and never
+    /// for a record this pane only issued as the orchestrator. The record stays
+    /// in the ledger: a `work-done` is still owed, #580's busy guard still
+    /// applies, and the worker-response timeout is untouched.
+    pub fn claim_worker_blocked_notice(
+        &self,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
+    ) -> Option<WorkerBlockedNotice> {
+        self.claim_worker_blocked_notice_of(worker_pane_id, worker_agent_id, None)
+    }
+
+    /// [`Self::claim_worker_blocked_notice`], restricted to the delegation of
+    /// generation `seq` when one is given.
+    fn claim_worker_blocked_notice_of(
+        &self,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
+        seq: Option<u64>,
+    ) -> Option<WorkerBlockedNotice> {
+        let mut tracker = self.delegations.lock().unwrap();
+        Self::claim_worker_blocked_notice_in(&mut tracker, worker_pane_id, worker_agent_id, seq)
+    }
+
+    /// [`Self::claim_worker_blocked_notice_of`], under a delegation lock the
+    /// caller already holds.
+    fn claim_worker_blocked_notice_in(
+        tracker: &mut DelegationTracker,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
+        seq: Option<u64>,
+    ) -> Option<WorkerBlockedNotice> {
+        let record = tracker.records.get_mut(worker_pane_id)?;
+        if record.blocked_reported
+            || seq.is_some_and(|seq| record.seq != seq)
+            || record.orchestrator_pane_id == worker_pane_id
+            || record.worker_agent_id.as_deref() != Some(worker_agent_id)
+        {
+            return None;
+        }
+        record.blocked_reported = true;
+        Some(WorkerBlockedNotice {
+            seq: record.seq,
+            role: record.role.clone(),
+            orchestrator_pane_id: record.orchestrator_pane_id.clone(),
+            orchestrator_agent_id: record.orchestrator_agent_id.clone(),
+            orchestration: record.orchestration.clone(),
+        })
+    }
+
+    /// Issue #714: release a blocked-worker notice claimed by
+    /// [`Self::claim_worker_blocked_notice`] whose write was refused with
+    /// nothing written, so a later block of the SAME delegation can
+    /// still report. Only the record of generation `seq` is touched: a record
+    /// that was retired or superseded since keeps its own flag. Returns whether
+    /// the claim was released.
+    pub fn release_worker_blocked_notice(&self, worker_pane_id: &str, seq: u64) -> bool {
+        let mut tracker = self.delegations.lock().unwrap();
+        match tracker.records.get_mut(worker_pane_id) {
+            Some(record) if record.seq == seq => {
+                record.blocked_reported = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Issue #714 (review): claim the blocked-worker notice owed for the
+    /// delegation on `worker_pane_id` — of generation `seq` when one is given —
+    /// against its block `epoch`, and deliver it on a task of its own.
+    ///
+    /// The claim is taken HERE, synchronously, so a concurrent block or bind of
+    /// the same delegation finds it claimed and the one-claim-at-a-time rule of
+    /// [`Self::deliver_worker_blocked_notice`] holds unchanged. Only the write is
+    /// spawned: it waits on the orchestrator's pane writer, which an in-flight
+    /// write to that pane can hold for as long as its PTY takes, and neither
+    /// caller — the daemon's event ingestion, which every pane's hooks pass
+    /// through, nor a delegate dispatch — may be held up by another pane's PTY. Returns the
+    /// delivery's handle, `None` when nothing was owed.
+    ///
+    /// The task is recorded on the claimed delegation record, spawned under the
+    /// same lock hold as the claim ([`BlockedNoticeWaiter`]): superseding or
+    /// retiring that delegation, or a newer notice task of it, cancels this one
+    /// if it has not begun writing. Without that, a stalled orchestrator writer
+    /// would queue one waiter per delegation handed to a blocked worker, each
+    /// ahead of the current delegation's notice (issue #714 review).
+    pub fn spawn_worker_blocked_notice(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
+        epoch: u64,
+        seq: Option<u64>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let mut tracker = self.delegations.lock().unwrap();
+        let notice = Self::claim_worker_blocked_notice_in(
+            &mut tracker,
+            worker_pane_id,
+            worker_agent_id,
+            seq,
+        )?;
+        let gate = Arc::new(BlockedNoticeGate::default());
+        let registry = Arc::clone(self);
+        let task_gate = Arc::clone(&gate);
+        let (pane, agent) = (worker_pane_id.to_string(), worker_agent_id.to_string());
+        let handle = tokio::spawn(async move {
+            registry
+                .deliver_worker_blocked_notice_gated(&pane, &agent, epoch, notice, &task_gate)
+                .await;
+        });
+        // The claim just succeeded on this record, so it is still here; a
+        // waiter it replaces is dropped — and cancelled — right now.
+        if let Some(record) = tracker.records.get_mut(worker_pane_id) {
+            record.blocked_notice_waiter = Some(BlockedNoticeWaiter {
+                gate,
+                task: handle.abort_handle(),
+            });
+        }
+        Some(handle)
+    }
+
+    /// Issue #714 (review): report a block that is ALREADY published to a
+    /// delegation that has just been handed to that worker.
+    ///
+    /// The notice is otherwise attempted only when a block is reported, and a
+    /// blocked agent reports nothing more until its next attempt — so a task
+    /// delegated to a worker that already reads `Blocked` would get no notice at
+    /// all, and the design owes one per outstanding delegation. Called once the
+    /// delegation of generation `seq` is bound to `worker_agent_id` and its task
+    /// pointer has been written; a no-op unless that agent still owns the pane
+    /// and its block is published. The claim is restricted to `seq`, so it can
+    /// only ever report THIS delegation, and it shares the per-record flag with
+    /// the publish path, so the two can never both report it.
+    pub fn report_published_block_to_new_delegation(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        seq: u64,
+        worker_agent_id: &str,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let epoch = self.quota_published_epoch(worker_pane_id, worker_agent_id)?;
+        tracing::debug!(
+            worker_pane_id = %worker_pane_id,
+            "quota: a delegation was handed to a worker whose block is already published"
+        );
+        self.spawn_worker_blocked_notice(worker_pane_id, worker_agent_id, epoch, Some(seq))
+    }
+
+    /// Issue #714: deliver the blocked-worker report claimed by
+    /// [`Self::claim_worker_blocked_notice`] into the orchestrator's pane.
+    ///
+    /// SUBMITTED, exactly as [`Self::deliver_worker_exited_notice`] is since
+    /// issue #708: fixed daemon-authored text with the worker's scrubbed pane id
+    /// as the only interpolation ([`crate::state::compose_worker_blocked_notice`]),
+    /// sent through [`Self::write_and_submit_guarded`] bound to the
+    /// orchestrator's registry agent id captured at arm time, refused for a pane
+    /// that is mid-close or has been re-homed into a different orchestration.
+    /// The role rides the log line, never the pane, and the agent's own error
+    /// text rides neither. Its payload record is released on `Applied`
+    /// ([`crate::state::settle_one_shot_payload_record`]), so the byte-identical
+    /// report owed to a LATER delegation to the same worker is not refused as a
+    /// repeat of whatever the user typed in between.
+    ///
+    /// The writer-held re-validation also re-checks the WORKER: a genuine work
+    /// hook that lifted the block `epoch` after the claim
+    /// ([`Self::quota_block_current`]) refuses the write, so a worker that is
+    /// visibly working again is not reported as blocked. Any refusal that wrote
+    /// nothing (`WrongSession`, `Stale`, `NoLiveTarget`) releases the claim
+    /// ([`Self::release_worker_blocked_notice`]); an ambiguous or failed write
+    /// does not, since bytes may have reached the orchestrator.
+    ///
+    /// A released claim is then offered to a NEWER block of the same worker and
+    /// the SAME delegation: a block published while this write was waiting on
+    /// the orchestrator's writer found the notice claimed and skipped it, and
+    /// nothing else would retry it. If the worker's published block is no
+    /// longer `epoch`, the notice is claimed afresh for that delegation and
+    /// delivered the same way — still one claim at a time, and at most one
+    /// successful notice, per delegation.
+    pub async fn deliver_worker_blocked_notice(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
+        epoch: u64,
+        notice: WorkerBlockedNotice,
+    ) {
+        let gate = Arc::new(BlockedNoticeGate::default());
+        self.deliver_worker_blocked_notice_gated(
+            worker_pane_id,
+            worker_agent_id,
+            epoch,
+            notice,
+            &gate,
+        )
+        .await;
+    }
+
+    /// [`Self::deliver_worker_blocked_notice`], refusing the write once `gate`
+    /// has been cancelled ([`BlockedNoticeWaiter`]).
+    async fn deliver_worker_blocked_notice_gated(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
+        mut epoch: u64,
+        mut notice: WorkerBlockedNotice,
+        gate: &Arc<BlockedNoticeGate>,
+    ) {
+        loop {
+            if !self
+                .deliver_worker_blocked_notice_once(
+                    worker_pane_id,
+                    worker_agent_id,
+                    epoch,
+                    &notice,
+                    gate,
+                )
+                .await
+            {
+                return;
+            }
+            let Some(newer) = self
+                .quota_published_epoch(worker_pane_id, worker_agent_id)
+                .filter(|&current| current != epoch)
+            else {
+                return;
+            };
+            let Some(claimed) = self.claim_worker_blocked_notice_of(
+                worker_pane_id,
+                worker_agent_id,
+                Some(notice.seq),
+            ) else {
+                return;
+            };
+            tracing::debug!(
+                worker_pane_id = %worker_pane_id,
+                role = %claimed.role,
+                "quota: a newer block of the worker was published while a refused notice held \
+                 the claim; delivering its notice"
+            );
+            (epoch, notice) = (newer, claimed);
+        }
+    }
+
+    /// One attempt of [`Self::deliver_worker_blocked_notice`]. Returns whether
+    /// the write was refused with nothing written and the claim released.
+    async fn deliver_worker_blocked_notice_once(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
+        epoch: u64,
+        notice: &WorkerBlockedNotice,
+        gate: &Arc<BlockedNoticeGate>,
+    ) -> bool {
+        let text = crate::state::compose_worker_blocked_notice(worker_pane_id);
+        let gate = Arc::clone(gate);
+        let orchestrator_pane_id = notice.orchestrator_pane_id.clone();
+        let expected_agent_id = notice.orchestrator_agent_id.clone();
+        let orchestration = notice.orchestration.clone();
+        let revalidate_registry = Arc::clone(self);
+        let revalidate_pane = orchestrator_pane_id.clone();
+        let (worker_pane, worker_agent) = (worker_pane_id.to_string(), worker_agent_id.to_string());
+        let outcome = self
+            .write_and_submit_guarded(
+                &orchestrator_pane_id,
+                &text,
+                &expected_agent_id,
+                || async move {
+                    if revalidate_registry.is_pane_closing(&revalidate_pane)
+                        || !revalidate_registry.quota_block_current(
+                            &worker_pane,
+                            &worker_agent,
+                            epoch,
+                        )
+                    {
+                        return false;
+                    }
+                    // Last, so a task that passes it writes: once past this
+                    // point the task can no longer be cancelled.
+                    crate::state::orchestration_still_matches(
+                        orchestration.as_ref(),
+                        revalidate_registry
+                            .pane_orchestration(&revalidate_pane)
+                            .as_ref(),
+                    ) && gate.begin_write()
+                },
+            )
+            .await;
+        // A one-shot submitted report: its payload record goes on `Applied` and
+        // stays on `Ambiguous`, so leftover bytes cannot ride a later identical
+        // report together with a user draft.
+        crate::state::settle_one_shot_payload_record(
+            self,
+            &orchestrator_pane_id,
+            &text,
+            outcome.as_ref().ok().copied(),
+        );
+        match outcome {
+            Ok(GuardedSend::Applied) => {
+                tracing::info!(
+                    worker_pane_id = %worker_pane_id,
+                    role = %notice.role,
+                    "quota: submitted a report of a delegated worker blocked by a provider usage \
+                     limit to the orchestrator"
+                );
+                false
+            }
+            Ok(GuardedSend::Ambiguous) => {
+                tracing::warn!(
+                    pane_id = %orchestrator_pane_id,
+                    role = %notice.role,
+                    "quota: the blocked-worker report's submission was ambiguous (partial \
+                     write); not retried, and its payload record is kept"
+                );
+                false
+            }
+            Ok(refused) => {
+                let released = self.release_worker_blocked_notice(worker_pane_id, notice.seq);
+                tracing::debug!(
+                    pane_id = %orchestrator_pane_id,
+                    role = %notice.role,
+                    expected_agent_id = %expected_agent_id,
+                    outcome = ?refused,
+                    "quota: re-validation refused the blocked-worker notice (orchestrator changed, \
+                     or the worker is no longer blocked); nothing written, notice still owed"
+                );
+                released
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pane_id = %orchestrator_pane_id,
+                    role = %notice.role,
+                    error = %e,
+                    "quota: failed to write the blocked-worker notice into the orchestrator pane"
+                );
+                false
+            }
+        }
+    }
+
     /// Take just the current scrollback snapshot for an agent.
     pub fn snapshot(&self, id: &str) -> Result<Vec<u8>, AgentPtyError> {
         let inner = self.inner.lock().unwrap();
@@ -10344,6 +10888,7 @@ impl AgentPtyRegistry {
                 spawned_at: None,
                 // Issue #868: synthetic test agent hasn't exited.
                 crashed: None,
+                quota_block: None,
             },
         );
         id
@@ -11088,6 +11633,62 @@ mod tests {
 
     // PRD #42 M1: the `pid_to_pgid` boundary-check unit tests moved with the
     // function to `crate::platform::proc` (see `src/platform/proc/unix.rs`).
+
+    /// Issue #714 (review): a blocked-worker notice task is cancellable only
+    /// until it begins its write, and one that was cancelled first never
+    /// begins it — so a cancel can never land on a write in progress.
+    #[test]
+    fn blocked_notice_gate_never_cancels_a_write_in_progress() {
+        let writing = BlockedNoticeGate::default();
+        assert!(writing.begin_write());
+        assert!(!writing.cancel(), "a task that is writing was cancelled");
+
+        let cancelled = BlockedNoticeGate::default();
+        assert!(cancelled.cancel());
+        assert!(!cancelled.begin_write(), "a cancelled task began its write");
+        assert!(!cancelled.cancel(), "a task was cancelled twice");
+    }
+
+    /// Issue #714: the blocked-worker notice is claimed once per outstanding
+    /// delegation, only by the worker whose identity the delegation bound, and
+    /// claiming it leaves the delegation outstanding.
+    #[test]
+    fn worker_blocked_notice_is_claimed_once_per_bound_delegation_and_keeps_it_armed() {
+        let reg = AgentPtyRegistry::new();
+        let armed = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+            .expect("arm");
+        assert!(
+            reg.claim_worker_blocked_notice("worker", "worker-agent")
+                .is_none(),
+            "an unbound delegation may belong to the previous occupant"
+        );
+        reg.bind_delegation_worker_agent_id("worker", armed.seq, "worker-agent");
+        assert!(
+            reg.claim_worker_blocked_notice("worker", "someone-else")
+                .is_none()
+        );
+        let notice = reg
+            .claim_worker_blocked_notice("worker", "worker-agent")
+            .expect("the bound worker's first block is reported");
+        assert_eq!(notice.orchestrator_pane_id, "orch");
+        assert_eq!(notice.orchestrator_agent_id, "orch-agent");
+        assert_eq!(notice.role, "coder");
+        assert!(
+            reg.claim_worker_blocked_notice("worker", "worker-agent")
+                .is_none(),
+            "once per delegation"
+        );
+        assert!(
+            reg.take_outstanding_delegation_if("worker", armed.seq)
+                .is_some(),
+            "the notice must not retire the delegation"
+        );
+        assert!(
+            reg.claim_worker_blocked_notice("nobody", "worker-agent")
+                .is_none()
+        );
+    }
 
     /// Issue #424 S1: the submit drain and the key forwarder must agree, and
     /// this is the seam that makes them.
@@ -14428,6 +15029,7 @@ mod spawn_tests {
                 last_user_prompt: None,
                 live_target: None,
                 last_activity_ms: None,
+                blocked: None,
             }),
             spawned_at_ms: None,
             cli_name: None,
@@ -17078,6 +17680,8 @@ mod spawn_tests {
             armed_at: Instant::now(),
             superseded: 0,
             worker_agent_id: None,
+            blocked_reported: false,
+            blocked_notice_waiter: None,
             _watch_cancel: oneshot::channel().0,
         }
     }
@@ -17152,6 +17756,114 @@ mod spawn_tests {
             Some(GuardedSend::Applied),
             "a byte-identical second worker-exited report must still be submitted after the user \
              has typed — the first one's payload record has to be released"
+        );
+    }
+
+    /// Issue #714, after #708: the blocked-worker report is SUBMITTED into the
+    /// orchestrator's pane, like its worker-exited sibling, and a byte-identical
+    /// report for a LATER delegation is still submitted after the user has typed
+    /// there. Driven through `spawn_worker_blocked_notice`, the one production
+    /// entry point, against a raw-mode `cat` so the byte after the report's
+    /// final clause is exactly the terminator the daemon wrote.
+    ///
+    /// 1. **Submitted.** An LF-terminated line reaches nobody in a dispatched
+    ///    unit — no human presses Enter — so an orchestrator would never learn
+    ///    to reassign a task its quota-blocked worker cannot finish.
+    /// 2. **Released on `Applied`.** A second delegation to the same blocked
+    ///    worker produces the same text. Without the payload record's release,
+    ///    the user-input guard would refuse it as a repeat of the user's draft.
+    #[tokio::test]
+    async fn worker_blocked_report_is_submitted_and_resubmits_after_user_input() {
+        const ORCH: &str = "blocked-report-orchestrator";
+        const WORKER: &str = "blocked-report-worker";
+        const OPENING: &[u8] = b"delegated worker blocked by a provider usage limit";
+        const TAIL: &[u8] = b"daemon log names the role.";
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let orchestrator = reg
+            .spawn_agent(SpawnOptions {
+                command: Some(
+                    "stty -echo -icanon -icrnl -opost min 1 time 0 && \
+                     printf RAW-READY && exec cat -u",
+                ),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn raw orchestrator stand-in");
+        let worker = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn worker stand-in");
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !reg
+            .snapshot(&orchestrator)
+            .unwrap_or_default()
+            .windows(b"RAW-READY".len())
+            .any(|w| w == b"RAW-READY")
+        {
+            assert!(
+                tokio::time::Instant::now() < ready_deadline,
+                "the orchestrator stand-in never applied stty"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        // The byte following each report's final clause, in scrollback order.
+        let terminators = || {
+            let snapshot = reg.snapshot(&orchestrator).unwrap_or_default();
+            let mut found = Vec::new();
+            let mut rest = &snapshot[..];
+            while let Some(start) = rest.windows(OPENING.len()).position(|w| w == OPENING) {
+                rest = &rest[start..];
+                let Some(end) = rest.windows(TAIL.len()).position(|w| w == TAIL) else {
+                    break;
+                };
+                let end = end + TAIL.len();
+                found.push(rest.get(end).copied());
+                rest = &rest[end..];
+            }
+            found
+        };
+        let report = |expected: usize| {
+            let (reg, orchestrator, worker) =
+                (Arc::clone(&reg), orchestrator.clone(), worker.clone());
+            let terminators = &terminators;
+            async move {
+                let armed = reg
+                    .arm_outstanding_delegation(WORKER, "coder", ORCH, &orchestrator, None)
+                    .expect("arm the delegation");
+                reg.bind_delegation_worker_agent_id(WORKER, armed.seq, &worker);
+                let epoch = reg
+                    .note_quota_block(WORKER, &worker)
+                    .expect("the worker owns its pane");
+                reg.spawn_worker_blocked_notice(WORKER, &worker, epoch, Some(armed.seq))
+                    .expect("a notice is owed for the new delegation")
+                    .await
+                    .expect("the delivery task");
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                while terminators().iter().flatten().count() < expected
+                    && tokio::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+            }
+        };
+
+        report(1).await;
+        // The user types, arming the repeat-payload refusal: without this clock
+        // the guard abstains and the repeat would pass for the wrong reason.
+        reg.note_user_input(ORCH);
+        report(2).await;
+        let observed = terminators();
+        reg.shutdown_all();
+
+        assert_eq!(
+            observed,
+            vec![Some(b'\r'), Some(b'\r')],
+            "both blocked-worker reports must be SUBMITTED (terminated by CR, not left as an \
+             LF-terminated line), and the second, byte-identical one must still be submitted \
+             after the user typed; terminators observed = {observed:?}"
         );
     }
 

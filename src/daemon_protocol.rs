@@ -7563,6 +7563,7 @@ mod tests {
                 last_user_prompt: Some("build the feature".into()),
                 live_target: None,
                 last_activity_ms: None,
+                blocked: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -7598,6 +7599,7 @@ mod tests {
                 last_user_prompt: None,
                 live_target: None,
                 last_activity_ms: None,
+                blocked: None,
             }),
             spawned_at_ms: None,
             cli_name: None,
@@ -7659,6 +7661,7 @@ mod tests {
             agent_type: AgentType::ClaudeCode,
             cwd: None,
             status: SessionStatus::Idle,
+            blocked: None,
             active_tool: None,
             started_at: quiet_since,
             last_activity: quiet_since,

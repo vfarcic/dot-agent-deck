@@ -28,6 +28,15 @@ pub enum EventType {
     /// gone, i.e. the previously-running foreground command has finished. See
     /// [`ShellBusy`](Self::ShellBusy).
     ShellIdle,
+    /// Issue #714: the agent's provider refused it for an exhausted usage limit
+    /// or credit pool. Reported by a producer from a structured signal — the
+    /// Claude Code `StopFailure` hook, OpenCode's `session.error` fields — or by
+    /// the daemon's Codex rollout tailer (`crate::codex_rollout_tail`). Its
+    /// kind, reset time and display detail ride the `quota_blocked_*` metadata
+    /// keys in [`crate::quota_block`], which the daemon normalises on arrival
+    /// and strips from every other event type. An older reader decodes it as
+    /// [`EventType::Unknown`], a no-op.
+    QuotaBlocked,
     /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
     /// forward-compat catch-all for a future/unknown `event_type` string on
     /// the wire, so a build newer than THIS one can add further variants
@@ -691,6 +700,25 @@ pub const CLEAR_SESSION_START_METADATA_KEY: &str = "session_start_source";
 /// was caused by the user running `/clear`".
 pub const CLEAR_SESSION_START_METADATA_VALUE: &str = "clear";
 
+/// Issue #714: `AgentEvent.metadata` key `dot-agent-deck wrap` stamps on every
+/// event its stdout line classifier emits (value
+/// [`WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE`]).
+///
+/// That classifier reads EVERY non-blank line as `Working` (→ `Thinking`),
+/// including Codex's own rendering of a provider's quota error and its idle
+/// redraws, so an event it emits proves the child printed something, not that it
+/// did any work. A `Blocked` card must not be cleared by it: without the mark,
+/// [`crate::quota_block::is_work_evidence`] would count those events and lift a
+/// rollout-reported Codex block the moment Codex drew the error. Marked rather
+/// than inferred so nothing else about those events changes. Forging the key can
+/// only make an event count for LESS as work evidence — it can keep a `Blocked`
+/// card blocked until the agent's next genuine work hook — so it is not, and
+/// must not be treated as, an authentication marker.
+pub const WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY: &str = "wrapper_output_classified";
+
+/// The [`WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`] value.
+pub const WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE: &str = "1";
+
 /// Issue #1354: the [`AgentEvent::metadata`] key naming the SUBAGENT an event
 /// came from, when the agent's hook payload says it came from one.
 ///
@@ -994,14 +1022,40 @@ impl AgentEvent {
         self.is_wrapper_fork_session_start() || self.is_wrapper_interface_session_start()
     }
 
+    /// Issue #714: is this the daemon's `Idle` that lifts a `Blocked` card whose
+    /// agent a pane restart replaced
+    /// ([`crate::quota_block::QUOTA_BLOCKED_LIFTED_METADATA_KEY`])? The hook loop
+    /// strips the key from every producer frame, so only the daemon sends it.
+    pub fn is_quota_block_lift(&self) -> bool {
+        self.event_type == EventType::Idle
+            && self
+                .metadata
+                .get(crate::quota_block::QUOTA_BLOCKED_LIFTED_METADATA_KEY)
+                .is_some_and(|v| v == crate::quota_block::QUOTA_BLOCKED_LIFTED_BY_PANE_RESTART)
+    }
+
+    /// Issue #714: was this event emitted by `dot-agent-deck wrap`'s stdout line
+    /// classifier (see [`WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`])?
+    pub fn is_wrapper_output_classified(&self) -> bool {
+        self.metadata
+            .get(WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY)
+            .is_some_and(|v| v == WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE)
+    }
+
     /// Issue #424 D4: was this event SYNTHESIZED BY THE DAEMON rather than
     /// produced by the pane's agent?
     ///
     /// The daemon emits events of its own through the same pipeline real hook
     /// events take: [`EventType::ShellBusy`]/[`EventType::ShellIdle`] from the
     /// shell-activity monitor (PRD #370/#386), the delivery-notice
-    /// [`EventType::Error`] (issue #424), and the card-surfacing `SessionStart`
-    /// (issue #684, [`CARD_SURFACE_SESSION_START_ORIGIN`]).
+    /// [`EventType::Error`] (issue #424), the card-surfacing `SessionStart`
+    /// (issue #684, [`CARD_SURFACE_SESSION_START_ORIGIN`]), and the Codex
+    /// rollout tailer's [`EventType::QuotaBlocked`] (issue #714), marked with
+    /// [`crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY`], which the hook
+    /// loop strips from every producer frame, and the `Idle` that lifts a
+    /// replaced agent's block after a pane restart
+    /// ([`Self::is_quota_block_lift`]). A producer's own `QuotaBlocked` (Claude
+    /// Code, OpenCode) is the agent reporting, and is not synthetic.
     ///
     /// The first two carry the pane's registry `agent_id` because that is how
     /// they land on the right card — the card-surfacing start is the exception and
@@ -1023,6 +1077,12 @@ impl AgentEvent {
     pub fn is_daemon_synthetic(&self) -> bool {
         matches!(self.event_type, EventType::ShellBusy | EventType::ShellIdle)
             || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
+            || self
+                .metadata
+                .contains_key(crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY)
+            || self
+                .metadata
+                .contains_key(crate::quota_block::QUOTA_BLOCKED_LIFTED_METADATA_KEY)
             || self.is_card_surface_session_start()
             || self.is_daemon_pane_closed()
     }
@@ -1723,6 +1783,35 @@ pub struct DelegateResponse {
     /// not refused over. A role listed here is also in `delivered`.
     #[serde(default)]
     pub superseded: Vec<BusyWorker>,
+    /// Issue #714: resolved roles whose worker's card reads `Blocked` — its
+    /// agent reported a provider usage-limit or credit error — whether the role
+    /// was delivered or refused as [`Self::busy`]. A warning, never a refusal:
+    /// the status is reported by the agent's own hooks or session log, which —
+    /// like every hook-reported status — is not an input this daemon may
+    /// authorize on (#601, #696), and a windowed limit may already have reset.
+    ///
+    /// Carries fixed data only — role, kind, age, reset — and never the text,
+    /// which is agent-controlled and would land in the orchestrator's tool
+    /// output. Additive on the hook socket like every field of this reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked: Vec<BlockedWorker>,
+}
+
+/// Issue #714: one delegate target whose worker appears blocked by a provider
+/// usage limit. See [`DelegateResponse::blocked`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedWorker {
+    /// The `--to` role the worker pane is registered for.
+    pub role: String,
+    /// Which limit the agent reported.
+    pub kind: crate::quota_block::BlockedKind,
+    /// Whole seconds since the agent reported the block.
+    #[serde(default)]
+    pub blocked_for_secs: u64,
+    /// Whole seconds until the provider said the limit resets, when it said
+    /// and that moment is still ahead. Additive optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_in_secs: Option<u64>,
 }
 
 /// Issue #580: one worker that still owed a `work-done` when a delegate named
@@ -1757,6 +1846,7 @@ impl Default for DelegateResponse {
             error: None,
             busy: Vec::new(),
             superseded: Vec::new(),
+            blocked: Vec::new(),
         }
     }
 }

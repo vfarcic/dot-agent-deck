@@ -208,6 +208,97 @@ const cleanupSessionMessages = (sessionId) => {{
   }}
 }};
 
+// Issue #714: the structured fields of a `session.error`, so the deck can tell
+// a provider quota or credit refusal from any other error by JSON keys (see
+// `quota_signals::classify_opencode_error`). Every read is guarded and every
+// value type-checked, so a changed OpenCode error shape degrades to sending no
+// fields, which the deck reads as a plain error. Only allow-listed response
+// headers are forwarded, each value bounded.
+//
+// The response body is NOT forwarded. It is parsed here, whole, and only the
+// marker keys the classifier reads are forwarded, at the same paths, as
+// `response_markers`: `type` and `name` at the top level, and `type`, `code`,
+// `name`, `resets_at` and `resets_in_seconds` under `error`. Classifying a
+// truncated copy instead would turn a long but valid provider error into
+// invalid JSON and lose its markers (Qodo on PR #1346). Strings are bounded,
+// numbers must be finite, and a body over MAX_PARSED_BODY characters is not
+// parsed at all, which the deck reads as a plain error.
+const MAX_PARSED_BODY = 1024 * 1024;
+const markerString = (value) => (typeof value === "string" ? value.slice(0, 200) : undefined);
+const markerNumber = (value) =>
+  typeof value === "number" && Number.isFinite(value) ? value : undefined;
+const isPlainObject = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+const responseMarkers = (body) => {{
+  if (typeof body !== "string" || body.length > MAX_PARSED_BODY) {{
+    return undefined;
+  }}
+  let parsed;
+  try {{
+    parsed = JSON.parse(body);
+  }} catch (_) {{
+    return undefined;
+  }}
+  if (!isPlainObject(parsed)) {{
+    return undefined;
+  }}
+  const put = (target, key, value) => {{
+    if (value !== undefined) {{
+      target[key] = value;
+    }}
+  }};
+  const out = {{}};
+  put(out, "type", markerString(parsed.type));
+  put(out, "name", markerString(parsed.name));
+  if (isPlainObject(parsed.error)) {{
+    const error = {{}};
+    put(error, "type", markerString(parsed.error.type));
+    put(error, "code", markerString(parsed.error.code));
+    put(error, "name", markerString(parsed.error.name));
+    put(error, "resets_at", markerNumber(parsed.error.resets_at));
+    put(error, "resets_in_seconds", markerNumber(parsed.error.resets_in_seconds));
+    out.error = error;
+  }}
+  return out;
+}};
+const ERROR_HEADER_ALLOW = new Set(["retry-after", "retry-after-ms", "x-codex-rate-limit-reached-type"]);
+const ERROR_HEADER_PREFIX = "anthropic-ratelimit-unified-";
+const errorFields = (error) => {{
+  const out = {{}};
+  if (!error || typeof error !== "object") {{
+    return out;
+  }}
+  if (typeof error.name === "string") {{
+    out.error_name = error.name.slice(0, 100);
+  }}
+  const data = error.data && typeof error.data === "object" ? error.data : {{}};
+  if (typeof data.message === "string") {{
+    out.error_message = data.message.slice(0, 500);
+  }}
+  const markers = responseMarkers(data.responseBody);
+  if (markers !== undefined) {{
+    out.response_markers = markers;
+  }}
+  const headers =
+    data.responseHeaders && typeof data.responseHeaders === "object" ? data.responseHeaders : {{}};
+  const kept = {{}};
+  let count = 0;
+  for (const [name, value] of Object.entries(headers)) {{
+    const key = String(name).toLowerCase();
+    if (
+      count < 32 &&
+      typeof value === "string" &&
+      (ERROR_HEADER_ALLOW.has(key) || key.startsWith(ERROR_HEADER_PREFIX))
+    ) {{
+      kept[key] = value.slice(0, 200);
+      count += 1;
+    }}
+  }}
+  if (count > 0) {{
+    out.response_headers = kept;
+  }}
+  return out;
+}};
+
 const sessionPayload = (event, directory) => {{
   const props = event?.properties ?? {{}};
   const info = props.info ?? {{}};
@@ -221,6 +312,7 @@ const sessionPayload = (event, directory) => {{
     event: event?.type ?? "session.unknown",
     status: status.type,
     cwd,
+    ...(event?.type === "session.error" ? errorFields(props.error) : {{}}),
   }};
 }};
 
@@ -702,6 +794,8 @@ pub fn uninstall_from(path: &PathBuf) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use spec::spec;
 
     #[test]
     fn plugin_template_uses_exec_file_sync() {
@@ -1398,5 +1492,140 @@ mod tests {
             "issue #536: a bare BINARY_PATH survived because the cwd held a file \
              of that name"
         );
+    }
+
+    /// Scenario: Load the generated plugin under Node with its binary pinned to
+    /// a recorder script, and send it a `session.error` whose error carries a
+    /// status, a JSON body over 8 KiB, and a mix of allowed and other response
+    /// headers. The recorded payload carries the typed fields, only the body's
+    /// marker keys, and only the allow-listed headers, and the deck classifies
+    /// it as Blocked; an error of an unexpected shape forwards no fields.
+    #[cfg(unix)]
+    #[spec("status/blocked/016")]
+    #[test]
+    fn status_blocked_016_opencode_plugin_forwards_structured_error_fields() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("payloads.jsonl");
+        let recorder = dir.path().join("recorder.sh");
+        std::fs::write(
+            &recorder,
+            format!(
+                "#!/bin/sh\ncat >> '{}'\necho >> '{}'\n",
+                out.display(),
+                out.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import plugin from "{}";
+const hooks = await plugin({{ directory: "/work" }});
+await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: "s1", error: {{
+  name: "APIError",
+  data: {{ message: "The usage limit has been reached", statusCode: 429, isRetryable: true,
+    responseBody: JSON.stringify({{ type: "error", error: {{ message: "x".repeat(9000),
+      type: "usage_limit_reached", resets_at: 1790001000, code: 7, param: "model" }}, request_id: "r1" }}),
+    responseHeaders: {{ "Retry-After": "60", "x-codex-rate-limit-reached-type": "workspace_member_usage_limit_reached",
+      "anthropic-ratelimit-unified-status": "rejected", "set-cookie": "secret", "authorization": "Bearer nope",
+      "x-request-id": "r1" }},
+    metadata: {{ url: "https://example.invalid" }} }} }} }} }} }});
+await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: "s1", error: "just a string" }} }} }});
+"#,
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        let status = std::process::Command::new("node")
+            .arg(&driver)
+            .status()
+            .expect("run node");
+        assert!(status.success(), "the plugin driver failed");
+        let payloads: Vec<serde_json::Value> = std::fs::read_to_string(&out)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let errors: Vec<&serde_json::Value> = payloads
+            .iter()
+            .filter(|p| p["event"] == "session.error")
+            .collect();
+        assert_eq!(errors.len(), 2, "{payloads:?}");
+        let structured = errors[0];
+        assert_eq!(structured["error_name"], "APIError");
+        for unread in ["status_code", "is_retryable"] {
+            assert!(
+                structured.get(unread).is_none(),
+                "{unread} is forwarded but nothing reads it: {structured}"
+            );
+        }
+        assert_eq!(
+            structured["error_message"],
+            "The usage limit has been reached"
+        );
+        assert!(
+            structured.get("response_body").is_none(),
+            "the raw body is not forwarded: {structured}"
+        );
+        // Qodo on PR #1346: the body is over 8 KiB and carries its marker after
+        // the long message, so a truncated copy would have been invalid JSON.
+        // Only the classifier's keys survive, each with its type checked.
+        assert_eq!(
+            structured["response_markers"],
+            serde_json::json!({
+                "type": "error",
+                "error": {"type": "usage_limit_reached", "resets_at": 1790001000}
+            })
+        );
+        let hook_input: crate::hook::OpenCodeHookInput =
+            serde_json::from_value(structured.clone()).unwrap();
+        assert_eq!(
+            crate::hook::build_opencode_event(hook_input)
+                .unwrap()
+                .event_type,
+            crate::event::EventType::QuotaBlocked,
+            "the forwarded payload must classify as Blocked"
+        );
+        let headers = structured["response_headers"].as_object().unwrap();
+        let mut names: Vec<&str> = headers.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "anthropic-ratelimit-unified-status",
+                "retry-after",
+                "x-codex-rate-limit-reached-type"
+            ],
+            "only allow-listed headers, lowercased"
+        );
+        assert!(structured.get("metadata").is_none());
+        let bare = errors[1];
+        for key in [
+            "error_name",
+            "error_message",
+            "response_markers",
+            "response_headers",
+        ] {
+            assert!(
+                bare.get(key).is_none(),
+                "{key} from an unexpected shape: {bare}"
+            );
+        }
     }
 }

@@ -9,6 +9,7 @@ import { ambiguousOrchestrationReason } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
+  AgentBlocked,
   AgentSession,
   AgentTarget,
   AgentStatus,
@@ -225,7 +226,7 @@ export interface DesktopAgentDto {
    * daemon's, resolved from the registry of the process that forked the agent.
    */
   cliName?: string;
-  status: "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "idle" | "error" | "unknown";
+  status: "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "idle" | "error" | "blocked" | "unknown";
   activeTool?: { name: string; detail?: string };
   toolCount: number;
   /**
@@ -269,6 +270,13 @@ export interface DesktopAgentDto {
    * checks rather than trusts.
    */
   spawnedAtMs?: number;
+  /**
+   * Issue #714: why the agent is `blocked` — present only beside
+   * `status: "blocked"`. `detail` is the agent's own error message, scrubbed by
+   * the crate and still agent-controlled text; `resetsAtMs` is when the
+   * provider said the limit resets, when it said.
+   */
+  blocked?: { kind: string; detectedAtMs: number; detail?: string; resetsAtMs?: number };
   /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
@@ -1785,6 +1793,10 @@ const DAEMON_STATUS: Record<string, AgentStatus> = {
   waiting_for_input: "waiting",
   idle: "waiting",
   error: "failed",
+  // Issue #714: a distinct state, not `failed` — the agent is alive and its
+  // terminal stays writable (only `stopped` locks it), but its provider refuses
+  // it, so the tile has to say something different from a crashed agent.
+  blocked: "blocked",
   unknown: "waiting",
 };
 
@@ -1831,6 +1843,21 @@ function taskLine(agent: DesktopAgentDto): string {
   const reported = agent.lastUserPrompt
     ?? (agent.activeTool ? `Active tool: ${agent.activeTool.name}${agent.activeTool.detail ? ` · ${agent.activeTool.detail}` : ""}` : undefined);
   return reported === undefined ? "Task metadata unavailable from the deck" : displayText(reported, DISPLAY_LIMITS.prompt);
+}
+
+/** Issue #714: the tile's view of `DesktopAgentDto.blocked`. */
+function blockedFromDto(blocked: NonNullable<DesktopAgentDto["blocked"]>): AgentBlocked {
+  const kind: AgentBlocked["kind"] = blocked.kind === "usage_limit" || blocked.kind === "credits_depleted"
+    ? blocked.kind
+    : "unknown";
+  return {
+    kind,
+    detectedAtMs: blocked.detectedAtMs,
+    ...(blocked.detail ? { detail: blocked.detail } : {}),
+    ...(typeof blocked.resetsAtMs === "number" && Number.isFinite(blocked.resetsAtMs)
+      ? { resetsAtMs: blocked.resetsAtMs }
+      : {}),
+  };
 }
 
 function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): AgentSession {
@@ -1882,6 +1909,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     lastUserPrompt: agent.lastUserPrompt,
     lastActivityMs: agent.lastActivityMs,
     spawnedAtMs: agent.spawnedAtMs,
+    ...(status === "blocked" && agent.blocked ? { blocked: blockedFromDto(agent.blocked) } : {}),
     rows: agent.rows,
     cols: agent.cols,
     activeTool: agent.activeTool?.name,
@@ -2067,7 +2095,10 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     id: `agent-${agent.id}`,
     label: agent.role,
     agentId: agent.id,
-    status: agent.status === "running" ? "active" : agent.status === "passed" ? "passed" : agent.status === "failed" ? "failed" : "queued",
+    // Issue #714: a quota-blocked agent keeps its own node state, as it does on
+    // its tile, rather than falling through to `queued` — it is alive, it is
+    // not waiting its turn, and a person has to act on it.
+    status: agent.status === "running" ? "active" : agent.status === "passed" ? "passed" : agent.status === "failed" ? "failed" : agent.status === "blocked" ? "blocked" : "queued",
     // No attempt: it was read straight off the hardcoded per-agent one, so
     // every live node claimed a retry count no daemon tracks (PRD #745 M8).
     enabled: true,
@@ -2102,7 +2133,9 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       newAgentReason: dto.connection.newAgentReason,
       listingOptions: dto.connection.listingOptions === true,
     },
-    health: dto.connection.status === "incompatible" ? "failed" : dto.connection.status === "disconnected" ? "idle" : agents.some((agent) => agent.status === "failed") ? "failed" : "healthy",
+    // Issue #714: a blocked agent needs a person, so it is `attention` — below
+    // `failed`, since nothing has crashed.
+    health: dto.connection.status === "incompatible" ? "failed" : dto.connection.status === "disconnected" ? "idle" : agents.some((agent) => agent.status === "failed") ? "failed" : agents.some((agent) => agent.status === "blocked") ? "attention" : "healthy",
     elapsed: previous?.elapsed ?? "—",
     spend: previous?.spend ?? 0,
     currentNode: Math.max(1, agents.findIndex((agent) => agent.status === "running") + 1),

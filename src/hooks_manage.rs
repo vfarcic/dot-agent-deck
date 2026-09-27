@@ -26,6 +26,206 @@ const HOOK_TYPES: &[&str] = &[
     "SubagentStop",
 ];
 
+/// Issue #714: the hook Claude Code fires INSTEAD of `Stop` when an API error
+/// ends the turn — how a provider quota block reaches the deck. Installed with
+/// no matcher, so every `error` kind arrives (a non-quota one maps to `Error`),
+/// and only for a Claude Code that accepts it ([`STOP_FAILURE_MIN_CLAUDE_VERSION`]).
+const STOP_FAILURE_HOOK: &str = "StopFailure";
+
+/// Issue #714: the first Claude Code release that accepts a `StopFailure` key
+/// under `hooks` in `settings.json`.
+///
+/// **An older release does not ignore the key: it drops EVERY hook in the
+/// file.** Measured on 2026-09-26 with a sandboxed `HOME`, a `settings.json`
+/// holding `SessionStart`, `UserPromptSubmit`, `Stop` and `StopFailure` command
+/// hooks, and `claude -p`: 2.0.0, 2.1.50, 2.1.74, 2.1.76 and 2.1.77 ran none of
+/// them, and each ran `SessionStart` and `UserPromptSubmit` once the
+/// `StopFailure` key was removed; 2.1.78, 2.1.79, 2.1.85, 2.1.100, 2.1.200 and
+/// 2.1.283 ran them with the key present. So the key is written only when the
+/// installed Claude Code is known to be at least this version, and an unknown
+/// version is treated as older.
+pub const STOP_FAILURE_MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 78);
+
+/// How long [`installed_claude_accepts_stop_failure`] waits for
+/// `claude --version` before treating the version as unknown. Since issue
+/// #1157 this also runs in `daemon serve` BEFORE it binds, so it is part of the
+/// daemon's pre-bind budget ([`crate::daemon_attach::DAEMON_START_POLL_TIMEOUT`]).
+pub(crate) const CLAUDE_VERSION_PROBE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// Issue #714: parse the leading `MAJOR.MINOR.PATCH` of `claude --version`'s
+/// output (`2.1.283 (Claude Code)`). `None` for anything else.
+pub fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
+    let word = output.split_whitespace().next()?;
+    let mut parts = word.split('.');
+    let mut next = || parts.next()?.parse::<u64>().ok();
+    let version = (next()?, next()?, next()?);
+    Some(version)
+}
+
+/// Issue #714: whether a Claude Code reporting `output` for `--version`
+/// accepts the `StopFailure` hook key ([`STOP_FAILURE_MIN_CLAUDE_VERSION`]).
+pub fn claude_version_accepts_stop_failure(output: &str) -> bool {
+    parse_claude_version(output).is_some_and(|v| v >= STOP_FAILURE_MIN_CLAUDE_VERSION)
+}
+
+/// Issue #714: run `claude --version` (the `claude` on `PATH`, the one the deck
+/// launches) and report whether it accepts the `StopFailure` hook key, with the
+/// raw first line for a message. Not found, failed, timed out or unparseable
+/// all answer `false`: writing the key for a Claude Code that rejects it would
+/// switch off every deck hook, while leaving it out only means a quota-blocked
+/// Claude Code agent is not shown as Blocked.
+pub fn installed_claude_accepts_stop_failure() -> (bool, Option<String>) {
+    probe_claude_version(std::ffi::OsStr::new("claude"), CLAUDE_VERSION_PROBE_TIMEOUT)
+}
+
+/// [`installed_claude_accepts_stop_failure`] with the program and the bound
+/// injected.
+///
+/// **The whole probe sits under `timeout`, the pipe included** — not only the
+/// child's exit. Waiting for the exit and then reading stdout to EOF would hang
+/// for as long as anything else holds the pipe's write end: a launcher script
+/// that backgrounds a helper, or a descendant of the version command, exits
+/// the direct child while keeping stdout open, and this runs at TUI start with
+/// [`SETTINGS_LOCK`] held. So stdout is drained on a thread, which stops at the
+/// first newline, at EOF or after 4 KiB, and hands back what it read; the
+/// probe waits for that hand-off until the deadline. The line is accepted only
+/// when the child has also exited on its own by then. Past the deadline,
+/// whether or not a line arrived, the probe answers unknown, kills the child's
+/// whole tree — on Unix its process group, which it was given at spawn, and on
+/// Windows the Job Object it is adopted into right after spawn — reaps it, and
+/// abandons the reader thread, which ends when the pipe closes because a
+/// helper holding it died with the tree. What escapes the tree keeps the pipe,
+/// and with it that one detached thread: on Unix a descendant that moved itself
+/// to another group, on Windows one spawned in the instant between
+/// `CreateProcess` and the job assignment
+/// ([`crate::platform::proc::AgentProcessGroup::adopt`] documents that window).
+/// Either way the probe still returns on time.
+fn probe_claude_version(
+    program: &std::ffi::OsStr,
+    timeout: std::time::Duration,
+) -> (bool, Option<String>) {
+    use std::io::Read as _;
+    let mut command = std::process::Command::new(program);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return (false, None),
+    };
+    // Windows has no process group to spawn into: contain the tree in a Job
+    // Object instead, so `kill_probe` reaps a launcher's helpers too (Qodo on
+    // PR #1346). Adoption failure degrades to killing the direct child only.
+    #[cfg(windows)]
+    let tree = crate::platform::proc::AgentProcessGroup::adopt(Some(child.id()));
+    #[cfg(not(windows))]
+    let tree = ProbeTree;
+    let deadline = std::time::Instant::now() + timeout;
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let mut chunk = [0u8; 512];
+            while output.len() < 4096 && !output.contains(&b'\n') {
+                match stdout.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => output.extend_from_slice(&chunk[..n]),
+                }
+            }
+            output.truncate(4096);
+            let _ = tx.send(output);
+        });
+    } else {
+        drop(tx);
+    }
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let Ok(output) = rx.recv_timeout(remaining) else {
+        // Deadline passed with no line. The child is not reaped yet (a zombie
+        // at worst), so its pid still names its group.
+        kill_probe(&mut child, &tree);
+        return (false, None);
+    };
+    // The line is in; it counts only if the child also exits on its own
+    // within what is left of the deadline. A version command that prints a
+    // plausible line and then hangs is killed and answers unknown, like one
+    // that never printed: the line alone does not prove which Claude Code
+    // `PATH` resolves to, and a wrong `true` disables every deck hook.
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                kill_probe(&mut child, &tree);
+                return (false, None);
+            }
+        }
+    }
+    let output = String::from_utf8_lossy(&output);
+    let line = output.lines().next().map(|l| l.trim().to_string());
+    (
+        line.as_deref()
+            .is_some_and(claude_version_accepts_stop_failure),
+        line,
+    )
+}
+
+/// Off Windows the probe's tree is its process group, named by the child's pid,
+/// so there is nothing to hold.
+#[cfg(not(windows))]
+struct ProbeTree;
+
+/// Kill a version probe that outlived its deadline — its whole tree first (the
+/// process group on Unix, the Job Object on Windows) — and reap it. Must run
+/// before the child is reaped, while its pid still names its group.
+#[cfg(not(windows))]
+fn kill_probe(child: &mut std::process::Child, _tree: &ProbeTree) {
+    #[cfg(unix)]
+    // SAFETY: `kill(2)` with a negative pid signals the process group that
+    // `process_group(0)` gave the child, whose id is the child's pid. The
+    // child is not reaped yet, so that id cannot have been reused.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// [`kill_probe`] on Windows: terminate the Job Object the probe was adopted
+/// into, which reaps every process that joined it, then the direct child in
+/// case adoption failed.
+#[cfg(windows)]
+fn kill_probe(child: &mut std::process::Child, tree: &crate::platform::proc::AgentProcessGroup) {
+    tree.terminate_tree("claude version probe");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Every hook type the deck may have installed, gated or not — what uninstall
+/// sweeps.
+fn hook_types_all() -> Vec<&'static str> {
+    hook_types(true)
+}
+
+/// The hook types to install: [`HOOK_TYPES`], plus [`STOP_FAILURE_HOOK`] when
+/// the installed Claude Code accepts it.
+fn hook_types(with_stop_failure: bool) -> Vec<&'static str> {
+    let mut types = HOOK_TYPES.to_vec();
+    if with_stop_failure {
+        types.push(STOP_FAILURE_HOOK);
+    }
+    types
+}
+
 /// Claude Code's user settings file, in the location Claude itself uses:
 /// `~/.claude/settings.json`.
 ///
@@ -403,17 +603,25 @@ struct InstallOutcome {
     coexisting: std::collections::BTreeSet<String>,
 }
 
-fn install_impl(settings: &mut Value, binary_path: &str) -> InstallOutcome {
+fn install_impl(
+    settings: &mut Value,
+    binary_path: &str,
+    with_stop_failure: bool,
+) -> InstallOutcome {
+    let hook_types = hook_types(with_stop_failure);
     let hooks_obj = ensure_hooks_object(settings);
 
-    // Clean up deck entries for hook types no longer in HOOK_TYPES. These are
-    // gone from HOOK_TYPES entirely, so any deck rule there is stale regardless
+    // Clean up deck entries for hook types no longer installed. These are
+    // gone from the list entirely, so any deck rule there is stale regardless
     // of which binary wrote it — use the generic, binary-agnostic predicate.
+    // Issue #714: that includes a deck `StopFailure` rule left behind for a
+    // Claude Code that no longer accepts it (a downgrade), which would
+    // otherwise switch off every hook in the file.
     let mut repaired = 0usize;
     let mut coexisting = std::collections::BTreeSet::new();
     let all_keys: Vec<String> = hooks_obj.keys().cloned().collect();
     for key in all_keys {
-        if !HOOK_TYPES.contains(&key.as_str()) {
+        if !hook_types.contains(&key.as_str()) {
             if let Some(arr) = hooks_obj.get_mut(&key).and_then(|v| v.as_array_mut()) {
                 repaired += strip_deck_commands(arr, command_is_ours);
             }
@@ -431,7 +639,7 @@ fn install_impl(settings: &mut Value, binary_path: &str) -> InstallOutcome {
     let mut installed = Vec::new();
     let mut skipped = Vec::new();
 
-    for &hook_type in HOOK_TYPES {
+    for &hook_type in &hook_types {
         let rules = ensure_hook_array(hooks_obj, hook_type);
 
         // Prune STALE deck-owned rules sharing the installing binary's own
@@ -522,7 +730,7 @@ fn uninstall_impl(settings: &mut Value) -> UninstallOutcome {
     let mut hook_types = Vec::new();
     let mut commands_removed = 0;
 
-    for &hook_type in HOOK_TYPES {
+    for hook_type in hook_types_all() {
         if let Some(arr) = hooks.get_mut(hook_type).and_then(|v| v.as_array_mut()) {
             let removed = strip_deck_commands(arr, command_is_ours);
             if removed > 0 {
@@ -530,6 +738,15 @@ fn uninstall_impl(settings: &mut Value) -> UninstallOutcome {
                 commands_removed += removed;
             }
         }
+    }
+    // Issue #714: an emptied `StopFailure` key goes too — an older Claude Code
+    // rejects the key itself, empty or not.
+    if hooks
+        .get(STOP_FAILURE_HOOK)
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| a.is_empty())
+    {
+        hooks.remove(STOP_FAILURE_HOOK);
     }
 
     UninstallOutcome {
@@ -727,9 +944,10 @@ fn owned_command_executable(command: &str) -> Option<String> {
 /// the PRD #381 refusal path: the dashboard is already painting by the time
 /// this can fail, so a refusal goes to `tracing::warn!` and nowhere else.
 pub fn auto_install() {
-    auto_install_to(
+    auto_install_to_gated(
         &settings_path(),
         crate::platform::paths::durable_binary_path,
+        || installed_claude_accepts_stop_failure().0,
     );
 }
 
@@ -749,7 +967,24 @@ pub fn auto_install() {
 /// The resolver is called only after the settings *directory* check, so the
 /// common "Claude Code not installed" case still costs one `exists()` and no
 /// filesystem walk.
+///
+/// Issue #714: this seam installs the base hook set, which every Claude Code
+/// accepts, and never the version-gated `StopFailure`; [`auto_install_to_gated`]
+/// is the same seam with the gate injected, and what [`auto_install`] calls.
 pub fn auto_install_to(path: &Path, resolve: impl FnOnce() -> Result<String, String>) {
+    auto_install_to_gated(path, resolve, || false);
+}
+
+/// [`auto_install_to`] with the `StopFailure` gate injected (issue #714):
+/// `stop_failure` answers whether the installed Claude Code accepts that hook
+/// key ([`installed_claude_accepts_stop_failure`] in production). Asked only
+/// after the directory check and the binary resolution, so a machine without
+/// Claude Code never runs the probe.
+pub fn auto_install_to_gated(
+    path: &Path,
+    resolve: impl FnOnce() -> Result<String, String>,
+    stop_failure: impl FnOnce() -> bool,
+) {
     if path.parent().is_none_or(|p| !p.exists()) {
         return;
     }
@@ -772,7 +1007,7 @@ pub fn auto_install_to(path: &Path, resolve: impl FnOnce() -> Result<String, Str
             return;
         }
     };
-    let outcome = install_impl(&mut settings, &binary_path);
+    let outcome = install_impl(&mut settings, &binary_path, stop_failure());
 
     // A pass that only PRUNED (a dead deck rule sitting beside the current one)
     // installs nothing, and returning here on `installed.is_empty()` alone
@@ -827,6 +1062,7 @@ pub fn install() -> Result<(), String> {
 /// durable deck on it.
 pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<(), String> {
     let binary_path = resolve()?;
+    let (stop_failure, claude_version) = installed_claude_accepts_stop_failure();
 
     let path = settings_path();
     let _guard = lock_settings();
@@ -837,7 +1073,7 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
         skipped,
         coexisting,
         ..
-    } = install_impl(&mut settings, &binary_path);
+    } = install_impl(&mut settings, &binary_path, stop_failure);
 
     write_settings(&path, &settings).map_err(|e| format!("writing {}: {e}", path.display()))?;
 
@@ -865,6 +1101,17 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
              daemon, so the extra deliveries are redundant. To collapse them, run \
              `dot-agent-deck hooks uninstall` and then `hooks install` from whichever \
              install you want to keep."
+        );
+    }
+    if !stop_failure {
+        let (major, minor, patch) = STOP_FAILURE_MIN_CLAUDE_VERSION;
+        println!(
+            "Note: the {STOP_FAILURE_HOOK} hook was not installed: `claude --version` reported \
+             {}, and only Claude Code {major}.{minor}.{patch} or newer accepts it (an older \
+             release ignores every hook in the file when it is present). Without it, a Claude \
+             Code agent whose provider quota runs out is not shown as Blocked. Run this again \
+             after updating Claude Code.",
+            claude_version.as_deref().unwrap_or("nothing usable")
         );
     }
     println!("Settings file: {}", path.display());
@@ -913,10 +1160,19 @@ pub fn uninstall() -> Result<(), String> {
 /// CLI path reports rather than swallowing them, so a test that expects a write
 /// to be refused has to say so — a seam that quietly discarded the refusal is
 /// how #522's uninstall defect stayed invisible under a green suite.
+///
+/// Issue #714: installs the base hook set, like [`auto_install_to`];
+/// [`install_to_gated`] injects the `StopFailure` gate.
 pub fn install_to(path: &Path, binary_path: &str) -> io::Result<()> {
+    install_to_gated(path, binary_path, false)
+}
+
+/// [`install_to`], writing the version-gated `StopFailure` hook too when
+/// `stop_failure` is set (issue #714).
+pub fn install_to_gated(path: &Path, binary_path: &str, stop_failure: bool) -> io::Result<()> {
     let _guard = lock_settings();
     let mut settings = load_settings_or_refuse(path)?;
-    install_impl(&mut settings, binary_path);
+    install_impl(&mut settings, binary_path, stop_failure);
     write_settings(path, &settings)
 }
 
@@ -1167,14 +1423,14 @@ mod tests {
         );
 
         let mut settings = serde_json::json!({});
-        let first = install_impl(&mut settings, &a);
+        let first = install_impl(&mut settings, &a, false);
         assert!(
             first.coexisting.is_empty(),
             "the first install has nothing to coexist with: {:?}",
             first.coexisting
         );
 
-        let second = install_impl(&mut settings, &b);
+        let second = install_impl(&mut settings, &b, false);
         assert_eq!(
             second.coexisting.iter().cloned().collect::<Vec<_>>(),
             vec![a.clone()],
@@ -1261,5 +1517,181 @@ mod tests {
         assert!(binary_names_match(DEFAULT_BINARY_NAME, &installed));
         assert!(binary_names_match(&installed, DEFAULT_BINARY_NAME));
         assert!(!binary_names_match("some-other-name", &installed));
+    }
+
+    /// Issue #714: the `StopFailure` gate — written for a Claude Code that
+    /// accepts it, withheld (and a stale one removed) for one that does not,
+    /// and swept by uninstall. The end-to-end half is `status/blocked/011` in
+    /// `crate::hook`.
+    #[test]
+    fn stop_failure_hook_is_installed_only_for_a_claude_code_that_accepts_it() {
+        assert_eq!(
+            parse_claude_version("2.1.283 (Claude Code)"),
+            Some((2, 1, 283))
+        );
+        assert!(claude_version_accepts_stop_failure("2.1.78 (Claude Code)"));
+        assert!(claude_version_accepts_stop_failure("3.0.0"));
+        assert!(!claude_version_accepts_stop_failure("2.1.77 (Claude Code)"));
+        assert!(!claude_version_accepts_stop_failure(
+            "1.0.128 (Claude Code)"
+        ));
+        assert!(!claude_version_accepts_stop_failure("Claude Code"));
+        assert!(!claude_version_accepts_stop_failure(""));
+
+        let binary = "/opt/deck/dot-agent-deck";
+        let deck_rules = |settings: &Value, key: &str| {
+            settings["hooks"][key]
+                .as_array()
+                .map(|rules| {
+                    rule_command_strs(rules)
+                        .into_iter()
+                        .filter(|c| command_is_ours(c))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let mut settings = serde_json::json!({
+            "model": "opus",
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "notify-send done"}]}]}
+        });
+        let outcome = install_impl(&mut settings, binary, true);
+        assert!(outcome.installed.contains(&STOP_FAILURE_HOOK));
+        assert_eq!(deck_rules(&settings, STOP_FAILURE_HOOK), 1);
+        assert_eq!(
+            settings["hooks"][STOP_FAILURE_HOOK][0].get("matcher"),
+            None,
+            "no matcher: every error kind must reach the deck"
+        );
+        for hook_type in HOOK_TYPES {
+            assert_eq!(deck_rules(&settings, hook_type), 1, "{hook_type}");
+        }
+        assert_eq!(settings["model"], "opus", "unrelated settings survive");
+
+        // A Claude Code that predates the key: none written, the stale one gone.
+        let outcome = install_impl(&mut settings, binary, false);
+        assert!(!outcome.installed.contains(&STOP_FAILURE_HOOK));
+        assert!(outcome.repaired >= 1);
+        assert!(settings["hooks"].get(STOP_FAILURE_HOOK).is_none());
+
+        let mut fresh = serde_json::json!({});
+        install_impl(&mut fresh, binary, false);
+        assert!(fresh["hooks"].get(STOP_FAILURE_HOOK).is_none());
+
+        // Uninstall sweeps the gated key as well, and drops it once empty.
+        install_impl(&mut settings, binary, true);
+        let removed = uninstall_impl(&mut settings);
+        assert!(removed.hook_types.contains(&STOP_FAILURE_HOOK));
+        assert!(settings["hooks"].get(STOP_FAILURE_HOOK).is_none());
+    }
+
+    /// Write `body` as an executable stand-in `claude` in `dir`.
+    #[cfg(unix)]
+    fn stand_in_claude(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("claude");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Issue #714 (audit A2): a stand-in `claude` that exits at once but leaves
+    /// a background child holding its stdout open, having printed no complete
+    /// line. The probe answers unknown within its bound instead of waiting for
+    /// EOF, and the helper holding the pipe is killed with the probe's group.
+    #[cfg(unix)]
+    #[test]
+    fn the_version_probe_is_bounded_when_a_descendant_holds_stdout_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("helper.pid");
+        let claude = stand_in_claude(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nprintf '2.1.300'\nexit 0\n",
+                pid_file.display()
+            ),
+        );
+        let bound = std::time::Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        let outcome = probe_claude_version(claude.as_os_str(), bound);
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, (false, None), "an unfinished line is unknown");
+        assert!(
+            elapsed < bound + std::time::Duration::from_millis(1500),
+            "the probe waited {elapsed:?} against a {bound:?} bound"
+        );
+
+        let helper: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = |pid: i32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+                stat.rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with('Z'))
+            })
+        };
+        if Path::new("/proc/self/stat").exists() {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !gone(helper) && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(gone(helper), "the helper holding stdout outlived the probe");
+        }
+    }
+
+    /// Issue #714: a stand-in `claude` that prints a full, accepted version
+    /// line and then hangs in the foreground. The line alone is not enough: the
+    /// probe kills the child at its bound and answers unknown, so a wrapper
+    /// that stalls never gets `StopFailure` installed.
+    #[cfg(unix)]
+    #[test]
+    fn the_version_probe_answers_unknown_when_the_child_hangs_after_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = stand_in_claude(
+            dir.path(),
+            "#!/bin/sh\necho '2.1.300 (Claude Code)'\nsleep 30\n",
+        );
+        let bound = std::time::Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        let outcome = probe_claude_version(claude.as_os_str(), bound);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            outcome,
+            (false, None),
+            "a line from a child killed at the deadline is unknown"
+        );
+        assert!(
+            elapsed < bound + std::time::Duration::from_millis(1500),
+            "the probe waited {elapsed:?} against a {bound:?} bound"
+        );
+    }
+
+    /// Issue #714 (audit A2): the probe needs the version LINE, not EOF — a
+    /// stand-in that prints a full line and leaves a helper holding stdout is
+    /// read as soon as the line arrives.
+    #[cfg(unix)]
+    #[test]
+    fn the_version_probe_reads_the_line_without_waiting_for_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = stand_in_claude(
+            dir.path(),
+            "#!/bin/sh\nsleep 3 &\necho '2.1.300 (Claude Code)'\nexit 0\n",
+        );
+        let started = std::time::Instant::now();
+        let outcome = probe_claude_version(claude.as_os_str(), std::time::Duration::from_secs(10));
+        assert_eq!(outcome, (true, Some("2.1.300 (Claude Code)".to_string())));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the probe waited {:?} for a pipe it did not need",
+            started.elapsed()
+        );
+        assert_eq!(
+            probe_claude_version(
+                dir.path().join("missing").as_os_str(),
+                std::time::Duration::from_secs(1)
+            ),
+            (false, None)
+        );
     }
 }

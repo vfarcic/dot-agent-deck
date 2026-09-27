@@ -51,6 +51,7 @@ fn fixture_session() -> SessionState {
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/example-project".to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,

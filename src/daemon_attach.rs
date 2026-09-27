@@ -40,8 +40,10 @@ use crate::daemon_client::LocalEndpoint;
 /// a round number, and that derivation is the point.** The daemon we spawn does
 /// real work *before* it binds: `main`'s `DaemonCmd::Serve` arm runs
 /// `apply_login_shell_path` (an interactive-login `$SHELL`, up to
-/// `CAPTURE_TIMEOUT`), then materializes the pi extension and the Codex hooks —
-/// all ahead of `IpcListener::bind`. So the launcher's budget must cover the
+/// `CAPTURE_TIMEOUT`), then materializes the pi extension and runs every
+/// agent's startup hook install — all ahead of `IpcListener::bind`. Since issue
+/// #1157 that includes Claude Code's, which runs a bounded `claude --version`
+/// probe (issue #714, up to `CLAUDE_VERSION_PROBE_TIMEOUT`). So the launcher's budget must cover the
 /// daemon's worst-case *pre-bind* budget, or it is guaranteed to time out while
 /// the daemon is still healthy.
 ///
@@ -410,14 +412,21 @@ mod tests {
     /// nothing but this assertion couples them. A timing test would be flaky
     /// and would only fail on a machine with a slow interactive shell — the
     /// ordering is the real invariant, so assert the ordering.
+    ///
+    /// Issue #714 x #1157: the Claude Code version probe now runs pre-bind too,
+    /// so it is counted in the budget rather than left to the slack.
     #[test]
     fn attach_poll_timeout_exceeds_daemon_pre_bind_budget() {
         assert!(
-            DAEMON_START_POLL_TIMEOUT > crate::login_shell::CAPTURE_TIMEOUT,
+            DAEMON_START_POLL_TIMEOUT
+                > crate::login_shell::CAPTURE_TIMEOUT
+                    + crate::hooks_manage::CLAUDE_VERSION_PROBE_TIMEOUT,
             "lazy-spawn would time out on a healthy but slow daemon: launcher waits \
              {DAEMON_START_POLL_TIMEOUT:?} but the daemon may spend up to {:?} in the \
-             login-shell PATH capture before it even calls bind",
+             login-shell PATH capture plus {:?} in the Claude Code version probe before it \
+             even calls bind",
             crate::login_shell::CAPTURE_TIMEOUT,
+            crate::hooks_manage::CLAUDE_VERSION_PROBE_TIMEOUT,
         );
     }
 
