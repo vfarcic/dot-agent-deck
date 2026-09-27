@@ -172,7 +172,7 @@ Optional:
 
 ### Daemon binary
 
-The deck installs the `dot-agent-deck` binary to `~/.local/bin/dot-agent-deck` on the remote by default.
+The deck installs the `dot-agent-deck` binary to `~/.local/bin/dot-agent-deck` on the remote by default. On a host where [Homebrew](installation.md#homebrew-macos--linux) already installed it, the deck uses that install and upgrades it with `brew upgrade` instead — see [Hosts where Homebrew installed the deck](remote-environments.md#hosts-where-homebrew-installed-the-deck).
 
 ### Daemon runtime files
 

@@ -44,13 +44,15 @@ const KIND_KUBERNETES: &str = "kubernetes";
 /// after the first miss before we conclude they're not paying attention.
 const PICKER_MAX_RETRIES: usize = 3;
 
-/// Absolute install location of `dot-agent-deck` on every registered remote.
-/// Hard-coded here for the same reason `remote::install_and_verify` hard-codes
-/// it: a non-interactive ssh shell typically doesn't have `~/.local/bin` on
-/// PATH, so we always invoke the binary by its absolute path. If the remote
-/// install location ever becomes user-configurable, this will become a field
-/// on `RemoteEntry`; until then, both `add` and `connect` agree on the same
-/// constant.
+/// Where `remote add` installs `dot-agent-deck` on a remote with no Homebrew
+/// install of it, and the binary `connect` runs for an entry that records no
+/// other ([`RemoteEntry::remote_binary`]). Invoked by absolute path because a
+/// non-interactive ssh shell typically doesn't have `~/.local/bin` on PATH.
+///
+/// Issue #1372 made the location a field on `RemoteEntry`, because a remote
+/// whose deck came from Homebrew has it at `<prefix>/bin/dot-agent-deck`
+/// instead. A client older than that still runs this path unconditionally, so
+/// a remote whose only install is Homebrew's stays unreachable from one.
 pub const REMOTE_INSTALL_PATH: &str = "~/.local/bin/dot-agent-deck";
 
 /// Default budget for the version-probe ssh round-trip. Overridable via
@@ -603,14 +605,13 @@ pub fn probe_remote_protocol(
     name: &str,
     install_path: &str,
 ) -> Result<Option<usize>, RemoteConnectError> {
-    // SAFETY (audit P3b): `install_path` is currently a module-level
-    // constant (`REMOTE_INSTALL_PATH`) with no shell metacharacters. If it
-    // ever becomes user- or registry-configurable, this interpolation needs
-    // a shell-quoting / validation pass before that change ships — the
-    // command is handed to the remote shell via `ssh <target> "<cmd>"`, so
-    // an attacker-controlled `install_path` could inject arbitrary remote
-    // commands. A regression test feeding spaces/quotes/metacharacters in
-    // `install_path` would catch this.
+    // SAFETY (audit P3b): `install_path` is interpolated unquoted into a
+    // command the remote shell runs, so it must never carry a shell
+    // metacharacter. It is either the constant `REMOTE_INSTALL_PATH` or a
+    // registry-recorded `RemoteBinaryPath` (issue #1372), which refuses any
+    // character outside `[A-Za-z0-9/._+-]` both when parsed from the remote
+    // and when `remotes.toml` is deserialized —
+    // `remote::homebrew_remote_tests::a_registry_binary_with_shell_metacharacters_is_refused`.
     let cmd = format!("{install_path} daemon hello");
     let result = executor.run_capped(target, &cmd, PROBE_PROTOCOL_STDOUT_CAP);
     match result {
@@ -1009,7 +1010,7 @@ fn laptop_is_newer(local: &str, remote: &str) -> bool {
 /// static-probe path; the note is simply omitted in that case.
 ///
 /// Generic over `BufRead` / `Write` so tests inject fake I/O (same seam as
-/// [`pick_remote`]).
+/// [`pick_remote`]). Returns whether an upgrade ran and succeeded.
 #[allow(clippy::too_many_arguments)]
 fn maybe_nudge_upgrade<R: BufRead, W: Write>(
     upgrader: &dyn RemoteUpgrader,
@@ -1020,14 +1021,14 @@ fn maybe_nudge_upgrade<R: BufRead, W: Write>(
     is_tty: bool,
     input: &mut R,
     output: &mut W,
-) -> Result<(), RemoteConnectError> {
+) -> Result<bool, RemoteConnectError> {
     // Newer-only: never suggest a downgrade or a same-version no-op.
     if !laptop_is_newer(local_version, remote_version) {
-        return Ok(());
+        return Ok(false);
     }
     // Non-TTY: no one to answer the prompt — connect as-is, no nudge.
     if !is_tty {
-        return Ok(());
+        return Ok(false);
     }
 
     let agents_note = match agent_count {
@@ -1046,20 +1047,20 @@ fn maybe_nudge_upgrade<R: BufRead, W: Write>(
     // Default N: empty input / bare Enter / EOF / anything but an explicit yes.
     let yes = n != 0 && (answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"));
     if !yes {
-        return Ok(());
+        return Ok(false);
     }
 
     // `y` → binary-swap upgrade to the laptop's version, then connect. A
     // failure falls back to connecting the existing version with a clear
     // message; the failure semantics are owned by `remote upgrade` (D3/D4).
     match upgrader.upgrade(name, local_version) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         Err(msg) => {
             writeln!(
                 output,
                 "warning: upgrade of remote '{name}' failed: {msg}\nConnecting to the existing {remote_version} install instead."
             )?;
-            Ok(())
+            Ok(false)
         }
     }
 }
@@ -1444,6 +1445,7 @@ pub fn run_connect<R: BufRead, W: Write>(
     is_tty: bool,
 ) -> Result<i32, RemoteConnectError> {
     let target = entry.ssh_target();
+    let mut install_path = install_path.to_string();
 
     // 1-based count of connect attempts made (initial connect + reconnects).
     // This is the retry budget: a transport failure on attempt N — a spawn
@@ -1477,7 +1479,7 @@ pub fn run_connect<R: BufRead, W: Write>(
         // session uses, on every attempt since issue #858. Everything else
         // stays fatal immediately. See `on_probe_unreachable`.
         progress.show(output, &entry.name, ConnectPhase::BinaryProbe);
-        let probed_version = probe_remote_version(executor, &target, &entry.name, install_path);
+        let probed_version = probe_remote_version(executor, &target, &entry.name, &install_path);
         progress.clear(output);
         let remote_version = match probed_version {
             Ok(v) => v,
@@ -1502,7 +1504,7 @@ pub fn run_connect<R: BufRead, W: Write>(
         // unanswerable handshake stays fatal so we never hand the terminal to a
         // remote whose install we could not confirm.
         progress.show(output, &entry.name, ConnectPhase::Handshake);
-        let probed_protocol = probe_remote_protocol(executor, &target, &entry.name, install_path);
+        let probed_protocol = probe_remote_protocol(executor, &target, &entry.name, &install_path);
         progress.clear(output);
         let agent_count = match probed_protocol {
             Ok(count) => count,
@@ -1527,7 +1529,7 @@ pub fn run_connect<R: BufRead, W: Write>(
         // connect to the upgraded remote (a failed upgrade falls back to the
         // existing version).
         if !session_established {
-            maybe_nudge_upgrade(
+            let upgraded = maybe_nudge_upgrade(
                 upgrader,
                 &entry.name,
                 &remote_version,
@@ -1537,10 +1539,18 @@ pub fn run_connect<R: BufRead, W: Write>(
                 input,
                 output,
             )?;
+            // Issue #1372: `remote upgrade` re-detects how the remote's deck
+            // is installed and records the binary it found, which can differ
+            // from the one this connect started with — an entry that recorded
+            // no method, on a remote whose deck Homebrew installed. Connect to
+            // the binary that was just upgraded, not to the one before it.
+            if upgraded && let Ok(updated) = lookup_remote(&entry.name, remotes_path) {
+                install_path = updated.remote_binary().to_string();
+            }
         }
 
         // Stage 2: hand the terminal over. This blocks until the user exits.
-        let exit_code = spawner.spawn(&target, install_path).map_err(|source| {
+        let exit_code = spawner.spawn(&target, &install_path).map_err(|source| {
             RemoteConnectError::SpawnFailed {
                 name: entry.name.clone(),
                 source,
@@ -1635,7 +1645,7 @@ pub fn run_connect_default(
         &upgrader,
         remotes_path,
         local_version,
-        REMOTE_INSTALL_PATH,
+        entry.remote_binary(),
         &mut input,
         &mut output,
         is_tty,
@@ -2058,6 +2068,7 @@ mod tests {
     struct ScriptedSpawner {
         codes: Vec<i32>,
         calls: Cell<usize>,
+        install_paths: std::cell::RefCell<Vec<String>>,
     }
 
     impl ScriptedSpawner {
@@ -2066,6 +2077,7 @@ mod tests {
             Self {
                 codes,
                 calls: Cell::new(0),
+                install_paths: Default::default(),
             }
         }
         fn spawn_count(&self) -> usize {
@@ -2074,7 +2086,10 @@ mod tests {
     }
 
     impl ConnectSpawner for ScriptedSpawner {
-        fn spawn(&self, _target: &SshTarget, _install_path: &str) -> Result<i32, std::io::Error> {
+        fn spawn(&self, _target: &SshTarget, install_path: &str) -> Result<i32, std::io::Error> {
+            self.install_paths
+                .borrow_mut()
+                .push(install_path.to_string());
             let n = self.calls.get();
             self.calls.set(n + 1);
             let code = self
@@ -2244,6 +2259,8 @@ mod tests {
             added_at: "2026-06-12T00:00:00Z".to_string(),
             upgraded_at: None,
             last_connected: None,
+            install: None,
+            binary: None,
         }
     }
 
@@ -3130,6 +3147,63 @@ mod tests {
             upgrader.calls(),
             vec![("prod".to_string(), "0.31.1".to_string())],
             "y ran `remote upgrade` to the laptop version before connecting"
+        );
+    }
+
+    /// Issue #1372: the nudge's upgrade can move an entry that recorded no
+    /// install method onto the Homebrew binary it found. The session that
+    /// follows must run that binary — the one just upgraded — rather than the
+    /// `~/.local/bin` copy the connect started with, which on such a remote is
+    /// the stale leftover the bug created.
+    #[test]
+    fn run_connect_after_a_nudge_upgrade_runs_the_binary_the_upgrade_recorded() {
+        struct RecordingBrewUpgrader {
+            registry: std::path::PathBuf,
+        }
+        impl RemoteUpgrader for RecordingBrewUpgrader {
+            fn upgrade(&self, name: &str, _version: &str) -> Result<(), String> {
+                let mut file = RemotesFile::load(&self.registry).unwrap();
+                let entry = file.remotes.iter_mut().find(|e| e.name == name).unwrap();
+                entry.install = Some(crate::remote::INSTALL_HOMEBREW.to_string());
+                entry.binary = Some(
+                    crate::remote::RemoteBinaryPath::try_from(
+                        "/opt/homebrew/bin/dot-agent-deck".to_string(),
+                    )
+                    .unwrap(),
+                );
+                file.save(&self.registry).unwrap();
+                Ok(())
+            }
+        }
+
+        let entry = test_entry("prod");
+        let (_dir, path) = registry_with(&entry);
+        let executor = VersionExecutor::new("0.31.0");
+        let spawner = ScriptedSpawner::new(vec![0]);
+        let upgrader = RecordingBrewUpgrader {
+            registry: path.clone(),
+        };
+        let mut input: &[u8] = b"y\n";
+        let mut output: Vec<u8> = Vec::new();
+
+        run_connect(
+            &entry,
+            &executor,
+            &spawner,
+            &RecordingBackoff::new(),
+            &upgrader,
+            &path,
+            "0.31.1",
+            entry.remote_binary(),
+            &mut input,
+            &mut output,
+            true,
+        )
+        .expect("connect after the y-upgrade");
+
+        assert_eq!(
+            *spawner.install_paths.borrow(),
+            vec!["/opt/homebrew/bin/dot-agent-deck".to_string()]
         );
     }
 }
