@@ -684,9 +684,31 @@ const DOCS_UP_MINUTES = {
   verify: 80,
 } as const;
 const DOCS_QUIET_MINUTES = 0;
+/**
+ * What the docs `agent-pane` screenshot shows in the open agent's terminal.
+ * The browser fixture has no PTY, so the pane shows the transcript the
+ * terminal writes on mount; without one the image is a blank terminal. Fixed
+ * text only: no timestamps, pids or host paths, so the capture is stable.
+ */
+const DOCS_IMPL_TRANSCRIPT = [
+  "\u001b[1m›\u001b[0m Add the retry action to the checkout view.",
+  "",
+  "\u001b[36m•\u001b[0m Read src/components/CheckoutView.tsx",
+  "\u001b[36m•\u001b[0m Read src/api/payments.ts",
+  "\u001b[36m•\u001b[0m Edit src/components/RetryPayment.tsx",
+  "    \u001b[32m+ export function RetryPayment({ onRetry, pending }: RetryPaymentProps) {\u001b[0m",
+  "    \u001b[32m+   return <button disabled={pending} onClick={onRetry}>Retry payment</button>;\u001b[0m",
+  "    \u001b[32m+ }\u001b[0m",
+  "\u001b[36m•\u001b[0m Ran npm test -- checkout",
+  "    \u001b[32mPASS\u001b[0m  src/components/RetryPayment.test.tsx (3 tests)",
+  "",
+  "The retry button renders and disables itself while a payment is pending.",
+  "Next: wire it into CheckoutView and cover the failed-payment path.",
+  "",
+].join("\r\n");
 const docsAgents: AgentSession[] = [
   crowdedAgent({ id: "1", displayName: "Plan / architecture", role: "Claude code", cli: "claude", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.plan, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Map the checkout flow and propose a retry design.", tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "2", displayName: "Desktop implementation", role: "Codex", cli: "codex", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.impl, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Edit", activeToolDetail: "src/components/RetryPayment.tsx", lastUserPrompt: "Add the retry action to the checkout view.", tab: { kind: "dashboard" } }),
+  { ...crowdedAgent({ id: "2", displayName: "Desktop implementation", role: "Codex", cli: "codex", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.impl, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Edit", activeToolDetail: "src/components/RetryPayment.tsx", lastUserPrompt: "Add the retry action to the checkout view.", tab: { kind: "dashboard" } }), transcript: DOCS_IMPL_TRANSCRIPT },
   crowdedAgent({ id: "3", displayName: "Contract review", role: "Claude code", cli: "claude", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.review, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Bash", activeToolDetail: "cargo test checkout_retry", lastUserPrompt: "Check the payment API for breaking changes.", tab: { kind: "dashboard" } }),
   crowdedAgent({ id: "4", displayName: "User-path verification", role: "Open code", cli: "opencode", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.verify, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Walk the checkout path and report failures.", tab: { kind: "dashboard" } }),
 ];
@@ -703,7 +725,7 @@ function docsFleet(): DeckSnapshot[] {
     agents: [
       crowdedAgent({ id: "1", displayName: "API implementation", role: "Codex", cli: "codex", status: "running", cwd: "/home/dev/service-api", toolCount: 2, upForMinutes: 44, quietForMinutes: 0, activeTool: "Edit", activeToolDetail: "src/routes.rs", lastUserPrompt: "Add the checkout endpoint.", tab: { kind: "dashboard" } }),
       crowdedAgent({ id: "2", displayName: "API review", role: "Claude code", cli: "claude", status: "waiting", cwd: "/home/dev/service-api", toolCount: 0, upForMinutes: 19, quietForMinutes: 0, lastUserPrompt: "Review the endpoint contract.", tab: { kind: "dashboard" } }),
-    ],
+    ].map((agent) => ({ ...agent, daemonId: FIXTURE_REMOTE_DAEMON_ID })),
     totalNodes: 2,
   };
   return [local, remote];
