@@ -10881,7 +10881,9 @@ impl AppState {
                         && session.agent_id == event.agent_id)
             })
         {
-            return;
+            // Nothing on any card moved, so to #447's waiting watch this is a
+            // refusal: it must touch no episode.
+            return AppliedEvent::Rejected;
         }
         // Issue #833: `tool_name` / `tool_detail` are PRODUCER-supplied — every
         // agent on the deck can post to the hook socket — and both are drawn
