@@ -448,6 +448,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     let subagent_id = subagent_id
         .filter(|id| !id.is_empty())
         .filter(|_| matches!(agent_type, AgentType::ClaudeCode | AgentType::Codex));
+    let from_subagent = subagent_id.is_some();
 
     let mut event_type = map_event_type(&hook_event_name)?;
     // PRD #20 W3-Pass-2 (finding #9): a FAILED tool call arrives as an ordinary
@@ -586,7 +587,16 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // kind maps to something — `StopFailure` replaces `Stop`, so an unmapped
     // kind would leave the card `Thinking` — and only a quota or credit refusal
     // becomes `QuotaBlocked`; see `crate::quota_signals`.
-    if hook_event_name == "StopFailure" && agent_type == AgentType::ClaudeCode {
+    //
+    // Not for a subagent's (issue #1354): a `StopFailure` fired inside one ends
+    // that subagent's run, whose failure reaches the main thread as its
+    // result, and the main thread reports its own refusal if it meets one. A
+    // `QuotaBlocked` or an `Error` would assert the parent card's status —
+    // after the turn ended, for a background agent, with nothing to lift it —
+    // so it arrives as the `SubagentStop` it stands in for.
+    if hook_event_name == "StopFailure" && from_subagent {
+        event_type = EventType::SubagentStop;
+    } else if hook_event_name == "StopFailure" && agent_type == AgentType::ClaudeCode {
         let outcome = claude_stop_failure_outcome(error.as_deref(), transcript_path.as_deref());
         if let crate::quota_signals::FailureOutcome::Blocked { kind, resets_at_ms } = outcome {
             event_type = EventType::QuotaBlocked;
@@ -3626,5 +3636,50 @@ mod tests {
             assert!(!event.is_from_subagent(), "agent_id = {odd}");
             assert_eq!(event.event_type, EventType::ToolStart, "agent_id = {odd}");
         }
+    }
+
+    /// Issues #714 and #1354: a `StopFailure` fired inside a subagent ends that
+    /// subagent's run, not the main thread's turn — its failure reaches the
+    /// main thread as the subagent's result, and the main thread reports its
+    /// own quota refusal if it meets one. So it is neither classified into a
+    /// `QuotaBlocked` nor left as an `Error`, both of which assert the parent
+    /// card's status; it arrives as the `SubagentStop` it stands in for.
+    #[test]
+    fn subagent_stop_failure_does_not_block_or_error_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"assistant","isSidechain":false,"error":"rate_limit","isApiErrorMessage":true,"#,
+                r#""quotaLimits":{"status":"rejected","resetsAt":1790409000}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        for kind in ["rate_limit", "billing_error", "server_error"] {
+            let mut input = claude_payload("StopFailure");
+            input.error = Some(kind.into());
+            input.transcript_path = Some(transcript.to_string_lossy().into_owned());
+            input.last_assistant_message = Some("provider said no".into());
+            input.subagent_id = Some("a7c1".into());
+            let event = build_event(input).expect("a subagent's StopFailure is kept");
+            assert_eq!(event.event_type, EventType::SubagentStop, "{kind}");
+            assert!(event.is_from_subagent());
+            assert!(
+                crate::quota_block::QUOTA_BLOCKED_METADATA_KEYS
+                    .iter()
+                    .all(|key| !event.metadata.contains_key(*key)),
+                "{kind}: no quota reason travels without the status"
+            );
+        }
+        // The main thread's own StopFailure is still classified.
+        let mut main = claude_payload("StopFailure");
+        main.error = Some("rate_limit".into());
+        main.transcript_path = Some(transcript.to_string_lossy().into_owned());
+        assert_eq!(
+            build_event(main).unwrap().event_type,
+            EventType::QuotaBlocked
+        );
     }
 }

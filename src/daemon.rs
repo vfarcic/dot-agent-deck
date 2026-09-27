@@ -1657,7 +1657,10 @@ fn notify_orchestrator_of_quota_block(
 ///   (`SessionStart`, `UserPromptSubmit` → `Thinking`, `Stop` → `Idle`), and
 ///   only within their bounds ([`crate::codex_rollout_tail::admissible_path`],
 ///   [`crate::codex_rollout_tail::admissible_turn_id`]) — an empty or oversized
-///   value loses its key, the event stays. The hook CLI applies the same
+///   value loses its key, the event stays. Never on a subagent's event (issue
+///   #1354, [`crate::event::SUBAGENT_ID_METADATA_KEY`]): a thread-spawned Codex
+///   subagent keeps the parent's session but names its own rollout and turn,
+///   and arming on it would move the parent's watch onto the subagent's log. The hook CLI applies the same
 ///   bounds, but a raw frame on the socket need not have come through it, and
 ///   these values are copied into the arm queue before anything else looks at
 ///   them.
@@ -1679,6 +1682,7 @@ fn admit_producer_event(event: &mut AgentEvent) {
         }
     }
     let codex_rollout_event = event.agent_type == crate::event::AgentType::Codex
+        && !event.is_from_subagent()
         && matches!(
             event.event_type,
             crate::event::EventType::SessionStart
@@ -3979,6 +3983,18 @@ mod quota_admission_tests {
         codex.agent_type = AgentType::Codex;
         admit_producer_event(&mut codex);
         assert_eq!(codex.metadata.len(), 3, "{:?}", codex.metadata);
+        // Issue #1354: a thread-spawned Codex subagent's hooks carry the
+        // parent's session and the subagent's own rollout and turn, so they
+        // lose both keys rather than re-arm the parent's watch.
+        let mut subagent = with(crate::event::EventType::Thinking, &codex_keys);
+        subagent.agent_type = AgentType::Codex;
+        subagent.metadata.insert(
+            crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
+            "a7c1".to_string(),
+        );
+        admit_producer_event(&mut subagent);
+        assert_eq!(subagent.metadata.len(), 2, "{:?}", subagent.metadata);
+        assert!(subagent.is_from_subagent());
     }
 }
 

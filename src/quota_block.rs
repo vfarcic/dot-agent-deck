@@ -174,6 +174,15 @@ pub fn scrub_detail(text: &str) -> String {
 /// fork/interface `SessionStart`, the card-surfacing start, and the wrapper's
 /// stdout line classifier, which calls every printed line `Working`.
 ///
+/// Nor anything a SUBAGENT reported ([`crate::event::SUBAGENT_ID_METADATA_KEY`],
+/// issue #1354). The card and the latch describe the main thread, and a
+/// subagent's calls say nothing about whether its provider still refuses the
+/// main thread — it may run on another model with a quota of its own. Worse, a
+/// background agent Claude Code runs after the blocked turn ended would lift
+/// the card to `Thinking`, and since a subagent's events assert no status,
+/// nothing would ever end that `Thinking`. The main thread's own call to the
+/// tool that launches a subagent carries no such key and still counts.
+///
 /// A `WaitingForInput` carrying [`NOTIFICATION_TYPE_METADATA_KEY`] counts only
 /// for one of [`WORKING_NOTIFICATION_TYPES`]: Claude Code fires `idle_prompt`
 /// once a turn has ended, including one that ended on a quota failure, so
@@ -198,6 +207,7 @@ pub fn is_work_evidence(event: &crate::event::AgentEvent) -> bool {
         _ => false,
     };
     work_type
+        && !event.is_from_subagent()
         && !event.is_daemon_synthetic()
         && !event.is_wrapper_session_start()
         && !event.is_wrapper_output_classified()

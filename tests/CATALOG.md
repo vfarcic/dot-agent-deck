@@ -644,6 +644,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** a real quota-exhausted account.
 - **Platform coverage:** mac+linux.
 
+##### status/blocked/024 — A subagent's events neither lift a Blocked card nor leave it stranded (issues #714, #1354).
+- **Layer:** L1 unit (src/state.rs).
+- **Agent:** none.
+- **Asserts:** a Blocked card stays Blocked, with its reason, through a subagent's SubagentStart, ToolStart, ToolEnd and SubagentStop (none of which is work evidence), and a main-thread ToolStart still lifts it to Working.
+- **Does not assert:** a real Claude Code or Codex subagent; the hook CLI mapping a subagent's `StopFailure` to `SubagentStop` (a plain unit test in `src/hook.rs`).
+- **Platform coverage:** mac+linux+windows.
+
 #### status/agent-event
 
 ##### status/agent-event/001 — A `dot-agent-deck agent-event --type <state>` frame routes into the existing `AgentEvent` stream and drives the target pane's card status, with NO hook and no `settings.json` mutation (PRD #201 M1.2/M1.3).

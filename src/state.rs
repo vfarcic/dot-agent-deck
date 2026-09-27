@@ -17183,6 +17183,52 @@ mod tests {
         assert_eq!((stats.blocked, stats.errors, stats.idle), (1, 0, 0));
     }
 
+    /// Scenario: Block a card with a quota event, then send it the tool
+    /// start, tool end and subagent stop of a background subagent (events
+    /// stamped with a subagent id) that keeps running after the main turn
+    /// ended. The card stays Blocked with its reason, rather than being lifted
+    /// to a Thinking nothing will ever end; a main-thread tool start still
+    /// clears it.
+    #[spec("status/blocked/024")]
+    #[test]
+    fn status_blocked_024_subagent_events_do_not_lift_a_blocked_card() {
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::Thinking, 1));
+        state.apply_event(quota_blocked_event(BlockedKind::UsageLimit, "x", 2));
+        let session = |state: &AppState| state.sessions["gen-q"].clone();
+        assert_eq!(session(&state).status, SessionStatus::Blocked);
+
+        for (i, event_type) in [
+            EventType::SubagentStart,
+            EventType::ToolStart,
+            EventType::ToolEnd,
+            EventType::SubagentStop,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut event = quota_event(event_type.clone(), 3 + i as i64);
+            event.metadata.insert(
+                crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
+                "a7c1".to_string(),
+            );
+            assert!(!crate::quota_block::is_work_evidence(&event));
+            state.apply_event(event);
+            assert_eq!(
+                session(&state).status,
+                SessionStatus::Blocked,
+                "a subagent's {event_type:?} must not lift the parent's block"
+            );
+            assert!(session(&state).blocked.is_some());
+        }
+
+        // The main thread working again is what lifts it.
+        state.apply_event(quota_event(EventType::ToolStart, 10));
+        assert_eq!(session(&state).status, SessionStatus::Working);
+        assert!(session(&state).blocked.is_none());
+    }
+
     /// Scenario: Serialize a live snapshot whose status is Blocked and decode it
     /// with a reader that predates the variant. The older reader must decode
     /// the whole record with the status as Unknown and ignore the reason, and
