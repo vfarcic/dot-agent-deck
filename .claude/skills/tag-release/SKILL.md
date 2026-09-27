@@ -16,6 +16,14 @@ This skill is **project-local and owned here** (CLAUDE.md rule 13). It was forke
 
 Several PRs have merged with changelog fragments in `changelog.d/` and you are ready to cut a release. It is a separate activity from any PR workflow — never run it as part of one.
 
+## Step 0 — Land the open PRs first
+
+When the user asks to "make a release" (or anything that means cutting one), the open PRs usually come first: the goal is that everything reviewed ships. Run the [`land-prs`](../land-prs/SKILL.md) skill before Step 1, with whatever PRs the user excludes, and proceed only when it reports nothing left that should be in this release. If it reports something that needs the user — a person's change request, a finding that needs facts only they have, a failing check — stop and bring that to the user rather than releasing around it.
+
+Skip this step when the user asks only to tag what is already on `main`.
+
+After `land-prs` has merged anything, build `main` once more (its Step 3 does) and **note the SHA you built**. Step 1 must record that same SHA: if `git rev-parse origin/main` there reads anything else, something merged in between, so build again before going on. Step 3's `expected_head` then refuses a tag on any other tree, so the release is the tree that was built.
+
 ## Step 1 — Analyze
 
 Run this from a checkout of `main` that is level with `origin/main`, because `analyze.sh` reads the working tree's `changelog.d/`. Record the SHA: it is what binds the release to the tree you are about to review.
