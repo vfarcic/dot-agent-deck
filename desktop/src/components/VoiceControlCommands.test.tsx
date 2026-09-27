@@ -167,7 +167,7 @@ function runtime(resolveVoice: ResolveVoice, voice: VoiceControls, overrides: Pa
       deck: selection,
       state: "ssh_unavailable" as const,
       ok: false,
-      message: "No deck is reachable from this test runtime.",
+      message: "No daemon is reachable from this test runtime.",
       disclosureKnown: false,
       forwards: [],
       knownHosts: [],
@@ -344,9 +344,9 @@ describe("what can I say?", () => {
   });
 
   const VOCABULARY: VoiceCommandDto[] = [
-    { id: "open_overview", description: "Show every agent in one list.", callable: true, unavailable_hint: "the agent overview opens from the deck", params: [] },
+    { id: "open_overview", description: "Show every agent in one list.", callable: true, unavailable_hint: "the agent overview opens from the daemon", params: [] },
     { id: "voice_off", description: "Stop listening.", callable: true, unavailable_hint: "turning voice off works anywhere", params: [] },
-    { id: "open_deck", description: "Go back to the terminals.", callable: true, unavailable_hint: "returning to the deck works from the agent overview", params: [] },
+    { id: "open_deck", description: "Go back to the terminals.", callable: true, unavailable_hint: "returning to the daemon works from the agent overview", params: [] },
     { id: "open_settings", description: "Open Settings.", callable: true, unavailable_hint: "settings open from the rail", params: [] },
     { id: "dictate_to_agent", description: "Type into an agent.", callable: false, unavailable_hint: "open an agent first", params: [] },
   ];
@@ -516,7 +516,7 @@ describe("the empty report row", () => {
    */
   it("gives way to a report, and returns when the row is emptied again", async () => {
     const voice = microphone(["show me every agent"]);
-    const resolveVoice: ResolveVoice = vi.fn(async () => dispatch("open_overview", "openOverview", "Opening the agent overview.", "show me every agent"));
+    const resolveVoice: ResolveVoice = vi.fn(async () => dispatch("open_overview", "openOverview", "Opening the agent dashboard.", "show me every agent"));
     render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
 
     await turnVoiceOn();
@@ -524,7 +524,7 @@ describe("the empty report row", () => {
 
     await completeUtterance();
     expect(screen.queryByTestId("voice-hint")).toBeNull();
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Opening the agent overview.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Opening the agent dashboard.");
 
     // Off and on again: `turnOn` clears the row through `forget()`, which is
     // the user-visible route back to an empty one.
@@ -532,7 +532,7 @@ describe("the empty report row", () => {
     await act(async () => { fireEvent.click(voiceButton()); });
     await flush();
     expect(screen.getByTestId("voice-hint")).toBeInTheDocument();
-    expect(screen.getByTestId("voice-report")).not.toHaveTextContent("Opening the agent overview.");
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent("Opening the agent dashboard.");
   });
 });
 
@@ -552,7 +552,7 @@ describe("typing into the open agent", () => {
   const PLANNER: VoiceResolvedParamDto[] = [
     { name: "agent", kind: "agent_ref", spoken: "planner", value: "planner", label: "Planner" },
   ];
-  /** What the deck itself calls that agent — read from the fixture, not retyped. */
+  /** What the daemon itself calls that agent — read from the fixture, not retyped. */
   const PLANNER_LABEL = createFixtureSnapshot("connected").agents.find((agent) => agent.id === "planner")?.displayName ?? "";
 
   /**
@@ -585,7 +585,7 @@ describe("typing into the open agent", () => {
     return vi.fn(async (utterance: string) =>
       utterance === "open the planner"
         ? dispatch("open_agent", "openAgent", "Opening Planner.", utterance, PLANNER)
-        : (answers[utterance] ?? dispatch("open_overview", "openOverview", "Opening the agent overview.", utterance)));
+        : (answers[utterance] ?? dispatch("open_overview", "openOverview", "Opening the agent dashboard.", utterance)));
   }
 
   async function openPlanner(voice: ReturnType<typeof microphone>) {
@@ -673,7 +673,7 @@ describe("typing into the open agent", () => {
     await completeUtterance();
 
     expect(resolveVoice).toHaveBeenCalledTimes(3);
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Opening the agent overview.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Opening the agent dashboard.");
   });
 
   /**
@@ -1020,6 +1020,7 @@ describe("closing what is on top", () => {
     await turnVoiceOn();
     await completeUtterance();
     expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Back to dashboard" })).toBeVisible();
 
     voice.deliver("close this");
     await completeUtterance();
@@ -1060,7 +1061,7 @@ describe("closing what is on top", () => {
   function newAgentDeck(voice: VoiceControls) {
     let settle!: () => void;
     const runAction = vi.fn((action: { type: string }) => action.type === "start_agent"
-      ? new Promise<DeckActionResult>((_resolve, reject) => { settle = () => reject(new Error("the deck refused the start")); })
+      ? new Promise<DeckActionResult>((_resolve, reject) => { settle = () => reject(new Error("the daemon refused the start")); })
       : Promise.resolve({ ok: true } as DeckActionResult));
     const deck = runtime(closing(), voice, {
       runAction,
@@ -1105,7 +1106,7 @@ describe("closing what is on top", () => {
    * Scenario (PRD #1223 U5 and audit F5): with a start in flight, "close" is
    * refused exactly as the X, Esc and the backdrop are — the dialog stays —
    * and the report says why in the dialog's own sentence rather than doing
-   * nothing silently. Once the deck has refused the start, "close" works.
+   * nothing silently. Once the daemon has refused the start, "close" works.
    */
   it("refuses to close the New agent dialog while a start is in flight, and says why", async () => {
     const voice = microphone([]);
@@ -1187,7 +1188,7 @@ describe("opening the New agent dialog, as a command (PRD #1223)", () => {
 
   /**
    * Scenario: on the overview, say "new agent on the build box". The New
-   * agent dialog opens with that deck already chosen — the same state its
+   * agent dialog opens with that daemon already chosen — the same state its
    * group header's own New agent button produces — and starts nothing.
    */
   it("opens the dialog with the named deck preselected", async () => {
@@ -1268,16 +1269,16 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
       const unavailable = (action: string, hint: string): VoiceResultDto => ({ resolveMs: 21, backend: "stub", outcome: { kind: "unavailable", transcript: utterance, action, hint, sentence: `Not here — ${hint}.` } });
       if (utterance.startsWith("open dir ")) {
         const name = utterance.slice("open dir ".length);
-        if (!directories && !options.forced) return unavailable("open_dir", "opening a directory needs the New agent dialog's directory listing; say “new agent” and choose a deck first");
+        if (!directories && !options.forced) return unavailable("open_dir", "opening a directory needs the New agent dialog's directory listing; say “new agent” and choose a daemon first");
         const entry = directories?.entries.find((candidate) => candidate.name === name) ?? { name, path: `/home/dev/${name}` };
         return dispatch("open_dir", "openDirectory", `Opening ${entry.name}.`, utterance, [{ name: "dir", kind: "dir_ref", spoken: name, value: entry.path, label: entry.name }]);
       }
       if (utterance === "go to parent") {
-        if (!directories?.hasParent && !options.forced) return unavailable("go_to_parent", "going up needs the New agent dialog showing a directory below the top; choose a deck and open a directory first");
+        if (!directories?.hasParent && !options.forced) return unavailable("go_to_parent", "going up needs the New agent dialog showing a directory below the top; choose a daemon and open a directory first");
         return dispatch("go_to_parent", "goToParentDirectory", "Going up.", utterance);
       }
       if (utterance === "use this directory") {
-        if (!directories && !options.forced) return unavailable("use_this_directory", "choosing a directory needs the New agent dialog's directory listing; say “new agent” and choose a deck first");
+        if (!directories && !options.forced) return unavailable("use_this_directory", "choosing a directory needs the New agent dialog's directory listing; say “new agent” and choose a daemon first");
         return dispatch("use_this_directory", "useThisDirectory", "Using this directory.", utterance);
       }
       return dispatch("close", "closeTopmost", "Closed.", utterance);
@@ -1412,7 +1413,7 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
     await completeUtterance();
 
     expect(declarations).toEqual([undefined]);
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — opening a directory needs the New agent dialog's directory listing; say “new agent” and choose a deck first.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — opening a directory needs the New agent dialog's directory listing; say “new agent” and choose a daemon first.");
     expect(listDirectories).not.toHaveBeenCalled();
     expect(screen.queryByTestId("new-agent-dialog")).toBeNull();
   });
@@ -1511,7 +1512,7 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
     voice.deliver("go to parent");
     await completeUtterance();
     expect(declarations.at(-1)?.hasParent).toBe(false);
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — going up needs the New agent dialog showing a directory below the top; choose a deck and open a directory first.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — going up needs the New agent dialog showing a directory below the top; choose a daemon and open a directory first.");
     expect(listDirectories).toHaveBeenCalledTimes(1);
     expect(currentPath()).toBe("/");
   });
@@ -1611,20 +1612,20 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
       const unresolved = (action: string, param: string, spoken: string, sentence: string): VoiceResultDto => ({ resolveMs: 21, backend: "stub", outcome: { kind: "param_unresolved", transcript: utterance, action, param, spoken, sentence } });
       if (utterance.startsWith("mode ")) {
         const spoken = utterance.slice("mode ".length);
-        if (!form && !options.forced) return unavailable("choose_mode", "choosing a mode needs a deck and a directory chosen in the New agent dialog; choose those first");
+        if (!form && !options.forced) return unavailable("choose_mode", "choosing a mode needs a daemon and a directory chosen in the New agent dialog; choose those first");
         const chip = form?.modes.find((candidate) => candidate.label.toLowerCase() === spoken) ?? (options.forced ? { id: spoken, label: spoken } : undefined);
         if (!chip) return unresolved("choose_mode", "mode", spoken, `Heard: “${utterance}” — no mode the New agent form offers matches “${spoken}”.`);
         return dispatch("choose_mode", "chooseNewAgentMode", `Mode: ${chip.label}.`, utterance, [{ name: "mode", kind: "mode_ref", spoken, value: chip.id, label: chip.label }]);
       }
       if (utterance.startsWith("use ")) {
         const spoken = utterance.slice("use ".length);
-        if (!form && !options.forced) return unavailable("choose_agent_type", "choosing an agent needs a deck and a directory chosen in the New agent dialog; choose those first");
+        if (!form && !options.forced) return unavailable("choose_agent_type", "choosing an agent needs a daemon and a directory chosen in the New agent dialog; choose those first");
         const entry = form?.agentTypes.find((candidate) => candidate.id === spoken || candidate.label.toLowerCase() === spoken);
-        if (!entry) return unresolved("choose_agent_type", "agent_type", spoken, `Heard: “${utterance}” — no agent this deck offers matches “${spoken}”.`);
+        if (!entry) return unresolved("choose_agent_type", "agent_type", spoken, `Heard: “${utterance}” — no agent this daemon offers matches “${spoken}”.`);
         return dispatch("choose_agent_type", "chooseNewAgentType", `Command set to ${entry.label}'s default command.`, utterance, [{ name: "agent_type", kind: "agent_type_ref", spoken, value: entry.id, label: entry.label }]);
       }
       if (utterance.startsWith("call it ")) {
-        if (!form && !options.forced) return unavailable("name_new_agent", "naming the new agent needs a deck and a directory chosen in the New agent dialog; choose those first");
+        if (!form && !options.forced) return unavailable("name_new_agent", "naming the new agent needs a daemon and a directory chosen in the New agent dialog; choose those first");
         const rest = utterance.slice("call it ".length);
         return dispatch("name_new_agent", "nameNewAgent", "Name set.", utterance, [{ name: "prefix", kind: "spoken_prefix", spoken: "call it", value: rest, label: rest }]);
       }
@@ -1710,7 +1711,7 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
   });
 
   /**
-   * Scenario: on a deck whose experimental flag is off, `schedule: issues` is
+   * Scenario: on a daemon whose experimental flag is off, `schedule: issues` is
    * not a chip at all. It is absent from the declaration, so "mode schedule:
    * issues" is refused as not offered and the Mode is left alone.
    */
@@ -1731,7 +1732,7 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
   });
 
   /** Scenario: with the flag ON, the same chip IS declared, and choosing it works. */
-  it("offers schedule: issues when the deck's flag is on", async () => {
+  it("offers schedule: issues when the daemon's flag is on", async () => {
     const voice = microphone([]);
     const { deck, declarations } = formDeck(voice, { experimental: true });
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
@@ -1766,7 +1767,7 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
   /**
    * Scenario: say "use claude". There is no Agent picker any more (PRD #1223),
    * so Command is overwritten with Claude Code's default command and the report
-   * says so. The declaration is the deck's registry, with no `auto`.
+   * says so. The declaration is the daemon's registry, with no `auto`.
    */
   it("chooses an agent type by filling Command with its default command", async () => {
     const voice = microphone([]);
@@ -1808,8 +1809,8 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
     expect(screen.getByTestId("new-agent-command")).toHaveValue("bash");
   });
 
-  /** Scenario: an agent the deck does not offer is refused, and Command is left alone. */
-  it("refuses an agent type the deck does not offer", async () => {
+  /** Scenario: an agent the daemon does not offer is refused, and Command is left alone. */
+  it("refuses an agent type the daemon does not offer", async () => {
     const voice = microphone([]);
     const { deck } = formDeck(voice);
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
@@ -1819,7 +1820,7 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
     voice.deliver("use codex");
     await completeUtterance();
 
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("no agent this deck offers matches “codex”");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("no agent this daemon offers matches “codex”");
     expect(screen.getByTestId("new-agent-command")).toHaveValue("bash");
   });
 
@@ -1888,7 +1889,7 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
     await completeUtterance();
 
     expect(declarations.at(-1)).toEqual({ form: undefined });
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — choosing a mode needs a deck and a directory chosen in the New agent dialog; choose those first.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — choosing a mode needs a daemon and a directory chosen in the New agent dialog; choose those first.");
   });
 
   /** Scenario: with the dialog closed nothing is declared, and a forced fill finds no form. */
@@ -1964,9 +1965,9 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
    */
   function d5Voice(declared: () => VoiceNewAgentDto | undefined): ResolveVoice {
     return vi.fn(async (utterance: string) => {
-      // "Start orchestration" is the Start button's own label with an
+      // "Activate orchestration" is the Start button's own label with an
       // orchestration chosen — the label rule (PRD #1223).
-      if (utterance === "start it" || utterance === "start the new agent" || utterance === "Start orchestration") {
+      if (utterance === "start it" || utterance === "start the new agent" || utterance === "Activate orchestration") {
         // With the dialog closed the callable row that answers "start" is
         // `open_new_agent` (D3); with it open, `start_new_agent` starts.
         if (!declared()) return dispatch("open_new_agent", "openNewAgent", "Opening the New agent dialog.", utterance);
@@ -2147,7 +2148,7 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
 
   /**
    * Scenario: the user's own report. With the `audit` orchestration chosen in
-   * Mode the Start button reads "Start orchestration"; the user reads it aloud
+   * Mode the Start button reads "Activate orchestration"; the user reads it aloud
    * and the orchestration launches — the button's words work as a command.
    */
   it("starts the chosen orchestration when the Start button's label is said", async () => {
@@ -2159,9 +2160,9 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     await chooseBilling();
     fireEvent.click(screen.getByTestId("new-agent-mode-orch:audit"));
     await flush();
-    expect(screen.getByTestId("new-agent-start")).toHaveTextContent("Start orchestration");
+    expect(screen.getByTestId("new-agent-start")).toHaveTextContent("Activate orchestration");
 
-    voice.deliver("Start orchestration");
+    voice.deliver("Activate orchestration");
     await completeUtterance();
     await flush();
 
@@ -2207,11 +2208,11 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     const dialog = confirmation();
     expect(dialog).not.toBeNull();
     expect(dialog).toHaveTextContent("This sends a stop request to");
-    expect(screen.getByRole("button", { name: "Stop agent" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close agent" })).toBeInTheDocument();
     expect(runAction).not.toHaveBeenCalled();
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Stop agent" }));
+      fireEvent.click(screen.getByRole("button", { name: "Close agent" }));
       await Promise.resolve();
     });
     await flush();
@@ -2239,7 +2240,7 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     expect(runAction).not.toHaveBeenCalled();
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Stop all 2 roles" }));
+      fireEvent.click(screen.getByRole("button", { name: "Close all 2 roles" }));
       await Promise.resolve();
     });
     await flush();
@@ -2319,7 +2320,7 @@ describe("a pending answer and a New agent dialog that changed under it (PRD #12
 
   const ANSWERS: Record<string, VoiceResultDto> = {
     close: dispatch("close", "closeTopmost", "Closed.", "done"),
-    open_deck: dispatch("open_deck", "openDeck", "Back to the deck.", "back"),
+    open_deck: dispatch("open_deck", "openDeck", "Back to the daemon.", "back"),
   };
 
   /**
@@ -2497,14 +2498,14 @@ describe("the New agent deck field and Discard, by voice (issues 1263 and 1247)"
      `deckId` and the label the overview shows. */
   const DECKS: Record<string, { value: string; label: string }> = {
     "deck build box": { value: FIXTURE_REMOTE_DAEMON_ID, label: "dev@build-box" },
-    "deck local": { value: FIXTURE_DAEMON_ID, label: "Local deck" },
+    "deck local": { value: FIXTURE_DAEMON_ID, label: "Local daemon" },
     "deck runner": { value: FIXTURE_UNREACHABLE_DAEMON_ID, label: "ci@runner-7" },
     "deck gone": { value: "deck-that-left", label: "gone@nowhere" },
   };
 
   function answer(utterance: string): VoiceResultDto {
     const named = DECKS[utterance];
-    if (named) return dispatch("choose_deck", "chooseNewAgentDeck", `Deck: ${named.label}.`, utterance, [{ name: "deck", kind: "deck_ref", spoken: utterance.slice("deck ".length), value: named.value, label: named.label }]);
+    if (named) return dispatch("choose_deck", "chooseNewAgentDeck", `Daemon: ${named.label}.`, utterance, [{ name: "deck", kind: "deck_ref", spoken: utterance.slice("deck ".length), value: named.value, label: named.label }]);
     if (utterance === "discard") return dispatch("discard_new_agent", "discardNewAgent", "Discarded the New agent form.", utterance);
     if (utterance === "close") return dispatch("close", "closeTopmost", "Closed.", utterance);
     if (utterance === "mode dispatcher") return dispatch("choose_mode", "chooseNewAgentMode", "Mode: dispatcher.", utterance, [{ name: "mode", kind: "mode_ref", spoken: "dispatcher", value: "dispatcher", label: "dispatcher" }]);
@@ -2574,7 +2575,7 @@ describe("the New agent deck field and Discard, by voice (issues 1263 and 1247)"
     expect(chosenDeck()).toBe(FIXTURE_REMOTE_DAEMON_ID);
     expect(deck.newAgentOptions).toHaveBeenLastCalledWith(FIXTURE_REMOTE_DAEMON_ID);
     expect(deck.listDirectories).toHaveBeenLastCalledWith(FIXTURE_REMOTE_DAEMON_ID, undefined);
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Deck: dev@build-box.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Daemon: dev@build-box.");
 
     await chooseBilling();
     fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "mine" } });
@@ -2796,7 +2797,7 @@ describe("switch deck by voice, against settings edited mid-flight", () => {
 
     await answer();
 
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("That deck changed in Settings since you asked for it — try again.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("That daemon changed in Settings since you asked for it — try again.");
     expect(store.current.endpoints?.remote[0].host).toBe("other-box");
     expect(store.current.endpoints?.selection).toBe("local");
   });
@@ -2843,7 +2844,7 @@ describe("switch deck by voice, against settings edited mid-flight", () => {
     await answer();
 
     const report = screen.getByTestId("voice-report");
-    expect(report).toHaveTextContent("That deck changed in Settings since you asked for it — try again.");
+    expect(report).toHaveTextContent("That daemon changed in Settings since you asked for it — try again.");
     expect(report).not.toHaveTextContent("Showing deploy@build-box.");
     expect(within(report).queryByRole("button", { name: /Undo/ })).toBeNull();
   });

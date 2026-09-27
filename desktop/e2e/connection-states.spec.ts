@@ -60,7 +60,7 @@ const STATES: StateExpectation[] = [
     note: "overview-disconnected",
     lampClass: "connection-disconnected",
     agents: "—",
-    daemonState: "No deck is listening on the configured socket.",
+    daemonState: "No daemon is listening on the configured socket.",
   },
   {
     name: "a daemon this build cannot speak to",
@@ -68,7 +68,7 @@ const STATES: StateExpectation[] = [
     note: "overview-incompatible",
     lampClass: "connection-error",
     agents: "—",
-    daemonState: "Protocol handshake failed. Desktop expects v6; deck reported v5.",
+    daemonState: "Protocol handshake failed. Desktop expects v6; daemon reported v5.",
   },
 ];
 
@@ -185,11 +185,11 @@ test("the daemon lamp's colour separates fault from health", async ({ page }) =>
  * whole-screen: a table, or a note. A fleet is two answers at once, and the
  * thing that has to read correctly is the boundary between them — the healthy
  * decks keep their tables, the unreachable one degrades ON ITS OWN, and the
- * header says the totals beside it are over the decks that answered.
+ * header says the totals beside it are over the daemons that answered.
  *
  * The failure this is really about does not look like a failure. A header that
  * summed over every deck would print a larger number with no lamp, no note and
- * nothing out of place — a deck's whole fleet quietly counted as the agents it
+ * nothing out of place — a daemon's whole fleet quietly counted as the agents it
  * happened to be running the last time anyone could see it, or as zero. So the
  * assertions here are about what is stated, and one of them is that a specific
  * wrong number is NOT on screen.
@@ -201,6 +201,7 @@ test.describe("partial connectivity (PRD #742 M4)", () => {
     await expect(page.getByTestId("daemon-group").first()).toBeVisible();
   }
 
+  /** Scenario: One deck down among two up reads as one deck's problem, not the screen's. */
   test("one deck down among two up reads as one deck's problem, not the screen's", async ({ page }) => {
     await openFleet(page);
     const decks = page.getByTestId("daemon-group");
@@ -223,14 +224,14 @@ test.describe("partial connectivity (PRD #742 M4)", () => {
     await expect(down).toHaveAttribute("data-deck-connected", "no");
     await expect(down.getByTestId("daemon-identity")).toHaveText("ci@runner-7");
     await expect(down.getByTestId("overview-disconnected")).toBeVisible();
-    await expect(down.getByTestId("daemon-state")).toHaveText("No deck is listening on the configured socket.");
+    await expect(down.getByTestId("daemon-state")).toHaveText("No daemon is listening on the configured socket.");
     await expect(down.getByTestId("daemon-unknown")).toHaveText("—");
     await expect(down.locator(".overview-row")).toHaveCount(0);
     await expect(down.locator(".daemon-pips")).toHaveCount(0);
 
     /*
       Real geometry: the degraded section is a box a reader can see, inside the
-      viewport and below the deck above it. A note rendered at zero height is a
+      viewport and below the daemon above it. A note rendered at zero height is a
       blank screen with the right `data-testid` on it, which is exactly what
       this tier exists to tell apart from the right answer.
     */
@@ -245,7 +246,7 @@ test.describe("partial connectivity (PRD #742 M4)", () => {
     expect(placement.right).toBeLessThanOrEqual(placement.viewport);
   });
 
-  test("the header counts the decks that answered and never the fleet the silent one was last seen running", async ({ page }) => {
+  test("the header counts the daemons that answered and never the fleet the silent one was last seen running", async ({ page }) => {
     await openFleet(page);
 
     // Two of four, stated. Without this the four counts beside it are a total
@@ -275,7 +276,7 @@ test.describe("partial connectivity (PRD #742 M4)", () => {
     expect(lamps[3].className).toContain("connection-loading");
     expect(lamps[2].background, "a downed deck's lamp paints the same as a healthy one's").not.toBe(lamps[0].background);
     /*
-      PRD #742 M14: and the deck that has not reported paints as NEITHER. A
+      PRD #742 M14: and the daemon that has not reported paints as NEITHER. A
       reader tells the two apart at a glance or not at all — the note says which
       is which, but the note is the thing they have to already be reading.
     */
@@ -285,7 +286,7 @@ test.describe("partial connectivity (PRD #742 M4)", () => {
 });
 
 /**
- * PRD #742 M14 — a deck that has NOT REPORTED YET, which is a sixth state and
+ * PRD #742 M14 — a daemon that has NOT REPORTED YET, which is a sixth state and
  * the one a reader is most likely to misread.
  *
  * It is on screen for a reason no other state is: not because something failed
@@ -300,8 +301,8 @@ test.describe("partial connectivity (PRD #742 M4)", () => {
  * cannot tell a lamp apart from the two beside it — both are questions about
  * what the engine actually paints.
  */
-test.describe("a deck that has not reported yet (PRD #742 M14)", () => {
-  test("is a group of its own, named, waiting, and never a deck that failed", async ({ page }) => {
+test.describe("a daemon that has not reported yet (PRD #742 M14)", () => {
+  test("is a group of its own, named, waiting, and never a daemon that failed", async ({ page }) => {
     await page.goto("/?fixture=1&state=fleet");
     await page.getByTestId("open-overview").click();
     await expect(page.getByTestId("daemon-group").first()).toBeVisible();
@@ -313,7 +314,7 @@ test.describe("a deck that has not reported yet (PRD #742 M14)", () => {
     /*
       Named by its address, which is the half that needs the crate's `observed`
       list: `fleet` carries `deck-<16 hex>` hashes, and a group built from an id
-      alone falls through to "Local deck" for a deck on another machine.
+      alone falls through to "Local daemon" for a daemon on another machine.
     */
     await expect(waiting).toHaveAttribute("data-deck-connected", "no");
     await expect(waiting.getByTestId("daemon-identity")).toHaveText("ops@edge-3");
@@ -321,7 +322,7 @@ test.describe("a deck that has not reported yet (PRD #742 M14)", () => {
     await expect(waiting.getByTestId("daemon-unknown")).toHaveText("—");
 
     // Its own note, and NOT the disconnected one — whose remedy is a Reconnect
-    // that would re-establish the whole fleet to hurry a deck already on its
+    // that would re-establish the whole fleet to hurry a daemon already on its
     // way. There is nothing here for the reader to press.
     await expect(waiting.getByTestId("overview-pending")).toBeVisible();
     await expect(waiting.getByTestId("overview-disconnected")).toHaveCount(0);
@@ -346,14 +347,14 @@ test.describe("a deck that has not reported yet (PRD #742 M14)", () => {
     expect(placement.right).toBeLessThanOrEqual(placement.viewport);
   });
 
-  test("is counted in the fleet's total and never among the decks that answered", async ({ page }) => {
+  test("is counted in the fleet's total and never among the daemons that answered", async ({ page }) => {
     await page.goto("/?fixture=1&state=fleet");
     await page.getByTestId("open-overview").click();
     await expect(page.getByTestId("daemon-group").first()).toBeVisible();
 
     /*
       Four configured, two answering. The number that used to be wrong is the
-      DENOMINATOR: a deck nothing had been heard from was absent from the fleet
+      DENOMINATOR: a daemon nothing had been heard from was absent from the fleet
       entirely, so this read `2/3` — and would have gone on reading as correct.
     */
     const decks = page.getByTestId("overview-count-decks").locator("strong");

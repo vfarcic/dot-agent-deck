@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { WorkflowPanel } from "./ConfigurationPanels";
+import { OrchestrationPanel } from "./ConfigurationPanels";
 import { DEFAULT_PROFILES } from "../data/fixture";
 import type { DaemonResolvedProject } from "../types";
 
@@ -14,7 +14,7 @@ const PROJECT: DaemonResolvedProject = {
 
 function panel(deckId: string, liveTitles: string[]) {
   return (
-    <WorkflowPanel
+    <OrchestrationPanel
       open
       profiles={DEFAULT_PROFILES}
       order={[]}
@@ -31,7 +31,7 @@ function panel(deckId: string, liveTitles: string[]) {
   );
 }
 
-describe("WorkflowPanel run name", () => {
+describe("OrchestrationPanel run name", () => {
   /**
    * PR #1333 review. Scenario: the sheet is open on deck A, which runs
    * `deck-orchestrator-1`, so it suggests `-2`. A fleet tick on the SAME deck
@@ -45,10 +45,10 @@ describe("WorkflowPanel run name", () => {
 
     rerender(panel("deck-a", ["deck-orchestrator-1", "deck-orchestrator-2"]));
     expect(screen.getByLabelText("Run name")).toHaveValue("deck-orchestrator-2");
-    expect(screen.getByTestId("workflow-title-taken")).toBeVisible();
+    expect(screen.getByTestId("orchestration-title-taken")).toBeVisible();
 
     rerender(panel("deck-b", []));
     expect(screen.getByLabelText("Run name")).toHaveValue("deck-orchestrator-1");
-    expect(screen.queryByTestId("workflow-title-taken")).toBeNull();
+    expect(screen.queryByTestId("orchestration-title-taken")).toBeNull();
   });
 });

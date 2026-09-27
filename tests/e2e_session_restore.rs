@@ -289,7 +289,7 @@ fn restore_001_no_flag_startup_restores_panes_from_snapshot() {
 
 /// Scenario: Launch the deck against a fresh (empty) daemon with NO snapshot on
 /// disk and NO `--continue` flag — the both-empty case. The deck must land on a
-/// clean empty dashboard ("No active sessions") with no restore warning, and
+/// clean empty dashboard ("No active agents") with no restore warning, and
 /// remain interactive (Ctrl+N opens the new-pane directory picker). This locks
 /// the post-Phase-2 invariant that making restore unconditional must still fall
 /// through cleanly when there is nothing to restore from either source.
@@ -312,7 +312,7 @@ fn restore_006_empty_daemon_and_no_snapshot_lands_on_clean_dashboard() {
         .launch_with_fixture("modes");
 
     // Empty daemon + empty snapshot → the empty-dashboard placeholder.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // No restore warning should be surfaced when there is nothing to restore.
     let grid = deck.snapshot_grid();
@@ -979,7 +979,7 @@ fn restore_015_flushed_warning_escapes_control_characters_in_pane_name() {
         .launch_with_fixture("minimal");
 
     // The only saved pane was skipped, so the deck lands on the empty dashboard.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Detach-quit: the clean teardown path that reaches the post-`restore()`
     // flush. A killed process never gets there, so the drain below is what
@@ -1132,7 +1132,7 @@ fn restore_016_reattach_restores_active_tab_and_focused_pane() {
     let session_file = shared.path().join("session.toml");
 
     let mut first = launch_deck_against(&daemon, &session_file);
-    first.wait_for_string("No active sessions");
+    first.wait_for_string("No active agents");
 
     // Open the orchestration. With no `[[modes]]` in the fixture the mode-chip
     // row is `[No mode] [Orch: reattach-orch] [schedule]`, so ONE Right selects
@@ -1217,7 +1217,7 @@ fn restore_016_reattach_restores_active_tab_and_focused_pane() {
     // Half 1 — the ACTIVE TAB. The remembered Dashboard is a real position, so
     // it wins over PRD #111's land-on-the-orchestration-tab default.
     //
-    // The header's `N/M session(s)` count is the precondition, not the claim:
+    // The header's `N/M agent(s)` count is the precondition, not the claim:
     // it says all three roles hydrated (M == 3) before anything is asserted
     // about which tab is highlighted. The Dashboard filters out panes that
     // belong to a mode/orchestration tab, so `0/3` is what a faithfully
@@ -1227,7 +1227,7 @@ fn restore_016_reattach_restores_active_tab_and_focused_pane() {
     assert!(
         common::wait_until(Duration::from_secs(15), || {
             let grid = second.snapshot_grid();
-            grid.contains("3 session(s)")
+            grid.contains("3 agent(s)")
                 && dashboard_tab_is_active(&second)
                 && focused_role_pane(&grid).is_none()
         }),
@@ -1322,21 +1322,21 @@ fn restore_019_cold_start_honours_the_remembered_tab_but_not_a_rebuilt_pane_id()
     // Read from the TAB STRIP (`Dashboard │ tdd-cycle [×]`) rather than from a
     // role card, because the role cards live on that tab and the Dashboard
     // filters out panes belonging to one — the same reason the restored
-    // overview here reads `0/3 session(s)`, which the predicate below also
+    // overview here reads `0/3 agent(s)`, which the predicate below also
     // requires so the count proves all three roles came back.
     deck.wait_for_string("tdd-cycle");
 
     assert!(
         common::wait_until(Duration::from_secs(15), || {
             let grid = deck.snapshot_grid();
-            grid.contains("3 session(s)")
+            grid.contains("3 agent(s)")
                 && dashboard_tab_is_active(&deck)
                 // No role pane is expanded: the Dashboard is what is drawn.
                 && common::role_pane_left_edge(&grid, "orchestrator").is_none()
                 && common::role_pane_left_edge(&grid, "coder").is_none()
                 // And the deck is in command mode, not the PaneInput the
                 // snapshot-restore block leaves behind.
-                && grid.contains("[New Pane Ctrl+N]")
+                && grid.contains("[New Agent Ctrl+N]")
                 && !grid.contains("[Command Mode Ctrl+D]")
         }),
         "a cold start must honour the remembered Dashboard, ignore the rebuilt pane id, and \

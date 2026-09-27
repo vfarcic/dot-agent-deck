@@ -5,7 +5,7 @@
 //! the project verbs.
 //!
 //! The subject under test is the real production call site: PRD #819 M6's
-//! `DaemonClient::list_projects` / `resolve_project` / `prepare_workflow`
+//! `DaemonClient::list_projects` / `resolve_project` / `prepare_orchestration`
 //! (`src/daemon_client.rs`), each of which opens with
 //! `self.require_capability(…).await?` before it connects — driven across a
 //! REAL Unix socket. Nothing here supplies its own guarded caller: the
@@ -56,7 +56,7 @@ use std::thread::JoinHandle;
 
 use dot_agent_deck::daemon_client::{ClientError, DaemonClient};
 use dot_agent_deck::daemon_protocol::{
-    AttachResponse, CAP_LIST_PROJECTS, CAP_PREPARE_WORKFLOW, CAP_RESOLVE_PROJECT,
+    AttachResponse, CAP_LIST_PROJECTS, CAP_PREPARE_ORCHESTRATION, CAP_RESOLVE_PROJECT,
     DAEMON_CAPABILITIES, KIND_REQ, PROTOCOL_VERSION, read_frame, write_resp,
 };
 use dot_agent_deck::event::{KnownProject, ProjectListing};
@@ -236,7 +236,7 @@ async fn handle_connection(
 
 /// Scenario: Stand up a synthetic daemon on a real attach socket whose `Hello`
 /// omits `capabilities` — an older daemon, exactly — and call the real
-/// `DaemonClient::list_projects` / `resolve_project` / `prepare_workflow`
+/// `DaemonClient::list_projects` / `resolve_project` / `prepare_orchestration`
 /// against it; all three must be withheld, and the daemon's own request log
 /// must show nothing but the one handshake, proving no verb reached the wire
 /// and its refusal text was never read. Then repeat against a second synthetic
@@ -300,16 +300,16 @@ fn handshake_008_absent_capabilities_withhold_project_verbs_before_the_wire() {
         "`resolve_project` propagates the capability decline verbatim: {withheld}"
     );
     let withheld = runtime
-        .block_on(client.prepare_workflow(
+        .block_on(client.prepare_orchestration(
             FIXTURE_PROJECT_PATH,
             "orchestration",
             "task",
             Some("revision"),
         ))
-        .expect_err("`DaemonClient::prepare_workflow` must not reach the socket");
+        .expect_err("`DaemonClient::prepare_orchestration` must not reach the socket");
     assert!(
-        withheld.to_string().contains(CAP_PREPARE_WORKFLOW),
-        "`prepare_workflow` propagates the capability decline verbatim: {withheld}"
+        withheld.to_string().contains(CAP_PREPARE_ORCHESTRATION),
+        "`prepare_orchestration` propagates the capability decline verbatim: {withheld}"
     );
 
     // THE ASSERTION THIS FILE EXISTS FOR. Not "the verb was refused" — "the

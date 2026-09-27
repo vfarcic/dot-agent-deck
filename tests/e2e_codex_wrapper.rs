@@ -177,7 +177,7 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
         .with_imported_codex_credentials()
         .launch_with_fixture("codex-live");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     let events = deck.subscribe_events();
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");

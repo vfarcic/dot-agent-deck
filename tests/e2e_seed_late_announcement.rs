@@ -86,7 +86,7 @@ fn seed_is_in_a_card_prompt_history(deck: &TuiDeck) -> bool {
 #[test]
 fn new_pane_017_a_spawn_time_seed_waits_for_the_agent_to_announce_itself() {
     let deck = TuiDeck::launch_with_fixture("mode-seed");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     let stand_in =
         common::write_late_announcing_agent(deck.workdir(), AGENT_LOG, ANNOUNCE_AFTER_SECS);
     let command = format!(

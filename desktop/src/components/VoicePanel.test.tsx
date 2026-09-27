@@ -203,6 +203,7 @@ describe("VoicePanel", () => {
    * the Commands endpoint, and the Names row decides whether the names on
    * screen are part of it.
    */
+  /** Scenario: Says what each command sends, and changes the sentence with the Names row. */
   it("says what each command sends, and changes the sentence with the Names row", () => {
     const { onSave } = renderPanel({ voice: undefined });
     const disclosure = screen.getByTestId("voice-intent-disclosure");
@@ -222,7 +223,7 @@ describe("VoicePanel", () => {
     // no such field — because a name is arbitrary text and can itself be a
     // path; and the words go with a command that REACHES the endpoint, since
     // the locally decided ones named above send nothing.
-    expect(disclosure).toHaveTextContent("This app adds no field of its own for a filesystem path, a deck or agent id, prompt text or a tool's arguments");
+    expect(disclosure).toHaveTextContent("This app adds no field of its own for a filesystem path, a daemon or agent id, prompt text or a tool's arguments");
     expect(disclosure).toHaveTextContent("a name is whatever it was set to, so a name can itself be a path.");
     expect(disclosure).toHaveTextContent("Every command that reaches the endpoint also carries your words as heard, which may contain anything you say.");
     expect(disclosure).not.toHaveTextContent("Those names include no filesystem path");

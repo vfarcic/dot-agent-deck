@@ -354,7 +354,9 @@ fn open_pane(deck: &TuiDeck, agent: &Agent, command: &str, last_command: &str) {
     deck.send_keys(b"\x0e"); // Ctrl+N -> directory picker
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // confirm the launch directory -> the form
-    deck.wait_for_string("New Agent");
+    // The button bar also says "New Agent"; wait for the form's bordered
+    // title so the keystrokes below cannot land on the picker.
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t"); // Mode -> Name
     deck.send_keys(&vec![BACKSPACE; LAUNCH_DIR.chars().count()]);
     deck.send_keys(agent.name.as_bytes());
@@ -365,7 +367,7 @@ fn open_pane(deck: &TuiDeck, agent: &Agent, command: &str, last_command: &str) {
     // The transcript's first line is its prompt, which no card shows yet.
     deck.wait_for_string(&format!("> {}", agent.prompt));
     deck.send_keys(b"\x04"); // Ctrl+D -> back to the dashboard
-    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("[New Agent Ctrl+N]");
 }
 
 /// The daemon's record of the pane named `name`, once it has one that
@@ -477,7 +479,7 @@ fn stage_dashboard() -> DashboardScene {
             .with_launch_subdir(LAUNCH_DIR)
             .impersonating_pane_signals()
     });
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     let stand_ins = deck.workdir().join("docs-stand-ins");
     let commands = write_stand_ins(&stand_ins);
 
@@ -514,7 +516,7 @@ fn stage_dashboard() -> DashboardScene {
     deck.send_keys(b"\r");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_keys(b"\x04");
-    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("[New Agent Ctrl+N]");
 
     // The cards' `Last:` ages. A card's last activity is a high-water mark
     // that starts at its pane's spawn, so every status event is stamped after
@@ -618,7 +620,7 @@ fn shell_quote_keeps_hostile_paths_one_word() {
 }
 
 /// Scenario: Launch the deck in a sandbox with no agents and write the
-/// dashboard's empty state — the `No active sessions` hint and the command-mode
+/// dashboard's empty state — the `No active agents` hint and the command-mode
 /// button bar — as `dashboard-empty-tui.html`.
 #[test]
 #[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
@@ -626,6 +628,6 @@ fn docs_screenshot_dashboard_empty() {
     html_dir();
     let deck = launch();
     capture(&deck, "dashboard-empty", |grid| {
-        grid.contains("No active sessions") && grid.contains("[New Pane Ctrl+N]")
+        grid.contains("No active agents") && grid.contains("[New Agent Ctrl+N]")
     });
 }

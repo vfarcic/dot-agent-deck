@@ -66,7 +66,7 @@ fn command_field_value(grid: &str) -> String {
 }
 
 fn open_new_pane_form(deck: &TuiDeck) -> String {
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // Space → confirm dir → new-pane form
@@ -88,7 +88,7 @@ fn new_pane_011_seed_from_last_command() {
     // DOT_AGENT_DECK_CONFIG nowhere, so the only seed left is the last-command
     // fallback this PRD adds.
     let deck = TuiDeck::launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // (1) Open the new-pane form. With no prior spawn the Command field is BLANK.
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
@@ -153,7 +153,7 @@ fn new_pane_012_default_command_precedence() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_CONFIG", cfg_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // (1) Open the form: the Command field pre-fills from `default_command`.
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
@@ -221,7 +221,7 @@ fn new_pane_013_authoring_spawn_records_last_command() {
     // seed is the last-command fallback — exactly the channel the authoring spawn
     // now feeds.
     let deck = TuiDeck::launch_with_fixture("schedule-mode");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // (1) Authoring spawn: open the form, cycle Mode to the built-in `schedule`
     // authoring option, type `cat`, and submit. `cat` is a real binary so the
@@ -301,7 +301,7 @@ fn new_pane_014_last_command_survives_restart() {
         let deck = TuiDeck::builder()
             .with_env("HOME", home_arg.as_str())
             .launch_with_fixture("minimal");
-        deck.wait_for_string("No active sessions");
+        deck.wait_for_string("No active agents");
 
         deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
         deck.wait_for_string("Select Directory");
@@ -338,7 +338,7 @@ fn new_pane_014_last_command_survives_restart() {
     let deck = TuiDeck::builder()
         .with_env("HOME", home_arg.as_str())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.wait_for_string("Select Directory");

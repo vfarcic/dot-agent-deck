@@ -46,7 +46,7 @@ const EVENT_TITLES: Record<string, string> = {
   error: "Agent reported an error",
   // Issue #714: the agent reported its provider refusing it for a quota.
   quota_blocked: "Provider usage limit reached",
-  delegation_dispatched: "Delegation dispatched",
+  delegation_dispatched: "Delegated",
   delegation_delivered: "Task delivered to worker",
   delegation_failed: "Delegation FAILED",
   worker_respawned: "Worker respawned for delegation",
@@ -147,7 +147,7 @@ export function mapDaemonEvent(payload: unknown, sequence: number, resolveAgent?
       from: workDone ? (metadata.from_role || agent?.role || "worker") : "orchestrator",
       to: workDone ? "orchestrator" : (metadata.to_role || ""),
       at: clockFor(event.timestamp),
-      reason: sessionId ? `Delegation ${sessionId}` : "Deck handoff event",
+      reason: sessionId ? `Delegation ${sessionId}` : "Daemon delegation event",
       acknowledged: false,
       agentId: agent?.id ?? agentId,
     };
@@ -161,7 +161,7 @@ export function mapDaemonEvent(payload: unknown, sequence: number, resolveAgent?
     from: agent?.role ?? agentId ?? paneId ?? sessionId ?? "Unattributed agent",
     to: "",
     at: clockFor(event.timestamp),
-    reason: "Live hook event from the deck event stream.",
+    reason: "Live hook event from the daemon event stream.",
     acknowledged: false,
     agentId: agent?.id ?? agentId,
   };
@@ -195,7 +195,7 @@ export function applyHandoffEvent(edges: HandoffEdge[], payload: unknown): Hando
       toRole: metadata.to_role || "unknown role",
       orchestration: metadata.orchestration || undefined,
       taskPreview: metadata.task_preview || undefined,
-      status: "dispatched",
+      status: "delegated",
       respawned: false,
       at,
     };

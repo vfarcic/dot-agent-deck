@@ -89,7 +89,7 @@ fn newagent_live_001_a_real_agent_reports_a_sentinel_from_the_browsed_directory(
         .with_pty_size(110, 32)
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let fixture = deck.home_dir().join(FIXTURE_DIRECTORY);
     std::fs::create_dir(&fixture).expect("create ordinary directory fixture under daemon HOME");
@@ -215,7 +215,7 @@ fn newagent_live_001_a_real_agent_reports_a_sentinel_from_the_browsed_directory(
 
     let session_id =
         events.wait_for_session_start_on_pane(PANE_ID, &agent_id, Duration::from_secs(180));
-    deck.wait_for_absence("No active sessions");
+    deck.wait_for_absence("No active agents");
     deck.send_keys(b"1");
 
     if !common::wait_until_panes_settled(

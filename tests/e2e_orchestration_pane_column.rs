@@ -108,7 +108,7 @@ fn orchestration_006_stacked_pane_column_hides_collapsed_frames_while_agents_sta
         .with_pty_size(160, 45)
         .launch_with_fixture("orch-focus-lifecycle");
     write_beta_agent(&deck);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     open_orchestration(&deck);
     deck.wait_for_string("orchestrator");
     deck.wait_for_string("alpha");
@@ -202,7 +202,7 @@ fn orchestration_007_ctrl_l_toggles_pane_column_split() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Same keystrokes as the `orch-focus-lifecycle` opener above: with no
     // `[[modes]]` in the fixture, ONE Right selects `[Orch: demo-orch]`, and
@@ -378,7 +378,7 @@ fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-focus-lifecycle");
     write_beta_agent(&deck);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_string("alpha");
@@ -584,7 +584,7 @@ fn orchestration_012_real_agent_reflows_across_a_zoom_round_trip() {
         // directives below are not swallowed answering them.
         .with_claude_trust_workdir()
         .launch_with_fixture("orch-lock-live");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Uniquely-named fixture sentinels the agent has to DISCOVER. Written into
     // the agents' cwd before the orchestration opens.

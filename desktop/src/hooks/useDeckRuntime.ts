@@ -45,7 +45,7 @@ function seedSnapshot(mode: RuntimeMode): DeckSnapshot {
       agents: [],
       evidence: [],
       handoffs: [],
-      connection: { status: "loading", message: "Connecting to the local deck…" },
+      connection: { status: "loading", message: "Connecting to the local daemon…" },
     };
   }
   const initial = createFixtureSnapshot("empty");
@@ -140,7 +140,7 @@ export function useDeckRuntime(): DeckRuntimeState {
    *
    * Held here rather than in a tile because the send that produces one is not
    * the tile's — the composer that used to own this is gone, and what remains
-   * are PROGRAMMATIC sends: the coordinator's seed prompt at workflow launch,
+   * are PROGRAMMATIC sends: the orchestrator's seed prompt at orchestration activation,
    * and whatever else dispatches through the guarded verb.
    *
    * A record here is one PAST ATTEMPT, never current state, which is why

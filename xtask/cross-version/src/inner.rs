@@ -37,8 +37,11 @@ pub(crate) const DAEMON_TIMEOUT: Duration = Duration::from_secs(45);
 /// between and there is nothing specific to poll for.
 pub(crate) const SETTLE: Duration = Duration::from_millis(400);
 
-/// A button the deck's footer draws only in Normal mode — see [`focus_role`].
-const NORMAL_MODE_BUTTON: &str = "[New Pane Ctrl+N]";
+/// The button the deck's footer draws only in command mode — see
+/// [`focus_role`]. Either TUI can be the one focusing (forward: the branch;
+/// reverse: the previous release), and #1045 renamed the button from "New
+/// Pane" to "New Agent", so both spellings count.
+const COMMAND_MODE_BUTTONS: [&str; 2] = ["[New Agent Ctrl+N]", "[New Pane Ctrl+N]"];
 /// How long the daemon gets after its one SIGTERM. Well past its 3 s agent
 /// grace (`AGENT_TERMINATE_GRACE`).
 pub(crate) const DAEMON_GRACE: Duration = Duration::from_secs(20);
@@ -1118,7 +1121,11 @@ fn scenario(
         rows: 55,
         stream_log: sb.artifacts.join(format!("{setup_label}.stream.txt")),
     })?;
-    if !setup_tui.wait_for_grid_string("No active sessions", UI_TIMEOUT) {
+    // Either TUI can be the setup TUI (forward: the previous release; reverse:
+    // the branch), and #1045 renamed this empty-state sentence, so accept both.
+    if !setup_tui.wait_for_grid(UI_TIMEOUT, |g| {
+        g.contains("No active agents") || g.contains("No active sessions")
+    }) {
         return Err(Abort::Scenario(format!(
             "{}: never reached an empty dashboard.\n=== grid ===\n{}",
             setup_tui.label,
@@ -2712,7 +2719,7 @@ fn open_orchestration(deck: &pty::PtyDeck) -> Result<(), String> {
 /// Give keyboard focus to `role`'s pane and leave the deck in `PaneInput` mode
 /// on it.
 ///
-/// `Ctrl+D` returns to Normal mode, a digit jumps to that role's card, and
+/// `Ctrl+D` returns to command mode, a digit jumps to that role's card, and
 /// `focus_deck` re-enters `PaneInput` on success — so one digit both selects the
 /// pane and makes it the one keystrokes reach. `PaneLayout::Stacked` draws only
 /// the focused role's pane and fuses its title into the box corner as
@@ -2736,19 +2743,21 @@ pub(crate) fn focus_role(deck: &pty::PtyDeck, plan: &Plan, role: &str) -> Result
         .ok_or_else(|| format!("role {role} is card {} — past the digit keys", index + 1))?;
     let expanded = format!("┌{role}");
     for attempt in 0..6 {
-        deck.send(b"\x04"); // Ctrl+D -> Normal mode
-        // Wait for Normal mode to be PAINTED before the digit, rather than only
+        deck.send(b"\x04"); // Ctrl+D -> command mode
+        // Wait for command mode to be PAINTED before the digit, rather than only
         // sleeping. A fixed `SETTLE` alone lost the race on a loaded host (load
         // average 12-20 on 16 cores, found running this harness for #1243): the
         // digit reached the focused pane as input, the orchestrator's shell ran
         // `1dot-agent-deck delegate …`, and tells 3 and 4 failed on `main` and
         // on a branch alike. The full button bar is drawn only outside
         // PaneInput mode (which shows just the dashboard button), so its
-        // `[New Pane Ctrl+N]` is a positive confirmation — the one the e2e
+        // `[New Agent Ctrl+N]` is a positive confirmation — the one the e2e
         // tier's own PTY tests use after the same Ctrl+D. Bounded, and the
         // sleep stays: a transient status message can occupy the bar's row, and
         // then this falls back to exactly the old behaviour.
-        let _ = deck.wait_for_grid_string(NORMAL_MODE_BUTTON, SETTLE * 5);
+        let _ = deck.wait_for_grid(SETTLE * 5, |g| {
+            COMMAND_MODE_BUTTONS.iter().any(|button| g.contains(button))
+        });
         std::thread::sleep(SETTLE);
         deck.send(&[digit]);
         if deck.wait_for_grid_string(&expanded, STEP_TIMEOUT) {

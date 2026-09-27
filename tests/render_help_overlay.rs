@@ -32,9 +32,11 @@ fn buffer_text_lower(buffer: &ratatui::buffer::Buffer) -> String {
 /// Scenario: Render the `?` help overlay into a tall (110×60) `TestBackend`
 /// buffer so all of its multi-section content fits, then assert it documents
 /// the canonical shortcut set: the five global commands the button bar
-/// advertises (New Pane Ctrl+N, Close Ctrl+W, Toggle Layout Ctrl+T, Help ?,
+/// advertises (New Agent Ctrl+N, Close Ctrl+W, Toggle Layout Ctrl+T, Help ?,
 /// Quit Ctrl+C) and the key dashboard / navigation actions (filter `/`,
-/// rename, generate, tab switching, card nav). Substring checks are
+/// rename, generate, tab switching, card nav). The labels must name agents,
+/// the schedule manager, and the command mode destination consistently.
+/// Substring checks are
 /// case-insensitive so a `Ctrl+n` vs `Ctrl+N` casing difference between the
 /// overlay and the buttons does not fail the test — it pins that each
 /// shortcut/command is *present* in the canonical reference.
@@ -46,7 +48,7 @@ fn help_001_overlay_documents_canonical_shortcut_set() {
     // Each entry: (token, human description for the failure message).
     let required: &[(&str, &str)] = &[
         // Five global commands the M2 button bar advertises.
-        ("ctrl+n", "New Pane (Ctrl+N)"),
+        ("ctrl+n", "New Agent (Ctrl+N)"),
         ("ctrl+w", "Close (Ctrl+W)"),
         ("ctrl+t", "Toggle Layout (Ctrl+T)"),
         ("ctrl+c", "Quit (Ctrl+C)"),
@@ -70,6 +72,20 @@ fn help_001_overlay_documents_canonical_shortcut_set() {
         missing.is_empty(),
         "help overlay is missing these canonical shortcuts/commands: {missing:?}\n--- rendered overlay ---\n{buf}"
     );
+    for label in [
+        "create new agent",
+        "filter agents",
+        "rename agent",
+        "jump to card n",
+        "close selected agent (confirms)",
+        "return to command mode",
+        "schedules manager",
+    ] {
+        assert!(
+            buf.contains(label),
+            "help overlay must show {label:?}\n{buf}"
+        );
+    }
 }
 
 /// Scenario: Render the default help overlay into a `TestBackend` buffer and snapshot its complete text. The Ctrl+D row must describe a bidirectional command-mode / pane-input toggle, so a user already on the dashboard can discover how to return to the pane.

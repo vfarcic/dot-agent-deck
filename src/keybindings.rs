@@ -137,14 +137,14 @@ pub const ACTIONS: &[ActionSpec] = &[
         section: Section::Global,
         name: "new_pane",
         default: "Ctrl+n",
-        description: "New pane",
+        description: "New agent",
     },
     ActionSpec {
         action: Action::ClosePane,
         section: Section::Global,
         name: "close_pane",
         default: "Ctrl+w",
-        description: "Close pane",
+        description: "Close agent",
     },
     ActionSpec {
         action: Action::ToggleLayout,
@@ -322,7 +322,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         default: "g",
         description: "Generate config",
     },
-    // PRD #127 finding #4: open the "Scheduled Tasks" manager dialog. Default
+    // PRD #127 finding #4: open the "Schedules" manager dialog. Default
     // `s`; the dashboard handler also keeps the legacy uppercase `S` as a
     // non-configurable alias (mirroring the Down/Up aliases for j/k), so both
     // cases open it by default while the action itself stays remappable.
@@ -331,7 +331,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         section: Section::Dashboard,
         name: "open_scheduled_tasks",
         default: "s",
-        description: "Scheduled Tasks manager",
+        description: "Schedules manager",
     },
     // PRD #341 M5: the keyboard equivalent of the mouse wheel over the focused
     // agent pane. Command mode is the safe resting state, so reading back
@@ -902,6 +902,19 @@ fn keybindings_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario: Read the labels exposed by the configured create, close, and
+    /// schedule shortcuts. Each description must use the same agent and
+    /// schedule terms that the TUI presents for those actions.
+    #[test]
+    fn action_descriptions_use_agent_and_schedule_words() {
+        assert_eq!(Action::NewPane.description(), "New agent");
+        assert_eq!(Action::ClosePane.description(), "Close agent");
+        assert_eq!(
+            Action::OpenScheduledTasks.description(),
+            "Schedules manager"
+        );
+    }
 
     fn ev(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)

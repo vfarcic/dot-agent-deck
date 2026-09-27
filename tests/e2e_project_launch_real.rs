@@ -170,7 +170,7 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
         // dir, which is the only spelling pair the daemon can produce here.
         .with_claude_trust_workdir()
         .launch_with_fixture("project-launch-real");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let socket = deck.attach_socket_path().to_path_buf();
     let events = deck.subscribe_events();
@@ -231,7 +231,7 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
     );
     let prepared = resp
         .workflow_prepared
-        .expect("a successful PrepareWorkflow must carry a PreparedWorkflow");
+        .expect("a successful PrepareWorkflow must carry a PreparedOrchestration");
 
     // Preconditions, not the claim — `project/launch/001` owns the publish
     // contract. They are here so a red run says WHICH half broke: the daemon
@@ -298,7 +298,7 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
     // Open the coordinator's pane in the already-attached TUI, so the live agent
     // is on screen (and on the cast) for the whole turn — the surface a user
     // actually watches.
-    deck.wait_for_absence("No active sessions");
+    deck.wait_for_absence("No active agents");
     deck.send_keys(b"1");
 
     // Nothing may be injected into a claude that is still painting its UI: bytes

@@ -122,7 +122,7 @@ function runtime(resolveVoice: ResolveVoice, voice: VoiceControls = voiceControl
       deck: selection,
       state: "ssh_unavailable" as const,
       ok: false,
-      message: "No deck is reachable from this test runtime.",
+      message: "No daemon is reachable from this test runtime.",
       disclosureKnown: false,
       forwards: [],
       knownHosts: [],
@@ -215,7 +215,7 @@ const DISPATCH = {
   action: "open_overview",
   invoke: "openOverview",
   params: [],
-  sentence: "Opening the agent overview.",
+  sentence: "Opening the agent dashboard.",
 };
 
 const OPEN_SETTINGS_DISPATCH = {
@@ -236,8 +236,8 @@ const OUTCOMES: Array<{ name: string; utterance: string; outcome: VoiceResultDto
       kind: "unavailable",
       transcript: "show me every agent",
       action: "open_overview",
-      hint: "the agent overview opens from the deck",
-      sentence: "Not here — the agent overview opens from the deck.",
+      hint: "the agent overview opens from the daemon",
+      sentence: "Not here — the agent overview opens from the daemon.",
     },
   },
   {
@@ -364,7 +364,7 @@ describe("voice control panel", () => {
   });
 
   /**
-   * Scenario: render the deck with voice available and inspect the surface's
+   * Scenario: render the daemon with voice available and inspect the surface's
    * shape. The trigger and the report are the two cells of ONE row, and that row
    * is the single element the agent pane's inert walk is told to skip.
    */
@@ -606,7 +606,7 @@ describe("voice control panel", () => {
   });
 
   /** Scenario: a spoken settings command opens the ordinary overlay and its transient report confirms the action. */
-  it("opens a deck overlay through the shell voice dispatch", async () => {
+  it("opens a daemon overlay through the shell voice dispatch", async () => {
     vi.useFakeTimers();
     const voice = automaticVoice(heard("open settings"));
     const resolveVoice = resolver(result(OPEN_SETTINGS_DISPATCH));
@@ -641,7 +641,7 @@ describe("voice control panel", () => {
     expect(screen.queryByTestId("evidence-drawer")).not.toBeInTheDocument();
   });
 
-  /** Scenario: a voice command navigates to the overview, then its transient Undo returns to the prior deck view. */
+  /** Scenario: a voice command navigates to the overview, then its transient Undo returns to the prior daemon view. */
   it("undoes a dispatched navigation back to the previous view", async () => {
     vi.useFakeTimers();
     const voice = automaticVoice(heard("show me every agent"));

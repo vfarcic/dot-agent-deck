@@ -697,6 +697,19 @@ pub async fn handle_utterance_with(
             .get(&spec.name)
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
+            // A REQUIRED deck made only of category words — "daemon", the
+            // dialog's field heading, or "the deck" — names no deck, so it is
+            // asked for exactly as an absent one is (issue #1045); unless it
+            // is a deck's own name said whole (`ops@daemon`'s "daemon"),
+            // which goes on to the resolver like any other. An optional one
+            // goes on to the resolver either way, which matches nothing for a
+            // category word, so the report says the daemon was not caught.
+            .filter(|value| {
+                spec.optional
+                    || spec.kind != ParamKind::DeckRef
+                    || !deck_reference(value).is_empty()
+                    || !decks_called(value, decks).is_empty()
+            })
         else {
             // An optional param the model left out is simply not dispatched
             // (PRD #1223's "new agent" with no deck named), and says nothing:
@@ -707,7 +720,7 @@ pub async fn handle_utterance_with(
             // **Dispatched, and still not named.** The implied deck is the
             // only one that can take a new agent, nobody referred to any deck,
             // and no note precedes it: there was no choice and no guess, so
-            // "Preselected deck: …" would tell the user nothing they do not
+            // "Preselected daemon: …" would tell the user nothing they do not
             // already know, on every "new agent". It is named where it carries
             // information — a deck someone referred to (`Ok` below), or after
             // a dropped one, whose note it answers ([`Unmet::dropped_note`]).
@@ -947,7 +960,7 @@ impl Unmet {
     /// **`implied` decides how it ends**: "…, so none is preselected." when
     /// nothing will be, or the implied deck's own note when the dialog will
     /// preselect the only deck that can take an agent regardless — "No deck
-    /// matches “ghost”. Preselected deck: Local deck." ([`implied_param`]).
+    /// matches “ghost”. Preselected daemon: Local daemon." ([`implied_param`]).
     fn dropped_note(
         &self,
         kind: ParamKind,
@@ -1014,14 +1027,14 @@ impl Unmet {
 /// "Deck X cannot take a new agent", and the deck step's reason for it as the
 /// detail — scrubbed, since it is display text that came through the webview,
 /// and without its closing full stop, which the caller's sentence supplies.
-/// The local deck's label already says "deck", so only a remote one, whose
+/// The local daemon's label already says "daemon", so only a remote one, whose
 /// label is an address, is introduced as one.
 fn deck_unavailable(label: &str, local: bool, reason: &str) -> (String, Option<String>) {
     let label = safe_message(label);
     let head = if local {
         format!("{label} cannot take a new agent")
     } else {
-        format!("Deck {label} cannot take a new agent")
+        format!("Daemon {label} cannot take a new agent")
     };
     let reason = safe_message(reason);
     let reason = reason.trim().trim_end_matches('.').trim_end();
@@ -1111,7 +1124,9 @@ fn said(spoken: &str, transcript: &str) -> bool {
 /// 1. **The decks the transcript names** ([`decks_named`]): every deck that
 ///    some contiguous run of the transcript's content words — its
 ///    [`spoken_words`] less [`NAMELESS_WORDS`] — resolves to on its own under
-///    [`resolve_deck_ref`], exact or loose. More than one →
+///    [`resolve_deck_ref`], exact or loose — or, in a transcript with no
+///    content word, a deck whose own name is nameless, said whole
+///    ([`decks_named`]). More than one →
 ///    [`Unmet::NamedSeveral`], whatever the model picked; negation, "X or Y",
 ///    "from X to Y" and overlapping names all land here.
 /// 2. **A contrast word** ([`contrast_marker`]) anywhere in the transcript →
@@ -1182,7 +1197,7 @@ fn switch_target(
     if let Some(marker) = contrast_marker(transcript.text(), decks, &named) {
         return Err(Unmet::Contrast(marker));
     }
-    if !said(spoken, transcript.text()) {
+    if !said(spoken, transcript.text()) && !said_as_a_name(spoken, transcript.text(), decks) {
         return Err(Unmet::NotSaid);
     }
     match resolve_deck_ref(spoken, decks) {
@@ -1206,10 +1221,22 @@ fn switch_target(
 /// Every run, not only single words: "build box" can resolve to one deck while
 /// "build" and "box" are each ambiguous. A voice utterance is a few seconds of
 /// speech, so the quadratic count of runs is small.
+///
+/// **A deck whose name is itself nameless** — `ops@daemon`, whose host is the
+/// category word "daemon" — is invisible to the content words, so it is looked
+/// for among ALL the transcript's words, by [`decks_called`] alone, only when
+/// the transcript has no content word at all, and only in the destination
+/// slot — the run of words the utterance ENDS with. "switch daemon to daemon"
+/// and "switch deck to daemon" name it; in "switch daemon to deck" the
+/// "daemon" is the selector's heading and names nothing, and in "switch daemon
+/// to staging" the deck named is staging's, or none. A trailing "please"
+/// therefore refuses too, which costs one more utterance.
 fn decks_named<'a>(transcript: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDeck> {
-    let content: Vec<String> = spoken_words(transcript)
-        .into_iter()
+    let all = spoken_words(transcript);
+    let content: Vec<String> = all
+        .iter()
         .filter(|word| !NAMELESS_WORDS.contains(&word.as_str()))
+        .cloned()
         .collect();
     let mut named: BTreeSet<String> = BTreeSet::new();
     for start in 0..content.len() {
@@ -1221,10 +1248,31 @@ fn decks_named<'a>(transcript: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDec
             }
         }
     }
+    if content.is_empty() {
+        for start in 0..all.len() {
+            if let [deck] = decks_called(&all[start..].join(" "), decks)[..] {
+                named.insert(deck.id.clone());
+            }
+        }
+    }
     decks
         .iter()
         .filter(|deck| named.contains(&deck.id))
         .collect()
+}
+
+/// [`said`] for a value with no content word: whether `spoken` is a deck's
+/// configured name ([`decks_called`]) that the transcript says verbatim, as a
+/// run of its [`spoken_words`]. What lets "switch daemon to daemon" ground
+/// `deck="daemon"` when `ops@daemon` is configured; [`decks_named`] still
+/// decides which deck that was.
+fn said_as_a_name(spoken: &str, transcript: &str, decks: &[VoiceDeck]) -> bool {
+    let wanted = spoken_words(spoken);
+    !wanted.is_empty()
+        && !decks_called(spoken, decks).is_empty()
+        && spoken_words(transcript)
+            .windows(wanted.len())
+            .any(|run| run == wanted.as_slice())
 }
 
 /// Words and phrases that turn a mention of a deck into an EXCLUSION of one —
@@ -1654,7 +1702,7 @@ fn millis(elapsed: std::time::Duration) -> u32 {
 /// to be the filler list of reference grounding for every row, removed on
 /// 2026-09-24 (see [`resolve_param`]); `switch_deck` is the only dispatch it
 /// gates now.
-const NAMELESS_WORDS: [&str; 52] = [
+const NAMELESS_WORDS: [&str; 53] = [
     "a",
     "an",
     "the",
@@ -1689,6 +1737,7 @@ const NAMELESS_WORDS: [&str; 52] = [
     "directory",
     "folder",
     "deck",
+    "daemon",
     "mode",
     "agent",
     "type",
@@ -1981,7 +2030,7 @@ impl ParamKind {
     fn missing_phrase(self) -> &'static str {
         match self {
             ParamKind::AgentRef => "I could not tell which agent you meant",
-            ParamKind::DeckRef => "I could not tell which deck you meant",
+            ParamKind::DeckRef => "I could not tell which daemon you meant",
             ParamKind::DirRef => "I could not tell which directory you meant",
             ParamKind::ModeRef => "I could not tell which mode you meant",
             ParamKind::AgentTypeRef => "I could not tell which agent type you meant",
@@ -2010,7 +2059,7 @@ impl ParamKind {
         let spoken = safe_message(spoken);
         match self {
             ParamKind::AgentRef => format!("no agent here matches \u{201c}{spoken}\u{201d}"),
-            ParamKind::DeckRef => format!("no deck matches \u{201c}{spoken}\u{201d}"),
+            ParamKind::DeckRef => format!("no daemon matches \u{201c}{spoken}\u{201d}"),
             // "on screen", because that is the whole of the claim: a directory
             // by that name may well exist elsewhere on the deck, and this app
             // deliberately cannot look (no search verb — see `commands.toml`).
@@ -2024,7 +2073,7 @@ impl ParamKind {
                 format!("no mode the New agent form offers matches \u{201c}{spoken}\u{201d}")
             }
             ParamKind::AgentTypeRef => {
-                format!("no agent this deck offers matches \u{201c}{spoken}\u{201d}")
+                format!("no agent this daemon offers matches \u{201c}{spoken}\u{201d}")
             }
             ParamKind::OrchestrationRef => {
                 format!("no orchestration here matches \u{201c}{spoken}\u{201d}")
@@ -2059,7 +2108,7 @@ impl ParamKind {
                 format!("\u{201c}{spoken}\u{201d} matches more than one agent: {listed}")
             }
             ParamKind::DeckRef => {
-                format!("\u{201c}{spoken}\u{201d} matches more than one deck: {listed}")
+                format!("\u{201c}{spoken}\u{201d} matches more than one daemon: {listed}")
             }
             ParamKind::DirRef => {
                 format!("\u{201c}{spoken}\u{201d} matches more than one directory: {listed}")
@@ -2089,7 +2138,7 @@ impl ParamKind {
     fn noun(self) -> &'static str {
         match self {
             ParamKind::AgentRef => "agent",
-            ParamKind::DeckRef => "deck",
+            ParamKind::DeckRef => "daemon",
             ParamKind::DirRef => "directory",
             ParamKind::ModeRef => "mode",
             ParamKind::AgentTypeRef => "agent type",
@@ -2197,25 +2246,62 @@ pub enum DeckRefMatch {
 ///
 /// **The label is what a sentence says, never the id.** The id is a
 /// `deck-<16 hex>` hash minted for keying, so it is neither sayable nor shown.
+///
+/// **The category words are not evidence for a deck** ([`DECK_CATEGORY_WORDS`],
+/// issue #1045). "daemon" is the New agent dialog's field heading and a word
+/// of the local label, "Local daemon", so under the word-subset pass a bare
+/// "daemon" — or "daemon build box" where the model kept only "daemon" —
+/// reached the local deck, although the user named no deck. A reference made
+/// only of them matches nothing, and the loose pass runs on the reference
+/// without them, so whatever it reaches is distinguished by a word that is not
+/// one of them.
+///
+/// **But a category word can be part of a real name**, so the exact pass tries
+/// the reference WHOLE first and the stripped reference only when that finds
+/// nothing. With `daemon-build-box` and `build-box` both on screen, "daemon
+/// build box" is the first host's alias verbatim; stripped first, it became the
+/// second host's, and the other machine was chosen.
+///
+/// **And a category word can BE a whole name**: a remote deck configured as
+/// `ops@daemon` has the host "daemon", which a sentence says and nothing else
+/// reaches. So a reference made only of category words still reaches a deck
+/// it names verbatim ([`decks_called`]) — its label or its host said whole,
+/// never a derived shortening such as `daemon.example.com`'s "daemon", and
+/// never "the daemon" — and otherwise names no deck, as above.
 pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
-    let reference = normalize(spoken);
+    let reference = deck_reference(spoken);
     if reference.is_empty() {
-        return DeckRefMatch::None;
+        return deck_ref_match(&decks_called(spoken, decks));
     }
+    let whole = normalize(spoken);
     let reference_words = words(&reference);
 
-    let mut exact: Vec<&VoiceDeck> = Vec::new();
-    let mut loose: Vec<&VoiceDeck> = Vec::new();
-    for deck in decks {
-        let names = deck_spoken_names(deck);
-        if names.iter().any(|name| normalize(name) == reference) {
-            exact.push(deck);
-        } else if names.iter().any(|name| word_subset(&reference_words, name)) {
-            loose.push(deck);
-        }
+    let named = |deck: &&VoiceDeck, reference: &str| {
+        deck_spoken_names(deck)
+            .iter()
+            .any(|name| normalize(name) == reference)
+    };
+    let mut hits: Vec<&VoiceDeck> = decks.iter().filter(|deck| named(deck, &whole)).collect();
+    if hits.is_empty() {
+        hits = decks
+            .iter()
+            .filter(|deck| named(deck, &reference))
+            .collect();
     }
+    if hits.is_empty() {
+        hits = decks
+            .iter()
+            .filter(|deck| {
+                deck_spoken_names(deck)
+                    .iter()
+                    .any(|name| word_subset(&reference_words, name))
+            })
+            .collect();
+    }
+    deck_ref_match(&hits)
+}
 
-    let hits = if exact.is_empty() { loose } else { exact };
+fn deck_ref_match(hits: &[&VoiceDeck]) -> DeckRefMatch {
     match hits.len() {
         0 => DeckRefMatch::None,
         1 => DeckRefMatch::One {
@@ -2224,6 +2310,23 @@ pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
         },
         _ => DeckRefMatch::Ambiguous(hits.iter().map(|deck| deck.label.clone()).collect()),
     }
+}
+
+/// The decks `spoken`, said whole, is a configured name of: the label, or a
+/// remote deck's host ([`remote_host`]). The one way a reference made only of
+/// [`DECK_CATEGORY_WORDS`] reaches a deck — `ops@daemon` by "daemon".
+fn decks_called<'a>(spoken: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDeck> {
+    let whole = normalize(spoken);
+    if whole.is_empty() {
+        return Vec::new();
+    }
+    decks
+        .iter()
+        .filter(|deck| {
+            normalize(&deck.label) == whole
+                || remote_host(deck).is_some_and(|host| normalize(&host) == whole)
+        })
+        .collect()
 }
 
 /// PRD #1195 M3 — put the Deck selector's token on a [`SWITCH_DECK_ROW`]
@@ -2318,9 +2421,9 @@ pub fn refuse_switch_beyond_selector(
     *sentence = heard(
         transcript,
         &format!(
-            "no deck voice can switch to matches \u{201c}{spoken}\u{201d}: the Deck selector \
-             lists {listed} remote decks, more than the {bound} voice takes, so choose it in \
-             the Deck selector"
+            "no daemon voice can switch to matches \u{201c}{spoken}\u{201d}: the Daemon selector \
+             lists {listed} remote daemons, more than the {bound} voice takes, so choose it in \
+             the Daemon selector"
         ),
     );
 }
@@ -2744,6 +2847,20 @@ fn choice_subset(reference_words: &BTreeSet<String>, name: &str) -> bool {
                 .all(|word| CHOICE_FILLER.contains(&word.as_str())))
 }
 
+/// The words that say a reference IS to a deck without saying which one: the
+/// field's name, before and since issue #1045, and the articles around it.
+const DECK_CATEGORY_WORDS: [&str; 7] = ["daemon", "daemons", "deck", "decks", "the", "a", "an"];
+
+/// `spoken`, normalised, less [`DECK_CATEGORY_WORDS`] — empty for a reference
+/// that names no deck.
+fn deck_reference(spoken: &str) -> String {
+    normalize(spoken)
+        .split(' ')
+        .filter(|word| !word.is_empty() && !DECK_CATEGORY_WORDS.contains(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Every name this deck answers to. See [`resolve_deck_ref`] for the rule.
 fn deck_spoken_names(deck: &VoiceDeck) -> Vec<String> {
     let mut names = vec![deck.label.clone()];
@@ -2752,18 +2869,9 @@ fn deck_spoken_names(deck: &VoiceDeck) -> Vec<String> {
         names.push("this machine".to_string());
         return names;
     }
-    // `user@host[:port]` → `host`. The label is `RemoteEndpoint::describe()`,
-    // whose shape this undoes; a label that is not in that shape yields no
-    // extra name rather than a wrong one.
-    let without_user = deck.label.rsplit('@').next().unwrap_or(&deck.label);
-    let host = without_user
-        .split(':')
-        .next()
-        .unwrap_or(without_user)
-        .trim();
-    if !host.is_empty() && host != deck.label {
-        names.push(host.to_string());
-    }
+    let Some(host) = remote_host(deck) else {
+        return names;
+    };
     if let Some(first) = host
         .split('.')
         .next()
@@ -2771,7 +2879,25 @@ fn deck_spoken_names(deck: &VoiceDeck) -> Vec<String> {
     {
         names.push(first.to_string());
     }
+    names.insert(1, host);
     names
+}
+
+/// A remote deck's host: `user@host[:port]` → `host`. The label is
+/// `RemoteEndpoint::describe()`, whose shape this undoes; a label that is not
+/// in that shape yields no host rather than a wrong one. `None` for the local
+/// deck.
+fn remote_host(deck: &VoiceDeck) -> Option<String> {
+    if deck.local {
+        return None;
+    }
+    let without_user = deck.label.rsplit('@').next().unwrap_or(&deck.label);
+    let host = without_user
+        .split(':')
+        .next()
+        .unwrap_or(without_user)
+        .trim();
+    (!host.is_empty() && host != deck.label).then(|| host.to_string())
 }
 
 /// Every name this agent answers to.
@@ -2961,6 +3087,9 @@ mod tests {
     async fn voice_outcome_switch_deck_resolves_or_reports_the_deck_reference() {
         let cases = [
             ("switch deck to the build box", "build box"),
+            // Issue #1045: the selector is the Daemon selector now, and the
+            // glossary word grounds the same way the older one does.
+            ("switch daemon to the build box", "build box"),
             ("switch deck to local", "local"),
             ("switch deck to this machine", "this machine"),
             ("switch deck to local", "build box"),
@@ -2974,7 +3103,10 @@ mod tests {
             );
             let outcome = run(&resolver, Screen::Deck, &fleet(), said).await;
             match (said, spoken) {
-                ("switch deck to the build box", "build box") => {
+                (
+                    "switch deck to the build box" | "switch daemon to the build box",
+                    "build box",
+                ) => {
                     let VoiceOutcome::Dispatch {
                         invoke,
                         params,
@@ -3005,12 +3137,12 @@ mod tests {
                 ),
                 (_, "build") => assert!(
                     matches!(&outcome, VoiceOutcome::ParamAmbiguous { action, sentence, .. }
-                        if action == "switch_deck" && sentence.contains("matches more than one deck")),
+                        if action == "switch_deck" && sentence.contains("matches more than one daemon")),
                     "{outcome:?}"
                 ),
                 (_, "ghost box") => assert!(
                     matches!(&outcome, VoiceOutcome::ParamUnresolved { action, sentence, .. }
-                        if action == "switch_deck" && sentence.contains("no deck matches")),
+                        if action == "switch_deck" && sentence.contains("no daemon matches")),
                     "{outcome:?}"
                 ),
                 _ => unreachable!(),
@@ -3143,13 +3275,14 @@ mod tests {
                 }],
                 // Named, because the user did not name it: a wrong guess is
                 // heard rather than found later on a deck they did not choose.
-                sentence: "Opening the New agent dialog. Preselected deck: Local deck.".to_string(),
+                sentence: "Opening the New agent dialog. Preselected daemon: Local deck."
+                    .to_string(),
             }
         );
     }
 
     /// What the report adds when the model supplied a deck the user did not say.
-    const NOT_CAUGHT_DECK: &str = "I did not catch which deck, so none is preselected.";
+    const NOT_CAUGHT_DECK: &str = "I did not catch which daemon, so none is preselected.";
 
     #[tokio::test]
     async fn voice_outcome_open_new_agent_on_a_deck_dispatches_its_id() {
@@ -3177,7 +3310,7 @@ mod tests {
         // A deck that resolved is named back by the name the screen shows.
         assert_eq!(
             sentence,
-            "Opening the New agent dialog. Preselected deck: deploy@build-box.example.com:2222."
+            "Opening the New agent dialog. Preselected daemon: deploy@build-box.example.com:2222."
         );
         assert_eq!(
             params,
@@ -3216,7 +3349,7 @@ mod tests {
                 action: "open_new_agent".to_string(),
                 invoke: "openNewAgent".to_string(),
                 params: Vec::new(),
-                sentence: "Opening the New agent dialog. No deck matches \u{201c}ghost box\u{201d}, so none is preselected.".to_string(),
+                sentence: "Opening the New agent dialog. No daemon matches \u{201c}ghost box\u{201d}, so none is preselected.".to_string(),
             }
         );
 
@@ -3248,7 +3381,7 @@ mod tests {
                 action: "open_new_agent".to_string(),
                 invoke: "openNewAgent".to_string(),
                 params: Vec::new(),
-                sentence: "Opening the New agent dialog. \u{201c}build\u{201d} matches more than one deck, so none is preselected: deploy@build-box.example.com:2222, ci@build-farm.".to_string(),
+                sentence: "Opening the New agent dialog. \u{201c}build\u{201d} matches more than one daemon, so none is preselected: deploy@build-box.example.com:2222, ci@build-farm.".to_string(),
             }
         );
 
@@ -3300,7 +3433,7 @@ mod tests {
             let outcome = run(&resolver, screen, &fleet(), "new agent").await;
             assert_eq!(
                 outcome.sentence(),
-                "Not here — the New agent dialog opens from the agent overview, when it is not \
+                "Not here — the New agent dialog opens from the agent dashboard, when it is not \
                  already open.",
                 "{screen}"
             );
@@ -3721,7 +3854,7 @@ mod tests {
         );
         assert_eq!(
             outcome.sentence(),
-            "Opening the New agent dialog. Settings \u{2192} Voice \u{2192} Names withholds deck \
+            "Opening the New agent dialog. Settings \u{2192} Voice \u{2192} Names withholds daemon \
              names, so none is preselected."
         );
 
@@ -3894,7 +4027,7 @@ mod tests {
         assert!(
             matches!(&outcome, VoiceOutcome::Dispatch { params, sentence, .. }
                 if params.len() == 1 && params[0].value == "deck-build"
-                    && sentence == "Opening the New agent dialog. Preselected deck: deploy@build-box.example.com:2222."),
+                    && sentence == "Opening the New agent dialog. Preselected daemon: deploy@build-box.example.com:2222."),
             "{outcome:?}"
         );
 
@@ -4020,7 +4153,7 @@ mod tests {
             );
             assert_eq!(
                 outcome.sentence(),
-                "Opening the New agent dialog. Preselected deck: \
+                "Opening the New agent dialog. Preselected daemon: \
                  deploy@build-box.example.com:2222.",
                 "{said:?}"
             );
@@ -4065,7 +4198,7 @@ mod tests {
     /// box, whose daemon is not listening — and the user says "new agent on
     /// the build box". The model was never shown that deck, and when its
     /// answer names it anyway the report says it cannot take a new agent, with
-    /// the reason the dialog's deck step shows, instead of "Preselected deck:"
+    /// the reason the dialog's deck step shows, instead of "Preselected daemon:"
     /// for a deck the dialog will not preselect. A deck the user did not name
     /// is not caught, as before.
     #[tokio::test]
@@ -4101,7 +4234,7 @@ mod tests {
         );
         assert_eq!(
             outcome.sentence(),
-            "Opening the New agent dialog. Deck deploy@build-box.example.com:2222 cannot take a \
+            "Opening the New agent dialog. Daemon deploy@build-box.example.com:2222 cannot take a \
              new agent, so none is preselected: No deck is listening on the configured socket."
         );
 
@@ -4191,32 +4324,32 @@ mod tests {
             (
                 "new agent on local",
                 IntentAnswer::new("open_new_agent").with_param("deck", "local"),
-                "Opening the New agent dialog. Preselected deck: Local deck.",
+                "Opening the New agent dialog. Preselected daemon: Local deck.",
             ),
             (
                 "new agent",
                 IntentAnswer::new("open_new_agent").with_param("deck", "Local deck"),
-                "Opening the New agent dialog. Preselected deck: Local deck.",
+                "Opening the New agent dialog. Preselected daemon: Local deck.",
             ),
             // A note precedes it, and the implied deck answers that note.
             (
                 "new agent on the build box",
                 IntentAnswer::new("open_new_agent").with_param("deck", "build box"),
-                "Opening the New agent dialog. Deck deploy@build-box.example.com:2222 cannot \
+                "Opening the New agent dialog. Daemon deploy@build-box.example.com:2222 cannot \
                  take a new agent: No deck is listening on the configured socket. Preselected \
-                 deck: Local deck.",
+                 daemon: Local deck.",
             ),
             (
                 "new agent on the ghost box",
                 IntentAnswer::new("open_new_agent").with_param("deck", "ghost box"),
-                "Opening the New agent dialog. No deck matches \u{201c}ghost box\u{201d}. \
-                 Preselected deck: Local deck.",
+                "Opening the New agent dialog. No daemon matches \u{201c}ghost box\u{201d}. \
+                 Preselected daemon: Local deck.",
             ),
             (
                 "new agent on build",
                 IntentAnswer::new("open_new_agent").with_param("deck", "build"),
                 "Opening the New agent dialog. \u{201c}build\u{201d} matches more than one \
-                 deck: deploy@build-box.example.com:2222, ci@build-farm. Preselected deck: Local \
+                 daemon: deploy@build-box.example.com:2222, ci@build-farm. Preselected daemon: Local \
                  deck.",
             ),
         ] {
@@ -4253,7 +4386,7 @@ mod tests {
         assert!(dispatched_local(&outcome), "{outcome:?}");
         assert_eq!(
             outcome.sentence(),
-            "Opening the New agent dialog. Preselected deck: Local deck."
+            "Opening the New agent dialog. Preselected daemon: Local deck."
         );
 
         // A fleet with nothing that can take one preselects nothing, and says
@@ -4413,17 +4546,17 @@ mod tests {
             (
                 "open dir billing",
                 "open_dir",
-                "opening a directory needs the New agent dialog's directory listing; say \u{201c}new agent\u{201d} and choose a deck first",
+                "opening a directory needs the New agent dialog's directory listing; say \u{201c}new agent\u{201d} and choose a daemon first",
             ),
             (
                 "go to parent dir",
                 "go_to_parent",
-                "going up needs the New agent dialog showing a directory below the top; choose a deck and open a directory first",
+                "going up needs the New agent dialog showing a directory below the top; choose a daemon and open a directory first",
             ),
             (
                 "use this directory",
                 "use_this_directory",
-                "choosing a directory needs the New agent dialog's directory listing; say \u{201c}new agent\u{201d} and choose a deck first",
+                "choosing a directory needs the New agent dialog's directory listing; say \u{201c}new agent\u{201d} and choose a daemon first",
             ),
         ] {
             let answer = if action == "open_dir" {
@@ -4472,7 +4605,7 @@ mod tests {
         let outcome = run_with(&resolver, Screen::Overview, Some(&root), "go up").await;
         assert_eq!(
             outcome.sentence(),
-            "Not here — going up needs the New agent dialog showing a directory below the top; choose a deck and open a directory first."
+            "Not here — going up needs the New agent dialog showing a directory below the top; choose a daemon and open a directory first."
         );
     }
 
@@ -4795,7 +4928,7 @@ mod tests {
         let outcome = run_form(&resolver, Screen::Overview, Some(&form), "use codex").await;
         assert_eq!(
             outcome.sentence(),
-            "Heard: \u{201c}use codex\u{201d} — no agent this deck offers matches \u{201c}codex\u{201d}."
+            "Heard: \u{201c}use codex\u{201d} — no agent this daemon offers matches \u{201c}codex\u{201d}."
         );
     }
 
@@ -4857,21 +4990,21 @@ mod tests {
                 "choose_mode",
                 "mode",
                 "schedule",
-                "choosing a mode needs a deck and a directory chosen in the New agent dialog; choose those first",
+                "choosing a mode needs a daemon and a directory chosen in the New agent dialog; choose those first",
             ),
             (
                 "use claude",
                 "choose_agent_type",
                 "agent_type",
                 "claude",
-                "choosing an agent needs a deck and a directory chosen in the New agent dialog; choose those first",
+                "choosing an agent needs a daemon and a directory chosen in the New agent dialog; choose those first",
             ),
             (
                 "name it docs",
                 "name_new_agent",
                 "prefix",
                 "name it",
-                "naming the new agent needs a deck and a directory chosen in the New agent dialog; choose those first",
+                "naming the new agent needs a daemon and a directory chosen in the New agent dialog; choose those first",
             ),
         ] {
             let resolver = StubResolver::new()
@@ -5108,7 +5241,7 @@ mod tests {
         let deck = run_agents(&resolver, Screen::Deck, &fleet(), "stop the tester").await;
         assert_eq!(
             deck.sentence(),
-            "Not here — stopping an agent works from the agent overview."
+            "Not here — stopping an agent works from the agent dashboard."
         );
     }
 
@@ -5243,7 +5376,7 @@ mod tests {
         let resolver =
             StubResolver::new().answering("show me everything", IntentAnswer::new("open_overview"));
         let outcome = run(&resolver, Screen::Deck, &fleet(), "show me everything").await;
-        assert_eq!(outcome.sentence(), "Opening the agent overview.");
+        assert_eq!(outcome.sentence(), "Opening the agent dashboard.");
         assert!(outcome.is_dispatch());
     }
 
@@ -5361,11 +5494,11 @@ mod tests {
         assert_eq!(action, "open_agent");
         assert_eq!(
             hint,
-            "opening an agent works from the deck or the agent overview"
+            "opening an agent works from the Daemons screen or the agent dashboard"
         );
         assert_eq!(
             outcome.sentence(),
-            "Not here — opening an agent works from the deck or the agent overview."
+            "Not here — opening an agent works from the Daemons screen or the agent dashboard."
         );
     }
 
@@ -7423,7 +7556,7 @@ mod tests {
             assert_eq!(param, "deck");
             assert_eq!(matches, &labels.to_vec(), "{sentence}");
             assert!(
-                sentence.contains("you named more than one deck"),
+                sentence.contains("you named more than one daemon"),
                 "{sentence}"
             );
         };
@@ -7565,7 +7698,7 @@ mod tests {
             assert_eq!(action, "switch_deck");
             assert_eq!(matches, &both.to_vec(), "{said}: {sentence}");
             assert!(
-                sentence.contains("you named more than one deck"),
+                sentence.contains("you named more than one daemon"),
                 "{sentence}"
             );
         }
@@ -7589,7 +7722,7 @@ mod tests {
             };
             assert_eq!(action, "switch_deck");
             assert!(
-                sentence.contains("say just the deck you want"),
+                sentence.contains("say just the daemon you want"),
                 "{said}: {sentence}"
             );
             assert!(
@@ -7782,7 +7915,7 @@ mod tests {
             assert_eq!(params.len(), 1);
             assert_eq!(params[0].kind, ParamKind::DeckRef);
             assert_eq!(params[0].value, "deck-build");
-            assert_eq!(sentence, "Deck: deploy@build-box.example.com:2222.");
+            assert_eq!(sentence, "Daemon: deploy@build-box.example.com:2222.");
         }
         let closed = heard_as_user_said(said, answer(), Screen::Overview, &fleet(), None).await;
         assert!(
@@ -7898,6 +8031,365 @@ mod tests {
         assert!(
             matches!(&bare, VoiceOutcome::ParamMissing { .. }),
             "{bare:?}"
+        );
+    }
+
+    /// The fleet as the dialog labels it since issue #1045: the local deck is
+    /// "Local daemon", so the field's heading is one of its label's words.
+    fn daemon_labelled_decks() -> Vec<VoiceDeck> {
+        vec![
+            deck("deck-local", "Local daemon", true),
+            deck("deck-build", "deploy@build-box.example.com:2222", false),
+            deck("deck-build-two", "ci@build-farm", false),
+        ]
+    }
+
+    #[test]
+    fn voice_outcome_deck_ref_needs_more_than_a_category_word() {
+        let fleet = daemon_labelled_decks();
+        for said in [
+            "daemon",
+            "Daemon",
+            "the daemon",
+            "deck",
+            "the deck",
+            "daemons",
+            "a deck",
+        ] {
+            assert_eq!(resolve_deck_ref(said, &fleet), DeckRefMatch::None, "{said}");
+        }
+        for said in ["local daemon", "Local daemon", "the local deck", "local"] {
+            assert_eq!(
+                resolve_deck_ref(said, &fleet),
+                DeckRefMatch::One {
+                    id: "deck-local".to_string(),
+                    label: "Local daemon".to_string(),
+                },
+                "{said}"
+            );
+        }
+        assert_eq!(
+            resolve_deck_ref("daemon build box", &fleet),
+            DeckRefMatch::One {
+                id: "deck-build".to_string(),
+                label: "deploy@build-box.example.com:2222".to_string(),
+            }
+        );
+        // "daemon" is no evidence for any deck, so "daemon build" is the
+        // two build hosts, not the local daemon.
+        assert_eq!(
+            resolve_deck_ref("daemon build", &fleet),
+            DeckRefMatch::Ambiguous(vec![
+                "deploy@build-box.example.com:2222".to_string(),
+                "ci@build-farm".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn voice_outcome_deck_ref_exact_name_beats_the_stripped_one() {
+        let fleet = vec![
+            deck("deck-local", "Local daemon", true),
+            deck("deck-daemon-box", "ops@daemon-build-box.example.com", false),
+            deck("deck-box", "ops@build-box.example.com", false),
+            deck("deck-bare", "ops@daemon.example.com", false),
+        ];
+        let one = |id: &str, label: &str| DeckRefMatch::One {
+            id: id.to_string(),
+            label: label.to_string(),
+        };
+        // The first host's alias, verbatim — not the second host's once
+        // "daemon" is dropped.
+        for said in ["daemon build box", "Daemon-Build-Box"] {
+            assert_eq!(
+                resolve_deck_ref(said, &fleet),
+                one("deck-daemon-box", "ops@daemon-build-box.example.com"),
+                "{said}"
+            );
+        }
+        // No name is said whole, so the stripped reference decides.
+        assert_eq!(
+            resolve_deck_ref("the build box", &fleet),
+            one("deck-box", "ops@build-box.example.com")
+        );
+        assert_eq!(
+            resolve_deck_ref("local daemon", &fleet),
+            one("deck-local", "Local daemon")
+        );
+        // A host whose name is a category word is not reached by that word
+        // alone: said bare it names no deck, and inside a longer reference the
+        // loose pass sees only the other words.
+        assert_eq!(resolve_deck_ref("daemon", &fleet), DeckRefMatch::None);
+        assert_eq!(resolve_deck_ref("daemon farm", &fleet), DeckRefMatch::None);
+    }
+
+    /// Scenario: the New agent dialog is open on the build box, and the user
+    /// says "daemon" — the field's heading — or "deck" or "the daemon", and the
+    /// model hands `choose_deck` that same word. It names no daemon, so the
+    /// form is not switched to the local one: the user is asked which daemon.
+    /// "daemon build box" switches to the build box when the model keeps
+    /// "build box", and is asked about when it keeps only "daemon"; "local
+    /// daemon" still switches to the local one.
+    #[tokio::test]
+    async fn voice_outcome_a_bare_daemon_word_chooses_no_deck() {
+        let mut dialog = new_agent_form();
+        if let Some(form) = dialog.form.as_mut() {
+            form.deck_id = "deck-build".to_string();
+        }
+        let fleet_decks = daemon_labelled_decks();
+        let ask = |said: &'static str, spoken: &'static str| {
+            let fleet_decks = fleet_decks.clone();
+            let dialog = dialog.clone();
+            async move {
+                let resolver = StubResolver::new().answering(
+                    said,
+                    IntentAnswer::new("choose_deck").with_param("deck", spoken),
+                );
+                handle_utterance(
+                    &resolver,
+                    table(),
+                    Screen::Overview,
+                    &fleet(),
+                    &fleet_decks,
+                    None,
+                    Some(&dialog),
+                    Transcript::new(said),
+                )
+                .await
+                .outcome
+            }
+        };
+        for (said, spoken) in [
+            ("daemon", "daemon"),
+            ("Daemon", "Daemon"),
+            ("deck", "deck"),
+            ("the daemon", "the daemon"),
+            ("daemon build box", "daemon"),
+        ] {
+            let outcome = ask(said, spoken).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ParamMissing { action, param, sentence, .. }
+                    if action == "choose_deck"
+                        && param == "deck"
+                        && sentence.contains("which daemon")),
+                "{said} / {spoken}: {outcome:?}"
+            );
+        }
+        for (said, spoken, id) in [
+            ("daemon build box", "build box", "deck-build"),
+            ("local daemon", "local daemon", "deck-local"),
+            ("use the local daemon", "Local daemon", "deck-local"),
+        ] {
+            let outcome = ask(said, spoken).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { invoke, params, .. }
+                    if invoke == "chooseNewAgentDeck" && params[0].value == id),
+                "{said} / {spoken}: {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: with the dialog closed and several daemons that can take an
+    /// agent, the user says "new agent on the daemon" and the model supplies
+    /// `deck = "daemon"`. The dialog opens with nothing preselected — not the
+    /// local daemon — and the report says which daemon was not caught.
+    #[tokio::test]
+    async fn voice_outcome_new_agent_on_a_bare_daemon_preselects_none() {
+        let said = "new agent on the daemon";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_new_agent").with_param("deck", "daemon"),
+        );
+        let outcome = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            &daemon_labelled_decks(),
+            None,
+            None,
+            Transcript::new(said),
+        )
+        .await
+        .outcome;
+        let VoiceOutcome::Dispatch {
+            params, sentence, ..
+        } = &outcome
+        else {
+            panic!("expected a dispatch, got {outcome:?}");
+        };
+        assert!(params.is_empty(), "{params:?}");
+        assert_eq!(
+            sentence,
+            &format!("Opening the New agent dialog. {NOT_CAUGHT_DECK}")
+        );
+    }
+
+    /// A fleet with a remote daemon whose host IS a category word: `ops@daemon`
+    /// answers to "daemon", and to nothing else a sentence can say.
+    fn fleet_with_a_host_named_daemon() -> Vec<VoiceDeck> {
+        vec![
+            deck("deck-local", "Local daemon", true),
+            deck("deck-daemon", "ops@daemon", false),
+            deck("deck-build-two", "ci@build-farm", false),
+        ]
+    }
+
+    #[test]
+    fn voice_outcome_deck_ref_a_host_named_by_a_category_word_is_reachable() {
+        let fleet = fleet_with_a_host_named_daemon();
+        let daemon_host = DeckRefMatch::One {
+            id: "deck-daemon".to_string(),
+            label: "ops@daemon".to_string(),
+        };
+        // Said whole, the category word IS that host's name.
+        for said in ["daemon", "Daemon", " daemon "] {
+            assert_eq!(resolve_deck_ref(said, &fleet), daemon_host, "{said}");
+        }
+        // Anything but the name said whole is still only category words, so
+        // it reaches no deck — not this one, and not the local daemon.
+        for said in ["the daemon", "deck", "a daemon", "daemons"] {
+            assert_eq!(resolve_deck_ref(said, &fleet), DeckRefMatch::None, "{said}");
+        }
+        // The exception is for a name the deck is configured with, never a
+        // derived shortening: `daemon.example.com`'s first component is not
+        // reached by "daemon".
+        let dotted = vec![
+            deck("deck-local", "Local daemon", true),
+            deck("deck-bare", "ops@daemon.example.com", false),
+        ];
+        assert_eq!(resolve_deck_ref("daemon", &dotted), DeckRefMatch::None);
+        // Two decks on that host are two decks.
+        let twice = vec![
+            deck("deck-daemon", "ops@daemon", false),
+            deck("deck-daemon-ci", "ci@daemon:2222", false),
+        ];
+        assert_eq!(
+            resolve_deck_ref("daemon", &twice),
+            DeckRefMatch::Ambiguous(vec!["ops@daemon".to_string(), "ci@daemon:2222".to_string()])
+        );
+    }
+
+    /// Scenario: a remote daemon is configured as `ops@daemon`. The user says
+    /// "switch daemon to daemon", "daemon" over the New agent dialog's Daemon
+    /// field, or "new agent on daemon", and the model hands over `daemon`:
+    /// each reaches that remote daemon — required and optional references
+    /// alike — rather than being asked about or reported as not caught. "the
+    /// daemon" still names no daemon.
+    #[tokio::test]
+    async fn voice_outcome_a_host_named_daemon_is_reachable_by_voice() {
+        let decks = fleet_with_a_host_named_daemon();
+        let mut dialog = new_agent_form();
+        if let Some(form) = dialog.form.as_mut() {
+            form.deck_id = "deck-build-two".to_string();
+        }
+        let ask = |said: &'static str, answer: IntentAnswer, screen: Screen, open: bool| {
+            let decks = decks.clone();
+            let dialog = dialog.clone();
+            async move {
+                let resolver = StubResolver::new().answering(said, answer);
+                handle_utterance(
+                    &resolver,
+                    table(),
+                    screen,
+                    &fleet(),
+                    &decks,
+                    None,
+                    open.then_some(&dialog),
+                    Transcript::new(said),
+                )
+                .await
+                .outcome
+            }
+        };
+        let switch = ask(
+            "switch daemon to daemon",
+            IntentAnswer::new("switch_deck").with_param("deck", "daemon"),
+            Screen::Deck,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(&switch, VoiceOutcome::Dispatch { invoke, params, .. }
+                if invoke == "switchDeck" && params[0].value == "deck-daemon"),
+            "{switch:?}"
+        );
+        let choose = ask(
+            "daemon",
+            IntentAnswer::new("choose_deck").with_param("deck", "daemon"),
+            Screen::Overview,
+            true,
+        )
+        .await;
+        assert!(
+            matches!(&choose, VoiceOutcome::Dispatch { invoke, params, .. }
+                if invoke == "chooseNewAgentDeck" && params[0].value == "deck-daemon"),
+            "{choose:?}"
+        );
+        let open = ask(
+            "new agent on daemon",
+            IntentAnswer::new("open_new_agent").with_param("deck", "daemon"),
+            Screen::Overview,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(&open, VoiceOutcome::Dispatch { params, .. }
+                if params.len() == 1 && params[0].value == "deck-daemon"),
+            "{open:?}"
+        );
+        // Said as the destination after the other selector word, it is still
+        // that daemon's name.
+        let destination = ask(
+            "switch deck to daemon",
+            IntentAnswer::new("switch_deck").with_param("deck", "daemon"),
+            Screen::Deck,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(&destination, VoiceOutcome::Dispatch { invoke, params, .. }
+                if invoke == "switchDeck" && params[0].value == "deck-daemon"),
+            "{destination:?}"
+        );
+        // Control: said as the selector's heading, before a destination that
+        // names no daemon, it is not the destination — a model reading it as
+        // the deck is refused.
+        let heading = ask(
+            "switch daemon to deck",
+            IntentAnswer::new("switch_deck").with_param("deck", "daemon"),
+            Screen::Deck,
+            false,
+        )
+        .await;
+        assert!(
+            !matches!(&heading, VoiceOutcome::Dispatch { .. }),
+            "{heading:?}"
+        );
+        // Control: beside another word that could be a name, "daemon" is the
+        // selector's heading, so a model reading it as the deck is refused.
+        let other = ask(
+            "switch daemon to the ghost box",
+            IntentAnswer::new("switch_deck").with_param("deck", "daemon"),
+            Screen::Deck,
+            false,
+        )
+        .await;
+        assert!(
+            !matches!(&other, VoiceOutcome::Dispatch { .. }),
+            "{other:?}"
+        );
+        // Control: the category phrase is not the host's name said whole.
+        let vague = ask(
+            "the daemon",
+            IntentAnswer::new("choose_deck").with_param("deck", "the daemon"),
+            Screen::Overview,
+            true,
+        )
+        .await;
+        assert!(
+            matches!(&vague, VoiceOutcome::ParamMissing { action, .. } if action == "choose_deck"),
+            "{vague:?}"
         );
     }
 
@@ -8101,13 +8593,17 @@ mod tests {
     // -- a control's visible label is part of its voice vocabulary ---------
 
     /// Scenario: in the New agent dialog, with an orchestration chosen in
-    /// Mode, the Start button reads "Start orchestration"; the user reads it
+    /// Mode, the Start button reads "Activate orchestration"; the user reads it
     /// aloud and the run starts — the dialog's own start, not a Mode change.
-    /// The same holds for the button's other label and the phrasings around
-    /// it (PRD #1223, the user's report).
+    /// The same holds for the button's other label, "Create agent", for the
+    /// pre-#1045 labels people keep saying, and for the phrasings around them
+    /// (PRD #1223, the user's report).
     #[tokio::test]
     async fn voice_outcome_start_orchestration_starts_the_run() {
         for said in [
+            "Activate orchestration",
+            "activate the orchestration",
+            "Create agent",
             "Start orchestration",
             "start the orchestration",
             "start the run",
@@ -8132,7 +8628,7 @@ mod tests {
         }
         // With the dialog closed the button's words open it, as "start it" does.
         let closed = heard_as_user_said(
-            "Start orchestration",
+            "Activate orchestration",
             IntentAnswer::new("start_new_agent"),
             Screen::Overview,
             &fleet(),
@@ -8153,6 +8649,7 @@ mod tests {
     /// The one rail, shown beside the overview as well as the deck (#1197).
     const NAVIGATION_RAIL_TSX: &str = include_str!("../../../src/components/NavigationRail.tsx");
     const NEW_AGENT_TS: &str = include_str!("../../../src/lib/newAgent.ts");
+    const AGENT_TILE_TSX: &str = include_str!("../../../src/components/AgentTile.tsx");
 
     /// Where a label lives, as the literal the source renders it from.
     struct ControlLabel {
@@ -8175,16 +8672,16 @@ mod tests {
     /// with their reasons.
     const CONTROL_LABELS: [ControlLabel; 21] = [
         ControlLabel {
-            source: "\"Start orchestration\"",
+            source: "\"Activate orchestration\"",
             file: NEW_AGENT_DIALOG_TSX,
-            said: "Start orchestration",
+            said: "Activate orchestration",
             row: "start_new_agent",
             over_the_form: true,
         },
         ControlLabel {
-            source: "\"Start agent\"",
+            source: "\"Create agent\"",
             file: NEW_AGENT_DIALOG_TSX,
-            said: "Start agent",
+            said: "Create agent",
             row: "start_new_agent",
             over_the_form: true,
         },
@@ -8217,13 +8714,14 @@ mod tests {
             row: "discard_new_agent",
             over_the_form: true,
         },
-        // Issue #1263 — the deck field's heading. Said alone it names no deck,
-        // so it reaches `choose_deck`'s "which deck"; "deck build box" is the
-        // label with a value, as "mode schedule" is for the Mode row.
+        // Issue #1263 — the daemon field's heading ("Deck" until #1045). Said
+        // alone it names no daemon, so it reaches `choose_deck`'s "which
+        // daemon"; "daemon build box" is the label with a value, as "mode
+        // schedule" is for the Mode row.
         ControlLabel {
-            source: "<h3 id={`${titleId}-deck`}>Deck</h3>",
+            source: "<h3 id={`${titleId}-deck`}>Daemon</h3>",
             file: NEW_AGENT_DIALOG_TSX,
-            said: "Deck",
+            said: "Daemon",
             row: "choose_deck",
             over_the_form: true,
         },
@@ -8277,23 +8775,23 @@ mod tests {
             over_the_form: false,
         },
         ControlLabel {
-            source: "<span>Open deck</span>",
+            source: "<span>Open daemons</span>",
             file: AGENT_OVERVIEW_TSX,
-            said: "Open deck",
+            said: "Open daemons",
             row: "open_deck",
             over_the_form: false,
         },
         ControlLabel {
-            source: "label=\"Deck\"",
+            source: "label=\"Daemons\"",
             file: NAVIGATION_RAIL_TSX,
-            said: "Deck",
+            said: "Daemons",
             row: "open_deck",
             over_the_form: false,
         },
         ControlLabel {
-            source: "label=\"Overview\"",
+            source: "label=\"Dashboard\"",
             file: NAVIGATION_RAIL_TSX,
-            said: "Overview",
+            said: "Dashboard",
             row: "open_overview",
             over_the_form: false,
         },
@@ -8312,10 +8810,10 @@ mod tests {
             over_the_form: false,
         },
         ControlLabel {
-            source: "aria-label={`Stop ${name} agent`}",
-            file: AGENT_OVERVIEW_TSX,
-            said: "Stop tester agent",
-            row: "stop_agent",
+            source: "aria-label=\"Back to dashboard\"",
+            file: AGENT_TILE_TSX,
+            said: "Back to dashboard",
+            row: "close",
             over_the_form: false,
         },
         ControlLabel {
@@ -8354,17 +8852,36 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// Scenario: the user reads the dashboard row's stop control aloud as it
+    /// is labelled since issue #1045, "Close tester agent". It does not ground
+    /// `stop_agent` — "close" stays a view word (D1) — so the one control left
+    /// out of [`CONTROL_LABELS`] is left out on purpose, and its spoken form
+    /// "stop tester agent" still reaches the stop confirmation.
+    #[test]
+    fn voice_outcome_the_row_close_label_is_not_a_stop_phrase() {
+        assert!(AGENT_OVERVIEW_TSX.contains("aria-label={`Close ${name} agent`}"));
+        let stop = table().row("stop_agent").expect("present");
+        assert!(!action_grounded(stop, "Close tester agent", None, None));
+        assert!(action_grounded(stop, "Stop tester agent", None, None));
+        let close = table().row("close").expect("present");
+        assert!(action_grounded(close, "Close tester agent", None, None));
+    }
+
     /// The labels the user hit, and the ones this sweep found missing from the
     /// row's prompt: each is written into its row's description, so the model
     /// reads the button's own words as that row.
     #[test]
     fn voice_outcome_label_phrasings_are_in_the_rows_prompt() {
         for (row, phrase) in [
+            ("start_new_agent", "Activate orchestration"),
+            ("start_new_agent", "Create agent"),
             ("start_new_agent", "Start orchestration"),
             ("start_new_agent", "Start agent"),
             ("start_new_agent", "start the orchestration"),
             ("start_new_agent", "start the run"),
             ("close", "close new agent"),
+            ("close", "back to dashboard"),
+            ("open_deck", "open daemons"),
             ("open_deck", "open deck"),
             ("open_agent", "open tester agent"),
             ("stop_agent", "stop tester agent"),
@@ -8389,7 +8906,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(mode.contains("The bare word \"orchestration\" names NO chip"));
-        assert!(mode.contains("\"Start orchestration\""));
+        assert!(mode.contains("\"Activate orchestration\""));
         assert!(mode.contains("mean `start_new_agent`"));
     }
 
@@ -8471,7 +8988,7 @@ mod tests {
         .await;
         assert_eq!(
             bare.sentence(),
-            "Not here — the New agent dialog opens from the agent overview, when it is not \
+            "Not here — the New agent dialog opens from the agent dashboard, when it is not \
              already open."
         );
         let on_a_deck = heard_as_user_said(

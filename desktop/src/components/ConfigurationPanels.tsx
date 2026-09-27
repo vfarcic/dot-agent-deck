@@ -21,13 +21,13 @@ import { defaultCliForProvider, permissionModeLabel, permissionModeOptions, reso
 import type { DaemonProjectsState } from "../hooks/useDaemonProjects";
 import { SelectDeckNote } from "./SelectDeckNote";
 import { ORCHESTRATION_TITLE_TAKEN, RUN_NAME_UNUSABLE, SAME_DIRECTORY_ORCHESTRATION, directoryLabel, isUsableRunName, orchestrationRunTitle, suggestOrchestrationName } from "../lib/newAgent";
-import type { AgentProfile, DaemonResolvedProject, DeckPrompt, Provider, RuntimeMode, WorkflowLaunchConfig } from "../types";
+import type { AgentProfile, DaemonResolvedProject, DeckPrompt, Provider, RuntimeMode, OrchestrationLaunchConfig } from "../types";
 
 /**
  * PRD #819 M6: the project PICKER, and nothing else.
  *
  * It used to be a project LIBRARY — add, rename, edit a directory, write notes,
- * name a workflow, remove — all persisted to `localStorage` and all of it
+ * name an orchestration, remove — all persisted to `localStorage` and all of it
  * client-held project state that a remote daemon could not honour. What
  * replaced it is a picker over the projects the daemon reports, plus a field
  * for a path the daemon has nothing live in. Nothing here is saved: choosing a
@@ -37,7 +37,7 @@ interface ProjectsPanelProps {
   open: boolean;
   state: DaemonProjectsState;
   onClose: () => void;
-  onConfigureWorkflow: () => void;
+  onConfigureOrchestration: () => void;
   /**
    * **All Decks** is selected (#1083). Projects come from ONE deck, so the
    * sheet says "Select a deck" instead of listing the local deck's — which is
@@ -46,7 +46,7 @@ interface ProjectsPanelProps {
   allDecks?: boolean;
 }
 
-export function ProjectsPanel({ open, state, onClose, onConfigureWorkflow, allDecks = false }: ProjectsPanelProps) {
+export function ProjectsPanel({ open, state, onClose, onConfigureOrchestration, allDecks = false }: ProjectsPanelProps) {
   const [pasted, setPasted] = useState("");
   if (!open) return null;
   const { projects, primary, listing, listingError, selected, resolving, resolveError, vanished } = state;
@@ -59,30 +59,30 @@ export function ProjectsPanel({ open, state, onClose, onConfigureWorkflow, allDe
   // are true of each. The daemon having nothing live is the first-run state,
   // and it is the only one — there is no second, remembered list behind it.
   const emptyNotice = vanished
-    ? "That project is no longer one this deck knows — nothing is running there any more. Pick another, or paste its path again below."
+    ? "That project is no longer one this daemon knows — nothing is running there any more. Pick another, or paste its path again below."
     : listing === "empty"
-      ? "This deck has nothing live and its own directory is not a project, so it knows of none to offer. Paste a project's absolute path below; the deck resolves it on its own machine."
+      ? "This daemon has nothing live and its own directory is not a project, so it knows of none to offer. Paste a project's absolute path below; the daemon resolves it on its own machine."
       : undefined;
 
   return (
     <div className="sheet-backdrop" role="presentation" onMouseDown={onClose}>
       <section className="config-sheet projects-sheet" role="dialog" aria-modal="true" aria-labelledby="projects-title" data-testid="projects-panel" onMouseDown={(event) => event.stopPropagation()}>
         <header className="sheet-header">
-          <div><span className="eyebrow">PROJECT SELECTION</span><h2 id="projects-title">Projects</h2><p>Choose the project this launch runs in. The deck answers with what it knows.</p></div>
+          <div><span className="eyebrow">PROJECT SELECTION</span><h2 id="projects-title">Projects</h2><p>Choose the project this orchestration runs in. The daemon answers with what it knows.</p></div>
           <button className="icon-button" aria-label="Close projects" onClick={onClose}><X size={18} /></button>
         </header>
         {allDecks ? (
-          <SelectDeckNote testId="projects-select-deck" className="sheet-select-deck" title="Select a deck to see its projects">
-            <p>Projects come from one deck — the machine a launch will run on — and All Decks is every deck at once.</p>
-            <p className="overview-note-hint">Close this sheet and choose a deck in the Deck selector.</p>
+          <SelectDeckNote testId="projects-select-deck" className="sheet-select-deck" title="Select a daemon to see its projects">
+            <p>Projects come from one daemon — the machine an activation will run on — and All daemons is every daemon at once.</p>
+            <p className="overview-note-hint">Close this sheet and choose a daemon in the Daemon selector.</p>
           </SelectDeckNote>
         ) : <>
-        <div className="local-only-notice project-notice"><FolderCheck size={15} /><span><strong>From the deck</strong> — these are the projects the connected deck can see on its own machine, and nothing is remembered between launches.</span></div>
+        <div className="local-only-notice project-notice"><FolderCheck size={15} /><span><strong>From the daemon</strong> — these are the projects the connected daemon can see on its own machine, and nothing is remembered between activations.</span></div>
 
         <div className="projects-layout">
           <aside className="project-library">
             <button className="add-project" onClick={() => void state.refresh()} data-testid="refresh-projects"><RefreshCw size={14} /> Refresh</button>
-            <nav aria-label="Deck projects">
+            <nav aria-label="Daemon projects">
               {projects.map((item) => (
                 /*
                  * `path` is the IDENTITY — the key, the selection argument and
@@ -99,37 +99,37 @@ export function ProjectsPanel({ open, state, onClose, onConfigureWorkflow, allDe
                 </button>
               ))}
             </nav>
-            {listing === "loading" && <div className="project-library-empty"><FolderGit2 size={22} /><span>Asking the deck…</span></div>}
-            {listing === "unavailable" && <div className="project-library-empty" data-testid="projects-unavailable"><AlertTriangle size={22} /><span>{listingError ?? "The deck did not answer."}</span></div>}
+            {listing === "loading" && <div className="project-library-empty"><FolderGit2 size={22} /><span>Asking the daemon…</span></div>}
+            {listing === "unavailable" && <div className="project-library-empty" data-testid="projects-unavailable"><AlertTriangle size={22} /><span>{listingError ?? "The daemon did not answer."}</span></div>}
             {!projects.length && listing !== "loading" && listing !== "unavailable" && <div className="project-library-empty" data-testid="projects-empty"><FolderGit2 size={22} /><span>No projects reported.</span></div>}
           </aside>
 
           <form className="project-form" onSubmit={(event) => { event.preventDefault(); void submitPasted(); }}>
             <div className="form-heading">
               <div><span>SELECTED PROJECT</span><h3>{selected?.displayName ?? "No project chosen"}</h3></div>
-              {selected ? <span className="active-project-badge"><Check size={11} /> Ready to launch</span> : null}
+              {selected ? <span className="active-project-badge"><Check size={11} /> Ready to activate</span> : null}
             </div>
             <div className="project-fields">
               {emptyNotice && <small className="project-field-note" data-testid="projects-nothing-known">{emptyNotice}</small>}
-              <label><span>Resolve a project by path</span><input aria-label="Project directory" value={pasted} onChange={(event) => setPasted(event.target.value)} placeholder="/Users/you/dev/project" spellCheck={false} /><small>The deck resolves this on its own filesystem, which may not be this one.</small></label>
+              <label><span>Resolve a project by path</span><input aria-label="Project directory" value={pasted} onChange={(event) => setPasted(event.target.value)} placeholder="/Users/you/dev/project" spellCheck={false} /><small>The daemon resolves this on its own filesystem, which may not be this one.</small></label>
               <button type="submit" className="button secondary" disabled={!pasted.trim() || resolving} data-testid="resolve-project">{resolving ? "Resolving…" : "Resolve"}</button>
               {resolveError && <small className="project-field-error" data-testid="project-resolve-error"><AlertTriangle size={12} /> {resolveError}</small>}
               {selected && (
                 <div className="project-fields" data-testid="selected-project">
-                  <label><span>Deck path</span><input aria-label="Resolved project path" value={selected.displayPath} readOnly spellCheck={false} /><small>The deck&apos;s own spelling. The launch uses it exactly as the deck reported it.</small></label>
-                  <span>Workflows in this project: {selected.orchestrations.length ? selected.orchestrations.map((orchestration) => orchestration.displayName).join(", ") : "none configured"}</span>
+                  <label><span>Daemon path</span><input aria-label="Resolved project path" value={selected.displayPath} readOnly spellCheck={false} /><small>The daemon&apos;s own spelling. Activation uses it exactly as the daemon reported it.</small></label>
+                  <span>Orchestrations in this project: {selected.orchestrations.length ? selected.orchestrations.map((orchestration) => orchestration.displayName).join(", ") : "none configured"}</span>
                 </div>
               )}
             </div>
             <div className="project-readiness">
               <FolderCheck size={16} />
-              <span><strong>{selected ? "Project resolved" : "No project chosen"}</strong>{selected ? "Open Workflows to pick one of its orchestrations and launch." : "Pick one above, or resolve a path, before configuring a workflow."}</span>
+              <span><strong>{selected ? "Project resolved" : "No project chosen"}</strong>{selected ? "Open Orchestrations to pick one of its orchestrations and activate it." : "Pick one above, or resolve a path, before configuring an orchestration."}</span>
             </div>
             <footer className="sheet-footer project-footer">
               <span />
               <div>
                 <button type="button" className="button secondary" onClick={() => state.clearSelection()} disabled={!selected}>Clear selection</button>
-                <button type="button" className="button primary" onClick={onConfigureWorkflow} disabled={!selected}><FolderCheck size={14} /> Configure workflow</button>
+                <button type="button" className="button primary" onClick={onConfigureOrchestration} disabled={!selected}><FolderCheck size={14} /> Configure orchestration</button>
               </div>
             </footer>
           </form>
@@ -161,7 +161,7 @@ export function PromptLibraryPanel({ open, prompts, selectedId, onSelect, onClos
     <div className="sheet-backdrop" role="presentation" onMouseDown={onClose}>
       <section className="config-sheet projects-sheet" role="dialog" aria-modal="true" aria-labelledby="prompts-title" data-testid="prompt-library-panel" onMouseDown={(event) => event.stopPropagation()}>
         <header className="sheet-header">
-          <div><span className="eyebrow">PROMPT LIBRARY</span><h2 id="prompts-title">Saved prompts</h2><p>Reusable text for the launch task prompt and for messaging a running agent.</p></div>
+          <div><span className="eyebrow">PROMPT LIBRARY</span><h2 id="prompts-title">Saved prompts</h2><p>Reusable text for the orchestration task prompt and for messaging a running agent.</p></div>
           <button className="icon-button" aria-label="Close prompt library" onClick={onClose}><X size={18} /></button>
         </header>
         <div className="local-only-notice project-notice"><BookMarked size={15} /><span><strong>Local library</strong> — prompts are stored on this device only. Nothing is written to the project's <code>.dot-agent-deck.toml</code>.</span></div>
@@ -187,7 +187,7 @@ export function PromptLibraryPanel({ open, prompts, selectedId, onSelect, onClos
               </div>
               <div className="project-fields">
                 <label><span>Name</span><input aria-label="Prompt name" value={prompt.name} onChange={(event) => onUpdate(prompt.id, { name: event.target.value })} placeholder="Fix the failing test" /></label>
-                <label><span>Prompt body</span><textarea aria-label="Prompt body" rows={10} value={prompt.body} onChange={(event) => onUpdate(prompt.id, { body: event.target.value })} placeholder="The task prompt to insert when launching a workflow…" /></label>
+                <label><span>Prompt body</span><textarea aria-label="Prompt body" rows={10} value={prompt.body} onChange={(event) => onUpdate(prompt.id, { body: event.target.value })} placeholder="The task prompt to insert when activating an orchestration…" /></label>
                 <label><span>Note</span><input aria-label="Prompt note" value={prompt.note ?? ""} onChange={(event) => onUpdate(prompt.id, { note: event.target.value })} placeholder="When you reach for this one" /></label>
               </div>
               <footer className="sheet-footer project-footer">
@@ -195,7 +195,7 @@ export function PromptLibraryPanel({ open, prompts, selectedId, onSelect, onClos
                 <div><span>Auto-saved locally</span></div>
               </footer>
             </form>
-          ) : <div className="configuration-empty">Add a prompt to reuse it when launching a workflow.</div>}
+          ) : <div className="configuration-empty">Add a prompt to reuse it when activating an orchestration.</div>}
         </div>
       </section>
     </div>
@@ -359,7 +359,7 @@ export function ProfilesPanel({ open, profiles, onClose, onUpdate, onReset, onSa
   );
 }
 
-interface WorkflowPanelProps {
+interface OrchestrationPanelProps {
   open: boolean;
   profiles: AgentProfile[];
   order: string[];
@@ -368,8 +368,8 @@ interface WorkflowPanelProps {
    * The resolved project this launch runs in, or `undefined` for none chosen.
    *
    * PRD #819 M6 replaced a free-typed `defaultCwd` string with this. The
-   * ordering is `daemon → project → workflow` and it does not commute: the
-   * workflow list comes out of the project's own config, so there is nothing to
+   * ordering is `daemon → project → orchestration` and it does not commute: the
+   * orchestration list comes out of the project's own config, so there is nothing to
    * offer until a project is picked. And the path is no longer typeable here at
    * all — the launch must send the daemon's canonical spelling, because
    * canonicalising a symlinked path changes its basename and an empty
@@ -380,10 +380,10 @@ interface WorkflowPanelProps {
   onClose: () => void;
   onToggle: (id: string) => void;
   onMove: (id: string, direction: -1 | 1) => void;
-  onLaunch: (config: WorkflowLaunchConfig) => void;
+  onLaunch: (config: OrchestrationLaunchConfig) => void;
   platformIssue?: string;
   /**
-   * Why this deck cannot start a workflow at all (PRD #741 M8), or `undefined`
+   * Why this daemon cannot activate an orchestration at all (PRD #741 M8), or `undefined`
    * when it can.
    *
    * A sibling of `platformIssue` rather than the same field, because the two are
@@ -423,18 +423,18 @@ interface WorkflowPanelProps {
   deckId?: string;
 }
 
-export function WorkflowPanel({ open, profiles, order, mode, project, onChooseProject, onClose, onToggle, onMove, onLaunch, platformIssue, capabilityIssue, prompts = [], allDecks = false, liveTitles = [], liveDirectories = [], deckId }: WorkflowPanelProps) {
+export function OrchestrationPanel({ open, profiles, order, mode, project, onChooseProject, onClose, onToggle, onMove, onLaunch, platformIssue, capabilityIssue, prompts = [], allDecks = false, liveTitles = [], liveDirectories = [], deckId }: OrchestrationPanelProps) {
   const orchestrations = project?.orchestrations ?? [];
   const [name, setName] = useState("");
   const [taskPrompt, setTaskPrompt] = useState("");
   /*
    * Issue #1044 — the run's name, the TUI `Ctrl+n` dialog's Name field. It is
    * SUGGESTED (`<basename>-orchestrator-N`, the lowest N no live orchestration
-   * on this deck holds) when the sheet opens and whenever the workflow changes,
+   * on this deck holds) when the sheet opens and whenever the orchestration changes,
    * but only while the user has not typed in it: a generated default may
    * replace a generated default, never a human edit (the TUI's
    * `resuggest_name_for_selection`). Emptying it is a choice, not a request for
-   * a new suggestion — the run then takes the workflow's name.
+   * a new suggestion — the run then takes the orchestration's name.
    *
    * The sheet stays MOUNTED while closed, so "opens" has to be detected: each
    * closed-to-open transition clears the edit, as the TUI builds a fresh form
@@ -446,23 +446,23 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
   const runNameTouched = useRef(false);
   const wasOpen = useRef(false);
   const cwdBasename = directoryLabel(project?.path ?? "");
-  const hasSelectedWorkflow = orchestrations.some((orchestration) => orchestration.name === name);
+  const hasSelectedOrchestration = orchestrations.some((orchestration) => orchestration.name === name);
   useEffect(() => {
     const opening = open && !wasOpen.current;
     wasOpen.current = open;
     if (!open) return;
     if (opening) runNameTouched.current = false;
     if (runNameTouched.current) return;
-    const suggestion = hasSelectedWorkflow && cwdBasename ? suggestOrchestrationName(cwdBasename, liveTitles) : "";
+    const suggestion = hasSelectedOrchestration && cwdBasename ? suggestOrchestrationName(cwdBasename, liveTitles) : "";
     // A basename the crate would refuse as a title (a control byte in the
     // directory name, an over-long one) is not offered: an empty Name, which
-    // takes the workflow's name, launches where that suggestion could not.
+    // takes the orchestration's name, launches where that suggestion could not.
     setRunName(isUsableRunName(suggestion) ? suggestion : "");
     // `liveTitles` is read, not watched: the TUI suggests from ONE snapshot
     // taken when the dialog opens, and a name that re-numbered itself under the
     // user's eyes as the fleet ticked would be worse than one that is briefly
     // stale — the collision check below reads the live list either way.
-  }, [open, name, hasSelectedWorkflow, cwdBasename, deckId]);
+  }, [open, name, hasSelectedOrchestration, cwdBasename, deckId]);
   // Pre-select the project's default orchestration, or its only one. A
   // selection that no longer names an orchestration this project offers is
   // dropped rather than sent — the config can have changed under it.
@@ -486,7 +486,7 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
    * and this screen used to assume it was always the one called `orchestrator`.
    * A project can mark any role as the start role, so an orchestration whose
    * start role is named anything else looked ready to launch here and was then
-   * refused three layers down — `order_workflow_roles` compares every submitted
+   * refused three layers down — `order_orchestration_roles` compares every submitted
    * start marker against the daemon's projection, and since the audit fix the
    * daemon refuses the spawn itself with `preparation-mismatch`.
    *
@@ -512,8 +512,8 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
   /*
    * An orchestration that marks no role as its start role cannot be launched
    * from this app at all: `validate_desktop_coordinator` has nothing to make the
-   * coordinator out of and refuses. Say so here, where the user can see which
-   * workflow it is, rather than letting it arrive as a bridge error after the
+   * orchestrator out of and refuses. Say so here, where the user can see which
+   * orchestration it is, rather than letting it arrive as a bridge error after the
    * confirmation dialog.
    *
    * The trailing `roles.some` is a separate condition rather than a second
@@ -521,13 +521,13 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
    * missing/extra banner is already explaining any case it could catch.
    */
   const startRoleIssue = orchestration && !startRoleNames.size
-    ? `${orchestration.displayName} marks no role as its start role, so there is no coordinator to launch. Mark one of its roles \`start = true\` in the project's .dot-agent-deck.toml.`
+    ? `${orchestration.displayName} marks no role as its start role, so there is no orchestrator to activate. Mark one of its roles \`start = true\` in the project's .dot-agent-deck.toml.`
     : undefined;
   const allRequiredRolesEnabled = Boolean(orchestration) && !missingRoles.length && !extraRoles.length && !startRoleIssue && roles.some((role) => role.start);
   /*
    * Issue #1044 — the TUI's two Name rules, against the selected deck's live
    * orchestrations. The title a launch would actually take (the Name, or the
-   * workflow's own name when it is empty — `orchestrationRunTitle`) colliding
+   * orchestration's own name when it is empty — `orchestrationRunTitle`) colliding
    * with a live one REFUSES the launch, as `name_collision` refuses the TUI's
    * submit; a directory that already runs an orchestration only WARNS. Both
    * read the app's own view of the deck, so a deck that has not reported reads
@@ -543,49 +543,49 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
   const runNameUnusable = runName !== "" && !isUsableRunName(runName);
   // The task prompt is NOT required (issue #1044): neither the deck nor the TUI
   // requires one, and starting the orchestration as-is and typing the task into
-  // the coordinator is the ordinary TUI habit.
+  // the orchestrator is the ordinary TUI habit.
   const canLaunch = mode === "live" && !allDecks && !platformIssue && !capabilityIssue && Boolean(project) && name.trim().length > 0 && cwd.startsWith("/") && !titleTaken && !runNameUnusable && allRequiredRolesEnabled && invalidCommands.length === 0;
   const customCommandCount = resolved.filter(({ resolution }) => resolution.source === "custom").length;
   const generatedFullAccessCount = resolved.filter(({ profile, resolution }) => resolution.source === "generated" && profile.permissionMode === "full-access").length;
   return (
     <div className="sheet-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className="config-sheet workflow-sheet" role="dialog" aria-modal="true" aria-labelledby="workflow-editor-title" data-testid="workflow-editor" onMouseDown={(event) => event.stopPropagation()}>
+      <section className="config-sheet orchestration-sheet" role="dialog" aria-modal="true" aria-labelledby="orchestration-editor-title" data-testid="orchestration-editor" onMouseDown={(event) => event.stopPropagation()}>
         <header className="sheet-header">
-          <div><span className="eyebrow">LOOP CONFIGURATION</span><h2 id="workflow-editor-title">Workflow order</h2><p>Shape the role sequence used by the cockpit preview.</p></div>
-          <button className="icon-button" aria-label="Close workflow editor" onClick={onClose}><X size={18} /></button>
+          <div><span className="eyebrow">LOOP CONFIGURATION</span><h2 id="orchestration-editor-title">Orchestration order</h2><p>Shape the role sequence used by the cockpit preview.</p></div>
+          <button className="icon-button" aria-label="Close orchestration editor" onClick={onClose}><X size={18} /></button>
         </header>
-        <div className="local-only-notice"><AlertTriangle size={15} /><span><strong>Local ordering</strong> — role order is a desktop draft. Launch uses these commands but does not rewrite project TOML.</span></div>
+        <div className="local-only-notice"><AlertTriangle size={15} /><span><strong>Local ordering</strong> — role order is a desktop draft. Activation uses these commands but does not rewrite project TOML.</span></div>
         {mode === "live" && allDecks && (
-          <SelectDeckNote testId="workflow-select-deck" className="sheet-select-deck" title="Select a deck to launch a workflow">
-            <p>A workflow launches on one deck, and All Decks is every deck at once — so there is no deck here to launch on.</p>
-            <p className="overview-note-hint">Close this sheet and choose a deck in the Deck selector.</p>
+          <SelectDeckNote testId="orchestration-select-deck" className="sheet-select-deck" title="Select a daemon to activate an orchestration">
+            <p>An orchestration activates on one daemon, and All daemons is every daemon at once — so there is no daemon here to activate it on.</p>
+            <p className="overview-note-hint">Close this sheet and choose a daemon in the Daemon selector.</p>
           </SelectDeckNote>
         )}
         {mode === "live" && !allDecks && (
-          <div className="workflow-launch-form">
+          <div className="orchestration-launch-form">
             {/*
-              A SELECT, not a text field: the workflows on offer are the ones
+              A SELECT, not a text field: the orchestrations on offer are the ones
               this project defines, and the daemon is the only party that can
               say what those are.
             */}
-            <label><span>Workflow name</span><select aria-label="Workflow name" value={name} onChange={(event) => setName(event.target.value)} disabled={!orchestrations.length}>{orchestrations.length ? orchestrations.map((candidate) => <option key={candidate.name} value={candidate.name}>{candidate.displayName}{candidate.default ? " (default)" : ""}</option>) : <option value="">No workflow available</option>}</select></label>
+            <label><span>Orchestration name</span><select aria-label="Orchestration name" value={name} onChange={(event) => setName(event.target.value)} disabled={!orchestrations.length}>{orchestrations.length ? orchestrations.map((candidate) => <option key={candidate.name} value={candidate.name}>{candidate.displayName}{candidate.default ? " (default)" : ""}</option>) : <option value="">No orchestration available</option>}</select></label>
             {/*
               READ-ONLY, and the whole point. This used to be a free-text
-              directory that went straight into the launch; it is now the
+              directory that went straight into the activation; it is now the
               daemon's canonical spelling of the chosen project, and the only
               way to change it is to choose a different project.
             */}
-            <label><span>Project directory (from the deck)</span><input aria-label="Absolute project directory" value={cwdDisplay} readOnly placeholder="Choose a project first" spellCheck={false} data-testid="workflow-project-path" /></label>
+            <label><span>Project directory (from the daemon)</span><input aria-label="Absolute project directory" value={cwdDisplay} readOnly placeholder="Choose a project first" spellCheck={false} data-testid="orchestration-project-path" /></label>
             {/*
               Issue #1044 — the run's name, which labels its tab and card. An
-              empty one is allowed and falls back to the workflow's name, which
+              empty one is allowed and falls back to the orchestration's name, which
               the placeholder says.
             */}
-            <label><span>Run name</span><input aria-label="Run name" value={runName} onChange={(event) => { runNameTouched.current = true; setRunName(event.target.value); }} placeholder={orchestration?.displayName ?? ""} spellCheck={false} data-testid="workflow-run-name" /></label>
-            {runNameUnusable && <small role="alert" data-testid="workflow-run-name-unusable"><AlertTriangle size={12} /> {RUN_NAME_UNUSABLE}</small>}
-            {titleTaken && <small role="alert" data-testid="workflow-title-taken"><AlertTriangle size={12} /> {ORCHESTRATION_TITLE_TAKEN}</small>}
-            {!titleTaken && sameDirectory && <small data-testid="workflow-same-directory"><AlertTriangle size={12} /> {SAME_DIRECTORY_ORCHESTRATION}</small>}
-            <label className="workflow-task-prompt">
+            <label><span>Run name</span><input aria-label="Run name" value={runName} onChange={(event) => { runNameTouched.current = true; setRunName(event.target.value); }} placeholder={orchestration?.displayName ?? ""} spellCheck={false} data-testid="orchestration-run-name" /></label>
+            {runNameUnusable && <small role="alert" data-testid="orchestration-run-name-unusable"><AlertTriangle size={12} /> {RUN_NAME_UNUSABLE}</small>}
+            {titleTaken && <small role="alert" data-testid="orchestration-title-taken"><AlertTriangle size={12} /> {ORCHESTRATION_TITLE_TAKEN}</small>}
+            {!titleTaken && sameDirectory && <small data-testid="orchestration-same-directory"><AlertTriangle size={12} /> {SAME_DIRECTORY_ORCHESTRATION}</small>}
+            <label className="orchestration-task-prompt">
               <span className="task-prompt-label">
                 Task prompt (optional)
                 {prompts.length > 0 && (
@@ -604,22 +604,22 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
               </span>
               <textarea aria-label="Task prompt" value={taskPrompt} onChange={(event) => setTaskPrompt(event.target.value)} placeholder="Tell the orchestrator what to build, fix, or investigate..." rows={5} />
             </label>
-            {!project && <small data-testid="workflow-needs-project"><AlertTriangle size={12} /> No project chosen. <button type="button" className="link-button" onClick={onChooseProject}>Choose one</button> — the deck offers the projects it can see, and workflows come from the project.</small>}
-            {project && !orchestrations.length && <small data-testid="workflow-no-orchestrations"><AlertTriangle size={12} /> The deck resolved this project but it defines no workflow with roles.</small>}
-            {!taskPrompt.trim() && <small data-testid="workflow-no-task">No task: the coordinator starts, reads its role and waits — type the task into its pane.</small>}
-            {platformIssue && <small data-testid="workflow-platform-issue"><AlertTriangle size={12} /> {platformIssue}</small>}
-            {/* PRD #741 M8: the deck does not advertise the verbs a launch needs. */}
-            {capabilityIssue && <small data-testid="workflow-capability-issue"><AlertTriangle size={12} /> {capabilityIssue}</small>}
-            {orchestration && (missingRoles.length > 0 || extraRoles.length > 0) && <small data-testid="workflow-role-mismatch"><AlertTriangle size={12} /> {orchestration.displayName} defines {requiredRoleLabels.join(", ") || "no roles"}.{missingRoles.length ? ` Enable a profile for: ${missingRoles.join(", ")}.` : ""}{extraRoles.length ? ` Not in this workflow: ${extraRoles.join(", ")}.` : ""}</small>}
-            {startRoleIssue && <small data-testid="workflow-no-start-role"><AlertTriangle size={12} /> {startRoleIssue}</small>}
+            {!project && <small data-testid="orchestration-needs-project"><AlertTriangle size={12} /> No project chosen. <button type="button" className="link-button" onClick={onChooseProject}>Choose one</button> — the daemon offers the projects it can see, and orchestrations come from the project.</small>}
+            {project && !orchestrations.length && <small data-testid="orchestration-no-orchestrations"><AlertTriangle size={12} /> The daemon resolved this project but it defines no orchestration with roles.</small>}
+            {!taskPrompt.trim() && <small data-testid="orchestration-no-task">No task: the orchestrator starts, reads its role and waits — type the task into its pane.</small>}
+            {platformIssue && <small data-testid="orchestration-platform-issue"><AlertTriangle size={12} /> {platformIssue}</small>}
+            {/* PRD #741 M8: the daemon does not advertise the verbs an activation needs. */}
+            {capabilityIssue && <small data-testid="orchestration-capability-issue"><AlertTriangle size={12} /> {capabilityIssue}</small>}
+            {orchestration && (missingRoles.length > 0 || extraRoles.length > 0) && <small data-testid="orchestration-role-mismatch"><AlertTriangle size={12} /> {orchestration.displayName} defines {requiredRoleLabels.join(", ") || "no roles"}.{missingRoles.length ? ` Enable a profile for: ${missingRoles.join(", ")}.` : ""}{extraRoles.length ? ` Not in this orchestration: ${extraRoles.join(", ")}.` : ""}</small>}
+            {startRoleIssue && <small data-testid="orchestration-no-start-role"><AlertTriangle size={12} /> {startRoleIssue}</small>}
             {invalidCommands.length > 0 && <small><AlertTriangle size={12} /> Fix the launch command for: {invalidCommands.map(({ profile }) => profile.role).join(", ")}.</small>}
           </div>
         )}
-        <div className="workflow-editor-list">
+        <div className="orchestration-editor-list">
           {ordered.map((profile, index) => (
-            <div className={`workflow-editor-row ${profile.enabled ? "" : "is-disabled"}`} key={profile.id}>
+            <div className={`orchestration-editor-row ${profile.enabled ? "" : "is-disabled"}`} key={profile.id}>
               <GripVertical size={16} aria-hidden="true" />
-              <span className="workflow-order">{String(index + 1).padStart(2, "0")}</span>
+              <span className="orchestration-order">{String(index + 1).padStart(2, "0")}</span>
               <div><strong>{profile.role}{profile.enabled && startRoleNames.has(profile.roleId) ? <em className="start-role">START</em> : null}{profile.commandMode === "custom" ? <em className="custom-command-badge">CUSTOM CMD</em> : null}</strong><small><code>{profile.roleId}</code> · {profile.commandMode === "custom" ? "exact shell command · permissions unmanaged" : `${profile.cli} · ${profile.model}`}</small></div>
               <label className="compact-check"><input type="checkbox" checked={profile.enabled} onChange={() => onToggle(profile.id)} /><span>{profile.enabled ? <Check size={12} /> : null}</span><em>{profile.enabled ? "Enabled" : "Skipped"}</em></label>
               <div className="order-buttons">
@@ -629,9 +629,9 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
             </div>
           ))}
         </div>
-        <footer className="sheet-footer workflow-footer">
+        <footer className="sheet-footer orchestration-footer">
           <span>{enabled.length} active roles · {ordered.length - enabled.length} skipped</span>
-          {mode === "live" ? <button className="button primary" data-testid="launch-live-loop" disabled={!canLaunch} onClick={() => onLaunch({ name, cwd, displayName: orchestration?.displayName ?? name, displayPath: cwdDisplay, ...(runName !== "" ? { displayTitle: runName } : {}), taskPrompt: taskPrompt.trim(), roles, rows: 32, cols: 120, customCommandCount, generatedFullAccessCount, configRevision: project?.configRevision })}><Bot size={14} /> Launch live loop</button> : <button className="button primary" onClick={onClose}><Check size={14} /> Use preview</button>}
+          {mode === "live" ? <button className="button primary" data-testid="activate-orchestration" disabled={!canLaunch} onClick={() => onLaunch({ name, cwd, displayName: orchestration?.displayName ?? name, displayPath: cwdDisplay, ...(runName !== "" ? { displayTitle: runName } : {}), taskPrompt: taskPrompt.trim(), roles, rows: 32, cols: 120, customCommandCount, generatedFullAccessCount, configRevision: project?.configRevision })}><Bot size={14} /> Activate orchestration</button> : <button className="button primary" onClick={onClose}><Check size={14} /> Use preview</button>}
         </footer>
       </section>
     </div>

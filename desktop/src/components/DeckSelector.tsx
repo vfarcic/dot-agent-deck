@@ -56,8 +56,9 @@
  *
  * # Vocabulary
  *
- * Rendered text says **Deck**, never "daemon". The sweep of the existing strings
- * is M15's; nothing new is written in the old vocabulary.
+ * Rendered text says **daemon**, never "Deck" (issue #1045 reversed PRD #741
+ * M15; `docs/develop/glossary.md` has the canonical words). Identifiers keep
+ * their `deck` spelling.
  */
 import { useEffect, useId, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronsUpDown, Server } from "lucide-react";
@@ -87,7 +88,7 @@ export function deckStateNote(connection: ConnectionView): string | undefined {
   // CONNECTED — to the local deck, while the selector names another one — so a
   // check on `status` alone would find nothing wrong and say nothing.
   if (connection.selectionFallback) return connection.selectionFallback;
-  if (connection.status === "loading") return "Connecting to this deck…";
+  if (connection.status === "loading") return "Connecting to this daemon…";
   if (connection.status !== "connected") return connection.message;
   // Connected, with a caveat the app is required to keep on screen for the whole
   // session (issue #801, PRD #741 M8). For a remote deck the build stamp is an
@@ -128,9 +129,9 @@ function noteIsProblem(connection: ConnectionView): boolean {
 export function chooseDeckSelection(settings: DesktopSettingsState, token: string, identity?: VoiceDeckIdentityDto): string | undefined {
   const section = settings.settings.endpoints;
   const next = deckChoices(section).find((choice) => choice.token === token);
-  if (!next) return "That deck is not in the Deck selector any more.";
+  if (!next) return "That daemon is not in the Daemon selector any more.";
   if (identity && !sameDeckIdentity(section?.remote?.find((row) => row.id === token), identity)) {
-    return "That deck changed in Settings since you asked for it — try again.";
+    return "That daemon changed in Settings since you asked for it — try again.";
   }
   /*
     The no-op guard, which is shared with `EndpointsPanel` since PRD #742 M6
@@ -220,7 +221,7 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
         data-testid="deck-selector-toggle"
         aria-expanded={open}
         aria-haspopup="true"
-        title="Choose which deck these screens are showing."
+        title="Choose which daemon these screens are showing."
         onClick={() => setOpen((wasOpen) => !wasOpen)}
       >
         <span className={`connection-lamp connection-${connection.status}`} aria-hidden="true" />
@@ -246,7 +247,7 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
       )}
       {open && (
         <div className="deck-selector-menu" data-testid="deck-selector-menu">
-          <span className="deck-selector-menu-label" id={labelId}>Deck</span>
+          <span className="deck-selector-menu-label" id={labelId}>Daemon</span>
           <div role="radiogroup" aria-labelledby={labelId}>
             {choices.map((choice) => {
               const chosen = sameSelection(choice.selection, selection);
@@ -265,7 +266,7 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
               );
             })}
           </div>
-          <p>Decks are added and removed in Settings.</p>
+          <p>Daemons are added and removed in Settings.</p>
         </div>
       )}
     </div>

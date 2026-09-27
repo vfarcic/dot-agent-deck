@@ -37,7 +37,7 @@ fn close_confirm_001_ctrl_w_opens_with_cancel_selected() {
         .expect("an armed CloseSelected action must open confirmation");
     let text = buffer_to_text(&render_close_confirm_to_buffer(&prompt, 80, 24));
 
-    assert!(text.contains("Close selected pane?"), "{text}");
+    assert!(text.contains("Close selected agent?"), "{text}");
     assert!(
         text.contains("> Cancel"),
         "Cancel must carry the default selection cursor\n{text}"
@@ -50,14 +50,14 @@ fn close_confirm_001_ctrl_w_opens_with_cancel_selected() {
     };
     let tab_text = buffer_to_text(&render_close_confirm_to_buffer(&tab_prompt, 80, 24));
     assert!(
-        tab_text.contains("Close this tab and all its panes?"),
+        tab_text.contains("Close this tab and all its agents?"),
         "{tab_text}"
     );
     assert!(
         tab_text.contains("stop all agents and remove the tab"),
         "{tab_text}"
     );
-    assert!(!tab_text.contains("Close selected pane?"), "{tab_text}");
+    assert!(!tab_text.contains("Close selected agent?"), "{tab_text}");
     assert!(tab_text.contains("> Cancel"), "{tab_text}");
 }
 
@@ -91,7 +91,7 @@ fn close_confirm_007_kept_worktree_warns_before_the_keystroke() {
         "the warning must come before the options the user is about to answer\n{text}"
     );
     // Still an ordinary close confirmation in every other respect.
-    assert!(text.contains("Close selected pane?"), "{text}");
+    assert!(text.contains("Close selected agent?"), "{text}");
     assert!(text.contains("  Close"), "{text}");
 
     // An inconclusive probe is kept too, so the path is still reported — under

@@ -102,12 +102,12 @@ test("terminal_001 a shell started from New agent runs a typed command in a real
       (await deck.terminalTexts()).some(({ text }) => text.includes("dad-driver-42-ok")),
     );
 
-    // The pane's own Close control, not Escape: focus is in xterm now, and a
-    // terminal rightly hands Escape to the shell.
+    // The pane's own Back to dashboard control, not Escape: focus is in xterm
+    // now, and a terminal rightly hands Escape to the shell.
     await deck.session.click(
       await deck.element(
-        '[data-testid="agent-pane-overlay"] button.agent-pane-control[aria-label^="Close "]',
-        "the pane's Close control",
+        '[data-testid="agent-pane-overlay"] button.agent-pane-control[aria-label="Back to dashboard"]',
+        "the pane's Back to dashboard control",
       ),
     );
     await waitFor("the pane to close", async () => (await deck.session.find('[data-testid="agent-pane-overlay"]')) === null);

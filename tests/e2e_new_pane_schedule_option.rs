@@ -42,7 +42,7 @@ use spec::spec;
 #[test]
 fn new_pane_007_schedule_authoring_option_visually_separated() {
     let deck = TuiDeck::launch_with_fixture("schedule-mode");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Open the new-pane form: Ctrl+n → directory picker, Space confirms the
     // current dir (no quiescence wait — the deck repaints on a periodic tick).
@@ -131,7 +131,7 @@ fn new_pane_007_schedule_authoring_option_visually_separated() {
 /// `schedule` authoring option, type the stand-in command `cat` into the Command
 /// field (so the spawn never depends on a real agent binary being on PATH), and
 /// submit it. Assert the authoring session lands as a single-agent DASHBOARD
-/// CARD — the dashboard's `dot-agent-deck — N session(s)` title renders (it shows
+/// CARD — the dashboard's `dot-agent-deck — N agent(s)` title renders (it shows
 /// only on the Dashboard tab) and no `×` tab-close glyph appears — NOT as a 50/50
 /// mode tab, which would open a second tab whose strip carries a `×` and hide the
 /// dashboard title. RED today: the `schedule` option opens via `render_mode_tab`
@@ -140,7 +140,7 @@ fn new_pane_007_schedule_authoring_option_visually_separated() {
 #[test]
 fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     let deck = TuiDeck::launch_with_fixture("schedule-mode");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Open the new-pane form and cycle the Mode field to the built-in
     // `schedule` authoring option (the cycler caps at the last option) —
@@ -189,7 +189,7 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     assert!(
         grid.contains("dot-agent-deck \u{2014}"),
         "the `schedule` authoring session must open as a single-agent DASHBOARD CARD: the \
-         dashboard's `dot-agent-deck — N session(s)` title renders only on the Dashboard \
+         dashboard's `dot-agent-deck — N agent(s)` title renders only on the Dashboard \
          tab, so its presence is what proves the authoring session stayed a card.\nGrid:\n{grid}"
     );
     assert!(
@@ -219,7 +219,7 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
 #[test]
 fn new_pane_009_schedule_chip_contained_when_row_overflows() {
     let deck = TuiDeck::launch_with_fixture("mode-chip-overflow");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Open the new-pane form: Ctrl+n → directory picker, Space confirms the
     // current dir → the new-pane form.
@@ -292,7 +292,7 @@ fn new_pane_010_issue_dispatch_option_flag_gated() {
     let on = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .launch_with_fixture("schedule-mode");
-    on.wait_for_string("No active sessions");
+    on.wait_for_string("No active agents");
     on.send_keys(b"\x0e"); // Ctrl+n → directory picker
     on.send_keys(b" "); // Space → confirm current dir → new-pane form
     // The Mode field is up at "No mode"; the chip row (all options) paints in the
@@ -309,7 +309,7 @@ fn new_pane_010_issue_dispatch_option_flag_gated() {
 
     // --- experimental OFF (control): the option is hidden; plain schedule stays. ---
     let off = TuiDeck::launch_with_fixture("schedule-mode");
-    off.wait_for_string("No active sessions");
+    off.wait_for_string("No active agents");
     off.send_keys(b"\x0e");
     off.send_keys(b" ");
     off.wait_for_string("No mode");

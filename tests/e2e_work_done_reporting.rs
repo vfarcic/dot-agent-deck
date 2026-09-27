@@ -186,7 +186,7 @@ fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui(
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
         .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     open_orchestration(&deck);
     deck.wait_for_string(WORKER_ROLE);
 
@@ -348,7 +348,7 @@ fn work_done_009_cut_report_names_its_saved_full_copy_in_the_attached_tui() {
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
         .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     // The orchestrator is a RAW, no-echo `cat` here, not the fixture's plain
     // one. A canonical-mode tty hands `cat` at most 4095 bytes of one line, so
     // a plain `cat` echoes the whole feedback and then reprints a copy cut

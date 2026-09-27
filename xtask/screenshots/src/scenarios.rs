@@ -73,7 +73,7 @@ impl Scenario {
 pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "dashboard",
-        description: "The agent list with four agents in mixed states — the TUI dashboard (card column beside the focused agent's pane) and the desktop agent overview.",
+        description: "The agent list with four agents in mixed states — the TUI dashboard (card column beside the focused agent's pane) and the desktop Dashboard.",
         clients: &[Client::Tui, Client::Desktop],
     },
     Scenario {

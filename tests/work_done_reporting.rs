@@ -982,7 +982,7 @@ fn dispatch_return_005_completion_is_dropped_after_the_caller_pane_is_gone() {
     });
 }
 
-/// Issue #508: the opening of a report that is longer than the deck will inline.
+/// Issue #508: the opening of a report that is longer than the daemon will inline.
 /// It must reach the recipient inline, so its presence is the control that the
 /// report was delivered at all.
 const LONG_REPORT_HEAD: &str = "long-report-head-3e1b";

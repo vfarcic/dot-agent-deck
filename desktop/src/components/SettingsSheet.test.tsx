@@ -94,7 +94,7 @@ describe("SettingsSheet section column", () => {
     // landed; it flipped on its own, with no change to the sheet, which is
     // exactly the claim the collapse was built to make good. Inverted rather
     // than deleted, so the live registry's real layout stays pinned. PRD #741's
-    // Decks row took it to three, again with no change to the sheet — the count
+    // Daemons row took it to three, again with no change to the sheet — the count
     // is pinned so adding a section is a deliberate edit here rather than a
     // silent one. PRD #802 M4's Voice row took it to four, and this line is
     // that deliberate edit.

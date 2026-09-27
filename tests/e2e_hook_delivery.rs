@@ -39,7 +39,7 @@ fn delivery_001_session_start_creates_card() {
     // — otherwise a fast write can land before the TUI subscribes. The
     // empty-state line is sufficient evidence the dashboard rendered;
     // wait_until_quiescent would race the TUI's periodic redraw tick.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // The hook event uses a session_id short enough to render in full
     // (the dashboard truncates to 11 chars), and a fresh pane_id that
@@ -134,7 +134,7 @@ fn delivery_008_background_subagent_tool_call_does_not_flip_idle_card_to_working
         |status: &'static str| move |grid: &str| grid.contains(SESSION) && grid.contains(status);
 
     let deck = TuiDeck::launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     claude_hook_via_cli(
         &deck,

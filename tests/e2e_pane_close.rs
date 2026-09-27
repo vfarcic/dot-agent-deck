@@ -21,7 +21,7 @@ fn pane_002_confirmed_ctrl_w_removes_card() {
     deck.wait_for_string("close-card");
 
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     assert!(
         common::wait_for_agent_display_name(
             deck.attach_socket_path(),
@@ -34,7 +34,7 @@ fn pane_002_confirmed_ctrl_w_removes_card() {
 
     deck.send_keys(b"\x1b[B");
     deck.send_keys(b"\r");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     assert!(
         common::wait_for_agent_display_name(
             deck.attach_socket_path(),
@@ -51,7 +51,7 @@ fn pane_002_confirmed_ctrl_w_removes_card() {
 #[test]
 fn pane_003_empty_dashboard_never_opens_close_confirmation() {
     let deck = TuiDeck::launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     deck.send_keys(b"\x17");
     deck.send_keys(b"?");
@@ -62,16 +62,16 @@ fn pane_003_empty_dashboard_never_opens_close_confirmation() {
     // half-painted frame. Measured on PR #1291's e2e-deterministic run
     // (36077156836), twice in a row. Same mechanism as #807/#395.
     deck.wait_until_grid("help painted over a still-rendered Dashboard", |grid| {
-        grid.contains("Create new pane") && grid.contains("Dashboard")
+        grid.contains("Create new agent") && grid.contains("Dashboard")
     });
 
     let grid = deck.snapshot_grid();
     assert!(
-        !grid.contains("Close selected pane?"),
+        !grid.contains("Close selected agent?"),
         "an empty dashboard must not arm a close confirmation\n{grid}"
     );
     assert!(
-        !grid.contains("Close this tab and all its panes?"),
+        !grid.contains("Close this tab and all its agents?"),
         "an empty dashboard must not leak a tab-scoped close confirmation\n{grid}"
     );
 }
@@ -88,9 +88,9 @@ fn close_confirm_002_real_cancel_preserves_and_confirm_closes() {
     deck.wait_for_string("confirm-target");
 
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     deck.send_keys(b"\r"); // Enter on the default Cancel option.
-    deck.wait_for_absence("Close selected pane?");
+    deck.wait_for_absence("Close selected agent?");
     assert!(
         common::wait_for_agent_display_name(
             deck.attach_socket_path(),
@@ -102,10 +102,10 @@ fn close_confirm_002_real_cancel_preserves_and_confirm_closes() {
     );
 
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     deck.send_keys(b"\x1b[B");
     deck.send_keys(b"\r");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     assert!(
         common::wait_for_agent_display_name(
             deck.attach_socket_path(),
@@ -131,15 +131,15 @@ fn close_confirm_003_real_button_and_key_share_confirmation() {
 
     let (col, row) = deck.wait_for_in_grid("[Close Ctrl+W]");
     deck.click(col + 1, row);
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     let clicked_modal = deck.snapshot_grid();
     assert!(clicked_modal.contains("> Cancel"), "{clicked_modal}");
     assert!(clicked_modal.contains("  Close"), "{clicked_modal}");
 
     deck.send_keys(b"\r");
-    deck.wait_for_absence("Close selected pane?");
+    deck.wait_for_absence("Close selected agent?");
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     let keyed_modal = deck.snapshot_grid();
     assert!(keyed_modal.contains("> Cancel"), "{keyed_modal}");
     assert!(keyed_modal.contains("  Close"), "{keyed_modal}");
@@ -173,7 +173,7 @@ fn close_confirm_004_pre_render_mouse_burst_cannot_confirm() {
     let burst = format!("\x1b[<0;{sgr_col};{sgr_row}M\x1b[<0;{sgr_col};{sgr_row}m\x1b[B\r");
     deck.send_bytes(burst.as_bytes());
 
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     assert!(
         common::wait_for_agent_display_name(
             deck.attach_socket_path(),
@@ -191,7 +191,7 @@ fn close_confirm_004_pre_render_mouse_burst_cannot_confirm() {
 
     deck.send_keys(b"\x1b[B");
     deck.send_keys(b"\r");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 }
 
 /// Scenario: Arm a real dashboard card's close confirmation, then deliver a SessionStart for a different agent on the same pane so the armed session identity is replaced before confirmation. Down+Enter must close nothing, retain the live daemon agent/card, and surface that the armed target is gone rather than retargeting the replacement.
@@ -215,7 +215,7 @@ fn close_confirm_005_vanished_armed_session_closes_nothing() {
         .as_deref()
         .expect("continued pane must retain its stable pane id");
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     let replacement = serde_json::json!({
         "session_id": "replacement-generation",
         "agent_type": "claude_code",
@@ -286,7 +286,7 @@ fn close_confirm_009_stable_key_respawn_closes_nothing() {
     deck.wait_for_string("generation-one-history-marker");
 
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
 
     // Generation two. Identical to generation one in every field the dashboard
     // renders — same producer key, same agent type, same pane — and differing

@@ -121,8 +121,8 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
     // generous bound here rather than widening the shared constant every
     // other harness test relies on.
     assert!(
-        deck.wait_for_grid_string_within("No active sessions", Duration::from_secs(30)),
-        "startup race: the deck never rendered \"No active sessions\" within 30s — this is the \
+        deck.wait_for_grid_string_within("No active agents", Duration::from_secs(30)),
+        "startup race: the deck never rendered \"No active agents\" within 30s — this is the \
          known loaded-machine startup flake (harness-side), not a badge or shell-activity \
          assertion:\n{}",
         deck.snapshot_grid()
@@ -152,7 +152,7 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(PANE_NAME_SUFFIX.as_bytes());
     deck.send_keys(b"\t");
@@ -289,8 +289,8 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     // generous bound here rather than widening the shared constant every
     // other harness test relies on.
     assert!(
-        deck.wait_for_grid_string_within("No active sessions", Duration::from_secs(30)),
-        "startup race: the deck never rendered \"No active sessions\" within 30s — this is the \
+        deck.wait_for_grid_string_within("No active agents", Duration::from_secs(30)),
+        "startup race: the deck never rendered \"No active agents\" within 30s — this is the \
          known loaded-machine startup flake (harness-side), not a badge or shell-activity \
          assertion:\n{}",
         deck.snapshot_grid()
@@ -314,7 +314,7 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(PANE_NAME_SUFFIX_006.as_bytes());
     deck.send_keys(b"\t");
@@ -525,8 +525,8 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     // generous bound here rather than widening the shared constant every
     // other harness test relies on.
     assert!(
-        deck.wait_for_grid_string_within("No active sessions", Duration::from_secs(30)),
-        "startup race: the deck never rendered \"No active sessions\" within 30s — this is the \
+        deck.wait_for_grid_string_within("No active agents", Duration::from_secs(30)),
+        "startup race: the deck never rendered \"No active agents\" within 30s — this is the \
          known loaded-machine startup flake (harness-side), not a badge or shell-activity \
          assertion:\n{}",
         deck.snapshot_grid()
@@ -548,7 +548,7 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(PANE_NAME_SUFFIX_007.as_bytes());
     deck.send_keys(b"\t");

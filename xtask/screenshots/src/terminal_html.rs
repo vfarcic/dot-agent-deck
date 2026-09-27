@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn rendering_is_deterministic() {
-        let bytes = b"\x1b[1;36mdot-agent-deck\x1b[0m \xe2\x94\x80 3 session(s)\r\n\x1b[33m\xe2\x97\x8f\x1b[0m Working";
+        let bytes = b"\x1b[1;36mdot-agent-deck\x1b[0m \xe2\x94\x80 3 agent(s)\r\n\x1b[33m\xe2\x97\x8f\x1b[0m Working";
         let a = screen(4, 40, bytes);
         let b = screen(4, 40, bytes);
         let options = RenderOptions::default();

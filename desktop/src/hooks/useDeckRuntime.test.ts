@@ -67,7 +67,7 @@ describe("useDeckRuntime", () => {
 
   /**
    * Issue #1046: the runtime held the last action's error and exposed no way to
-   * drop it, which is why the deck's toast had a dismiss button that could not
+   * drop it, which is why the daemon's toast had a dismiss button that could not
    * dismiss an error. Clearing must not disturb what the CONNECTION reports —
    * the banner reads `snapshot.connection`, and that is a different question
    * from whether the user has waved away the last failure.
@@ -94,6 +94,7 @@ describe("useDeckRuntime", () => {
    * same list the dialog preselects from — so an unreachable deck reaches Rust
    * with the reason the step shows, and the panel had to say nothing about it.
    */
+  /** Scenario: Declares the fleet's deck step with every voice declaration. */
   it("declares the fleet's deck step with every voice declaration", async () => {
     bridge.connect.mockResolvedValue(createFixtureFleet("fleet"));
     const { result } = renderHook(() => useDeckRuntime());
@@ -105,7 +106,7 @@ describe("useDeckRuntime", () => {
     const [screen, directories, newAgent, deckStep] = bridge.declareVoiceScreen.mock.calls[0];
     expect([screen, directories, newAgent]).toEqual(["overview", undefined, undefined]);
     expect(deckStep).toContainEqual({ deckId: FIXTURE_DAEMON_ID });
-    expect(deckStep).toContainEqual({ deckId: FIXTURE_UNREACHABLE_DAEMON_ID, reason: "No deck is listening on the configured socket." });
+    expect(deckStep).toContainEqual({ deckId: FIXTURE_UNREACHABLE_DAEMON_ID, reason: "No daemon is listening on the configured socket." });
   });
 
   /**
@@ -270,6 +271,7 @@ describe("useDeckRuntime", () => {
    * afterwards. The reconnect's sentence replaces the error; the launch's
    * roles stay queued as their own warning.
    */
+  /** Scenario: Keeps a launch's cleanup roles through a failed reconnect. */
   it("keeps a launch's cleanup roles through a failed reconnect", async () => {
     let rejectLaunch: ((cause: unknown) => void) | undefined;
     let rejectConnect: ((cause: unknown) => void) | undefined;
@@ -283,11 +285,11 @@ describe("useDeckRuntime", () => {
       bridge.connect.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectConnect = reject; }));
       const refresh = result.current.reconnect();
       rejectLaunch?.(new LaunchCleanupError("launch failed; cleanup could not confirm stop for 1 role(s)", ["planner"]));
-      rejectConnect?.(new Error("the deck is not answering"));
+      rejectConnect?.(new Error("the daemon is not answering"));
       await Promise.all([launch, refresh]);
     });
 
-    expect(result.current.error).toBe("the deck is not answering");
+    expect(result.current.error).toBe("the daemon is not answering");
     expect(result.current.cleanupWarnings?.map((warning) => warning.stops)).toEqual([["planner"]]);
   });
 
@@ -352,6 +354,6 @@ describe("useDeckRuntime", () => {
     });
 
     expect(result.current.snapshot.connection.deckId).not.toBe(FIXTURE_REMOTE_DAEMON_ID);
-    expect(result.current.cleanupWarnings?.map((warning) => warning.deck)).toEqual([deckName(remote.connection), "Local deck"]);
+    expect(result.current.cleanupWarnings?.map((warning) => warning.deck)).toEqual([deckName(remote.connection), "Local daemon"]);
   });
 });

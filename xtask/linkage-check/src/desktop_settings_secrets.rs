@@ -592,7 +592,12 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 25] = [
 /// deleted the key. Removing it from the pin is the deliberate edit this check
 /// exists to force: the guard reddened on the merge that brought #827's pin and
 /// #819's deletion together, which is the mechanism working rather than failing.
-const PINNED_STORAGE_KEYS: [(&str, &str, bool); 5] = [
+///
+/// Issue #1045 renamed the desktop's "workflow" to the TUI's "orchestration", so
+/// the role-order key moved to `ORCHESTRATION_STORAGE_KEY`. The old one stays
+/// pinned as `LEGACY_WORKFLOW_STORAGE_KEY` because `App.tsx` still reads it once,
+/// to migrate a saved order, and then removes it.
+const PINNED_STORAGE_KEYS: [(&str, &str, bool); 6] = [
     (
         "FIXTURE_SETTINGS_KEY",
         "dot-agent-deck.desktop-settings",
@@ -604,7 +609,12 @@ const PINNED_STORAGE_KEYS: [(&str, &str, bool); 5] = [
         true,
     ),
     (
-        "WORKFLOW_STORAGE_KEY",
+        "ORCHESTRATION_STORAGE_KEY",
+        "dot-agent-deck.desktop.orchestration-preview.v1",
+        true,
+    ),
+    (
+        "LEGACY_WORKFLOW_STORAGE_KEY",
         "dot-agent-deck.desktop.workflow-preview.v1",
         true,
     ),

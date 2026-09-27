@@ -25,7 +25,7 @@ use crate::config::DashboardConfig;
 /// [`crate::project_resolve::MAX_CONCURRENT_PROJECT_READS`] permits (the
 /// listing) or take no permit at all (the options query), so a burst of
 /// listings against a slow directory could hold every permit `ResolveProject`
-/// and `PrepareWorkflow` need, and a burst of options queries could spawn one
+/// and `PrepareOrchestration` need, and a burst of options queries could spawn one
 /// blocking job each. With their own pool neither can occupy a project-verb
 /// permit, and together they occupy at most this many blocking threads.
 ///
@@ -416,7 +416,7 @@ mod tests {
     /// Audit A4: with the daemon-wide new-agent pool saturated, the queries are
     /// refused while the project verbs' own pool still hands out a permit — the
     /// two are separate, so listings can no longer starve `ResolveProject` /
-    /// `PrepareWorkflow`.
+    /// `PrepareOrchestration`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn project_verbs_still_acquire_while_the_new_agent_pool_is_saturated() {
         let _serial = POOL_TEST_GUARD.lock().await;

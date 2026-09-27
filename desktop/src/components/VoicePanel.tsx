@@ -147,14 +147,14 @@ export const INTENT_DISCLOSURE = "Each command sends the Commands endpoint the w
  * utterance: `INTENT_DISCLOSURE`'s own last sentence names the ones decided on
  * this machine, which send nothing.
  */
-export const INTENT_DISCLOSURE_SHARED = "With Names shared it also sends the names on screen: each agent on the selected deck with its role, CLI name, live status and the tool it is running; every deck's label, which for a remote deck is its SSH user, host and any non-default port; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and agent entries; and each orchestration's title and roles. This app adds no field of its own for a filesystem path, a deck or agent id, prompt text or a tool's arguments \u2014 but a name is whatever it was set to, so a name can itself be a path. Every command that reaches the endpoint also carries your words as heard, which may contain anything you say.";
+export const INTENT_DISCLOSURE_SHARED = "With Names shared it also sends the names on screen: each agent on the selected daemon with its role, CLI name, live status and the tool it is running; every daemon's label, which for a remote daemon is its SSH user, host and any non-default port; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and agent entries; and each orchestration's title and roles. This app adds no field of its own for a filesystem path, a daemon or agent id, prompt text or a tool's arguments \u2014 but a name is whatever it was set to, so a name can itself be a path. Every command that reaches the endpoint also carries your words as heard, which may contain anything you say.";
 
 /**
  * What Names = Withheld leaves out, and what it costs. Withholding drops the
  * observed-names turn from the request; it does not redact the transcript
  * (PRD #1223, closing audit G2), which is why the second sentence exists.
  */
-export const INTENT_DISCLOSURE_WITHHELD = "With Names withheld it sends none of the names this app reads from the screen, so the commands that name an agent, deck, directory, mode, agent type or orchestration are unavailable. It does not redact your words: every command that reaches the endpoint still carries them as heard.";
+export const INTENT_DISCLOSURE_WITHHELD = "With Names withheld it sends none of the names this app reads from the screen, so the commands that name an agent, daemon, directory, mode, agent type or orchestration are unavailable. It does not redact your words: every command that reaches the endpoint still carries them as heard.";
 
 /** The token the speech backend takes when it authenticates with a key. */
 const KEYED = "remote";

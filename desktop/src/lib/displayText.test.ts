@@ -325,14 +325,15 @@ describe("displayUptime", () => {
 
 /**
  * PRD #1105 moved this off `AgentOverview` because the agent pane became its
- * second caller: a pane for an agent on a deck this app is not attached to
- * names that deck inside a sentence. One function, so the header and the
+ * second caller: a pane for an agent on a daemon this app is not attached to
+ * names that daemon inside a sentence. One function, so the header and the
  * sentence cannot spell the same deck two ways.
  */
 describe("deckName", () => {
+  /** Scenario: Names a local deck by the word and a remote one by its address. */
   it("names a local deck by the word and a remote one by its address", () => {
-    expect(deckName({})).toBe("Local deck");
-    expect(deckName({ deckKind: "local", socketPath: "/run/user/1000/dot-agent-deck.sock" })).toBe("Local deck");
+    expect(deckName({})).toBe("Local daemon");
+    expect(deckName({ deckKind: "local", socketPath: "/run/user/1000/dot-agent-deck.sock" })).toBe("Local daemon");
     expect(deckName({ deckKind: "remote", socketPath: "dev@build-box" })).toBe("dev@build-box");
     expect(deckName({ deckKind: "remote", socketPath: "ops@edge-3:2222" })).toBe("ops@edge-3:2222");
   });
@@ -343,10 +344,11 @@ describe("deckName", () => {
    * `displayIdentity` case — both read as the same honest words rather than as
    * a blank header cell, or as a gap in the middle of the pane's sentence.
    */
+  /** Scenario: Falls back to the same words for an addressless deck and an invisible label. */
   it("falls back to the same words for an addressless deck and an invisible label", () => {
-    expect(deckName({ deckKind: "remote" })).toBe("Remote deck");
-    expect(deckName({ deckKind: "remote", socketPath: "" })).toBe("Remote deck");
-    expect(deckName({ deckKind: "remote", socketPath: "\u200b\u200c\u200d\ufeff" })).toBe("Remote deck");
+    expect(deckName({ deckKind: "remote" })).toBe("Remote daemon");
+    expect(deckName({ deckKind: "remote", socketPath: "" })).toBe("Remote daemon");
+    expect(deckName({ deckKind: "remote", socketPath: "\u200b\u200c\u200d\ufeff" })).toBe("Remote daemon");
   });
 
   /**

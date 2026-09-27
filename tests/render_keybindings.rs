@@ -131,7 +131,7 @@ fn hints_001_bar_reflects_active_bindings() {
     insta::assert_snapshot!(text);
 }
 
-/// Scenario: Unbind `new_pane` in a default keybinding config and render the production button bar. The live New Pane button must show `(unbound)` rather than an empty shortcut field.
+/// Scenario: Unbind `new_pane` in a default keybinding config and render the production button bar. The live New Agent button must show `(unbound)` rather than an empty shortcut field.
 #[spec("keybindings/hints/002")]
 #[test]
 fn hints_002_unbound_action_not_bare() {
@@ -145,12 +145,12 @@ fn hints_002_unbound_action_not_bare() {
     let text = buffer_to_text(&buffer);
 
     assert!(
-        text.contains("[New Pane (unbound)]"),
-        "the live New Pane button must render an explicit unbound shortcut\n{text}"
+        text.contains("[New Agent (unbound)]"),
+        "the live New Agent button must render an explicit unbound shortcut\n{text}"
     );
     assert!(
-        !text.contains("[New Pane ]"),
-        "the live bar must not leave the New Pane shortcut blank\n{text}"
+        !text.contains("[New Agent ]"),
+        "the live bar must not leave the New Agent shortcut blank\n{text}"
     );
 }
 

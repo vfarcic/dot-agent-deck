@@ -299,7 +299,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ScheduleAction {
-    /// Add a new scheduled task.
+    /// Add a new schedule.
     Add {
         #[arg(long)]
         name: String,
@@ -340,8 +340,8 @@ enum ScheduleAction {
         #[arg(long)]
         query: Option<String>,
     },
-    /// Update fields of an existing task. Rename is forbidden — there is no
-    /// name-change flag; `name` selects the task to edit.
+    /// Update fields of an existing schedule. Rename is forbidden — there is no
+    /// name-change flag; `name` selects the schedule to edit.
     Update {
         #[arg(long)]
         name: String,
@@ -364,24 +364,24 @@ enum ScheduleAction {
         #[arg(long)]
         shape: Option<String>,
     },
-    /// Remove a task definition (does not kill an open tab for it).
+    /// Remove a schedule (does not kill an open tab for it).
     Remove {
         #[arg(long)]
         name: String,
     },
-    /// List scheduled tasks with their enabled/disabled state and next-fire.
+    /// List schedules with their enabled/disabled state and next-fire.
     List,
-    /// Enable a task.
+    /// Enable a schedule.
     Enable {
         #[arg(long)]
         name: String,
     },
-    /// Disable a task (keeps the definition; stops it firing).
+    /// Disable a schedule (keeps the definition; stops it firing).
     Disable {
         #[arg(long)]
         name: String,
     },
-    /// Fire a task now via the running daemon.
+    /// Fire a schedule now via the running daemon.
     RunNow {
         #[arg(long)]
         name: String,

@@ -361,7 +361,7 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
             scope: spawnable[0].name.clone(),
             message: format!(
                 "{} orchestrations are defined and none declares `default = true`, so a dispatch \
-                 or scheduled task that names none opens this one purely because it comes first \
+                 or schedule that names none opens this one purely because it comes first \
                  in the file — reordering the file would silently change that. Add \
                  `default = true` to the one you want.",
                 spawnable.len()

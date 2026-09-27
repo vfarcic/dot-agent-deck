@@ -16,7 +16,8 @@ function handoffPayload(eventType: string, sessionId: string, metadata: Record<s
 }
 
 describe("applyHandoffEvent", () => {
-  it("walks the healthy lifecycle: dispatched → respawned → delivered → done", () => {
+  /** Scenario: Walks the healthy lifecycle: delegated → respawned → delivered → done. */
+  it("walks the healthy lifecycle: delegated → respawned → delivered → done", () => {
     let edges: HandoffEdge[] = [];
     edges = applyHandoffEvent(edges, handoffPayload("delegation_dispatched", "dlg-1", {
       to_role: "coder",
@@ -24,11 +25,11 @@ describe("applyHandoffEvent", () => {
       task_preview: "Implement the thing.",
     }));
     expect(edges).toHaveLength(1);
-    expect(edges[0]).toMatchObject({ id: "dlg-1", toRole: "coder", status: "dispatched", respawned: false });
+    expect(edges[0]).toMatchObject({ id: "dlg-1", toRole: "coder", status: "delegated", respawned: false });
 
     edges = applyHandoffEvent(edges, handoffPayload("worker_respawned", "dlg-1", { to_role: "coder" }));
     expect(edges[0].respawned).toBe(true);
-    expect(edges[0].status).toBe("dispatched");
+    expect(edges[0].status).toBe("delegated");
 
     edges = applyHandoffEvent(edges, handoffPayload("delegation_delivered", "dlg-1", { to_role: "coder" }));
     expect(edges[0].status).toBe("delivered");

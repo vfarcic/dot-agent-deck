@@ -18,12 +18,12 @@ expression: buf
    │  global (works from any pane)                       mode tab (in-tab navigation)                    │    
    │                                                                                                     │    
    │  ctrl+d             toggle command / pane           j / down           focus next pane              │    
-   │  ctrl+n             create new pane                 k / up             focus previous pane          │    
+   │  ctrl+n             create new agent                k / up             focus previous pane          │    
    │  ctrl+t             toggle layout (stacked/tiled)   enter           enter paneinput on selected     │    
    │  ctrl+c             quit                            esc             deselect side pane              │    
    │                                                     mouse click     focus pane                      │    
    │  tab navigation                                     ctrl+click      open hyperlink                  │    
-   │                                                     ctrl+d             return to normal mode        │    
+   │                                                     ctrl+d             return to command mode       │    
    │  tab / right / l    next tab                                                                        │    
    │  shift+tab / left / h prev tab                      new agent form                                  │    
    │  ctrl+pgdn          next tab                                                                        │    
@@ -33,17 +33,17 @@ expression: buf
    │                                                     esc             cancel                          │    
    │  j / down           select next card                                                                │    
    │  k / up             select previous card            directory picker                                │    
-   │  1-9                jump to pane n                                                                  │    
+   │  1-9                jump to card n                                                                  │    
    │  enter              focus selected pane             j / down        select next                     │    
-   │  ctrl+w             close selected pane (confirms)  k / up          select previous                 │    
+   │  ctrl+w             close selected agent (confirms) k / up          select previous                 │    
    │  ctrl+l             toggle orch tab split ratio     l / right / enter   enter directory             │    
    │  ctrl+z             zoom focused pane               h / left / bksp     go up one level             │    
-   │  /                  filter sessions                 space           confirm current directory       │    
+   │  /                  filter agents                   space           confirm current directory       │    
    │  esc                clear filter                    /               filter (case-insensitive)       │    
-   │  r                  rename session                  esc             clear filter (twice = close)    │    
+   │  r                  rename agent                    esc             clear filter (twice = close)    │    
    │  g                  generate .dot-agent-deck.toml   q               cancel                          │    
    │  y / n              approve / deny permission                                                       │    
-   │  s                  scheduled tasks manager         session                                         │    
+   │  s                  schedules manager               session                                         │    
    │  pageup / pagedown  scroll focused pane                                                             │    
    │  ?                  toggle this help                panes auto-saved continuously.                  │    
    │                                                     restored automatically on launch.               │    

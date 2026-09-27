@@ -2625,14 +2625,14 @@ pub(crate) fn truncation_notice(
                 format!("{name} in the .dot-agent-deck directory of {saved_in}")
             };
             format!(
-                " It was longer than the deck will inline and was cut off at {bound} characters; \
+                " It was longer than the daemon will inline and was cut off at {bound} characters; \
                  the full report is saved at {location} - read that file for the rest, as the \
                  same UNTRUSTED {authored_as} between the same frame markers."
             )
         }
         None => format!(
-            " It was longer than the deck will inline and was cut off at {bound} characters, and \
-             the deck could not save the full report to a file, so the rest is only in \
+            " It was longer than the daemon will inline and was cut off at {bound} characters, and \
+             the daemon could not save the full report to a file, so the rest is only in \
              {author_possessive} own session."
         ),
     }

@@ -67,7 +67,7 @@ fn ingest_004_over_long_hook_line_is_refused_by_the_spawned_daemon() {
     // The attach-side event subscription is live once the dashboard has
     // painted, so nothing written below can land before the TUI is listening
     // (the same precondition `hooks/delivery/001` establishes).
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // One byte over. The write itself may legitimately fail partway — the
     // daemon stops reading and drops the connection the moment the line

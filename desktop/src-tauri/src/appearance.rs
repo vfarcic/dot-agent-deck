@@ -165,8 +165,8 @@ mod tests {
     /// What that costs is small and worth naming: these two run on Linux and
     /// macOS — both required checks — and what they assert is which string the
     /// plugin holds, which no platform can answer differently. The desktop app
-    /// does not ship on Windows either (`ensure_desktop_workflow_platform_
-    /// supported` blocks its workflows there, and `docs/develop/desktop-gui.md`
+    /// does not ship on Windows either (`ensure_desktop_orchestration_platform_
+    /// supported` blocks its orchestrations there, and `docs/develop/desktop-gui.md`
     /// names only WebKitGTK and WKWebView). The alternative was losing the
     /// seam assertion on every platform, or leaving the entire workspace's
     /// Windows test run unable to start.

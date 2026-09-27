@@ -9,7 +9,7 @@ import { enterDeck } from "./support/overview";
 test.describe("agent terminal input", () => {
   /**
    * Scenario: open the crowded deck and wait for all fifteen xterm inputs to
-   * mount. Each tile has exactly that one textarea, including the coordinator;
+   * mount. Each tile has exactly that one textarea, including the orchestrator;
    * no role-labelled composer or Send control is rendered beside it.
    */
   test("renders xterm as each tile's only text input", async ({ page }) => {
@@ -22,7 +22,7 @@ test.describe("agent terminal input", () => {
     await expect(terminalInputs).toHaveCount(15);
     await expect(tiles.locator('[data-testid^="composer-"]')).toHaveCount(0);
     await expect(tiles.locator("textarea:not(.xterm-helper-textarea)")).toHaveCount(0);
-    await expect(tiles.getByText("Message coordinator", { exact: true })).toHaveCount(0);
+    await expect(tiles.getByText("Message orchestrator", { exact: true })).toHaveCount(0);
     await expect(tiles.getByRole("button", { name: "Send", exact: true })).toHaveCount(0);
   });
 

@@ -676,12 +676,12 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 // what voice preselects, whatever the model answered.
                 //
                 // Both are claims about the New agent dialog's deck, so neither
-                // applies to `switch_deck` (PRD #1195): the Deck selector
+                // applies to `switch_deck` (PRD #1195): the Daemon selector
                 // switches to a deck the dialog disables, and its report is
                 // "Showing <deck>." rather than a preselection. The first is
-                // scoped to the rows that append "Preselected deck:" at all —
+                // scoped to the rows that append "Preselected daemon:" at all —
                 // an OPTIONAL `deck_ref` — which also stops it failing every
-                // `choose_deck` fixture, whose report is "Deck: <deck>.".
+                // `choose_deck` fixture, whose report is "Daemon: <deck>.".
                 let dispatched = match &answer.outcome {
                     VoiceOutcome::Dispatch { action, .. } => table().row(action),
                     _ => None,
@@ -701,7 +701,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     });
                 let unavailable_named = !fixture.names_unavailable_deck
                     || answer.outcome.sentence().contains(&format!(
-                        "Deck ci@stale-box cannot take a new agent, so none is preselected: {}",
+                        "Daemon ci@stale-box cannot take a new agent, so none is preselected: {}",
                         STALE_BOX_REASON.trim_end_matches('.')
                     ));
                 let deck_named = !preselects
@@ -709,7 +709,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                         answer
                             .outcome
                             .sentence()
-                            .contains(&format!("Preselected deck: {label}."))
+                            .contains(&format!("Preselected daemon: {label}."))
                     });
                 let hidden_deck_explained = !fixture.deck_hidden
                     || fixture.action != "open_deck"
