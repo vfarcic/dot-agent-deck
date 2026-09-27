@@ -1522,10 +1522,10 @@ async fn run_idle_monitor(
 /// that the broadcast happens whether or not the local `apply_event` accepts
 /// the event, e.g. for an unmanaged pane id — is unchanged: both run under
 /// the same guard, unconditionally.
-async fn ingest_event(
+pub async fn ingest_event(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     mut event: AgentEvent,
 ) {
     // Issue #770: half of the orphan verdict, asked of the registry BEFORE the
@@ -1560,7 +1560,11 @@ async fn ingest_event(
         .metadata
         .remove(crate::event::DAEMON_PANE_CLOSED_METADATA_KEY);
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
-    state.apply_event(event);
+    // Issue #447: `apply_event` plus the orchestrator-facing consumer of a
+    // delegated worker's `WaitingForInput` — see the method's doc, including
+    // why the pane's live agent is read there, under this lock, and not before
+    // it like `daemon_owns_pane` above.
+    state.apply_event_watching_waiting(event, registry);
 }
 
 /// Issue #424 (reviewer blocker 3): teach the registry how to turn a
@@ -3446,7 +3450,7 @@ mod hook_ingestion_tests {
     /// that would let any same-uid process make a TUI drop a live pane.
     #[tokio::test]
     async fn ingest_strips_a_producer_supplied_pane_closed_marker() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let state: SharedState =
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let (event_tx, mut rx) = broadcast::channel(8);
