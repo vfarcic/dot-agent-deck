@@ -44,7 +44,7 @@ dot-agent-deck remote remove my-vm         # forget the registry entry (host unt
 | `--port` | `22` | ssh port. |
 | `--key` | _none_ | Path to an ssh identity file. Forwarded to ssh as `-i`. Omit to use ssh's default key search. |
 | `--version` | client version | Daemon binary version to install on the remote. Usually leave unset. |
-| `--no-install` | `false` | Skip the binary push; pre-flight requires `~/.local/bin/dot-agent-deck` on the remote with a matching version. On a Homebrew host nothing is pushed either way, and the Homebrew install is checked instead. |
+| `--no-install` | `false` | Skip the binary push; pre-flight requires `~/.local/bin/dot-agent-deck` on the remote with a matching version. On a Homebrew host nothing is pushed either way, and the Homebrew install must report the matching version instead. |
 
 Example with a non-default identity file and port:
 
@@ -62,7 +62,7 @@ dot-agent-deck remote add my-vm deck@198.51.100.10 \
 - `remote upgrade` runs `brew upgrade dot-agent-deck` on the host. Homebrew installs its tap's latest release and cannot install a chosen one, so the version that landed is what gets recorded, and if it differs from `--version` the command tells you.
 - The registry entry records the install method and the Homebrew binary's path (for example `/opt/homebrew/bin/dot-agent-deck`), `connect` and `remote doctor` run that binary, and it is the one that runs `hooks install` on the host.
 
-If a host has **both** a Homebrew install and a copy at `~/.local/bin/dot-agent-deck` — which is what `remote upgrade` from a release older than this left behind on a Homebrew host — the command names both and uses the Homebrew one. It does not delete the other copy. Remove it yourself (`ssh my-vm rm ~/.local/bin/dot-agent-deck`), because while it exists `dot-agent-deck hooks install` can pin the agent hooks to it.
+If a host has **both** a Homebrew install and a copy at `~/.local/bin/dot-agent-deck` — which is what `remote upgrade` from a release older than this left behind on a Homebrew host — the command names both and uses the Homebrew one. It does not delete the other copy. Remove it yourself (`ssh my-vm rm ~/.local/bin/dot-agent-deck`), because a `dot-agent-deck` client older than this still runs it on `connect`.
 
 Entries registered before this existed record no install method. They keep running `~/.local/bin/dot-agent-deck` until the next `remote upgrade`, which detects the install and records it. A `dot-agent-deck` client older than this always runs `~/.local/bin/dot-agent-deck`, so it cannot `connect` to a host whose only install is Homebrew's. It also drops the recorded method if it rewrites `remotes.toml`, and the next `remote upgrade` from a current client records it again.
 

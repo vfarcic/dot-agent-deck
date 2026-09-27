@@ -1615,7 +1615,8 @@ impl Installed {
 ///   (`remote upgrade` without `--no-install`); `remote add` registers the
 ///   install as it is. Homebrew cannot install a chosen version, so the
 ///   version that landed is what is recorded, and a difference from
-///   `version` is reported rather than refused.
+///   `version` is reported rather than refused — except under `no_install`,
+///   which requires the match exactly as it does for `~/.local/bin`.
 /// - Otherwise the release binary goes to [`REMOTE_INSTALL_PATH`], exactly as
 ///   before issue #1372.
 ///
@@ -1655,7 +1656,7 @@ fn install_or_upgrade(
     if found.local_bin {
         let _ = writeln!(
             out,
-            "Remote '{name}' has two dot-agent-deck installs: Homebrew's at {binary} and a copy at {REMOTE_INSTALL_PATH}. The deck uses the Homebrew one and leaves the other untouched. Remove it (`ssh {host} rm {REMOTE_INSTALL_PATH}`) — while it exists, `hooks install` can pin agent hooks to it, and an older dot-agent-deck client still runs it on `connect`.",
+            "Remote '{name}' has two dot-agent-deck installs: Homebrew's at {binary} and a copy at {REMOTE_INSTALL_PATH}. The deck uses the Homebrew one and leaves the other untouched. Remove it (`ssh {host} rm {REMOTE_INSTALL_PATH}`) — an older dot-agent-deck client still runs it on `connect`.",
             binary = binary.as_str(),
             host = target.user_host(),
         );
@@ -1673,6 +1674,16 @@ fn install_or_upgrade(
     }
 
     let landed = remote_binary_version(executor, target, binary.as_str(), version)?;
+    // `--no-install` is a pre-flight that the remote already runs the
+    // requested version, on this path as on the `~/.local/bin` one; it is
+    // only when this command installs through Homebrew that a different
+    // version is accepted, because Homebrew cannot install a chosen one.
+    if no_install && landed != version {
+        return Err(RemoteAddError::VersionMismatch {
+            actual: landed,
+            expected: version.to_string(),
+        });
+    }
     if landed != version {
         let next = if run_brew_upgrade {
             "Homebrew installs its tap's latest release and cannot install a chosen one"
@@ -3389,6 +3400,20 @@ mod homebrew_remote_tests {
         assert!(!remote.local_bin_copy().exists());
         assert_eq!(entry.version, "0.43.0");
         assert_eq!(entry.install.as_deref(), Some(INSTALL_HOMEBREW));
+
+        // A different version fails the pre-flight, as it does for a
+        // `~/.local/bin` install, and leaves the registry alone (PR #1373
+        // review).
+        let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.44.0", true);
+        let err = result.expect_err("--no-install must require the requested version");
+        assert!(
+            matches!(
+                err,
+                RemoteUpgradeError::Inner(RemoteAddError::VersionMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(remote.entry().version, "0.43.0");
     }
 
     /// A failing `brew upgrade` fails the command and never falls back to a
