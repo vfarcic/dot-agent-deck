@@ -22,7 +22,7 @@ When the user asks to "make a release" (or anything that means cutting one), the
 
 Skip this step when the user asks only to tag what is already on `main`.
 
-After `land-prs` has merged anything, build `main` once more (its Step 3 does) before Step 1 records the SHA: the tag binds to that tree.
+After `land-prs` has merged anything, build `main` once more (its Step 3 does) and **note the SHA you built**. Step 1 must record that same SHA: if `git rev-parse origin/main` there reads anything else, something merged in between, so build again before going on. Step 3's `expected_head` then refuses a tag on any other tree, so the release is the tree that was built.
 
 ## Step 1 — Analyze
 

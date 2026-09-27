@@ -36,11 +36,11 @@ If what you read back differs, trust the API over this paragraph and update it.
 gh pr list --state open --limit 100 --json number,title,reviewDecision,mergeStateStatus,mergeable,author,headRefName,headRefOid
 ```
 
-For each PR, also read its unresolved thread count (GraphQL `reviewThreads { isResolved }`) and its required checks (`gh pr checks <n> --required`). Then put every PR, minus the user's exclusions, in exactly one bucket:
+For each PR, also read its unresolved thread count (GraphQL `reviewThreads { isResolved }`), its required checks (`gh pr checks <n> --required`), **and its non-required checks** (`gh pr checks <n>`). Then put every PR, minus the user's exclusions, in exactly one bucket:
 
 | Bucket | Test | Action |
 |---|---|---|
-| Ready | `APPROVED`, `CLEAN`, 0 unresolved, required checks pass | merge (Step 3) |
+| Ready | `APPROVED`, `CLEAN`, 0 unresolved, required checks pass, every failing or pending **non-required** check explained | merge (Step 3) |
 | Conflicting | `mergeable: CONFLICTING` | resolve (Step 4), then re-review |
 | Needs review | `REVIEW_REQUIRED`, green, 0 unresolved | request review (Step 5) |
 | Checks running | a required check pending | wait, then re-bucket |
@@ -48,7 +48,9 @@ For each PR, also read its unresolved thread count (GraphQL `reviewThreads { isR
 | Failing CI | a required check failed | Step 6 |
 | Changes requested | `CHANGES_REQUESTED` | Step 6 |
 
-**When `git fetch origin <branch>` fails** for a PR (seen with a Renovate branch), fetch the PR ref instead: `git fetch origin pull/<n>/head:refs/remotes/origin/pr-<n>`. Do not read a failed fetch as "no conflicts".
+**A non-required check is not a formality.** `UNSTABLE` in `mergeStateStatus` means one is failing, and GitHub will merge past it. Read why before merging: on 2026-09-27 #1363's advisory `desktop-driver` failure was the only sign that merging it would re-break the desktop build (Step 3, "`main` also moves under you"). Merge past a failing or pending non-required check only once you can say it is unrelated to this PR — the same failure on `main`, a known flake re-run green — and say so in the report. CLAUDE.md rule 8 covers the same trap for auto-merge.
+
+**Address every PR by its PR ref, never by `origin/<headRefName>`.** A fork PR's branch is not on `origin`, and an `origin` branch can share a fork's branch name while pointing at unrelated code. Fetch the head the PR will actually merge: `git fetch origin pull/<n>/head:refs/remotes/origin/pr-<n>`, and use `origin/pr-<n>` everywhere below. It also covers the case where `git fetch origin <branch>` simply fails (seen with a Renovate branch) — never read a failed fetch as "no conflicts".
 
 **`UNKNOWN` is not a bucket.** GitHub recomputes mergeability after `main` moves and reports `UNKNOWN` for seconds to minutes. Poll until it settles; never read it as blocked or as clean.
 
@@ -67,24 +69,29 @@ Merge one PR at a time, and re-read every remaining PR's `mergeable` after each 
 ```bash
 git fetch origin
 c=$(git rev-parse origin/main)
-# stack the READY PRs in the order you intend to merge them
-for x in <ready PRs>; do
-  h=$(git rev-parse origin/$(gh pr view $x --json headRefName --jq .headRefName))
-  t=$(git merge-tree --write-tree "$c" "$h" | head -1) || { echo "#$x conflicts while stacking"; continue; }
-  c=$(git commit-tree "$t" -p "$c" -p "$h" -m sim)
+# stack EVERY PR you intend to land, in the order it will merge — the ready
+# ones first, then the ones awaiting review — so the awaiting ones are tested
+# against each other too
+for x in <PRs, in merge order>; do
+  git fetch -q origin "pull/$x/head:refs/remotes/origin/pr-$x"
+  h=$(git rev-parse "origin/pr-$x")
+  # capture first, then test merge-tree's OWN exit status: piping it into
+  # `head` would test head's status and let a conflict read as clean
+  if out=$(git merge-tree --write-tree "$c" "$h"); then
+    c=$(git commit-tree "$(printf '%s\n' "$out" | head -1)" -p "$c" -p "$h" -m "sim #$x")
+    echo "#$x stacks cleanly"
+  else
+    echo "#$x conflicts with what is stacked before it"   # do not stack it; it goes to Step 4
+  fi
 done
-# then ask whether every PR still waiting on review merges cleanly on top
-for y in <PRs awaiting review>; do
-  git merge-tree --write-tree "$c" "origin/$(gh pr view $y --json headRefName --jq .headRefName)" >/dev/null \
-    && echo "#$y clean" || echo "#$y would conflict"
-done
+git update-ref refs/heads/sim/integration "$c"
 ```
 
-**Also simulate the awaiting-review PRs against each other, in the order they will land.** Checking each one only against the stacked ready PRs misses two awaiting PRs that conflict with each other — on 2026-09-26 #1338 and #1331 each merged cleanly on top of the ready stack, and #1331 went `CONFLICTING` the moment #1338 landed. Stack them the same way and note which later ones break.
+**Simulate the awaiting-review PRs in the same stack, not just against the ready ones.** Checking each only against the ready stack misses two awaiting PRs that conflict with each other — on 2026-09-26 #1338 and #1331 each merged cleanly on top of the ready stack, and #1331 went `CONFLICTING` the moment #1338 landed.
 
 **A clean merge is not a green merge.** `merge-tree` finds textual conflicts only. Two approved PRs can merge cleanly and still break each other's behaviour — #1340's voice deck-switch test failed after #1334 changed how desktop settings save, with no conflict marker anywhere. Step 4's gates catch that; run them on every branch you merged `main` into, including the desktop frontend's tests when `desktop/` is touched.
 
-**Then build and test the stacked result before anyone reviews or merges anything.** Write the final simulated commit to a ref (`git update-ref refs/heads/sim/integration $c`), check it out detached in the land worktree, and run the full gates on it — rule 2's clippy, `cargo test-fast`, and the desktop `pnpm test` plus typecheck. This is the merge queue this repository cannot have (a user-owned repo rejects the `merge_queue` rule, #1088), run once for the whole batch. It finds the clashes `merge-tree` cannot see while every PR still has its approval.
+**Then build and test the stacked result before anyone reviews or merges anything.** Check `sim/integration` — every PR that stacked cleanly, awaiting-review ones included — out detached in the land worktree, and run the full gates on it — rule 2's clippy, `cargo test-fast`, and the desktop `pnpm test` plus typecheck. This is the merge queue this repository cannot have (a user-owned repo rejects the `merge_queue` rule, #1088), run once for the whole batch. It finds the clashes `merge-tree` cannot see while every PR still has its approval.
 
 **Batch what the simulation clears, serialise what it does not.** Merging one PR never dismisses another's approval — only a push to that PR does. So every PR that stacks cleanly *and* passes on the integration build can be reviewed in one sweep and merged back to back with no further pushes. Only the PRs the simulation flags need a push: resolve those one at a time after the PR they collide with, or stack them onto it beforehand so the resolution is done and gated once — after the base lands, one mechanical merge of `main` and a re-review still remain (item 4 below). Finding collisions during merging instead — what happened on 2026-09-26 — turns every one into a push, a CI run and a re-review, and the next merge can surface the next one.
 
@@ -116,14 +123,23 @@ Decide on the read-back, not on the exit code.
 
 **Work in a sibling worktree** (CLAUDE.md rule 14), never in the main checkout — every dispatched unit is cut from its `HEAD`. The unit that wrote the PR has usually closed its tab by now, and its worktree went with it, so do not count on finding one.
 
+Work on a **detached** checkout of the PR's head, so it does not matter whether a local branch exists or is checked out in another worktree (the #714 team's still was), and push the result back to the PR's branch by name:
+
 ```bash
 git fetch origin
-git worktree add --detach ../<repo>-land origin/main
+[ -d ../<repo>-land ] || git worktree add --detach ../<repo>-land origin/main
 cd ../<repo>-land
-git rev-list --left-right --count <branch>...origin/<branch>   # must be 0 0 — never resolve onto a stale local branch
-git switch <branch>
-git merge origin/main
+git fetch -q origin "pull/<n>/head:refs/remotes/origin/pr-<n>"
+git switch --detach "origin/pr-<n>"
+git merge origin/main              # resolve the conflicts (rules below)
+git add <each resolved file>
+git diff --name-only --diff-filter=U   # must print nothing
+git commit --no-edit               # completes the merge; nothing is pushed without it
+# gates (below), then:
+git push origin "HEAD:$(gh pr view <n> --json headRefName --jq .headRefName)"
 ```
+
+That push is a fast-forward of the PR branch, so it is refused rather than overwriting anything if the branch moved meanwhile — fetch again and redo the merge. For a fork PR the branch is not on `origin`; push to the fork only if `maintainerCanModify` is true, and otherwise ask its author.
 
 Resolution rules, from cases met so far:
 
@@ -133,9 +149,9 @@ Resolution rules, from cases met so far:
 - **Two sides that each reworked the same test fixture:** keep the structure that landed on `main`, and port the branch's additions onto it (constants, extra env, call-site changes). Read both sides before editing.
 - **A call site the other PR's change made stale** — a new argument, a new return type — is resolution when the correct value follows from the other PR's own definition, not from a design choice: #1335's two-argument call took `None` for the parameter #1341 added, and #1346's bare `return;` became `AppliedEvent::Rejected` once #1347 gave the function a return value, because #1347 defines `Rejected` as "nothing on any card moved". Say which definition decided it in the commit. Anything that needs judgement about behaviour goes to a unit.
 
-Then run the gates on the merged branch before pushing — CLAUDE.md rule 2's `cargo fmt --check` and `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings`, rule 5's `cargo test-fast`, the tests covering whatever the conflict touched, and **the desktop frontend's `pnpm test` and typecheck whenever the PR or the merged-in `main` touches `desktop/`** (`cargo test-fast` does not run vitest). A gate that fails after a clean merge is a semantic clash between two PRs: that is code, not conflict resolution, so it goes to a unit (Step 6). Push normally (`git push origin <branch>`); the push is a fast-forward of the PR branch. It dismisses the approval, so the PR moves to "Needs review".
+Then run the gates on the merged branch before pushing — CLAUDE.md rule 2's `cargo fmt --check` and `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings`, rule 5's `cargo test-fast`, the tests covering whatever the conflict touched, and **the desktop frontend's `pnpm test` and typecheck whenever the PR or the merged-in `main` touches `desktop/`** (`cargo test-fast` does not run vitest). A gate that fails after a clean merge is a semantic clash between two PRs: that is code, not conflict resolution, so it goes to a unit (Step 6). The push dismisses the approval, so the PR moves to "Needs review".
 
-Several branches can share one worktree: switch between them, but finish (commit or abort) one merge before switching.
+Several PRs can share one worktree: switch between detached heads, but finish (commit or `git merge --abort`) one merge before switching.
 
 **If an edit is refused by the permission classifier,** stop on that PR, leave the merge in progress, and tell the user which file and what the resolution would be. Do not reach the same edit by another tool.
 
@@ -163,9 +179,9 @@ When a vote arrives, go back to Step 3. A `REQUEST_CHANGES` from the reviewer go
 
 Report these; do not work around them.
 
-- **A person's `CHANGES_REQUESTED`.** Theirs to lift. Say what they asked for, and check whether it still applies on the current `main` — a blocker about files `main` no longer carries may have resolved itself (#1252: two fragments it "deleted" had since been consumed by a release). If it no longer applies and the reviewer is unavailable, the user decides. **Do not dismiss the review and do not reopen the PR as a new one** — the second has the effect of a dismissal with less of a record. The agent reviewer does not help here: it skips a PR with an open change request by rule (`skip #<n>: changes requested by a reviewer`), so there is no approval to get. What worked for #1252: on the user's explicit instruction, confirm the required checks are green, no thread is unresolved and the PR merges cleanly, then `gh pr merge <n> --squash --admin` with the reason written into the squash commit's body — which blocker it was, why it no longer applies, and that the review was left standing. That is the one sanctioned use of `--admin` in this skill.
+- **A person's `CHANGES_REQUESTED`.** Theirs to lift. Say what they asked for, and check whether it still applies on the current `main` — a blocker about files `main` no longer carries may have resolved itself (#1252: two fragments it "deleted" had since been consumed by a release). If it no longer applies and the reviewer is unavailable, the user decides. **Do not dismiss the review and do not reopen the PR as a new one** — the second has the effect of a dismissal with less of a record. The agent reviewer does not help here: it skips a PR with an open change request by rule (`skip #<n>: changes requested by a reviewer`), so there is no approval to get. What worked for #1252: on the user's explicit instruction, confirm the required checks are green, no thread is unresolved and the PR merges cleanly, write the reason to a file — which blocker it was, why it no longer applies, and that the review was left standing — and pass it as the squash body: `gh pr merge <n> --squash --admin --body-file <reason.md>`. Without `--body-file` the reason is lost, which defeats the point of recording it. That is the one sanctioned use of `--admin` in this skill.
 - **A reviewer `REQUEST_CHANGES` naming a manual obligation** (for example rule 12's cross-version test) — addressed to a person; a green check is not an answer to it.
-- **Unresolved review threads, and findings that need code.** Hand the PR to a unit — `/pr-review-queue` composes that task — or, for a single PR, tell the user. A unit that already finished cannot be sent more input from here. A unit fixing an existing PR must not open a new one: its worktree is cut from `main`, so tell it to `git fetch origin <branch> && git switch --detach origin/<branch>`, commit there, and `git push origin HEAD:<branch>` — the detached form also works when the branch is checked out in some other worktree. Tell it to stop after the push without requesting review; this skill runs the re-review.
+- **Unresolved review threads, and findings that need code.** Hand the PR to a unit — `/pr-review-queue` composes that task — or, for a single PR, tell the user. A unit that already finished cannot be sent more input from here. A unit fixing an existing PR must not open a new one: its worktree is cut from `main`, so tell it to `git fetch origin pull/<n>/head:refs/remotes/origin/pr-<n> && git switch --detach origin/pr-<n>`, commit there, and `git push origin HEAD:<headRefName>` — the detached form also works when the branch is checked out in some other worktree. Tell it to stop after the push without requesting review; this skill runs the re-review.
 - **A trivial rule violation the reviewer requested changes on** (a Scenario comment over rule 7's sentence cap, a hard-wrapped paragraph) is mechanical: fix it yourself on the branch, run the gates, push, and say so in a PR comment. Anything that changes behaviour is not trivial.
 - **A findings thread that needs facts only the user has** (what they observed on a machine you cannot reach): never write the result yourself. Ask the user, and leave that thread open until they answer.
 - **A failing required check** that is not a conflict artefact. The same: a unit, or the user.
