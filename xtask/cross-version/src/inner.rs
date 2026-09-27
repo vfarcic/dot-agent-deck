@@ -354,7 +354,7 @@ impl Guard<'_> {
             None => Default::default(),
         };
         let mut details = Vec::new();
-        for path in &self.matrix.owned {
+        for path in self.matrix.held() {
             let inodes = isolation::listening_inodes(&listeners, path);
             if inodes.is_empty() {
                 return Err(Abort::Scenario(format!(
@@ -655,10 +655,12 @@ pub(crate) fn tail(s: &str, n: usize) -> String {
 /// ask — a client started before the daemon is listening is exactly the one
 /// that lazy-spawns. Returns the candidate the daemon bound.
 ///
-/// With one candidate this is "wait for the predicted pair". With two (a
-/// reverse `resolved` run, see [`EndpointMatrix::candidates`]) it is "wait for
-/// either pair", and the other pair is then held ABSENT by every pre-connect
-/// assertion from here on, exactly as a predicted matrix would hold it.
+/// With one candidate this is "wait for the predicted pair". With several (a
+/// `resolved` run with `XDG_RUNTIME_DIR` unset, see
+/// [`EndpointMatrix::candidates`]) it is "wait for whichever layout the daemon
+/// completes" ([`EndpointMatrix::select`]), and every address outside that
+/// layout is then held ABSENT by every pre-connect assertion from here on,
+/// exactly as a predicted matrix would hold it.
 fn wait_for_listeners(
     daemon: &mut SandboxProcess,
     candidates: &[EndpointMatrix],
@@ -675,20 +677,26 @@ fn wait_for_listeners(
         }
         let listeners = proc::unix_listeners().map_err(iso)?;
         let held = proc::socket_inodes(daemon.pid()).unwrap_or_default();
-        let bound = candidates.iter().find(|m| {
-            m.owned.iter().all(|p| {
+        let bound = EndpointMatrix::select(
+            candidates,
+            |p| {
                 let inodes = isolation::listening_inodes(&listeners, p);
                 !inodes.is_empty() && inodes.iter().all(|i| held.contains(i))
-            })
-        });
+            },
+            |p| !isolation::listening_inodes(&listeners, p).is_empty(),
+        );
         if let Some(m) = bound {
             return Ok(m.clone());
         }
         if Instant::now() >= deadline {
             return Err(Abort::Scenario(format!(
-                "the sandbox daemon never bound any of {:?} within {DAEMON_TIMEOUT:?}; the \
-                 namespace's listeners were {listeners:?}",
-                candidates.iter().map(|m| &m.owned).collect::<Vec<_>>()
+                "the sandbox daemon never completed any of the candidate layouts {:?} (each: \
+                 every address held by the daemon, every absent one unbound) within \
+                 {DAEMON_TIMEOUT:?}; the namespace's listeners were {listeners:?}",
+                candidates
+                    .iter()
+                    .map(|m| m.held().collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
             )));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -895,16 +903,15 @@ fn drive(
     ev.daemon_endpoint = matrix.attach().display().to_string();
     if plan.matrices.len() > 1 {
         ev.isolated(format!(
-            "the {} daemon bound `{}` and `{}` — {} — out of {} candidate layouts; from here on \
-             every other candidate ({}) must be absent before any client connects",
+            "the {} daemon bound {} — {} — out of {} candidate layouts; from here on every other \
+             candidate ({}) must be absent before any client connects",
             cast.daemon_build,
-            matrix.owned[0].display(),
-            matrix.owned[1].display(),
-            if matrix.owns_per_uid(plan.uid) {
-                "the post-#1121 per-uid directory"
-            } else {
-                "the pre-#1121 flat fallback"
-            },
+            matrix
+                .held()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            matrix.layout(plan.uid),
             plan.matrices.len(),
             matrix
                 .absent
@@ -1220,7 +1227,7 @@ fn scenario(
     );
     g.preconnect_logged(&format!("{} TUI", cast.client_side), &plan.env, ev)?;
     let fallback_arm = plan.mode == EndpointMode::Resolved && !plan.keep_xdg_runtime_dir;
-    if fallback_arm && cast.direction == Direction::Forward {
+    if fallback_arm && cast.direction == Direction::Forward && g.matrix.aliases.is_empty() {
         ev.isolated(format!(
             "fallback arm: the branch TUI starts with no `XDG_RUNTIME_DIR` and no socket override \
              in its environment, its own primary fallback `{}` is absent (no file, no listener), \
@@ -1233,16 +1240,40 @@ fn scenario(
             g.matrix.owned[1].display()
         ));
     }
+    if fallback_arm && cast.direction == Direction::Forward && !g.matrix.aliases.is_empty() {
+        ev.isolated(format!(
+            "fallback arm, #1211 layout: the branch TUI starts with no `XDG_RUNTIME_DIR` and no \
+             socket override in its environment. The {} daemon listens at the per-uid `{}` and \
+             `{}` and also holds the pre-#1121 flat {} as its #1211 alias; the XDG pair is \
+             absent (no file, no listener). A branch TUI that resolves the per-uid fallback \
+             reaches that daemon at its primary address, so this run does NOT exercise the \
+             compatibility read of the literal `/tmp` — only a previous release older than \
+             v0.41.1 leaves that read as the only way in.",
+            plan.previous,
+            g.matrix.owned[0].display(),
+            g.matrix.owned[1].display(),
+            g.matrix
+                .aliases
+                .iter()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ));
+    }
     if fallback_arm && cast.direction == Direction::Reverse {
         ev.isolated(format!(
             "fallback arm, reverse: the {} TUI starts with no `XDG_RUNTIME_DIR` and no socket \
-             override in its environment. The branch daemon listens at `{}` and `{}`; every \
-             other candidate — {} — is absent (no file, no listener). Whatever the old TUI \
-             reaches next is decided by its own resolution of the no-XDG, no-override fallback \
-             and nothing else.",
+             override in its environment. The branch daemon listens at {} — {}; every other \
+             candidate — {} — is absent (no file, no listener). Whatever the old TUI reaches \
+             next is decided by its own resolution of the no-XDG, no-override fallback and \
+             nothing else.",
             cast.client_build,
-            g.matrix.owned[0].display(),
-            g.matrix.owned[1].display(),
+            g.matrix
+                .held()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            g.matrix.layout(plan.uid),
             g.matrix
                 .absent
                 .iter()
@@ -1616,7 +1647,14 @@ fn with_attached_tui(
         ),
     );
 
-    if plan.mode == EndpointMode::Resolved && cast.direction == Direction::Forward {
+    if plan.mode == EndpointMode::Resolved
+        && cast.direction == Direction::Forward
+        && !g.matrix.owns_per_uid(plan.uid)
+    {
+        // Only against an old daemon on the flat pair: against one that owns
+        // the per-uid directory itself (#1211's layout) the directory exists
+        // because that daemon made it, and says nothing about the branch.
+        //
         // The change that makes `resolved` mode necessary (issue #1121) claims
         // its compatibility read is READ-ONLY: a branch build that found the old
         // daemon at the legacy address must never bind, create or unlink
@@ -1648,10 +1686,14 @@ fn with_attached_tui(
             format!(
                 "fallback arm confirmed: with the matrix above holding before the branch TUI \
                  started, tell 1 (no second daemon) and tell 2 (the same listener on `{}` at both \
-                 ends) passing mean the branch TUI reached the {} daemon through the legacy flat \
-                 address",
+                 ends) passing mean the branch TUI reached the {} daemon through {}",
                 attach.display(),
-                plan.previous
+                plan.previous,
+                if g.matrix.aliases.is_empty() {
+                    "the legacy flat address"
+                } else {
+                    "the per-uid fallback it binds as its primary, not the compatibility read"
+                }
             )
         } else {
             "fallback arm NOT confirmed: tell 1 or tell 2 did not pass, so which daemon the branch \
@@ -1854,7 +1896,7 @@ fn classify_undiscovered(
         Ok(()) if !daemon.has_exited() => {
             let now = proc::unix_listeners().map_err(iso)?;
             let held_now = proc::socket_inodes(daemon.pid()).map_err(iso)?;
-            g.matrix.owned.iter().all(|p| {
+            g.matrix.held().all(|p| {
                 let inodes = isolation::listening_inodes(&now, p);
                 !inodes.is_empty() && inodes.iter().all(|i| held_now.contains(i))
             })
@@ -1866,14 +1908,13 @@ fn classify_undiscovered(
         format!("the {} daemon is untouched by the old client's fallback", cast.daemon_side),
         if untouched { Verdict::Pass } else { Verdict::Fail },
         format!(
-            "pid {} {}; its recorded identity {}; it {} every endpoint the matrix says it owns ({})",
+            "pid {} {}; its recorded identity {}; it {} every endpoint the matrix says it holds ({})",
             daemon.pid(),
             if daemon.has_exited() { "has EXITED" } else { "is alive" },
             if daemon.identity.verify().is_ok() { "still verifies" } else { "NO LONGER verifies" },
             if untouched { "still holds" } else { "does NOT hold" },
             g.matrix
-                .owned
-                .iter()
+                .held()
                 .map(|p| format!("`{}`", p.display()))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -2082,8 +2123,7 @@ fn classify_undiscovered(
         dpid = daemon.pid(),
         owned = g
             .matrix
-            .owned
-            .iter()
+            .held()
             .map(|p| format!("`{}`", p.display()))
             .collect::<Vec<_>>()
             .join(" and "),

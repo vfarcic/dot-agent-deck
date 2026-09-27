@@ -1609,14 +1609,17 @@ mod tests {
             "matrices": [], "masks": [], "masked_home": null, "outer_mnt_ns": "mnt:[1]"
         }))
         .expect("plan");
-        let [per_uid, flat] = <[EndpointMatrix; 2]>::try_from(EndpointMatrix::candidates(
+        let [aliased, per_uid, flat] = <[EndpointMatrix; 3]>::try_from(EndpointMatrix::candidates(
             &sb,
             crate::sandbox::EndpointMode::Resolved,
             false,
             1000,
             crate::sandbox::Direction::Reverse,
         ))
-        .expect("two candidates");
+        .expect("three candidates");
+        // #1211's layout is the per-uid directory too: the flat alias beside it
+        // does not move where the daemon's primary endpoints are.
+        assert!(daemon_layout_precondition(&plan, &aliased).is_none());
         assert!(daemon_layout_precondition(&plan, &per_uid).is_none());
         assert!(
             daemon_layout_precondition(&plan, &flat)
