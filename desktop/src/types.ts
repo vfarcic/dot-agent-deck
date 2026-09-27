@@ -22,8 +22,22 @@ export const UNREPORTED = "Unavailable";
 
 export type ConnectionStatus = "loading" | "connected" | "disconnected" | "error";
 export type RunHealth = "healthy" | "attention" | "failed" | "idle";
-export type AgentStatus = "queued" | "running" | "waiting" | "passed" | "failed" | "stopped";
-export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting";
+export type AgentStatus = "queued" | "running" | "waiting" | "passed" | "failed" | "stopped" | "blocked";
+
+/**
+ * Issue #714: why an agent is `blocked` — the agent reported that its provider
+ * refused it for an exhausted usage limit or credit pool. `detail` is the
+ * agent's own error message: agent-controlled text, scrubbed by the crate and
+ * rendered through `displayText` like every other such string. `resetsAtMs` is
+ * when the provider said the limit resets, when it said.
+ */
+export type AgentBlocked = {
+  kind: "usage_limit" | "credits_depleted" | "unknown";
+  detectedAtMs: number;
+  detail?: string;
+  resetsAtMs?: number;
+};
+export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting" | "blocked";
 export type PanelTab = "terminal" | "diff" | "checks" | "handoffs" | "artifacts";
 
 /**
@@ -644,6 +658,8 @@ export interface AgentSession {
    * rule and forks only the wording.
    */
   spawnedAtMs?: number;
+  /** HONEST. Issue #714: present only while `status` is `"blocked"`. */
+  blocked?: AgentBlocked;
   /** HONEST. */
   rows: number;
   /** HONEST. */

@@ -647,6 +647,7 @@ mod tests {
             last_user_prompt: None,
             live_target: None,
             last_activity_ms: Some(1_700_000_000_000),
+            blocked: None,
         });
 
         let mut view = AgentView::default();
@@ -686,6 +687,7 @@ mod tests {
             last_user_prompt: None,
             live_target: None,
             last_activity_ms: Some(1_700_000_000_000),
+            blocked: None,
         });
 
         let mut view = AgentView::default();
@@ -722,6 +724,7 @@ mod tests {
             last_user_prompt: None,
             live_target: None,
             last_activity_ms: Some(1_700_000_000_000),
+            blocked: None,
         });
 
         let mut view = AgentView::default();

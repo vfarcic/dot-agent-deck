@@ -11,7 +11,7 @@ use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::endpoint_resolve::client_socket_path;
 use crate::event::{AgentEvent, AgentType, EventType};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct ClaudeCodeHookInput {
     session_id: String,
     hook_event_name: String,
@@ -33,6 +33,22 @@ struct ClaudeCodeHookInput {
     // unexpected `source` shape, not just lose the field.
     #[serde(default, deserialize_with = "lenient_string")]
     source: Option<String>,
+    // Issue #714: named for the same reason as `source`, and lenient for the
+    // same reason. `error` and `last_assistant_message` ride Claude Code's
+    // `StopFailure`; `transcript_path` rides every Claude and Codex event (the
+    // `StopFailure` classifier reads it for Claude, and the daemon's Codex
+    // rollout tailer for Codex); `notification_type` rides Claude's
+    // `Notification`; `turn_id` rides Codex's `UserPromptSubmit`.
+    #[serde(default, deserialize_with = "lenient_string")]
+    error: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    transcript_path: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    last_assistant_message: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    notification_type: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    turn_id: Option<String>,
     // Issue #1354: the payload's own `agent_id`, which Claude Code (and Codex)
     // set ONLY on a hook that fires inside a subagent. Renamed on the Rust side
     // because `AgentEvent::agent_id` is the deck's id for the spawned process,
@@ -52,8 +68,8 @@ fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::
     Ok(Option::<Value>::deserialize(d)?.and_then(|v| v.as_str().map(str::to_owned)))
 }
 
-#[derive(Debug, Deserialize)]
-struct OpenCodeHookInput {
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct OpenCodeHookInput {
     session_id: String,
     event: String,
     tool_name: Option<String>,
@@ -61,8 +77,41 @@ struct OpenCodeHookInput {
     status: Option<String>,
     cwd: Option<String>,
     prompt: Option<String>,
+    // Issue #714: the structured fields of a `session.error`, as the deck's
+    // plugin forwards them (`crate::opencode_manage`). All lenient: an
+    // unexpected shape degrades to "no field", which classifies as `Error`,
+    // today's behaviour, instead of dropping the whole event.
+    #[serde(default, deserialize_with = "lenient_string")]
+    error_name: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    error_message: Option<String>,
+    // The response body's marker keys only, parsed from the WHOLE body by the
+    // plugin (`crate::opencode_manage`), never a truncated copy of it.
+    #[serde(default, deserialize_with = "lenient_object")]
+    response_markers: Option<Value>,
+    #[serde(default, deserialize_with = "lenient_string_map")]
+    response_headers: HashMap<String, String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
+}
+
+/// [`lenient_string`] for a JSON object: anything else is `None`.
+fn lenient_object<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Ok(Option::<Value>::deserialize(d)?.filter(Value::is_object))
+}
+
+/// [`lenient_string`] for a string map: anything but a JSON object is empty,
+/// and a non-string value is dropped.
+fn lenient_string_map<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<HashMap<String, String>, D::Error> {
+    Ok(match Option::<Value>::deserialize(d)? {
+        Some(Value::Object(map)) => map
+            .into_iter()
+            .filter_map(|(k, v)| v.as_str().map(|v| (k.to_ascii_lowercase(), v.to_owned())))
+            .collect(),
+        _ => HashMap::new(),
+    })
 }
 
 pub fn handle_hook(agent: &str) -> ExitCode {
@@ -142,12 +191,17 @@ fn map_event_type(hook_event_name: &str) -> Option<EventType> {
         "Notification" => Some(EventType::WaitingForInput),
         "PermissionRequest" => Some(EventType::PermissionRequest),
         "Stop" => Some(EventType::Idle),
-        // NOTE: there is no `StopFailure` hook event in Claude Code or Codex
-        // 0.144.4 (Codex's installed events are enumerated in
-        // [`crate::codex_hooks_manage`]). A mid-session failure surfaces instead
-        // through a FAILED `PostToolUse` (`tool_response` reports a non-zero
-        // exit / error), which [`build_event_typed`] promotes to
-        // [`EventType::Error`] — see [`tool_response_is_failure`].
+        // Issue #714: Claude Code fires `StopFailure` *instead of* `Stop` when an
+        // API error ends the turn (hook metadata in 2.1.283). It lands here as
+        // `Error`, and [`build_event_typed`] upgrades a Claude quota failure to
+        // [`EventType::QuotaBlocked`]. Codex has no failure hook: its errored
+        // turn runs no `Stop` hook (`core/src/session/turn.rs`, `rust-v0.156.1`),
+        // which is why Codex is read from its rollout
+        // (`crate::codex_rollout_tail`). A failed TOOL call surfaces through a
+        // FAILED `PostToolUse` (`tool_response` reports a non-zero exit / error),
+        // which [`build_event_typed`] promotes to [`EventType::Error`] — see
+        // [`tool_response_is_failure`].
+        "StopFailure" => Some(EventType::Error),
         "PreCompact" => Some(EventType::Compacting),
         "PostCompact" => Some(EventType::Thinking),
         // Devin's spelling of the post-compaction event. Devin fires ONLY the
@@ -377,6 +431,11 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         tool_use_id,
         prompt,
         source,
+        error,
+        transcript_path,
+        last_assistant_message,
+        notification_type,
+        turn_id,
         subagent_id,
         _extra: extra,
     } = input;
@@ -389,6 +448,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     let subagent_id = subagent_id
         .filter(|id| !id.is_empty())
         .filter(|_| matches!(agent_type, AgentType::ClaudeCode | AgentType::Codex));
+    let from_subagent = subagent_id.is_some();
 
     let mut event_type = map_event_type(&hook_event_name)?;
     // PRD #20 W3-Pass-2 (finding #9): a FAILED tool call arrives as an ordinary
@@ -523,6 +583,71 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         metadata.insert("bash_command".to_string(), cmd.to_string());
     }
 
+    // Issue #714: a Claude Code turn that an API error ended. Every `error`
+    // kind maps to something — `StopFailure` replaces `Stop`, so an unmapped
+    // kind would leave the card `Thinking` — and only a quota or credit refusal
+    // becomes `QuotaBlocked`; see `crate::quota_signals`.
+    //
+    // Not for a subagent's (issue #1354): a `StopFailure` fired inside one ends
+    // that subagent's run, whose failure reaches the main thread as its
+    // result, and the main thread reports its own refusal if it meets one. A
+    // `QuotaBlocked` or an `Error` would assert the parent card's status —
+    // after the turn ended, for a background agent, with nothing to lift it —
+    // so it arrives as the `SubagentStop` it stands in for.
+    if hook_event_name == "StopFailure" && from_subagent {
+        event_type = EventType::SubagentStop;
+    } else if hook_event_name == "StopFailure" && agent_type == AgentType::ClaudeCode {
+        let outcome = claude_stop_failure_outcome(error.as_deref(), transcript_path.as_deref());
+        if let crate::quota_signals::FailureOutcome::Blocked { kind, resets_at_ms } = outcome {
+            event_type = EventType::QuotaBlocked;
+            insert_quota_blocked_metadata(
+                &mut metadata,
+                kind,
+                resets_at_ms,
+                last_assistant_message.as_deref(),
+            );
+        }
+    }
+
+    // Issue #714: which notification this is, so a Claude `idle_prompt` —
+    // fired after every ended turn, a quota-blocked one included — is not read
+    // as work evidence (`crate::quota_block::is_work_evidence`).
+    if event_type == EventType::WaitingForInput
+        && agent_type == AgentType::ClaudeCode
+        && let Some(kind) = notification_type.filter(|k| k.len() <= 64)
+    {
+        metadata.insert(
+            crate::quota_block::NOTIFICATION_TYPE_METADATA_KEY.to_string(),
+            kind,
+        );
+    }
+
+    // Issue #714: hand the daemon's Codex rollout tailer the session log to
+    // read and the turn to watch (`crate::codex_rollout_tail`): `SessionStart`
+    // names the log, `UserPromptSubmit` the log and the turn, and `Stop` the
+    // turn that ended normally.
+    if agent_type == AgentType::Codex
+        && matches!(
+            hook_event_name.as_str(),
+            "SessionStart" | "UserPromptSubmit" | "Stop"
+        )
+    {
+        if let Some(path) =
+            transcript_path.filter(|p| crate::codex_rollout_tail::admissible_path(p))
+        {
+            metadata.insert(
+                crate::codex_rollout_tail::CODEX_TRANSCRIPT_PATH_METADATA_KEY.to_string(),
+                path,
+            );
+        }
+        if let Some(turn) = turn_id.filter(|t| crate::codex_rollout_tail::admissible_turn_id(t)) {
+            metadata.insert(
+                crate::codex_rollout_tail::CODEX_TURN_ID_METADATA_KEY.to_string(),
+                turn,
+            );
+        }
+    }
+
     Some(AgentEvent {
         session_id,
         agent_type,
@@ -539,6 +664,76 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         schema_version: None,
         live_target: None,
     })
+}
+
+/// Issue #714: how many times, after the first read, the Claude `StopFailure`
+/// hook re-reads the transcript when its last assistant record is not yet the
+/// API error, and how long it waits between reads. Whether Claude Code flushes
+/// that record before running the hook is unconfirmed, so the hook allows for
+/// it; giving up yields `Error`, a false negative, never a false `Blocked`.
+const CLAUDE_TRANSCRIPT_RETRIES: u32 = 3;
+const CLAUDE_TRANSCRIPT_RETRY_GAP: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Issue #714: classify a Claude Code `StopFailure`, reading the transcript
+/// only when the `error` kind needs it
+/// ([`crate::quota_signals::claude_stop_failure_needs_transcript`]).
+fn claude_stop_failure_outcome(
+    error: Option<&str>,
+    transcript_path: Option<&str>,
+) -> crate::quota_signals::FailureOutcome {
+    use crate::quota_signals::{
+        classify_claude_stop_failure, claude_stop_failure_needs_transcript,
+        last_claude_api_error_record, read_claude_transcript_tail,
+    };
+    if !claude_stop_failure_needs_transcript(error) {
+        return classify_claude_stop_failure(error, None);
+    }
+    let Some(path) = transcript_path else {
+        return classify_claude_stop_failure(error, None);
+    };
+    let mut record = None;
+    for attempt in 0..=CLAUDE_TRANSCRIPT_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(CLAUDE_TRANSCRIPT_RETRY_GAP);
+        }
+        let Some(tail) = read_claude_transcript_tail(path) else {
+            // Refused (not a regular `.jsonl` file): re-reading cannot help.
+            break;
+        };
+        record = last_claude_api_error_record(&tail);
+        if record.is_some() {
+            break;
+        }
+    }
+    classify_claude_stop_failure(error, record.as_ref())
+}
+
+/// Issue #714: the producer's half of the `quota_blocked` contract — the kind,
+/// the reset when the provider gave one, and the agent's own message, scrubbed,
+/// for display.
+fn insert_quota_blocked_metadata(
+    metadata: &mut HashMap<String, String>,
+    kind: crate::quota_block::BlockedKind,
+    resets_at_ms: Option<i64>,
+    detail: Option<&str>,
+) {
+    use crate::quota_block::{
+        QUOTA_BLOCKED_DETAIL_METADATA_KEY, QUOTA_BLOCKED_KIND_METADATA_KEY,
+        QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, scrub_detail,
+    };
+    metadata.insert(
+        QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
+        kind.as_wire().to_string(),
+    );
+    if let Some(at) = resets_at_ms {
+        metadata.insert(
+            QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY.to_string(),
+            at.to_string(),
+        );
+    }
+    if let Some(detail) = detail.map(scrub_detail).filter(|d| !d.is_empty()) {
+        metadata.insert(QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(), detail);
+    }
 }
 
 fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventType> {
@@ -565,8 +760,8 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
     }
 }
 
-fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
-    let event_type = map_opencode_event_type(&input.event, input.status.as_deref())?;
+pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
+    let mut event_type = map_opencode_event_type(&input.event, input.status.as_deref())?;
     let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
     let user_prompt = input.prompt.as_deref().map(record_submitted_prompt);
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
@@ -592,6 +787,28 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
         && let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str())
     {
         metadata.insert("bash_command".to_string(), cmd.to_string());
+    }
+
+    // Issue #714: a `session.error` whose structured fields name a provider
+    // quota or credit refusal is a block; every other one stays `Error`. See
+    // `crate::quota_signals::classify_opencode_error`.
+    if input.event == "session.error" {
+        let fields = crate::quota_signals::OpenCodeErrorFields {
+            error_name: input.error_name,
+            response_markers: input.response_markers,
+            response_headers: input.response_headers,
+        };
+        if let crate::quota_signals::FailureOutcome::Blocked { kind, resets_at_ms } =
+            crate::quota_signals::classify_opencode_error(&fields, Utc::now().timestamp_millis())
+        {
+            event_type = EventType::QuotaBlocked;
+            insert_quota_blocked_metadata(
+                &mut metadata,
+                kind,
+                resets_at_ms,
+                input.error_message.as_deref(),
+            );
+        }
     }
 
     Some(AgentEvent {
@@ -1615,6 +1832,7 @@ mod tests {
             source: None,
             subagent_id: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
         let event = build_event(input).unwrap();
         assert_eq!(event.session_id, "test-123");
@@ -1637,6 +1855,7 @@ mod tests {
             source: None,
             subagent_id: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
         let event = build_event(input).unwrap();
         assert_eq!(event.event_type, EventType::ToolStart);
@@ -1657,6 +1876,7 @@ mod tests {
             source: None,
             subagent_id: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
         assert!(build_event(input).is_none());
     }
@@ -1674,6 +1894,7 @@ mod tests {
             source: None,
             subagent_id: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
         let event = build_event(input).unwrap();
         assert_eq!(event.event_type, EventType::Thinking);
@@ -1694,6 +1915,7 @@ mod tests {
             source: None,
             subagent_id: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
         let event = build_event(input).unwrap();
         let prompt = event.user_prompt.unwrap();
@@ -2760,6 +2982,7 @@ mod tests {
             cwd: Some("/tmp".into()),
             prompt: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
         let event = build_opencode_event(input).unwrap();
         assert_eq!(event.session_id, "oc-123");
@@ -2779,6 +3002,7 @@ mod tests {
             cwd: None,
             prompt: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
         let event = build_opencode_event(input).unwrap();
         assert_eq!(event.event_type, EventType::ToolStart);
@@ -2797,6 +3021,7 @@ mod tests {
             cwd: None,
             prompt: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
         assert!(build_opencode_event(input).is_none());
     }
@@ -2857,6 +3082,7 @@ mod tests {
                 source: None,
                 subagent_id: None,
                 _extra: extra,
+                ..Default::default()
             }
         };
 
@@ -2899,6 +3125,7 @@ mod tests {
             source: None,
             subagent_id: None,
             _extra: HashMap::new(),
+            ..Default::default()
         })
         .expect("SessionStart maps to an event");
         assert!(!genuine.is_wrapper_fork_session_start());
@@ -2925,6 +3152,7 @@ mod tests {
             source: source.map(str::to_string),
             subagent_id: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
 
         // A `SessionStart` with `source: "clear"` forwards the key.
@@ -3015,6 +3243,7 @@ mod tests {
             source: None,
             subagent_id: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
         let event = build_event(input).unwrap();
         assert_eq!(event.pane_id.as_deref(), Some("pane-42"));
@@ -3043,6 +3272,7 @@ mod tests {
             prompt: None,
             status: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
         let event = build_opencode_event(input).unwrap();
         assert_eq!(event.pane_id.as_deref(), Some("pane-99"));
@@ -3069,6 +3299,7 @@ mod tests {
             source: None,
             subagent_id: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
         let event = build_event(input).unwrap();
         assert_eq!(
@@ -3095,6 +3326,7 @@ mod tests {
             source: None,
             subagent_id: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
         let event = build_event(input).unwrap();
         assert!(!event.metadata.contains_key("bash_command"));
@@ -3113,6 +3345,7 @@ mod tests {
             source: None,
             subagent_id: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
         let event = build_event(input).unwrap();
         assert!(!event.metadata.contains_key("bash_command"));
@@ -3130,11 +3363,226 @@ mod tests {
             cwd: None,
             prompt: None,
             _extra: HashMap::new(),
+            ..Default::default()
         };
         let event = build_opencode_event(input).unwrap();
         assert_eq!(
             event.metadata.get("bash_command").map(String::as_str),
             Some(full_cmd),
+        );
+    }
+
+    fn claude_payload(event: &str) -> ClaudeCodeHookInput {
+        ClaudeCodeHookInput {
+            session_id: "s-714".into(),
+            hook_event_name: event.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Scenario: Install the deck's Claude Code hooks into an existing settings
+    /// file with the StopFailure gate open, then feed the hook builder a
+    /// StopFailure for every error kind Claude Code names, a Notification with
+    /// a type, and transcript paths that must be refused. Every StopFailure ends
+    /// as Blocked or Error (never dropped), the notification type is forwarded,
+    /// and the tail read is bounded and refuses a FIFO and a non-.jsonl path.
+    #[spec("status/blocked/011")]
+    #[test]
+    fn status_blocked_011_stop_failure_is_installed_and_never_leaves_thinking() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        std::fs::write(&settings, r#"{"model":"opus","hooks":{}}"#).unwrap();
+        crate::hooks_manage::install_to_gated(&settings, "/opt/deck/dot-agent-deck", true).unwrap();
+        let written: Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+        assert_eq!(written["model"], "opus");
+        let stop_failure = written["hooks"]["StopFailure"].to_string();
+        assert!(
+            stop_failure.contains("hook --agent claude-code"),
+            "{stop_failure}"
+        );
+        assert!(
+            written["hooks"]["Stop"]
+                .to_string()
+                .contains("hook --agent claude-code")
+        );
+
+        // Every error kind maps to a terminal status.
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"assistant","isSidechain":false,"error":"rate_limit","isApiErrorMessage":true,"#,
+                r#""quotaLimits":{"status":"rejected","resetsAt":1790409000}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        for kind in [
+            "authentication_failed",
+            "oauth_org_not_allowed",
+            "billing_error",
+            "rate_limit",
+            "invalid_request",
+            "server_error",
+            "overloaded",
+            "max_output_tokens",
+            "model_not_found",
+            "unknown",
+        ] {
+            let mut input = claude_payload("StopFailure");
+            input.error = Some(kind.into());
+            input.transcript_path = Some(transcript.to_string_lossy().into_owned());
+            input.last_assistant_message = Some("provider said\u{202e} no".into());
+            let event = build_event(input).unwrap_or_else(|| panic!("{kind} was dropped"));
+            match kind {
+                "billing_error" | "rate_limit" => {
+                    assert_eq!(event.event_type, EventType::QuotaBlocked, "{kind}");
+                    assert_eq!(
+                        event.metadata[crate::quota_block::QUOTA_BLOCKED_DETAIL_METADATA_KEY],
+                        "provider said no"
+                    );
+                }
+                _ => assert_eq!(event.event_type, EventType::Error, "{kind}"),
+            }
+        }
+        let mut rate = claude_payload("StopFailure");
+        rate.error = Some("rate_limit".into());
+        rate.transcript_path = Some(transcript.to_string_lossy().into_owned());
+        let event = build_event(rate).unwrap();
+        assert_eq!(
+            event.metadata[crate::quota_block::QUOTA_BLOCKED_KIND_METADATA_KEY],
+            "usage_limit"
+        );
+        assert_eq!(
+            event.metadata[crate::quota_block::QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY],
+            "1790409000000"
+        );
+        // No error kind, or no transcript for `rate_limit`: still Error.
+        assert_eq!(
+            build_event(claude_payload("StopFailure"))
+                .unwrap()
+                .event_type,
+            EventType::Error
+        );
+        // Codex fires no StopFailure, and a Codex-shaped one is not classified.
+        let mut codex = claude_payload("StopFailure");
+        codex.error = Some("billing_error".into());
+        assert_eq!(
+            build_event_typed(codex, AgentType::Codex)
+                .unwrap()
+                .event_type,
+            EventType::Error
+        );
+
+        // The notification type rides the WaitingForInput event.
+        let mut notification = claude_payload("Notification");
+        notification.notification_type = Some("idle_prompt".into());
+        let event = build_event(notification).unwrap();
+        assert_eq!(event.event_type, EventType::WaitingForInput);
+        assert_eq!(
+            event.metadata[crate::quota_block::NOTIFICATION_TYPE_METADATA_KEY],
+            "idle_prompt"
+        );
+
+        // The tail read: bounded, and refused for a non-.jsonl path, a
+        // relative path, and a FIFO.
+        let big = dir.path().join("big.jsonl");
+        let mut body = vec![b'x'; 300 * 1024];
+        body.extend_from_slice(b"\n{\"type\":\"assistant\"}\n");
+        std::fs::write(&big, &body).unwrap();
+        let tail = crate::quota_signals::read_claude_transcript_tail(&big.to_string_lossy())
+            .expect("a regular .jsonl file is read");
+        assert!(tail.len() as u64 <= crate::quota_signals::CLAUDE_TRANSCRIPT_TAIL_BYTES);
+        assert_eq!(
+            tail, b"{\"type\":\"assistant\"}\n",
+            "the cut first line is dropped"
+        );
+        let txt = dir.path().join("t.txt");
+        std::fs::write(&txt, "{}").unwrap();
+        assert!(
+            crate::quota_signals::read_claude_transcript_tail(&txt.to_string_lossy()).is_none()
+        );
+        assert!(crate::quota_signals::read_claude_transcript_tail("t.jsonl").is_none());
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("fifo.jsonl");
+            let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+            // SAFETY: a valid NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            assert!(
+                crate::quota_signals::read_claude_transcript_tail(&fifo.to_string_lossy())
+                    .is_none(),
+                "a FIFO is refused without blocking the hook"
+            );
+        }
+    }
+
+    /// Issue #714: a Codex hook hands the daemon's rollout tailer its session
+    /// log and turn — on `SessionStart`, `UserPromptSubmit` and `Stop` only —
+    /// and an OpenCode `session.error` classifies its structured fields.
+    #[test]
+    fn codex_rollout_keys_and_opencode_error_fields_are_forwarded() {
+        use crate::codex_rollout_tail::{
+            CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY,
+        };
+        let codex = |event: &str| {
+            let mut input = claude_payload(event);
+            input.transcript_path = Some("/h/.codex/sessions/rollout-a.jsonl".into());
+            input.turn_id = Some("t1".into());
+            build_event_typed(input, AgentType::Codex).unwrap()
+        };
+        let prompt = codex("UserPromptSubmit");
+        assert_eq!(prompt.metadata[CODEX_TURN_ID_METADATA_KEY], "t1");
+        assert_eq!(
+            prompt.metadata[CODEX_TRANSCRIPT_PATH_METADATA_KEY],
+            "/h/.codex/sessions/rollout-a.jsonl"
+        );
+        assert!(
+            codex("SessionStart")
+                .metadata
+                .contains_key(CODEX_TRANSCRIPT_PATH_METADATA_KEY)
+        );
+        assert_eq!(codex("Stop").metadata[CODEX_TURN_ID_METADATA_KEY], "t1");
+        assert!(
+            !codex("PreToolUse")
+                .metadata
+                .contains_key(CODEX_TURN_ID_METADATA_KEY)
+        );
+        let mut claude = claude_payload("UserPromptSubmit");
+        claude.transcript_path = Some("/x.jsonl".into());
+        claude.turn_id = Some("t".into());
+        assert!(build_event(claude).unwrap().metadata.is_empty());
+        let mut long = claude_payload("UserPromptSubmit");
+        long.turn_id = Some("x".repeat(crate::codex_rollout_tail::MAX_METADATA_BYTES + 1));
+        assert!(
+            !build_event_typed(long, AgentType::Codex)
+                .unwrap()
+                .metadata
+                .contains_key(CODEX_TURN_ID_METADATA_KEY)
+        );
+
+        let opencode: OpenCodeHookInput = serde_json::from_str(
+            r#"{"session_id":"oc","event":"session.error","error_name":"APIError",
+                "error_message":"The usage limit has been reached",
+                "response_markers":{"error":{"type":"usage_limit_reached","resets_at":1790001000}},
+                "response_headers":{"Retry-After":"60"}}"#,
+        )
+        .unwrap();
+        let event = build_opencode_event(opencode).unwrap();
+        assert_eq!(event.event_type, EventType::QuotaBlocked);
+        assert_eq!(
+            event.metadata[crate::quota_block::QUOTA_BLOCKED_DETAIL_METADATA_KEY],
+            "The usage limit has been reached"
+        );
+        let bare: OpenCodeHookInput = serde_json::from_str(
+            r#"{"session_id":"oc","event":"session.error","error_name":"APIError",
+                "response_markers":{"error":{"type":"rate_limit_error"}},
+                "response_headers":"not an object"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            build_opencode_event(bare).unwrap().event_type,
+            EventType::Error
         );
     }
 
@@ -3188,5 +3636,50 @@ mod tests {
             assert!(!event.is_from_subagent(), "agent_id = {odd}");
             assert_eq!(event.event_type, EventType::ToolStart, "agent_id = {odd}");
         }
+    }
+
+    /// Issues #714 and #1354: a `StopFailure` fired inside a subagent ends that
+    /// subagent's run, not the main thread's turn — its failure reaches the
+    /// main thread as the subagent's result, and the main thread reports its
+    /// own quota refusal if it meets one. So it is neither classified into a
+    /// `QuotaBlocked` nor left as an `Error`, both of which assert the parent
+    /// card's status; it arrives as the `SubagentStop` it stands in for.
+    #[test]
+    fn subagent_stop_failure_does_not_block_or_error_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"assistant","isSidechain":false,"error":"rate_limit","isApiErrorMessage":true,"#,
+                r#""quotaLimits":{"status":"rejected","resetsAt":1790409000}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        for kind in ["rate_limit", "billing_error", "server_error"] {
+            let mut input = claude_payload("StopFailure");
+            input.error = Some(kind.into());
+            input.transcript_path = Some(transcript.to_string_lossy().into_owned());
+            input.last_assistant_message = Some("provider said no".into());
+            input.subagent_id = Some("a7c1".into());
+            let event = build_event(input).expect("a subagent's StopFailure is kept");
+            assert_eq!(event.event_type, EventType::SubagentStop, "{kind}");
+            assert!(event.is_from_subagent());
+            assert!(
+                crate::quota_block::QUOTA_BLOCKED_METADATA_KEYS
+                    .iter()
+                    .all(|key| !event.metadata.contains_key(*key)),
+                "{kind}: no quota reason travels without the status"
+            );
+        }
+        // The main thread's own StopFailure is still classified.
+        let mut main = claude_payload("StopFailure");
+        main.error = Some("rate_limit".into());
+        main.transcript_path = Some(transcript.to_string_lossy().into_owned());
+        assert_eq!(
+            build_event(main).unwrap().event_type,
+            EventType::QuotaBlocked
+        );
     }
 }

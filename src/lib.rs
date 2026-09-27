@@ -8,6 +8,7 @@ pub mod bounded_read;
 pub mod build_id;
 pub mod build_version_handshake;
 pub mod codex_hooks_manage;
+pub mod codex_rollout_tail;
 pub mod config;
 pub mod config_gen;
 pub mod config_validation;
@@ -71,6 +72,8 @@ pub mod project_config;
 // selected over the attach socket.
 pub mod project_resolve;
 pub mod prompt_delivery;
+pub mod quota_block;
+pub mod quota_signals;
 pub mod remote;
 pub mod remote_doctor;
 pub mod remote_tunnel;

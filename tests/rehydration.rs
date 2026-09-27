@@ -375,6 +375,7 @@ fn make_session(
         agent_type: AgentType::ClaudeCode,
         cwd: None,
         status,
+        blocked: None,
         active_tool: None,
         started_at: last_activity,
         last_activity,
@@ -2919,6 +2920,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         last_user_prompt: Some("build the feature".into()),
         live_target: None,
         last_activity_ms: None,
+        blocked: None,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -3064,6 +3066,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         )),
                         live_target: None,
                         last_activity_ms: None,
+                        blocked: None,
                     }),
                     spawned_at_ms: None,
                     cli_name: None,
@@ -3184,6 +3187,7 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         agent_type: AgentType::ClaudeCode,
         cwd: None,
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -3297,6 +3301,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         agent_type: AgentType::None,
         cwd: None,
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: None,
         started_at: Utc::now(),
         last_activity: Utc::now(),

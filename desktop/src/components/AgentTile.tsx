@@ -28,6 +28,7 @@ import type {
   TerminalFeed,
 } from "../types";
 import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } from "../lib/terminalInput";
+import { blockedReasonText } from "../lib/blockedReason";
 import { OutputReader } from "./OutputReader";
 import { TerminalViewport } from "./TerminalViewport";
 
@@ -344,6 +345,11 @@ export function AgentTile({
                   ><Pencil size={11} /></button>
                 )}
               </p>
+            )}
+            {/* Issue #714: say WHY the agent is blocked, beside the status it
+                explains. Not on a held record: that status is a past reading. */}
+            {agent.status === "blocked" && !held && (
+              <p className="agent-blocked-reason" data-testid={`blocked-reason-${agent.id}`}>{blockedReasonText(agent.blocked)}</p>
             )}
           </div>
         </div>

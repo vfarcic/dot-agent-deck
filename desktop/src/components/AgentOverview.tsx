@@ -308,7 +308,7 @@ function roleIndexOf(agent: OverviewAgent): number {
 }
 
 /** Statuses in the order an operator scans them: what needs attention first. */
-const STATUS_ORDER: AgentStatus[] = ["running", "waiting", "failed", "queued", "passed", "stopped"];
+const STATUS_ORDER: AgentStatus[] = ["running", "waiting", "failed", "blocked", "queued", "passed", "stopped"];
 
 export function countByStatus(agents: OverviewAgent[]): { status: AgentStatus; count: number }[] {
   return STATUS_ORDER
