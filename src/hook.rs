@@ -3497,6 +3497,36 @@ mod tests {
             tail, b"{\"type\":\"assistant\"}\n",
             "the cut first line is dropped"
         );
+        // A window that starts exactly on a record boundary keeps its first
+        // record: when that record is the quota error that ended the turn,
+        // dropping it would leave the card Error instead of Blocked.
+        let boundary = dir.path().join("boundary.jsonl");
+        let record = r#"{"type":"assistant","isSidechain":false,"error":"rate_limit","isApiErrorMessage":true,"quotaLimits":{"status":"rejected","resetsAt":1790409000}}"#;
+        let window = crate::quota_signals::CLAUDE_TRANSCRIPT_TAIL_BYTES as usize;
+        let trailer_frame = r#"{"type":"system","subtype":"turn_duration","pad":""}"#.len();
+        let pad = "p".repeat(window - record.len() - 1 - trailer_frame - 1);
+        let mut body = b"{\"type\":\"user\"}\n".to_vec();
+        body.extend_from_slice(record.as_bytes());
+        body.push(b'\n');
+        body.extend_from_slice(
+            format!(r#"{{"type":"system","subtype":"turn_duration","pad":"{pad}"}}"#).as_bytes(),
+        );
+        body.push(b'\n');
+        std::fs::write(&boundary, &body).unwrap();
+        let tail = crate::quota_signals::read_claude_transcript_tail(&boundary.to_string_lossy())
+            .expect("a regular .jsonl file is read");
+        assert_eq!(
+            crate::quota_signals::classify_claude_stop_failure(
+                Some("rate_limit"),
+                crate::quota_signals::last_claude_api_error_record(&tail).as_ref(),
+            ),
+            crate::quota_signals::FailureOutcome::Blocked {
+                kind: crate::quota_block::BlockedKind::UsageLimit,
+                resets_at_ms: Some(1_790_409_000_000),
+            },
+            "a quota record starting exactly at the window boundary still blocks"
+        );
+        assert_eq!(tail.len(), window, "the whole window is complete records");
         let txt = dir.path().join("t.txt");
         std::fs::write(&txt, "{}").unwrap();
         assert!(

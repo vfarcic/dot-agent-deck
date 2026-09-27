@@ -27,8 +27,16 @@ export function formatSpan(ms: number): string {
 }
 
 /**
+ * How far ahead a reset may lie and still be shown — the crate's
+ * `QUOTA_RESET_MAX_FUTURE_MS` (`src/quota_block.rs`), past which the TUI card
+ * shows no countdown either.
+ */
+const RESET_MAX_FUTURE_MS = 400 * 24 * 60 * 60 * 1000;
+
+/**
  * The reason line a blocked tile prints: the fixed label for the kind, when the
- * provider said the limit resets (if that is still ahead of `nowMs`), then the
+ * provider said the limit resets (if that is still ahead of `nowMs`, and within
+ * a plausible window of it), then the
  * agent's own error message. That message is agent-controlled text, so it goes
  * through `displayText` here even though the crate already scrubbed it — the
  * render seam checks rather than trusts.
@@ -36,7 +44,7 @@ export function formatSpan(ms: number): string {
 export function blockedReasonText(blocked: AgentBlocked | undefined, nowMs: number = Date.now()): string {
   const label = KIND_LABEL[blocked?.kind ?? "unknown"];
   const left = blocked?.resetsAtMs !== undefined ? blocked.resetsAtMs - nowMs : 0;
-  const resets = left > 0 ? ` · resets in ${formatSpan(left)}` : "";
+  const resets = left > 0 && left <= RESET_MAX_FUTURE_MS ? ` · resets in ${formatSpan(left)}` : "";
   const detail = blocked?.detail ? displayText(blocked.detail, DISPLAY_LIMITS.message) : "";
   return detail ? `${label}${resets} — ${detail}` : `${label}${resets}`;
 }

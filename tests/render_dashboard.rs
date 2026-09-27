@@ -1198,7 +1198,8 @@ fn status_badge_002_blocked_card_snapshot() {
 
 /// Scenario: Render a Blocked card whose provider supplies a reset two hours
 /// and ten minutes after the fixed render clock. The card tells the user when
-/// the usage limit resets.
+/// the usage limit resets, and a reset at either extreme of the range still
+/// renders the reason, with no countdown.
 #[spec("status/badge/003")]
 #[test]
 fn status_badge_003_blocked_card_shows_reset() {
@@ -1229,6 +1230,28 @@ fn status_badge_003_blocked_card_shows_reset() {
         rendered.contains("resets in 2h 10m"),
         "the blocked card omitted its provider reset:\n{rendered}"
     );
+
+    // A reset no provider could have sent — the extremes a malformed snapshot
+    // can carry — still renders the card, with the reason and no countdown.
+    for extreme in [i64::MIN, i64::MAX] {
+        session.blocked.as_mut().unwrap().resets_at_ms = Some(extreme);
+        let buffer = render_card_to_buffer(
+            &session,
+            Some("quota-worker"),
+            Some(1),
+            density,
+            0,
+            render_now(),
+            false,
+            80,
+            density.rendered_height(),
+        );
+        let rendered = buffer_to_text(&buffer);
+        assert!(
+            rendered.contains("Usage limit") && !rendered.contains("resets in"),
+            "reset {extreme} must render the reason without a countdown:\n{rendered}"
+        );
+    }
 }
 
 /// Read the `(fg, modifier)` of a card/pane's left border at a mid-height row.

@@ -18,6 +18,12 @@ describe("blockedReasonText", () => {
       .toBe("Usage limit reached · resets in 2h 10m — limit hit");
     expect(blockedReasonText({ kind: "usage_limit", detectedAtMs: now, resetsAtMs: now - 1 }, now))
       .toBe("Usage limit reached");
+    // A reset no provider could send — past the crate's plausible window
+    // (`QUOTA_RESET_MAX_FUTURE_MS`) — prints no countdown, as on the TUI card.
+    for (const resetsAtMs of [Number.MAX_SAFE_INTEGER, now + 401 * 86_400_000]) {
+      expect(blockedReasonText({ kind: "usage_limit", detectedAtMs: now, resetsAtMs }, now))
+        .toBe("Usage limit reached");
+    }
     expect(formatSpan(59_000)).toBe("59 seconds");
     expect(formatSpan(60_000)).toBe("1 minute");
     expect(formatSpan(3 * 3_600_000)).toBe("3 hours");

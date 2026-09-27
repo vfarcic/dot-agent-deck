@@ -7969,13 +7969,18 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
     session.status = snap.status.clone();
     // Issue #714: the reason travels with the status it explains, and only with
     // it. The detail is agent-derived text arriving over the wire, so it gets the
-    // same scrub `apply_event` gives it rather than trusting the daemon's.
+    // same scrub `apply_event` gives it rather than trusting the daemon's, and
+    // the reset the same window the daemon admits a producer's under.
     session.blocked = if snap.status == SessionStatus::Blocked {
         snap.blocked.clone().map(|mut reason| {
             reason.detail = reason
                 .detail
                 .map(|d| crate::quota_block::scrub_detail(&d))
                 .filter(|d| !d.is_empty());
+            let now_ms = Utc::now().timestamp_millis();
+            reason.resets_at_ms = reason
+                .resets_at_ms
+                .filter(|&at| crate::quota_block::reset_at_is_plausible(at, now_ms));
             reason
         })
     } else {
@@ -18216,6 +18221,57 @@ mod tests {
         let legacy: SessionSnapshot =
             serde_json::from_str(r#"{"status":"Idle","tool_count":0}"#).unwrap();
         assert!(legacy.blocked.is_none());
+    }
+
+    /// Issue #714: a hydrated Blocked snapshot keeps its reason, but only a
+    /// reset within the window the daemon admits from a producer — a malformed
+    /// snapshot's extreme value is dropped rather than stored on the card.
+    #[test]
+    fn a_hydrated_blocked_snapshot_keeps_only_a_plausible_reset() {
+        let now_ms = Utc::now().timestamp_millis();
+        let snap = |resets_at_ms| SessionSnapshot {
+            status: SessionStatus::Blocked,
+            agent_type: Some(AgentType::ClaudeCode),
+            active_tool: None,
+            tool_count: 0,
+            first_prompts: Vec::new(),
+            last_user_prompt: None,
+            live_target: None,
+            last_activity_ms: None,
+            blocked: Some(BlockedReason {
+                kind: BlockedKind::UsageLimit,
+                detected_at_ms: now_ms,
+                detail: None,
+                resets_at_ms,
+            }),
+        };
+        let hydrated = |resets_at_ms| {
+            let mut state = AppState::default();
+            state.seed_hydrated_session(
+                "pane-h".to_string(),
+                None,
+                Some(AgentType::ClaudeCode),
+                Some("agent-h".to_string()),
+                Some(&snap(resets_at_ms)),
+            );
+            let session = state
+                .sessions
+                .values()
+                .find(|s| s.pane_id.as_deref() == Some("pane-h"))
+                .expect("the hydrated card");
+            assert_eq!(session.status, SessionStatus::Blocked);
+            session
+                .blocked
+                .clone()
+                .expect("the reason travels with Blocked")
+        };
+        let plausible = now_ms + 3_600_000;
+        assert_eq!(hydrated(Some(plausible)).resets_at_ms, Some(plausible));
+        for extreme in [i64::MIN, i64::MAX, 0] {
+            let reason = hydrated(Some(extreme));
+            assert_eq!(reason.kind, BlockedKind::UsageLimit);
+            assert_eq!(reason.resets_at_ms, None, "reset {extreme} is dropped");
+        }
     }
 
     /// Issue #714: the blocked-worker report is one line of fixed text with the
