@@ -1538,14 +1538,6 @@ pub async fn ingest_event(
         .pane_id
         .as_deref()
         .is_some_and(|pane_id| registry.has_live_pane(pane_id));
-    // Issue #447: the pane's live generation, for the waiting-for-input
-    // notice's "does this report name the agent that owns the pane?" check —
-    // asked here, before the state lock, for the same lock-order reason as
-    // `daemon_owns_pane` above.
-    let pane_live_agent_id = event
-        .pane_id
-        .as_deref()
-        .and_then(|pane_id| registry.pane_current_agent_id(pane_id));
     let mut state = state.write().await;
     // The other half, plus the stamp: is this an orchestration role pane whose
     // role registration a daemon restart destroyed while its agent survived?
@@ -1569,8 +1561,10 @@ pub async fn ingest_event(
         .remove(crate::event::DAEMON_PANE_CLOSED_METADATA_KEY);
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
     // Issue #447: `apply_event` plus the orchestrator-facing consumer of a
-    // delegated worker's `WaitingForInput` — see the method's doc.
-    state.apply_event_watching_waiting(event, registry, pane_live_agent_id.as_deref());
+    // delegated worker's `WaitingForInput` — see the method's doc, including
+    // why the pane's live agent is read there, under this lock, and not before
+    // it like `daemon_owns_pane` above.
+    state.apply_event_watching_waiting(event, registry);
 }
 
 /// Issue #424 (reviewer blocker 3): teach the registry how to turn a

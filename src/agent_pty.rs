@@ -5264,15 +5264,21 @@ impl AgentPtyRegistry {
         })
     }
 
-    /// Issue #447: close `worker_pane_id`'s waiting episode, if one is open —
-    /// the worker left `WaitingForInput`. Dropping the record cancels its task.
-    pub fn cancel_waiting_notice(&self, worker_pane_id: &str) -> bool {
-        self.delegations
-            .lock()
-            .unwrap()
+    /// Issue #447: close `worker_pane_id`'s waiting episode, if one is open
+    /// and it is `worker_agent_id`'s — that agent left `WaitingForInput`.
+    /// Dropping the record cancels its task. An episode belonging to another
+    /// agent is left alone: one agent leaving its prompt says nothing about
+    /// whether another is still at its own (Qodo, #1347).
+    pub fn cancel_waiting_notice(&self, worker_pane_id: &str, worker_agent_id: &str) -> bool {
+        let mut tracker = self.delegations.lock().unwrap();
+        if !tracker
             .waiting_notices
-            .remove(worker_pane_id)
-            .is_some()
+            .get(worker_pane_id)
+            .is_some_and(|open| open.worker_agent_id == worker_agent_id)
+        {
+            return false;
+        }
+        tracker.waiting_notices.remove(worker_pane_id).is_some()
     }
 
     /// Issue #447: whether the waiting episode `seq` is still the open,
@@ -17245,13 +17251,21 @@ mod spawn_tests {
         );
 
         let mut cancel = second.cancel;
-        assert!(reg.cancel_waiting_notice("worker"));
+        assert!(
+            !reg.cancel_waiting_notice("worker", "agent-1"),
+            "the replaced agent leaving the state must not close its successor's episode"
+        );
+        assert!(
+            reg.waiting_notice_is_current("worker", second.seq),
+            "a cancel naming another agent left the episode open"
+        );
+        assert!(reg.cancel_waiting_notice("worker", "agent-2"));
         assert!(
             matches!(cancel.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
             "leaving the state drops the record, which resolves the task's cancel"
         );
         assert!(
-            !reg.cancel_waiting_notice("worker"),
+            !reg.cancel_waiting_notice("worker", "agent-2"),
             "nothing left to cancel"
         );
     }
@@ -17278,7 +17292,7 @@ mod spawn_tests {
             "the same agent re-reporting the same wait must not open a second episode"
         );
         assert!(
-            reg.cancel_waiting_notice("worker"),
+            reg.cancel_waiting_notice("worker", "agent"),
             "leaving the state ends it"
         );
         let after_unsent = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
@@ -17289,7 +17303,7 @@ mod spawn_tests {
 
         let before = Instant::now();
         reg.settle_waiting_notice("worker", after_unsent.seq, true);
-        assert!(reg.cancel_waiting_notice("worker"));
+        assert!(reg.cancel_waiting_notice("worker", "agent"));
         let next = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
         let floor = next
             .not_before

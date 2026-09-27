@@ -1703,7 +1703,7 @@ fn waiting_notices_for(snapshot: &str, role: &str) -> usize {
         .count()
 }
 
-/// Scenario: Delegate to six workers of one orchestration and leave a seventh undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card; `already-waiting-worker` was waiting before it was delegated to; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first three — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other four, then or after further waiting.
+/// Scenario: Delegate to six workers of one orchestration and leave a seventh undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card, after which its own agent reports only informational events; `already-waiting-worker` was waiting before it was delegated to; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first three — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other four, then or after further waiting.
 #[spec("scheduler/idle-worker/021")]
 #[test]
 fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() {
@@ -1819,6 +1819,16 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             )
             .await;
         }
+        // Then the waiting agent's OWN tagged reports that assert no status —
+        // a subagent starting and stopping, and an event type from a newer
+        // build. Each leaves the untagged repaint on the card, but none says
+        // the agent left its prompt, so none may close its episode (Qodo,
+        // #1347).
+        for informational in ["subagent_start", "subagent_stop", "a_future_event_type"] {
+            harness
+                .worker_event("repainted-worker", informational)
+                .await;
+        }
         // A worker that reports its completion while still showing as
         // waiting owes nothing any more, so there is nothing to report.
         harness.work_done("finishing-worker").await;
@@ -1867,8 +1877,9 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
         assert_eq!(
             waiting_notices_for(&snapshot, "repainted-worker"),
             1,
-            "an untagged report that repainted the card silenced the report about a worker \
-             still at its prompt; snapshot = {snapshot:?}"
+            "an untagged report that repainted the card, or a tagged report from the same agent \
+             that asserted no status after it, silenced the report about a worker still at its \
+             prompt; snapshot = {snapshot:?}"
         );
         assert_eq!(
             waiting_notices_for(&snapshot, "already-waiting-worker"),
@@ -1928,6 +1939,185 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             0,
             "a WaitingForInput report naming an agent that does not own the pane started a \
              notice; snapshot = {settled:?}"
+        );
+    });
+}
+
+/// Issue #447: a hook event for `role`'s worker pane, under `session_id`,
+/// tagged with `agent_id` when there is one — the shape the hook script posts.
+fn worker_hook_event(
+    role: &str,
+    session_id: &str,
+    event_type: &str,
+    agent_id: Option<&str>,
+) -> dot_agent_deck::event::AgentEvent {
+    let mut event = serde_json::json!({
+        "session_id": session_id,
+        "agent_type": "claude_code",
+        "event_type": event_type,
+        "timestamp": chrono::Utc::now(),
+        "pane_id": worker_pane(role),
+    });
+    if let Some(agent_id) = agent_id {
+        event["agent_id"] = serde_json::Value::from(agent_id);
+    }
+    serde_json::from_value(event).expect("build a worker hook event")
+}
+
+/// Scenario: Delegate to three workers whose agents are each replaced in their pane by a successor that is already waiting for input when it is delegated to again. For two of them a hook event from the REPLACED agent reaches the daemon's real ingestion first, reads the pane's owner, and is held on the state lock until the replacement has happened — one reporting `WaitingForInput`, the other, after an untagged report repainted the successor's card, reporting `thinking`. The orchestrator pane must receive exactly one waiting-for-input notice about each successor, the third worker being the control with no stale event at all.
+#[spec("scheduler/idle-worker/023")]
+#[test]
+fn idle_worker_023_a_replaced_agents_stale_report_cannot_erase_its_successors_wait() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("600000"));
+    let debounce = Duration::from_millis(600);
+    let _debounce = DebounceEnvGuard::set("600");
+    // Single-threaded on purpose: a spawned ingestion runs up to its first
+    // await — the state lock — on the next yield, so "it has read the pane's
+    // owner and is now waiting for the lock" is a fact of the schedule rather
+    // than a sleep that load could outrun.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+    runtime.block_on(async {
+        let roles = ["overwritten-worker", "cancelled-worker", "control-worker"];
+        let workers: Vec<(&str, &str)> = roles.iter().map(|role| (*role, WORKER_COMMAND)).collect();
+        let harness = IdleHarness::with_workers(&workers, None).await;
+        // The daemon's admission control, as `run_daemon_with` installs it:
+        // without the registry as ownership oracle, a replaced agent's report
+        // would be admitted on the pane-set rule alone.
+        {
+            let ownership: Arc<dyn dot_agent_deck::state::AgentOwnership> =
+                harness.registry.clone();
+            harness
+                .state
+                .write()
+                .await
+                .set_agent_ownership(Arc::downgrade(&ownership));
+        }
+        for role in roles {
+            harness.manage_worker_pane(role).await;
+            harness.worker_event(role, "session_start").await;
+        }
+        harness.delegate(&roles).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        for role in roles {
+            let predecessor = harness.worker_agent_ids[role].clone();
+            // What the replaced agent says, if anything, in the window between
+            // the daemon reading the pane's owner and taking the state lock.
+            let stale_event = match role {
+                "overwritten-worker" => Some("waiting_for_input"),
+                "cancelled-worker" => Some("thinking"),
+                _ => None,
+            };
+            let mut guard = harness.state.write().await;
+            let stale = stale_event.map(|event_type| {
+                let event = worker_hook_event(
+                    role,
+                    &format!("session-{role}"),
+                    event_type,
+                    Some(&predecessor),
+                );
+                let (state, event_tx, registry) = (
+                    Arc::clone(&harness.state),
+                    harness.event_tx.clone(),
+                    Arc::clone(&harness.registry),
+                );
+                tokio::spawn(async move {
+                    dot_agent_deck::daemon::ingest_event(&state, &event_tx, &registry, event).await;
+                })
+            });
+            tokio::task::yield_now().await;
+            // The replacement lands while that report waits for the lock: the
+            // pane gets a successor agent, which reports itself waiting and is
+            // delegated to again — the already-waiting path opens its episode.
+            let successor = harness
+                .registry
+                .respawn_agent_for_pane(&worker_pane(role), WORKER_COMMAND)
+                .await
+                .unwrap_or_else(|error| panic!("replace {role}'s agent: {error}"));
+            assert_ne!(
+                successor, predecessor,
+                "precondition: {role} was not replaced"
+            );
+            let successor_session = format!("session-{role}-successor");
+            for event_type in ["session_start", "waiting_for_input"] {
+                guard.apply_event(worker_hook_event(
+                    role,
+                    &successor_session,
+                    event_type,
+                    Some(&successor),
+                ));
+            }
+            guard
+                .handle_delegate(
+                    DelegateSignal {
+                        pane_id: ORCH_PANE.to_string(),
+                        task: "Perform the delegated test task.".to_string(),
+                        to: vec![role.to_string()],
+                        supersede: true,
+                        timestamp: chrono::Utc::now(),
+                        token: None,
+                    },
+                    &harness.registry,
+                    &harness.event_tx,
+                )
+                .await;
+            if role == "cancelled-worker" {
+                // An untagged report repaints the successor's card, so the
+                // stale report below finds the pane off `WaitingForInput`.
+                guard.apply_event(worker_hook_event(
+                    role,
+                    &successor_session,
+                    "thinking",
+                    None,
+                ));
+            }
+            drop(guard);
+            if let Some(stale) = stale {
+                stale.await.expect("the stale ingestion task");
+            }
+        }
+
+        let snapshot = harness
+            .wait_for_snapshot(
+                |snapshot| {
+                    roles
+                        .iter()
+                        .all(|role| waiting_notices_for(snapshot, role) > 0)
+                },
+                common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+        assert_eq!(
+            waiting_notices_for(&snapshot, "control-worker"),
+            1,
+            "control: a replaced worker's waiting successor was never reported, with no stale \
+             event involved at all; snapshot = {snapshot:?}"
+        );
+        assert_eq!(
+            waiting_notices_for(&snapshot, "overwritten-worker"),
+            1,
+            "a replaced agent's WaitingForInput, which the daemon rejected, overwrote its \
+             successor's waiting episode, so the successor's wait was never reported; \
+             snapshot = {snapshot:?}"
+        );
+        assert_eq!(
+            waiting_notices_for(&snapshot, "cancelled-worker"),
+            1,
+            "a replaced agent's report, which the daemon rejected, cancelled its successor's \
+             waiting episode, so the successor's wait was never reported; \
+             snapshot = {snapshot:?}"
+        );
+        tokio::time::sleep(debounce * 3).await;
+        let settled = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
+        assert_eq!(
+            settled.matches(WAITING_NEEDLE).count(),
+            3,
+            "exactly one waiting notice per successor may reach the orchestrator; \
+             snapshot = {settled:?}"
         );
     });
 }

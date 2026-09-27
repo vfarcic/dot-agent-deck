@@ -3128,6 +3128,24 @@ pub(crate) fn compose_worker_waiting_notice(
     ))
 }
 
+/// What [`AppState::apply_event`] did with one event — the answer issue #447's
+/// waiting-for-input watch needs and every other caller ignores (Qodo, #1347).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppliedEvent {
+    /// Admission control refused it: nothing on any card moved.
+    Rejected,
+    /// Admitted, but the status on the card is not one it wrote — an
+    /// informational event (`SubagentStart`, `SubagentStop`, `Unknown`, a
+    /// subagent's `ToolStart`), or one whose status arm declined to overwrite
+    /// what was there (`ToolStart` on `WaitingForInput`, `ShellBusy` on a real
+    /// status).
+    StatusKept,
+    /// Admitted, and it wrote the status now on the card, or ended the session
+    /// that status belonged to (`SessionEnd`, the daemon's pane-closed
+    /// announcement).
+    StatusAsserted,
+}
+
 impl AppState {
     /// The status of the session currently bound to `pane_id`, read the way
     /// [`Self::pane_session_id`] picks that session.
@@ -3147,42 +3165,60 @@ impl AppState {
     /// Keyed on the status the daemon itself applied, not on the event's type —
     /// so `PermissionRequest` counts like `WaitingForInput` (both set the
     /// status), and a `ToolStart` that preserves the status keeps the episode
-    /// open. Every applied event that leaves the pane waiting asks
+    /// open. Every admitted event that leaves the pane waiting asks
     /// [`Self::open_waiting_episode`], which is idempotent per agent, so a
     /// repeated report keeps the first clock, while a replacement agent or a
     /// tagged report superseding an untagged one still gets its own episode
     /// (Qodo, #1347).
     ///
-    /// An event that moves the pane OFF the status closes the episode only when
-    /// it names the pane's live agent (Greptile, #1347): the hook socket is
-    /// unauthenticated, and an untagged or foreign report that repaints the card
-    /// must not be able to silence the report about the agent that is still at
-    /// its prompt. An episode whose agent has been replaced is dropped when it
+    /// An event that leaves the pane OFF the status closes the episode only
+    /// when it wrote that status itself ([`AppliedEvent::StatusAsserted`]) and
+    /// names the pane's live agent, and then only that agent's episode. The
+    /// hook socket is unauthenticated, and an untagged or foreign report that
+    /// repaints the card must not be able to silence the report about the agent
+    /// that is still at its prompt (Greptile, #1347) — nor may that agent's own
+    /// informational report after the repaint (`SubagentStart`,
+    /// `SubagentStop`, an event type from a newer build), which says nothing
+    /// about its prompt and merely leaves the foreign status standing (Qodo,
+    /// #1347). An episode whose agent has been replaced is dropped when it
     /// fires instead, by its own identity check.
+    ///
+    /// **A rejected event touches no episode, and the pane's live agent is read
+    /// here, under the state lock, after admission** (Qodo, #1347). Read before
+    /// the lock, as it once was, the identity could go stale while the event
+    /// waited for it: a replaced agent's late report, which admission control
+    /// then refused, still matched the snapshot and could overwrite or cancel
+    /// its successor's episode. Asking the registry under this lock adds no lock
+    /// nesting: admission control inside `apply_event` already asks it, through
+    /// [`AgentOwnershipOracle`], on this same path and under this same lock.
     pub fn apply_event_watching_waiting(
         &mut self,
         event: AgentEvent,
         registry: &Arc<AgentPtyRegistry>,
-        pane_live_agent_id: Option<&str>,
     ) {
         let pane_id = event.pane_id.clone();
         let event_agent_id = event.agent_id.clone();
-        self.apply_event(event);
+        let applied = self.apply_event_reporting(event);
         let Some(pane_id) = pane_id else {
             return;
         };
+        if applied == AppliedEvent::Rejected {
+            return;
+        }
+        let live_agent_id = registry.pane_current_agent_id(&pane_id);
         if self.pane_status(&pane_id) == Some(SessionStatus::WaitingForInput) {
             self.open_waiting_episode(
                 &pane_id,
                 event_agent_id.as_deref(),
-                pane_live_agent_id,
+                live_agent_id.as_deref(),
                 registry,
             );
             return;
         }
-        if event_agent_id.is_some()
-            && event_agent_id.as_deref() == pane_live_agent_id
-            && registry.cancel_waiting_notice(&pane_id)
+        if applied == AppliedEvent::StatusAsserted
+            && let Some(agent_id) = event_agent_id.as_deref()
+            && live_agent_id.as_deref() == Some(agent_id)
+            && registry.cancel_waiting_notice(&pane_id, agent_id)
         {
             tracing::debug!(
                 pane_id = %pane_id,
@@ -3204,10 +3240,9 @@ impl AppState {
     /// An episode is opened only when all of these hold:
     ///
     /// * the status was reported by the pane's CURRENT registry agent
-    ///   (`live_agent_id`, which the daemon's ingestion reads before taking the
-    ///   state lock). The hook socket is unauthenticated, so a report that
-    ///   cannot name the live generation does not get to start a notice about
-    ///   it;
+    ///   (`live_agent_id`, which both callers read under the state lock they
+    ///   hold). The hook socket is unauthenticated, so a report that cannot
+    ///   name the live generation does not get to start a notice about it;
     /// * the status was not set by an untagged producer
     ///   ([`Self::untagged_status_panes`]) — the command-entry lock refuses to
     ///   act on such a status, and so does this;
@@ -10443,7 +10478,14 @@ impl AppState {
         format!("{pane_id}::{session_id}")
     }
 
-    pub fn apply_event(&mut self, mut event: AgentEvent) {
+    pub fn apply_event(&mut self, event: AgentEvent) {
+        let _ = self.apply_event_reporting(event);
+    }
+
+    /// [`Self::apply_event`], reporting what it did with the event — see
+    /// [`AppliedEvent`]. The daemon's waiting-for-input watch is the one caller
+    /// that needs the answer (issue #447).
+    fn apply_event_reporting(&mut self, mut event: AgentEvent) -> AppliedEvent {
         // PRD #1223: the daemon's pane-closed announcement is a statement ABOUT
         // a pane, not a producer's conversation ending, so none of the
         // `SessionEnd` machinery below applies to it — in particular its
@@ -10452,7 +10494,7 @@ impl AppState {
             if let Some(pane_id) = event.pane_id.as_deref() {
                 self.apply_daemon_pane_closed(pane_id, event.agent_id.as_deref());
             }
-            return;
+            return AppliedEvent::StatusAsserted;
         }
         // Issue #833: `tool_name` / `tool_detail` are PRODUCER-supplied — every
         // agent on the deck can post to the hook socket — and both are drawn
@@ -10542,7 +10584,7 @@ impl AppState {
                     // admits the format on its own (it only checks for
                     // `[A-Za-z0-9_-]`).
                     if crate::ui::is_dead_slot_pane_id(pane_id) {
-                        return;
+                        return AppliedEvent::Rejected;
                     }
                     // Round 2, and the reason this is NOT a widening of the
                     // pre-existing `SessionStart` escape hatch (#601, out of
@@ -10576,12 +10618,12 @@ impl AppState {
                     match self.oracle_ownership(Some(pane_id.as_str()), None) {
                         // The registry claims this pane; it is not in the
                         // startup race and stays generation-checked.
-                        Some(Ownership::Owned) => return,
+                        Some(Ownership::Owned) => return AppliedEvent::Rejected,
                         // The registry could not answer. That is not evidence
                         // that the pane is free, and this is the one place where
                         // treating it as evidence would hand out a permanent
                         // bearer token.
-                        Some(Ownership::Unknown) => return,
+                        Some(Ownership::Unknown) => return AppliedEvent::Rejected,
                         // Genuinely unclaimed, or no registry at all (the TUI,
                         // whose own panes are exactly what this race is about).
                         Some(Ownership::Unclaimed) | None => {}
@@ -10599,11 +10641,11 @@ impl AppState {
                     // (reviewer finding 3).
                     self.managed_pane_ids.insert(pane_id.clone());
                 } else {
-                    return;
+                    return AppliedEvent::Rejected;
                 }
             }
         } else if !self.admits_paneless_event(event.agent_id.as_deref()) {
-            return;
+            return AppliedEvent::Rejected;
         }
         // PRD #284 sub-problem (a): a terminal frame claims no generation, so it
         // is not evidence of a takeover and may retire nothing. Hoisted above
@@ -11262,7 +11304,7 @@ impl AppState {
                     placeholder.display_name = Some(name);
                 }
             }
-            return;
+            return AppliedEvent::StatusAsserted;
         }
 
         // PRD #20 R20-003 (finding #4): record the LATEST hook-session generation
@@ -11750,6 +11792,11 @@ impl AppState {
             } else {
                 self.untagged_status_panes.remove(&pane_id);
             }
+        }
+        if asserted_status {
+            AppliedEvent::StatusAsserted
+        } else {
+            AppliedEvent::StatusKept
         }
     }
 }
