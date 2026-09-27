@@ -1709,7 +1709,7 @@ fn waiting_notices_for(snapshot: &str, role: &str) -> usize {
         .count()
 }
 
-/// Scenario: Delegate to seven workers of one orchestration and leave an eighth undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card, after which its own agent reports only informational events; `cleared-worker`'s agent starts a new hook session and waits in it, and then a delayed report from its old session arrives; `already-waiting-worker` was waiting before it was delegated to; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first four — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other four, then or after further waiting.
+/// Scenario: Delegate to seven workers of one orchestration and leave an eighth undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card, after which its own agent reports only informational events; `cleared-worker`'s agent starts a new hook session and waits in it, and then a delayed report and a delayed `session_start` from its old session arrive; `already-waiting-worker` was waiting before it was delegated to; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first four — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other four, then or after further waiting.
 #[spec("scheduler/idle-worker/021")]
 #[test]
 fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() {
@@ -1797,14 +1797,20 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
                 ))
                 .await;
         }
-        let mut delayed = worker_hook_event(
-            "cleared-worker",
-            "session-cleared-worker",
-            "thinking",
-            Some(&cleared_agent),
-        );
-        delayed.timestamp = before_clear;
-        harness.ingest(delayed).await;
+        // Both a status report and a `session_start`: a `SessionStart` naming
+        // another session moves `pane_hook_session` whatever its timestamp
+        // (issue #424 D2), so it is the case the generation check must judge by
+        // age rather than by whether the pane followed it (Qodo, #1347).
+        for event_type in ["thinking", "session_start"] {
+            let mut delayed = worker_hook_event(
+                "cleared-worker",
+                "session-cleared-worker",
+                event_type,
+                Some(&cleared_agent),
+            );
+            delayed.timestamp = before_clear;
+            harness.ingest(delayed).await;
+        }
 
         harness
             .worker_event("idle-bystander", "waiting_for_input")

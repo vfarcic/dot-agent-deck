@@ -3215,19 +3215,23 @@ impl AppState {
         // A report from a hook session the pane has already moved past — the
         // same agent's conversation before a `/clear`, arriving late — is about
         // a conversation that is over, so it neither opens nor closes a wait
-        // (Qodo, #1347). Judged by the generation rule `apply_event` keeps in
-        // `pane_hook_session`: the event is current if it names the generation
-        // the pane held and is not older than it, or if it just advanced the
-        // pane to a new one. A pane with no generation yet has nothing to be
-        // stale against.
+        // (Qodo, #1347). Judged against the generation the pane held BEFORE the
+        // event, in `pane_hook_session`: the event is current only if it is not
+        // older than that generation, and it either names it or has just
+        // advanced the pane to a new one. The age test applies to the advancing
+        // case too, because a `SessionStart` naming another session moves the
+        // pane whatever its timestamp (issue #424 D2) — so a delayed start from
+        // before the `/clear` would otherwise pass for the new conversation. A
+        // pane with no generation yet has nothing to be stale against.
         let from_current_generation = match &generation_before {
             None => true,
             Some((current, current_ts)) => {
-                (*current == event_session_id && event_timestamp >= *current_ts)
-                    || self
-                        .pane_hook_session
-                        .get(&pane_id)
-                        .is_some_and(|(now, _)| *now == event_session_id && now != current)
+                event_timestamp >= *current_ts
+                    && (*current == event_session_id
+                        || self
+                            .pane_hook_session
+                            .get(&pane_id)
+                            .is_some_and(|(now, _)| *now == event_session_id))
             }
         };
         if !from_current_generation {
