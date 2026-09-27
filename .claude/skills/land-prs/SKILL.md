@@ -50,7 +50,7 @@ For each PR, also read its unresolved thread count (GraphQL `reviewThreads { isR
 
 **A non-required check is not a formality.** `UNSTABLE` in `mergeStateStatus` means one is failing, and GitHub will merge past it. Read why before merging: on 2026-09-27 #1363's advisory `desktop-driver` failure was the only sign that merging it would re-break the desktop build (Step 3, "`main` also moves under you"). Merge past a failing or pending non-required check only once you can say it is unrelated to this PR — the same failure on `main`, a known flake re-run green — and say so in the report. CLAUDE.md rule 8 covers the same trap for auto-merge.
 
-**Address every PR by its PR ref, never by `origin/<headRefName>`.** A fork PR's branch is not on `origin`, and an `origin` branch can share a fork's branch name while pointing at unrelated code. Fetch the head the PR will actually merge: `git fetch origin pull/<n>/head:refs/remotes/origin/pr-<n>`, and use `origin/pr-<n>` everywhere below. It also covers the case where `git fetch origin <branch>` simply fails (seen with a Renovate branch) — never read a failed fetch as "no conflicts".
+**Address every PR by its PR ref, never by `origin/<headRefName>`.** A fork PR's branch is not on `origin`, and an `origin` branch can share a fork's branch name while pointing at unrelated code. Fetch the head the PR will actually merge — **with a leading `+`**, so the ref follows a force-push instead of silently keeping the old commit: `git fetch origin +pull/<n>/head:refs/remotes/origin/pr-<n>`, then confirm `git rev-parse origin/pr-<n>` equals `gh pr view <n> --json headRefOid --jq .headRefOid`, and use `origin/pr-<n>` everywhere below. It also covers the case where `git fetch origin <branch>` simply fails (seen with a Renovate branch) — never read a failed fetch as "no conflicts".
 
 **`UNKNOWN` is not a bucket.** GitHub recomputes mergeability after `main` moves and reports `UNKNOWN` for seconds to minutes. Poll until it settles; never read it as blocked or as clean.
 
@@ -73,8 +73,9 @@ c=$(git rev-parse origin/main)
 # ones first, then the ones awaiting review — so the awaiting ones are tested
 # against each other too
 for x in <PRs, in merge order>; do
-  git fetch -q origin "pull/$x/head:refs/remotes/origin/pr-$x"
+  git fetch -q origin "+pull/$x/head:refs/remotes/origin/pr-$x"
   h=$(git rev-parse "origin/pr-$x")
+  [ "$h" = "$(gh pr view "$x" --json headRefOid --jq .headRefOid)" ] || { echo "#$x: fetched ref is not the PR head"; exit 1; }
   # capture first, then test merge-tree's OWN exit status: piping it into
   # `head` would test head's status and let a conflict read as clean
   if out=$(git merge-tree --write-tree "$c" "$h"); then
@@ -129,17 +130,18 @@ Work on a **detached** checkout of the PR's head, so it does not matter whether 
 git fetch origin
 [ -d ../<repo>-land ] || git worktree add --detach ../<repo>-land origin/main
 cd ../<repo>-land
-git fetch -q origin "pull/<n>/head:refs/remotes/origin/pr-<n>"
+git fetch -q origin "+pull/<n>/head:refs/remotes/origin/pr-<n>"
 git switch --detach "origin/pr-<n>"
 git merge origin/main              # resolve the conflicts (rules below)
 git add <each resolved file>
 git diff --name-only --diff-filter=U   # must print nothing
 git commit --no-edit               # completes the merge; nothing is pushed without it
 # gates (below), then:
+# same-repository PR only (isCrossRepository is false) — see below for a fork
 git push origin "HEAD:$(gh pr view <n> --json headRefName --jq .headRefName)"
 ```
 
-That push is a fast-forward of the PR branch, so it is refused rather than overwriting anything if the branch moved meanwhile — fetch again and redo the merge. For a fork PR the branch is not on `origin`; push to the fork only if `maintainerCanModify` is true, and otherwise ask its author.
+That push is a fast-forward of the PR branch, so it is refused rather than overwriting anything if the branch moved meanwhile — fetch again and redo the merge. **Never push a fork PR's resolution to `origin`**: `origin` is the base repository, so `HEAD:<headRefName>` there creates or moves an unrelated same-named branch and leaves the PR untouched. Check `gh pr view <n> --json isCrossRepository,headRepositoryOwner,headRepository,maintainerCanModify` first; for a fork, push to the head repository's own URL (`https://github.com/<headRepositoryOwner>/<headRepository>.git`) and only when `maintainerCanModify` is true — otherwise ask its author.
 
 Resolution rules, from cases met so far:
 
@@ -181,7 +183,7 @@ Report these; do not work around them.
 
 - **A person's `CHANGES_REQUESTED`.** Theirs to lift. Say what they asked for, and check whether it still applies on the current `main` — a blocker about files `main` no longer carries may have resolved itself (#1252: two fragments it "deleted" had since been consumed by a release). If it no longer applies and the reviewer is unavailable, the user decides. **Do not dismiss the review and do not reopen the PR as a new one** — the second has the effect of a dismissal with less of a record. The agent reviewer does not help here: it skips a PR with an open change request by rule (`skip #<n>: changes requested by a reviewer`), so there is no approval to get. What worked for #1252: on the user's explicit instruction, confirm the required checks are green, no thread is unresolved and the PR merges cleanly, write the reason to a file — which blocker it was, why it no longer applies, and that the review was left standing — and pass it as the squash body: `gh pr merge <n> --squash --admin --body-file <reason.md>`. Without `--body-file` the reason is lost, which defeats the point of recording it. That is the one sanctioned use of `--admin` in this skill.
 - **A reviewer `REQUEST_CHANGES` naming a manual obligation** (for example rule 12's cross-version test) — addressed to a person; a green check is not an answer to it.
-- **Unresolved review threads, and findings that need code.** Hand the PR to a unit — `/pr-review-queue` composes that task — or, for a single PR, tell the user. A unit that already finished cannot be sent more input from here. A unit fixing an existing PR must not open a new one: its worktree is cut from `main`, so tell it to `git fetch origin pull/<n>/head:refs/remotes/origin/pr-<n> && git switch --detach origin/pr-<n>`, commit there, and `git push origin HEAD:<headRefName>` — the detached form also works when the branch is checked out in some other worktree. Tell it to stop after the push without requesting review; this skill runs the re-review.
+- **Unresolved review threads, and findings that need code.** Hand the PR to a unit — `/pr-review-queue` composes that task — or, for a single PR, tell the user. A unit that already finished cannot be sent more input from here. A unit fixing an existing PR must not open a new one: its worktree is cut from `main`, so tell it to `git fetch origin +pull/<n>/head:refs/remotes/origin/pr-<n> && git switch --detach origin/pr-<n>`, commit there, and `git push origin HEAD:<headRefName>` — for a same-repository PR; a fork PR's push goes to the fork as Step 4 describes. The detached form also works when the branch is checked out in some other worktree. Tell it to stop after the push without requesting review; this skill runs the re-review.
 - **A trivial rule violation the reviewer requested changes on** (a Scenario comment over rule 7's sentence cap, a hard-wrapped paragraph) is mechanical: fix it yourself on the branch, run the gates, push, and say so in a PR comment. Anything that changes behaviour is not trivial.
 - **A findings thread that needs facts only the user has** (what they observed on a machine you cannot reach): never write the result yourself. Ask the user, and leave that thread open until they answer.
 - **A failing required check** that is not a conflict artefact. The same: a unit, or the user.
