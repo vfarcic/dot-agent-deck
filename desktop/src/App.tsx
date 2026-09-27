@@ -35,7 +35,7 @@ import { AgentOverview } from "./components/AgentOverview";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
-import { DeckSelector } from "./components/DeckSelector";
+import { DeckSelector, chooseDeckSelection } from "./components/DeckSelector";
 import { HandoffRail } from "./components/HandoffRail";
 import { SelectDeckNote } from "./components/SelectDeckNote";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
@@ -128,10 +128,25 @@ function evidenceOpenOnFirstLoad(): boolean {
 }
 
 /**
+ * Every {@link DeckOverlay}, for the deck's blanket close. Written as a
+ * record's keys so that adding an overlay to the union is a type error here
+ * rather than an overlay the Deck button and `Escape` silently leave open —
+ * the property the `Record<DeckOverlay, …>` of setters this replaced carried.
+ */
+const DECK_OVERLAYS = Object.keys({ projects: true, prompts: true, profiles: true, orchestration: true, settings: true } satisfies Record<DeckOverlay, true>) as DeckOverlay[];
+
+/**
  * The registry entry voice's `open_deck` row invokes — typed against the
  * registry, so renaming the entry breaks this rather than the gate below.
  */
 const OPEN_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "openDeck";
+
+/**
+ * The registry entry voice's `switch_deck` row invokes (PRD #1195 M3), whose
+ * `deck_ref` value is the Deck selector's token rather than a fleet key — see
+ * `VoiceDispatchTarget.deckSelection`.
+ */
+const SWITCH_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "switchDeck";
 
 /**
  * Issue #1198 — what a view that names the deck is shown as while the deck is
@@ -195,6 +210,22 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const settings = useDesktopSettings(runtime);
   useZoom(runtime, settings);
   /**
+   * PRD #1195 — the settings as of the LATEST render, for a voice dispatch
+   * that writes them. `VoiceControlPanel` captures `dispatchVoice` when an
+   * utterance BEGINS and calls it when the answer lands, so a `settings` closed
+   * over by that callback is the document from before the round trip: a
+   * `switch_deck` judged against it accepts an address Settings has since
+   * changed, and writing from it undoes every edit made meanwhile. Read here
+   * instead, as `useZoom` reads its own copy.
+   *
+   * No separate wait on an in-flight save is needed: `useDesktopSettings.save`
+   * applies each document to its state at once and queues the disk writes in
+   * order, dropping a superseded response, so the latest render already holds
+   * the document the queue will end on, and a write from here queues behind it.
+   */
+  const latestSettings = useRef(settings);
+  latestSettings.current = settings;
+  /**
    * PRD #802 M7 — where the mounted deck publishes the context it can serve.
    *
    * A `useRef` and not state: nothing renders from it, and the only reader is
@@ -235,6 +266,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * the app's `initialView`, a future deep link — closes to a real screen
    * instead of to nothing.
    */
+  // voice-registry-exempt: the view's own back, which opens nothing — the effects below call it when a pane's subject goes away, and the dispatch context's `closeAgentView` reaches it
   const closeAgent = useCallback(() => setView((current) => (current.kind === "agent" ? { kind: current.from } : current)), []);
   /**
    * PRD #802 M2 — the same close, dispatched through the action registry.
@@ -654,7 +686,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       agentLabel: agent?.label ?? paneAgent?.displayName,
       text: dictated?.value,
       agentViewOpen: agentView !== undefined,
-      ...(namedDeck ? { preselectDeckId: namedDeck.value } : {}),
+      ...(namedDeck
+        ? (outcome.invoke === SWITCH_DECK_INVOKE
+          ? { deckSelection: namedDeck.value, ...(namedDeck.deckIdentity ? { deckIdentity: namedDeck.deckIdentity } : {}) }
+          : { preselectDeckId: namedDeck.value })
+        : {}),
       ...(namedDirectory ? { directoryPath: namedDirectory.value } : {}),
       /* What the utterance was judged against, so a directory move can refuse
          a browser that has moved on since (see the member's own comment). */
@@ -679,6 +715,8 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       closeOverlays: railContext.closeOverlays,
       /* Only while Settings is open, so `close` reads its presence (#1197). */
       ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
+      /* The Deck selector's own write, which its menu calls too (PRD #1195). */
+      switchDeck: (selection, identity) => chooseDeckSelection(latestSettings.current, selection, identity),
       navigate: (next) => { moved = true; setView(next); },
       closeAgentView: () => { moved = true; closeAgent(); },
     };
@@ -689,6 +727,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
        dispatch the host cannot serve, so the report says nothing ran. */
     if (outcome.invoke === OPEN_DECK_INVOKE && !features.showDeck) return undefined;
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
+    // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
   }, [agentView, base, closeAgent, features.showDeck, overlaysOpen.settings, paneAgent, railContext, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
@@ -698,12 +737,16 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   /* Which mount of the dialog that declaration came from — never sent to Rust,
      read only to refuse an answer whose dialog has been replaced (PRD #1223). */
   const readNewAgentInstance = useCallback(() => newAgentVoice.current?.instance, []);
+  /* PRD #1195 — the Deck selector's section as it renders, not as it is on
+     disk: `save` applies an edit at once and writes it behind. */
+  const readEndpoints = useCallback(() => latestSettings.current.settings.endpoints, []);
   /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
      and `DeckSurface`'s own promotion condition. */
   const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId } : undefined;
   const screenNode = base === "overview"
     ? (
       <>
+        {/* voice-registry-exempt: the overview's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS` */}
         <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} />
         {/*
           The overview mounts no terminal of its own (PRD #745's commitment), so
@@ -732,6 +775,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
       </>
     )
+    // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
     : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} overlays={deckOverlays} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
@@ -758,9 +802,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   */
   return (
     <>
+      {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
       <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
       {screenNode}
-      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} />
+      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} />
       <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
     </>
   );
@@ -833,7 +878,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
  * unnecessary rather than merely unwise.
  */
 function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; onClose: () => void }) {
-  const [tab, setTab] = useState<PanelTab>("terminal");
+  const [tab, setTab] = useState<PanelTab>("terminal"); // voice-registry-exempt: the pane-over-the-overview's own tab strip, a control inside one pane
   return (
     <AgentPaneFrame
       open
@@ -977,6 +1022,7 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPla
   };
   return (
     <>
+      {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
       <NavigationRail screen="deck" overlays={open} context={context} connection={props.runtime.snapshot.connection} features={desktopFeaturesOf(props.runtime)} onShowShortcuts={() => setOverlay("deck", "shortcuts", true)} />
       <DeckSurface {...props} settings={settings} overlays={deck} />
       <ShellSettings runtime={props.runtime} settings={settings} open={open.settings ?? false} onClose={() => setOverlay("deck", "settings", false)} />
@@ -1026,26 +1072,22 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     : undefined;
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
-  const [selectedEvidenceId, setSelectedEvidenceId] = useState("");
+  const [selectedEvidenceId, setSelectedEvidenceId] = useState(""); // voice-registry-exempt: which evidence item the drawer shows — a selection within the drawer, which the drawer's rows and J/K set
   const [evidenceOpen, setEvidenceOpen] = useState(evidenceOpenOnFirstLoad);
   const projectsOpen = overlays.open.projects ?? false;
-  const setProjectsOpen = (open: boolean) => setOverlay("projects", open);
   const profilesOpen = overlays.open.profiles ?? false;
-  const setProfilesOpen = (open: boolean) => setOverlay("profiles", open);
   const promptsOpen = overlays.open.prompts ?? false;
-  const setPromptsOpen = (open: boolean) => setOverlay("prompts", open);
-  const [selectedPromptId, setSelectedPromptId] = useState("");
+  const [selectedPromptId, setSelectedPromptId] = useState(""); // voice-registry-exempt: which stored prompt the library panel is editing — a selection within that panel
   const [terminalFocus, setTerminalFocus] = useState<{ agentId: string; token: number }>();
   const orchestrationOpen = overlays.open.orchestration ?? false;
-  const setOrchestrationOpen = (open: boolean) => setOverlay("orchestration", open);
-  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false); // voice-registry-exempt: the command palette is the registry's own surface: it lists entries and runs them, and opening it runs none
   const helpOpen = overlays.open.shortcuts ?? false;
+  // voice-registry-exempt: the shortcut sheet is a `ShellOverlay` and not a `DeckOverlay` — no registry entry opens it; `?` and the rail's bottom button do
   const setHelpOpen = (open: boolean) => setOverlay("shortcuts", open);
-  const setSettingsOpen = (open: boolean) => setOverlay("settings", open);
   /* Issue #1234: a sentence only. The roles a failed launch could not confirm
      are stopped are the runtime's `cleanupWarnings`, which outlive any notice. */
-  const [notice, setNotice] = useState<string>();
-  const [confirm, setConfirm] = useState<ConfirmState>();
+  const [notice, setNotice] = useState<string>(); // voice-registry-exempt: the toast's sentence, reporting what an action did
+  const [confirm, setConfirm] = useState<ConfirmState>(); // voice-registry-exempt: the confirmation an action that starts or stops agents asks first — opened by the action it guards, never on its own
   const { profiles, updateProfile, resetProfiles } = useAgentProfiles(snapshot.profiles);
   /*
    * PRD #819 M6: the projects come from the daemon and nothing is remembered.
@@ -1128,7 +1170,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const orchestrationLiveTitlesRef = useRef(orchestrationLiveTitles);
   orchestrationLiveTitlesRef.current = orchestrationLiveTitles;
   const { prompts, addPrompt, updatePrompt, removePrompt } = usePromptLibrary();
-  const [profileOrder, setProfileOrder] = useState<string[]>([]);
+  const [profileOrder, setProfileOrder] = useState<string[]>([]); // voice-registry-exempt: the orchestration editor's draft role order, edited inside that panel
 
   // PRD #743: applied on LOAD as well as on change. Keeping it in one effect
   // keyed on the stored value means the panel only has to save — the change
@@ -1149,6 +1191,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
 
   useEffect(() => {
     if (!selectedAgentId || !snapshot.agents.some((agent) => agent.id === selectedAgentId)) {
+      // voice-registry-exempt: an invariant, not a control — keeps the selection on a live agent when the snapshot moves under it
       setSelectedAgentId(snapshot.agents[0]?.id ?? "");
     }
   }, [selectedAgentId, snapshot.agents]);
@@ -1265,54 +1308,54 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   };
 
   /**
-   * Issue #1042: the terminal IS the input path now, so the palette's
-   * "Message coordinator…" entry puts the caret where the agent's own CLI
-   * grammar lives instead of in a composer that no longer exists. It still
-   * sends nothing — it selects the agent, shows its terminal, and asks that
-   * terminal to take focus.
+   * Every deck overlay closed, the deck itself left alone. Only the deck's own
+   * panels: the shortcut sheet is not a {@link DeckOverlay} and has its own
+   * close. Each write is `setOverlay(…, false)`, a dismissal, which is why it
+   * may live outside the context below (PRD #1195's capability-state rule).
    */
-  const focusTerminal = (agentId: string) => {
-    setSelectedAgentId(agentId);
-    setTabs((current) => ({ ...current, [agentId]: "terminal" }));
-    setTerminalFocus((current) => ({ agentId, token: (current?.token ?? 0) + 1 }));
-  };
-
+  const closeOverlays = () => DECK_OVERLAYS.forEach((overlay) => setOverlay(overlay, false));
   /**
    * PRD #802 M2 — the deck's half of the action registry's context, and the one
-   * place the rail buttons, the palette entries and the tile's open/close pair
-   * reach their state from.
+   * place the rail buttons, the palette entries, the tile's open/close pair and
+   * (since PRD #1195 M1) the in-panel controls reach their state from.
    *
-   * A `Record<DeckOverlay, …>` rather than a switch, so adding an overlay to the
-   * union is a type error here rather than a silently unreachable case. Each
-   * setter is React's own and therefore stable, which is what makes it safe for
-   * the `window` keydown effect below to close over the first render's copy.
-   */
-  const overlaySetters: Record<DeckOverlay, (open: boolean) => void> = {
-    projects: setProjectsOpen,
-    prompts: setPromptsOpen,
-    profiles: setProfilesOpen,
-    orchestration: setOrchestrationOpen,
-    settings: setSettingsOpen,
-  };
-  const closeOverlays = () => Object.values(overlaySetters).forEach((setOpen) => setOpen(false));
-  /**
+   * **The setters are named INSIDE this literal, and that is load-bearing**
+   * (PRD #1195 M2): `xtask/linkage-check`'s capability-state rule derives the
+   * registry-owned setters from what this literal names, and fails the build
+   * on a write to one of them anywhere else that is not a dismissal or does
+   * not carry a written exemption. A helper defined above and referenced here
+   * would hide its setters from that derivation, which is why
+   * `focusTerminal`'s body is written in place rather than beside it.
+   *
+   * Each setter is React's own or `useShellOverlays`' stable one, which is what
+   * makes it safe for the `window` keydown effect below to close over the
+   * first render's copy.
+   *
    * **`onNavigate` and `onCloseAgent` stay optional here rather than in the
    * registry.** Both have been optional props since PRD #1105, so a deck
    * mounted without them renders and its Overview button does nothing — the
    * behaviour this move must not change. Deciding what an absent prop means is
-   * the host's job; the registry's job is to be the dispatch seam for the rail,
-   * the palette and every voice-reachable capability. Five of its `no_voice`
-   * entries also have a second `setState` path in this file — `voiceActions.ts`
-   * names them, and the narrower claim is the true one.
+   * the host's job; the registry's job is to be the dispatch seam.
    */
   const voiceContext: VoiceScreenContext = {
     navigate: (view) => onNavigate?.(view),
     closeAgentView: () => onCloseAgent?.(),
-    openOverlay: (overlay) => overlaySetters[overlay](true),
+    openOverlay: (overlay) => setOverlay(overlay, true),
     closeOverlays,
-    toggleEvidence: () => setEvidenceOpen((open) => !open),
+    toggleEvidence: (open) => setEvidenceOpen((current) => open ?? !current),
     selectAgent: setSelectedAgentId,
-    focusTerminal,
+    /*
+     * Issue #1042: the terminal IS the input path now, so the palette's
+     * "Message coordinator…" entry puts the caret where the agent's own CLI
+     * grammar lives instead of in a composer that no longer exists. It still
+     * sends nothing — it selects the agent, shows its terminal, and asks that
+     * terminal to take focus.
+     */
+    focusTerminal: (agentId) => {
+      setSelectedAgentId(agentId);
+      setTabs((current) => ({ ...current, [agentId]: "terminal" }));
+      setTerminalFocus((current) => ({ agentId, token: (current?.token ?? 0) + 1 }));
+    },
     advanceFixture: () => { void perform({ type: "advance_fixture" }); },
   };
 
@@ -1355,7 +1398,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         // Not a registry dispatch, and the distinction is worth keeping: this
         // is a blanket DISMISSAL — palette, shortcut sheet, confirm dialog and
         // every overlay at once — rather than the Deck control, which shows the
-        // deck. It shares `closeOverlays` so the five setters are written once.
+        // deck. It shares `closeOverlays` so the deck overlays are listed once.
         setPaletteOpen(false); setHelpOpen(false); closeOverlays(); setConfirm(undefined);
         return;
       }
@@ -1515,7 +1558,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
             return;
           }
           await runtime.runAction({ type: "activate_orchestration", ...launch });
-          setOrchestrationOpen(false);
+          setOverlay("orchestration", false);
           await runtime.reconnect();
           setNotice(`${config.displayName} activated with ${config.roles.length} configured roles.`);
         } catch (cause) {
@@ -1548,8 +1591,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           if (message.includes(PROJECT_UNRESOLVED_CODE)) {
             projectState.clearSelection();
             void projectState.refresh();
-            setOrchestrationOpen(false);
-            setProjectsOpen(true);
+            setOverlay("orchestration", false);
+            VOICE_ACTIONS.openProjects.run(voiceContext);
             setNotice("That project is no longer one this daemon knows — nothing is running there any more. Choose another, or paste its path again.");
             return;
           }
@@ -1587,7 +1630,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
            * sentence already names what to do instead, so pass it through.
            */
           if (message.includes(PROJECT_UNSUPPORTED_PLATFORM_CODE)) {
-            setOrchestrationOpen(false);
+            setOverlay("orchestration", false);
             setNotice(message);
             return;
           }
@@ -1748,7 +1791,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         )}
 
         {!allDecks && <section className="workflow-strip" aria-labelledby="workflow-title">
-          <header><div><span className="section-kicker">RUN GRAPH</span><h1 id="workflow-title">Visible deterministic loop</h1></div><button onClick={() => setOrchestrationOpen(true)}><SlidersHorizontal size={13} /> Edit loop</button></header>
+          <header><div><span className="section-kicker">RUN GRAPH</span><h1 id="workflow-title">Visible deterministic loop</h1></div><button onClick={() => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext)}><SlidersHorizontal size={13} /> Edit loop</button></header>
           <div className="workflow-track">
             {orderedStages.length ? orderedStages.map((stage, index) => (
               <div className={`workflow-node node-${stage.status} ${stage.enabled ? "" : "is-disabled"}`} key={stage.id} data-testid={`workflow-node-${stage.id}`}>
@@ -1756,7 +1799,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                 <div><strong>{stage.label}</strong><small>{stage.enabled ? (stage.attempt === undefined ? stage.status : `${stage.status} · att ${stage.attempt}`) : "skipped"}</small></div>
                 {index < orderedStages.length - 1 && <i className="workflow-link" aria-hidden="true" />}
               </div>
-            )) : <div className="workflow-empty">No workflow nodes reported. Open <button onClick={() => setOrchestrationOpen(true)}>Edit loop</button> to inspect configuration.</div>}
+            )) : <div className="workflow-empty">No workflow nodes reported. Open <button onClick={() => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext)}>Edit loop</button> to inspect configuration.</div>}
           </div>
         </section>}
 
@@ -1765,7 +1808,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         {!allDecks && <section className="workspace-section" aria-label="Agent terminals">
           <header className="workspace-header">
             <div><span className="section-kicker">AGENT DECK</span><h2>Live work surfaces</h2></div>
-            <div className="workspace-tools"><span>{snapshot.agents.length} agents</span><span>{snapshot.agents.filter((agent) => agent.status === "running").length} active</span><button className={evidenceOpen ? "is-active" : ""} onClick={() => setEvidenceOpen((open) => !open)}><PanelRight size={14} /> Events</button></div>
+            <div className="workspace-tools"><span>{snapshot.agents.length} agents</span><span>{snapshot.agents.filter((agent) => agent.status === "running").length} active</span><button className={evidenceOpen ? "is-active" : ""} onClick={() => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext)}><PanelRight size={14} /> Events</button></div>
           </header>
           {snapshot.connection.status === "loading" && !snapshot.agents.length ? <LoadingDeck /> : snapshot.agents.length ? (
             <div className="agent-grid">
@@ -1793,12 +1836,13 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                   evidence={snapshot.evidence}
                   inputResult={runtime.terminalInputResults?.[agentKey(agent.daemonId, agent.id)]}
                   terminalFocusToken={terminalFocus?.agentId === agent.id ? terminalFocus.token : 0}
-                  onSelect={() => setSelectedAgentId(agent.id)}
+                  onSelect={() => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id })}
+                  // voice-registry-exempt: a tile's own tab strip, a control inside one tile; `focusTerminal` writes the same map only to show the terminal it focuses
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}
                   onTerminalInput={runtime.sendTerminalInput}
                   onTerminalResize={runtime.resizeTerminal}
                   appliedGeometry={runtime.appliedGeometry?.[agentKey(agent.daemonId, agent.id)]}
-                  onEvidenceSelect={(id) => { setSelectedEvidenceId(id); setEvidenceOpen(true); }}
+                  onEvidenceSelect={(id) => { setSelectedEvidenceId(id); VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext, { open: true }); }}
                   onRename={mode === "live" ? renameAgent : undefined}
                   /*
                     Opening SELECTS as well, which is the difference between the
@@ -1813,7 +1857,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                 />
               ))}
             </div>
-          ) : <EmptyDeck onReconnect={() => void runtime.reconnect()} onProfiles={() => setProfilesOpen(true)} />}
+          ) : <EmptyDeck onReconnect={() => void runtime.reconnect()} onProfiles={() => VOICE_ACTIONS.openAgentProfiles.run(voiceContext)} />}
         </section>}
       </main>
 
@@ -1822,8 +1866,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       <ProjectsPanel
         open={projectsOpen}
         state={projectState}
-        onClose={() => setProjectsOpen(false)}
-        onConfigureOrchestration={() => { setProjectsOpen(false); setOrchestrationOpen(true); }}
+        onClose={() => setOverlay("projects", false)}
+        onConfigureOrchestration={() => { setOverlay("projects", false); VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext); }}
         allDecks={allDecks}
       />
       <PromptLibraryPanel
@@ -1831,13 +1875,13 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         prompts={prompts}
         selectedId={selectedPromptId}
         onSelect={setSelectedPromptId}
-        onClose={() => setPromptsOpen(false)}
+        onClose={() => setOverlay("prompts", false)}
         onAdd={() => setSelectedPromptId(addPrompt())}
         onUpdate={updatePrompt}
         onRemove={(id) => { removePrompt(id); setNotice("Prompt removed from this device's library."); }}
       />
-      <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOrchestrationOpen(false); setProjectsOpen(true); }} onClose={() => setOrchestrationOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={orchestrationPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} liveTitles={orchestrationLiveTitles} liveDirectories={orchestrationLiveDirectories} deckId={orchestrationDeckId} />
+      <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setOverlay("profiles", false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
+      <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOverlay("orchestration", false); VOICE_ACTIONS.openProjects.run(voiceContext); }} onClose={() => setOverlay("orchestration", false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={orchestrationPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} liveTitles={orchestrationLiveTitles} liveDirectories={orchestrationLiveDirectories} deckId={orchestrationDeckId} />
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
@@ -1985,7 +2029,7 @@ function EmptyDeck({ onReconnect, onProfiles }: { onReconnect: () => void; onPro
 }
 
 function CommandPalette({ commands, onClose }: { commands: { label: string; hint: string; icon: typeof Bot; run: () => void }[]; onClose: () => void }) {
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(""); // voice-registry-exempt: the palette's search text
   const filtered = commands.filter((item) => `${item.label} ${item.hint}`.toLowerCase().includes(query.toLowerCase()));
   return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section className="command-palette" role="dialog" aria-modal="true" aria-label="Command menu" onMouseDown={(event) => event.stopPropagation()}><label><Search size={17} /><input autoFocus placeholder="Search controls, agents, and views…" value={query} onChange={(event) => setQuery(event.target.value)} /><kbd>ESC</kbd></label><div>{filtered.map(({ label, hint, icon: Icon, run }) => <button key={label} onClick={() => { run(); onClose(); }}><Icon size={16} /><span><strong>{label}</strong><small>{hint}</small></span><ChevronRight size={14} /></button>)}{!filtered.length && <p>No matching controls.</p>}</div><footer><span><Command size={12} /> local control surface</span><span><kbd>↵</kbd> select</span></footer></section></div>;
 }

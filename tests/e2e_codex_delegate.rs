@@ -395,8 +395,16 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     // worker only happens BECAUSE of the delegate this wait would gate — a
     // circular precondition. The native events are asserted after the delegate
     // instead (below), where they prove delivery rather than deadlock on it.
+    //
+    // Matched ASCII-case-insensitively because Codex paints the model's DISPLAY
+    // name: `--model gpt-5.6-luna`, the model the Codex preflight recommends for
+    // a ChatGPT-subscription login, renders `GPT-5.6-Luna`, and a case-sensitive
+    // needle failed this precondition with the TUI visibly up (issue #1243's
+    // lane-2 run).
     assert!(
-        deck.wait_for_grid_string_within(common::codex_test_model(), Duration::from_secs(60)),
+        deck.wait_for_grid_predicate_within(Duration::from_secs(60), |grid| grid
+            .to_ascii_lowercase()
+            .contains(&common::codex_test_model().to_ascii_lowercase())),
         "the `clear = true` worker's REAL Codex TUI never came up in its role pane (no {:?} \
          header within 60s) — nothing has been delegated yet, so this is a boot/auth failure, \
          not a delivery failure.\nFinal grid:\n{}",
