@@ -3933,6 +3933,26 @@ struct DelegationCommission {
     /// an agent exit that took no close path, so nothing swept the ledger — must
     /// not refuse the successor, which never delegated that work.
     orchestrator_agent_id: Option<String>,
+    /// Issue #447 review (#1347, Qodo finding 15): the registry agent id of the
+    /// WORKER the newest commission was made to — the agent that holds the task
+    /// pointer. Last delegate wins, like the orchestrator fields: every arm
+    /// resets it to `None`, and the delegate path binds it
+    /// ([`AgentPtyRegistry::bind_commission_worker_agent_id`]) once it knows who
+    /// the pointer goes to — the pane's occupant for a `clear = false` delegate,
+    /// the fresh agent once a `clear = true` respawn has resolved.
+    ///
+    /// Read only by [`AgentPtyRegistry::commission_owed_to_agent`]. A worker
+    /// that exits naturally takes no path that sweeps its commission, so the
+    /// entry can outlive it by up to [`DELEGATION_COMMISSION_TTL`] (issue #507);
+    /// this is what stops a later agent in the same pane, which was never
+    /// delegated to, from being reported as the commissioned worker.
+    worker_agent_id: Option<String>,
+    /// Issue #447 review (#1347, Qodo): the arm id
+    /// ([`CommissionDispatchInFlight::arm_id`]) of the newest commission. A
+    /// bind is applied only for this arm, so a dispatch that reaches the pane's
+    /// dispatch lock after a newer delegate was armed — spawned dispatch tasks
+    /// are not ordered — cannot overwrite the newer commission's worker.
+    newest_arm_id: Option<u64>,
 }
 
 /// Issue #590: how long a commission stays owed without a `work-done` crediting
@@ -3964,6 +3984,8 @@ impl DelegationCommission {
             armed_at: VecDeque::new(),
             orchestrator_pane_id: orchestrator_pane_id.to_string(),
             orchestrator_agent_id: None,
+            worker_agent_id: None,
+            newest_arm_id: None,
         }
     }
 
@@ -4063,6 +4085,14 @@ pub struct CommissionDispatchInFlight {
 }
 
 impl CommissionDispatchInFlight {
+    /// Issue #447 review (#1347): the arm this guard belongs to — what
+    /// [`AgentPtyRegistry::bind_commission_worker_agent_id`] takes, so a
+    /// dispatch can bind its worker only while its commission is still the
+    /// pane's newest.
+    pub fn arm_id(&self) -> u64 {
+        self.id
+    }
+
     /// Record which idle-worker record this dispatch armed — its `seq`, or
     /// `None` when the idle detector armed nothing for it. Until this is called
     /// the dispatch's idle record is unknown, and
@@ -5250,6 +5280,10 @@ impl AgentPtyRegistry {
         entry.orchestrator_pane_id = orchestrator_pane_id.to_string();
         entry.orchestrator_agent_id = orchestrator_agent_id.map(str::to_string);
         let id = self.delegation_seq.fetch_add(1, Ordering::SeqCst);
+        // Nobody holds this commission's task pointer yet: the caller binds the
+        // worker once it knows who that is, under this arm's id (Qodo, #1347).
+        entry.worker_agent_id = None;
+        entry.newest_arm_id = Some(id);
         tracker
             .commission_dispatches_in_flight
             .entry(worker_pane_id.to_string())
@@ -5319,17 +5353,75 @@ impl AgentPtyRegistry {
     /// ([`DELEGATION_COMMISSION_TTL`]) are dropped first, like every other
     /// ledger read. The orchestrator fields are last-delegate-wins, exactly as
     /// the busy check reads them.
+    ///
+    /// Says nothing about WHICH agent in the pane owes it; a caller about to
+    /// report on a specific agent wants [`Self::commission_owed_to_agent`].
     pub fn commission_owed_to(&self, worker_pane_id: &str) -> Option<CommissionOwner> {
+        self.commission_owed_where(worker_pane_id, |_| true)
+    }
+
+    /// Issue #447 review (#1347, Qodo finding 15): [`Self::commission_owed_to`],
+    /// but only when the newest outstanding commission was made to
+    /// `worker_agent_id` — the agent bound by
+    /// [`Self::bind_commission_worker_agent_id`]. `None` for a commission whose
+    /// worker has not been bound yet, and for one bound to a different agent:
+    /// a worker that exited without a `work-done` leaves its commission standing
+    /// (issue #507), and a later agent in the same pane was never delegated to.
+    pub fn commission_owed_to_agent(
+        &self,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
+    ) -> Option<CommissionOwner> {
+        self.commission_owed_where(worker_pane_id, |entry| {
+            entry.worker_agent_id.as_deref() == Some(worker_agent_id)
+        })
+    }
+
+    /// The shared read behind [`Self::commission_owed_to`] and
+    /// [`Self::commission_owed_to_agent`].
+    fn commission_owed_where(
+        &self,
+        worker_pane_id: &str,
+        accept: impl Fn(&DelegationCommission) -> bool,
+    ) -> Option<CommissionOwner> {
         let mut tracker = self.delegations.lock().unwrap();
         Self::expire_commissions(&mut tracker, worker_pane_id, Instant::now());
         tracker
             .commissions
             .get(worker_pane_id)
-            .filter(|entry| entry.outstanding() > 0)
+            .filter(|entry| entry.outstanding() > 0 && accept(entry))
             .map(|entry| CommissionOwner {
                 orchestrator_pane_id: entry.orchestrator_pane_id.clone(),
                 orchestrator_agent_id: entry.orchestrator_agent_id.clone(),
             })
+    }
+
+    /// Issue #447 review (#1347, Qodo finding 15): record that
+    /// `worker_pane_id`'s newest commission was made to `worker_agent_id` — the
+    /// agent its task pointer goes to. `arm_id` is the arm the caller's
+    /// dispatch holds ([`CommissionDispatchInFlight::arm_id`]); the bind is a
+    /// no-op unless that arm is still the pane's newest, so a dispatch that runs
+    /// after a newer delegate was armed cannot rebind the newer commission
+    /// (Qodo, #1347). A no-op too when the pane owes nothing. See
+    /// [`DelegationCommission::worker_agent_id`].
+    ///
+    /// Returns whether the bind was applied.
+    pub fn bind_commission_worker_agent_id(
+        &self,
+        worker_pane_id: &str,
+        arm_id: u64,
+        worker_agent_id: &str,
+    ) -> bool {
+        let mut tracker = self.delegations.lock().unwrap();
+        let Some(entry) = tracker
+            .commissions
+            .get_mut(worker_pane_id)
+            .filter(|entry| entry.newest_arm_id == Some(arm_id))
+        else {
+            return false;
+        };
+        entry.worker_agent_id = Some(worker_agent_id.to_string());
+        true
     }
 
     /// Issue #447: open a waiting episode for `worker_pane_id` — its hook has
@@ -17921,6 +18013,78 @@ mod spawn_tests {
             reg.commission_owed_to("worker"),
             None,
             "a credited work-done leaves nobody to report a wait to"
+        );
+    }
+
+    /// Issue #447 review (#1347, Qodo finding 15): the waiting notice's read of
+    /// the ledger answers only for the worker agent the newest commission was
+    /// made to. Unbound, bound to another agent, or reset by a newer arm, it
+    /// answers `None` — while `commission_owed_to`, which a second caller may
+    /// read, is unchanged. And a bind is taken only for the newest arm, so an
+    /// older dispatch that runs after a newer delegate was armed cannot rebind
+    /// the newer commission (Qodo, #1347).
+    #[test]
+    fn commission_owed_to_agent_answers_only_for_the_bound_worker() {
+        fn arm(reg: &Arc<AgentPtyRegistry>, supersede: bool) -> u64 {
+            match reg.arm_delegation_commission("worker", "orch", Some("orch-agent"), supersede) {
+                CommissionArm::Armed { in_flight, .. } => in_flight.arm_id(),
+                other => panic!("expected an armed commission, got {other:?}"),
+            }
+        }
+        let reg = Arc::new(AgentPtyRegistry::new());
+        reg.bind_commission_worker_agent_id("worker", 0, "worker-agent-1");
+        assert_eq!(
+            reg.commission_owed_to_agent("worker", "worker-agent-1"),
+            None,
+            "binding a pane that owes nothing must not create a commission"
+        );
+        let first = arm(&reg, false);
+        let owner = CommissionOwner {
+            orchestrator_pane_id: "orch".to_string(),
+            orchestrator_agent_id: Some("orch-agent".to_string()),
+        };
+        assert_eq!(
+            reg.commission_owed_to_agent("worker", "worker-agent-1"),
+            None,
+            "a commission nobody has been bound to is owed by no agent yet"
+        );
+        assert_eq!(reg.commission_owed_to("worker"), Some(owner.clone()));
+        reg.bind_commission_worker_agent_id("worker", first, "worker-agent-1");
+        assert_eq!(
+            reg.commission_owed_to_agent("worker", "worker-agent-1"),
+            Some(owner.clone())
+        );
+        assert_eq!(
+            reg.commission_owed_to_agent("worker", "worker-agent-2"),
+            None,
+            "a later agent in the pane was never delegated to"
+        );
+        let second = arm(&reg, true);
+        assert_eq!(
+            reg.commission_owed_to_agent("worker", "worker-agent-1"),
+            None,
+            "a newer delegation resets the binding until its worker is known"
+        );
+        reg.bind_commission_worker_agent_id("worker", second, "worker-agent-2");
+        assert_eq!(
+            reg.commission_owed_to_agent("worker", "worker-agent-2"),
+            Some(owner.clone())
+        );
+        // The older dispatch reaches the pane after the newer one, replaces the
+        // worker, and tries to bind its own agent: refused.
+        reg.bind_commission_worker_agent_id("worker", first, "worker-agent-3");
+        assert_eq!(
+            reg.commission_owed_to_agent("worker", "worker-agent-3"),
+            None,
+            "an older arm's dispatch rebound the newer commission's worker"
+        );
+        assert_eq!(
+            reg.commission_owed_to_agent("worker", "worker-agent-2"),
+            Some(owner)
+        );
+        assert_eq!(
+            reg.commission_owed_to_agent("worker", "worker-agent-1"),
+            None
         );
     }
 

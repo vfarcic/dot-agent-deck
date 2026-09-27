@@ -36,6 +36,9 @@ pub(crate) const DAEMON_TIMEOUT: Duration = Duration::from_secs(45);
 /// Settle pause between a key and the next one, where the deck has to redraw in
 /// between and there is nothing specific to poll for.
 pub(crate) const SETTLE: Duration = Duration::from_millis(400);
+
+/// A button the deck's footer draws only in Normal mode — see [`focus_role`].
+const NORMAL_MODE_BUTTON: &str = "[New Pane Ctrl+N]";
 /// How long the daemon gets after its one SIGTERM. Well past its 3 s agent
 /// grace (`AGENT_TERMINATE_GRACE`).
 pub(crate) const DAEMON_GRACE: Duration = Duration::from_secs(20);
@@ -2734,6 +2737,18 @@ pub(crate) fn focus_role(deck: &pty::PtyDeck, plan: &Plan, role: &str) -> Result
     let expanded = format!("┌{role}");
     for attempt in 0..6 {
         deck.send(b"\x04"); // Ctrl+D -> Normal mode
+        // Wait for Normal mode to be PAINTED before the digit, rather than only
+        // sleeping. A fixed `SETTLE` alone lost the race on a loaded host (load
+        // average 12-20 on 16 cores, found running this harness for #1243): the
+        // digit reached the focused pane as input, the orchestrator's shell ran
+        // `1dot-agent-deck delegate …`, and tells 3 and 4 failed on `main` and
+        // on a branch alike. The full button bar is drawn only outside
+        // PaneInput mode (which shows just the dashboard button), so its
+        // `[New Pane Ctrl+N]` is a positive confirmation — the one the e2e
+        // tier's own PTY tests use after the same Ctrl+D. Bounded, and the
+        // sleep stays: a transient status message can occupy the bar's row, and
+        // then this falls back to exactly the old behaviour.
+        let _ = deck.wait_for_grid_string(NORMAL_MODE_BUTTON, SETTLE * 5);
         std::thread::sleep(SETTLE);
         deck.send(&[digit]);
         if deck.wait_for_grid_string(&expanded, STEP_TIMEOUT) {
