@@ -146,18 +146,6 @@ fn capture_unless(
         );
         page.replace_range(start..end, &format!("{display:<width$}"));
     }
-    if scenario == "orchestration" {
-        // Role-card ages depend on when the sandbox daemon finishes spawning.
-        // Blank just that footer text, preserving its cell count and the card
-        // borders, so the run depicts the same scene on every capture.
-        let ages = regex::Regex::new(r"Last: [0-9]+s  Tools: [0-9]+")
-            .expect("valid role-card age matcher");
-        page = ages
-            .replace_all(&page, |caps: &regex::Captures<'_>| {
-                " ".repeat(caps[0].len())
-            })
-            .into_owned();
-    }
     let dir = html_dir();
     std::fs::create_dir_all(&dir).expect("create the TUI HTML dir");
     let path = dir.join(format!("{scenario}-tui.html"));
@@ -690,13 +678,50 @@ fn docs_screenshot_new_agent() {
 }
 
 /// Scenario: Activate the project's demo-loop orchestration with two stand-in
-/// roles, then show its active tab and the two role panes.
+/// roles, then address synthetic working events to their real pane IDs. Capture
+/// its active tab only when both role cards show their work and fixed ages.
 #[test]
 #[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
 fn docs_screenshot_orchestration() {
     html_dir();
+    for attempt in 1..=DASHBOARD_ATTEMPTS {
+        let scene = stage_orchestration();
+        let ready = |grid: &str| {
+            grid.contains("demo-loop [×]")
+                && grid.contains("planner")
+                && grid.contains("builder")
+                && grid.contains("Planning the checkout retry flow")
+                && grid.contains("Plan the checkout retry flow.")
+                && grid.contains("Implement the checkout retry flow.")
+                && grid.contains("src/checkout/flow.ts")
+                && grid.contains("src/checkout/RetryPayment.tsx")
+                && grid.contains("Last: 2s ")
+                && grid.contains("Last: 3s ")
+                && grid.matches("Working").count() == 2
+                && grid.matches('●').count() == 2
+                && !grid.contains("No agent")
+                && !grid.contains("Launch an agent to get started")
+                && !grid.contains("Activated orchestration")
+        };
+        let last_attempt = attempt == DASHBOARD_ATTEMPTS;
+        let missed = || !last_attempt && Utc::now().timestamp() >= scene.capture_at + 2;
+        if capture_unless(&scene.deck, "orchestration", ready, missed) {
+            return;
+        }
+        eprintln!(
+            "docs_screenshot_orchestration: attempt {attempt} of {DASHBOARD_ATTEMPTS} \
+             missed its capture second; building the scene again"
+        );
+    }
+    unreachable!("the last attempt either captures or panics");
+}
+
+/// A fresh orchestration whose role hooks are stamped for one capture second.
+fn stage_orchestration() -> DashboardScene {
     let deck = launch_fixture_with("docs-screenshots", |builder| {
-        builder.with_launch_subdir(DOCS_PROJECT_DIR)
+        builder
+            .with_launch_subdir(DOCS_PROJECT_DIR)
+            .impersonating_pane_signals()
     });
     deck.wait_for_string("No active agents");
     deck.send_keys(b"\x0e");
@@ -709,14 +734,87 @@ fn docs_screenshot_orchestration() {
     deck.send_keys(&vec![0x7f; "demo-project-orchestrator-1".len()]);
     deck.send_keys(b"demo-loop");
     deck.send_keys(b"\r");
-    capture(&deck, "orchestration", |grid| {
-        grid.contains("demo-loop [×]")
-            && grid.contains("planner")
-            && grid.contains("builder")
-            && grid.contains("Planning the checkout retry flow")
-            && !grid.contains("Activated orchestration")
-            && grid.matches('●').count() == 2
-    });
+    wait_for_record(&deck, "planner", |_| true);
+    wait_for_record(&deck, "builder", |_| true);
+
+    // A role card's last activity starts at its pane's spawn. Stamp both
+    // status events after both panes exist, on whole seconds, so their Last:
+    // labels roll over together and the ready check captures exactly one
+    // second. Rebuild the scene if that second is missed.
+    let now = Utc::now();
+    // The activation banner has a 15-second TTL. Its lifetime starts before
+    // this clock sample, so 18 seconds leaves room for its next redraw to
+    // clear it before the capture second.
+    let capture_at = now.timestamp() + 18;
+    for (role, agent_type, session, prompt, tool, detail, quiet_for_secs) in [
+        (
+            "planner",
+            "claude_code",
+            "docs-orch-planner",
+            "Plan the checkout retry flow.",
+            "Read",
+            "src/checkout/flow.ts",
+            2,
+        ),
+        (
+            "builder",
+            "codex",
+            "docs-orch-builder",
+            "Implement the checkout retry flow.",
+            "Edit",
+            "src/checkout/RetryPayment.tsx",
+            3,
+        ),
+    ] {
+        let record = wait_for_record(&deck, role, |_| true);
+        let pane_id = record
+            .pane_id_env
+            .clone()
+            .unwrap_or_else(|| panic!("{role}'s pane has no pane id"));
+        send(
+            &deck,
+            serde_json::json!({
+                "session_id": session,
+                "agent_type": agent_type,
+                "event_type": "session_start",
+                "timestamp": (now - ChronoDuration::minutes(30)).to_rfc3339(),
+                "cwd": "/home/dev/demo-project",
+                "pane_id": pane_id,
+                "agent_id": record.id,
+                "metadata": { "display_name": role },
+            }),
+        );
+        let expected_type = serde_json::Value::from(agent_type);
+        wait_for_record(&deck, role, |r| {
+            r.live.as_ref().is_some_and(|live| {
+                live.agent_type.as_ref().map(|t| serde_json::json!(t))
+                    == Some(expected_type.clone())
+            })
+        });
+        send(
+            &deck,
+            serde_json::json!({
+                "session_id": session,
+                "agent_type": agent_type,
+                "event_type": "tool_start",
+                "timestamp": chrono::DateTime::from_timestamp(capture_at - quiet_for_secs, 0)
+                    .expect("a representable instant")
+                    .to_rfc3339(),
+                "cwd": "/home/dev/demo-project",
+                "pane_id": pane_id,
+                "agent_id": record.id,
+                "user_prompt": prompt,
+                "tool_name": tool,
+                "tool_detail": detail,
+            }),
+        );
+        wait_for_record(&deck, role, |r| {
+            r.live
+                .as_ref()
+                .is_some_and(|live| live.last_user_prompt.as_deref() == Some(prompt))
+        });
+    }
+    DashboardScene { deck, capture_at }
 }
 
 /// Scenario: Open the Schedules manager over an empty dashboard with one

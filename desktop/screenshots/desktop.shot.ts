@@ -29,6 +29,9 @@ desktopScenario("dashboard-empty", async (page) => {
 
 desktopScenario("dashboard-fleet", async (page) => {
   await overview(page, "docs-fleet");
+  await page.getByTestId("deck-selector-toggle").click();
+  await page.getByTestId("deck-selector-option-all").click();
+  await expect(page.getByTestId("deck-selector-current")).toHaveText("All daemons");
   await expect(page.getByTestId("daemon-group")).toHaveCount(2);
   await expect(page.getByTestId("overview-count-decks")).toContainText("2/2");
   await expect(page.locator(".overview-row")).toHaveCount(6);
