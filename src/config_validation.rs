@@ -443,8 +443,16 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
         }
 
         // Issue #1243: a role whose agent the deck cannot identify at all.
+        let named_orchestrator = orch.roles.iter().any(|r| r.name == "orchestrator");
         for role in &orch.roles {
-            if let Some(issue) = unidentified_role_agent_issue(&orch.name, role) {
+            // Orchestrator on BOTH registration paths (see
+            // `unidentified_role_agent_issue`): the start role, unless a
+            // different role is named `orchestrator`.
+            let orchestrator_everywhere =
+                role.start && (role.name == "orchestrator" || !named_orchestrator);
+            if let Some(issue) =
+                unidentified_role_agent_issue(&orch.name, role, orchestrator_everywhere)
+            {
                 issues.push(issue);
             }
         }
@@ -524,30 +532,44 @@ fn unknown_agent_issue(scope: &str, declared: Option<&str>) -> Option<Validation
 /// (`dispatch_one_owned` in `src/state.rs` enters it only inside its
 /// `role.clear` branch), so the timeout is claimed only for a worker that takes
 /// it. A `clear = false` worker keeps its process and gets the task pointer
-/// written straight into it, and the `start` role is never a delegate target at
-/// all (`AppState::delegate_targets` filters out every orchestrator pane); both still get the warning, because the card still gets no agent from
-/// the config and a Codex agent behind the launcher still runs without the
-/// deck's wrapper (`spawn` resolves the wrapper from the same type), but the
-/// message says that instead of a wait they never pay.
+/// written straight into it, and the orchestrator is never a delegate target at
+/// all (`AppState::delegate_targets` filters out every orchestrator pane). Both
+/// still get the warning, because the card still gets no agent from the config
+/// and a Codex agent behind the launcher still runs without the deck's wrapper
+/// (`spawn` resolves the wrapper from the same type), but the message says that
+/// instead of a wait they never pay.
+///
+/// Which role is the orchestrator is NOT one answer, which is why the caller
+/// passes `orchestrator_everywhere` rather than this reading `role.start`. The
+/// two ways the daemon registers a tab's orchestrator disagree (issue #523): the
+/// daemon's `spawn` registers [`crate::spawn::orchestrator_role_index`] — the
+/// role named `orchestrator`, else the start role — while the `Ctrl+N` path
+/// registers the raw `start` flag. Validation already demands exactly one
+/// `start = true` role, so they agree precisely when that role is itself named
+/// `orchestrator` or no role is; only then is "never a delegate target" true
+/// whichever path opened the tab. Any other role gets the `clear`-keyed
+/// message, which holds on both paths, since it describes each delegation the
+/// role does receive.
 fn unidentified_role_agent_issue(
     scope: &str,
     role: &crate::project_config::OrchestrationRoleConfig,
+    orchestrator_everywhere: bool,
 ) -> Option<ValidationIssue> {
     if role.command.trim().is_empty() || role.resolved_agent_type().is_some() {
         return None;
     }
     let command = bound_chars(role.command.trim(), MAX_QUOTED_VALUE_CHARS);
-    let consequence = if role.start {
-        "the card gets no agent from the config, and a Codex agent behind it runs without the \
-         deck's wrapper. It is the start role, which is never a delegate target, so it never \
-         waits on the readiness timeout"
+    let consequence = if orchestrator_everywhere {
+        "the card gets no agent from the config, and if the agent behind it is Codex it runs \
+         without the deck's wrapper. It is the start role, which is never a delegate target, so \
+         it never waits on the readiness timeout"
     } else if role.clear {
         "the card gets no agent from the config, and a Codex, Pi or OpenCode worker behind it \
          waits the full 30 s readiness timeout on every delegation"
     } else {
-        "the card gets no agent from the config, and a Codex agent behind it runs without the \
-         deck's wrapper. It keeps its process across delegations (`clear = false`), so no \
-         delegation waits on the readiness timeout"
+        "the card gets no agent from the config, and if the agent behind it is Codex it runs \
+         without the deck's wrapper. It keeps its process across delegations (`clear = false`), \
+         so no delegation waits on the readiness timeout"
     };
     Some(ValidationIssue {
         severity: Severity::Warning,
@@ -1136,6 +1158,45 @@ mod tests {
         assert!(
             warning_for(persistent).contains("`clear = false`"),
             "the persistent-worker warning names the setting that makes it so"
+        );
+
+        // Qodo on PR #1331: which role is the orchestrator depends on the path
+        // that opened the tab (issue #523) — `spawn` takes the role NAMED
+        // `orchestrator` first, `Ctrl+N` the `start = true` one. A start role
+        // that is not named `orchestrator` is the orchestrator on both paths
+        // only when no other role carries that name.
+        let messages = |roles: Vec<OrchestrationRoleConfig>| -> Vec<String> {
+            validate_config(&make_orch_config(vec![make_orchestration("orch", roles)]))
+                .into_iter()
+                .filter(|i| i.message.contains("declares no `agent`"))
+                .map(|i| i.message)
+                .collect()
+        };
+        let launcher = |name: &str, start: bool| {
+            let mut role = make_role(name, start);
+            role.command = "devbox run codex-big".to_string();
+            role
+        };
+
+        let unambiguous = messages(vec![launcher("planner", true), launcher("coder", false)]);
+        assert!(
+            unambiguous
+                .iter()
+                .any(|w| w.starts_with("role 'planner':") && w.contains("start role")),
+            "with no role named `orchestrator`, the start role is never delegated to; \
+             got {unambiguous:?}"
+        );
+
+        let split = messages(vec![
+            launcher("planner", true),
+            launcher("orchestrator", false),
+        ]);
+        assert_eq!(split.len(), 2, "both launcher roles warn; got {split:?}");
+        assert!(
+            split.iter().all(|w| !w.contains("start role")
+                && w.contains("30 s readiness timeout on every delegation")),
+            "beside a role named `orchestrator`, neither role is the orchestrator on every path, \
+             so neither may be told it is never delegated to; got {split:?}"
         );
     }
 
