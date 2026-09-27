@@ -3180,8 +3180,11 @@ impl AppState {
     /// informational report after the repaint (`SubagentStart`,
     /// `SubagentStop`, an event type from a newer build), which says nothing
     /// about its prompt and merely leaves the foreign status standing (Qodo,
-    /// #1347). An episode whose agent has been replaced is dropped when it
-    /// fires instead, by its own identity check.
+    /// #1347). Nor may a late report from the same agent's PREVIOUS hook
+    /// session — its conversation before a `/clear` — which names the live
+    /// agent but no longer speaks for the pane (Qodo, #1347; see
+    /// `pane_hook_session`). An episode whose agent has been replaced is
+    /// dropped when it fires instead, by its own identity check.
     ///
     /// **A rejected event touches no episode, and the pane's live agent is read
     /// here, under the state lock, after admission** (Qodo, #1347). Read before
@@ -3198,11 +3201,36 @@ impl AppState {
     ) {
         let pane_id = event.pane_id.clone();
         let event_agent_id = event.agent_id.clone();
+        let generation_before = pane_id
+            .as_deref()
+            .and_then(|pane_id| self.pane_hook_session.get(pane_id).cloned());
+        let (event_session_id, event_timestamp) = (event.session_id.clone(), event.timestamp);
         let applied = self.apply_event_reporting(event);
         let Some(pane_id) = pane_id else {
             return;
         };
         if applied == AppliedEvent::Rejected {
+            return;
+        }
+        // A report from a hook session the pane has already moved past — the
+        // same agent's conversation before a `/clear`, arriving late — is about
+        // a conversation that is over, so it neither opens nor closes a wait
+        // (Qodo, #1347). Judged by the generation rule `apply_event` keeps in
+        // `pane_hook_session`: the event is current if it names the generation
+        // the pane held and is not older than it, or if it just advanced the
+        // pane to a new one. A pane with no generation yet has nothing to be
+        // stale against.
+        let from_current_generation = match &generation_before {
+            None => true,
+            Some((current, current_ts)) => {
+                (*current == event_session_id && event_timestamp >= *current_ts)
+                    || self
+                        .pane_hook_session
+                        .get(&pane_id)
+                        .is_some_and(|(now, _)| *now == event_session_id && now != current)
+            }
+        };
+        if !from_current_generation {
             return;
         }
         let live_agent_id = registry.pane_current_agent_id(&pane_id);

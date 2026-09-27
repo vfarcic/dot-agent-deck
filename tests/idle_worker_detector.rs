@@ -1683,6 +1683,12 @@ impl IdleHarness {
             .await;
     }
 
+    /// Feed one prepared hook event through the daemon's real ingestion step.
+    async fn ingest(&self, event: dot_agent_deck::event::AgentEvent) {
+        dot_agent_deck::daemon::ingest_event(&self.state, &self.event_tx, &self.registry, event)
+            .await;
+    }
+
     /// Admit `role`'s worker pane to the daemon's `AppState`, as `StartAgent`
     /// does for an orchestration role pane, so its hook events drive a session.
     async fn manage_worker_pane(&self, role: &str) {
@@ -1703,7 +1709,7 @@ fn waiting_notices_for(snapshot: &str, role: &str) -> usize {
         .count()
 }
 
-/// Scenario: Delegate to six workers of one orchestration and leave a seventh undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card, after which its own agent reports only informational events; `already-waiting-worker` was waiting before it was delegated to; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first three — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other four, then or after further waiting.
+/// Scenario: Delegate to seven workers of one orchestration and leave an eighth undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card, after which its own agent reports only informational events; `cleared-worker`'s agent starts a new hook session and waits in it, and then a delayed report from its old session arrives; `already-waiting-worker` was waiting before it was delegated to; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first four — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other four, then or after further waiting.
 #[spec("scheduler/idle-worker/021")]
 #[test]
 fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() {
@@ -1724,6 +1730,7 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
                 ("impersonated-worker", WORKER_COMMAND),
                 ("repainted-worker", WORKER_COMMAND),
                 ("already-waiting-worker", WORKER_COMMAND),
+                ("cleared-worker", WORKER_COMMAND),
             ],
             None,
         )
@@ -1736,6 +1743,7 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             "impersonated-worker",
             "repainted-worker",
             "already-waiting-worker",
+            "cleared-worker",
         ] {
             harness.manage_worker_pane(role).await;
             harness.worker_event(role, "session_start").await;
@@ -1765,10 +1773,38 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
                 "impersonated-worker",
                 "repainted-worker",
                 "already-waiting-worker",
+                "cleared-worker",
             ])
             .await;
         // Let the task pointers land before the workers start "asking".
         tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The cleared worker's agent starts a NEW hook session — a `/clear` —
+        // and waits in it. Then a report from its OLD session arrives late:
+        // same agent id, the old session id, the old timestamp. It is about a
+        // conversation that is over, so it must not close the new one's wait
+        // (Qodo, #1347).
+        let cleared_agent = harness.worker_agent_ids["cleared-worker"].clone();
+        let before_clear = chrono::Utc::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for event_type in ["session_start", "waiting_for_input"] {
+            harness
+                .ingest(worker_hook_event(
+                    "cleared-worker",
+                    "session-cleared-worker-after-clear",
+                    event_type,
+                    Some(&cleared_agent),
+                ))
+                .await;
+        }
+        let mut delayed = worker_hook_event(
+            "cleared-worker",
+            "session-cleared-worker",
+            "thinking",
+            Some(&cleared_agent),
+        );
+        delayed.timestamp = before_clear;
+        harness.ingest(delayed).await;
 
         harness
             .worker_event("idle-bystander", "waiting_for_input")
@@ -1860,6 +1896,7 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
                         "asking-worker",
                         "repainted-worker",
                         "already-waiting-worker",
+                        "cleared-worker",
                     ]
                     .iter()
                     .all(|role| waiting_notices_for(snapshot, role) > 0)
@@ -1887,6 +1924,12 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             "a worker already waiting when it was delegated to was never reported; \
              snapshot = {snapshot:?}"
         );
+        assert_eq!(
+            waiting_notices_for(&snapshot, "cleared-worker"),
+            1,
+            "a delayed report from the worker's previous hook session closed the wait of the \
+             session that replaced it; snapshot = {snapshot:?}"
+        );
         assert!(
             snapshot.contains(&format!("{WAITING_FINAL_CLAUSE}\r")),
             "the waiting notice was not SUBMITTED with a CR, so an unattended orchestrator \
@@ -1912,7 +1955,7 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
         let settled = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
         assert_eq!(
             settled.matches(WAITING_NEEDLE).count(),
-            3,
+            4,
             "exactly one waiting notice per waiting worker may reach the orchestrator; \
              snapshot = {settled:?}"
         );
