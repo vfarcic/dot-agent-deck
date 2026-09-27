@@ -699,13 +699,16 @@ pub async fn handle_utterance_with(
             .filter(|value| !value.is_empty())
             // A REQUIRED deck made only of category words — "daemon", the
             // dialog's field heading, or "the deck" — names no deck, so it is
-            // asked for exactly as an absent one is (issue #1045). An optional
-            // one goes on to the resolver, which matches nothing for it, so
-            // the report says the daemon was not caught.
+            // asked for exactly as an absent one is (issue #1045); unless it
+            // is a deck's own name said whole (`ops@daemon`'s "daemon"),
+            // which goes on to the resolver like any other. An optional one
+            // goes on to the resolver either way, which matches nothing for a
+            // category word, so the report says the daemon was not caught.
             .filter(|value| {
                 spec.optional
                     || spec.kind != ParamKind::DeckRef
                     || !deck_reference(value).is_empty()
+                    || !decks_called(value, decks).is_empty()
             })
         else {
             // An optional param the model left out is simply not dispatched
@@ -1121,7 +1124,9 @@ fn said(spoken: &str, transcript: &str) -> bool {
 /// 1. **The decks the transcript names** ([`decks_named`]): every deck that
 ///    some contiguous run of the transcript's content words — its
 ///    [`spoken_words`] less [`NAMELESS_WORDS`] — resolves to on its own under
-///    [`resolve_deck_ref`], exact or loose. More than one →
+///    [`resolve_deck_ref`], exact or loose — or, in a transcript with no
+///    content word, a deck whose own name is nameless, said whole
+///    ([`decks_named`]). More than one →
 ///    [`Unmet::NamedSeveral`], whatever the model picked; negation, "X or Y",
 ///    "from X to Y" and overlapping names all land here.
 /// 2. **A contrast word** ([`contrast_marker`]) anywhere in the transcript →
@@ -1192,7 +1197,7 @@ fn switch_target(
     if let Some(marker) = contrast_marker(transcript.text(), decks, &named) {
         return Err(Unmet::Contrast(marker));
     }
-    if !said(spoken, transcript.text()) {
+    if !said(spoken, transcript.text()) && !said_as_a_name(spoken, transcript.text(), decks) {
         return Err(Unmet::NotSaid);
     }
     match resolve_deck_ref(spoken, decks) {
@@ -1216,10 +1221,19 @@ fn switch_target(
 /// Every run, not only single words: "build box" can resolve to one deck while
 /// "build" and "box" are each ambiguous. A voice utterance is a few seconds of
 /// speech, so the quadratic count of runs is small.
+///
+/// **A deck whose name is itself nameless** — `ops@daemon`, whose host is the
+/// category word "daemon" — is invisible to the content words, so it is looked
+/// for among ALL the transcript's words, by [`decks_called`] alone, and only
+/// when the transcript has no content word at all: "switch daemon to daemon"
+/// names it, while in "switch daemon to staging" the "daemon" stays the
+/// selector's name and the deck named is staging's, or none.
 fn decks_named<'a>(transcript: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDeck> {
-    let content: Vec<String> = spoken_words(transcript)
-        .into_iter()
+    let all = spoken_words(transcript);
+    let content: Vec<String> = all
+        .iter()
         .filter(|word| !NAMELESS_WORDS.contains(&word.as_str()))
+        .cloned()
         .collect();
     let mut named: BTreeSet<String> = BTreeSet::new();
     for start in 0..content.len() {
@@ -1231,10 +1245,33 @@ fn decks_named<'a>(transcript: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDec
             }
         }
     }
+    if content.is_empty() {
+        for start in 0..all.len() {
+            for end in start + 1..=all.len() {
+                if let [deck] = decks_called(&all[start..end].join(" "), decks)[..] {
+                    named.insert(deck.id.clone());
+                }
+            }
+        }
+    }
     decks
         .iter()
         .filter(|deck| named.contains(&deck.id))
         .collect()
+}
+
+/// [`said`] for a value with no content word: whether `spoken` is a deck's
+/// configured name ([`decks_called`]) that the transcript says verbatim, as a
+/// run of its [`spoken_words`]. What lets "switch daemon to daemon" ground
+/// `deck="daemon"` when `ops@daemon` is configured; [`decks_named`] still
+/// decides which deck that was.
+fn said_as_a_name(spoken: &str, transcript: &str, decks: &[VoiceDeck]) -> bool {
+    let wanted = spoken_words(spoken);
+    !wanted.is_empty()
+        && !decks_called(spoken, decks).is_empty()
+        && spoken_words(transcript)
+            .windows(wanted.len())
+            .any(|run| run == wanted.as_slice())
 }
 
 /// Words and phrases that turn a mention of a deck into an EXCLUSION of one —
@@ -2223,10 +2260,17 @@ pub enum DeckRefMatch {
 /// nothing. With `daemon-build-box` and `build-box` both on screen, "daemon
 /// build box" is the first host's alias verbatim; stripped first, it became the
 /// second host's, and the other machine was chosen.
+///
+/// **And a category word can BE a whole name**: a remote deck configured as
+/// `ops@daemon` has the host "daemon", which a sentence says and nothing else
+/// reaches. So a reference made only of category words still reaches a deck
+/// it names verbatim ([`decks_called`]) — its label or its host said whole,
+/// never a derived shortening such as `daemon.example.com`'s "daemon", and
+/// never "the daemon" — and otherwise names no deck, as above.
 pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
     let reference = deck_reference(spoken);
     if reference.is_empty() {
-        return DeckRefMatch::None;
+        return deck_ref_match(&decks_called(spoken, decks));
     }
     let whole = normalize(spoken);
     let reference_words = words(&reference);
@@ -2253,6 +2297,10 @@ pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
             })
             .collect();
     }
+    deck_ref_match(&hits)
+}
+
+fn deck_ref_match(hits: &[&VoiceDeck]) -> DeckRefMatch {
     match hits.len() {
         0 => DeckRefMatch::None,
         1 => DeckRefMatch::One {
@@ -2261,6 +2309,23 @@ pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
         },
         _ => DeckRefMatch::Ambiguous(hits.iter().map(|deck| deck.label.clone()).collect()),
     }
+}
+
+/// The decks `spoken`, said whole, is a configured name of: the label, or a
+/// remote deck's host ([`remote_host`]). The one way a reference made only of
+/// [`DECK_CATEGORY_WORDS`] reaches a deck — `ops@daemon` by "daemon".
+fn decks_called<'a>(spoken: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDeck> {
+    let whole = normalize(spoken);
+    if whole.is_empty() {
+        return Vec::new();
+    }
+    decks
+        .iter()
+        .filter(|deck| {
+            normalize(&deck.label) == whole
+                || remote_host(deck).is_some_and(|host| normalize(&host) == whole)
+        })
+        .collect()
 }
 
 /// PRD #1195 M3 — put the Deck selector's token on a [`SWITCH_DECK_ROW`]
@@ -2803,18 +2868,9 @@ fn deck_spoken_names(deck: &VoiceDeck) -> Vec<String> {
         names.push("this machine".to_string());
         return names;
     }
-    // `user@host[:port]` → `host`. The label is `RemoteEndpoint::describe()`,
-    // whose shape this undoes; a label that is not in that shape yields no
-    // extra name rather than a wrong one.
-    let without_user = deck.label.rsplit('@').next().unwrap_or(&deck.label);
-    let host = without_user
-        .split(':')
-        .next()
-        .unwrap_or(without_user)
-        .trim();
-    if !host.is_empty() && host != deck.label {
-        names.push(host.to_string());
-    }
+    let Some(host) = remote_host(deck) else {
+        return names;
+    };
     if let Some(first) = host
         .split('.')
         .next()
@@ -2822,7 +2878,25 @@ fn deck_spoken_names(deck: &VoiceDeck) -> Vec<String> {
     {
         names.push(first.to_string());
     }
+    names.insert(1, host);
     names
+}
+
+/// A remote deck's host: `user@host[:port]` → `host`. The label is
+/// `RemoteEndpoint::describe()`, whose shape this undoes; a label that is not
+/// in that shape yields no host rather than a wrong one. `None` for the local
+/// deck.
+fn remote_host(deck: &VoiceDeck) -> Option<String> {
+    if deck.local {
+        return None;
+    }
+    let without_user = deck.label.rsplit('@').next().unwrap_or(&deck.label);
+    let host = without_user
+        .split(':')
+        .next()
+        .unwrap_or(without_user)
+        .trim();
+    (!host.is_empty() && host != deck.label).then(|| host.to_string())
 }
 
 /// Every name this agent answers to.
@@ -8147,6 +8221,146 @@ mod tests {
         assert_eq!(
             sentence,
             &format!("Opening the New agent dialog. {NOT_CAUGHT_DECK}")
+        );
+    }
+
+    /// A fleet with a remote daemon whose host IS a category word: `ops@daemon`
+    /// answers to "daemon", and to nothing else a sentence can say.
+    fn fleet_with_a_host_named_daemon() -> Vec<VoiceDeck> {
+        vec![
+            deck("deck-local", "Local daemon", true),
+            deck("deck-daemon", "ops@daemon", false),
+            deck("deck-build-two", "ci@build-farm", false),
+        ]
+    }
+
+    #[test]
+    fn voice_outcome_deck_ref_a_host_named_by_a_category_word_is_reachable() {
+        let fleet = fleet_with_a_host_named_daemon();
+        let daemon_host = DeckRefMatch::One {
+            id: "deck-daemon".to_string(),
+            label: "ops@daemon".to_string(),
+        };
+        // Said whole, the category word IS that host's name.
+        for said in ["daemon", "Daemon", " daemon "] {
+            assert_eq!(resolve_deck_ref(said, &fleet), daemon_host, "{said}");
+        }
+        // Anything but the name said whole is still only category words, so
+        // it reaches no deck — not this one, and not the local daemon.
+        for said in ["the daemon", "deck", "a daemon", "daemons"] {
+            assert_eq!(resolve_deck_ref(said, &fleet), DeckRefMatch::None, "{said}");
+        }
+        // The exception is for a name the deck is configured with, never a
+        // derived shortening: `daemon.example.com`'s first component is not
+        // reached by "daemon".
+        let dotted = vec![
+            deck("deck-local", "Local daemon", true),
+            deck("deck-bare", "ops@daemon.example.com", false),
+        ];
+        assert_eq!(resolve_deck_ref("daemon", &dotted), DeckRefMatch::None);
+        // Two decks on that host are two decks.
+        let twice = vec![
+            deck("deck-daemon", "ops@daemon", false),
+            deck("deck-daemon-ci", "ci@daemon:2222", false),
+        ];
+        assert_eq!(
+            resolve_deck_ref("daemon", &twice),
+            DeckRefMatch::Ambiguous(vec!["ops@daemon".to_string(), "ci@daemon:2222".to_string()])
+        );
+    }
+
+    /// Scenario: a remote daemon is configured as `ops@daemon`. The user says
+    /// "switch daemon to daemon", "daemon" over the New agent dialog's Daemon
+    /// field, or "new agent on daemon", and the model hands over `daemon`:
+    /// each reaches that remote daemon — required and optional references
+    /// alike — rather than being asked about or reported as not caught. "the
+    /// daemon" still names no daemon.
+    #[tokio::test]
+    async fn voice_outcome_a_host_named_daemon_is_reachable_by_voice() {
+        let decks = fleet_with_a_host_named_daemon();
+        let mut dialog = new_agent_form();
+        if let Some(form) = dialog.form.as_mut() {
+            form.deck_id = "deck-build-two".to_string();
+        }
+        let ask = |said: &'static str, answer: IntentAnswer, screen: Screen, open: bool| {
+            let decks = decks.clone();
+            let dialog = dialog.clone();
+            async move {
+                let resolver = StubResolver::new().answering(said, answer);
+                handle_utterance(
+                    &resolver,
+                    table(),
+                    screen,
+                    &fleet(),
+                    &decks,
+                    None,
+                    open.then_some(&dialog),
+                    Transcript::new(said),
+                )
+                .await
+                .outcome
+            }
+        };
+        let switch = ask(
+            "switch daemon to daemon",
+            IntentAnswer::new("switch_deck").with_param("deck", "daemon"),
+            Screen::Deck,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(&switch, VoiceOutcome::Dispatch { invoke, params, .. }
+                if invoke == "switchDeck" && params[0].value == "deck-daemon"),
+            "{switch:?}"
+        );
+        let choose = ask(
+            "daemon",
+            IntentAnswer::new("choose_deck").with_param("deck", "daemon"),
+            Screen::Overview,
+            true,
+        )
+        .await;
+        assert!(
+            matches!(&choose, VoiceOutcome::Dispatch { invoke, params, .. }
+                if invoke == "chooseNewAgentDeck" && params[0].value == "deck-daemon"),
+            "{choose:?}"
+        );
+        let open = ask(
+            "new agent on daemon",
+            IntentAnswer::new("open_new_agent").with_param("deck", "daemon"),
+            Screen::Overview,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(&open, VoiceOutcome::Dispatch { params, .. }
+                if params.len() == 1 && params[0].value == "deck-daemon"),
+            "{open:?}"
+        );
+        // Control: beside another word that could be a name, "daemon" is the
+        // selector's heading, so a model reading it as the deck is refused.
+        let other = ask(
+            "switch daemon to the ghost box",
+            IntentAnswer::new("switch_deck").with_param("deck", "daemon"),
+            Screen::Deck,
+            false,
+        )
+        .await;
+        assert!(
+            !matches!(&other, VoiceOutcome::Dispatch { .. }),
+            "{other:?}"
+        );
+        // Control: the category phrase is not the host's name said whole.
+        let vague = ask(
+            "the daemon",
+            IntentAnswer::new("choose_deck").with_param("deck", "the daemon"),
+            Screen::Overview,
+            true,
+        )
+        .await;
+        assert!(
+            matches!(&vague, VoiceOutcome::ParamMissing { action, .. } if action == "choose_deck"),
+            "{vague:?}"
         );
     }
 
