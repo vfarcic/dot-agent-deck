@@ -1253,7 +1253,8 @@ pub struct AppState {
     /// Issue #447 (Qodo, #1347): per pane, the most recent hook sessions the
     /// pane has genuinely moved past, newest last and at most
     /// [`WAITING_SUPERSEDED_SESSIONS_KEPT`] of them. Written and read only by
-    /// [`Self::apply_event_watching_waiting`], so it is empty in the TUI.
+    /// [`Self::apply_event_watching_waiting`], so it is empty in the TUI, and
+    /// dropped with the pane by [`Self::unregister_pane`].
     ///
     /// It exists because `pane_hook_session`'s timestamp cannot answer "is this
     /// report from a conversation that is over?" on its own: a `SessionStart`
@@ -8948,6 +8949,9 @@ impl AppState {
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
+        // Issue #447 (Qodo, #1347): the waiting watch's history is about THIS
+        // pane's conversations, so a pane reusing the id must not inherit it.
+        self.waiting_superseded_sessions.remove(pane_id);
         if let Some(identity) = self.pane_orchestration_map.remove(pane_id) {
             // Issue #555 / #962: the title goes when the last pane of its
             // orchestration does.
@@ -12978,6 +12982,49 @@ mod tests {
                 "attacker text must stay inside the untrusted field ({fragment:?}): {prompt:?}"
             );
         }
+    }
+
+    /// Issue #447 (Qodo, #1347): the waiting watch's record of the hook sessions
+    /// a pane has moved past is dropped when the pane is unregistered, so a
+    /// closed pane leaves nothing behind and a later pane reusing its id starts
+    /// with no history.
+    #[test]
+    fn waiting_superseded_sessions_are_dropped_with_the_pane() {
+        fn event(session: &str, secs: i64) -> AgentEvent {
+            AgentEvent {
+                session_id: session.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::seconds(secs),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some("pane".into()),
+                agent_id: Some("agent".into()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let mut state = AppState::default();
+        state.managed_pane_ids.insert("pane".into());
+        state.apply_event_watching_waiting(event("before-clear", 1), &registry);
+        state.apply_event_watching_waiting(event("after-clear", 2), &registry);
+        assert!(
+            state
+                .waiting_superseded_sessions
+                .get("pane")
+                .is_some_and(|sessions| sessions.iter().eq(["before-clear"])),
+            "precondition: the session the pane moved off is recorded"
+        );
+        state.unregister_pane("pane");
+        assert!(
+            !state.waiting_superseded_sessions.contains_key("pane"),
+            "unregistering the pane left its superseded-session record behind"
+        );
     }
 
     /// Issue #447 (Qodo, #1347): the delegate-time waiting episode is skipped
