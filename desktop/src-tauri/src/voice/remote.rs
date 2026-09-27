@@ -629,6 +629,8 @@ mod tests {
         }
     }
 
+    /// Scenario: build a hosted-model request and check that its strict tool
+    /// permits deck switching in the shipped action list.
     #[test]
     fn voice_remote_request_constrains_the_action_to_the_table_plus_the_escape() {
         let body = body("show me the tester");
@@ -649,6 +651,7 @@ mod tests {
                 "open_deck",
                 "close",
                 "open_settings",
+                "switch_deck",
                 "voice_off",
                 "list_commands",
                 "dictate_to_agent",
