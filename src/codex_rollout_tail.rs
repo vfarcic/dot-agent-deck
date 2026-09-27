@@ -155,6 +155,9 @@ pub struct CodexTurnFailure {
     pub pane_id: String,
     pub agent_id: String,
     pub session_id: String,
+    /// The failed turn — what [`CodexRolloutArms::supersedes`] compares a
+    /// newer arm against.
+    pub turn_id: String,
     pub outcome: FailureOutcome,
     /// The `task_complete` error message, unscrubbed.
     pub message: Option<String>,
@@ -203,6 +206,26 @@ impl CodexRolloutArms {
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         pending.bytes = 0;
         pending.commands.drain(..).collect()
+    }
+
+    /// Whether a queued, not-yet-applied arm names a turn of `agent_id`'s other
+    /// than `turn_id` — so a failure the monitor found for `turn_id` belongs
+    /// to a turn Codex has already moved past (issue #1359). The hook loop
+    /// queues a prompt's arm BEFORE it applies the prompt to the card, so a
+    /// prompt already on the card is in this queue until the next tick drains
+    /// it.
+    pub fn supersedes(&self, agent_id: &str, turn_id: &str) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .commands
+            .iter()
+            .any(|command| match command {
+                ArmCommand::Arm(req) => {
+                    req.agent_id == agent_id && req.turn_id.as_deref().is_some_and(|t| t != turn_id)
+                }
+                ArmCommand::Disarm { .. } => false,
+            })
     }
 
     /// The total bytes currently queued. For tests and diagnostics.
@@ -356,11 +379,16 @@ impl CodexRolloutTailers {
                     }
                 }
             }
+            let turn_id = tailer
+                .watch
+                .as_ref()
+                .map_or_else(String::new, |w| w.turn_id().to_owned());
             if let Some((outcome, message)) = read_tailer(tailer) {
                 failures.push(CodexTurnFailure {
                     pane_id: tailer.pane_id.clone(),
                     agent_id: agent_id.clone(),
                     session_id: tailer.session_id.clone(),
+                    turn_id,
                     outcome,
                     message,
                 });
@@ -587,6 +615,7 @@ mod tests {
                 pane_id: "pane-a".into(),
                 agent_id: "a".into(),
                 session_id: "session-a".into(),
+                turn_id: TURN.into(),
                 outcome: FailureOutcome::Blocked {
                     kind: BlockedKind::CreditsDepleted,
                     resets_at_ms: None,
@@ -617,6 +646,7 @@ mod tests {
                 pane_id: "pane-a".into(),
                 agent_id: "a".into(),
                 session_id: "session-a".into(),
+                turn_id: "turn-err".into(),
                 outcome: FailureOutcome::Error,
                 message: Some("model not supported".into()),
             }]
