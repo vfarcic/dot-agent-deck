@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::TabMembership;
+use dot_agent_deck::event::{EventType, SUBAGENT_ID_METADATA_KEY};
 use spec::spec;
 
 const BLOCKED_NOTICE: &str =
@@ -375,6 +376,10 @@ sys.stdin.buffer.read()
 }
 
 fn claude_hook(deck: &TuiDeck, role: &str, event: &str) {
+    claude_hook_with_fields(deck, role, event, json!({}));
+}
+
+fn claude_hook_with_fields(deck: &TuiDeck, role: &str, event: &str, fields: Value) {
     use std::io::Write as _;
     use std::process::Stdio;
     let settings: Value = serde_json::from_slice(
@@ -397,14 +402,12 @@ fn claude_hook(deck: &TuiDeck, role: &str, event: &str) {
         .stdin(Stdio::piped())
         .spawn()
         .expect("run installed hook");
-    writeln!(
-        child.stdin.take().expect("stdin"),
-        "{}",
-        json!({
-            "hook_event_name":event,"session_id":"quota-claude"
-        })
-    )
-    .expect("send hook payload");
+    let mut payload = json!({"hook_event_name":event,"session_id":"quota-claude"});
+    payload
+        .as_object_mut()
+        .expect("hook payload object")
+        .extend(fields.as_object().expect("hook fields object").clone());
+    writeln!(child.stdin.take().expect("stdin"), "{payload}").expect("send hook payload");
     assert!(child.wait().expect("wait hook").success());
 }
 
@@ -444,6 +447,101 @@ fn status_blocked_017_claude_stop_failure_hook_shows_blocked_card() {
         deck.snapshot_grid()
     );
     assert_transient_claude_429_is_error();
+}
+
+/// Scenario: A Claude stand-in blocks its attached card through a rejected-quota
+/// StopFailure hook, then subagent tool and failure hooks leave both the card and
+/// daemon status Blocked. A main-thread prompt clears the card to Thinking.
+#[spec("status/blocked/025")]
+#[test]
+fn status_blocked_025_subagent_hooks_keep_parent_blocked() {
+    let fixture = common::race_safe_tempdir();
+    let bin = fixture.path().join("bin");
+    let fifo = fixture.path().join("claude-trigger");
+    let transcript = fixture.path().join("claude-quota.jsonl");
+    trigger_fifo(&fifo);
+    write_claude_record(&transcript, false);
+    install_structured_standin(&bin, "claude");
+    let deck = quota_deck(&bin, &fifo, &transcript);
+    deck.wait_for_string("No active sessions");
+    write_orchestration(&deck, &[("worker", "claude", "claude")]);
+    open_orchestration(&deck);
+    wait_for_role(&deck, "worker");
+    release_standin(&fifo, &deck, "worker");
+    assert_blocked(&deck, "worker", "usage_limit");
+
+    let events = deck.subscribe_events();
+    let subagent = "quota-subagent-025";
+    for (hook, expected, fields) in [
+        (
+            "SubagentStart",
+            EventType::SubagentStart,
+            json!({"agent_id":subagent}),
+        ),
+        (
+            "PreToolUse",
+            EventType::ToolStart,
+            json!({"agent_id":subagent,"tool_name":"Bash","tool_use_id":"quota-tool-025",
+                "tool_input":{"command":"echo subagent-only"}}),
+        ),
+        (
+            "PostToolUse",
+            EventType::ToolEnd,
+            json!({"agent_id":subagent,"tool_name":"Bash","tool_use_id":"quota-tool-025",
+                "tool_response":{"stdout":"subagent-only","stderr":"","interrupted":false}}),
+        ),
+        (
+            "StopFailure",
+            EventType::SubagentStop,
+            json!({"agent_id":subagent,"error":"billing_error",
+                "transcript_path":transcript}),
+        ),
+    ] {
+        claude_hook_with_fields(&deck, "worker", hook, fields);
+        // The broadcast confirms this hook reached the daemon before checking
+        // the card. Checking each step prevents a later hook from hiding a
+        // brief, incorrect transition to Working or Error.
+        events.wait_for(
+            |event| {
+                event.event_type == expected
+                    && event
+                        .metadata
+                        .get(SUBAGENT_ID_METADATA_KEY)
+                        .map(String::as_str)
+                        == Some(subagent)
+            },
+            Duration::from_secs(10),
+        );
+        deck.wait_until_grid_then_hold(
+            &format!("{hook} leaves the worker card Blocked"),
+            Duration::from_millis(250),
+            |grid| {
+                has_role_badge(grid, "worker", "Blocked")
+                    && !has_role_badge(grid, "worker", "Error")
+            },
+        );
+        assert_eq!(
+            role_status(&deck, "worker").as_deref(),
+            Some("Blocked"),
+            "{hook} changed daemon status"
+        );
+    }
+    assert!(
+        deck.snapshot_grid().contains("Usage"),
+        "subagent hooks removed the quota reason:\n{}",
+        deck.snapshot_grid()
+    );
+
+    claude_hook(&deck, "worker", "UserPromptSubmit");
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            role_status(&deck, "worker").as_deref() == Some("Thinking")
+                && has_role_badge(&deck.snapshot_grid(), "worker", "Thinking")
+        }),
+        "main-thread prompt did not clear Blocked: {}\n{}",
+        status_document(&deck),
+        deck.snapshot_grid()
+    );
 }
 
 /// Scenario: A transient Claude 429 reaches StopFailure without quotaLimits.

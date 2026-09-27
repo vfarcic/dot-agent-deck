@@ -651,6 +651,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** a real Claude Code or Codex subagent; the hook CLI mapping a subagent's `StopFailure` to `SubagentStop` (a plain unit test in `src/hook.rs`).
 - **Platform coverage:** mac+linux+windows.
 
+##### status/blocked/025 — Subagent hooks leave a quota-blocked Claude card Blocked (issues #714, #1354).
+- **Layer:** L2, lane 1, PTY-attached.
+- **Agent:** synthetic Claude executable using the installed hook; no provider credential.
+- **Asserts:** a rejected-quota StopFailure blocks the attached card and daemon status; subagent-tagged tool and stop hooks, including a billing-error StopFailure, leave both Blocked with the Usage reason; a main-thread prompt clears it.
+- **Does not assert:** a real quota-exhausted account or a real Claude subagent.
+- **Platform coverage:** mac+linux.
+
 #### status/agent-event
 
 ##### status/agent-event/001 — A `dot-agent-deck agent-event --type <state>` frame routes into the existing `AgentEvent` stream and drives the target pane's card status, with NO hook and no `settings.json` mutation (PRD #201 M1.2/M1.3).
