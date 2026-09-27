@@ -6097,6 +6097,32 @@ fn write_work_done_summary(
     }
 }
 
+/// Issue #447 (Qodo, #1347): bind a dispatch's commission to the worker agent
+/// its pointer goes to ([`AgentPtyRegistry::bind_commission_worker_agent_id`]),
+/// and, when the bind applied, open that agent's waiting episode if it is
+/// already waiting. An agent that stopped at a prompt while the commission
+/// still named its predecessor — the pane changed hands between the delegate
+/// and this write — failed the episode gate then, and never makes the
+/// transition again. Idempotent per agent, so an episode already open keeps
+/// its clock. `state` is `None` only for callers with no daemon state.
+async fn bind_dispatched_commission(
+    registry: &Arc<AgentPtyRegistry>,
+    state: Option<&SharedState>,
+    worker_pane_id: &str,
+    arm_id: u64,
+    worker_agent_id: &str,
+) {
+    if !registry.bind_commission_worker_agent_id(worker_pane_id, arm_id, worker_agent_id) {
+        return;
+    }
+    if let Some(state) = state {
+        state
+            .read()
+            .await
+            .open_waiting_episode_if_already_waiting(worker_pane_id, registry);
+    }
+}
+
 /// Per-target body of [`AppState::handle_delegate`], factored out so
 /// each target runs in its own `tokio::spawn`. Owns all the inputs it
 /// needs (no `&self` / `&AppState` borrows) so the spawn future is
@@ -6489,7 +6515,14 @@ async fn dispatch_one_owned(
                 // dispatch's commission was made to, and from this moment — so a
                 // setup prompt it stops at before the pointer lands is reported.
                 if let Some(arm_id) = commission_arm_id {
-                    registry.bind_commission_worker_agent_id(&pane_id, arm_id, &new_agent_id);
+                    bind_dispatched_commission(
+                        &registry,
+                        state.as_ref(),
+                        &pane_id,
+                        arm_id,
+                        &new_agent_id,
+                    )
+                    .await;
                 }
                 if retired > 0 {
                     tracing::info!(
@@ -7365,7 +7398,8 @@ async fn dispatch_one_owned(
     if let (Some(arm_id), Some(worker_agent_id)) =
         (commission_arm_id, expected_worker_agent_id.as_deref())
     {
-        registry.bind_commission_worker_agent_id(&pane_id, arm_id, worker_agent_id);
+        bind_dispatched_commission(&registry, state.as_ref(), &pane_id, arm_id, worker_agent_id)
+            .await;
     }
     // PRD #249 M3: arm the cancellation record and subscribe BEFORE the write.
     // Subscribing first means an agent that consumes the pointer and emits its

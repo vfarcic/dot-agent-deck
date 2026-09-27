@@ -5281,18 +5281,24 @@ impl AgentPtyRegistry {
     /// after a newer delegate was armed cannot rebind the newer commission
     /// (Qodo, #1347). A no-op too when the pane owes nothing. See
     /// [`DelegationCommission::worker_agent_id`].
+    ///
+    /// Returns whether the bind was applied.
     pub fn bind_commission_worker_agent_id(
         &self,
         worker_pane_id: &str,
         arm_id: u64,
         worker_agent_id: &str,
-    ) {
+    ) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
-        if let Some(entry) = tracker.commissions.get_mut(worker_pane_id)
-            && entry.newest_arm_id == Some(arm_id)
-        {
-            entry.worker_agent_id = Some(worker_agent_id.to_string());
-        }
+        let Some(entry) = tracker
+            .commissions
+            .get_mut(worker_pane_id)
+            .filter(|entry| entry.newest_arm_id == Some(arm_id))
+        else {
+            return false;
+        };
+        entry.worker_agent_id = Some(worker_agent_id.to_string());
+        true
     }
 
     /// Issue #447: open a waiting episode for `worker_pane_id` — its hook has

@@ -393,6 +393,25 @@ impl IdleHarness {
             .await;
     }
 
+    /// [`Self::delegate`], but with the daemon's state handed to the dispatch
+    /// the way the daemon's own socket handler hands it — for a case whose
+    /// dispatch must reach back into `AppState` (issue #447, Qodo #1347).
+    async fn delegate_with_state(&self, roles: &[&str]) {
+        let signal = DelegateSignal {
+            pane_id: ORCH_PANE.to_string(),
+            task: "Perform the delegated test task.".to_string(),
+            to: roles.iter().map(|role| (*role).to_string()).collect(),
+            supersede: true,
+            timestamp: chrono::Utc::now(),
+            token: None,
+        };
+        self.state
+            .read()
+            .await
+            .handle_delegate_with_state(signal, &self.registry, &self.event_tx, Some(&self.state))
+            .await;
+    }
+
     async fn work_done(&self, role: &str) {
         self.state
             .read()
@@ -1713,7 +1732,7 @@ fn waiting_notices_for(snapshot: &str, role: &str) -> usize {
         .count()
 }
 
-/// Scenario: Delegate to ten workers of one orchestration and leave an eleventh undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card, after which its own agent reports only informational events; `cleared-worker`'s agent starts a new hook session and waits in it, and then a delayed report and a delayed `session_start` from its old session arrive; `restarted-worker` waits and then genuinely starts a new hook session whose start carries an earlier timestamp; `already-waiting-worker` was waiting before it was delegated to; `respawned-worker` is a `clear = true` role, so its delegate replaces its agent, and the replacement waits; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; `exited-worker`'s agent exits by itself once its task pointer arrives, and a different agent that was never delegated to takes its pane and waits; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first five — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other six, then or after further waiting.
+/// Scenario: Delegate to eleven workers of one orchestration and leave a twelfth undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card, after which its own agent reports only informational events; `cleared-worker`'s agent starts a new hook session and waits in it, and then a delayed report and a delayed `session_start` from its old session arrive; `restarted-worker` waits and then genuinely starts a new hook session whose start carries an earlier timestamp; `already-waiting-worker` was waiting before it was delegated to; `respawned-worker` is a `clear = true` role, so its delegate replaces its agent, and the replacement waits; `handed-over-worker`'s agent is replaced while its delegate's dispatch is held on the pane's dispatch lock, and the replacement waits before the dispatch writes the pointer to it; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; `exited-worker`'s agent exits by itself once its task pointer arrives, and a different agent that was never delegated to takes its pane and waits; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first six — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other six, then or after further waiting.
 #[spec("scheduler/idle-worker/021")]
 #[test]
 fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() {
@@ -1741,6 +1760,7 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
                 // or restart path touching its commission.
                 ("exited-worker", EXITS_ON_POINTER_COMMAND),
                 ("respawned-worker", WORKER_COMMAND),
+                ("handed-over-worker", WORKER_COMMAND),
             ],
             Some(&format!(
                 "[[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
@@ -1761,6 +1781,7 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             "restarted-worker",
             "exited-worker",
             "respawned-worker",
+            "handed-over-worker",
         ] {
             harness.manage_worker_pane(role).await;
             harness.worker_event(role, "session_start").await;
@@ -1853,6 +1874,37 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
                 ))
                 .await;
         }
+        // The pane changes hands between a delegate and its write: the
+        // commission is bound to the occupant when it is armed, the dispatch is
+        // held on the pane's dispatch lock while a replacement takes the pane
+        // and waits — failing the gate, since the commission names its
+        // predecessor — and the pointer is then written to the replacement. The
+        // dispatch's rebinding must open the replacement's episode, because it
+        // never makes the transition again (Qodo, #1347).
+        let handed_over_pane = worker_pane("handed-over-worker");
+        let dispatch_lock = harness.registry.pane_dispatch_lock(&handed_over_pane);
+        let held = dispatch_lock.lock().await;
+        harness.delegate_with_state(&["handed-over-worker"]).await;
+        let handed_over_successor = harness
+            .registry
+            .respawn_agent_for_pane(&handed_over_pane, WORKER_COMMAND)
+            .await
+            .unwrap_or_else(|error| panic!("replace the handed-over worker's agent: {error}"));
+        assert_ne!(
+            handed_over_successor, harness.worker_agent_ids["handed-over-worker"],
+            "precondition: the handed-over worker's pane did not get a different agent"
+        );
+        for event_type in ["session_start", "waiting_for_input"] {
+            harness
+                .ingest(worker_hook_event(
+                    "handed-over-worker",
+                    "session-handed-over-worker-successor",
+                    event_type,
+                    Some(&handed_over_successor),
+                ))
+                .await;
+        }
+        drop(held);
         for event_type in ["session_start", "waiting_for_input"] {
             harness
                 .ingest(worker_hook_event(
@@ -2009,6 +2061,7 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
                         "already-waiting-worker",
                         "cleared-worker",
                         "respawned-worker",
+                        "handed-over-worker",
                     ]
                     .iter()
                     .all(|role| waiting_notices_for(snapshot, role) > 0)
@@ -2048,6 +2101,12 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
             "the agent a clear = true delegate respawned was never reported waiting, though the \
              commission was made to it; snapshot = {snapshot:?}"
         );
+        assert_eq!(
+            waiting_notices_for(&snapshot, "handed-over-worker"),
+            1,
+            "a worker that was already waiting when its delegate's pointer was written to it was \
+             never reported; snapshot = {snapshot:?}"
+        );
         assert!(
             snapshot.contains(&format!("{WAITING_FINAL_CLAUSE}\r")),
             "the waiting notice was not SUBMITTED with a CR, so an unattended orchestrator \
@@ -2079,7 +2138,7 @@ fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() 
         );
         assert_eq!(
             settled.matches(WAITING_NEEDLE).count(),
-            5,
+            6,
             "exactly one waiting notice per waiting worker may reach the orchestrator; \
              snapshot = {settled:?}"
         );
