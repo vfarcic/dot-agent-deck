@@ -3935,6 +3935,12 @@ struct DelegationCommission {
     /// this is what stops a later agent in the same pane, which was never
     /// delegated to, from being reported as the commissioned worker.
     worker_agent_id: Option<String>,
+    /// Issue #447 review (#1347, Qodo): the arm id
+    /// ([`CommissionDispatchInFlight::arm_id`]) of the newest commission. A
+    /// bind is applied only for this arm, so a dispatch that reaches the pane's
+    /// dispatch lock after a newer delegate was armed — spawned dispatch tasks
+    /// are not ordered — cannot overwrite the newer commission's worker.
+    newest_arm_id: Option<u64>,
 }
 
 /// Issue #590: how long a commission stays owed without a `work-done` crediting
@@ -3967,6 +3973,7 @@ impl DelegationCommission {
             orchestrator_pane_id: orchestrator_pane_id.to_string(),
             orchestrator_agent_id: None,
             worker_agent_id: None,
+            newest_arm_id: None,
         }
     }
 
@@ -4066,6 +4073,14 @@ pub struct CommissionDispatchInFlight {
 }
 
 impl CommissionDispatchInFlight {
+    /// Issue #447 review (#1347): the arm this guard belongs to — what
+    /// [`AgentPtyRegistry::bind_commission_worker_agent_id`] takes, so a
+    /// dispatch can bind its worker only while its commission is still the
+    /// pane's newest.
+    pub fn arm_id(&self) -> u64 {
+        self.id
+    }
+
     /// Record which idle-worker record this dispatch armed — its `seq`, or
     /// `None` when the idle detector armed nothing for it. Until this is called
     /// the dispatch's idle record is unknown, and
@@ -5141,10 +5156,11 @@ impl AgentPtyRegistry {
         // pointing its close sweep at the dead pane.
         entry.orchestrator_pane_id = orchestrator_pane_id.to_string();
         entry.orchestrator_agent_id = orchestrator_agent_id.map(str::to_string);
-        // Nobody holds this commission's task pointer yet: the caller binds the
-        // worker once it knows who that is (Qodo, #1347).
-        entry.worker_agent_id = None;
         let id = self.delegation_seq.fetch_add(1, Ordering::SeqCst);
+        // Nobody holds this commission's task pointer yet: the caller binds the
+        // worker once it knows who that is, under this arm's id (Qodo, #1347).
+        entry.worker_agent_id = None;
+        entry.newest_arm_id = Some(id);
         tracker
             .commission_dispatches_in_flight
             .entry(worker_pane_id.to_string())
@@ -5259,11 +5275,22 @@ impl AgentPtyRegistry {
 
     /// Issue #447 review (#1347, Qodo finding 15): record that
     /// `worker_pane_id`'s newest commission was made to `worker_agent_id` — the
-    /// agent its task pointer goes to. A no-op when the pane owes nothing. See
+    /// agent its task pointer goes to. `arm_id` is the arm the caller's
+    /// dispatch holds ([`CommissionDispatchInFlight::arm_id`]); the bind is a
+    /// no-op unless that arm is still the pane's newest, so a dispatch that runs
+    /// after a newer delegate was armed cannot rebind the newer commission
+    /// (Qodo, #1347). A no-op too when the pane owes nothing. See
     /// [`DelegationCommission::worker_agent_id`].
-    pub fn bind_commission_worker_agent_id(&self, worker_pane_id: &str, worker_agent_id: &str) {
+    pub fn bind_commission_worker_agent_id(
+        &self,
+        worker_pane_id: &str,
+        arm_id: u64,
+        worker_agent_id: &str,
+    ) {
         let mut tracker = self.delegations.lock().unwrap();
-        if let Some(entry) = tracker.commissions.get_mut(worker_pane_id) {
+        if let Some(entry) = tracker.commissions.get_mut(worker_pane_id)
+            && entry.newest_arm_id == Some(arm_id)
+        {
             entry.worker_agent_id = Some(worker_agent_id.to_string());
         }
     }
@@ -17275,20 +17302,25 @@ mod spawn_tests {
     /// the ledger answers only for the worker agent the newest commission was
     /// made to. Unbound, bound to another agent, or reset by a newer arm, it
     /// answers `None` — while `commission_owed_to`, which a second caller may
-    /// read, is unchanged.
+    /// read, is unchanged. And a bind is taken only for the newest arm, so an
+    /// older dispatch that runs after a newer delegate was armed cannot rebind
+    /// the newer commission (Qodo, #1347).
     #[test]
     fn commission_owed_to_agent_answers_only_for_the_bound_worker() {
+        fn arm(reg: &Arc<AgentPtyRegistry>, supersede: bool) -> u64 {
+            match reg.arm_delegation_commission("worker", "orch", Some("orch-agent"), supersede) {
+                CommissionArm::Armed { in_flight, .. } => in_flight.arm_id(),
+                other => panic!("expected an armed commission, got {other:?}"),
+            }
+        }
         let reg = Arc::new(AgentPtyRegistry::new());
-        reg.bind_commission_worker_agent_id("worker", "worker-agent-1");
+        reg.bind_commission_worker_agent_id("worker", 0, "worker-agent-1");
         assert_eq!(
             reg.commission_owed_to_agent("worker", "worker-agent-1"),
             None,
             "binding a pane that owes nothing must not create a commission"
         );
-        assert!(matches!(
-            reg.arm_delegation_commission("worker", "orch", Some("orch-agent"), false),
-            CommissionArm::Armed { .. }
-        ));
+        let first = arm(&reg, false);
         let owner = CommissionOwner {
             orchestrator_pane_id: "orch".to_string(),
             orchestrator_agent_id: Some("orch-agent".to_string()),
@@ -17299,7 +17331,7 @@ mod spawn_tests {
             "a commission nobody has been bound to is owed by no agent yet"
         );
         assert_eq!(reg.commission_owed_to("worker"), Some(owner.clone()));
-        reg.bind_commission_worker_agent_id("worker", "worker-agent-1");
+        reg.bind_commission_worker_agent_id("worker", first, "worker-agent-1");
         assert_eq!(
             reg.commission_owed_to_agent("worker", "worker-agent-1"),
             Some(owner.clone())
@@ -17309,16 +17341,25 @@ mod spawn_tests {
             None,
             "a later agent in the pane was never delegated to"
         );
-        assert!(matches!(
-            reg.arm_delegation_commission("worker", "orch", Some("orch-agent"), true),
-            CommissionArm::Armed { .. }
-        ));
+        let second = arm(&reg, true);
         assert_eq!(
             reg.commission_owed_to_agent("worker", "worker-agent-1"),
             None,
             "a newer delegation resets the binding until its worker is known"
         );
-        reg.bind_commission_worker_agent_id("worker", "worker-agent-2");
+        reg.bind_commission_worker_agent_id("worker", second, "worker-agent-2");
+        assert_eq!(
+            reg.commission_owed_to_agent("worker", "worker-agent-2"),
+            Some(owner.clone())
+        );
+        // The older dispatch reaches the pane after the newer one, replaces the
+        // worker, and tries to bind its own agent: refused.
+        reg.bind_commission_worker_agent_id("worker", first, "worker-agent-3");
+        assert_eq!(
+            reg.commission_owed_to_agent("worker", "worker-agent-3"),
+            None,
+            "an older arm's dispatch rebound the newer commission's worker"
+        );
         assert_eq!(
             reg.commission_owed_to_agent("worker", "worker-agent-2"),
             Some(owner)

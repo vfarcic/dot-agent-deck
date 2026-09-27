@@ -6254,6 +6254,11 @@ async fn dispatch_one_owned(
     // rather than "in flight" to `retire_commissions_of_replaced_agent`, which
     // is why the guard goes now and only whether it existed is kept.
     let commission_armed = commission_in_flight.is_some();
+    // Issue #447 (Qodo, #1347): kept past the guard, so this dispatch can bind
+    // its worker onto its own commission and not a newer delegate's.
+    let commission_arm_id = commission_in_flight
+        .as_ref()
+        .map(crate::agent_pty::CommissionDispatchInFlight::arm_id);
     drop(commission_in_flight);
 
     // Look the role config up by `(worker cwd, orchestration name,
@@ -6483,8 +6488,8 @@ async fn dispatch_one_owned(
                 // Issue #447 (Qodo, #1347): the replacement is the agent this
                 // dispatch's commission was made to, and from this moment — so a
                 // setup prompt it stops at before the pointer lands is reported.
-                if commission_armed {
-                    registry.bind_commission_worker_agent_id(&pane_id, &new_agent_id);
+                if let Some(arm_id) = commission_arm_id {
+                    registry.bind_commission_worker_agent_id(&pane_id, arm_id, &new_agent_id);
                 }
                 if retired > 0 {
                     tracing::info!(
@@ -7357,8 +7362,10 @@ async fn dispatch_one_owned(
     // Issue #447 (Qodo, #1347): and the commission ledger's own binding, which
     // the waiting-for-input notice requires — `handle_delegate` bound the
     // pane's occupant at arm time, and the pointer goes to whoever holds it now.
-    if commission_armed && let Some(worker_agent_id) = expected_worker_agent_id.as_deref() {
-        registry.bind_commission_worker_agent_id(&pane_id, worker_agent_id);
+    if let (Some(arm_id), Some(worker_agent_id)) =
+        (commission_arm_id, expected_worker_agent_id.as_deref())
+    {
+        registry.bind_commission_worker_agent_id(&pane_id, arm_id, worker_agent_id);
     }
     // PRD #249 M3: arm the cancellation record and subscribe BEFORE the write.
     // Subscribing first means an agent that consumes the pointer and emits its
@@ -9394,11 +9401,15 @@ impl AppState {
             // holds the pane now. `dispatch_one_owned` rebinds it to whoever the
             // pointer is actually written to, and to the fresh agent on a
             // `clear = true` respawn.
-            if commission_in_flight.is_some()
+            if let Some(in_flight) = commission_in_flight.as_ref()
                 && !delegate_respawns_worker(cwd.as_deref(), orchestration.as_ref(), &target_role)
             {
                 if let Some(worker_agent_id) = registry.pane_current_agent_id(&pane_id) {
-                    registry.bind_commission_worker_agent_id(&pane_id, &worker_agent_id);
+                    registry.bind_commission_worker_agent_id(
+                        &pane_id,
+                        in_flight.arm_id(),
+                        &worker_agent_id,
+                    );
                 }
                 self.open_waiting_episode_if_already_waiting(&pane_id, &registry);
             }
