@@ -91,6 +91,25 @@ impl SshTarget {
             format!("ssh -p {} {}", self.port, self.user_host())
         }
     }
+
+    /// A command line the user can paste to run `remote_command` on this
+    /// remote themselves: the registered port and identity file included, so
+    /// it reaches the endpoint the deck talks to rather than port 22 (PR
+    /// #1373 review — the same wrong-endpoint defect `host_key_remedy`
+    /// records). `remote_command` is the deck's own text and is passed as-is;
+    /// the key path is the user's and is single-quoted.
+    pub fn command_line(&self, remote_command: &str) -> String {
+        let mut line = String::from("ssh");
+        if self.port != DEFAULT_SSH_PORT {
+            line.push_str(&format!(" -p {}", self.port));
+        }
+        if let Some(key) = &self.key {
+            let key = key.to_string_lossy().replace('\'', "'\\''");
+            line.push_str(&format!(" -i '{key}'"));
+        }
+        line.push_str(&format!(" {} {remote_command}", self.user_host()));
+        line
+    }
 }
 
 /// Captured output of one ssh invocation.
@@ -1656,9 +1675,9 @@ fn install_or_upgrade(
     if found.local_bin {
         let _ = writeln!(
             out,
-            "Remote '{name}' has two dot-agent-deck installs: Homebrew's at {binary} and a copy at {REMOTE_INSTALL_PATH}. The deck uses the Homebrew one and leaves the other untouched. Remove it (`ssh {host} rm {REMOTE_INSTALL_PATH}`) — an older dot-agent-deck client still runs it on `connect`.",
+            "Remote '{name}' has two dot-agent-deck installs: Homebrew's at {binary} and a copy at {REMOTE_INSTALL_PATH}. The deck uses the Homebrew one and leaves the other untouched. Remove it (`{cleanup}`) — an older dot-agent-deck client still runs it on `connect`.",
             binary = binary.as_str(),
-            host = target.user_host(),
+            cleanup = target.command_line(&format!("rm {REMOTE_INSTALL_PATH}")),
         );
     }
 
@@ -2166,6 +2185,18 @@ mod tests {
         assert_eq!(t.host, "hetzner-1.example.com");
         assert_eq!(t.port, 2222);
         assert_eq!(t.user_host(), "viktor@hetzner-1.example.com");
+    }
+
+    #[test]
+    fn command_line_carries_the_registered_port_and_key() {
+        assert_eq!(
+            SshTarget::parse("u@h", 22, None).command_line("rm x"),
+            "ssh u@h rm x"
+        );
+        assert_eq!(
+            SshTarget::parse("u@h", 2222, Some(PathBuf::from("/k/it's key"))).command_line("rm x"),
+            "ssh -p 2222 -i '/k/it'\\''s key' u@h rm x"
+        );
     }
 
     #[test]
@@ -3287,8 +3318,9 @@ mod homebrew_remote_tests {
             out.contains("has two dot-agent-deck installs")
                 && out.contains(&brew_binary)
                 && out.contains(REMOTE_INSTALL_PATH)
-                && out.contains("uses the Homebrew one"),
-            "both installs and the one in use must be named: {out}"
+                && out.contains("uses the Homebrew one")
+                && out.contains("`ssh user@mac rm ~/.local/bin/dot-agent-deck`"),
+            "both installs, the one in use and the cleanup must be named: {out}"
         );
         assert_eq!(remote.entry().remote_binary(), brew_binary);
     }
