@@ -154,6 +154,7 @@ The approving actor is the agent reviewer, `pr-review-batch.yml` (CLAUDE.md rule
 - **It reviews three PRs in parallel** (`max-parallel: 3`), so a sweep over many PRs takes several rounds.
 - A sweep also covers PRs you are not landing. That is its normal job — an approval is not a merge, and the exclusions are still yours to hold.
 - **For a stack, review bottom-up one PR at a time** (`pr_number=<n>`), each after the previous review has finished and the previous PR has merged: an upper PR's review is wasted if its base draws a change request. A small loop that waits for CI, dispatches the review, waits for it, and merges only when the PR reads `MERGEABLE APPROVED` with no unresolved thread and a clean `merge-tree` against `main` — stopping at the first PR that does not — keeps this unattended without ever merging past a problem.
+- **Wait for CI on the PR's current head SHA, not for `gh pr checks` to read green.** Right after a push `gh pr checks` can still report the previous head's results, and a review dispatched then skips the PR (`required context 'build' has not concluded`). Read the head with `gh pr view <n> --json headRefOid` and wait for `gh run list --commit <sha> --workflow ci.yml` to report `completed` first.
 - **Every push brings a fresh Qodo review**, including a push that only merges `main` in. Its new findings land as threads and block the reviewer's vote, so after each push read the threads again before expecting a vote.
 
 When a vote arrives, go back to Step 3. A `REQUEST_CHANGES` from the reviewer goes to Step 6.
