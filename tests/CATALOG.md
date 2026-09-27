@@ -574,17 +574,17 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** a real Claude session.
 - **Platform coverage:** mac+linux+windows.
 
-##### status/blocked/012 — Codex rollout classification only blocks an armed matching turn (issue #714).
+##### status/blocked/012 — Codex rollout classification blocks or errors only an armed matching turn (issues #714, #1359).
 - **Layer:** L1 unit (src/quota_signals.rs).
 - **Agent:** none.
-- **Asserts:** task_complete with usage_limit_exceeded uses the matching token_count kind; wrong turns, other errors and healthy has_credits:false do not block.
+- **Asserts:** task_complete with usage_limit_exceeded uses the matching token_count kind; every other error on the armed turn — the verbatim invalid-model record real Codex 0.156.1 wrote (`codex_error_info: "other"`), a string or object-valued codex_error_info, including rate_limit_exceeded — is Error, never Blocked; wrong turns and healthy has_credits:false are neither, and a null error is a clean end.
 - **Does not assert:** daemon polling or a real Codex session.
 - **Platform coverage:** mac+linux+windows.
 
 ##### status/blocked/013 — Codex rollout tailing is bounded and path safe (issue #714).
 - **Layer:** L1 unit (src/codex_rollout_tail.rs).
 - **Agent:** none.
-- **Asserts:** an armed regular rollout file reports its matching failure once, malformed or oversized lines are bounded, and a dead owner drops the tailer. The FIFO and symlink refusal checks run on Unix only.
+- **Asserts:** an armed regular rollout file reports its matching failure once — a quota failure as Blocked, a non-quota one as Error (issue #1359) — malformed or oversized lines are bounded, and a dead owner drops the tailer. The FIFO and symlink refusal checks run on Unix only.
 - **Does not assert:** a live Codex process.
 - **Platform coverage:** mac+linux+windows.
 
@@ -609,10 +609,10 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** a real quota-exhausted account.
 - **Platform coverage:** mac+linux.
 
-##### status/blocked/018 — A launcher-started Codex rollout blocks its card (issue #714).
+##### status/blocked/018 — A launcher-started Codex rollout blocks its card, or errors it for a non-quota failure (issues #714, #1359).
 - **Layer:** L2, lane 1, PTY-attached.
 - **Agent:** synthetic Codex executable using installed hooks and writing rollout JSONL; no provider credential.
-- **Asserts:** a matching task_complete error yields Credits Blocked in the card and daemon status.
+- **Asserts:** a matching usage_limit_exceeded task_complete yields Credits Blocked in the card and daemon status; in a second deck, the verbatim invalid-model task_complete error real Codex wrote yields Error in both, never Blocked.
 - **Does not assert:** a real Codex API request.
 - **Platform coverage:** mac+linux.
 
@@ -656,6 +656,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** synthetic Claude executable using the installed hook; no provider credential.
 - **Asserts:** a rejected-quota StopFailure blocks the attached card and daemon status; subagent-tagged tool and stop hooks, including a billing-error StopFailure, leave both Blocked with the Usage reason; a main-thread prompt clears it.
 - **Does not assert:** a real quota-exhausted account or a real Claude subagent.
+- **Platform coverage:** mac+linux.
+
+##### status/blocked/026 — A real Codex API failure ends as Error (issue #1359).
+- **Layer:** L2, lane 2, PTY-attached (`tests/e2e_quota_blocked_live.rs`).
+- **Agent:** real interactive Codex with a model name no account can use; developer credentials required.
+- **Asserts:** a submitted prompt, whose failed turn Codex reports through no hook, produces a Codex Error event from the daemon's rollout tailer (not one from `wrap`'s stdout classifier) and a rendered Error card that never shows Blocked.
+- **Does not assert:** that the card half discriminates on its own — for this failure `wrap` also emits an Error, because Codex renders the provider's raw JSON body and its `"type":"error"` is the wrapper's Codex error marker (status/blocked/018 asserts the card for a failure without it); a real quota-exhausted account; any Codex failure other than a rejected model.
 - **Platform coverage:** mac+linux.
 
 #### status/agent-event
