@@ -659,9 +659,9 @@ fn orchestration_delegate_037_delegate_to_blocked_worker_warns_and_delivers() {
 /// Scenario: A delegated Codex worker announces its rollout path through the
 /// installed hook and appends a structured quota failure while work is owed.
 /// The orchestrator receives one fixed notice and the ledger stays busy.
-#[spec("scheduler/idle-worker/021")]
+#[spec("scheduler/idle-worker/024")]
 #[test]
-fn scheduler_idle_worker_021_blocked_worker_notices_orchestrator_once() {
+fn scheduler_idle_worker_024_blocked_worker_notices_orchestrator_once() {
     let fixture = common::race_safe_tempdir();
     let bin = fixture.path().join("bin");
     let fifo = fixture.path().join("codex-trigger");
