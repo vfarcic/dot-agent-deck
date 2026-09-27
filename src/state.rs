@@ -3391,9 +3391,11 @@ impl AppState {
     ///   ([`Self::untagged_status_panes`]) — the command-entry lock refuses to
     ///   act on such a status, and so does this;
     /// * the pane is an orchestration role pane with an outstanding commission
-    ///   — the delegation, not the status, is what makes this orchestrator's
-    ///   business. That is re-checked when the notice fires and again
-    ///   immediately before it is written;
+    ///   made to THIS agent — the delegation, not the status, is what makes this
+    ///   orchestrator's business, and a later agent in the pane of a worker that
+    ///   exited without a `work-done` was never delegated to (Qodo, #1347;
+    ///   [`AgentPtyRegistry::commission_owed_to_agent`]). That is re-checked
+    ///   when the notice fires and again immediately before it is written;
     /// * the notice is not switched off ([`waiting_notice_debounce`]).
     ///
     /// Nothing here is authority. The status only decides when the daemon
@@ -3420,7 +3422,10 @@ impl AppState {
         let Some(debounce) = waiting_notice_debounce() else {
             return;
         };
-        if registry.commission_owed_to(pane_id).is_none() {
+        if registry
+            .commission_owed_to_agent(pane_id, live_agent_id)
+            .is_none()
+        {
             return;
         }
         let Some(armed) = registry.arm_waiting_notice(
@@ -3509,9 +3514,11 @@ struct WaitingNoticeWatch {
 ///   re-checks that neither pane is closing, that the agent that reported the
 ///   wait still owns the worker pane, that the episode is still open (the
 ///   worker has not left the state), that the commission is still owed to
-///   that same orchestrator agent (a `work-done` or a pane close since means
-///   there is nothing to report), and that the orchestrator pane still belongs
-///   to the worker's orchestration.
+///   that same orchestrator agent BY the agent that reported the wait (a
+///   `work-done` or a pane close since means there is nothing to report, and a
+///   commission made to another agent in the pane is not this one's — Qodo,
+///   #1347), and that the orchestrator pane still belongs to the worker's
+///   orchestration.
 ///
 /// One notice per episode: the episode is settled whatever the outcome, and a
 /// write that was refused is not retried — a refusal means the target changed,
@@ -3564,10 +3571,13 @@ fn arm_waiting_notice_watch(
             registry.settle_waiting_notice(&worker_pane_id, seq, false);
             return;
         }
-        let Some(owner) = registry.commission_owed_to(&worker_pane_id) else {
+        let Some(owner) = registry.commission_owed_to_agent(&worker_pane_id, &worker_agent_id)
+        else {
             tracing::debug!(
                 pane_id = %worker_pane_id,
-                "waiting notice: the worker no longer owes a work-done; no notice"
+                worker_agent_id = %worker_agent_id,
+                "waiting notice: the waiting agent no longer owes a work-done, or was never the \
+                 one delegated to; no notice"
             );
             registry.settle_waiting_notice(&worker_pane_id, seq, false);
             return;
@@ -3629,7 +3639,9 @@ fn arm_waiting_notice_watch(
                             .as_deref()
                             != Some(revalidate_worker_agent.as_str())
                         || !revalidate_registry.waiting_notice_is_current(&revalidate_worker, seq)
-                        || revalidate_registry.commission_owed_to(&revalidate_worker) != Some(owner)
+                        || revalidate_registry
+                            .commission_owed_to_agent(&revalidate_worker, &revalidate_worker_agent)
+                            != Some(owner)
                     {
                         return false;
                     }
@@ -6236,6 +6248,32 @@ fn write_work_done_summary(
     }
 }
 
+/// Issue #447 (Qodo, #1347): bind a dispatch's commission to the worker agent
+/// its pointer goes to ([`AgentPtyRegistry::bind_commission_worker_agent_id`]),
+/// and, when the bind applied, open that agent's waiting episode if it is
+/// already waiting. An agent that stopped at a prompt while the commission
+/// still named its predecessor — the pane changed hands between the delegate
+/// and this write — failed the episode gate then, and never makes the
+/// transition again. Idempotent per agent, so an episode already open keeps
+/// its clock. `state` is `None` only for callers with no daemon state.
+async fn bind_dispatched_commission(
+    registry: &Arc<AgentPtyRegistry>,
+    state: Option<&SharedState>,
+    worker_pane_id: &str,
+    arm_id: u64,
+    worker_agent_id: &str,
+) {
+    if !registry.bind_commission_worker_agent_id(worker_pane_id, arm_id, worker_agent_id) {
+        return;
+    }
+    if let Some(state) = state {
+        state
+            .read()
+            .await
+            .open_waiting_episode_if_already_waiting(worker_pane_id, registry);
+    }
+}
+
 /// Per-target body of [`AppState::handle_delegate`], factored out so
 /// each target runs in its own `tokio::spawn`. Owns all the inputs it
 /// needs (no `&self` / `&AppState` borrows) so the spawn future is
@@ -6393,6 +6431,11 @@ async fn dispatch_one_owned(
     // rather than "in flight" to `retire_commissions_of_replaced_agent`, which
     // is why the guard goes now and only whether it existed is kept.
     let commission_armed = commission_in_flight.is_some();
+    // Issue #447 (Qodo, #1347): kept past the guard, so this dispatch can bind
+    // its worker onto its own commission and not a newer delegate's.
+    let commission_arm_id = commission_in_flight
+        .as_ref()
+        .map(crate::agent_pty::CommissionDispatchInFlight::arm_id);
     drop(commission_in_flight);
 
     // Look the role config up by `(worker cwd, orchestration name,
@@ -6628,6 +6671,19 @@ async fn dispatch_one_owned(
                 }
                 let retired =
                     registry.retire_commissions_of_replaced_agent(&pane_id, commission_armed);
+                // Issue #447 (Qodo, #1347): the replacement is the agent this
+                // dispatch's commission was made to, and from this moment — so a
+                // setup prompt it stops at before the pointer lands is reported.
+                if let Some(arm_id) = commission_arm_id {
+                    bind_dispatched_commission(
+                        &registry,
+                        state.as_ref(),
+                        &pane_id,
+                        arm_id,
+                        &new_agent_id,
+                    )
+                    .await;
+                }
                 if retired > 0 {
                     tracing::info!(
                         pane_id = %pane_id,
@@ -7495,6 +7551,15 @@ async fn dispatch_one_owned(
         (delegation_seq, expected_worker_agent_id.as_deref())
     {
         registry.bind_delegation_worker_agent_id(&pane_id, seq, worker_agent_id);
+    }
+    // Issue #447 (Qodo, #1347): and the commission ledger's own binding, which
+    // the waiting-for-input notice requires — `handle_delegate` bound the
+    // pane's occupant at arm time, and the pointer goes to whoever holds it now.
+    if let (Some(arm_id), Some(worker_agent_id)) =
+        (commission_arm_id, expected_worker_agent_id.as_deref())
+    {
+        bind_dispatched_commission(&registry, state.as_ref(), &pane_id, arm_id, worker_agent_id)
+            .await;
     }
     // PRD #249 M3: arm the cancellation record and subscribe BEFORE the write.
     // Subscribing first means an agent that consumes the pointer and emits its
@@ -9577,9 +9642,22 @@ impl AppState {
             // Decided the way `dispatch_one_owned` decides it, from the same
             // `cwd` and orchestration, and a missing role config means no
             // respawn there too.
-            if commission_in_flight.is_some()
+            //
+            // Before that, the commission is bound to the agent its pointer is
+            // for (Qodo, #1347): on a delegate that respawns nothing, whoever
+            // holds the pane now. `dispatch_one_owned` rebinds it to whoever the
+            // pointer is actually written to, and to the fresh agent on a
+            // `clear = true` respawn.
+            if let Some(in_flight) = commission_in_flight.as_ref()
                 && !delegate_respawns_worker(cwd.as_deref(), orchestration.as_ref(), &target_role)
             {
+                if let Some(worker_agent_id) = registry.pane_current_agent_id(&pane_id) {
+                    registry.bind_commission_worker_agent_id(
+                        &pane_id,
+                        in_flight.arm_id(),
+                        &worker_agent_id,
+                    );
+                }
                 self.open_waiting_episode_if_already_waiting(&pane_id, &registry);
             }
             if !delivered.iter().any(|r| r == &target_role) {
