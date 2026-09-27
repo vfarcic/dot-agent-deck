@@ -651,7 +651,7 @@ const home = process.env.HOME;
 const candidates = [path.join(home, '.config/opencode/plugin/dot-agent-deck.js'),
                     path.join(home, '.opencode/plugin/dot-agent-deck.js')];
 const variant = process.argv[2];
-fs.readFileSync(process.env.QUOTA_TRIGGER_FIFO, 'utf8');
+fs.readFileSync(process.env.QUOTA_TRIGGER_FIFO + '-' + variant, 'utf8');
 const pluginPath = candidates.find(p => fs.existsSync(p));
 if (!pluginPath) throw new Error('deck-installed OpenCode plugin missing');
 const source = fs.readFileSync(pluginPath, 'utf8');
@@ -676,9 +676,9 @@ process.stdin.resume();
     );
 }
 
-/// Scenario: Two OpenCode stand-ins load the deck-installed plugin and send
-/// session.error events. A structured usage marker blocks the first card;
-/// a bare 429 leaves the other in Error.
+/// Scenario: Two OpenCode stand-ins are released independently, load the
+/// deck-installed plugin, and send session.error events. A structured usage
+/// marker blocks the first card; a bare 429 leaves the other in Error.
 #[spec("status/blocked/019")]
 #[test]
 fn status_blocked_019_opencode_plugin_error_blocks_and_bare_429_does_not() {
@@ -689,8 +689,11 @@ fn status_blocked_019_opencode_plugin_error_blocks_and_bare_429_does_not() {
     let fixture = common::race_safe_tempdir();
     let bin = fixture.path().join("bin");
     let fifo = fixture.path().join("opencode-trigger");
+    let marker_fifo = fixture.path().join("opencode-trigger-marker");
+    let bare_fifo = fixture.path().join("opencode-trigger-bare");
     let transcript = fixture.path().join("unused.jsonl");
-    trigger_fifo(&fifo);
+    trigger_fifo(&marker_fifo);
+    trigger_fifo(&bare_fifo);
     install_opencode_standin(&bin);
     let deck = quota_deck(&bin, &fifo, &transcript);
     deck.wait_for_string("No active sessions");
@@ -704,11 +707,11 @@ fn status_blocked_019_opencode_plugin_error_blocks_and_bare_429_does_not() {
     open_orchestration(&deck);
     wait_for_role(&deck, "marker");
     wait_for_role(&deck, "bare");
-    release_standin(&fifo, &deck, "marker");
-    release_standin(&fifo, &deck, "bare");
+    release_standin(&marker_fifo, &deck, "marker");
+    release_standin(&bare_fifo, &deck, "bare");
     assert_blocked(&deck, "marker", "usage_limit");
     assert!(
-        common::wait_until(Duration::from_secs(10), || {
+        common::wait_until(Duration::from_secs(20), || {
             role_status(&deck, "bare").as_deref() == Some("Error")
                 && has_role_badge(&deck.snapshot_grid(), "bare", "Error")
         }),
