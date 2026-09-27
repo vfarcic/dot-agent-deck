@@ -1884,8 +1884,11 @@ async fn report_codex_rollout_failure(
     registry: &Arc<AgentPtyRegistry>,
     failure: crate::codex_rollout_tail::CodexTurnFailure,
 ) {
+    use crate::quota_signals::FailureOutcome;
+    let pane_id = failure.pane_id.clone();
     let agent_id = failure.agent_id.clone();
     let turn_id = failure.turn_id.clone();
+    let outcome = failure.outcome.clone();
     let event = codex_rollout_failure_event(failure);
     let superseded = || {
         registry
@@ -1897,6 +1900,22 @@ async fn report_codex_rollout_failure(
             agent_id = %escape_id_for_log(&agent_id),
             "codex rollout: dropped a failed turn that a newer turn superseded"
         );
+        return;
+    }
+    // Logged only once the card really changed, so a dropped stale failure
+    // never reads as a status change (Qodo on PR #1375).
+    match outcome {
+        FailureOutcome::Blocked { kind, .. } => warn!(
+            pane_id = %escape_id_for_log(&pane_id),
+            agent_id = %escape_id_for_log(&agent_id),
+            kind = kind.as_wire(),
+            "quota: the Codex session log records a usage-limit failure; marked Blocked"
+        ),
+        FailureOutcome::Error => warn!(
+            pane_id = %escape_id_for_log(&pane_id),
+            agent_id = %escape_id_for_log(&agent_id),
+            "the Codex session log records a failed turn; marked Error"
+        ),
     }
 }
 
@@ -1956,22 +1975,9 @@ fn codex_rollout_failure_event(failure: crate::codex_rollout_tail::CodexTurnFail
                 QUOTA_BLOCKED_SOURCE_METADATA_KEY.to_string(),
                 QUOTA_BLOCKED_SOURCE_CODEX_ROLLOUT.to_string(),
             );
-            warn!(
-                pane_id = %escape_id_for_log(&failure.pane_id),
-                agent_id = %escape_id_for_log(&failure.agent_id),
-                kind = kind.as_wire(),
-                "quota: the Codex session log records a usage-limit failure; marked Blocked"
-            );
             crate::event::EventType::QuotaBlocked
         }
-        FailureOutcome::Error => {
-            warn!(
-                pane_id = %escape_id_for_log(&failure.pane_id),
-                agent_id = %escape_id_for_log(&failure.agent_id),
-                "the Codex session log records a failed turn; marked Error"
-            );
-            crate::event::EventType::Error
-        }
+        FailureOutcome::Error => crate::event::EventType::Error,
     };
     AgentEvent {
         session_id: failure.session_id,
