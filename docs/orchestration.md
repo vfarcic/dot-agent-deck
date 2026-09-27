@@ -86,7 +86,7 @@ Opening an orchestration tab uses the same `Ctrl+n` flow as a regular pane, but 
 
 A new tab opens with one pane per role. The role cards appear on the left sidebar; the orchestrator's pane is active on the right. Each pane has the role's `command` running inside it.
 
-![Orchestration tab on launch — five role cards in the sidebar, orchestrator pane active on the right](./img/orchestration-start.png)
+![An orchestration tab on launch: the tab bar shows Dashboard and the orchestration's own tab, two role cards, planner and builder, are stacked in the left sidebar, and the orchestrator role, planner, is selected with its pane active on the right](/img/orchestration-tui.png)
 
 </TabItem>
 <TabItem value="desktop" label="Desktop">
@@ -97,6 +97,8 @@ A new tab opens with one pane per role. The role cards appear on the left sideba
 4. Optionally type a **Name** for the run, then press **Activate orchestration**.
 
 The Dashboard shows the run as an **ORCHESTRATION** group with a row per role, numbered in role order, and an **ORCHESTRATOR** badge on the start role, the one you message. Click a role's row to open its terminal. The group's **Close** stops every role, after a confirmation that lists them (**Close all N roles**). See [Desktop app → Dashboard](desktop/dashboard.md) and [New agent](desktop/new-agent.md).
+
+![The desktop app's Dashboard with an activated orchestration: below the standalone agents, an ORCHESTRATION group named demo-loop with a Close button and a numbered row per role, 01 planner carrying the ORCHESTRATOR badge and 02 builder](/img/orchestration-desktop.png)
 
 </TabItem>
 </Tabs>

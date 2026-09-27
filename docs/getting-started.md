@@ -112,6 +112,8 @@ About 30 seconds after every client (the TUI, the desktop app) has disconnected 
 
 > **Tip:** `Ctrl+d` toggles: press it in a pane to enter command / navigation mode, press it again to go back to the pane.
 
+![The TUI's New Agent form over the dashboard: the chosen directory at the top, a Mode row with No mode selected and an orchestration, schedule and dispatcher as the other choices, then the Name field pre-filled from the directory, an empty Command field, and Submit and Cancel](/img/new-agent-tui.png)
+
 </TabItem>
 <TabItem value="desktop" label="Desktop">
 
@@ -120,6 +122,8 @@ About 30 seconds after every client (the TUI, the desktop app) has disconnected 
 3. Watch the agent's row: its status, and whichever columns you chose with **Columns**, update as the agent works.
 4. To type into an agent, click its row. Its terminal opens in a full-window pane over the Dashboard; press `Escape` or **Back to dashboard** to return.
 5. To close an agent, use the stop control on its row (`Close <name> agent`) and confirm with **Close agent**.
+
+![The desktop app's New agent dialog over the Dashboard: the Local daemon chosen under Daemon, a directory chosen in the browser, the Mode chips with No mode selected, the Name pre-filled from the directory, an empty Command field, and Discard and Create agent](/img/new-agent-desktop.png)
 
 </TabItem>
 </Tabs>
@@ -137,9 +141,11 @@ Once you have a config, starting an orchestration is the same as starting any ot
 3. Cycle the **Mode** field (`Left`/`Right` or `h`/`l`) until the orchestration name appears.
 4. Press `Enter` — the deck opens a tab with a pane for every role.
 
-![Orchestration tab on launch — five role cards stacked in the sidebar (orchestrator working, coder, reviewer, auditor and release idle), with the focused orchestrator pane filling the right-hand side](./img/orchestration-start.png)
+![An orchestration tab on launch: two role cards, planner and builder, stacked in the sidebar, with the orchestrator role, planner, selected and its pane filling the right-hand side](/img/orchestration-tui.png)
 
 In the desktop app, choose the project directory in **New agent**, pick its `Orch: <name>` chip under **Mode**, and press **Activate orchestration**; the Dashboard then shows the run as one group. Generating the config with `g` is TUI-only.
+
+![The desktop app's Dashboard with an activated orchestration shown as one ORCHESTRATION group, a row per role and an ORCHESTRATOR badge on the start role](/img/orchestration-desktop.png)
 
 For the full reference, examples, and configuration options, see [Orchestration](orchestration.md).
 

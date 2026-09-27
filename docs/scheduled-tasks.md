@@ -25,6 +25,8 @@ The [reference section](#reference) below documents the on-disk file the agent w
 
 Press **`s`** on the dashboard (lowercase; the legacy uppercase **`S`** also works) to open the **Schedules** manager — your one place to see and manage every schedule. Its **`[Schedules s]`** button is **always present on the dashboard**: it doesn't wait for a schedule to exist, because the manager's **`[Add]`** action is itself how you create the first one. You never type field values into the dialog itself — **`[Add]`** and **`[Edit]`** hand you to the authoring agent described below, which does the writing for you.
 
+![The TUI's Schedules manager with one schedule: its row shows the name, the status disabled and a next fire of —, above the Add, Edit, Delete, Run now and Toggle buttons](/img/schedules-tui.png)
+
 Rows are **click-selectable**. Each row shows the task **name**, a **status** indicator, and its **next-fire** time:
 
 | Status | Meaning |

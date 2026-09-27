@@ -20,6 +20,8 @@ The selector's menu only chooses. Daemons are added and removed in **Settings â†
 
 Open **Settings** in the rail and choose **Daemons**. The **Daemon** row lists the same choices as the selector; choose one to see or change its settings, or press **Add a daemon** to add a remote one. The trash icon beside a remote daemon removes it from the app; it does nothing on the host.
 
+![Settings â†’ Daemons with a remote daemon, build-box, chosen in the Daemon row beside All daemons and This machine, its Host filled in, the other fields showing their placeholders, and Test connection below, not yet pressed](/img/settings-daemons-desktop.png)
+
 A remote daemon has these fields:
 
 | Field | What it is |

@@ -8,13 +8,15 @@ title: New Agent
 
 The dialog has three parts, top to bottom: **Daemon**, **Directory**, and the form.
 
+![The New agent dialog over the Dashboard: the Local daemon chosen under Daemon, a directory chosen in the browser with Use this directory beside it, and the form below with Dir, the Mode chips (No mode selected), Name pre-filled from the directory, an empty Command, and Discard and Create agent](/img/new-agent-desktop.png)
+
 ## Daemon
 
 Every daemon the app knows is listed, with a tag saying what kind it is. Pick the one the agent should run on. A daemon that cannot take a new agent right now is greyed out, with the reason beside it. If no daemon is configured, the list says so.
 
 ## Directory
 
-The directory browser lists directories **on the chosen daemon's machine**, not on the computer the app runs on, so for a remote daemon you are browsing the remote host. It opens at that daemon's [`default_dir`](../configuration.md) when one is set.
+The directory browser lists directories **on the chosen daemon's machine**, not on the computer the app runs on, so for a remote daemon you are browsing the remote host. It opens at that daemon's [`default_dir`](../configuration.md#default-directory) when one is set.
 
 - A directory holding a `.dot-agent-deck.toml` is tagged **project**; its orchestrations become Mode chips once you choose it.
 - A symbolic link to a directory is tagged **link**. Opening it lists the directory it leads to, and an agent started there runs in that real directory.

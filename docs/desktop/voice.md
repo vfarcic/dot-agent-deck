@@ -20,6 +20,8 @@ To type into an agent, open its [pane](dashboard.md#the-agent-pane) and start wi
 
 ## Settings → Voice
 
+![Settings → Voice with the default services: Speech on this machine, through a local speech container, and Commands through an OpenAI-compatible API, each with its Endpoint and Model, then Names set to Shared and Max tokens](/img/settings-voice-desktop.png)
+
 | Row | What it sets |
 | --- | --- |
 | **Speech** | Where speech is turned into text. **On this machine — speech container, no key** (the default) uses a local container; the panel gives the `docker run` command that starts it, and the first thing you say downloads its model. **OpenAI — needs an OpenAI API key** sends your audio to OpenAI. |

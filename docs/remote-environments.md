@@ -41,6 +41,8 @@ The desktop app reaches a daemon that is **already installed and running** on th
 3. In the app, open **Settings → Daemons**, press **Add a daemon**, fill in **Host** (and **User**, **Port**, **Key file** or **Jump host** as needed), and press **Test connection**, which also finds the daemon's socket.
 4. Pick the daemon in the **Daemon** selector on the Dashboard, or **All daemons**.
 
+![Settings → Daemons with a remote daemon, build-box, chosen in the Daemon row beside All daemons and This machine, its Host filled in, the other fields showing their placeholders, and Test connection below, not yet pressed](/img/settings-daemons-desktop.png)
+
 [Desktop app → Daemons](desktop/daemons.md) has the fields, the test results and what they mean.
 
 </TabItem>
