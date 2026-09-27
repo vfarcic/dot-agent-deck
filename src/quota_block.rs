@@ -32,6 +32,22 @@ pub const QUOTA_BLOCKED_DETAIL_METADATA_KEY: &str = "quota_blocked_detail";
 /// does not parse or lies outside a sane window.
 pub const QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY: &str = "quota_blocked_resets_at_ms";
 
+/// How far in the past a reported reset may lie and still be kept.
+pub const QUOTA_RESET_MAX_PAST_MS: i64 = 60 * 60 * 1000;
+
+/// How far in the future a reported reset may lie and still be kept — past a
+/// year, no provider's window is plausible.
+pub const QUOTA_RESET_MAX_FUTURE_MS: i64 = 400 * 24 * 60 * 60 * 1000;
+
+/// Whether a reset at `at` (epoch milliseconds) is plausible at `now_ms`: within
+/// [`QUOTA_RESET_MAX_PAST_MS`] before it and [`QUOTA_RESET_MAX_FUTURE_MS`] after.
+/// The one window for a reset arriving from a producer (the daemon's
+/// normaliser) and from a snapshot (the client's hydration overlay).
+pub fn reset_at_is_plausible(at: i64, now_ms: i64) -> bool {
+    at >= now_ms.saturating_sub(QUOTA_RESET_MAX_PAST_MS)
+        && at <= now_ms.saturating_add(QUOTA_RESET_MAX_FUTURE_MS)
+}
+
 /// Metadata key marking the `quota_blocked` event the DAEMON authored from a
 /// Codex rollout (value [`QUOTA_BLOCKED_SOURCE_CODEX_ROLLOUT`]). Daemon-owned:
 /// the hook loop strips it from every producer frame, and

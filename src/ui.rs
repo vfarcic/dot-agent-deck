@@ -21372,7 +21372,8 @@ fn render_session_card(
     // reason as the orphaned line — it is the fact that explains everything
     // else on the card. The label is fixed daemon-authored text keyed on the
     // kind, followed by when the provider said the limit resets (measured
-    // against the same `now` as `Last:`, and placed before the detail so a
+    // against the same `now` as `Last:`, shown only for a reset inside the
+    // window the daemon admits, and placed before the detail so a
     // narrow card truncates the detail first); the detail is the agent's own
     // error message, already scrubbed at every point it was stored
     // (`apply_event`, `overlay_snapshot_fields`).
@@ -21382,9 +21383,12 @@ fn render_session_card(
             .map(|r| r.kind)
             .unwrap_or(crate::state::BlockedKind::Unknown)
             .label();
+        let now_ms = now.timestamp_millis();
         let resets = reason
             .and_then(|r| r.resets_at_ms)
-            .and_then(|at| u64::try_from(at - now.timestamp_millis()).ok())
+            .filter(|&at| crate::quota_block::reset_at_is_plausible(at, now_ms))
+            .and_then(|at| at.checked_sub(now_ms))
+            .and_then(|ms| u64::try_from(ms).ok())
             .filter(|&ms| ms > 0)
             .map(|ms| {
                 format!(

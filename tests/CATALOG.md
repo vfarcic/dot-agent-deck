@@ -533,7 +533,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### status/badge/003 — A blocked card shows when a provider says the limit resets (issue #714).
 - **Layer:** L1 (ratatui buffer with a fixed render clock).
 - **Agent:** none (a fixed structured usage-limit reason).
-- **Asserts:** the reason line says the usage limit resets in two hours and ten minutes.
+- **Asserts:** the reason line says the usage limit resets in two hours and ten minutes; a reset at `i64::MIN` or `i64::MAX` still renders the reason, with no countdown and no panic.
 - **Does not assert:** provider classification or a live agent.
 - **Platform coverage:** mac+linux+windows.
 
@@ -570,7 +570,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### status/blocked/011 — Claude installs StopFailure and maps each failure to a terminal status (issue #714).
 - **Layer:** L1 unit (src/hook.rs and src/hooks_manage.rs).
 - **Agent:** none.
-- **Asserts:** installation retains other hooks; StopFailure maps to Blocked or Error; notification type is forwarded; unsafe transcript paths are refused.
+- **Asserts:** installation retains other hooks; StopFailure maps to Blocked or Error; notification type is forwarded; unsafe transcript paths are refused; the bounded tail drops a first line its window cut but keeps a quota record that starts exactly at the window edge.
 - **Does not assert:** a real Claude session.
 - **Platform coverage:** mac+linux+windows.
 

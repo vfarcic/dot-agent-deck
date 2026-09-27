@@ -1715,17 +1715,10 @@ fn admit_producer_event(event: &mut AgentEvent) {
     }
 }
 
-/// Issue #714: how far in the past a reported reset may lie and still be kept.
-const QUOTA_RESET_MAX_PAST_MS: i64 = 60 * 60 * 1000;
-
-/// Issue #714: how far in the future a reported reset may lie and still be
-/// kept — past a year, no provider's window is plausible.
-const QUOTA_RESET_MAX_FUTURE_MS: i64 = 400 * 24 * 60 * 60 * 1000;
-
 /// Issue #714: normalise the `quota_blocked_*` keys of a `quota_blocked` event
 /// at time `now_ms` — an unknown or missing kind becomes `unknown`, a reset that
-/// does not parse as epoch milliseconds within
-/// [`QUOTA_RESET_MAX_PAST_MS`]/[`QUOTA_RESET_MAX_FUTURE_MS`] of now is removed
+/// does not parse as epoch milliseconds within the plausible window around now
+/// ([`crate::quota_block::reset_at_is_plausible`]) is removed
 /// (the event stays), and the detail is scrubbed and bounded.
 fn normalize_quota_blocked_metadata(
     metadata: &mut std::collections::HashMap<String, String>,
@@ -1742,14 +1735,10 @@ fn normalize_quota_blocked_metadata(
         QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
         kind.as_wire().to_string(),
     );
-    let in_window = |at: i64| {
-        at >= now_ms.saturating_sub(QUOTA_RESET_MAX_PAST_MS)
-            && at <= now_ms.saturating_add(QUOTA_RESET_MAX_FUTURE_MS)
-    };
     if !metadata
         .get(QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY)
         .and_then(|v| v.parse::<i64>().ok())
-        .is_some_and(in_window)
+        .is_some_and(|at| crate::quota_block::reset_at_is_plausible(at, now_ms))
     {
         metadata.remove(QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY);
     }

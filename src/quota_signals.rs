@@ -139,8 +139,9 @@ pub fn classify_claude_stop_failure(error: Option<&str>, record: Option<&Value>)
 /// Refused (`None`) unless the path is absolute and ends in `.jsonl`, opens
 /// read-only, and the opened file is a regular file. On Unix the open is
 /// non-blocking, so a FIFO planted at the path cannot hang the hook; it is then
-/// refused by the regular-file check. When the read starts mid-file, the partial
-/// first line is dropped.
+/// refused by the regular-file check. When the read starts mid-file, a first
+/// line the window cut in half is dropped; one that starts exactly at the
+/// window's edge is kept.
 pub fn read_claude_transcript_tail(path: &str) -> Option<Vec<u8>> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let path = std::path::Path::new(path);
@@ -161,12 +162,16 @@ pub fn read_claude_transcript_tail(path: &str) -> Option<Vec<u8>> {
     }
     let len = meta.len();
     let start = len.saturating_sub(CLAUDE_TRANSCRIPT_TAIL_BYTES);
-    file.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::with_capacity((len - start) as usize);
-    file.take(CLAUDE_TRANSCRIPT_TAIL_BYTES)
+    // A window that starts mid-file also reads the byte before it, so the
+    // first line is dropped only when the window cut it: when that byte is a
+    // newline the window starts on a complete record, and only it is dropped.
+    let lead = u64::from(start > 0);
+    file.seek(SeekFrom::Start(start - lead)).ok()?;
+    let mut buf = Vec::with_capacity((len - start + lead) as usize);
+    file.take(CLAUDE_TRANSCRIPT_TAIL_BYTES + lead)
         .read_to_end(&mut buf)
         .ok()?;
-    if start > 0 {
+    if lead > 0 {
         let cut = buf
             .iter()
             .position(|&b| b == b'\n')
