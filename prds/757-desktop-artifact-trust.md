@@ -455,5 +455,7 @@ Decision 11's guards live in `xtask/linkage-check/src/release_workflow_wiring.rs
 
 **The maintainer verified the published `.dmg` on a Mac**, which is the M6 acceptance test: `stapler validate`, `spctl`, and a launch with the network off, with no "damaged" dialog.
 
+**What was not recorded separately.** Asked for per-step results on 2026-09-27 (Greptile on PR #1327), the maintainer confirmed that M6 is done but did not have individual results for the rest of the procedure in `docs/develop/desktop-signing.md`: the `gh attestation verify` check, the microphone (audio-input) check, and whether the WebView rendered and ran. They are recorded here as not captured rather than as passed. Two consequences follow. The audio-input and `allow-jit` entitlements rest on the signed bundle having launched with them, not on an observed microphone or WebView run, which is why `desktop-signing.md` still describes `allow-jit` as unmeasured and keeps it. And the attestation of the published bytes is evidenced by attempt 3's `attest` job above, not by a check run on the Mac.
+
 **The certificate expires 2027-02-01**, about four months after it was created, which is much shorter than the usual description of Developer ID lifetimes. Why is not known. #1326 tracks the renewal, and the job warns 30 days ahead.
 
