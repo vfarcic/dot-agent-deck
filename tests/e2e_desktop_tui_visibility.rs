@@ -21,8 +21,12 @@ use std::time::Duration;
 
 use common::{DaemonProc, TuiDeck};
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, TabMembership};
-use dot_agent_deck::daemon_client::{DaemonClient, EventSubscription, StartAgentOptions};
-use dot_agent_deck::daemon_protocol::{AttachRequest, AttachResponse, KIND_EVENT, KIND_RESP};
+use dot_agent_deck::daemon_client::{
+    DaemonClient, EventSubscription, GatedQuery, StartAgentOptions,
+};
+use dot_agent_deck::daemon_protocol::{
+    AttachRequest, AttachResponse, KIND_EVENT, KIND_RESP, PrepareSpelling,
+};
 use dot_agent_deck::event::{AgentType, BroadcastMsg};
 use spec::spec;
 
@@ -377,7 +381,7 @@ fn start_plain_from_tui(deck: &TuiDeck) {
 }
 
 /// Use the real TUI new-agent form to launch the fixture's orchestration. This
-/// is the control for the desktop's PrepareWorkflow + StartPreparedAgent loop.
+/// is the control for the desktop's prepare-orchestration + prepared-role loop.
 fn start_orchestration_from_tui(deck: &TuiDeck) {
     deck.wait_for_string("No active agents");
     deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
@@ -583,61 +587,81 @@ fn run_mid_attach_start_attempt(attempt: usize) {
     drop(daemon);
 }
 
-/// Drive the desktop's empty-task preparation and configured-role loop. Its
-/// dimensions are the desktop orchestration defaults (32×120), distinct from
-/// the plain action's 24×80 defaults.
+/// Drive the desktop's empty-task preparation and configured-role loop
+/// through the SAME client calls its `start_orchestration_action` makes —
+/// `DaemonClient::prepare_orchestration`, then one
+/// `DaemonClient::start_prepared_role` per role — rather than hand-built
+/// requests, so the capability-selected spelling (issue #1045) is the one on
+/// the wire. Against this branch's daemon that is `prepare-orchestration`,
+/// answered on `orchestration_prepared`; the legacy `prepare-workflow` stays
+/// covered by `project/launch/*`. Its dimensions are the desktop
+/// orchestration defaults (32×120), distinct from the plain action's 24×80.
 fn start_orchestration_from_desktop(daemon: &DaemonProc, project_path: &str) {
-    let response = daemon
-        .send_attach_request(&AttachRequest::PrepareWorkflow {
-            path: project_path.into(),
-            orchestration: ORCHESTRATION_NAME.into(),
-            task: String::new(),
-            config_revision: None,
-        })
-        .expect("desktop-shaped PrepareWorkflow over the attach socket");
-    assert!(
-        response.ok,
-        "desktop-shaped PrepareWorkflow must succeed before roles can start: {:?}",
-        response.error
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build desktop launch runtime");
+    let client = DaemonClient::new(daemon.attach_socket.clone());
+    let spelling = runtime
+        .block_on(client.capabilities())
+        .expect("desktop client handshake")
+        .prepare_orchestration_spelling()
+        .expect("the branch daemon must answer the prepare verb");
+    assert_eq!(
+        spelling,
+        PrepareSpelling::Orchestration,
+        "a daemon of this build advertises `prepare-orchestration`, so the client must choose \
+         it over the legacy `prepare-workflow`"
     );
-    let prepared = response
-        .workflow_prepared
-        .expect("successful PrepareWorkflow must return its roles and token");
+    let prepared = runtime
+        .block_on(client.prepare_orchestration(project_path, ORCHESTRATION_NAME, "", None))
+        .expect("the desktop's production prepare-orchestration call must succeed");
     assert_eq!(
         prepared.roles.len(),
         ORCHESTRATION_ROLES.len(),
         "the fixture must prepare the same three roles as the TUI control"
     );
+    assert_eq!(
+        Path::new(&prepared.context_path),
+        Path::new(project_path).join(".dot-agent-deck/orchestrator-context.md"),
+        "the daemon publishes the coordinator context inside the project the roles start in"
+    );
 
     for (role_index, role) in prepared.roles.iter().enumerate() {
-        let pane_id = desktop_pane_id(role_index);
-        let response = daemon
-            .send_attach_request(&AttachRequest::StartPreparedAgent {
-                prep_token: prepared.token.clone(),
-                command: None,
-                cwd: Some(project_path.into()),
-                rows: 32,
-                cols: 120,
-                env: vec![(DOT_AGENT_DECK_PANE_ID.into(), pane_id)],
-                display_name: Some(role.name.clone()),
-                tab_membership: Some(TabMembership::Orchestration {
-                    name: ORCHESTRATION_NAME.into(),
-                    role_index,
-                    role_name: role.name.clone(),
-                    is_start_role: role.start,
-                    orchestration_cwd: Some(project_path.into()),
-                    display_title: Some(ORCHESTRATION_TITLE.into()),
-                    orchestration_id: Some(ORCHESTRATION_ID.into()),
-                }),
-                agent_type: None,
-                seed: None,
-                use_configured_command: true,
-            })
-            .expect("desktop-shaped StartPreparedAgent over the attach socket");
+        let started = runtime
+            .block_on(client.start_prepared_role(
+                StartAgentOptions {
+                    command: None,
+                    cwd: Some(project_path.into()),
+                    display_name: Some(role.name.clone()),
+                    rows: 32,
+                    cols: 120,
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.into(), desktop_pane_id(role_index))],
+                    tab_membership: Some(TabMembership::Orchestration {
+                        name: ORCHESTRATION_NAME.into(),
+                        role_index,
+                        role_name: role.name.clone(),
+                        is_start_role: role.start,
+                        orchestration_cwd: Some(project_path.into()),
+                        display_title: Some(ORCHESTRATION_TITLE.into()),
+                        orchestration_id: Some(ORCHESTRATION_ID.into()),
+                    }),
+                    agent_type: None,
+                    seed: None,
+                },
+                &prepared.token,
+            ))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "desktop start for role {:?} must succeed: {error}",
+                    role.name
+                )
+            });
         assert!(
-            response.ok,
-            "desktop-shaped start for role {:?} must succeed: {:?}",
-            role.name, response.error
+            matches!(started, GatedQuery::Answered(_)),
+            "the branch daemon advertises `prepared-role-command`, so role {:?} must be started \
+             rather than withheld",
+            role.name
         );
     }
 }
@@ -969,7 +993,7 @@ fn visibility_001_desktop_started_plain_agent_survives_mid_attach_hydration() {
 
 /// Scenario: First launch a three-role orchestration through the real TUI form
 /// and confirm it creates a separate tab with every role visible. Then drive
-/// the desktop's empty-task `PrepareWorkflow` plus one configured
+/// the desktop's empty-task `prepare-orchestration` plus one configured
 /// `StartPreparedAgent` per role against a headless daemon, attach a fresh real
 /// TUI without sending input, and require the named orchestration tab to be
 /// rebuilt with all three role cards.
@@ -1028,9 +1052,11 @@ fn visibility_002_desktop_prepared_orchestration_rebuilds_its_tab_with_every_rol
 }
 
 /// Scenario: Keep a real TUI attached to an empty daemon, then launch the
-/// desktop's empty-task prepared orchestration. The titled tab must appear
-/// without a reconnect, and switching into it must show all three role-named
-/// cards with their declared agent types.
+/// desktop's empty-task prepared orchestration through its own client calls,
+/// which choose `prepare-orchestration`. The titled tab must appear without a
+/// reconnect, switching into it must show all three role-named cards with
+/// their declared agent types, and the coordinator's pane must show the two
+/// workers the daemon-published coordinator context lists.
 #[spec("newagent/visibility/002")]
 #[test]
 fn visibility_002_desktop_prepared_orchestration_surfaces_into_attached_tui_as_own_tab() {
@@ -1075,6 +1101,22 @@ fn visibility_002_desktop_prepared_orchestration_surfaces_into_attached_tui_as_o
         "the already-attached TUI created tab {ORCHESTRATION_TITLE:?}, but switching into it \
          did not show exactly three sessions with the role-named ClaudeCode coordinator, \
          OpenCode builder, and Pi reviewer cards. Role metadata: {records:#?}\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    // The prepared context is what the coordinator started with: its pane
+    // shows the agents the daemon-published context lists — the two workers,
+    // and not the coordinator itself, which the composer leaves out.
+    let (coordinator_col, coordinator_row) = deck.wait_for_in_grid("ClaudeCode · coordinator");
+    deck.click(coordinator_col, coordinator_row);
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            let grid = deck.snapshot_grid();
+            grid.contains("CONTEXT_LISTS builder")
+                && grid.contains("CONTEXT_LISTS reviewer")
+                && !grid.contains("CONTEXT_LISTS coordinator")
+        }),
+        "the coordinator's pane must show the worker roles listed in the coordinator context \
+         `prepare-orchestration` published. Final grid:\n{}",
         deck.snapshot_grid()
     );
 }

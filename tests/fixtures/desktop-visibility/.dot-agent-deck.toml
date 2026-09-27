@@ -1,12 +1,17 @@
 # Synthetic three-role orchestration for the desktop-to-TUI visibility
 # reproduction. Distinct declared agent types make a missing role attributable
 # to its start/worker position and configured agent without running an LLM.
+#
+# The coordinator stand-in reads the coordinator context the preparation
+# published and prints one `CONTEXT_LISTS <role>` line per agent listed under
+# its `## Available agents` — so `newagent/visibility/002` can see, in the
+# coordinator's pane, that the prepared context is what the role started with.
 [[orchestrations]]
 name = "desktop-visibility-team"
 
 [[orchestrations.roles]]
 name = "coordinator"
-command = "printf 'COORDINATOR_SENTINEL\\n'; sleep 600"
+command = '''printf 'COORDINATOR_SENTINEL\n'; sed -n 's/^- \*\*\([a-z]*\)\*\*.*/CONTEXT_LISTS \1/p' .dot-agent-deck/orchestrator-context.md; sleep 600'''
 agent = "claude"
 start = true
 
