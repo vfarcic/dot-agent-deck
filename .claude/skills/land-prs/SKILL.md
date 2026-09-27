@@ -141,7 +141,7 @@ git commit --no-edit               # completes the merge; nothing is pushed with
 git push origin "HEAD:$(gh pr view <n> --json headRefName --jq .headRefName)"
 ```
 
-That push is a fast-forward of the PR branch, so it is refused rather than overwriting anything if the branch moved meanwhile — fetch again and redo the merge. **Never push a fork PR's resolution to `origin`**: `origin` is the base repository, so `HEAD:<headRefName>` there creates or moves an unrelated same-named branch and leaves the PR untouched. Check `gh pr view <n> --json isCrossRepository,headRepositoryOwner,headRepository,maintainerCanModify` first; for a fork, push to the head repository's own URL (`https://github.com/<headRepositoryOwner>/<headRepository>.git`) and only when `maintainerCanModify` is true — otherwise ask its author.
+That push is a fast-forward of the PR branch, so it is refused rather than overwriting anything if the branch moved meanwhile — fetch again and redo the merge. **Never push a fork PR's resolution to `origin`**: `origin` is the base repository, so `HEAD:<headRefName>` there creates or moves an unrelated same-named branch and leaves the PR untouched. Check `gh pr view <n> --json isCrossRepository,maintainerCanModify` first. For a fork, and only when `maintainerCanModify` is true, push to the head repository itself — `gh pr view` returns the owner and repository as objects, so build the URL from their fields: `git push "$(gh pr view <n> --json headRepositoryOwner,headRepository --jq '"https://github.com/\(.headRepositoryOwner.login)/\(.headRepository.name).git"')" "HEAD:<headRefName>"`. Otherwise ask its author.
 
 Resolution rules, from cases met so far:
 
