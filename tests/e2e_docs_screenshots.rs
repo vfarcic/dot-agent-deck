@@ -59,13 +59,20 @@ fn launch() -> TuiDeck {
 /// environment is read back to prove it, since the harness would otherwise
 /// pass that key through by default.
 fn launch_with(customize: impl FnOnce(TuiDeckBuilder) -> TuiDeckBuilder) -> TuiDeck {
+    launch_fixture_with("minimal", customize)
+}
+
+fn launch_fixture_with(
+    fixture: &str,
+    customize: impl FnOnce(TuiDeckBuilder) -> TuiDeckBuilder,
+) -> TuiDeck {
     let deck = customize(
         TuiDeck::builder()
             .with_pty_size(COLS, ROWS)
             .without_success_recording()
             .without_agent_credentials(),
     )
-    .launch_with_fixture("minimal");
+    .launch_with_fixture(fixture);
     #[cfg(target_os = "linux")]
     {
         let pid = deck
@@ -117,9 +124,40 @@ fn capture_unless(
             give_up().then_some(None)
         }
     });
-    let Some(page) = page else {
+    let Some(mut page) = page else {
         return false;
     };
+    if scenario == "new-agent" {
+        // The form shows the harness's random temp path. Replace only its
+        // visible Dir field, before the HTML becomes a published PNG, while
+        // keeping the same cell width and the rest of the real frame intact.
+        let start = page
+            .find("Dir: /")
+            .expect("New Agent form has an absolute Dir field");
+        let end = start
+            + page[start..]
+                .find("</span>")
+                .expect("Dir field ends in a rendered span");
+        let width = page[start..end].chars().count();
+        let display = "Dir: /home/dev/demo-project";
+        assert!(
+            display.len() <= width,
+            "Dir field is too narrow for the docs path"
+        );
+        page.replace_range(start..end, &format!("{display:<width$}"));
+    }
+    if scenario == "orchestration" {
+        // Role-card ages depend on when the sandbox daemon finishes spawning.
+        // Blank just that footer text, preserving its cell count and the card
+        // borders, so the run depicts the same scene on every capture.
+        let ages = regex::Regex::new(r"Last: [0-9]+s  Tools: [0-9]+")
+            .expect("valid role-card age matcher");
+        page = ages
+            .replace_all(&page, |caps: &regex::Captures<'_>| {
+                " ".repeat(caps[0].len())
+            })
+            .into_owned();
+    }
     let dir = html_dir();
     std::fs::create_dir_all(&dir).expect("create the TUI HTML dir");
     let path = dir.join(format!("{scenario}-tui.html"));
@@ -288,6 +326,7 @@ const FOCUSED_PANE_LINES: &[&str] = &[
 /// offers and the panes run in. Named like the hook events' `cwd` so the
 /// cards' `Dir:` reads the same whichever of the two it shows.
 const LAUNCH_DIR: &str = "storefront";
+const DOCS_PROJECT_DIR: &str = "demo-project";
 
 /// The script every stand-in pane runs, the same text for every agent: it
 /// takes the file to record its environment's variable names in as `$1` and
@@ -629,5 +668,90 @@ fn docs_screenshot_dashboard_empty() {
     let deck = launch();
     capture(&deck, "dashboard-empty", |grid| {
         grid.contains("No active agents") && grid.contains("[New Agent Ctrl+N]")
+    });
+}
+
+/// Scenario: Choose the sandbox project's directory through Ctrl+N and show
+/// the New Agent form before starting any command.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_new_agent() {
+    html_dir();
+    let deck = launch_fixture_with("docs-screenshots", |builder| {
+        builder.with_launch_subdir(DOCS_PROJECT_DIR)
+    });
+    deck.wait_for_string("No active agents");
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" ");
+    capture(&deck, "new-agent", |grid| {
+        grid.contains("┌ New Agent") && grid.contains(DOCS_PROJECT_DIR) && grid.contains("No mode")
+    });
+}
+
+/// Scenario: Activate the project's demo-loop orchestration with two stand-in
+/// roles, then show its active tab and the two role panes.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_orchestration() {
+    html_dir();
+    let deck = launch_fixture_with("docs-screenshots", |builder| {
+        builder.with_launch_subdir(DOCS_PROJECT_DIR)
+    });
+    deck.wait_for_string("No active agents");
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" ");
+    deck.wait_for_string("┌ New Agent");
+    deck.send_keys(b"\x1b[C");
+    deck.wait_for_string("Orch: demo-loop");
+    deck.send_keys(b"\r");
+    deck.send_keys(&vec![0x7f; "demo-project-orchestrator-1".len()]);
+    deck.send_keys(b"demo-loop");
+    deck.send_keys(b"\r");
+    capture(&deck, "orchestration", |grid| {
+        grid.contains("demo-loop [×]")
+            && grid.contains("planner")
+            && grid.contains("builder")
+            && grid.contains("Planning the checkout retry flow")
+            && !grid.contains("Activated orchestration")
+            && grid.matches('●').count() == 2
+    });
+}
+
+/// Scenario: Open the Schedules manager over an empty dashboard with one
+/// configured task whose disabled state keeps its next-fire field stable.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_schedules() {
+    html_dir();
+    let scratch = common::harness_tempdir().expect("schedules scratch directory");
+    let schedules = scratch.path().join("schedules.toml");
+    std::fs::write(
+        &schedules,
+        "[[scheduled_tasks]]\nname = \"job\"\ncron = \"0 9 * * *\"\nworking_dir = \"/home/dev/storefront\"\ncommand = \"cat\"\nprompt = \"Summarize checkout changes.\"\nenabled = false\n",
+    )
+    .expect("write docs schedule");
+    let deck = launch_with(|builder| {
+        builder.with_env("DOT_AGENT_DECK_SCHEDULES", schedules.to_string_lossy())
+    });
+    deck.wait_for_string("No active agents");
+    deck.send_keys(b"S");
+    capture(&deck, "schedules", |grid| {
+        grid.contains("NEXT FIRE") && grid.contains("job") && grid.contains("disabled")
+    });
+}
+
+/// Scenario: Open the dashboard's question-mark help overlay so the keyboard
+/// shortcuts and their plain-English actions are visible.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_help() {
+    html_dir();
+    let deck = launch();
+    deck.wait_for_string("No active agents");
+    deck.send_keys(b"?");
+    capture(&deck, "help", |grid| {
+        grid.contains("Create new agent") && grid.contains("┌ Help")
     });
 }

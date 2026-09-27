@@ -26,3 +26,62 @@ desktopScenario("dashboard-empty", async (page) => {
   await overview(page, "empty");
   await expect(page.getByTestId("overview-first-run")).toBeVisible();
 });
+
+/** Select the fixture project's directory in the shared New agent form. */
+async function projectInNewAgent(page: Page): Promise<void> {
+  await overview(page, "docs");
+  await page.getByTestId("overview-new-agent").click();
+  await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/dev");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/dev/demo-project");
+  await page.keyboard.press(" ");
+  await expect(page.getByTestId("new-agent-dir")).toHaveText("/home/dev/demo-project");
+}
+
+desktopScenario("new-agent", async (page) => {
+  await projectInNewAgent(page);
+  await expect(page.getByTestId("new-agent-dialog")).toBeVisible();
+  await expect(page.getByTestId("new-agent-name")).toHaveValue("demo-project");
+  await page.getByTestId("new-agent-name").evaluate((input) => (input as HTMLInputElement).blur());
+});
+
+desktopScenario("orchestration", async (page) => {
+  await projectInNewAgent(page);
+  await page.getByTestId("new-agent-mode-orch:demo-loop").click();
+  await page.getByTestId("new-agent-name").fill("demo-loop");
+  await page.getByTestId("new-agent-start").click();
+  await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByText("ORCHESTRATOR", { exact: true })).toBeVisible();
+  await expect(page.locator(".overview-row")).toHaveCount(6);
+});
+
+desktopScenario("agent-pane", async (page) => {
+  await overview(page, "docs");
+  await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+  await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
+  await expect(page.locator(".xterm-screen canvas").first()).toBeVisible();
+});
+
+desktopScenario("settings-daemons", async (page) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("dot-agent-deck.desktop-settings", JSON.stringify({
+      version: 1,
+      appearance: { mode: "dark" },
+      zoom: { level: 1 },
+      endpoints: { remote: [{ host: "build-box", id: "deck0000000000aa", port: 22 }], selection: "deck0000000000aa" },
+    }));
+  });
+  await page.goto("/?fixture=1&state=docs");
+  await page.getByTestId("open-settings").click();
+  await page.getByTestId("settings-section-decks").click();
+  await expect(page.getByTestId("settings-panel-decks")).toBeVisible();
+  await expect(page.getByTestId("settings-panel-decks").getByText("build-box")).toBeVisible();
+});
+
+desktopScenario("settings-voice", async (page) => {
+  await page.goto("/?fixture=1&state=docs");
+  await page.getByTestId("open-settings").click();
+  await page.getByTestId("settings-section-voice").click();
+  await expect(page.getByTestId("settings-panel-voice")).toBeVisible();
+});

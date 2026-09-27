@@ -23,6 +23,22 @@ cargo docs-screenshots --out ../scratch/shots          # anywhere else, e.g. to 
 
 Each image is named `<scenario>-<client>.png`, so the `dashboard` scenario produces `docs/img/dashboard-tui.png` and `docs/img/dashboard-desktop.png`. The command prints every file it wrote and fails if an expected one is missing.
 
+## Registered scenes
+
+| Scenario | Clients | Screen |
+| --- | --- | --- |
+| `dashboard` | TUI, desktop | Four agents in mixed states. |
+| `dashboard-empty` | TUI, desktop | First-run empty state. |
+| `new-agent` | TUI, desktop | New Agent form with a project directory chosen. |
+| `orchestration` | TUI, desktop | Activated `demo-loop` with planner and builder roles. |
+| `agent-pane` | desktop | Agent pane over the Dashboard; the browser fixture does not replay terminal bytes, so its terminal is empty. |
+| `settings-daemons` | desktop | Daemons settings with one configured remote. The browser fixture cannot produce a successful Test connection result. |
+| `settings-voice` | desktop | Voice settings. |
+| `schedules` | TUI | Schedules manager with one disabled task, keeping the next-fire field stable. |
+| `help` | TUI | The `?` keyboard shortcut overlay. |
+
+The docs-only fleet fixture is prepared in `desktop/src/data/fixture.ts`, but `dashboard-fleet` is not registered until the browser preview accepts its state. The preview's fixture-state allowlist is in `desktop/src/lib/bridge.ts`; that file needs to admit `docs-fleet` before a capture can select it.
+
 It runs two stages:
 
 1. **TUI capture.** `cargo nextest run --features e2e --test e2e_docs_screenshots --run-ignored only` with an exact filter for the selected scenarios. Each capture drives the real binary in the L2 PTY harness (`tests/common/mod.rs`), inside the harness's isolated sandbox: its own `HOME`, sockets, state dir and lazily spawned daemon, so it never attaches to your running deck. It launches the deck with `without_agent_credentials()`, so no agent credential is in its environment even when one is ambient on your machine (on Linux the capture reads `/proc/<pid>/environ` back to prove it), puts the scene on screen with stand-in commands in real panes and synthetic hook events (no real agent), then writes the vt100 frame, every cell with its character, colours and attributes, as `<scenario>-tui.html` under this invocation's own directory, `target/docs-screenshots/run-<pid>/tui-html/`. That directory is created empty (a leftover from a dead run that had the same pid is cleared first), so a stale HTML file is never rasterized, and the whole `run-<pid>/` directory is removed when the command exits, whether it succeeded or failed. A run that is killed, `Ctrl+C` included, leaves its directory behind; nothing reuses it except a later run that happens to get the same pid, which clears it.

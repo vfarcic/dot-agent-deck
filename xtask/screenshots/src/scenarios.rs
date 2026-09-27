@@ -81,6 +81,41 @@ pub const SCENARIOS: &[Scenario] = &[
         description: "The agent list with no agents running — each client's empty state.",
         clients: &[Client::Tui, Client::Desktop],
     },
+    Scenario {
+        name: "new-agent",
+        description: "The New Agent form with a project directory selected.",
+        clients: &[Client::Tui, Client::Desktop],
+    },
+    Scenario {
+        name: "orchestration",
+        description: "An active orchestration with planner and builder roles.",
+        clients: &[Client::Tui, Client::Desktop],
+    },
+    Scenario {
+        name: "agent-pane",
+        description: "The desktop agent pane over the Dashboard.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "settings-daemons",
+        description: "Desktop Daemons settings with one remote configured.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "settings-voice",
+        description: "Desktop Voice settings.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "schedules",
+        description: "The TUI Schedules manager with one configured task.",
+        clients: &[Client::Tui],
+    },
+    Scenario {
+        name: "help",
+        description: "The TUI keyboard shortcut help overlay.",
+        clients: &[Client::Tui],
+    },
 ];
 
 /// Look a scenario up by name.
