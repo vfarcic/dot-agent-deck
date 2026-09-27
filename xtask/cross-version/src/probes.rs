@@ -1609,18 +1609,17 @@ mod tests {
             "matrices": [], "masks": [], "masked_home": null, "outer_mnt_ns": "mnt:[1]"
         }))
         .expect("plan");
-        let [aliased, per_uid, flat] = <[EndpointMatrix; 3]>::try_from(EndpointMatrix::candidates(
-            &sb,
-            crate::sandbox::EndpointMode::Resolved,
-            false,
-            1000,
-            crate::sandbox::Direction::Reverse,
-        ))
-        .expect("three candidates");
-        // #1211's layout is the per-uid directory too: the flat alias beside it
-        // does not move where the daemon's primary endpoints are.
-        assert!(daemon_layout_precondition(&plan, &aliased).is_none());
-        assert!(daemon_layout_precondition(&plan, &per_uid).is_none());
+        let candidates =
+            EndpointMatrix::candidates(&sb, crate::sandbox::EndpointMode::Resolved, false, 1000);
+        let (per_uid, flat): (Vec<_>, Vec<_>) =
+            candidates.into_iter().partition(|m| m.owns_per_uid(1000));
+        let [flat] = <[EndpointMatrix; 1]>::try_from(flat).expect("one flat candidate");
+        // #1211's layouts are the per-uid directory too: a flat alias beside it,
+        // whole, partial or skipped, does not move the daemon's primary endpoints.
+        assert_eq!(per_uid.len(), 4);
+        for m in &per_uid {
+            assert!(daemon_layout_precondition(&plan, m).is_none(), "{m:?}");
+        }
         assert!(
             daemon_layout_precondition(&plan, &flat)
                 .is_some_and(|m| m.contains("does not carry #1121's layout"))

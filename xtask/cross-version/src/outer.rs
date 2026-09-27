@@ -1425,8 +1425,7 @@ fn run_one(
         let extra_env = probe.extra_env(&sb);
         let env = sandbox::run_env(&sb, spec, &user, &extra_env);
         sandbox::check_env(&env, &sb, spec, &extra_env)?;
-        let matrices =
-            EndpointMatrix::candidates(&sb, mode, spec.keep_xdg_runtime_dir, uid, direction);
+        let matrices = EndpointMatrix::candidates(&sb, mode, spec.keep_xdg_runtime_dir, uid);
         for m in &matrices {
             sandbox::check_socket_path_lengths(m)?;
         }

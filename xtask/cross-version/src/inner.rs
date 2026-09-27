@@ -1227,7 +1227,8 @@ fn scenario(
     );
     g.preconnect_logged(&format!("{} TUI", cast.client_side), &plan.env, ev)?;
     let fallback_arm = plan.mode == EndpointMode::Resolved && !plan.keep_xdg_runtime_dir;
-    if fallback_arm && cast.direction == Direction::Forward && g.matrix.aliases.is_empty() {
+    let old_daemon_per_uid = g.matrix.owns_per_uid(plan.uid);
+    if fallback_arm && cast.direction == Direction::Forward && !old_daemon_per_uid {
         ev.isolated(format!(
             "fallback arm: the branch TUI starts with no `XDG_RUNTIME_DIR` and no socket override \
              in its environment, its own primary fallback `{}` is absent (no file, no listener), \
@@ -1240,24 +1241,27 @@ fn scenario(
             g.matrix.owned[1].display()
         ));
     }
-    if fallback_arm && cast.direction == Direction::Forward && !g.matrix.aliases.is_empty() {
+    if fallback_arm && cast.direction == Direction::Forward && old_daemon_per_uid {
         ev.isolated(format!(
-            "fallback arm, #1211 layout: the branch TUI starts with no `XDG_RUNTIME_DIR` and no \
-             socket override in its environment. The {} daemon listens at the per-uid `{}` and \
-             `{}` and also holds the pre-#1121 flat {} as its #1211 alias; the XDG pair is \
-             absent (no file, no listener). A branch TUI that resolves the per-uid fallback \
-             reaches that daemon at its primary address, so this run does NOT exercise the \
-             compatibility read of the literal `/tmp` — only a previous release older than \
-             v0.41.1 leaves that read as the only way in.",
+            "fallback arm, per-uid layout: the branch TUI starts with no `XDG_RUNTIME_DIR` and no \
+             socket override in its environment. The {} daemon listens at {} — {}; every other \
+             candidate — {} — is absent (no file, no listener). A branch TUI that resolves the \
+             per-uid fallback reaches that daemon at its primary address, so this run does NOT \
+             exercise the compatibility read of the literal `/tmp` — only a previous release \
+             older than v0.41.1 leaves that read as the only way in.",
             plan.previous,
-            g.matrix.owned[0].display(),
-            g.matrix.owned[1].display(),
             g.matrix
-                .aliases
+                .held()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            g.matrix.layout(plan.uid),
+            g.matrix
+                .absent
                 .iter()
                 .map(|p| format!("`{}`", p.display()))
                 .collect::<Vec<_>>()
-                .join(" and ")
+                .join(", ")
         ));
     }
     if fallback_arm && cast.direction == Direction::Reverse {
@@ -1652,7 +1656,7 @@ fn with_attached_tui(
         && !g.matrix.owns_per_uid(plan.uid)
     {
         // Only against an old daemon on the flat pair: against one that owns
-        // the per-uid directory itself (#1211's layout) the directory exists
+        // the per-uid directory itself (v0.41.1 on) the directory exists
         // because that daemon made it, and says nothing about the branch.
         //
         // The change that makes `resolved` mode necessary (issue #1121) claims
@@ -1689,10 +1693,10 @@ fn with_attached_tui(
                  ends) passing mean the branch TUI reached the {} daemon through {}",
                 attach.display(),
                 plan.previous,
-                if g.matrix.aliases.is_empty() {
-                    "the legacy flat address"
-                } else {
+                if g.matrix.owns_per_uid(plan.uid) {
                     "the per-uid fallback it binds as its primary, not the compatibility read"
+                } else {
+                    "the legacy flat address"
                 }
             )
         } else {
