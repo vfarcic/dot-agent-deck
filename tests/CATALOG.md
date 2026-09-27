@@ -747,6 +747,43 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** how much wall time either sample takes, or that any particular `/proc` file was or was not opened — the timing and `strace` evidence for why this matters lives in `prds/386-descendant-scan-shell-activity-signal.md` (M5) and in the doc comment on `PS_TABLE_ARGS`, not in an assertion, because a threshold here would be a flake generator on a loaded machine (PRD #386's Test Plan says so about M5 explicitly). Also does not assert anything about the daemon's poll task or a real agent.
 - **Platform coverage:** mac+linux (real-process assertion; not run on Windows, where `process_table()` is unconditionally `None`).
 
+#### status/subagent
+
+##### status/subagent/001 — A background subagent's tool call after the turn went Idle leaves the card Idle, even when it never gets a `PostToolUse` (issue #1354).
+- **Layer:** L1 (fast tier; each payload goes through the real `hook --agent <agent>` CLI, then `AppState::apply_event`).
+- **Agent:** none (Claude Code- and Codex-shaped hook payloads, modelled on the schemas those agents declare: `agent_id` present only on a hook fired inside a subagent, the parent's `session_id` throughout).
+- **Asserts:** for both `claude-code` and `codex`, replaying issue #1354's sequence — main `PreToolUse`/`PostToolUse` on `Bash`, `Stop`, then a subagent `PreToolUse` carrying `agent_id` with no `PostToolUse`, then `SubagentStop` — leaves the card's status Idle and no active tool.
+- **Does not assert:** that a real Claude Code or Codex emits this sequence — the payloads are built from their declared hook-input schemas and the reported `deck.log`, not captured from a live agent; the rendered badge (`hooks/delivery/008`).
+- **Platform coverage:** mac+linux.
+
+##### status/subagent/002 — A main-thread tool call after the turn went Idle still reads Working (the control for `/001`).
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** the same sequence with the trailing call from the main thread — once plain, once from an `--agent` session whose payload carries `agent_type` but no `agent_id` — leaves the card Working with `Bash` as its active tool, so what keeps `/001` Idle is the subagent attribution rather than a `ToolStart` that stopped counting.
+- **Does not assert:** anything about Codex or Devin payloads.
+- **Platform coverage:** mac+linux.
+
+##### status/subagent/003 — A background subagent's FAILED tool call after the turn went Idle leaves the card Idle rather than Error.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** a subagent `PostToolUse` whose `tool_response` reports a non-zero exit reaches the daemon as `ToolEnd`, not `Error`, and the card reads Idle with the call counted; the same response on a main-thread call still becomes `Error` and the card reads Error.
+- **Does not assert:** which `tool_response` shapes count as failures (`hook.rs`'s own unit tests).
+- **Platform coverage:** mac+linux.
+
+##### status/subagent/004 — A foreground subagent inside a live turn keeps the card Working on the main thread's call, and its permission prompt is still answerable.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** step by step through the main thread's `Agent` call, the subagent's `Bash` call, the subagent's `PermissionRequest` and its answered `PostToolUse`, `SubagentStop`, the `Agent` call's end and `Stop`: the card reads Working with `Agent` as active tool through the subagent's own calls, Needs Input on the subagent's prompt and Thinking once that call ends, and Idle at the end.
+- **Does not assert:** a subagent prompt answered after the main turn already stopped — that still leaves Thinking until the next event, as it did before issue #1354.
+- **Platform coverage:** mac+linux.
+
+##### status/subagent/005 — A subagent's tool call between `ShellBusy` and `ShellIdle` does not strand the synthetic Working.
+- **Layer:** L1.
+- **Agent:** none (the `ShellBusy`/`ShellIdle` frames are daemon-synthesized in production and built directly here).
+- **Asserts:** from an Idle card, `ShellBusy` sets Working; a subagent `ToolStart` (through the real hook CLI) followed by `ShellIdle` returns the card to Idle. The control, a main-thread `ToolStart` in the same spot, takes the status over as real and the card stays Working through the `ShellIdle`.
+- **Does not assert:** the descendant scan that produces `ShellBusy` (`status/shell-activity/*`).
+- **Platform coverage:** mac+linux.
+
 ### Agent protocol
 
 #### agent/readiness
@@ -1937,6 +1974,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the rendered card label (the `AgentRecord`→placeholder→render mapping is covered by `rehydration` + L1 dashboard tests); the live-stream upgrade path while a TUI is already attached.
 - **Platform coverage:** mac+linux.
 
+##### hooks/delivery/008 — A background subagent's unfinished tool call after the turn went Idle does not flip the rendered card back to Working (issue #1354).
+- **Layer:** L2.
+- **Agent:** none (Claude Code-shaped payloads piped through the real `dot-agent-deck hook --agent claude-code` CLI at the per-test hook socket).
+- **Asserts:** the card's badge reads Working on the main turn's `Bash` (proving the needle can appear), then Idle after `Stop`; after a subagent `PreToolUse` carrying `agent_id` with no `PostToolUse`, and `SubagentStop`, the background call is visible in the card's tool history and the badge still reads Idle — held for 2 seconds with no `Working` anywhere on screen.
+- **Does not assert:** a real Claude Code producing the sequence; the Codex half (`status/subagent/001`); anything but the one card.
+- **Platform coverage:** mac+linux.
+
 #### hooks/ingest
 
 ##### hooks/ingest/001 — An over-long hook line is refused at the production cap rather than buffered, and the daemon keeps serving (issues #903 / #319).
@@ -2883,6 +2927,13 @@ without depending on the config struct API.
 - **Asserts:** `request_from_socket_at_detailed`, handed a request line sized past this host's measured socket buffering under a 300 ms deadline, returns `SocketReply::NoReply` with the cause `NoReplyCause::PartialWrite { written, total }` where `0 < written < total` — the kernel takes the prefix that fits the socket's buffering and the remainder times out. The payload is at least 4 MiB and at least four times the Unix-stream write capacity the test first measures on a fresh `UnixStream::pair` (`unix_stream_write_capacity`), so host socket tuning cannot let the whole line fit: on Linux that capacity is the writer's own `SO_SNDBUF` (`net.core.wmem_default`), not the reader's `SO_RCVBUF` — shrinking the stub's receive buffer, which an earlier revision of this test did, measurably changed nothing. Issue #434: `write_all(…).is_err() || flush().is_err()` classified every write failure as `SocketReply::Unreachable`, whose doc promises the caller that the request "was never sent" and is therefore safe to retry; since issue #419 put a write timeout on the socket a write can fail with part of the line already in the daemon's buffer, and `crate::bounded_read::read_capped_line` treats a trailing unterminated line as a line, so a write that broke after the last JSON byte hands the daemon a complete, actionable request that a retry would then duplicate. The second assertion is what stops a false pass: a `NoReplyCause::Read(DeadlineExpired)` would mean the whole line fit after all and nothing about partial writes was exercised.
 - **Does not assert:** a write that fails at a byte offset the test chose — a real socket cannot be asked for that, and the `write_request_line` stub-writer unit tests beside this one pin the classifier at exact offsets instead (including the zero-byte `Unreachable` case, the `EINTR` retry, `WriteZero`, and a failing flush); that the daemon in fact parsed the prefix (the stub never reads); which CLI verb observes the reclassification; Windows named-pipe write semantics.
 - **Platform coverage:** mac+linux (Unix-domain socket; the payload is sized from the host's measured buffering, so it holds on a tuned host as well as a default one).
+
+##### error/socket/014 — A per-uid fallback directory another uid owns no longer wedges startup: the daemon relocates into an unguessable owner-only sibling.
+- **Layer:** L2 (headless: the real `dot-agent-deck` binary's `daemon serve`, `daemon endpoint`, `daemon status`, `daemon stop` and the launcher's lazy-spawn path via `DOT_AGENT_DECK_EXIT_AFTER_HANDSHAKE`, all inside one bubblewrap namespace — no PTY).
+- **Agent:** none.
+- **Asserts:** with a root-owned directory read-only-bound over `<isolated TMPDIR>/dot-agent-deck-<uid>` (so the daemon's `lstat` sees another owner — the squatter of issue #1173), `XDG_RUNTIME_DIR` absent and both endpoint overrides absent, `daemon serve` starts instead of refusing; exactly one `<TMPDIR>/dot-agent-deck-<uid>.<16 hex>` directory exists afterwards, owned by the test's uid at mode `0o700`; `daemon endpoint` names the `attach.sock` inside it both after `daemon serve` and after the launcher's lazy-spawn, so the launcher reused the directory rather than minting a second; `daemon status` and `daemon stop` both reach the relocated daemon through client resolution; the relocated daemon still binds the redirected pre-#1121 attach alias (issue #1211); the log holds exactly two `Attach protocol listening` lines (one per daemon, both on the relocated path) and the relocation warning; nothing is created inside the squatted name; read-only metadata snapshots assert both literal `/tmp/dot-agent-deck[-attach]-<uid>.sock` production paths are unchanged.
+- **Does not assert:** a real second uid (the bind supplies the ownership); an older build's client against the relocated daemon (the `cargo xver` reverse run, and the manual run recorded on the PR, cover v0.42.0); the desktop app's lazy-spawn, which does not relocate; macOS, where the per-user `$TMPDIR` is not world-writable and the squat is not reachable. **Skips** (prints `SKIP:` and returns) where `bwrap` is missing or cannot create its namespace, which includes CI runners that restrict unprivileged user namespaces.
+- **Platform coverage:** linux (bubblewrap).
 
 #### error/config
 

@@ -73,6 +73,7 @@ On success, tell the user:
 - That a `chore: publish docs image main-<sha> [skip ci]` commit was pushed to `main` — they should `git pull` to pick it up.
 - Argo CD will detect the `values.yaml` change and sync within a minute or two; the site at https://agent-deck.devopstoolkit.ai will update shortly after.
 - The chart now points at a `main-<sha>` tag. The next `/tag-release` will re-pin it to `v<semver>` automatically.
+- The same run also deploys that commit's build to Netlify production (site `agent-deck-devopstoolkit-ai`, URL in the run summary). This runs alongside the cluster during the migration to Netlify; until DNS is switched, the Netlify copy is not what `agent-deck.devopstoolkit.ai` serves. A failed Netlify step does not undo the image or the chart bump, which run first.
 
 ## Notes
 

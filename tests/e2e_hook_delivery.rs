@@ -61,3 +61,143 @@ fn delivery_001_session_start_creates_card() {
     // or display_name".
     deck.wait_for_string("m2demo");
 }
+
+/// Pipe one Claude Code hook payload through the REAL `dot-agent-deck hook
+/// --agent claude-code` CLI at the deck's per-test hook socket, the way
+/// Claude Code's installed hook command delivers it.
+fn claude_hook_via_cli(deck: &TuiDeck, pane_id: &str, payload: &serde_json::Value) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["hook", "--agent", "claude-code"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", deck.home_dir())
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", pane_id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn `dot-agent-deck hook --agent claude-code`");
+    child
+        .stdin
+        .take()
+        .expect("hook stdin")
+        .write_all(payload.to_string().as_bytes())
+        .expect("write hook payload");
+    let output = child.wait_with_output().expect("wait for hook CLI");
+    assert!(
+        output.status.success(),
+        "hook CLI refused {payload}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Scenario: Launch the deck, then replay issue #1354's hook sequence for one
+/// Claude session through the real `hook --agent claude-code` CLI: the main
+/// turn's `Bash` starts (the card reads Working) and ends, the turn stops (the
+/// card reads Idle), then a background agent under the same session starts a
+/// `Bash` call that never ends and `SubagentStop` follows. The card must still
+/// read Idle, and keep reading it, rather than flipping back to Working.
+#[spec("hooks/delivery/008")]
+#[test]
+fn delivery_008_background_subagent_tool_call_does_not_flip_idle_card_to_working() {
+    const PANE: &str = "pane-sub-1354";
+    const SESSION: &str = "sub1354";
+    const SUBAGENT_ID: &str = "a7c1e0b2d9f34e18";
+    let payload = |event: &str, extra: serde_json::Value| {
+        let mut value = serde_json::json!({
+            "session_id": SESSION,
+            "transcript_path": format!("/home/user/.claude/projects/wt/{SESSION}.jsonl"),
+            "cwd": "/home/user/code/wt",
+            "permission_mode": "default",
+            "hook_event_name": event,
+        });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        value
+    };
+    let bash = |id: &str, command: &str| {
+        serde_json::json!({
+            "tool_name": "Bash",
+            "tool_use_id": id,
+            "tool_input": {"command": command},
+        })
+    };
+    // Only the one card is on screen, so a status word anywhere in the grid
+    // is that card's badge.
+    let card_reads =
+        |status: &'static str| move |grid: &str| grid.contains(SESSION) && grid.contains(status);
+
+    let deck = TuiDeck::launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    claude_hook_via_cli(
+        &deck,
+        PANE,
+        &payload("SessionStart", serde_json::json!({"source": "startup"})),
+    );
+    deck.wait_for_string(SESSION);
+
+    let work_done = "git status --short; dot-agent-deck work-done --task-file report.md";
+    claude_hook_via_cli(
+        &deck,
+        PANE,
+        &payload("PreToolUse", bash("toolu_main_1", work_done)),
+    );
+    // Proves the needle can appear at all, so the Idle hold below is not
+    // passing on a card that never shows Working.
+    deck.wait_until_grid(
+        "card reads Working on the main turn's Bash",
+        card_reads("Working"),
+    );
+
+    let mut end = bash("toolu_main_1", work_done);
+    end["tool_response"] = serde_json::json!({"stdout": "", "stderr": "", "interrupted": false});
+    claude_hook_via_cli(&deck, PANE, &payload("PostToolUse", end));
+    claude_hook_via_cli(
+        &deck,
+        PANE,
+        &payload("Stop", serde_json::json!({"stop_hook_active": false})),
+    );
+    deck.wait_until_grid("card reads Idle after the turn stops", |g| {
+        card_reads("Idle")(g) && !g.contains("Working")
+    });
+
+    // The background agent: Claude Code stamps `agent_id` on every hook that
+    // fires inside a subagent's context. No PostToolUse ever arrives.
+    let mut background = bash(
+        "toolu_bg_1",
+        "ls .dot-agent-deck/worker-task-*.md 2>/dev/null",
+    );
+    background["agent_id"] = SUBAGENT_ID.into();
+    background["agent_type"] = "general-purpose".into();
+    claude_hook_via_cli(&deck, PANE, &payload("PreToolUse", background));
+    claude_hook_via_cli(
+        &deck,
+        PANE,
+        &payload(
+            "SubagentStop",
+            serde_json::json!({
+                "stop_hook_active": false,
+                "agent_id": SUBAGENT_ID,
+                "agent_type": "general-purpose",
+                "agent_transcript_path": "/home/user/.claude/projects/wt/agent.jsonl",
+            }),
+        ),
+    );
+    // The background call reaches the card's tool history either way — it
+    // is work the session did — which is also the barrier: once it is on
+    // screen, the event that used to flip the badge has been applied.
+    deck.wait_for_string("worker-task");
+
+    deck.wait_until_grid_then_hold(
+        "card still reads Idle after the background agent's unfinished call",
+        std::time::Duration::from_secs(2),
+        |g| card_reads("Idle")(g) && !g.contains("Working"),
+    );
+}

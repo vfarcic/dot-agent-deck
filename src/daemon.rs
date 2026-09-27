@@ -308,7 +308,7 @@ fn lock_path_for(socket_path: &Path, override_root: Option<&Path>) -> PathBuf {
 /// Subprocess daemons (spawned via `dot-agent-deck daemon serve`)
 /// inherit `DOT_AGENT_DECK_LOCK_DIR` from their parent's environment,
 /// so the env-var fallback still applies when the override is absent.
-fn lock_root(override_root: Option<&Path>) -> PathBuf {
+pub(crate) fn lock_root(override_root: Option<&Path>) -> PathBuf {
     if let Some(p) = override_root {
         return p.to_path_buf();
     }

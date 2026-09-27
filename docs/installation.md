@@ -86,7 +86,7 @@ nix profile install github:vfarcic/dot-agent-deck
 }
 ```
 
-The `follows` line is the usual tradeoff: one nixpkgs in your closure instead of two, paid for by building against a nixpkgs this project has not tested against, which has to be recent enough to carry rustc 1.85 or newer.
+The `follows` line is the usual tradeoff: one nixpkgs in your closure instead of two, paid for by building against a nixpkgs this project has not tested against, which has to be recent enough to carry rustc 1.97.1 or newer.
 
 **Via the overlay.** If you would rather reach it as `pkgs.dot-agent-deck` everywhere, apply the overlay instead:
 
@@ -98,7 +98,7 @@ The `follows` line is the usual tradeoff: one nixpkgs in your closure instead of
 }
 ```
 
-The overlay always builds against *your* nixpkgs, never the pinned one, so that rustc 1.85 minimum applies here whether or not you set `follows`. The crate is edition 2024, which is where the floor comes from.
+The overlay always builds against *your* nixpkgs, never the pinned one, so that rustc 1.97.1 minimum applies here whether or not you set `follows`. That number is the toolchain this project is built and tested on, declared as `rust-version` in `Cargo.toml` — so cargo refuses an older one up front and names the version it wants, instead of failing somewhere inside the build. An older rustc may well work; nothing here tests one, which is why it is not promised.
 
 ### The home-manager module
 

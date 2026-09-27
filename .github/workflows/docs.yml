@@ -53,3 +53,17 @@ jobs:
           file: site/Dockerfile
           load: true
           tags: ghcr.io/vfarcic/dot-agent-deck-docs:test
+
+      # The Netlify preview is DEPLOYED by docs-preview.yml, not here. This job
+      # runs the PR's own code -- its workflow, its devbox.json init hook, its
+      # npm dependency tree -- so it gets no secret, and hands over only the
+      # built static files. docs-preview.yml runs from `main` on
+      # `workflow_run`, holds the Netlify token, and executes nothing from the
+      # PR. Forks get no preview (and upload nothing).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        with:
+          name: docs-site
+          path: site/build
+          if-no-files-found: error
+          retention-days: 1

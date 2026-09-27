@@ -81,7 +81,7 @@ import { Mic, MicOff, Undo2, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
-import type { VoiceCommandDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
+import type { EndpointSettingsDto, VoiceCommandDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
 import { desktopFeaturesOf, type DeckRuntimeState } from "../types";
 
 /**
@@ -485,6 +485,14 @@ interface VoiceControlPanelProps {
    */
   newAgentInstance?: () => string | undefined;
   /**
+   * The `[endpoints]` section the Deck selector is rendering right now
+   * (PRD #1195) — declared with each utterance so "switch deck to …" resolves
+   * against the decks on screen rather than `desktop.toml`, which lags an edit
+   * by a queued write (Qodo on PR #1340). Read at the same moment as
+   * `directories`, for the same reason.
+   */
+  endpoints?: () => EndpointSettingsDto | undefined;
+  /**
    * Where this panel publishes the context members only IT can serve
    * (PRD #802, the `voice_off` row).
    *
@@ -544,7 +552,7 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints }: VoiceControlPanelProps) {
   /* Held in a ref so the resolve and the overlay read the host's latest getter
      without either callback being rebuilt when the host re-renders. */
   const directoriesRef = useRef(directories);
@@ -553,6 +561,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   newAgentRef.current = newAgent;
   const newAgentInstanceRef = useRef(newAgentInstance);
   newAgentInstanceRef.current = newAgentInstance;
+  const endpointsRef = useRef(endpoints);
+  endpointsRef.current = endpoints;
   const { declareVoiceScreen, resolveVoice, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
   /* Issue #1198 — the list of what can be said leaves out the deck while the
      deck is hidden, even from its "elsewhere" half: it is not somewhere else,
@@ -588,6 +598,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     it — and `fn` here is a navigation.
   */
   const [undo, setUndo] = useState<{ run: () => void }>();
+  /** Set by `reportRefused` while `resolveOne` is dispatching, so a refused
+      dispatch reports only its refusal (see there). */
+  const refusedRef = useRef(false);
 
   /*
     Both toggles are mirrored into refs and written through a setter, because
@@ -903,9 +916,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const declaredDirectories = directoriesRef.current?.();
     const declaredNewAgent = newAgentRef.current?.();
     const declaredInstance = newAgentInstanceRef.current?.();
+    const declaredEndpoints = endpointsRef.current?.();
     setPhase("resolving");
     try {
-      declareVoiceScreen?.(declared, declaredDirectories, declaredNewAgent);
+      declareVoiceScreen?.(declared, declaredDirectories, declaredNewAgent, declaredEndpoints);
       const answer = await resolveVoice(utterance);
       // Abandoned, or replaced by a later utterance. Say nothing and run
       // nothing: voice is off, or this belongs to the cycle that replaced it.
@@ -930,8 +944,16 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       }
       setResult(answer);
       if (answer.outcome.kind === "dispatch") {
+        refusedRef.current = false;
         const dispatched = onDispatch(answer.outcome, declaredDirectories, declaredNewAgent);
-        if (!dispatched) setProblem(NOTHING_DISPATCHED);
+        /* What the dispatch reached refused it, in its own sentence, so the
+           outcome's sentence — "Showing …", written before anything ran — is
+           now false, and an Undo would reverse nothing. The refusal is the
+           whole report, exactly as for a screen that moved on (Greptile on
+           PR #1340). Every `reportRefused` caller reports synchronously from
+           inside its row's `run`, which is what lets the flag be read here. */
+        if (refusedRef.current) setResult(undefined);
+        else if (!dispatched) setProblem(NOTHING_DISPATCHED);
         else if (dispatched.undo) setUndo({ run: dispatched.undo });
       }
     } catch (cause) {
@@ -1309,7 +1331,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   /** Say there was nothing on top to close. See {@link VOICE_NOTHING_TO_CLOSE}. */
   const reportNothingToClose = useCallback(() => setProblem(VOICE_NOTHING_TO_CLOSE), []);
   /** Say that what a dispatch reached refused, in its own sentence (PRD #1223). */
-  const reportRefused = useCallback((reason: string) => setProblem(reason), []);
+  const reportRefused = useCallback((reason: string) => {
+    refusedRef.current = true;
+    setProblem(reason);
+  }, []);
 
   /*
     PRD #802 — publish the members only this surface can serve, so a row naming
@@ -1432,7 +1457,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
              way `DeckShell` routes its own Close through `closeAgentView`: the
              `voice_off` row names `stopVoice`, and a button that reached the
              same behaviour by a second route would be exactly the residual
-             PRD #802 D10 records for the five unspoken capabilities. */
+             PRD #802 D10 recorded for the unspoken capabilities, which PRD
+             #1195 M1 then closed. */
           if (onRef.current || phaseRef.current === "unreleased") VOICE_ACTIONS.stopVoice.run({ stopVoice });
           else void turnOn();
         }}
