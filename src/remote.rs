@@ -96,19 +96,40 @@ impl SshTarget {
     /// remote themselves: the registered port and identity file included, so
     /// it reaches the endpoint the deck talks to rather than port 22 (PR
     /// #1373 review — the same wrong-endpoint defect `host_key_remedy`
-    /// records). `remote_command` is the deck's own text and is passed as-is;
-    /// the key path is the user's and is single-quoted.
+    /// records). `remote_command` is the deck's own text and is passed as-is.
+    /// The destination and the key path came from the user's `remote add`
+    /// and are quoted for a POSIX shell whenever they hold anything outside a
+    /// plain set, so pasting the line runs only `ssh` locally; a destination
+    /// that starts with `-` is preceded by `--` so ssh cannot read it as an
+    /// option (PR #1373 review).
     pub fn command_line(&self, remote_command: &str) -> String {
         let mut line = String::from("ssh");
         if self.port != DEFAULT_SSH_PORT {
             line.push_str(&format!(" -p {}", self.port));
         }
         if let Some(key) = &self.key {
-            let key = key.to_string_lossy().replace('\'', "'\\''");
-            line.push_str(&format!(" -i '{key}'"));
+            line.push_str(&format!(" -i {}", shell_word(&key.to_string_lossy())));
         }
-        line.push_str(&format!(" {} {remote_command}", self.user_host()));
+        let destination = self.user_host();
+        if destination.starts_with('-') {
+            line.push_str(" --");
+        }
+        line.push_str(&format!(" {} {remote_command}", shell_word(&destination)));
         line
+    }
+}
+
+/// `word` as one POSIX shell word: unchanged when it is made only of
+/// characters no shell treats specially, single-quoted otherwise.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@%+=:,./_-".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
     }
 }
 
@@ -2197,6 +2218,17 @@ mod tests {
             SshTarget::parse("u@h", 2222, Some(PathBuf::from("/k/it's key"))).command_line("rm x"),
             "ssh -p 2222 -i '/k/it'\\''s key' u@h rm x"
         );
+        assert_eq!(
+            SshTarget::parse("u@h", 22, Some(PathBuf::from("/home/u/.ssh/id_ed25519")))
+                .command_line("rm x"),
+            "ssh -i /home/u/.ssh/id_ed25519 u@h rm x"
+        );
+        // The destination is the user's own `remote add` input; pasting the
+        // line must still run nothing but `ssh` locally.
+        let hostile = SshTarget::parse("u@h;touch pwned", 22, None).command_line("rm x");
+        assert_eq!(hostile, "ssh 'u@h;touch pwned' rm x");
+        let option = SshTarget::parse("-oProxyCommand=id", 22, None).command_line("rm x");
+        assert_eq!(option, "ssh -- -oProxyCommand=id rm x");
     }
 
     #[test]
