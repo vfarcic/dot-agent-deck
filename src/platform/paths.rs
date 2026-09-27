@@ -1461,6 +1461,26 @@ pub enum EndpointSource {
     /// [`crate::endpoint_resolve`]'s connect-side compatibility read. **Not a
     /// primary endpoint** — see [`ResolvedEndpoint::is_primary`].
     LegacyCompat,
+    /// A daemon found answering inside a **relocated** endpoint directory —
+    /// the unguessable owner-only sibling of [`fallback_endpoint_dir`] that
+    /// `daemon serve` binds into when another uid already holds the
+    /// predictable name (issue #1173; see [`crate::endpoint_resolve`]'s
+    /// "When the per-uid directory is taken"). Selected by the connect side's
+    /// discovery, so, like [`Self::LegacyCompat`], **not a primary endpoint**:
+    /// a client talks to the daemon there but never unlinks, lazy-spawns at or
+    /// polls that address, because a daemon started later chooses its own
+    /// directory afresh ([`crate::endpoint_resolve::prepare_bind_endpoint`]).
+    Relocated,
+}
+
+impl EndpointSource {
+    /// See [`ResolvedEndpoint::is_primary`]: false for the two arms a client
+    /// reaches only by **discovering** a daemon that is already answering —
+    /// [`Self::LegacyCompat`] and [`Self::Relocated`] — and true for every arm
+    /// a daemon started now would bind.
+    pub fn is_primary(self) -> bool {
+        !matches!(self, Self::LegacyCompat | Self::Relocated)
+    }
 }
 
 /// An endpoint address together with [`EndpointSource`], the arm that produced
@@ -1500,8 +1520,14 @@ impl ResolvedEndpoint {
     /// Is this an address a client of this build may treat as the deck's own
     /// — **create, unlink, lazy-spawn at, or wait for a daemon to bind**?
     ///
-    /// True for every arm but [`EndpointSource::LegacyCompat`]. A client does
-    /// none of those at the pre-#1121 spelling, and the reason is sharper than
+    /// True for every arm but [`EndpointSource::LegacyCompat`] and
+    /// [`EndpointSource::Relocated`]. A relocated address is excluded for the
+    /// same reason in a different place: the daemon that bound it chose its
+    /// directory by what the filesystem looked like when *it* started, and a
+    /// replacement started now may choose another — so an address found by
+    /// discovery is one to talk to, not one to spawn at or poll.
+    ///
+    /// A client does none of those at the pre-#1121 spelling, and the reason is sharper than
     /// tidiness: [`crate::daemon_attach::ensure_daemon_running`]'s stale-inode
     /// recovery `remove_file`s the address it is given, and its poll loop then
     /// waits for a freshly-spawned daemon to appear *there* — but a fresh
@@ -1513,7 +1539,7 @@ impl ResolvedEndpoint {
     /// alias bind never goes through a [`ResolvedEndpoint`]; see
     /// [`crate::endpoint_resolve::prepare_legacy_alias`].)
     pub fn is_primary(&self) -> bool {
-        !matches!(self.source, EndpointSource::LegacyCompat)
+        self.source.is_primary()
     }
 }
 
@@ -1648,6 +1674,15 @@ const FALLBACK_ATTACH_ENDPOINT_FILE: &str = "attach.sock";
 /// [`crate::remote_tunnel::tunnel_socket_dir_in`], which already solves this
 /// for ssh-forwarded sockets. The name does not collide with that module's own
 /// `dot-agent-deck-tunnels-{uid}`.
+///
+/// **This directory's own name is predictable**, so another uid can create it
+/// first. When one has, `daemon serve` binds in a relocated sibling
+/// (`dot-agent-deck-{uid}.<16 hex>`) instead of refusing to start, and the
+/// connect side finds it by listing (issue #1173) — see
+/// [`crate::endpoint_resolve::prepare_bind_endpoint`]. This function does not
+/// know about that and must not learn: it stays the pure, infallible answer
+/// for a host where the name is free, which is every host where nobody took
+/// it.
 #[cfg(unix)]
 pub fn fallback_endpoint_dir() -> PathBuf {
     fallback_endpoint_dir_in(&endpoint_temp_dir())
@@ -2193,12 +2228,13 @@ mod tests {
                 "{primary:?} names an address this build binds"
             );
         }
-        assert!(
-            !ResolvedEndpoint::new(PathBuf::from("/tmp/x.sock"), EndpointSource::LegacyCompat)
-                .is_primary(),
-            "the compatibility spelling is the one address that must never be \
-             unlinked, bound or lazy-spawned at"
-        );
+        for discovered in [EndpointSource::LegacyCompat, EndpointSource::Relocated] {
+            assert!(
+                !ResolvedEndpoint::new(PathBuf::from("/tmp/x.sock"), discovered).is_primary(),
+                "{discovered:?} is reached only by discovering a live daemon, so it must \
+                 never be unlinked, bound or lazy-spawned at"
+            );
+        }
     }
 
     /// Scenario: Drive `resolve_binary_name` — the pure seam behind

@@ -25,6 +25,7 @@
       "disable_plugin": true
     },
     "pnpm":                       "11.22.0",
+    "netlify-cli":                "23.15.0",
     "pkg-config":                 "0.29.2",
     "path:tauri-deps#tauri-deps": ""
   },

@@ -1231,6 +1231,7 @@ mod tests {
                 // between that overlay and an agent pane is decided at dispatch.
                 ("close", "closeTopmost", vec![]),
                 ("open_settings", "openSettings", vec!["deck", "overview"]),
+                ("switch_deck", "switchDeck", vec!["deck", "overview"]),
                 // No screens: see the row's own comment — stopping must never
                 // be unavailable.
                 ("voice_off", "stopVoice", vec![]),
@@ -2175,8 +2176,8 @@ mod tests {
         }
     }
 
-    /// Scenario: enumerate callable voice commands on each screen. Both base
-    /// screens expose the shared rail's Overview, Deck, and Settings actions.
+    /// Scenario: load the shipped table and check which actions can be used
+    /// from each screen, including deck switching from the two base screens.
     #[test]
     fn voice_table_callable_per_screen_for_the_shipped_rows() {
         let table = super::table();
@@ -2201,6 +2202,7 @@ mod tests {
                 "open_deck",
                 "close",
                 "open_settings",
+                "switch_deck",
                 "voice_off",
                 "list_commands"
             ]
@@ -2213,6 +2215,7 @@ mod tests {
                 "open_deck",
                 "close",
                 "open_settings",
+                "switch_deck",
                 "voice_off",
                 "list_commands",
                 "open_new_agent",
@@ -2262,6 +2265,28 @@ mod tests {
         assert_eq!(ParamKind::parse("agentRef"), None);
         assert_eq!(ParamKind::parse("deckRef"), None);
         assert_eq!(ParamKind::parse("dirRef"), None);
+    }
+
+    /// Scenario: load the deck-switch command and check that it names one
+    /// required deck reference and is available exactly where the selector is clickable.
+    #[test]
+    fn voice_table_switch_deck_targets_a_required_deck_on_base_screens() {
+        let row = super::table().row("switch_deck").expect("switch_deck row");
+        assert_eq!(row.invoke, "switchDeck");
+        // "Showing" remains true when the selected deck was already active.
+        assert_eq!(row.report, "Showing {deck}.");
+        assert_eq!(row.screens, vec![Screen::Deck, Screen::Overview]);
+        assert_eq!(
+            row.params,
+            vec![ParamSpec {
+                name: "deck".to_string(),
+                kind: ParamKind::DeckRef,
+                optional: false,
+            }]
+        );
+        assert!(row.callable(Screen::Deck, None, None));
+        assert!(row.callable(Screen::Overview, None, None));
+        assert!(!row.callable(Screen::Agent, None, None));
     }
 
     #[test]
