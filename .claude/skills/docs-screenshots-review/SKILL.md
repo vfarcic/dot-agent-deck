@@ -55,6 +55,8 @@ The imports go right below the frontmatter, the blank lines around each image ar
 
 **Where no scenario can reach the screen**, use the [`run-dot-agent-deck`](../run-dot-agent-deck/SKILL.md) skill to drive the TUI in an isolated sandbox and capture it, and say on the page, in the PRD or in your report that this image is not reproducible from a scenario and why.
 
+That sandbox isolates the capture from your own deck; it redacts nothing. A frame with a real agent in it can show credentials, prompts or someone else's content, so apply the rule for agent-backed scenarios in [`docs/develop/docs-screenshots.md`](../../../docs/develop/docs-screenshots.md): redact before the image is written, then inspect the final image yourself for tokens, real home paths, host names, user names, prompts and anyone else's content before committing or publishing it. If it cannot be made clean, do not commit it; tell the user what to capture instead, as section 3 describes.
+
 Then build the site — `cd site && npm ci && npm run build` — which fails on a broken image or link.
 
 ## 3. If you cannot produce it, say exactly what to capture
