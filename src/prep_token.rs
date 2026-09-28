@@ -161,7 +161,7 @@ pub const MAX_LIVE_PREP_TOKENS: usize = 64;
 /// silent degradation of the launch verb's guarantee, because the verb itself is
 /// refused there — see
 /// [`crate::daemon_protocol::PROJECT_ERR_UNSUPPORTED_PLATFORM`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InodeIdentity {
     pub dev: u64,
     pub ino: u64,

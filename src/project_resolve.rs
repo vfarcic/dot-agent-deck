@@ -1468,8 +1468,11 @@ pub fn prepare_orchestration_before(
 
     // Not written here: the caller answers first and writes it afterwards
     // (issue #1233 audit). See `CONTEXT_FILE_NAME` for who reads it.
-    let mirror =
-        crate::orchestrator_context::PendingMirror::new(prepared.dir.clone(), prepared.content);
+    let mirror = crate::orchestrator_context::PendingMirror::new(
+        prepared.dir.clone(),
+        prepared.publish_seq,
+        prepared.content,
+    );
 
     let answer = crate::event::PreparedOrchestration {
         context_path: prepared.context_path.to_string_lossy().into_owned(),

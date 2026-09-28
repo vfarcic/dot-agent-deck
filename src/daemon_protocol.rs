@@ -574,8 +574,10 @@ pub const CAP_PREPARE_WORKFLOW: &str = "prepare-workflow";
 /// and withdraws any context file it published, best effort — one still
 /// running at the deadline does so at its next deadline check; and every
 /// preparation publishes a file of its own, so even one answered late cannot
-/// replace a retry's (the fixed-name mirror, which binds nothing, can still end
-/// up with either's bytes). Together those are what make a CLIENT-side bound on
+/// replace a retry's (the fixed-name mirror binds nothing: this daemon never
+/// lets the earlier publish's mirror write land over the retry's, but a TUI or
+/// `dispatch` mirroring into the same project from its own process can still
+/// leave it with their bytes). Together those are what make a CLIENT-side bound on
 /// the call safe:
 /// the desktop wraps its preparation in its per-call timeout only against a
 /// daemon that names this, and keeps waiting an older one out. Nothing on the
@@ -5118,6 +5120,10 @@ async fn handle_connection(
                             Some(latch),
                         ) {
                             Ok(prepared) => {
+                                // Runs after the reply on this blocking thread, so
+                                // two preparations' mirror writes can finish in
+                                // either order; `mirror_into`'s ordering guard keeps
+                                // the earlier publish from landing over the later.
                                 let (answer, mirror) = prepared.into_parts();
                                 let after: crate::project_resolve::AfterReply =
                                     Box::new(move || mirror.write());

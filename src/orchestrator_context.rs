@@ -472,6 +472,8 @@ pub struct PreparedContext {
     pub dir: ContextDir,
     /// The published file itself, held open ([`PublishedContext::held`]).
     pub held: HeldContextFile,
+    /// [`PublishedContext::publish_seq`].
+    pub publish_seq: u64,
 }
 
 impl PreparedContext {
@@ -482,6 +484,7 @@ impl PreparedContext {
             identity: self.context_identity,
             dir: self.dir.clone(),
             held: self.held.clone(),
+            publish_seq: self.publish_seq,
         }
     }
 }
@@ -514,7 +517,7 @@ pub fn prepare_orchestrator_context(
     attendance: Attendance,
 ) -> Result<PreparedContext, ContextPublishError> {
     let prepared = prepare_unmirrored_orchestrator_context(config, cwd, task, attendance)?;
-    mirror_into(&prepared.dir, &prepared.content);
+    mirror_into(&prepared.dir, prepared.publish_seq, &prepared.content);
     Ok(prepared)
 }
 
@@ -546,6 +549,7 @@ pub fn prepare_unmirrored_orchestrator_context(
         context_identity: published.identity,
         dir: published.dir,
         held: published.held,
+        publish_seq: published.publish_seq,
         content,
     })
 }
@@ -729,9 +733,13 @@ pub const CONTEXT_DIR_NAME: &str = ".dot-agent-deck";
 /// predate #1233: an older TUI's compaction re-arm reads the task back from here,
 /// and so do role commands and templates that hard-code the path. So does this
 /// build's re-arm of a tab whose own path it does not know
-/// ([`reassert_orchestrator_prompt`] with `known: None`). It holds the
-/// latest publish in the project, so those readers keep the old semantics,
-/// including the old race. No preparation binding covers it. Retiring it is
+/// ([`reassert_orchestrator_prompt`] with `known: None`). Within one process
+/// it holds the latest publish mirrored into it — a mirror write never lands
+/// over a later publish's from the same process ([`mirror_into`]) — but the
+/// daemon, a TUI's `Ctrl+n` and `dispatch --orchestration` each mirror from
+/// their own process, and writes from two of them close together can leave it
+/// with either one's bytes. So those readers keep the old semantics, including
+/// the old race. No preparation binding covers it. Retiring it is
 /// follow-up #1395.
 pub const CONTEXT_FILE_NAME: &str = "orchestrator-context.md";
 
@@ -793,6 +801,10 @@ pub struct PublishedContext {
     /// removed a replacement file at the same name until this was held) — and a
     /// held inode is never freed.
     pub held: HeldContextFile,
+    /// This publish's place in this process's publish order
+    /// ([`next_publish_seq`]), which the compatibility mirror's ordering guard
+    /// compares ([`mirror_into`]).
+    pub publish_seq: u64,
 }
 
 /// An open handle on a published context file, kept only to pin its inode
@@ -1718,6 +1730,7 @@ pub fn publish_orchestrator_context(
     let dir = open_publish_dir(project_dir, content)?;
     let name = unique_context_file_name();
     let final_path = dir.path().join(&name);
+    let publish_seq = next_publish_seq();
 
     let mut created = false;
     let outcome = (|| {
@@ -1737,6 +1750,7 @@ pub fn publish_orchestrator_context(
                 identity,
                 dir,
                 held: HeldContextFile::new(file),
+                publish_seq,
             })
         }
         Err(e) => {
@@ -1803,8 +1817,9 @@ pub fn withdraw_published_context(published: &PublishedContext) {
 ///
 /// **Blocking.** Async callers go through [`crate::project_resolve::run_bounded`].
 pub fn mirror_orchestrator_context(project_dir: &std::path::Path, content: &str) {
+    let publish_seq = next_publish_seq();
     match open_publish_dir(project_dir, content) {
-        Ok(dir) => mirror_into(&dir, content),
+        Ok(dir) => mirror_into(&dir, publish_seq, content),
         Err(e) => tracing::warn!(
             project = %project_dir.display(),
             reason = %e,
@@ -1816,14 +1831,108 @@ pub fn mirror_orchestrator_context(project_dir: &std::path::Path, content: &str)
 /// [`mirror_orchestrator_context`] into a directory a publish already holds
 /// open — the one its own per-publish file went into — rather than resolving
 /// the project path again (issue #1233 audit).
-pub fn mirror_into(dir: &ContextDir, content: &str) {
-    if let Err(e) = write_mirror(dir, content) {
-        tracing::warn!(
+///
+/// `publish_seq` is the publish this mirror write belongs to
+/// ([`PublishedContext::publish_seq`]). **Within one process, a mirror write
+/// never lands over a later publish's** (PR #1407 review): the daemon answers a
+/// preparation first and writes its mirror afterwards, on a blocking thread of
+/// its own, so two preparations in one project can finish their mirror writes
+/// in the opposite order to their publishes. [`write_mirror`] therefore checks
+/// `publish_seq` against the last one mirrored into the same directory, under
+/// that directory's lock, immediately before the rename, and discards a write
+/// that has been overtaken.
+///
+/// **Writers in other processes are not ordered by this** — the TUI's
+/// `Ctrl+n` and `dispatch --orchestration` each publish and mirror in their own
+/// process, and a daemon and a TUI in the same project can still leave the
+/// mirror holding whichever of their writes renamed last. What is ordered is
+/// the daemon's own preparations, which are the writes that can run after
+/// their reply.
+pub fn mirror_into(dir: &ContextDir, publish_seq: u64, content: &str) {
+    match write_mirror(dir, publish_seq, content) {
+        Ok(MirrorWrite::Written) => {}
+        Ok(MirrorWrite::Overtaken) => tracing::debug!(
+            dir = %dir.path().display(),
+            "skipped a {CONTEXT_FILE_NAME} compatibility-mirror write a later publish \
+             had already overtaken"
+        ),
+        Err(e) => tracing::warn!(
             dir = %dir.path().display(),
             reason = %e,
             "could not refresh the {CONTEXT_FILE_NAME} compatibility mirror"
-        );
+        ),
     }
+}
+
+/// What [`write_mirror`] did with a write that raised no error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MirrorWrite {
+    /// The mirror now holds this write's bytes.
+    Written,
+    /// A later publish's mirror write had already landed in this directory, so
+    /// this one was discarded and the mirror left as it was.
+    Overtaken,
+}
+
+/// The next value of this process's publish order, starting at 1.
+///
+/// One counter for every project: the order only has to be monotonic within a
+/// directory, and a single counter is monotonic everywhere. Assigned when the
+/// per-publish file is created, so it orders publishes rather than mirror
+/// writes, which is the order the mirror must follow.
+fn next_publish_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Which directory a mirror write lands in, for the ordering guard: the held
+/// directory's inode identity where the platform has one, its path otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum MirrorDirKey {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Identity(crate::prep_token::InodeIdentity),
+    Path(std::path::PathBuf),
+}
+
+impl ContextDir {
+    fn mirror_key(&self) -> MirrorDirKey {
+        #[cfg(unix)]
+        if let Some(identity) = self
+            .guard
+            .metadata()
+            .ok()
+            .as_ref()
+            .and_then(crate::prep_token::inode_identity)
+        {
+            return MirrorDirKey::Identity(identity);
+        }
+        MirrorDirKey::Path(self.path.clone())
+    }
+}
+
+/// The last publish mirrored into each directory this process has mirrored
+/// into, one lock per directory so a stalled rename in one project does not
+/// hold up another's.
+///
+/// Grows by one small entry per directory for the life of the process, and is
+/// never pruned: an entry is what keeps an overtaken write from landing, so
+/// dropping one would reopen the race for that directory. A daemon mirrors
+/// into as many directories as it prepares orchestrations in.
+///
+/// An inode number reused by a `.dot-agent-deck` deleted and recreated
+/// inherits the old directory's entry. That is harmless: the counter is
+/// process-wide, so every publish after the recreation has a higher number
+/// than anything recorded before it.
+fn mirror_order_slot(key: MirrorDirKey) -> std::sync::Arc<std::sync::Mutex<u64>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static SLOTS: OnceLock<Mutex<HashMap<MirrorDirKey, Arc<Mutex<u64>>>>> = OnceLock::new();
+    let mut slots = SLOTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    Arc::clone(slots.entry(key).or_default())
 }
 
 /// A preparation's compatibility-mirror write, held back until the
@@ -1836,18 +1945,24 @@ pub fn mirror_into(dir: &ContextDir, content: &str) {
 #[derive(Debug)]
 pub struct PendingMirror {
     dir: ContextDir,
+    publish_seq: u64,
     content: String,
 }
 
 impl PendingMirror {
-    /// Hold `content` back for `dir`.
-    pub fn new(dir: ContextDir, content: String) -> Self {
-        Self { dir, content }
+    /// Hold `content`, published as `publish_seq`, back for `dir`.
+    pub fn new(dir: ContextDir, publish_seq: u64, content: String) -> Self {
+        Self {
+            dir,
+            publish_seq,
+            content,
+        }
     }
 
-    /// Write it, best effort ([`mirror_into`]).
+    /// Write it, best effort and never over a later publish's mirror
+    /// ([`mirror_into`]).
     pub fn write(self) {
-        mirror_into(&self.dir, &self.content);
+        mirror_into(&self.dir, self.publish_seq, &self.content);
     }
 }
 
@@ -1865,9 +1980,18 @@ impl PendingMirror {
 /// * The same size, symlink-directory, owner-only and group-write checks as
 ///   [`publish_orchestrator_context`], through [`open_publish_dir`].
 ///
-/// A failure leaves the previous mirror — if any — exactly as it was, and
-/// removes the temp file.
-fn write_mirror(dir: &ContextDir, content: &str) -> Result<(), ContextPublishError> {
+/// * **Never over a later publish's mirror in this process.** The bytes are
+///   written to the temp file outside any lock; only the comparison of
+///   `publish_seq` against the directory's last mirrored publish and the
+///   rename run under the directory's lock ([`mirror_into`] has the scope).
+///
+/// A failure, or a write that was overtaken, leaves the previous mirror — if
+/// any — exactly as it was, and removes the temp file.
+fn write_mirror(
+    dir: &ContextDir,
+    publish_seq: u64,
+    content: &str,
+) -> Result<MirrorWrite, ContextPublishError> {
     // Re-applied rather than inherited from the publish that opened `dir`: the
     // mirror may run after the reply, and the directory's mode can have been
     // widened since.
@@ -1883,10 +2007,17 @@ fn write_mirror(dir: &ContextDir, content: &str) -> Result<(), ContextPublishErr
             .map_err(ContextPublishError::TempCreate)?;
         write_context_file(&mut file, dir, content)?;
         drop(file);
+        let slot = mirror_order_slot(dir.mirror_key());
+        let mut last = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if publish_seq < *last {
+            return Ok(MirrorWrite::Overtaken);
+        }
         dir.rename(&temp_name, CONTEXT_FILE_NAME)
-            .map_err(ContextPublishError::Publish)
+            .map_err(ContextPublishError::Publish)?;
+        *last = publish_seq;
+        Ok(MirrorWrite::Written)
     })();
-    if outcome.is_err() {
+    if !matches!(outcome, Ok(MirrorWrite::Written)) {
         // `TempCreate` is the one case where there is nothing to remove, and
         // removing a name that is not there is a no-op.
         let _ = dir.unlink(&temp_name);
@@ -2901,11 +3032,66 @@ mod tests {
             "and did not touch the directory now at the old path"
         );
 
-        mirror_into(&published.dir, "mine");
+        mirror_into(&published.dir, published.publish_seq, "mine");
         assert!(
             !replacement_dir.join(CONTEXT_FILE_NAME).exists(),
             "the mirror is not written into the replacement"
         );
+    }
+
+    /// PR #1407 review: two preparations in one project whose mirror writes
+    /// finish in the opposite order to their publishes — the daemon writes each
+    /// after its reply, on a thread of its own — leave the mirror holding the
+    /// LATER publish, and the overtaken write leaves no temp file behind.
+    #[test]
+    fn an_overtaken_mirror_write_does_not_land_over_a_later_publishs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mirror = || std::fs::read_to_string(context_dir_of(tmp.path()).join(CONTEXT_FILE_NAME));
+        let first = publish_orchestrator_context(tmp.path(), "FIRST").expect("published");
+        let second = publish_orchestrator_context(tmp.path(), "SECOND").expect("published");
+        assert!(first.publish_seq < second.publish_seq);
+
+        PendingMirror::new(second.dir.clone(), second.publish_seq, "SECOND".into()).write();
+        PendingMirror::new(first.dir.clone(), first.publish_seq, "FIRST".into()).write();
+        assert_eq!(
+            mirror().unwrap(),
+            "SECOND",
+            "the earlier publish's mirror landed last"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(context_dir_of(tmp.path()))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "overtaken temp files left: {leftovers:?}"
+        );
+
+        // In order, every write lands.
+        let third = publish_orchestrator_context(tmp.path(), "THIRD").expect("published");
+        mirror_into(&third.dir, third.publish_seq, "THIRD");
+        assert_eq!(mirror().unwrap(), "THIRD");
+    }
+
+    /// The ordering guard is per directory: a later publish in one project
+    /// does not stop an earlier one's mirror from landing in another.
+    #[test]
+    fn the_mirror_ordering_guard_is_per_directory() {
+        let (p, q) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let in_q = publish_orchestrator_context(q.path(), "Q").expect("published");
+        let in_p = publish_orchestrator_context(p.path(), "P").expect("published");
+        assert!(in_q.publish_seq < in_p.publish_seq);
+
+        mirror_into(&in_p.dir, in_p.publish_seq, "P");
+        mirror_into(&in_q.dir, in_q.publish_seq, "Q");
+        for (dir, want) in [(p.path(), "P"), (q.path(), "Q")] {
+            assert_eq!(
+                std::fs::read_to_string(context_dir_of(dir).join(CONTEXT_FILE_NAME)).unwrap(),
+                want
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
