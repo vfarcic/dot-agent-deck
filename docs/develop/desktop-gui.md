@@ -176,6 +176,8 @@ PRD [#741](https://github.com/vfarcic/dot-agent-deck/issues/741) turns the daemo
 
 ### The `[endpoints]` section
 
+**Since issue #1350 the rows are not stored here.** The remote decks live in `remotes.toml`, the CLI's registry, which both clients read and write through `src/deck_list.rs`; `desktop/src-tauri/src/decks.rs` converts a registry entry to the `RemoteEndpointSettings` row described below (and `key` to `identity`, so no `key` name reaches this document). `load_snapshot` fills `endpoints.remote` from `remotes.toml`, and `save` turns the difference between the webview's `base` and its edited document into one-row edits, each against a fresh read of that file — `desktop.toml` keeps only `selection`. A document written before #1350 still carries `[[endpoints.remote]]`; its first load moves the rows into `remotes.toml` (matched by host, login and port, so nothing is listed twice), removes them from `desktop.toml` and re-points the selection if the row merged into an existing deck with an id of its own. The shape below is therefore the pre-#1350 on-disk shape and the in-memory/IPC shape, not what a current build writes. User-facing behaviour, including what an older CLI's re-save drops, is in [Remote Environments](../remote-environments.md#one-deck-list-for-the-cli-and-the-desktop-app).
+
 The decks live in the same per-installation `desktop.toml` as everything else in [Application settings](#application-settings), under `[endpoints]`, and the section holds exactly two things: `remote`, a list of rows, and `selection`, a token naming the deck the app is talking to.
 
 ```toml

@@ -54,6 +54,41 @@ dot-agent-deck remote add my-vm deck@198.51.100.10 \
   --port 2222
 ```
 
+### Remote names
+
+A name is what you type after `connect`, so `remote add` requires a short, shell-safe one: ASCII letters, digits, `.`, `-` and `_`, starting with a letter or digit, at most 64 characters. A name registered before this rule existed keeps working everywhere — the rule applies only when a remote is added.
+
+## One deck list for the CLI and the desktop app
+
+`~/.config/dot-agent-deck/remotes.toml` is the deck list for both clients. A remote added with `remote add` appears in the desktop app's deck settings, and a deck added in the desktop app appears in `remote list` and can be opened with `connect <name>`. Either client can edit or remove any deck; "added by the CLI" is information, not a lock. `DOT_AGENT_DECK_REMOTES`, when set, moves the file for whichever client sees it. The local deck is not in the file: the desktop app always offers it, and which deck the app has selected stays in the app's own settings.
+
+Removing a deck in the desktop app forgets the entry and nothing else, exactly like `remote remove`: the binary and hooks the CLI installed on the host are left in place.
+
+### Decks the desktop app adds
+
+The desktop app does not ask for a name. It names a deck after its host — `build.example.com` — and when that is taken, after the login and host (`dev-build.example.com`) and then with a number (`build.example.com-2`). The name follows the same rule as `remote add`, so `connect` accepts it.
+
+Such a deck has no `dot-agent-deck` installed by `remote add`, so its entry records `version = "unmanaged"` instead of a version number, and that is what `remote list` shows in its VERSION column. Nothing reads the value as a version: `connect` and `remote doctor` ask the host's own binary. Running `dot-agent-deck remote upgrade <name>` installs the binary and replaces the placeholder with the real version.
+
+A desktop deck carries fields a CLI-added one may not:
+
+| Field | Meaning |
+|---|---|
+| `id` | The desktop app's stable identifier for the deck. An entry without one gets one derived from its name. |
+| `jump_host` | A `Host` name from your `~/.ssh/config` to reach the deck through (`ssh -J`). The desktop app uses it; `connect` does not route through it yet. |
+| `socket` | The deck's attach socket path on the host, which the desktop's **Test connection** discovers. `connect` does not need it. |
+| `user` | The login, stored separately only when it contains `@` itself (`dev@REALM`). Otherwise the login is written into `host` as `dev@build.example.com`, which is the form every version of `connect` understands. |
+
+The file stays hand-editable. Both clients change only the entry being edited and re-read the file at the moment they save, so a remote you add in a terminal while the desktop app is open is not overwritten by the app's next save. Keys neither client knows about, and comments, are kept.
+
+### Moving the desktop app's existing decks
+
+Desktop builds before the shared list kept their decks in the app's own `desktop.toml`, under `[[endpoints.remote]]`. The first time a build with the shared list starts, it moves those decks into `remotes.toml` and removes them from `desktop.toml`; appearance, zoom and the selected deck stay where they are. A deck that is already in `remotes.toml` — the same host, login and port — is not added twice: the existing entry keeps its name and version and gains the desktop's jump host, socket and key if it had none. If the selected deck was one of those, the selection moves with it. The move happens once; starting the app again changes nothing.
+
+### Older versions of the CLI
+
+A `dot-agent-deck` from before the shared list reads a file the desktop app wrote without trouble, because every entry carries the `type`, `version` and `added_at` fields it requires. It does not keep fields it does not know, though: `remote add`, `remote remove` and `remote upgrade` from an older version, and its `connect` when a session ends, rewrite the whole file and drop `id`, `jump_host`, `socket` and `user` from **every** entry. The decks stay listed in the desktop app, but a deck the app had selected falls back to the local deck until you select it again, a jump host has to be entered again, and **Test connection** has to rediscover the socket. Upgrade `dot-agent-deck` on every machine that shares the file to avoid it. The same applies to an older desktop build: it reads decks only from `desktop.toml`, so once a newer build has moved them it shows no remote decks.
+
 ## Lifecycle model
 
 Everything except the terminal lives on the remote — the agents run there, and so does the part of the deck that supervises them and outlives your session. ssh carries the terminal back and forth and nothing else.
