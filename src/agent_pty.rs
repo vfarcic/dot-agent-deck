@@ -1442,6 +1442,13 @@ const EXEC_FROM_CWD_SCRIPT: &str = r#"exec "$0" "$@""#;
 /// `PATH`, or by bare name under the cwd also looks started and exits in the
 /// child (all three measured against [`spawn`]), and a multi-word command runs
 /// its program from a shell's `-c`, where every exec failure is the child's.
+///
+/// **An executable file with no `#!` line runs as a shell script, as before.**
+/// Its `execve` fails with `ENOEXEC` and the shell's `exec` retries it under
+/// `/bin/sh`; the direct exec did the same, because std's `Command` execs
+/// through `execvp`, which on glibc and macOS retries `ENOEXEC` the same way.
+/// Pinned as parity by
+/// `spawn_in_runs_a_script_without_an_interpreter_line_as_a_direct_exec_does`.
 #[cfg(unix)]
 fn exec_program_from_child_cwd(
     cmd: &mut CommandBuilder,
@@ -15265,6 +15272,13 @@ mod spawn_tests {
     /// the rewritten start spawns and its shell's `exec` fails inside the PTY.
     /// Pinned so the residual documented on [`exec_program_from_child_cwd`] is
     /// measured, not assumed.
+    ///
+    /// Unlike its neighbours this child writes to the PTY — the shell's error
+    /// — so the master is drained while it exits: on macOS the last close of a
+    /// tty slave waits for its output queue to empty, and with the master held
+    /// open and unread the child never finished exiting and this test hung to
+    /// nextest's timeout on `build-macos`. The wait is bounded as well, so a
+    /// child that still cannot exit fails the test rather than hanging it.
     #[cfg(unix)]
     #[test]
     fn spawn_in_leaves_a_bad_interpreter_to_fail_inside_the_child() {
@@ -15289,9 +15303,101 @@ mod spawn_tests {
             &verified,
         )
         .expect("the probes cannot see a missing interpreter, so the spawn starts");
-        let mut child = pty.child;
-        let status = child.wait().expect("wait should succeed");
+        let status = wait_draining(pty, "the shell whose exec failed");
         assert!(!status.success(), "the shell's exec must fail: {status:?}");
+    }
+
+    /// Reap `pty`'s child while draining its master, failing rather than
+    /// hanging when it does not exit within 30 s.
+    ///
+    /// The drain is what a child that writes to its PTY needs on macOS: the last
+    /// close of a tty slave there waits for the output queue to empty, so with
+    /// the master held open and unread the child never finishes exiting.
+    #[cfg(unix)]
+    fn wait_draining(pty: AgentPty, what: &str) -> portable_pty::ExitStatus {
+        let AgentPty {
+            mut child,
+            master,
+            writer,
+            mut reader,
+            process_group,
+        } = pty;
+        // Detached: on Linux the read ends in `EIO` once the slave is gone, but
+        // nothing here depends on when, so it is never joined.
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while matches!(reader.read(&mut buf), Ok(n) if n > 0) {}
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait should succeed") {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                drop(writer);
+                drop(master);
+                crate::platform::proc::force_kill_child_and_wait(&mut child, &process_group);
+                panic!("{what} did not exit within 30 s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// An executable text file with no `#!` line makes `execve` fail with
+    /// `ENOEXEC`, and the rewritten start's shell then runs the file as a shell
+    /// script — which is what the direct exec did before the rewrite, because
+    /// std's `Command` execs through `execvp`, and both glibc's and macOS's
+    /// `execvp` retry an `ENOEXEC` file under `/bin/sh`. Pinned as parity: the
+    /// same file started unprepared by absolute path runs the same way, so the
+    /// rewrite changes nothing about which files end up interpreted.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_in_runs_a_script_without_an_interpreter_line_as_a_direct_exec_does() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("create tempdir");
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).expect("create the project dir");
+        let script = dir.join("no-interp");
+        std::fs::write(&script, b"echo x > marker\n").expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let path = dir.to_str().expect("utf-8 tempdir");
+        let marker = dir.join("marker");
+
+        // Single words both, so each is exec'd rather than wrapped in `-c`.
+        let unprepared = spawn(SpawnOptions {
+            command: Some(script.to_str().expect("utf-8 tempdir")),
+            cwd: Some(path),
+            env: vec![("SHELL".into(), "/bin/sh".into())],
+            ..SpawnOptions::default()
+        })
+        .expect("the unprepared spawn starts");
+        let status = wait_draining(unprepared, "the unprepared start");
+        assert!(status.success(), "the unprepared start failed: {status:?}");
+        assert!(
+            marker.exists(),
+            "the direct exec must have run the file as a shell script"
+        );
+        std::fs::remove_file(&marker).expect("reset the marker");
+
+        let verified =
+            crate::project_resolve::VerifiedProjectDir::open(&dir).expect("open the project dir");
+        let prepared = spawn_in(
+            SpawnOptions {
+                command: Some("./no-interp"),
+                cwd: Some(path),
+                env: vec![("SHELL".into(), "/bin/sh".into())],
+                ..SpawnOptions::default()
+            },
+            &verified,
+        )
+        .expect("the prepared spawn starts");
+        let status = wait_draining(prepared, "the prepared start");
+        assert!(status.success(), "the prepared start failed: {status:?}");
+        assert!(
+            marker.exists(),
+            "the rewritten start must have run the file as a shell script, as the direct exec did"
+        );
     }
 
     /// The rewrite behind `spawn_in_runs_a_relative_program_from_the_verified_directory`
