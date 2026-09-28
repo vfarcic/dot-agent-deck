@@ -8,6 +8,8 @@ A freshly launched agent announces that its session has started well **before** 
 
 ## The readiness buffer
 
+A `clear = true` delegation first terminates the worker's agent (SIGTERM, escalating to SIGKILL if it does not exit) and relaunches the role's `command` in the same pane; the buffer below is what stands between that relaunch and the task write.
+
 The deck therefore holds a `clear = true` task for a short readiness buffer after the replacement signals its session start (and after the fallback wait expires, for agents that never signal at all). The default is 1000 ms: the spawn-time path's 500 ms (`SPAWN_TIME_READINESS_BUFFER`), which was tuned for a warm pane, doubled because a respawn is a cold start. How long the deck actually holds a task depends on what it has been able to establish about the worker:
 
 | what the deck can tell about the worker | how long it holds the task |

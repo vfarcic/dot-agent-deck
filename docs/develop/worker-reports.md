@@ -1,6 +1,6 @@
 # Daemon worker reports: design notes
 
-Maintainer notes for the reports the daemon submits into an orchestrator's pane about its delegated workers — the idle-worker report (PRD #126), the went-quiet report (PRD #249), the waiting-for-input report, and the exited / never-came-up / blocked notices. The user-facing description is [Idle Workers & Notifications](../idle-workers-and-notifications.md); this page keeps the exact wording, the reasoning behind it, and the edge cases the user page summarises. The text is built in `src/state.rs`.
+Maintainer notes for the reports the daemon submits into an orchestrator's pane about its delegated workers — the idle-worker report (PRD #126), the went-quiet report (PRD #249), the waiting-for-input report, and the exited / never-came-up / blocked notices. The user-facing description is [Idle Workers & Notifications](../idle-workers-and-notifications.md); this page keeps the exact wording, the reasoning behind it, and the edge cases the user page summarises, plus the reasons behind the delegation bookkeeping [Orchestration](../orchestration.md) describes. The text is built in `src/state.rs`.
 
 ## Why the daemon has to own this
 
@@ -96,3 +96,13 @@ The window defaults to `worker_response_timeout_minutes` capped at 30 seconds, s
 - **v1 measures elapsed time, not activity.** A legitimately long task produces one report to read and discard. The default is deliberately long, the report is cheap to ignore, and a liveness-based signal is a later refinement.
 - **`0` used to mean "report immediately".** That was a bug: the timer raced the worker's own startup and reported every worker as stuck. `0` now means off.
 - **Out-of-range values fall back to the default rather than clamping**, on the grounds that a value the user did not write is better than a value that looks like theirs but is not. The daemon logs a warning.
+
+## Delegation bookkeeping behind the Orchestration page
+
+[Orchestration](../orchestration.md) states these behaviours without their reasons; the reasons are kept here.
+
+- **The busy refusal reads the delegation ledger, never the worker's status.** Status is reported by the agent itself and can be wrong for hours — an agent whose API quota has run out can go on showing `Working` — so `delegate` refuses from the daemon's own record of commissions it has dispatched. That record does not consult liveness either, so a worker whose agent exited without `work-done` still owes its task until `pane restart` retires it. The refusal is bound to the orchestrator agent that delegated: if that agent has been replaced in its pane, its successor is dispatched and the response lists the commission it superseded.
+- **Commissions expire after seven days** (`DELEGATION_COMMISSION_TTL`, `src/agent_pty.rs`). The length is deliberate because the two failure directions are not symmetric: expiring a commission whose worker is still working relabels its genuine completion as unsolicited and suppresses its summary file. The constant's doc comment has the full argument.
+- **An unsolicited `work-done` leaves `work-done-<role>.md` untouched**, so an uncommissioned report cannot overwrite the last one the orchestrator did commission. The label itself exists because, without it, the orchestrator reads the report as a delegated task coming back and re-plans on it.
+- **The generated protocol hands tasks over as files.** Inline `--task` text passes through the orchestrator's own shell before the deck sees it, so parts of it can be executed or quietly dropped while the delegation still reports success; a `--task-file` is read off disk verbatim. The protocol has a fallback for an agent that is not *authorized* to write a file, but it cannot grant itself the tool, which is why the user page tells users to allow the file-writing tool.
+- **Protocol commands name the deck by the absolute path of the binary that wrote them.** They run later, in the agent's own shell, where a bare `dot-agent-deck` is looked up in that shell's `PATH`, which need not match the deck's: a login shell that puts `~/bin` first can hand the command to a different `dot-agent-deck`, and the signal is then lost without an error anywhere. The cost is that a permission rule matching command text, such as `Bash(dot-agent-deck work-done:*)`, does not match the path form.
