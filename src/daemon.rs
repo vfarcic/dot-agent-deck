@@ -1588,6 +1588,13 @@ pub async fn ingest_event(
     // registry has never heard of the pane, and a non-`SessionStart` frame is
     // dropped. The card that needs the badge is an attached TUI's.
     state.stamp_orchestration_orphan(&mut event, daemon_owns_pane);
+    // Issue #320: the registry's generation verdict, stamped for the same
+    // reason and at the same point as the orphan marker — an attached TUI has
+    // no registry, and without it ordered a takeover by the frame's type and
+    // producer clock, so a late frame from the OUTGOING generation retired the
+    // live card there while the daemon refused it here. See
+    // `PANE_GENERATION_METADATA_KEY`.
+    state.stamp_pane_generation(&mut event);
     // PRD #1223: the pane-closed marker is the daemon's alone too — it makes an
     // attached TUI drop the pane — so a producer's copy never reaches the
     // fan-out. The daemon's own removal is broadcast directly and never passes
@@ -7511,6 +7518,356 @@ mod hook_ingestion_tests {
             state.read().await.sessions.len() == 1,
             "the daemon state itself is unaffected by the registry going away"
         );
+    }
+
+    /// Issue #320: one frame as a generation's hook would post it, naming its
+    /// pane and its registry agent id.
+    fn takeover_frame_320(
+        pane: &str,
+        agent_id: &str,
+        session_id: &str,
+        event_type: crate::event::EventType,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> AgentEvent {
+        AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp,
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(pane.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// Issue #320: a pane that has changed hands, observed from both ends of
+    /// the fan-out — the daemon's own `AppState` (registry oracle installed, as
+    /// `run_daemon_with` installs it) and an attached TUI's (no oracle, fed
+    /// every relayed frame the way `spawn_event_subscriber` feeds it).
+    struct Takeover320 {
+        registry: Arc<AgentPtyRegistry>,
+        _ownership: Arc<dyn crate::state::AgentOwnership>,
+        daemon: SharedState,
+        tui: crate::state::AppState,
+        event_tx: broadcast::Sender<BroadcastMsg>,
+        rx: broadcast::Receiver<BroadcastMsg>,
+        pane: String,
+        old: String,
+        new: String,
+    }
+
+    impl Takeover320 {
+        /// The OUTGOING generation `old` runs on the pane, opens its card and
+        /// exits; the INCOMING generation `new` then claims the pane. Nothing
+        /// from `new` has been ingested yet.
+        async fn new(pane: &str) -> Self {
+            let mut fixture = Self::start(pane, "/usr/bin/true").await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while fixture.registry.live_count() != 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the outgoing generation's child never exited"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            fixture.new = fixture
+                .registry
+                .spawn_agent(Self::spawn_options(pane, "/bin/cat"))
+                .expect("the pane must be reusable once its child is gone");
+            fixture
+        }
+
+        /// The `clear = true` shape instead: `respawn_agent_for_pane` lifts the
+        /// outgoing generation's record out of the registry BEFORE the incoming
+        /// one is published, so there is no record left to carry a handover
+        /// flag when the outgoing agent's late frame is read.
+        async fn by_respawn(pane: &str) -> Self {
+            let mut fixture = Self::start(pane, "/bin/cat").await;
+            fixture.new = fixture
+                .registry
+                .respawn_agent_for_pane(pane, "/bin/cat")
+                .await
+                .expect("respawn the pane's agent in place");
+            fixture
+        }
+
+        fn spawn_options(pane: &str, command: &'static str) -> SpawnOptions<'static> {
+            SpawnOptions {
+                command: Some(command),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )]),
+                ..SpawnOptions::default()
+            }
+        }
+
+        /// The outgoing generation runs `command` on the pane and opens its
+        /// card with a `SessionStart`.
+        async fn start(pane: &str, command: &'static str) -> Self {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let old = registry
+                .spawn_agent(Self::spawn_options(pane, command))
+                .expect("spawn the outgoing generation");
+            let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+            let daemon: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            daemon
+                .write()
+                .await
+                .set_agent_ownership(Arc::downgrade(&ownership));
+            let mut tui = crate::state::AppState::default();
+            // The TUI registers the panes it draws; the daemon never does for
+            // an ordinary spawn — the registry is its answer.
+            tui.register_pane(pane.to_string());
+            let (event_tx, rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let mut fixture = Self {
+                registry,
+                _ownership: ownership,
+                daemon,
+                tui,
+                event_tx,
+                rx,
+                pane: pane.to_string(),
+                old,
+                new: String::new(),
+            };
+            let (old, pane) = (fixture.old.clone(), fixture.pane.clone());
+            fixture
+                .ingest(takeover_frame_320(
+                    &pane,
+                    &old,
+                    "old-session",
+                    crate::event::EventType::SessionStart,
+                    chrono::Utc::now() - chrono::Duration::seconds(60),
+                ))
+                .await;
+            fixture
+        }
+
+        /// Post `event` through the daemon's real ingestion and relay what the
+        /// daemon broadcast into the TUI's state.
+        async fn ingest(&mut self, event: AgentEvent) -> AgentEvent {
+            ingest_event(&self.daemon, &self.event_tx, &self.registry, event).await;
+            let BroadcastMsg::Event(relayed) = self.rx.try_recv().expect("the frame is relayed")
+            else {
+                panic!("expected an event on the fan-out");
+            };
+            self.tui.apply_event(relayed.clone());
+            relayed
+        }
+
+        /// Every card on the pane, by the generation it names, on each side.
+        async fn owners(&self) -> (Vec<Option<String>>, Vec<Option<String>>) {
+            let on_pane = |state: &crate::state::AppState| {
+                let mut owners: Vec<Option<String>> = state
+                    .sessions
+                    .values()
+                    .filter(|s| s.pane_id.as_deref() == Some(self.pane.as_str()))
+                    .map(|s| s.agent_id.clone())
+                    .collect();
+                owners.sort();
+                owners
+            };
+            (on_pane(&*self.daemon.read().await), on_pane(&self.tui))
+        }
+
+        async fn assert_one_live_card(&self, after: &str) {
+            let want = vec![Some(self.new.clone())];
+            let (daemon, tui) = self.owners().await;
+            assert_eq!(
+                daemon, want,
+                "daemon: after {after}, the pane must carry the live generation's card \
+                 and nothing else"
+            );
+            assert_eq!(
+                tui, want,
+                "attached TUI: after {after}, the pane must carry the live generation's \
+                 card and nothing else — a frame was ordered by its type or its \
+                 producer clock instead of by the pane's generation"
+            );
+        }
+
+        /// The incoming generation announces itself with a `SessionStart`
+        /// stamped EARLIER than the outgoing card's last activity — case B's
+        /// shape, where a start's producer clock is not ordering evidence — and
+        /// must still take the pane over on both sides.
+        async fn take_over(&mut self) {
+            let (new, pane) = (self.new.clone(), self.pane.clone());
+            let relayed = self
+                .ingest(takeover_frame_320(
+                    &pane,
+                    &new,
+                    "new-session",
+                    crate::event::EventType::SessionStart,
+                    chrono::Utc::now() - chrono::Duration::seconds(120),
+                ))
+                .await;
+            assert_eq!(
+                relayed.pane_generation_verdict(),
+                Some(crate::event::GenerationVerdict::Current),
+                "the incoming generation's frame is relayed as the pane's current one"
+            );
+            self.assert_one_live_card("the incoming SessionStart").await;
+        }
+    }
+
+    impl Drop for Takeover320 {
+        fn drop(&mut self) {
+            self.registry.shutdown_all();
+        }
+    }
+
+    /// Issue #320: a late `SessionStart` from the OUTGOING generation — the
+    /// frame PRD #92 F9 followup-7 documents a slow-booting old agent firing —
+    /// arrives after the incoming one owns the pane. It announces a generation
+    /// the registry has already seen displaced, so it must neither retire the
+    /// live card nor add one beside it, on either side of the fan-out.
+    #[tokio::test]
+    async fn a_late_outgoing_session_start_cannot_retire_the_live_card() {
+        let mut deck = Takeover320::new("takeover-start-320").await;
+        deck.take_over().await;
+
+        let (old, pane) = (deck.old.clone(), deck.pane.clone());
+        deck.ingest(takeover_frame_320(
+            &pane,
+            &old,
+            "old-session",
+            crate::event::EventType::SessionStart,
+            chrono::Utc::now(),
+        ))
+        .await;
+        deck.assert_one_live_card("the outgoing generation's late SessionStart")
+            .await;
+    }
+
+    /// Issue #320, the sibling class #284 added: an outgoing NON-start frame
+    /// stamped at-or-newer than the live card's high-water mark. The producer
+    /// clock says "newer"; the registry says "displaced", and the registry is
+    /// what decides.
+    #[tokio::test]
+    async fn a_late_outgoing_frame_stamped_newer_cannot_retire_the_live_card() {
+        let mut deck = Takeover320::new("takeover-newer-320").await;
+        deck.take_over().await;
+
+        let (old, pane) = (deck.old.clone(), deck.pane.clone());
+        deck.ingest(takeover_frame_320(
+            &pane,
+            &old,
+            "old-session",
+            crate::event::EventType::Thinking,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        ))
+        .await;
+        deck.assert_one_live_card("the outgoing generation's late, newer-stamped Thinking")
+            .await;
+    }
+
+    /// Issue #320, the other direction of the same discriminator: the incoming
+    /// generation's first frame is an ordinary status report (Pi's shape — it
+    /// sends no `SessionStart`) stamped OLDER than the outgoing card's last
+    /// activity. The registry names it the pane's current generation, so it
+    /// retires the stale card on both sides; the producer clock is not weighed.
+    #[tokio::test]
+    async fn the_current_generation_supersedes_whatever_its_first_frame_is_stamped() {
+        let mut deck = Takeover320::new("takeover-older-320").await;
+
+        let (new, pane) = (deck.new.clone(), deck.pane.clone());
+        deck.ingest(takeover_frame_320(
+            &pane,
+            &new,
+            "new-session",
+            crate::event::EventType::Thinking,
+            chrono::Utc::now() - chrono::Duration::seconds(120),
+        ))
+        .await;
+        deck.assert_one_live_card("the incoming generation's older-stamped first frame")
+            .await;
+    }
+
+    /// Issue #320, on the path PRD #92 F9 followup-7 is actually about: a
+    /// `clear = true` respawn replaces the pane's agent IN PLACE, removing the
+    /// outgoing record before the incoming one is published. The outgoing
+    /// agent's late `SessionStart` must still be recognised as displaced.
+    #[tokio::test]
+    async fn a_late_frame_from_a_generation_replaced_in_place_cannot_retire_the_live_card() {
+        let mut deck = Takeover320::by_respawn("takeover-respawn-320").await;
+        deck.take_over().await;
+
+        let (old, pane) = (deck.old.clone(), deck.pane.clone());
+        let relayed = deck
+            .ingest(takeover_frame_320(
+                &pane,
+                &old,
+                "old-session",
+                crate::event::EventType::SessionStart,
+                chrono::Utc::now(),
+            ))
+            .await;
+        assert_eq!(
+            relayed.pane_generation_verdict(),
+            Some(crate::event::GenerationVerdict::Displaced),
+            "the registry published the outgoing generation on this pane, so it knows \
+             it was replaced even though its record is gone"
+        );
+        deck.assert_one_live_card("the replaced generation's late SessionStart")
+            .await;
+    }
+
+    /// Issue #320: the generation marker is the REGISTRY's answer and nobody
+    /// else's. A producer's own copy is removed before the fan-out, and an agent
+    /// id the registry never published on the pane — an invented one, as a
+    /// stand-in or a forgery would carry — is relayed with no verdict at all,
+    /// so it is ordered exactly as it was before this marker existed.
+    #[tokio::test]
+    async fn the_generation_marker_is_the_registrys_answer_only() {
+        let mut deck = Takeover320::new("takeover-marker-320").await;
+        deck.take_over().await;
+        let pane = deck.pane.clone();
+
+        let mut forged = takeover_frame_320(
+            &pane,
+            "an-id-the-registry-never-minted",
+            "forged-session",
+            crate::event::EventType::Thinking,
+            chrono::Utc::now(),
+        );
+        forged.metadata.insert(
+            crate::event::PANE_GENERATION_METADATA_KEY.to_string(),
+            crate::event::PANE_GENERATION_CURRENT.to_string(),
+        );
+        let relayed = deck.ingest(forged).await;
+        assert_eq!(
+            relayed
+                .metadata
+                .get(crate::event::PANE_GENERATION_METADATA_KEY),
+            None,
+            "a producer-supplied marker must not survive, and an id the registry never \
+             published on the pane gets no verdict of its own"
+        );
+
+        // A pane the registry holds nothing for gets no verdict either, whatever
+        // the producer claimed.
+        let mut elsewhere = takeover_frame_320(
+            "a-pane-the-registry-never-heard-of",
+            &deck.new.clone(),
+            "elsewhere-session",
+            crate::event::EventType::Thinking,
+            chrono::Utc::now(),
+        );
+        elsewhere.metadata.insert(
+            crate::event::PANE_GENERATION_METADATA_KEY.to_string(),
+            crate::event::PANE_GENERATION_DISPLACED.to_string(),
+        );
+        let relayed = deck.ingest(elsewhere).await;
+        assert_eq!(relayed.pane_generation_verdict(), None);
     }
 }
 

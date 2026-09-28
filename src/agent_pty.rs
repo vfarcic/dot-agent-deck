@@ -4618,6 +4618,28 @@ struct RegistryInner {
     /// which is bounded by the panes a person or a schedule actually opens, and
     /// pruning it is exactly the operation that would re-open the window.
     hook_token_panes: HashSet<String>,
+    /// Issue #320 — per pane id, the agent ids of the generations this registry
+    /// has PUBLISHED on it, oldest first, at most [`PANE_GENERATIONS_KEPT`].
+    ///
+    /// [`AgentPtyRegistry::pane_generation_verdict`] reads it to tell a frame
+    /// from a generation that has been REPLACED on its pane — which must
+    /// supersede nothing — from a frame naming an id the registry never put
+    /// there, which it has no verdict on. `agents` cannot answer that, for the
+    /// same window `hook_token_panes` exists for: `respawn_agent_for_pane`
+    /// removes the outgoing record before the incoming one is published, so the
+    /// outgoing generation of a `clear = true` respawn — the one whose late
+    /// `SessionStart` PRD #92 F9 followup-7 documents — has no record left to
+    /// carry a `pane_handed_over` flag by the time its frame is read.
+    ///
+    /// Appended under the same lock acquisition as the `agents.insert` that
+    /// publishes the generation, so no frame can observe a published generation
+    /// the history does not yet name. Never pruned by pane — like
+    /// `hook_token_panes` it grows with the distinct pane ids a daemon spawns —
+    /// but capped per pane, so a pane respawned without end costs a bounded
+    /// amount. A generation evicted by the cap is merely forgotten: its frames
+    /// get no verdict and fall back to the rule they were ordered by before
+    /// this existed.
+    pane_generations: HashMap<String, VecDeque<String>>,
     /// Issue #454: spawns that have been ADMITTED but whose `RunningAgent` is
     /// not in `agents` yet — keyed by the pre-allocated agent id, valued by the
     /// spawn's validated `pane_id_env` (`None` for a paneless agent).
@@ -4922,7 +4944,22 @@ impl crate::state::AgentOwnership for AgentPtyRegistry {
     ) -> crate::state::Ownership {
         AgentPtyRegistry::generation_ownership(self, pane_id, agent_id)
     }
+
+    fn pane_generation_verdict(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+    ) -> Option<crate::event::GenerationVerdict> {
+        AgentPtyRegistry::pane_generation_verdict(self, pane_id, agent_id)
+    }
 }
+
+/// Issue #320: how many published generations
+/// `RegistryInner::pane_generations` remembers per pane. A generation this
+/// many respawns in the past whose frame is only now arriving has been late
+/// for far longer than any hook delivery takes; evicting it costs only its
+/// verdict, never a card.
+const PANE_GENERATIONS_KEPT: usize = 32;
 
 impl AgentPtyRegistry {
     pub fn new() -> Self {
@@ -4933,6 +4970,7 @@ impl AgentPtyRegistry {
                 next_viewer_id: 1,
                 agents: HashMap::new(),
                 hook_token_panes: HashSet::new(),
+                pane_generations: HashMap::new(),
                 pending_spawns: HashMap::new(),
                 cleanup_holds: HashSet::new(),
                 exit_waiters: HashMap::new(),
@@ -7506,6 +7544,9 @@ impl AgentPtyRegistry {
         let registry_for_thread = Arc::downgrade(self);
         let agent_id_for_thread = preallocated_id.clone();
         let pane_id_env_for_thread = pane_id_env.clone();
+        // Issue #320: for `RegistryInner::pane_generations`, appended where
+        // the agent is published below.
+        let pane_for_history = pane_id_env.clone();
         // Captured HERE, at spawn time, rather than inside
         // `pump_reader` itself — `Handle::try_current()` must run on a
         // thread that is currently inside a tokio runtime, and `spawn_agent`
@@ -7591,6 +7632,16 @@ impl AgentPtyRegistry {
         // id is the invariant the agent-id-scoped SessionStart filter
         // depends on.
         let id = preallocated_id;
+        // Issue #320: the pane's generation history learns this generation
+        // under the same lock acquisition that publishes it. See
+        // `RegistryInner::pane_generations`.
+        if let Some(pane) = pane_for_history {
+            let history = inner.pane_generations.entry(pane).or_default();
+            history.push_back(id.clone());
+            while history.len() > PANE_GENERATIONS_KEPT {
+                history.pop_front();
+            }
+        }
         inner.agents.insert(id.clone(), agent);
         // Signal *after* releasing the lock would be cleaner, but we still
         // hold `inner` here. Notify is cheap and a spurious wake-up is
@@ -10380,6 +10431,51 @@ impl AgentPtyRegistry {
         }
     }
 
+    /// Issue #320: which generation of `pane_id` is `agent_id`? The contract is
+    /// [`crate::state::AgentOwnership::pane_generation_verdict`]; this is its
+    /// production implementation.
+    ///
+    /// The pane's current generation is read in the order the registry's own
+    /// invariants make unambiguous: a spawn reserving the pane is newer than any
+    /// record on it, and reservations are exclusive against a live occupant, so
+    /// at most one exists; otherwise at most one record on the pane is not
+    /// `pane_handed_over`, because every publish sets the flag on each record
+    /// already there.
+    ///
+    /// Like [`Self::generation_ownership`] it does not panic on a poisoned lock
+    /// — it sits on the same ingestion path — and answers no verdict instead.
+    pub fn pane_generation_verdict(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+    ) -> Option<crate::event::GenerationVerdict> {
+        use crate::event::GenerationVerdict;
+        let Ok(inner) = self.inner.lock() else {
+            tracing::error!("pane_generation_verdict: registry lock is poisoned; cannot answer");
+            return None;
+        };
+        let current = inner
+            .pending_spawns
+            .iter()
+            .find_map(|(id, reserved)| (reserved.as_deref() == Some(pane_id)).then_some(id))
+            .or_else(|| {
+                inner.agents.iter().find_map(|(id, a)| {
+                    (a.pane_id_env.as_deref() == Some(pane_id) && !a.pane_handed_over).then_some(id)
+                })
+            })?;
+        if current == agent_id {
+            Some(GenerationVerdict::Current)
+        } else if inner
+            .pane_generations
+            .get(pane_id)
+            .is_some_and(|history| history.iter().any(|id| id == agent_id))
+        {
+            Some(GenerationVerdict::Displaced)
+        } else {
+            None
+        }
+    }
+
     /// Issue #454 round-3 review (blocker 1): take the durable authorisation for
     /// `StopAgent`'s PANE-SCOPED cleanup of `pane_id` on behalf of `stopping_id`.
     ///
@@ -13162,6 +13258,49 @@ mod spawn_tests {
     /// admission tests in `crate::state`.
     fn owns(registry: &AgentPtyRegistry, pane_id: Option<&str>, agent_id: Option<&str>) -> bool {
         registry.generation_ownership(pane_id, agent_id) == Ownership::Owned
+    }
+
+    /// Issue #320: a spawn reserving the pane is its CURRENT generation, a
+    /// generation published there earlier is displaced by it, and only an id
+    /// the registry published on the pane is ever called displaced. Planted
+    /// directly, like the reservation test below, because the window between
+    /// reservation and publish is not one a real spawn holds open.
+    #[test]
+    fn a_reservation_is_the_panes_current_generation_and_history_decides_displaced() {
+        use crate::event::GenerationVerdict;
+        let registry = AgentPtyRegistry::new();
+        let pane = "verdict-pane-320";
+        {
+            let mut inner = registry.inner.lock().unwrap();
+            inner
+                .pane_generations
+                .entry(pane.to_string())
+                .or_default()
+                .push_back("11".to_string());
+            inner
+                .pending_spawns
+                .insert("12".to_string(), Some(pane.to_string()));
+        }
+        assert_eq!(
+            registry.pane_generation_verdict(pane, "12"),
+            Some(GenerationVerdict::Current),
+            "the in-flight spawn is the pane's newest generation"
+        );
+        assert_eq!(
+            registry.pane_generation_verdict(pane, "11"),
+            Some(GenerationVerdict::Displaced),
+            "a generation published on the pane earlier is displaced by the reservation"
+        );
+        assert_eq!(
+            registry.pane_generation_verdict(pane, "never-published-here"),
+            None,
+            "an id the registry never published on the pane gets no verdict"
+        );
+        assert_eq!(
+            registry.pane_generation_verdict("some-other-pane-320", "12"),
+            None,
+            "a pane the registry holds nothing for gets no verdict"
+        );
     }
 
     /// The startup-race half. A spawn is owned from the moment it is RESERVED —

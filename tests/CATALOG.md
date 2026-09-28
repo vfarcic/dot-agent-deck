@@ -824,6 +824,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the daemon's own handling of the same stamp, which its registry-ownership ground (`generation_disowned`, issue #454) bounds and which a client state has no counterpart for; the readout, which is `0s` either way because `format_elapsed` clamps a future delta.
 - **Platform coverage:** mac+linux+windows.
 
+##### status/supersede/019 — A late frame the daemon marked as from a DISPLACED generation neither retires the live card nor adds one beside it (issue #320).
+- **Layer:** L1 (in-process `AppState` with no registry — an attached TUI's shape — fed frames carrying the daemon's `pane_generation` metadata stamp through `apply_event`).
+- **Agent:** none (synthetic Claude Code generations under two registry agent ids).
+- **Asserts:** with the incoming generation's card on the pane, a late `SessionStart` and a late `Thinking` stamped an hour in the future from the outgoing generation, each marked `displaced`, leave that card as the pane's only card. Control: the same frames unmarked — as a daemon predating the stamp relays them — are still ordered by the old type-and-timestamp rule and replace the live card, so the verdict is what decides.
+- **Does not assert:** that the daemon stamps the right verdict — that is its registry's answer, pinned end to end against a real `AgentPtyRegistry` by `daemon::hook_ingestion_tests` (`a_late_outgoing_session_start_cannot_retire_the_live_card`, `a_late_outgoing_frame_stamped_newer_cannot_retire_the_live_card`, `a_late_frame_from_a_generation_replaced_in_place_cannot_retire_the_live_card`, `the_generation_marker_is_the_registrys_answer_only`); an id the registry never published on the pane, which gets no verdict and keeps the old rule, residual included.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/020 — A frame the daemon marked as the pane's CURRENT generation supersedes the previous generation's card however it is stamped (issue #320).
+- **Layer:** L1 (in-process `AppState` with no registry, fed stamped frames through `apply_event`).
+- **Agent:** none (synthetic Pi generations — the agent that sends no `SessionStart`).
+- **Asserts:** an outgoing Pi card, then the incoming generation's first `Thinking` stamped 30 seconds EARLIER than that card's last activity and marked `current`, leaves exactly one card, owned by the incoming agent. Control: the same frame unmarked is held back by the timestamp and the pane keeps both cards, the TUI-side behaviour against a daemon that predates the stamp.
+- **Does not assert:** the daemon's own side, where the registry answers directly (`daemon::hook_ingestion_tests::the_current_generation_supersedes_whatever_its_first_frame_is_stamped`); the scheduler placeholder handoff (`status/supersede/001`, `scheduler/live/004`), which a current-generation `SessionStart` still performs.
+- **Platform coverage:** mac+linux+windows.
+
 #### status/shell-activity
 
 ##### status/shell-activity/001 — The process-table primitive finds a real, detached grandchild process as a descendant and reports its no-controlling-tty / session-leader / argv / session-id facts correctly (PRD #386 M1).
