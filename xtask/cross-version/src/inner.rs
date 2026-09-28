@@ -1344,8 +1344,14 @@ fn with_attached_tui(
     // DECLINE_KEY). Accepting would SIGTERM the daemon under test and replace
     // it, which destroys the entire point of the run.
     tui.send(DECLINE_KEY);
+    // The prompt itself names the live roles, `orchestrator` among them, so a
+    // grid still showing it is NOT an attach: only a grid the prompt has left —
+    // the dashboard takes the alternate screen — counts as one. The refusal is
+    // printed below the prompt on the normal screen, so it is looked for first.
     let attached_or_refused = tui.wait_for_grid(UI_TIMEOUT, |g| {
-        g.contains("XVER_") || g.contains(ROLE_ORCHESTRATOR) || g.contains(PROTOCOL_REFUSAL)
+        g.contains(PROTOCOL_REFUSAL)
+            || (!g.contains("Daemon version mismatch")
+                && (g.contains("XVER_") || g.contains(ROLE_ORCHESTRATOR)))
     });
     if tui.stream_text().contains(PROTOCOL_REFUSAL) {
         ev.excerpt(

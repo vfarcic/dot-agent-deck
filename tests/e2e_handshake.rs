@@ -44,7 +44,7 @@
 //! external daemon is started at `OLD_BUILD` and the TUI is launched at
 //! `NEW_BUILD`, pointed at the daemon's sockets so it reuses that older daemon
 //! and the handshake observes a mismatch. Protocol skew (009/010) is simulated
-//! the same way through the `e2e`-only
+//! the same way through the test-only (`e2e` feature + debug build)
 //! `DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE`, which changes only the
 //! number the daemon's `hello` reply advertises.
 //!
@@ -390,8 +390,8 @@ fn handshake_007_omitted_running_agents_falls_back_no_silent_kill() {
 }
 
 /// Start an external `daemon serve` pinned to `build_id` whose `Hello` reply
-/// advertises attach protocol `protocol` instead of this build's own, via the
-/// `e2e`-only `DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE` seam (issue
+/// advertises attach protocol `protocol` instead of this build's own, via the test-only
+/// (`e2e` feature + debug build) `DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE` seam (issue
 /// #405). The daemon and the TUI here are one compiled binary, so this is the
 /// only way a PTY test can put a protocol skew between them.
 fn spawn_daemon_at_build_and_protocol(build_id: &str, protocol: u32) -> DaemonProc {

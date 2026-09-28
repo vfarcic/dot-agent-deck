@@ -483,18 +483,21 @@ pub const PROTOCOL_VERSION: u32 = 10;
 /// [`AttachResponse::server_version`]. [`PROTOCOL_VERSION`] in every shipped
 /// build.
 ///
-/// Issue #405 test seam: under the `e2e` feature only,
-/// `DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE` replaces the advertised
-/// number, so an L2 test can start a daemon that *claims* another protocol and
-/// drive the real TUI's refusal against it. The daemon and the TUI there are
-/// one compiled binary sharing one constant, so without this no PTY test can
-/// produce a protocol skew at all. It is gated on `e2e` rather than on
-/// `debug_assertions` for the reason [`crate::platform::paths`]' current-exe
-/// override is: neither a release build nor a `cargo test-fast` run compiles
-/// the branch, so there is no code for production to take. Only the reply's
-/// number moves; the daemon still speaks this build's wire.
+/// Issue #405 test seam: `DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE`
+/// replaces the advertised number, so an L2 test can start a daemon that
+/// *claims* another protocol and drive the real TUI's refusal against it. The
+/// daemon and the TUI there are one compiled binary sharing one constant, so
+/// without this no PTY test can produce a protocol skew at all. Only the reply's
+/// number moves; the daemon still speaks this build's wire — which is exactly
+/// why the branch must never exist in a binary someone runs for real.
+///
+/// So it needs BOTH `feature = "e2e"` and `debug_assertions`. `e2e`, as
+/// [`crate::platform::paths`]' current-exe override does, keeps it out of a
+/// `cargo test-fast` run and every ordinary build; `debug_assertions`, as
+/// [`crate::build_id::local_build_id`]'s override does, keeps it out of a
+/// release-profile binary even if someone builds one with `--features e2e`.
 pub fn advertised_protocol_version() -> u32 {
-    #[cfg(feature = "e2e")]
+    #[cfg(all(feature = "e2e", debug_assertions))]
     if let Some(v) = std::env::var("DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE")
         .ok()
         .and_then(|s| s.parse().ok())
