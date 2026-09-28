@@ -1312,12 +1312,21 @@ fn revalidate_approved_roles(
     };
     // Captured before the context checks so the returned list is the one the
     // orchestration lookup just matched, rather than a second lookup's.
+    //
+    // Issue #523: `start` is the orchestrator SEAT by the one rule, not the
+    // bare flag, so `verify_prepared_start_role` accepts exactly the membership
+    // a seat-computing client sends (`TabMembership::is_start_role` means the
+    // seat) and the configured Pi seed follows the same role. The desktop, the
+    // one client today, refuses to launch without exactly one `start = true`
+    // role, and for such a config the two readings are the same value.
+    let seat = orch.orchestrator_role_index();
     let approved_roles: Vec<ApprovedRole> = orch
         .roles
         .iter()
-        .map(|role| ApprovedRole {
+        .enumerate()
+        .map(|(index, role)| ApprovedRole {
             name: role.name.clone(),
-            start: role.start,
+            start: index == seat,
             command: role.command.clone(),
             agent_type: role.resolved_agent_type(),
         })
@@ -1334,8 +1343,10 @@ fn revalidate_approved_roles(
 }
 
 /// One role of the orchestration a preparation approved, as the config declares
-/// it: the exact name a spawn must send back, whether that role is the one the
-/// orchestration starts, and — for PRD #1223 M6's opted-in start — what the TUI
+/// it: the exact name a spawn must send back, whether that role is the
+/// orchestration's orchestrator seat (`start`: by
+/// [`crate::project_config::OrchestrationConfig::orchestrator_role_index`],
+/// issue #523, not the bare flag), and — for PRD #1223 M6's opted-in start — what the TUI
 /// takes from the role's config when it spawns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ApprovedRole {

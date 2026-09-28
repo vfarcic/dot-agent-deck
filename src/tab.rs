@@ -969,7 +969,40 @@ impl TabManager {
     /// Open a new orchestration tab. Creates one pane per role.
     /// `orchestrator_prompt` is injected into the start role once its agent is ready.
     /// Returns `(tab_index, role_pane_ids)`.
+    ///
+    /// The orchestrator is the role the config's one rule seats
+    /// ([`OrchestrationConfig::orchestrator_role_index`], issue #523); see
+    /// [`Self::open_orchestration_tab_seated`] for the one caller that seats a
+    /// different role on purpose.
     pub fn open_orchestration_tab(
+        &mut self,
+        config: &OrchestrationConfig,
+        cwd: &str,
+        orchestrator_prompt: Option<String>,
+        display_title: Option<&str>,
+        spawn_dims: (u16, u16),
+    ) -> Result<(usize, Vec<String>), TabError> {
+        self.open_orchestration_tab_seated(
+            config,
+            cwd,
+            orchestrator_prompt,
+            display_title,
+            spawn_dims,
+            None,
+        )
+    }
+
+    /// [`Self::open_orchestration_tab`] with an explicit orchestrator SEAT.
+    ///
+    /// `seat` is `None` everywhere but the snapshot restore, which passes the
+    /// SAVED start cursor: PRD #89 F3 honours that cursor even where it
+    /// differs from what the config would seat now (`session/restore/011`),
+    /// and it has to be honoured by the membership sent to the daemon (who may
+    /// `delegate`) and the Pi seed as well as by focus and prompt delivery, or
+    /// the prompt lands on one pane while a different one is registered to act
+    /// on it (issue #523 review). An out-of-range `seat` falls back to the
+    /// config's rule; the restore path has already refused one as drift.
+    pub fn open_orchestration_tab_seated(
         &mut self,
         config: &OrchestrationConfig,
         cwd: &str,
@@ -993,6 +1026,7 @@ impl TabManager {
         // pass reconciles each role pane to its exact inner area (and the
         // active tab's focus state) on the first frame.
         spawn_dims: (u16, u16),
+        seat: Option<usize>,
     ) -> Result<(usize, Vec<String>), TabError> {
         let mut role_pane_ids: Vec<String> = Vec::with_capacity(config.roles.len());
         let (spawn_rows, spawn_cols) = spawn_dims;
@@ -1015,9 +1049,12 @@ impl TabManager {
         // those read the bare `start` flag, with a role-0 fallback and no
         // name-based one, so a config that named its orchestrator but set no
         // `start` opened with the prompt on whichever role came first.
-        let orch_idx = config.orchestrator_role_index();
+        let orch_idx = seat
+            .filter(|i| *i < config.roles.len())
+            .unwrap_or_else(|| config.orchestrator_role_index());
         let start_role_is_pi = config
-            .orchestrator_role()
+            .roles
+            .get(orch_idx)
             // Issue #308: the role's RESOLVED type — its `agent = "…"`
             // declaration when it made one, else the type derived from the
             // command — so a Pi orchestrator launched through a wrapper script
@@ -2223,6 +2260,56 @@ mod tests {
                 Some(role_ids[want].as_str()),
                 "[{case}] default focus lands on the orchestrator"
             );
+        }
+    }
+
+    /// Issue #523 review: an explicit seat (the snapshot restore's saved
+    /// cursor) is the tab's one orchestrator for the membership sent to the
+    /// daemon as well as for `start_role_index`; an out-of-range seat falls
+    /// back to the config's rule.
+    #[test]
+    fn an_explicit_seat_is_the_one_orchestrator() {
+        let role = |name: &str| OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: format!("echo {name}"),
+            start: false,
+            description: None,
+            prompt_template: None,
+            clear: false,
+        };
+        let config = OrchestrationConfig {
+            default: false,
+            name: "seat".to_string(),
+            roles: vec![role("coder"), role("orchestrator")],
+        };
+        for (seat, want) in [(Some(0), 0), (Some(99), 1), (None, 1)] {
+            let pc = Arc::new(MockPaneController::new());
+            let mut tm = TabManager::new(pc.clone());
+            let (idx, _) = tm
+                .open_orchestration_tab_seated(&config, "/work", None, None, (24, 80), seat)
+                .expect("open orchestration tab");
+            let flagged: Vec<usize> = pc
+                .memberships
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|m| match m {
+                    Some(TabMembership::Orchestration {
+                        role_index,
+                        is_start_role: true,
+                        ..
+                    }) => Some(*role_index),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(flagged, vec![want], "seat {seat:?}: membership");
+            match &tm.tabs[idx] {
+                Tab::Orchestration {
+                    start_role_index, ..
+                } => assert_eq!(*start_role_index, want, "seat {seat:?}: start_role_index"),
+                _ => panic!("expected an orchestration tab"),
+            }
         }
     }
 

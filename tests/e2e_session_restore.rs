@@ -597,7 +597,9 @@ fn restore_010_zero_role_reresolved_orchestration_falls_back_without_panic() {
 /// default. Launch against a fresh (empty) daemon with NO flag. The saved start
 /// cursor must be HONORED: the replayed `orchestrator_prompt` must land on the
 /// role at the SAVED index (`coder`, index 1) and be recorded there, NOT on the
-/// config-default start role (`orchestrator`, index 0). RED today: the restore
+/// config-default start role (`orchestrator`, index 0) — and `daemon status`
+/// must mark that same saved role, and only it, as the orchestrator, so the
+/// pane holding the prompt is the pane allowed to delegate. RED today: the restore
 /// branch recomputes the start from the live config
 /// (`roles.iter().position(|r| r.start)`) and never reads `snap.start_role_index`,
 /// so the prompt is delivered to `orchestrator` and `coder` never receives it.
@@ -687,6 +689,46 @@ fn restore_011_saved_start_role_index_is_honored_over_config_default() {
         "the config-default start role (`orchestrator`, index 0) must NOT receive the prompt \
          when the saved cursor points elsewhere — but it did, at {orchestrator_record:?}."
     );
+
+    // Issue #523 review: the saved cursor is the tab's ONE orchestrator, so the
+    // pane the prompt went to is also the pane the daemon registered as allowed
+    // to `delegate` — `daemon status` marks `coder`, and only `coder`. Before,
+    // the daemon kept registering the config's `start = true` role while the
+    // prompt went to the saved one: a prompt on one pane, delegate rights on
+    // another.
+    let marked = common::wait_until(Duration::from_secs(10), || {
+        orchestrator_marked_roles(&deck) == vec!["coder (orchestrator)".to_string()]
+    });
+    assert!(
+        marked,
+        "the restored tab must seat exactly the saved role as its orchestrator;          `daemon status` marks: {:?}",
+        orchestrator_marked_roles(&deck)
+    );
+}
+
+/// The `role` labels `daemon status --json` marks `(orchestrator)` for this
+/// deck's agents.
+fn orchestrator_marked_roles(deck: &TuiDeck) -> Vec<String> {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["daemon", "status", "--json"])
+        .env("DOT_AGENT_DECK_ATTACH_SOCKET", deck.attach_socket_path())
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("HOME", deck.home_dir())
+        .current_dir(deck.workdir())
+        .output()
+        .expect("run daemon status --json");
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+    doc["agents"]
+        .as_array()
+        .map(|agents| {
+            agents
+                .iter()
+                .filter_map(|a| a["role"].as_str())
+                .filter(|r| r.contains("(orchestrator)"))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Scenario: Stage TWO directories — a legitimate saved working dir (no

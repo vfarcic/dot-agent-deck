@@ -13460,7 +13460,16 @@ pub fn run_tui(
                         // start role once it signals readiness.
                         let replay_prompt = (!orch_snap.orchestrator_prompt.is_empty())
                             .then(|| orch_snap.orchestrator_prompt.clone());
-                        match tab_manager.open_orchestration_tab(
+                        // PRD #89 review-fix F3: honor the SAVED start cursor,
+                        // even when it differs from the role the config seats
+                        // now, so the prompt-delivery gate and the landing focus
+                        // target the role the user left as start. Issue #523
+                        // review: passed as the tab's SEAT rather than patched
+                        // onto `start_role_index` afterwards, so the membership
+                        // the daemon registers (who may `delegate`) and the Pi
+                        // seed name that same role — one orchestrator, not a
+                        // prompt on one pane and delegate rights on another.
+                        match tab_manager.open_orchestration_tab_seated(
                             &orch_config,
                             &saved_pane.dir,
                             replay_prompt,
@@ -13470,22 +13479,9 @@ pub fn run_tui(
                             // when unset falls back to the canonical name.
                             orch_snap.display_title.as_deref(),
                             spawn_dims,
+                            Some(saved_start_idx),
                         ) {
                             Ok((tab_idx, role_pane_ids)) => {
-                                // PRD #89 review-fix F3: honor the SAVED start
-                                // cursor. `open_orchestration_tab` computed
-                                // `start_role_index` from the config's `start`
-                                // flags; override it with the validated saved
-                                // index so the prompt-delivery gate (and the
-                                // landing focus) target the role the user left
-                                // as start, even when it differs from the config
-                                // default. The just-opened tab is the active tab.
-                                if let Tab::Orchestration {
-                                    start_role_index, ..
-                                } = tab_manager.active_tab_mut()
-                                {
-                                    *start_role_index = saved_start_idx;
-                                }
                                 // Snapshot each role pane's daemon agent_id before
                                 // the placeholder insert so the strict-equality
                                 // reuse guard accepts each role agent's first
@@ -13516,7 +13512,7 @@ pub fn run_tui(
                                     // TUI-side router would silently hit, is on
                                     // the first of these registrations in
                                     // `surface_one_orchestration`.
-                                    let orch_idx = orch_config.orchestrator_role_index();
+                                    // The tab's seat — the saved cursor (above).
                                     for (i, role) in orch_config.roles.iter().enumerate() {
                                         st.pane_role_map
                                             .insert(role_pane_ids[i].clone(), role.name.clone());
@@ -13524,7 +13520,7 @@ pub fn run_tui(
                                             role_pane_ids[i].clone(),
                                             saved_pane.dir.clone(),
                                         );
-                                        if i == orch_idx {
+                                        if i == saved_start_idx {
                                             st.orchestrator_pane_ids
                                                 .insert(role_pane_ids[i].clone());
                                         }
