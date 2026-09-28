@@ -1588,6 +1588,10 @@ fn restore_022_legacy_mode_snapshot_becomes_dashboard_card() {
         "a legacy snapshot must not open a mode tab; grid:\n{grid}"
     );
 
+    // The card can render before restore has entered PaneInput. Wait for its
+    // footer before the detach helper samples the mode, or Ctrl+C can reach
+    // the restored pane instead of opening the quit dialog under CI load.
+    deck.wait_for_string("[Command Mode Ctrl+D]");
     let output = detach_and_collect_output(&mut deck);
     let warning = "Workspace modes were removed (#1199): pane 'old-pane' was saved in mode 'legacy-ops' and was restored as a plain pane.";
     assert!(
