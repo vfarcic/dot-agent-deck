@@ -1154,8 +1154,8 @@ fn context_dir_unchanged(_guard: &ContextDirGuard, _dir: &std::path::Path) -> bo
 /// [`open_context_dir`] opened with `O_NOFOLLOW | O_DIRECTORY` — `openat` with
 /// `O_CREAT | O_EXCL | O_NOFOLLOW`, `renameat`, `unlinkat`, `fstatat` with
 /// `AT_SYMLINK_NOFOLLOW` — and each takes a **single name**, never a path. So
-/// once the checks have passed, no operation through this handle re-traverses
-/// the project pathname: a project renamed and replaced under a shared parent
+/// once the checks have passed, no mutating operation through this handle
+/// re-traverses the project pathname: a project renamed and replaced under a shared parent
 /// afterwards cannot redirect a create, the mirror's rename, a failure's
 /// cleanup, a withdrawal or the TUI's removal of a replaced file into another
 /// directory. Before the

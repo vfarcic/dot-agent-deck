@@ -818,13 +818,27 @@ impl ReplyLatch {
 /// thread and under the same permit — issue #1233's compatibility mirror.
 pub type AfterReply = Box<dyn FnOnce() + Send>;
 
+/// Why [`run_bounded_answer`] gave up at its deadline without an answer. Both
+/// causes reach a client as the same `preparation-expired` refusal; they are
+/// told apart for the daemon's log, where they point at different remedies
+/// (issue #1233 re-review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expired {
+    /// No [`MAX_CONCURRENT_PROJECT_READS`] permit freed up: the work never ran.
+    NoPermit,
+    /// A permit was held and the work ran, but it had not committed when the
+    /// deadline fired, so the [`ReplyLatch`] was abandoned — the work refuses
+    /// and withdraws at its next latch check.
+    Abandoned,
+}
+
 /// [`run_bounded`] under a `deadline` that bounds the **answer**, not only the
 /// permit wait (issue #1233 item 4 and its audit).
 ///
-/// * `None` when the deadline passed before an answer: either no permit freed
-///   up (`f` never ran), or `f` had not committed and the [`ReplyLatch`] was
-///   abandoned — so an `f` that checks the latch, as the preparation does at
-///   its last gate, refuses and withdraws.
+/// * `Err(`[`Expired`]`)` when the deadline passed before an answer: either no
+///   permit freed up (`f` never ran), or `f` had not committed and the
+///   [`ReplyLatch`] was abandoned — so an `f` that checks the latch, as the
+///   preparation does at its last gate, refuses and withdraws.
 /// * `f` returns its answer and, optionally, work to run **after** the answer
 ///   has gone: that work cannot delay the reply. This function runs it
 ///   whenever `f` returns it; the preparation returns it only for an answer it
@@ -835,14 +849,14 @@ pub type AfterReply = Box<dyn FnOnce() + Send>;
 pub async fn run_bounded_answer<T, F>(
     deadline: tokio::time::Instant,
     f: F,
-) -> Result<Option<T>, ProjectResolveError>
+) -> Result<Result<T, Expired>, ProjectResolveError>
 where
     F: FnOnce(&ReplyLatch) -> (T, Option<AfterReply>) + Send + 'static,
     T: Send + 'static,
 {
     let permit =
         match tokio::time::timeout_at(deadline, project_fs_limit().clone().acquire_owned()).await {
-            Err(_elapsed) => return Ok(None),
+            Err(_elapsed) => return Ok(Err(Expired::NoPermit)),
             Ok(permit) => permit.map_err(|_| ProjectResolveError::Internal)?,
         };
     let latch = Arc::new(ReplyLatch::default());
@@ -850,6 +864,13 @@ where
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     // Detached: the answer arrives over `rx`, and what runs after it is not
     // this reply's business.
+    //
+    // A panic inside `f` after it committed — between the preparation's last
+    // gate and `tx.send` — delivers no answer (the reply reads `Internal`) yet
+    // withdraws nothing, because the work had committed: its token and
+    // published file are then bounded by the token TTL and the coordination
+    // retention sweep, not by withdrawal. Only non-blocking construction of the
+    // answer stands in that window.
     drop(tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let (answer, after) = f(&work_latch);
@@ -859,14 +880,11 @@ where
         }
     }));
     match tokio::time::timeout_at(deadline, &mut rx).await {
-        Ok(answer) => answer.map(Some).map_err(|_| ProjectResolveError::Internal),
-        Err(_elapsed) if latch.abandon() => Ok(None),
+        Ok(answer) => answer.map(Ok).map_err(|_| ProjectResolveError::Internal),
+        Err(_elapsed) if latch.abandon() => Ok(Err(Expired::Abandoned)),
         // The work committed just before the deadline fired; its answer is
         // already on its way.
-        Err(_elapsed) => rx
-            .await
-            .map(Some)
-            .map_err(|_| ProjectResolveError::Internal),
+        Err(_elapsed) => rx.await.map(Ok).map_err(|_| ProjectResolveError::Internal),
     }
 }
 
@@ -1144,7 +1162,9 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
 /// [`prepare_orchestration_before`]'s deadline — a refusal that withdraws the
 /// publish best effort. (The token minted after the publish is an in-memory
 /// record; a preparation refused after minting it revokes it, so no live token
-/// outlasts a failed preparation.)
+/// outlasts a refused preparation. One that committed and then lost its answer
+/// to a panic before it was sent is not refused, and is bounded by the token
+/// TTL and the retention sweep instead — see [`run_bounded_answer`].)
 ///
 /// **What the returned token binds, and why that is not a detail.** PRD #819's
 /// original design had this issue a token recording only its issuance time, and
@@ -3363,8 +3383,9 @@ command = "cat"
         )
         .await
         .expect("no internal error");
-        assert!(
-            outcome.is_none(),
+        assert_eq!(
+            outcome,
+            Err(Expired::NoPermit),
             "the deadline passed before a permit freed up"
         );
         assert!(
@@ -3379,11 +3400,11 @@ command = "cat"
         )
         .await
         .expect("no internal error");
-        assert_eq!(outcome, Some(Some(42)), "with a permit free the work runs");
+        assert_eq!(outcome, Ok(Some(42)), "with a permit free the work runs");
     }
 
     /// Issue #1233 audit: a work that is still running at the deadline does not
-    /// hold the reply — it is answered `None` (expired) on time — and when it
+    /// hold the reply — it is answered `Expired::Abandoned` on time — and when it
     /// does finish, its commit is refused, which is what makes it withdraw.
     #[tokio::test]
     async fn run_bounded_answer_answers_on_time_and_abandons_a_stalled_work() {
@@ -3399,7 +3420,11 @@ command = "cat"
         })
         .await
         .expect("no internal error");
-        assert!(outcome.is_none(), "answered as expired, got {outcome:?}");
+        assert_eq!(
+            outcome,
+            Err(Expired::Abandoned),
+            "answered as expired because the running work was abandoned"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the answer did not wait for the stalled work ({:?})",
@@ -3437,7 +3462,7 @@ command = "cat"
         })
         .await
         .expect("no internal error");
-        assert_eq!(outcome, Some(true), "the committed answer is delivered");
+        assert_eq!(outcome, Ok(true), "the committed answer is delivered");
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the answer did not wait for the after-reply work ({:?})",

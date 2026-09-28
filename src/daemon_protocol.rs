@@ -5128,13 +5128,19 @@ async fn handle_connection(
                     })
                     .await
                     {
-                        Ok(Some(Ok(prepared))) => AttachResponse::prepared(prepared, spelling),
-                        Ok(Some(Err(refusal))) => AttachResponse::err(refusal),
-                        Ok(None) => {
-                            warn!(
-                                "prepare-orchestration refused: no project permit freed up before \
-                                 its deadline"
-                            );
+                        Ok(Ok(Ok(prepared))) => AttachResponse::prepared(prepared, spelling),
+                        Ok(Ok(Err(refusal))) => AttachResponse::err(refusal),
+                        Ok(Err(expired)) => {
+                            match expired {
+                                crate::project_resolve::Expired::NoPermit => warn!(
+                                    "prepare-orchestration refused: no project permit freed up \
+                                     before its deadline"
+                                ),
+                                crate::project_resolve::Expired::Abandoned => warn!(
+                                    "prepare-orchestration refused: its work was still running at \
+                                     its deadline; it withdraws itself when it finishes"
+                                ),
+                            }
                             AttachResponse::err(
                                 crate::project_resolve::preparation_expired_refusal(),
                             )
