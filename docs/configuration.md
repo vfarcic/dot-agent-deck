@@ -72,8 +72,6 @@ description = "Implements the changes the orchestrator delegates"
 
 For the full reference, see [Orchestration](orchestration.md#configuration-reference). `default` and `extends` only matter to a project that defines **several** orchestrations, and are explained under [More than one orchestration](orchestration.md#more-than-one-orchestration).
 
-**A `[[modes]]` block is ignored with a warning.** Workspace modes were removed in [#1199](https://github.com/vfarcic/dot-agent-deck/issues/1199); a file that still declares one keeps loading, the TUI shows a warning the first time the New Agent form reads it in a session, and `dot-agent-deck validate` reports it. Delete the block to clear the warning. See [Workspace Modes (removed)](workspace-modes.md) for what to use instead.
-
 ### Naming the agent a command launches
 
 The deck identifies which agent a pane runs by reading the first word of its command, so `claude`, `codex`, `opencode --model gpt-4o` and `/usr/local/bin/pi` all resolve by themselves. A command that starts the agent through something else does not — `devbox run -- codex`, `mise exec -- codex`, `nix develop -c codex`, `make codex`, `./run-codex.sh` — because nothing about a launcher reveals what it will end up starting. Such a pane shows **No agent** and gets no status tracking, and for Codex it stays that way until you give it its first task.
@@ -133,7 +131,7 @@ cd your-project
 dot-agent-deck validate
 ```
 
-It checks your orchestrations — duplicate names, the role count, exactly one `start = true` role, empty or duplicate role names, empty commands, and unknown `agent` names, among others; [Validate your config](orchestration.md#validate-your-config) covers the multi-orchestration checks. A leftover `[[modes]]` block is reported as a warning saying workspace modes were removed and the block can be deleted. Only errors make `validate` exit non-zero, so a config whose only finding is that warning still exits `0`.
+It checks your orchestrations — duplicate names, the role count, exactly one `start = true` role, empty or duplicate role names, empty commands, and unknown `agent` names, among others; [Validate your config](orchestration.md#validate-your-config) covers the multi-orchestration checks. Only errors make `validate` exit non-zero, so a config whose only findings are warnings still exits `0`.
 
 #### `dot-agent-deck watch`
 

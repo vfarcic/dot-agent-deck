@@ -82,8 +82,6 @@ Orchestration tabs return in full, with the orchestrator and its prompt, the rol
 
 In every case only the workspace structure is restored, not an agent's internal conversation. If something in your project's `.dot-agent-deck.toml` has changed since you last ran it — the file is missing, an orchestration was renamed, or a role was removed — Agent Deck shows a clear warning and brings that pane back as a plain dashboard pane instead of a broken tab.
 
-A pane saved from a workspace-mode tab, from a release before [workspace modes were removed](workspace-modes.md), comes back the same way: as a plain pane on the dashboard, with a warning. Its side panes are not restored.
-
 ### Starting Fresh
 
 To discard the saved workspace and start from an empty dashboard next time, clear the snapshot:
