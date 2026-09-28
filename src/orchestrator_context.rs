@@ -561,10 +561,6 @@ pub struct PublishedPrompt {
     /// keeps it so its compaction or `/clear` re-arm reads the task back from
     /// its own file rather than from the shared mirror.
     pub context_path: std::path::PathBuf,
-    /// The directory it was published into, held open, so the tab's removal of
-    /// the file this one replaces is anchored on it
-    /// ([`remove_replaced_context`]).
-    pub dir: ContextDir,
 }
 
 /// Write the orchestrator context to a file and return a one-liner to inject.
@@ -595,7 +591,6 @@ pub fn prepare_orchestrator_prompt(
         Ok(prepared) => Some(PublishedPrompt {
             prompt: prepared.prompt,
             context_path: prepared.context_path,
-            dir: prepared.dir,
         }),
         Err(e) => {
             tracing::warn!(reason = %e, "could not publish the orchestrator context");
@@ -1211,8 +1206,7 @@ fn context_dir_unchanged(_guard: &ContextDirGuard, _dir: &std::path::Path) -> bo
 /// once the checks have passed, no mutating operation through this handle
 /// re-traverses the project pathname: a project renamed and replaced under a shared parent
 /// afterwards cannot redirect a create, the mirror's rename, a failure's
-/// cleanup, a withdrawal or the TUI's removal of a replaced file into another
-/// directory. Before the
+/// cleanup or a withdrawal into another directory. Before the
 /// audit each of those joined a name onto the path again, after the identity
 /// check, which is exactly the window it named.
 ///
@@ -1379,14 +1373,6 @@ impl ContextDir {
             .as_ref()
             .and_then(crate::prep_token::inode_identity)
     }
-}
-
-/// Whether `name` is a per-publish context file name:
-/// [`CONTEXT_FILE_PREFIX`], 32 hex digits, `.md` (issue #1233).
-fn is_per_publish_context_name(name: &str) -> bool {
-    name.strip_prefix(CONTEXT_FILE_PREFIX)
-        .and_then(|rest| rest.strip_suffix(".md"))
-        .is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Do not publish into a `.dot-agent-deck` that grants **write** to group or
@@ -1863,27 +1849,6 @@ impl PendingMirror {
     pub fn write(self) {
         mirror_into(&self.dir, &self.content);
     }
-}
-
-/// Remove `old`, the per-publish context a re-arm just replaced, from the
-/// directory `dir` — the one the re-arm's own publish holds open (issue #1233
-/// audit, the TUI's `replace_orchestration_context_path`).
-///
-/// The caller only has `old` as a path, so the removal is anchored rather
-/// than revalidated: it happens only when `old`'s parent is `dir`'s own path
-/// and its name is a per-publish context name, and then through `unlinkat` on
-/// the held descriptor — so a project renamed and replaced since cannot turn it
-/// into a removal in another directory. Anything else is left in place for the
-/// retention sweep rather than removed by pathname. Best effort; `true` when a
-/// file was removed.
-pub fn remove_replaced_context(dir: &ContextDir, old: &std::path::Path) -> bool {
-    if old.parent() != Some(dir.path()) {
-        return false;
-    }
-    let Some(name) = old.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    is_per_publish_context_name(name) && dir.unlink(name).is_ok()
 }
 
 /// The mirror write itself: the fixed-name publish every deck performed before
@@ -2871,7 +2836,7 @@ mod tests {
         assert!(rearmed.prompt.contains("carry out that task"));
         assert!(
             a.context_path.is_file(),
-            "the re-arm does not delete the file it read; the tab does"
+            "the re-arm does not delete the file it read, and neither does the tab (PR #1407 review)"
         );
     }
 
@@ -2906,9 +2871,8 @@ mod tests {
     /// through the held `.dot-agent-deck` descriptor, so a project renamed and
     /// replaced afterwards cannot redirect it. The withdrawal removes the file
     /// from the directory it was published into — now under the moved name —
-    /// and leaves a same-named file in the replacement alone; the mirror is not
-    /// written into the replacement; and the TUI's removal of a replaced file is
-    /// anchored the same way.
+    /// and leaves a same-named file in the replacement alone; and the mirror is
+    /// not written into the replacement.
     #[cfg(unix)]
     #[test]
     fn publish_follow_ups_act_on_the_held_directory_not_the_replaced_path() {
@@ -2942,51 +2906,6 @@ mod tests {
             !replacement_dir.join(CONTEXT_FILE_NAME).exists(),
             "the mirror is not written into the replacement"
         );
-
-        // The TUI's removal: a replaced per-publish file under the held
-        // directory's path is removed from the HELD directory.
-        let second = publish_orchestrator_context(&moved, "second").expect("published");
-        let third = publish_orchestrator_context(&moved, "third").expect("published");
-        let second_name = second.path.file_name().unwrap().to_owned();
-        let moved_again = tmp.path().join("p.moved.again");
-        std::fs::rename(&moved, &moved_again).unwrap();
-        std::fs::create_dir_all(context_dir_of(&moved)).unwrap();
-        std::fs::write(context_dir_of(&moved).join(&second_name), "decoy").unwrap();
-        assert!(remove_replaced_context(&third.dir, &second.path));
-        assert!(!context_dir_of(&moved_again).join(&second_name).exists());
-        assert_eq!(
-            std::fs::read_to_string(context_dir_of(&moved).join(&second_name)).unwrap(),
-            "decoy"
-        );
-    }
-
-    /// Issue #1233 audit: the TUI's removal only ever removes a per-publish
-    /// context file in the held directory — a file in another directory, or one
-    /// whose name is not a per-publish name, is left for the sweep.
-    #[test]
-    fn remove_replaced_context_refuses_anything_but_a_sibling_per_publish_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let published = publish_orchestrator_context(tmp.path(), "ctx").expect("published");
-        let dir = &published.dir;
-
-        let elsewhere = tempfile::tempdir().unwrap();
-        let foreign = elsewhere.path().join(published.path.file_name().unwrap());
-        std::fs::write(&foreign, "foreign").unwrap();
-        assert!(!remove_replaced_context(dir, &foreign));
-        assert!(foreign.exists());
-
-        let not_ours = dir.path().join("worker-task-coder.md");
-        std::fs::write(&not_ours, "task").unwrap();
-        assert!(!remove_replaced_context(dir, &not_ours));
-        assert!(not_ours.exists());
-
-        let mirror = dir.path().join(CONTEXT_FILE_NAME);
-        std::fs::write(&mirror, "mirror").unwrap();
-        assert!(!remove_replaced_context(dir, &mirror));
-        assert!(mirror.exists());
-
-        assert!(remove_replaced_context(dir, &published.path));
-        assert!(!published.path.exists());
     }
 
     // -----------------------------------------------------------------------

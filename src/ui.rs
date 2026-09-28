@@ -4206,30 +4206,21 @@ fn schedule_send_retry(
 }
 
 /// Issue #1233: point an orchestration tab at the context file its re-arm just
-/// published, and remove the file it replaced.
+/// published.
 ///
 /// Published context files are never rewritten, so every re-arm publishes a new
-/// one, and the tab's previous file is no longer named by anything the tab will
-/// deliver. The removal is best effort; a file it misses is swept once it ages
-/// past the coordination retention window
-/// (`orchestrator_context::is_sweepable_coordination_name`).
-///
-/// **Anchored on the new publish's held directory, not on `old` as a path**
-/// (issue #1233 audit): the tab only has the old file's pathname, and removing
-/// by pathname would re-resolve a project that may have been renamed and
-/// replaced since. `remove_replaced_context` removes it through `unlinkat` on
-/// `dir`, and only when `old` sits in that same directory — anything else is
-/// left for the sweep.
+/// one. The file it replaces is **left in place**, deliberately (PR #1407
+/// review): the coordinator may still be reading it — the re-arm is triggered
+/// by a compaction or `/clear` it is recovering from, and nothing tells the tab
+/// when the coordinator has finished with the previous brief. A file this
+/// leaves behind is removed by the coordination sweep once it ages past the
+/// retention window (`orchestrator_context::is_sweepable_coordination_name`);
+/// deleting each file when its orchestration ends is follow-up #1395.
 fn replace_orchestration_context_path(
     slot: &mut Option<std::path::PathBuf>,
     new: std::path::PathBuf,
-    dir: &crate::orchestrator_context::ContextDir,
 ) {
-    if let Some(old) = slot.replace(new)
-        && slot.as_deref() != Some(old.as_path())
-    {
-        crate::orchestrator_context::remove_replaced_context(dir, &old);
-    }
+    *slot = Some(new);
 }
 
 /// PRD #20 R20-003/R20-004: capture the delivery identity for an automatic
@@ -14711,11 +14702,7 @@ pub fn run_tui(
                         ui.orchestration_ready_since.remove(id);
 
                         *orchestrator_prompt = Some(published.prompt);
-                        replace_orchestration_context_path(
-                            context_path,
-                            published.context_path,
-                            &published.dir,
-                        );
+                        replace_orchestration_context_path(context_path, published.context_path);
                         ui.orchestration_prompted.remove(id);
                         // Re-anchor the delivery deadline to NOW:
                         // `deliver_orchestrator_prompt` abandons once
@@ -14860,7 +14847,6 @@ pub fn run_tui(
                             replace_orchestration_context_path(
                                 context_path,
                                 published.context_path,
-                                &published.dir,
                             );
                             ui.orchestration_prompted.remove(id);
                             ui.orchestration_prompt_anchor_at.insert(*id, orch_now);
@@ -28787,6 +28773,45 @@ mod tests {
         let content = std::fs::read_to_string(file_path).unwrap();
         assert!(content.contains("Available agents"));
         assert!(content.contains("**worker**: Does work"));
+    }
+
+    /// Issue #1233, PR #1407 review: a re-arm repoints the tab at its new file
+    /// and leaves the file it replaced on disk, because the coordinator may
+    /// still be reading it. Until the review this removed it.
+    #[test]
+    fn a_rearm_repoints_the_tab_and_leaves_the_replaced_brief_in_place() {
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let config = OrchestrationConfig {
+            default: false,
+            name: "test".to_string(),
+            roles: vec![OrchestrationRoleConfig {
+                agent: None,
+                name: "lead".to_string(),
+                command: "claude".to_string(),
+                start: true,
+                description: None,
+                prompt_template: None,
+                clear: true,
+            }],
+        };
+        let first = prepare_orchestrator_prompt(&config, cwd, Some("TASK"), Attendance::Attended)
+            .expect("first publish");
+        let mut slot = Some(first.context_path.clone());
+        let rearmed = crate::orchestrator_context::reassert_orchestrator_prompt(
+            &config,
+            cwd,
+            slot.as_deref(),
+        )
+        .expect("re-armed");
+        assert_ne!(rearmed.context_path, first.context_path);
+
+        replace_orchestration_context_path(&mut slot, rearmed.context_path.clone());
+        assert_eq!(slot.as_deref(), Some(rearmed.context_path.as_path()));
+        assert!(
+            first.context_path.is_file(),
+            "the replaced brief is left for the coordinator that may be reading it"
+        );
     }
 
     #[test]
