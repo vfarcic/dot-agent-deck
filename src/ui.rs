@@ -3162,6 +3162,40 @@ pub struct OrchestrationRoleSlot {
     pub is_start_role: bool,
 }
 
+/// Issue #523 review: the orchestrator seat of a tab rebuilt from live role
+/// panes (reconnect hydration, the live surface), and whether the TUI-side
+/// `orchestrator_pane_ids` mirror may register the pane in it.
+///
+/// `role_pane_ids` is the slot vector the caller actually kept (first pane
+/// wins per role index), so only a flag on a KEPT pane seats the tab — a flag
+/// on a discarded duplicate would otherwise seat, and mirror, the surviving
+/// unflagged pane at that index, which the daemon does not let delegate. With
+/// no kept flag the seat is the config's rule; the mirror is then allowed only
+/// if no slot was flagged at all (an older daemon, or a config that seats
+/// nothing else), since a discarded flag means the daemon's orchestrator is
+/// not on this tab.
+fn rebuilt_tab_seat(
+    config: &crate::project_config::OrchestrationConfig,
+    slots: &[OrchestrationRoleSlot],
+    role_pane_ids: &[Option<String>],
+) -> (usize, bool) {
+    let kept = |slot: &&OrchestrationRoleSlot| {
+        role_pane_ids
+            .get(slot.role_index)
+            .and_then(Option::as_deref)
+            == Some(slot.pane_id.as_str())
+    };
+    let kept_flagged: Vec<usize> = slots
+        .iter()
+        .filter(|slot| slot.is_start_role)
+        .filter(kept)
+        .map(|slot| slot.role_index)
+        .collect();
+    let seat = config.live_orchestrator_seat(kept_flagged.iter().copied());
+    let mirror = !kept_flagged.is_empty() || !slots.iter().any(|slot| slot.is_start_role);
+    (seat, mirror)
+}
+
 /// PRD #111: pick the `OrchestrationConfig` the hydration site uses
 /// when rebuilding an orchestration tab. Extracted from the hydration
 /// loop so the `local-wins / synthesise-otherwise` selection has a
@@ -5954,13 +5988,8 @@ fn surface_one_orchestration(
     // Issue #523 review: seated where the DAEMON registered the orchestrator
     // (the memberships' `is_start_role`), so the tab focuses — and the mirror
     // below registers — the pane that may delegate.
-    let orch_idx = orch_config.live_orchestrator_seat(
-        bucket
-            .role_slots
-            .iter()
-            .filter(|slot| slot.is_start_role)
-            .map(|slot| slot.role_index),
-    );
+    let (orch_idx, mirror_seat) =
+        rebuilt_tab_seat(&orch_config, &bucket.role_slots, &role_pane_ids);
     match tab_manager.open_orchestration_tab_with_existing_role_panes_seated(
         &orch_config,
         &surface.cwd,
@@ -6005,7 +6034,7 @@ fn surface_one_orchestration(
                     st.register_pane(pane_id.clone());
                     st.pane_role_map.insert(pane_id.clone(), role.name.clone());
                     st.pane_cwd_map.insert(pane_id.clone(), surface.cwd.clone());
-                    if i == orch_idx {
+                    if i == orch_idx && mirror_seat {
                         st.orchestrator_pane_ids.insert(pane_id.clone());
                     }
                 }
@@ -13297,13 +13326,8 @@ pub fn run_tui(
             // surviving memberships — a restored tab may have been seated on a
             // saved cursor the config would not pick (PRD #89 F3) — so focus
             // and this mirror follow the pane that may delegate.
-            let start_role_index = orch_config.live_orchestrator_seat(
-                bucket
-                    .role_slots
-                    .iter()
-                    .filter(|slot| slot.is_start_role)
-                    .map(|slot| slot.role_index),
-            );
+            let (start_role_index, mirror_seat) =
+                rebuilt_tab_seat(&orch_config, &bucket.role_slots, &role_pane_ids);
             let orchestrator_pane = role_pane_ids.get(start_role_index).and_then(|s| s.clone());
             match tab_manager.open_orchestration_tab_with_existing_role_panes_seated(
                 &orch_config,
@@ -13360,7 +13384,7 @@ pub fn run_tui(
                             }
                             st.pane_role_map.insert(pane_id.clone(), role.name.clone());
                             st.pane_cwd_map.insert(pane_id.clone(), bucket.cwd.clone());
-                            if i == start_role_index {
+                            if i == start_role_index && mirror_seat {
                                 st.orchestrator_pane_ids.insert(pane_id.clone());
                             }
                         }
@@ -24198,6 +24222,72 @@ pub fn render_new_pane_form_schedule_to_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #523 review (Qodo, PR #1388): a rebuilt tab is seated from the
+    /// memberships of the panes it KEPT. When the daemon reports two panes for
+    /// one role index (hydration keeps the first), a flag on the discarded
+    /// duplicate must not seat — or let the TUI mirror mark — the surviving,
+    /// unflagged pane, which the daemon does not let delegate.
+    #[test]
+    fn rebuilt_tab_seat_reads_only_the_panes_it_kept() {
+        let role = |name: &str, start: bool| crate::project_config::OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: "cat".to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        };
+        let config = crate::project_config::OrchestrationConfig {
+            name: "team".to_string(),
+            default: false,
+            roles: vec![role("orchestrator", true), role("coder", false)],
+        };
+        let slot = |role_index: usize, pane_id: &str, is_start_role: bool| OrchestrationRoleSlot {
+            role_index,
+            pane_id: pane_id.to_string(),
+            role_name: String::new(),
+            is_start_role,
+        };
+        let kept = |ids: &[&str]| -> Vec<Option<String>> {
+            ids.iter().map(|id| Some((*id).to_string())).collect()
+        };
+
+        // The daemon seated `coder` (a restored saved cursor): followed, mirrored.
+        assert_eq!(
+            rebuilt_tab_seat(
+                &config,
+                &[slot(0, "p0", false), slot(1, "p1", true)],
+                &kept(&["p0", "p1"])
+            ),
+            (1, true)
+        );
+        // Nothing flagged at all (an older daemon): the config's rule, mirrored.
+        assert_eq!(
+            rebuilt_tab_seat(
+                &config,
+                &[slot(0, "p0", false), slot(1, "p1", false)],
+                &kept(&["p0", "p1"])
+            ),
+            (0, true)
+        );
+        // The flag sits on a DISCARDED duplicate of role 1 (`p1-dup`): it does
+        // not seat role 1's surviving `p1`, and nothing is mirrored, because the
+        // pane the daemon lets delegate is not on this tab.
+        assert_eq!(
+            rebuilt_tab_seat(
+                &config,
+                &[
+                    slot(0, "p0", false),
+                    slot(1, "p1", false),
+                    slot(1, "p1-dup", true)
+                ],
+                &kept(&["p0", "p1"]),
+            ),
+            (0, false)
+        );
+    }
     use crate::authoring_seeds::{
         AuthoringKind, DISPATCHER_SEED_PROMPT, SCHEDULE_AUTHORING_SEED_PROMPT,
     };
