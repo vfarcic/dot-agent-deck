@@ -1477,3 +1477,40 @@ fn status_supersede_020_the_current_generation_supersedes_whatever_it_is_stamped
         "an unmarked older-stamped frame is held back by the timestamp, as before"
     );
 }
+
+/// Scenario: A pane's successor has reserved it but not reported yet, so the outgoing agent's card is still the one on screen when that agent's own `SessionEnd` arrives, marked by the daemon as coming from a displaced generation. The end must still end that card: the displaced mark refuses a frame's claim to a generation, and a `SessionEnd` makes none, so the card must not linger showing an agent that has finished.
+#[spec("status/supersede/021")]
+#[test]
+fn status_supersede_021_a_displaced_generation_still_ends_its_own_card() {
+    let now = Utc::now();
+    let mut tui = AppState::default();
+    tui.register_pane(PANE_ID.to_string());
+    tui.apply_event(event(
+        "outgoing-session",
+        AgentType::ClaudeCode,
+        EventType::SessionStart,
+        Some("outgoing-agent"),
+        now - Duration::seconds(30),
+    ));
+    assert_eq!(
+        owners_on_pane(&tui),
+        vec![Some("outgoing-agent".to_string())],
+        "precondition: the outgoing generation's card is the pane's card"
+    );
+
+    tui.apply_event(stamped(
+        event(
+            "outgoing-session",
+            AgentType::ClaudeCode,
+            EventType::SessionEnd,
+            Some("outgoing-agent"),
+            now,
+        ),
+        GenerationVerdict::Displaced,
+    ));
+    assert!(
+        !tui.sessions.contains_key("outgoing-session"),
+        "the outgoing agent's own SessionEnd must still end its card; the pane shows {:?}",
+        owners_on_pane(&tui)
+    );
+}

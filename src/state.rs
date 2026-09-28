@@ -11150,22 +11150,30 @@ impl AppState {
         // compares against — see [`Self::pane_hook_session`].
         let incoming_session_id = event.session_id.clone();
         // Issue #320: a frame from a generation the registry has seen DISPLACED
-        // from its pane drives nothing. That is not a new refusal for the
-        // daemon: with a generation on the pane, `owns_pane_event` below
-        // already refuses every such frame (the named agent is not the pane's
-        // owner, and a registration is subordinate to the pane's claim), and
-        // saying so here states the rule once for both processes. What is new
-        // is the attached TUI, which has no registry and applies every frame the
-        // daemon relays — including the ones the daemon refused. It used to
-        // judge a late `SessionStart`, or a late frame stamped newer, from the
-        // OUTGOING agent by its type and its producer clock, and both retired
-        // the live card; it now reads the daemon's verdict off the frame. See
+        // from its pane may not claim that pane. For the daemon that is not a
+        // new refusal: with a generation on the pane, `owns_pane_event` below
+        // already refuses every frame from a displaced generation (the named
+        // agent is not the pane's owner, and a registration is subordinate to
+        // the pane's claim). What is new is the attached TUI, which has no
+        // registry and applies every frame the daemon relays — including the
+        // ones the daemon refused. It used to judge a late `SessionStart`, or a
+        // late frame stamped newer, from the OUTGOING agent by its type and its
+        // producer clock, and both retired the live card; it now reads the
+        // daemon's verdict off the frame. See
         // [`crate::event::PANE_GENERATION_METADATA_KEY`].
         //
-        // Every event type, not only the ones that claim a generation: the
-        // daemon refused them all, and a displaced `SessionEnd` has no card of
-        // its own left to end once the successor's first frame retired it.
-        if self.generation_verdict(&event) == Some(GenerationVerdict::Displaced) {
+        // Only frames that CLAIM a generation, which is where the harm was. A
+        // `SessionEnd` claims none, and a generation displaced only by a
+        // successor's pending reservation can still have its card on screen —
+        // the successor has not reported, and its spawn may yet fail and hand
+        // the pane back. Refusing that agent's own end would leave its card
+        // showing an agent that has finished (Greptile, PR #1389;
+        // `status/supersede/021`). A displaced end keeps the path it had before
+        // this, which cannot erase a successor's card (`status/supersede/003`).
+        // The daemon still refuses it at admission, as it did before #320.
+        if event.event_type != EventType::SessionEnd
+            && self.generation_verdict(&event) == Some(GenerationVerdict::Displaced)
+        {
             return AppliedEvent::Rejected;
         }
         // Only accept events from agents managed by our app.

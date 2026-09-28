@@ -838,6 +838,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the daemon's own side, where the registry answers directly (`daemon::hook_ingestion_tests::the_current_generation_supersedes_whatever_its_first_frame_is_stamped`); the scheduler placeholder handoff (`status/supersede/001`, `scheduler/live/004`), which a current-generation `SessionStart` still performs.
 - **Platform coverage:** mac+linux+windows.
 
+##### status/supersede/021 — A displaced generation's own `SessionEnd` still ends its card (issue #320, Greptile on PR #1389).
+- **Layer:** L1 (in-process `AppState` with no registry, fed stamped frames through `apply_event`).
+- **Agent:** none (a synthetic Claude Code generation).
+- **Asserts:** with the outgoing generation's card still the pane's card (its successor has only reserved the pane), that generation's `SessionEnd` marked `displaced` removes the card. The displaced mark refuses frames that claim a generation; a `SessionEnd` claims none, so it keeps the path it had before the mark existed.
+- **Does not assert:** that the end cannot erase a successor's card, which that same path already guarantees (`status/supersede/003`); the placeholder the `SessionEnd` branch restores (`status/supersede/008`); the daemon's own handling, whose admission refuses a displaced end as it did before #320.
+- **Platform coverage:** mac+linux+windows.
+
 #### status/shell-activity
 
 ##### status/shell-activity/001 — The process-table primitive finds a real, detached grandchild process as a descendant and reports its no-controlling-tty / session-leader / argv / session-id facts correctly (PRD #386 M1).
