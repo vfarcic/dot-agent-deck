@@ -1398,11 +1398,21 @@ const EXEC_FROM_CWD_SCRIPT: &str = r#"exec "$0" "$@""#;
 ///
 /// Not affected either way: a multi-word command, which is already a shell's
 /// `-c` string resolved by that shell in its own cwd (the Codex `wrap` rewrite
-/// is always multi-word, so it is one); an absolute program; and a relative
-/// `PATH` entry, which portable-pty joins onto the program without the cwd
-/// string, so no `/proc` path reaches the exec (its existence is checked
-/// relative to the spawning process's own cwd, which is portable-pty's
-/// behaviour on every spawn, prepared or not).
+/// is always multi-word, so it is one); and an absolute program.
+///
+/// **Not covered: a relative `PATH` entry.** For a program not found under the
+/// cwd string, portable-pty tries each `PATH` entry joined onto the program and
+/// takes the first that passes `access(X_OK)` — made in the parent, so a
+/// relative candidate such as `bin/<program>` is checked against the spawning
+/// process's own cwd. It then hands that relative candidate to `Command::new`
+/// with `current_dir` set to the cwd string, so the child's exec resolves it
+/// against the directory the child entered: on Linux the verified object, on
+/// every other Unix whatever the pathname named at the `chdir`. The file that
+/// passed the check and the file exec'd can therefore differ, and when the
+/// latter does not exist the exec fails inside the child rather than failing
+/// the spawn. The rewrite does not fire for it (the cwd join does not exist),
+/// and it is portable-pty's behaviour on every spawn, prepared or not; a
+/// relative `PATH` entry is pathological enough that it is left as it is.
 ///
 /// **A program the child could not exec fails the spawn, not the pane** (Qodo
 /// finding on PR #1407). Wrapped, the exec is the shell's, which fails inside
@@ -15108,9 +15118,13 @@ mod spawn_tests {
     /// portable-pty 0.8.1's `search_path` joins such a program onto the cwd
     /// string, which for a Linux prepared start is `/proc/self/fd/N`, and
     /// `close_random_fds` closes `N` in the child before the exec — so without
-    /// the deck resolving it the spawn failed with `ENOENT`. The replacement at
-    /// the old path holds same-named programs writing a different marker, so a
-    /// fix that resolved the program through the pathname fails this too.
+    /// the deck resolving it the child's exec failed with `ENOENT`. `spawn`
+    /// itself still reported success (portable-pty 0.8.1 surfaces no exec
+    /// failure to the parent), so the failure showed as the child exiting
+    /// unsuccessfully, which the status assertion below catches. The
+    /// replacement at the old path holds same-named programs writing a
+    /// different marker, so a fix that resolved the program through the
+    /// pathname fails this too.
     #[cfg(unix)]
     #[test]
     fn spawn_in_runs_a_relative_program_from_the_verified_directory() {
