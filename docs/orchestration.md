@@ -589,7 +589,7 @@ Available dispatch targets:
 Ask the user which they want before dispatching, then pass the matching flag.
 ```
 
-A **schedule** cannot ask or show you anything, so for a schedule this warning only reaches the daemon log — which is why setting `default` matters most there.
+A **schedule** cannot ask or show you anything, so for a schedule this warning only reaches the [daemon log](troubleshooting.md#enabling-debug-logs) — which is why setting `default` matters most there.
 
 ### Running several at the same time
 
@@ -658,7 +658,7 @@ The role's `command` launches the agent through something the deck cannot see pa
 
 ### A delegated worker never came up
 
-When a `clear = true` worker is restarted for a new task and the new agent never starts, your orchestrator's pane gets `⚠ delegated worker never came up (dot-agent-deck daemon report)`: the task was not delivered, and no `work-done` will come for it. An unattended orchestrator can then re-delegate, reassign the task, or notify you. The report names the worker's pane; the daemon log names the role and the error.
+When a `clear = true` worker is restarted for a new task and the new agent never starts, your orchestrator's pane gets `⚠ delegated worker never came up (dot-agent-deck daemon report)`: the task was not delivered, and no `work-done` will come for it. An unattended orchestrator can then re-delegate, reassign the task, or notify you. The report names the worker's pane; the [daemon log](troubleshooting.md#enabling-debug-logs) names the role and the error.
 
 The usual cause is the role's `command` — a launcher that fails in that directory, a binary that is not on the `PATH` the deck was started with, or an agent that exits as soon as it starts. Look at the worker's pane: whatever the agent printed before it died is still there. Running the role's `command` by hand in the worker's directory reproduces most of these.
 
@@ -670,7 +670,7 @@ If you want a role to stay gone, remove it from `.dot-agent-deck.toml` (or close
 
 ### Orchestrator receives no work-done feedback
 
-Reports are sent into the orchestrator's pane; if that pane is closed, they are lost. For a delegated task the report is also saved to `.dot-agent-deck/work-done-<role>.md`, which you can read yourself — unless the daemon log shows a `failed to write work-done summary` warning, in which case that file is from an **earlier** task (or incomplete).
+Reports are sent into the orchestrator's pane; if that pane is closed, they are lost. For a delegated task the report is also saved to `.dot-agent-deck/work-done-<role>.md`, which you can read yourself — unless the [daemon log](troubleshooting.md#enabling-debug-logs) shows a `failed to write work-done summary` warning, in which case that file is from an **earlier** task (or incomplete).
 
 ### Orchestrator is told a completion was "unsolicited"
 

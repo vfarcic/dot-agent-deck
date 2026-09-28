@@ -34,14 +34,14 @@ Good to know:
 
 ## Configuring the timeout
 
-`worker_response_timeout_minutes` is a **top-level key** in the `.dot-agent-deck.toml` that defines the orchestration.
+`worker_response_timeout_minutes` is a **top-level key** in the `.dot-agent-deck.toml` that defines the orchestration. (Workers that run in a separate clone or worktree take it from that file too, not from their own; the deck reads the worker directory's `.dot-agent-deck.toml` only when the orchestration's is missing or cannot be read.)
 
 | | |
 |---|---|
 | **Default** | `120` minutes |
 | **Accepted range** | `1`–`10080` (one minute to seven days) |
 | **`0`** | **Turns the idle-worker report off** — and the went-quiet report too, unless you set its window explicitly (see [Tuning the other reports](#tuning-the-other-reports)) |
-| **Out of range** | Uses the **default**, not the nearest bound — `20000` gives you 120 minutes, and a warning in the daemon log |
+| **Out of range** | Uses the **default**, not the nearest bound — `20000` gives you 120 minutes, and a warning in the [daemon log](troubleshooting.md#enabling-debug-logs) |
 
 `0` means **off**, not "report immediately". It only turns reports off: a `work-done` still reaches the orchestrator as usual.
 
