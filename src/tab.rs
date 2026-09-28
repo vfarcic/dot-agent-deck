@@ -1264,6 +1264,29 @@ impl TabManager {
         config: &OrchestrationConfig,
         cwd: &str,
         role_pane_ids: Vec<Option<String>>,
+        display_title: Option<&str>,
+        orchestration_id: Option<&str>,
+    ) -> Result<(usize, Vec<String>), TabError> {
+        self.open_orchestration_tab_with_existing_role_panes_seated(
+            config,
+            cwd,
+            role_pane_ids,
+            display_title,
+            orchestration_id,
+            None,
+        )
+    }
+
+    /// [`Self::open_orchestration_tab_with_existing_role_panes`] with an
+    /// explicit orchestrator seat — the one the daemon registered, read off
+    /// the surviving role memberships
+    /// ([`OrchestrationConfig::live_orchestrator_seat`], issue #523 review).
+    /// `None`, or an out-of-range seat, falls back to the config's rule.
+    pub fn open_orchestration_tab_with_existing_role_panes_seated(
+        &mut self,
+        config: &OrchestrationConfig,
+        cwd: &str,
+        role_pane_ids: Vec<Option<String>>,
         // PRD #107 follow-up: the user-typed title the daemon echoed back on
         // each role pane's `TabMembership::Orchestration.display_title`. Used
         // for the tab TITLE so detach/reattach preserves the name the user
@@ -1280,6 +1303,7 @@ impl TabManager {
         // `Self::orchestration_tab_index_for` can match by instance instead
         // of the bare `(cwd, name)` tuple.
         orchestration_id: Option<&str>,
+        seat: Option<usize>,
     ) -> Result<(usize, Vec<String>), TabError> {
         // M2.12 fixup auditor #3: this is a hydration-oriented API, so
         // mismatched lengths must surface as a `TabError` for the
@@ -1323,9 +1347,12 @@ impl TabManager {
         let id = self.next_id;
         self.next_id += 1;
 
-        // Issue #523: the same rule the tab's own spawn used, so a rebuilt tab
-        // focuses the pane the daemon registered as the orchestrator.
-        let start_role_index = config.orchestrator_role_index();
+        // Issue #523: the pane the daemon registered as the orchestrator — the
+        // caller's `seat`, read off the memberships — so a rebuilt tab focuses
+        // the pane that may delegate; else the config's rule.
+        let start_role_index = seat
+            .filter(|i| *i < config.roles.len())
+            .unwrap_or_else(|| config.orchestrator_role_index());
 
         // Title-only: prefer the user-typed title the daemon round-tripped,
         // falling back to the canonical resolved name when absent/empty.

@@ -5951,12 +5951,23 @@ fn surface_one_orchestration(
     // The tab bar shows whenever `tabs.len() > 1`, so the new label still paints
     // regardless of which tab is active.
     let prev_active = tab_manager.active_index();
-    match tab_manager.open_orchestration_tab_with_existing_role_panes(
+    // Issue #523 review: seated where the DAEMON registered the orchestrator
+    // (the memberships' `is_start_role`), so the tab focuses — and the mirror
+    // below registers — the pane that may delegate.
+    let orch_idx = orch_config.live_orchestrator_seat(
+        bucket
+            .role_slots
+            .iter()
+            .filter(|slot| slot.is_start_role)
+            .map(|slot| slot.role_index),
+    );
+    match tab_manager.open_orchestration_tab_with_existing_role_panes_seated(
         &orch_config,
         &surface.cwd,
         role_pane_ids.clone(),
         bucket.display_title.as_deref(),
         bucket.orchestration_id.as_deref(),
+        Some(orch_idx),
     ) {
         Ok((tab_index, _)) => {
             if let Some(warning) = drift_warning {
@@ -5987,7 +5998,6 @@ fn surface_one_orchestration(
             // reasoning, including the `None == None` degeneracy in
             // `delegate_targets` that a TUI-side router would silently hit, is
             // on the grow-existing-tab registration earlier in this function.
-            let orch_idx = orch_config.orchestrator_role_index();
             for (i, role) in orch_config.roles.iter().enumerate() {
                 if let Some(Some(pane_id)) = role_pane_ids.get(i)
                     && !is_dead_slot_pane_id(pane_id)
@@ -13282,14 +13292,26 @@ pub fn run_tui(
             // Now register the orchestrator pane mapping for any live
             // start role so M5 dispatch keeps routing work-done events
             // back to the right place.
-            let start_role_index = orch_config.orchestrator_role_index();
+            //
+            // Issue #523 review: where the DAEMON registered it, read off the
+            // surviving memberships — a restored tab may have been seated on a
+            // saved cursor the config would not pick (PRD #89 F3) — so focus
+            // and this mirror follow the pane that may delegate.
+            let start_role_index = orch_config.live_orchestrator_seat(
+                bucket
+                    .role_slots
+                    .iter()
+                    .filter(|slot| slot.is_start_role)
+                    .map(|slot| slot.role_index),
+            );
             let orchestrator_pane = role_pane_ids.get(start_role_index).and_then(|s| s.clone());
-            match tab_manager.open_orchestration_tab_with_existing_role_panes(
+            match tab_manager.open_orchestration_tab_with_existing_role_panes_seated(
                 &orch_config,
                 &bucket.cwd,
                 role_pane_ids.clone(),
                 bucket.display_title.as_deref(),
                 bucket.orchestration_id.as_deref(),
+                Some(start_role_index),
             ) {
                 Ok((tab_index, _)) => {
                     if first_orchestration_tab_index.is_none() {

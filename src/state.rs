@@ -9890,6 +9890,27 @@ impl AppState {
     /// `verb` names the action in the refusal message (e.g. `"delegate"`,
     /// `"restart a role"`). Returns the error message to embed in the
     /// caller's own response type, or `None` when the caller is authorized.
+    /// Issue #523 review: whether `pane spawn <role>` from `caller_pane_id`
+    /// asks for this orchestration's own orchestrator role. `config_seat` is
+    /// the config's answer for `role`.
+    ///
+    /// Answered from the instance, not the config: the caller has already
+    /// passed [`Self::refuse_unless_orchestrator_caller`], so ITS role is the
+    /// orchestrator this instance registered — which is the config's seat
+    /// except where a restored tab honoured a saved cursor (PRD #89 F3). The
+    /// config's answer is only the fallback for a caller with no role entry.
+    fn spawn_role_is_the_orchestrator(
+        &self,
+        caller_pane_id: &str,
+        role: &str,
+        config_seat: bool,
+    ) -> bool {
+        match self.pane_role_map.get(caller_pane_id) {
+            Some(caller_role) => caller_role == role,
+            None => config_seat,
+        }
+    }
+
     fn refuse_unless_orchestrator_caller(&self, pane_id: &str, verb: &str) -> Option<String> {
         if !self.pane_role_map.contains_key(pane_id) {
             // Issue #1082: the `pane_role_map` lookup just MISSED, so this id
@@ -10352,7 +10373,7 @@ pub async fn handle_spawn_role_with_state(
         // Issue #523: the orchestrator by the one rule, not the bare `start`
         // flag — a role named `orchestrator` in a toml that flags no role is
         // this orchestration's orchestrator, and is not a spawnable worker.
-        if is_orchestrator {
+        if guard.spawn_role_is_the_orchestrator(&signal.pane_id, &signal.role, is_orchestrator) {
             return SpawnRoleResponse {
                 error: Some(format!(
                     "role `{}` is this orchestration's own start (orchestrator) role — it is \
@@ -14719,6 +14740,35 @@ mod tests {
              [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"cat\"\nstart = true\n";
         assert_eq!(seat(flagged, "lead"), Some((1, true)));
         assert_eq!(seat(flagged, "orchestrator"), Some((0, false)));
+    }
+
+    /// Issue #523 review (Qodo, PR #1388): a restored tab can seat a role other
+    /// than the config's (PRD #89 F3 honours the saved cursor), and the daemon
+    /// registers that seat. `pane spawn <that role>` from its own orchestrator
+    /// must still be refused as the orchestrator — the config-seat check alone
+    /// let it through, and `delegate_targets` excludes orchestrator panes, so
+    /// the duplicate check would not catch it either. The config's seat,
+    /// meanwhile a live worker there, is not "the orchestrator".
+    #[test]
+    fn spawn_role_refuses_the_callers_own_seat_even_when_the_config_seats_another() {
+        let mut state = AppState::default();
+        let identity = instance("orch-restored-0");
+        // Config seats `orchestrator` (index 0); the restore seated `coder`.
+        state.register_orchestration_role("pane-0", "orchestrator", false, identity.clone(), None);
+        state.register_orchestration_role("pane-1", "coder", true, identity, None);
+
+        assert!(
+            state.spawn_role_is_the_orchestrator("pane-1", "coder", false),
+            "`coder` is the seat this instance registered, and it is asking for its own role"
+        );
+        assert!(
+            !state.spawn_role_is_the_orchestrator("pane-1", "orchestrator", true),
+            "the config's seat is a worker in this instance, not its orchestrator"
+        );
+        assert!(
+            !state.spawn_role_is_the_orchestrator("pane-1", "reviewer", false),
+            "an ordinary worker role is spawnable"
+        );
     }
 
     #[test]
