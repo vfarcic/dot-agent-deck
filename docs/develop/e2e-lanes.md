@@ -114,6 +114,29 @@ Two are worth knowing about before you run a filter that selects them:
 
 **One thing is genuinely undetermined:** whether an `OPENAI_API_KEY`-derived `auth.json` can reach `gpt-5.1-codex-mini` (`CODEX_TEST_MODEL_DEFAULT`). The dev box this was written on holds a ChatGPT-subscription `auth.json`, which that model family refuses outright, and nothing has since exercised `codex login --with-api-key` end to end. If the probe fails on your machine, the remedy is `DOT_AGENT_DECK_CODEX_TEST_MODEL` — not dropping the preflight.
 
+## Reading a red run: the load context
+
+Every panic the harness's hook renders ends with a `---- load context (issue #701) ----` block, in both lanes and in CI. It is appended by `tests/common/load_context.rs` in any test process that launched a `TuiDeck`, allocated a harness temp dir, or ran an agent preflight or credential importer — the entries that install the harness's redacting panic hook — so it covers headless tests such as `dispatch_005` as well as PTY ones. A test that uses none of those gets neither the hook nor the block. Read its first line before anything else:
+
+```
+verdict: STARVED — the machine was starved while this test ran. A timing-sensitive failure here is expected and is NOT evidence of a regression: rerun this test alone (CLAUDE.md rule 6) before investigating the code.
+window:  32.8s, from this process's first harness call to the panic
+stall:   cpu some 91.9% / io full 0.0% / memory full 0.0% of the window (PSI; ...)
+load:    1-min average 51.93 at start, 77.56 now, on 16 CPUs (votes only where a PSI source is missing; ...)
+alive:   8 claude, 1 opencode, 5 codex, 22 dot-agent-deck processes on this machine, this test's own included
+```
+
+- **`STARVED`** — rerun the test alone before spending any time on the code. This is the case #701 recorded: a load-induced red that used to cost a separate `origin/main` control plus several isolated reruns to clear.
+- **`CONTENDED`** — busy, not starved. A solo rerun separates the two.
+- **`QUIET`** — load is not the explanation to reach for first. It does not prove a regression; a readiness race or a model that ignored its prompt can fail on a quiet box too. It only rules out one explanation.
+- **`UNMEASURED`** — no signal on this host (PSI unreadable and no load average).
+
+The verdict comes from Linux Pressure Stall Information over the test's own window: the growth of `/proc/pressure/{cpu,io,memory}`'s cumulative `total` counters divided by the wall time between the two readings. That makes it an exact share of the window rather than a sample. `cpu some` at 50% or more, or `io full` / `memory full` at 20% or more, reads as STARVED. The load average is printed, but it votes only where a PSI source is missing: all three on macOS, or some of them on a kernel or container that hides the rest. On Linux it counts tasks blocked on I/O, and while this was calibrated it sat at 21–57 on 16 CPUs on a box whose PSI read 1.5–13% with tests passing at their solo times. The window is one per test *process*, which is one per test under nextest (every alias and CI job). Under plain `cargo test` a window can span several tests, and the printed window length shows that. Calibration, on the 16-core dev box: solo runs beside other agents' ordinary work measured 1.5–13% `cpu some`, and runs under 48 or 96 busy-loops measured 85–97%.
+
+A test that nextest **kills** at its `slow-timeout` never reaches the panic hook, so a background thread also writes a one-line `[load-context] +60s STARVED cpu-some=…` reading to stderr once a minute. nextest keeps a timed-out test's output, so that line survives the kill. A test that finishes within a minute never prints one.
+
+**Typing a prompt into a real Claude Code pane:** use `TuiDeck::submit_claude_prompt(&events, &agent_id, &prompt, probe)` rather than `send_keys(prompt)` followed by `send_keys(b"\r")`. In one burst, the `\r` can reach Claude Code inside the same read as the tail of the prompt, where it is taken as part of a paste: a newline, not a submit. Under 48 busy-loops that lost `shell_activity_005`'s prompt in 3 of 3 runs. The helper waits for a space-free `probe` from the prompt to render, followed by the prompt's last word, before pressing Enter. It presses Enter until Claude Code's `UserPromptSubmit` hook (`EventType::Thinking`) fires, and checks the hook's reported prompt against what was typed with `prompt_submission_matches`. It fails with `PROMPT NOT DELIVERED` if the prompt never lands, or `PROMPT PARTIALLY DELIVERED` if only part of it does. The same 3 runs then passed 3 of 3. `status/shell-activity/005`, `status/shell-activity/006` and `dashboard/card-stats/005` use it. Other real-Claude tests still type and press Enter directly, and some of them gate on the text rendering first.
+
 ## Where a rendered credential can go, and what stops it
 
 Lane 2 hands a real credential to a process that draws a terminal, and everything that terminal draws is captured somewhere. The #785 audit walked those sinks; one was open, and the fixes below close it and its two neighbours.

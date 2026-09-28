@@ -413,6 +413,66 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** accepting or clearing the filter (covered by `dashboard/filter/002` and `dashboard/selection/004`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/filter/005 — A filter that matches no card says "No agents match filter." (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: `render_frame` into a ratatui `TestBackend`, inline `insta` snapshot of the title and message rows).
+- **Agent:** none (two synthetic dashboard cards).
+- **Asserts:** with two cards and a filter matching neither, the sidebar title reads `dot-agent-deck — 0/2 agent(s)` and the message reads `No agents match filter.` — the glossary's word (#1045), so a return to "sessions" fails the snapshot.
+- **Does not assert:** how the filter is typed or applied (covered by `dashboard/filter/001`-`004`); the zero-agent empty state.
+- **Platform coverage:** mac+linux+windows.
+
+#### dashboard/status-message
+
+The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a later terminology regression fails a test (issue #1369).
+
+##### dashboard/status-message/001 — The digit-jump to a stale card reports "Removed stale agent" (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: drives the branch against a mock `PaneController`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** `focus_deck` on a card whose `focus_pane` fails and whose on-demand attach finds nothing removes the card and the status row reads ` COMMAND  Removed stale agent: Pane p0 not found`.
+- **Does not assert:** the attach retry itself (covered by `dashboard/selection/003`, `020` and `021`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/status-message/002 — The digit-jump to a card with no pane reports "No pane linked to agent" (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: drives the branch against a mock `PaneController`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** `focus_deck` on a live card whose `pane_id` is unset stays in command mode and the status row reads ` COMMAND  No pane linked to agent s0`.
+- **Does not assert:** how a card comes to lack a pane.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/status-message/003 — Enter on a stale card reports "Removed stale agent" (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: drives the branch against a mock `PaneController`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** `dispatch_action(Action::Focus, …)` — Enter carries its own copy of the stale-card branch — removes the card and the status row reads ` COMMAND  Removed stale agent: Pane p0 not found`.
+- **Does not assert:** the attach retry itself (covered by `dashboard/selection/020` and `021`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/status-message/004 — Enter on a card with no pane reports "No pane linked to agent" (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: drives the branch against a mock `PaneController`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** `dispatch_action(Action::Focus, …)` on a live card whose `pane_id` is unset stays in command mode and the status row reads ` COMMAND  No pane linked to agent s0`.
+- **Does not assert:** how a card comes to lack a pane.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/status-message/005 — Asking for the config-generation prompt with no card selected reports "No active agent to send prompt to." (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: drives the branch against a mock `PaneController`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** `dispatch_action(Action::RequestConfigGen, …)` with no selected card does not open the prompt and the status row reads ` COMMAND  No active agent to send prompt to.`.
+- **Does not assert:** the prompt itself when a target exists (covered by `dashboard/config-gen`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/status-message/006 — A successful plain-card spawn reports "Created agent … in …" (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: drives the branch against a mock `PaneController`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** `dispatch_action(Action::SpawnPane(…), …)` for a plain dashboard card that the controller creates enters `PaneInput` and the status row reads ` TYPING  Created agent mock-pane-0 in /work/card` with the `[Command Mode Ctrl+D]` button at its right edge.
+- **Does not assert:** which tab the card lands on (covered by `tabs/spawn/001`-`003`); the mode and orchestration spawn paths.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/status-message/007 — A refused plain-card spawn reports "New agent failed" (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: drives the branch against a mock `PaneController`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** `dispatch_action(Action::SpawnPane(…), …)` for a plain dashboard card that the controller refuses does not enter `PaneInput` and the status row reads ` COMMAND  New agent failed: Command failed: daemon refused the start`, the `Command failed:` prefix being `PaneError::CommandFailed`'s own `Display`.
+- **Does not assert:** the orchestration refusal that reopens the form (covered by `orchestration/identity/009`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/rename
 
 ##### dashboard/rename/001 — `r` on the selected card opens a rename input pre-filled with the current name.
@@ -574,17 +634,17 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** a real Claude session.
 - **Platform coverage:** mac+linux+windows.
 
-##### status/blocked/012 — Codex rollout classification only blocks an armed matching turn (issue #714).
+##### status/blocked/012 — Codex rollout classification blocks or errors only an armed matching turn (issues #714, #1359).
 - **Layer:** L1 unit (src/quota_signals.rs).
 - **Agent:** none.
-- **Asserts:** task_complete with usage_limit_exceeded uses the matching token_count kind; wrong turns, other errors and healthy has_credits:false do not block.
+- **Asserts:** task_complete with usage_limit_exceeded uses the matching token_count kind; every other error on the armed turn — the verbatim invalid-model record real Codex 0.156.1 wrote (`codex_error_info: "other"`), a string or object-valued codex_error_info, including rate_limit_exceeded — is Error, never Blocked; wrong turns and healthy has_credits:false are neither, and a null error is a clean end.
 - **Does not assert:** daemon polling or a real Codex session.
 - **Platform coverage:** mac+linux+windows.
 
 ##### status/blocked/013 — Codex rollout tailing is bounded and path safe (issue #714).
 - **Layer:** L1 unit (src/codex_rollout_tail.rs).
 - **Agent:** none.
-- **Asserts:** an armed regular rollout file reports its matching failure once, malformed or oversized lines are bounded, and a dead owner drops the tailer. The FIFO and symlink refusal checks run on Unix only.
+- **Asserts:** an armed regular rollout file reports its matching failure once — a quota failure as Blocked, a non-quota one as Error (issue #1359) — malformed or oversized lines are bounded, and a dead owner drops the tailer. The FIFO and symlink refusal checks run on Unix only.
 - **Does not assert:** a live Codex process.
 - **Platform coverage:** mac+linux+windows.
 
@@ -609,10 +669,10 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** a real quota-exhausted account.
 - **Platform coverage:** mac+linux.
 
-##### status/blocked/018 — A launcher-started Codex rollout blocks its card (issue #714).
+##### status/blocked/018 — A launcher-started Codex rollout blocks its card, or errors it for a non-quota failure (issues #714, #1359).
 - **Layer:** L2, lane 1, PTY-attached.
 - **Agent:** synthetic Codex executable using installed hooks and writing rollout JSONL; no provider credential.
-- **Asserts:** a matching task_complete error yields Credits Blocked in the card and daemon status.
+- **Asserts:** a matching usage_limit_exceeded task_complete yields Credits Blocked in the card and daemon status; in a second deck, the verbatim invalid-model task_complete error real Codex wrote yields Error in both, never Blocked.
 - **Does not assert:** a real Codex API request.
 - **Platform coverage:** mac+linux.
 
@@ -656,6 +716,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** synthetic Claude executable using the installed hook; no provider credential.
 - **Asserts:** a rejected-quota StopFailure blocks the attached card and daemon status; subagent-tagged tool and stop hooks, including a billing-error StopFailure, leave both Blocked with the Usage reason; a main-thread prompt clears it.
 - **Does not assert:** a real quota-exhausted account or a real Claude subagent.
+- **Platform coverage:** mac+linux.
+
+##### status/blocked/026 — A real Codex API failure ends as Error (issue #1359).
+- **Layer:** L2, lane 2, PTY-attached (`tests/e2e_quota_blocked_live.rs`).
+- **Agent:** real interactive Codex with a model name no account can use; developer credentials required.
+- **Asserts:** a submitted prompt, whose failed turn Codex reports through no hook, produces a Codex Error event from the daemon's rollout tailer (not one from `wrap`'s stdout classifier) and a rendered Error card that never shows Blocked.
+- **Does not assert:** that the card half discriminates on its own — for this failure `wrap` also emits an Error, because Codex renders the provider's raw JSON body and its `"type":"error"` is the wrapper's Codex error marker (status/blocked/018 asserts the card for a failure without it); a real quota-exhausted account; any Codex failure other than a rejected model.
 - **Platform coverage:** mac+linux.
 
 #### status/agent-event
@@ -822,6 +889,27 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (synthetic Pi generations; the snapshot declares `history-only`, so `pane_writable` shows which card it picked).
 - **Asserts:** seeding from a snapshot whose `last_activity_ms` is an hour in the future leaves the card's freshly minted `last_activity` (the stamp is not imported), and a different agent's frame stamped a minute after the reconnect retires the seeded card, with `pane_session_id` and `pane_writable` following the successor. With the no-later-than-the-minted-value clause removed the card imports the future stamp, and with the value check also removed the successor fails to retire it — the pin itself, not only the value, is what goes red.
 - **Does not assert:** the daemon's own handling of the same stamp, which its registry-ownership ground (`generation_disowned`, issue #454) bounds and which a client state has no counterpart for; the readout, which is `0s` either way because `format_elapsed` clamps a future delta.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/019 — A late frame the daemon marked as from a DISPLACED generation neither retires the live card nor adds one beside it (issue #320).
+- **Layer:** L1 (in-process `AppState` with no registry — an attached TUI's shape — fed frames carrying the daemon's `pane_generation` metadata stamp through `apply_event`).
+- **Agent:** none (synthetic Claude Code generations under two registry agent ids).
+- **Asserts:** with the incoming generation's card on the pane, a late `SessionStart` and a late `Thinking` stamped an hour in the future from the outgoing generation, each marked `displaced`, leave that card as the pane's only card. Control: the same frames unmarked — as a daemon predating the stamp relays them — are still ordered by the old type-and-timestamp rule and replace the live card, so the verdict is what decides.
+- **Does not assert:** that the daemon stamps the right verdict — that is its registry's answer, pinned end to end against a real `AgentPtyRegistry` by `daemon::hook_ingestion_tests` (`a_late_outgoing_session_start_cannot_retire_the_live_card`, `a_late_outgoing_frame_stamped_newer_cannot_retire_the_live_card`, `a_late_frame_from_a_generation_replaced_in_place_cannot_retire_the_live_card`, `the_generation_marker_is_the_registrys_answer_only`); an id the registry never published on the pane, which gets no verdict and keeps the old rule, residual included.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/020 — A frame the daemon marked as the pane's CURRENT generation supersedes the previous generation's card however it is stamped (issue #320).
+- **Layer:** L1 (in-process `AppState` with no registry, fed stamped frames through `apply_event`).
+- **Agent:** none (synthetic Pi generations — the agent that sends no `SessionStart`).
+- **Asserts:** an outgoing Pi card, then the incoming generation's first `Thinking` stamped 30 seconds EARLIER than that card's last activity and marked `current`, leaves exactly one card, owned by the incoming agent. Control: the same frame unmarked is held back by the timestamp and the pane keeps both cards, the TUI-side behaviour against a daemon that predates the stamp.
+- **Does not assert:** the daemon's own side, where the registry answers directly (`daemon::hook_ingestion_tests::the_current_generation_supersedes_whatever_its_first_frame_is_stamped`); the scheduler placeholder handoff (`status/supersede/001`, `scheduler/live/004`), which a current-generation `SessionStart` still performs.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/021 — A displaced generation's own `SessionEnd` still ends its card (issue #320, Greptile on PR #1389).
+- **Layer:** L1 (in-process `AppState` with no registry, fed stamped frames through `apply_event`).
+- **Agent:** none (a synthetic Claude Code generation).
+- **Asserts:** with the outgoing generation's card still the pane's card (its successor has only reserved the pane), that generation's `SessionEnd` marked `displaced` removes the card. The displaced mark refuses frames that claim a generation; a `SessionEnd` claims none, so it keeps the path it had before the mark existed — but only while the pane holds a card of the ending agent's own. With the successor's Pi card under the shared `{pane_id}-session` key and no card of the outgoing agent's left, the outgoing agent's displaced `SessionEnd` under that key leaves the successor's card in place, with its own status. Asserted on the card rather than on the pane's owners, because the terminal branch rebuilds a bare placeholder carrying the removed card's `agent_id` (Qodo on PR #1389).
+- **Does not assert:** that a displaced end on a different key cannot erase a successor's card, which that path already guarantees (`status/supersede/003`); the placeholder the `SessionEnd` branch restores (`status/supersede/008`); the daemon's own handling, whose admission refuses a displaced end as it did before #320; an UNMARKED end under a successor's key, from a daemon that predates the mark, which still takes the historical path.
 - **Platform coverage:** mac+linux+windows.
 
 #### status/shell-activity
@@ -1834,11 +1922,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 #### tabs/orchestration
 
-##### tabs/orchestration/001 — Selecting an orchestration on the new-pane form opens one pane per role with the orchestrator's pane in focus.
-- **Layer:** L2.
-- **Agent:** none (orchestration fixture with three stub-command roles, one with `start = true`).
-- **Asserts:** the new tab contains three panes; the focused pane is the `start = true` role.
-- **Does not assert:** what command is rendered in each pane (the stub fixture is opaque to the harness).
+##### tabs/orchestration/001 — Selecting an orchestration on the new-pane form opens one pane per role and seats exactly one orchestrator: it has focus, receives the orchestrator prompt, and is the one pane that may `delegate` (issue #523).
+- **Layer:** L2 (`tests/e2e_orchestrator_seat.rs`).
+- **Agent:** none (a two-role config written at runtime over the `minimal` fixture; both roles are `cat` stand-ins that print a ready sentinel and echo their PTY input, so "which pane received it" is a substring question. No LLM tokens, so deliberately unmarked for the reel).
+- **Asserts:** for a config whose worker `coder` comes FIRST and whose second role is named `orchestrator` — once with `start = true` on it (the control) and once with no `start` anywhere (issue #523's config) — a keystroke typed on the freshly opened tab reaches `orchestrator`'s pane and not `coder`'s; the orchestrator prompt (the pointer to `orchestrator-context.md`) is delivered into `orchestrator`'s pane and not `coder`'s; the context file carries `orchestrator`'s own `prompt_template` and lists only `coder` under the available agents; `daemon status --json` marks exactly one card `(orchestrator)`, the named one; `coder`'s `delegate` is refused and `orchestrator`'s reaches `coder`'s PTY.
+- **Does not assert:** a real agent reading the prompt (stand-ins only); the dispatched/scheduled spawn path, whose seat is the same `OrchestrationConfig::orchestrator_role_index` rule and is covered at L1 (`spawn::tests::orchestrator_role_index_*`, `state::tests::register_orchestration_role_makes_orch_idx_the_orchestrator`); a config with `start = true` on a role beside a DIFFERENT role named `orchestrator` (L1: `tab::tests::orchestration_tab_seats_the_one_orchestrator_the_rule_names`); the reconnect rebuild of the tab.
 - **Platform coverage:** mac+linux.
 
 ##### tabs/orchestration/002 — `Ctrl+w` on an orchestration tab closes the tab and stops every role pane.
@@ -2581,6 +2669,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** any TUI or desktop surface (PRD #819 leaves the TUI's project-resolution sites out of scope, so the client methods are driven directly rather than through a UI); the daemon-side behaviour of the verbs themselves (`project/resolve/001`, `project/launch/001`–`002`); the fallback for an omitted `running_agents`, which is `lifecycle/handshake/007`'s separate claim.
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/handshake/009 — A daemon on a different attach protocol with a live agent: declining the restart prompt refuses to attach, names both protocol numbers, and leaves the daemon and its agent running (issue #405).
+- **Layer:** L2 (real `dot-agent-deck` binary in a PTY against a real external `daemon serve`).
+- **Agent:** one synthetic `sleep`-style agent with a distinctive display name; the daemon runs with the test-only `DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE` (compiled only with `feature = "e2e"` in a debug build) so its `Hello` reply advertises `PROTOCOL_VERSION + 1`, which is the only way a single compiled binary can stand on both sides of a protocol skew.
+- **Asserts:** the restart prompt appears; after `Esc` the TUI exits non-zero within 15s instead of attaching (pre-fix it attached into a normal-looking dashboard), the screen carries the refusal's own header (`error: daemon speaks attach protocol v<N+1>, but this binary speaks v<N>`) and its keep-the-agents line naming the daemon's build id, the daemon process is still alive, and the live agent is still reachable on it by display name.
+- **Does not assert:** the rest of the refusal's wording (pinned character-for-character by `build_version_handshake::tests::protocol_refusal_*`); the non-TTY arm (`build_version_handshake::tests::protocol_skew_with_agents_on_a_pipe_is_refused_naming_the_protocol`, against a scripted daemon); that a daemon's events would in fact fail to decode across a real skew, which only two builds can show.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/handshake/010 — A daemon whose build id MATCHES but whose attach protocol differs, with no agents, is restarted silently rather than attached to (issue #405).
+- **Layer:** L2 (real `dot-agent-deck` binary in a PTY against a real external `daemon serve`).
+- **Agent:** none; the daemon is pinned to the TUI's own build id and advertises `PROTOCOL_VERSION - 1` through `DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE`.
+- **Asserts:** the empty dashboard (`No active agents`) appears and the original daemon process exits — the build-id match did not wave the skew through (pre-fix it returned `Match` and attached, leaving the daemon alive).
+- **Does not assert:** the fresh daemon's advertised protocol; the agents-present arms (009, and the scripted-daemon unit tests).
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/login-path
 
 ##### lifecycle/login-path/001 — A dashboard new-pane whose command is a bare binary living only in the user's login-shell PATH spawns successfully when the daemon was launched without that dir on PATH (PRD #170 M1.3).
@@ -3226,36 +3328,36 @@ without depending on the config struct API.
 ##### orchestration/delegate/016 — The generated orchestrator context names what `binary_name()` resolves for the running process, not a baked-in literal (issue prageethw/dot-agent-deck#253).
 - **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `orchestrator_context::build_orchestrator_context`; no TUI harness, no daemon).
 - **Agent:** none.
-- **Asserts:** with a synthetic role config, the composed context's `delegate` and `work-done` command examples both contain `platform::paths::binary_name()`'s resolution for the running process — under `cargo test` the throwaway test binary is never on `$PATH`, so this is its own absolute `current_exe()` path, never literally `dot-agent-deck` — proving the text is generated from `current_exe()` rather than a hardcoded string.
+- **Asserts:** with a synthetic role config, the composed context's `delegate` and `work-done` command examples both contain `platform::paths::binary_name()`'s resolution for the running process — its own absolute `current_exe()` path (issue #549), never literally `dot-agent-deck` — proving the text is generated from `current_exe()` rather than a hardcoded string.
 - **Does not assert:** the symlink-resolution behavior of `current_exe()` itself (a property of the platform, not this crate); the malformed-`current_exe()` fallback branch (`orchestration/delegate/018`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/delegate/017 — The generated worker task file's `work-done` instruction names what `binary_name()` resolves for the running process, not a baked-in literal (issue prageethw/dot-agent-deck#253).
 - **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `state::compose_worker_task_file`; no TUI harness, no daemon).
 - **Agent:** none.
-- **Asserts:** the composed worker task file's `## When done` footer's `--task-file` and inline `--task` command examples both contain `platform::paths::binary_name()`'s resolution for the running process (the `cargo test` test binary's own absolute `current_exe()` path, which is never literally `dot-agent-deck`).
+- **Asserts:** the composed worker task file's `## When done` footer's `--task-file` and inline `--task` command examples both contain `platform::paths::binary_name()`'s resolution for the running process (the test binary's own absolute `current_exe()` path, which is never literally `dot-agent-deck`).
 - **Does not assert:** the malformed-`current_exe()` fallback branch (`orchestration/delegate/018`); the rest of the footer's shell-safety content (covered by the pre-existing `compose_worker_task_file_appends_work_done_footer`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/delegate/018 — The command-name resolver falls back to the crate's default literal only when `current_exe()` itself is unavailable or unusable (issue prageethw/dot-agent-deck#253).
 - **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `platform::paths::resolve_binary_name`, the pure seam behind `binary_name`; no TUI harness, no daemon).
 - **Agent:** none.
-- **Asserts:** an `Err` result, a path with no file name (`/`), and (Unix-only) a non-UTF-8 file name all resolve to `DEFAULT_BINARY_NAME` (`env!("CARGO_PKG_NAME")`) rather than panicking or producing an empty string. A well-formed `current_exe()` whose bare file name is merely shell-unsafe or absent from `$PATH` does NOT fall back to this literal — it falls back to the absolute `current_exe()` path instead (`platform::paths::resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_shell_unsafe`/`_not_on_path`, plain `#[test]`s alongside this one, not separately cataloged).
-- **Does not assert:** a real `current_exe()` failure (not reproducible on demand); the happy path (`orchestration/delegate/016`–`017`).
+- **Asserts:** an `Err` result, a path with no file name (`/`), and (Unix-only) a non-UTF-8 file name all resolve to `DEFAULT_BINARY_NAME` (`env!("CARGO_PKG_NAME")`) rather than panicking or producing an empty string. A well-formed `current_exe()` never resolves to this literal — it resolves to its own absolute path, quoted when its file name is shell-unsafe (`platform::paths::resolve_binary_name_quotes_the_absolute_path_when_the_name_is_shell_unsafe` and `resolve_binary_name_emits_the_absolute_path_for_a_shell_safe_name`, plain `#[test]`s alongside this one, not separately cataloged).
+- **Does not assert:** a real `current_exe()` failure (not reproducible on demand); the happy path (`orchestration/delegate/016`–`017`, `/019`).
 - **Platform coverage:** mac+linux+windows.
 
-##### orchestration/delegate/019 — A same-named binary shadowing the running executable earlier on `$PATH` is rejected by identity, not merely resolved (issue prageethw/dot-agent-deck#253 `$PATH`-identity tightening).
-- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `platform::paths::path_identity_match` and `platform::paths::resolve_binary_name`; no TUI harness, no daemon).
+##### orchestration/delegate/019 — The command word names the running binary by absolute path, so a same-named file earlier on the CONSUMING shell's `$PATH` cannot take its place (issue #549).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `platform::paths::resolve_binary_name`, the pure seam behind `binary_name`; no TUI harness, no daemon). The Unix half spawns `/bin/sh` against tempfile scripts.
 - **Agent:** none.
-- **Asserts:** with a synthetic `$PATH` value (never the real process-global `PATH`) listing two directories that each hold an executable file sharing one basename — a "shadow" file first, the "real" (`current_exe()`-standing-in) file second — `path_identity_match` reports no match for the shadow-first ordering and a match once the roles are reversed (proving the rejection is genuinely about file identity, not mere absence), and `resolve_binary_name` driven through that shadow-first `$PATH` falls back to the shell-quoted absolute `current_exe()` path rather than emitting the bare name a consuming shell would resolve to the shadowing binary.
-- **Does not assert:** the real process-global `$PATH` (a synthetic value is used throughout); the empty/relative-`$PATH`-entry branch (`platform::paths::is_untrustworthy_path_entry_rejects_empty_and_relative_but_accepts_absolute`, a plain `#[test]` alongside this one, not separately cataloged).
-- **Platform coverage:** mac+linux+windows.
+- **Asserts:** with two directories each holding an executable sharing one basename — a "real" file standing in for `current_exe()` and a "shadow" — the resolved command word is the real file's absolute path, spelled by `shell_quote_if_needed` (with the `/` respelling on Windows), never the bare basename. On Unix, a `/bin/sh` whose own `$PATH` lists the shadow directory first runs the shadow for the bare name (the control) and the real file for the emitted word.
+- **Does not assert:** the generated instruction text itself (`/016`, `/017`) or a worker actually delivering a signal with it (`/020`); the real process-global `$PATH` (every `$PATH` here is a synthetic value given to the child shell).
+- **Platform coverage:** mac+linux+windows (the shell half is Unix-only).
 
-##### orchestration/delegate/020 — The bare-name success branch is reached against a REAL `current_exe()` on a REAL `$PATH` — PR #520's whole motivating scenario, previously untested (prageethw/dot-agent-deck#253 round-4 verification, finding 1).
-- **Layer:** L2 (in-process daemon whose `handle_delegate` fan-out composes the worker task file; a `cat`-stub worker PTY via `AgentPtyRegistry::spawn_agent`, no real agent — the `e2e` tier, no LLM call). Entry point is a sync `#[test]` that `block_on`s an async body (the linkage-check scanner links `#[spec]` to the next PLAIN `fn`, so a `#[tokio::test] async fn` would misbind — same pattern as `chain-smoke/pi/002`).
-- **Agent:** none (`cat` stub; only the generated file is under test).
-- **Asserts:** with the built deck binary's own directory prepended to this process's `$PATH` (the deck's normal on-`PATH` install shape) and `spawn_inprocess_daemon`'s test-current-exe override injecting the real built `dot-agent-deck` binary as `binary_name()`'s effective `current_exe()`, delegating a task writes `.dot-agent-deck/worker-task-coder.md` whose `work-done` instruction names the BARE binary (`dot-agent-deck work-done --task-file …`) — not the quoted absolute-path fallback every other `binary_name()` test in this repo exercises, and not the running libtest binary's own path (the regression this issue's round-4 verification found: without the override, an in-process daemon's `handle_delegate` runs in the TEST process, so `binary_name()` correctly-for-that-process named the libtest binary, and a real worker following the generated command hit libtest's CLI parser instead of the deck's).
-- **Does not assert:** a real agent following the generated command (covered, for the two real-agent arms this regression broke, by `delegate_work_done_chain_claude` and `chain-smoke/pi/002`, both now fixed by the same override); the malformed-`current_exe()` fallback (`orchestration/delegate/018`); the `$PATH`-identity-shadowing rejection (`orchestration/delegate/019`).
+##### orchestration/delegate/020 — The `work-done` line the deck writes into a worker's task file reaches the deck that wrote it when the worker's own `$PATH` puts a different `dot-agent-deck` first (issue #549).
+- **Layer:** L2, lane 1 (`tests/e2e_delegate_command_word.rs`, gated `all(feature = "e2e", unix)`; in-process daemon whose `handle_delegate` fan-out composes the worker task file; a shell-stub worker PTY via `AgentPtyRegistry::spawn_agent`; no LLM call). Entry point is a sync `#[test]` that `block_on`s an async body (the linkage-check scanner links `#[spec]` to the next PLAIN `fn`, so a `#[tokio::test] async fn` would misbind — same pattern as `chain-smoke/pi/002`). Moved out of the lane-2 file `e2e_delegate_work_done_chain.rs`, where it never needed a credential and so ran in no CI job.
+- **Agent:** none. The worker is a `sh` stub standing in for an agent copying the line out of its task file: it runs the line it is handed from its own environment — the shadow-first `$PATH` it was spawned with and the hook capability token the daemon minted into its pane.
+- **Asserts:** with the built deck binary's own directory first on the DECK's `$PATH` (the configuration in which the pre-#549 code proved first-match identity and emitted the bare `dot-agent-deck`) and `spawn_inprocess_daemon`'s test-current-exe override naming the real built binary, the `work-done --task-file` line from `.dot-agent-deck/worker-task-coder.md`, run by the worker, does not invoke the shadow `dot-agent-deck` first on the WORKER's `$PATH`, exits 0, and the daemon writes `.dot-agent-deck/work-done-coder.md` carrying the worker's report sentinel. A control first proves a bare `dot-agent-deck` in a shell with the worker's `$PATH` does run the shadow. **Verified red** on the pre-fix `src/platform/paths.rs`: the shadow received `work-done --task-file …` and no report arrived.
+- **Does not assert:** a real agent following the generated command (`delegate_work_done_chain_claude`, lane 2); the orchestrator context's `delegate` examples or the dispatch prompt's `work-done --done` line, which take the same word from the same `binary_name()` (`/016`, and the `dispatch` unit test `a_single_dispatch_prompt_tells_the_unit_to_report_when_it_finishes`); a replacement of the deck's own file between composing the line and running it, which no command word can prevent.
 - **Platform coverage:** mac+linux (unix-only PTY/UDS; `spawn_inprocess_daemon` is `#[cfg(unix)]`).
 
 ##### orchestration/delegate/021 — Work-done completion does not make the next same-pointer delegate disappear after the user types an unsent draft.
@@ -3302,7 +3404,7 @@ without depending on the config struct API.
 - **Re-founded in round 3, because the old test passed with the guard deleted.** It used to assert a 1000 ms LOWER bound under a 10 s ceiling, on the theory that the weak fact releases the gate and pays the ordinary buffer. `46ccca1` made the upgrade window `SESSION_START_WAIT_TIMEOUT`, so a weak fact that never upgrades is released by window-expiry at ~30 s and *then* pays 1000 ms — landing in the same instant as "released by nothing at all", which no ceiling can separate from it, and satisfying a 1000 ms floor whether or not any guard exists. Anchoring on WHICH FACT released the gate, rather than on how long the release took, is what makes it falsifiable again.
 - **`DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` is deliberately UNSET, and that is load-bearing rather than tidiness.** Guard 3 makes an explicitly-set value win over BOTH defaults, so with it pinned the two buffers collapse to one number and the bound stops distinguishing them.
 - **Verified load-bearing:** deleting the upgrade window (`interface_upgrade_window` returning `ZERO` unconditionally) releases the gate on the guess and delivers the pointer **6.23 ms** after the strong fact against the 5000 ms bound — and 1.269 s after the weak one, i.e. the ordinary buffer paid off a launcher's silence.
-- **Does not assert:** that a real Codex produces both facts in this order (measured in the issue at 21/21 for `devbox run codex-big`, not re-derived here; `orchestration/delegate/009` is where a real one runs); what the window's VALUE should be, only that the weak fact does not release before the strong one arrives; the single-fact path (`orchestration/delegate/027`); the window EXPIRY fallback, where no strong fact ever comes — that shape is what `/029`'s old fixture became and no test now pins it, since its outcome is indistinguishable in time from an unready fallback.
+- **Does not assert:** that a real Codex produces both facts in this order (measured in the issue at 21/21 for `devbox run codex-big`, not re-derived here; `orchestration/delegate/009` is where a real one runs); what the window's VALUE should be, only that the weak fact does not release before the strong one arrives; the single-fact path (`orchestration/delegate/027`); the window EXPIRY fallback, where no strong fact ever comes — that shape is what `/029`'s old fixture became and no test now pins it by latency, since its outcome is indistinguishable in time from an unready fallback (`orchestration/delegate/039` drives the expiry on a paused clock, with a strong fact landing after it).
 - **Platform coverage:** mac+linux (unix-only — the stand-in is a POSIX shell script and both facts depend on pty line discipline).
 
 ##### orchestration/delegate/027 — The wrapper's STRONG interface fact (the child took raw input mode) is priced at the 5000 ms interface buffer rather than the ordinary 1000 ms, and an operator-pinned buffer replaces it in both directions (issue #243, guards 1–3).
@@ -3408,6 +3510,14 @@ without depending on the config struct API.
 - **Asserts:** a blocked delivered role still exits successfully with a warning, a blocked busy role is named, and neither warning exposes agent-controlled detail.
 - **Does not assert:** actual pointer delivery or the worker's ability to complete it.
 - **Platform coverage:** mac+linux+windows.
+
+##### orchestration/delegate/039 — On the delegate gate, a wrapper's STRONG interface fact that lands while the weak fact's buffer is running re-prices that buffer to the interface buffer measured from the strong fact, instead of letting the pointer go out when the ordinary buffer ends (issue #724).
+- **Layer:** fast synthetic PTY integration on a paused Tokio clock (real `handle_delegate` + `clear = true` respawn + the REAL `dot-agent-deck wrap` rewrite; the two interface facts are sent onto the daemon's event broadcast by the test, which is what lets a 30 s upgrade window cost no wall time). Same shape as `orchestration/delegate/011`.
+- **Agent:** a cooked-mode `cat` named `codex`, so the replacement is a wrapper host in the deck's own launch record. The registry has no hook socket, so the real wrapper reports nothing and the facts arrive only when the test sends them.
+- **Asserts:** the control that the replacement is a wrapper host, and the control that nothing was written at the release itself; then that with the weak fact released at window expiry and the strong fact sent 300 ms into the ordinary 1000 ms buffer, the pointer is NOT on the worker's pane once that buffer would have ended, and IS once the 5000 ms interface buffer from the strong fact has passed. `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` is unset, because an explicit value collapses the two defaults to one.
+- **Verified load-bearing:** passing `None` instead of `weak_fact_buffer_reprice(…)` at the delegate's call site turns it red: the pointer lands when the ordinary buffer ends.
+- **Does not assert:** that the marker is authentic (it is not; the re-price is gated on the frozen launch record and can only make a write later, both pinned by `hold_readiness_buffer`'s unit tests); a real wrapper producing the two facts in this order across the 30 s window (`orchestration/delegate/026` runs the real wrapper on the pre-release upgrade); the scheduler seam (`scheduler/spawn/010`).
+- **Platform coverage:** mac+linux (unix-only — daemon-owned PTYs and a POSIX shell stand-in).
 
 #### orchestration/work-done
 
@@ -4151,7 +4261,7 @@ without depending on the config struct API.
 ##### session/restore/011 — A saved `start_role_index` that differs from the config default is honored on restore: the orchestrator prompt lands on the role at the saved index (PRD #89 review-fix F3).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (both roles run a recorder shell script that self-posts `SessionStart` and appends its stdin to an absolute `record-<role>.log` — no LLM tokens).
-- **Asserts:** with a `tdd-cycle` config whose default start role is `orchestrator` (index 0, `start = true`) and a recorder on BOTH roles, a hand-staged snapshot saving `start_role_index = 1` (`coder`) makes the replayed `orchestrator_prompt` land on and be recorded by the role at the SAVED index (`coder`, index 1) — and NOT by the config-default start role (`orchestrator`, index 0). Pins that restore reads `snap.start_role_index` rather than recomputing the start cursor from the live config's `start` flag.
+- **Asserts:** with a `tdd-cycle` config whose default start role is `orchestrator` (index 0, `start = true`) and a recorder on BOTH roles, a hand-staged snapshot saving `start_role_index = 1` (`coder`) makes the replayed `orchestrator_prompt` land on and be recorded by the role at the SAVED index (`coder`, index 1) — and NOT by the config-default start role (`orchestrator`, index 0). Pins that restore reads `snap.start_role_index` rather than recomputing the start cursor from the live config's `start` flag. Since issue #523's review, also that the saved cursor is the tab's ONE seat: `daemon status --json` marks `coder (orchestrator)` and no other role, so the pane the prompt went to is the pane the daemon lets `delegate` (before, it kept registering the config's `start = true` role).
 - **Does not assert:** the drift/bounds handling when the saved index is out of range (`session/restore/010`); `started_role_indices` replay (captured but has no reader); the exact role-card styling / focus border.
 - **Platform coverage:** mac+linux.
 
@@ -4216,6 +4326,13 @@ without depending on the config struct API.
 - **Agent:** none (both roles run `sleep 600`, started with the `TabMembership::Orchestration` stamps a detached TUI leaves behind; no LLM).
 - **Asserts:** five attaches to one daemon running `review-team` (`lead`, `coder`). **Control:** with a config that still lists it, the tab reattaches with no `[config drift]` marker and the detach-quit prints nothing about drift. **Orchestration renamed** in the file (the issue's report): the tab strip reads `! review-team [config drift]`, the status line carries `Config drift:`, and the detach-quit's flushed `session_warnings` name the orchestration as not listed in `<cwd>/.dot-agent-deck.toml` together with the roles it is running, `(lead, coder)`. **Role renamed** (`coder` → `qa`, the misroute the issue's follow-up describes, where the local config still wins): the tab is marked again and the exit warning names both `(lead, coder)` and `(lead, qa)`. **File does not parse** (Qodo on PR #1281 — the rebuild falls back to the daemon's roles exactly as for an absent file): the tab is marked and the exit warning names `<cwd>/.dot-agent-deck.toml` as not loadable. **File deleted** (the branch PRD #111's remote reconnect takes, where synthesis is the right answer): the tab reattaches unmarked and nothing about drift is printed.
 - **Does not assert:** a genuinely remote daemon whose cwd does not exist locally (the deleted file reaches the same `config absent` branch, which is what decides the outcome); the live daemon-dispatch surfacing path `surface_one_orchestration`, which calls the same helpers and the same surfacing function, and whose grow-an-open-tab check (`grown_orchestration_tab_drift_warning`) is unit-tested — driving a live role spawn at lane 1 needs the per-spawn hook capability token (#1077), which only the spawned agent's environment holds; what `dot-agent-deck delegate` reports for a renamed role (`delegate_verdict`'s unit tests in `src/main.rs`); the exact warning wording beyond the quoted fragments.
+- **Platform coverage:** mac+linux.
+
+##### session/restore/021 — A TUI reattaching to a warm daemon seats the rebuilt orchestration tab where the DAEMON registered its orchestrator, even where the config would seat another role (issue #523 review).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness, `tests/e2e_session_restore.rs`, two decks attached in turn to one external `daemon serve`).
+- **Agent:** none (both roles run `session/restore/011`'s recorder shell script, which self-posts `SessionStart` and appends its stdin to `record-<role>.log`; no LLM).
+- **Asserts:** with `session/restore/011`'s drift (the config seats `orchestrator`, index 0; the staged snapshot saved `coder`, index 1) restored into an empty external daemon, the prompt replays to `coder` and the daemon holds exactly one `is_start_role` membership, on `coder` (both preconditions). After a detach-quit, a FRESH deck with no saved session (so no remembered focus) rebuilds the tab from the daemon's live panes; stepping Left onto the Dashboard and Right back onto the tab focuses `coder` (the switch-in fallback to the tab's seat): `PaneLayout::Stacked` expands `coder`'s pane and not `orchestrator`'s. Red before the fix, when the rebuild re-derived the seat from the config and the switch-in expanded `orchestrator`.
+- **Does not assert:** the live-surface rebuild (`surface_one_orchestration`), which shares the seat helper `rebuilt_tab_seat` and its unit test `ui::tests::rebuilt_tab_seat_reads_only_the_panes_it_kept` (the discarded-duplicate case included); that `delegate` from the reattached tab routes (daemon-side, unchanged by a reattach); a remembered focus, which wins over the seat (`session/restore/016`); the landing frame itself, which draws card 0 when nothing is focused whatever the seat.
 - **Platform coverage:** mac+linux.
 
 ### Live session status on reconnect (PRD #162)
@@ -4931,6 +5048,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** the idle-worker (`worker_response_timeout_minutes`) report, which the same restart cancels by the same call; the case of a dispatch queued behind the pane lock during the restart (`agent_pty`'s `replaced_agent_watches_are_cancelled_unless_a_dispatch_is_in_flight` owns that).
 - **Platform coverage:** mac+linux (unix-only).
 
+##### pane/restart/014 — After `pane restart`, a late `SessionStart` from the REPLACED generation cannot take the role's card back in an attached TUI (issue #320).
+- **Layer:** L2 (PTY-attached real binary: real daemon, real TUI, the real `pane restart` CLI; hook frames posted on the real hook socket).
+- **Agent:** none (`cat` stand-ins for both roles; the hook frames stand in for a hook-emitting agent's, naming the daemon's real registry ids for coder's two generations).
+- **Asserts:** with coder restarted so the daemon has published two generations on its pane, the new generation's `SessionStart` draws its prompt on coder's card; a late `SessionStart` from the replaced generation, followed on the same connection by a barrier frame on the orchestrator's pane, leaves the live generation's prompt on screen and never draws the replaced generation's. The barrier is on another pane on purpose: one from coder's live generation would re-retire a wrongly restored card and hide the defect. Verified load-bearing: with the daemon's generation stamp removed the replaced generation's prompt is drawn and the test fails.
+- **Does not assert:** a real agent's hook (`orchestration/delegate/014` covers a real Claude worker through a `clear = true` respawn); the late non-start frame stamped newer, or the incoming generation's older-stamped first frame, which `daemon::hook_ingestion_tests` pins at the ingestion seam and `status/supersede/019` / `/020` at the card layer.
+- **Platform coverage:** mac+linux (the e2e tier is Unix-only).
+
 #### pane/spawn
 
 ##### pane/spawn/001 — Spawning a configured-but-unspawned role succeeds and it becomes reachable (issue #868).
@@ -5612,6 +5736,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the `shape` vocabulary's parse rules (the `SpawnShapeOverride::parse` unit tests own those), load-time rejection of a typo or of `shape` + `issue_dispatch` (`config.rs`'s `shape_*` unit tests), the CLI write doors (`schedule_cli.rs`'s `add_*`/`update_*` unit tests), or the config-derived path with no shape at all (`scheduler/spawn/002` and `/008`).
 - **Platform coverage:** mac+linux.
 
+##### scheduler/spawn/010 — On the scheduler's gate, a wrapper's STRONG interface fact that lands while the weak fact's buffer is running re-prices that buffer from the strong fact's arrival instead of letting it run out on the weak fact's schedule (issue #724).
+- **Layer:** fast synthetic PTY integration (the real `crate::spawn::spawn` primitive against an in-process daemon, with the REAL `dot-agent-deck wrap` rewrite at the common spawn boundary; no LLM and no `e2e` feature gate).
+- **Agent:** a `codex`-named stand-in that paints a nonce banner, stays in COOKED mode for 3.5 s, then runs `stty raw -echo` and `exec cat`. It answers the deck's `codex app-server` hook-listing probe at once, because a stand-in that played its dwell for the probe too delays the pane's start by that long. `DOT_AGENT_DECK_SESSION_START_WAIT_MS=2000` shortens the scheduler's readiness wait so its expiry falls between the two facts, and `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=4000` pins both buffers to one value so the bound below does not depend on the strong fact hitting a 1000 ms target.
+- **Asserts:** the control that the pane is one the daemon spawned as a wrapper host; the control that the weak fact was stamped inside the wait, so the wait's expiry released the gate on it; the control that the strong fact was stamped after the wait could have expired, which keeps the run from being vacuous (a strong fact inside the wait releases the gate on itself and passes the bound with or without re-pricing). Then the bound: the prompt reached the pane at least 4000 ms after the strong fact. Measured **2.47 s** before the fix, which is the weak fact's buffer ending on schedule.
+- **Verified load-bearing:** making `weak_fact_buffer_reprice` answer `None` turns it red at **2.47 s**, and so does leaving `released_on_settled_guess` unset on the window-expiry release.
+- **Does not assert:** the default-valued re-price (1000 ms weak, 5000 ms strong), the never-earlier `max`, which events may re-price, or the forged-marker refusal, all pinned by `hold_readiness_buffer`'s unit tests in `src/state.rs`; the delegate seam (`orchestration/delegate/039`); a real Codex producing this timing, which on the production wait needs the strong fact to land in the one second after a 30 s window.
+- **Platform coverage:** mac+linux (unix-only — POSIX shell, `stty`, and pty line discipline).
+
 #### scheduler/dispatch
 
 ##### scheduler/dispatch/001 — Firing an `issue_dispatch` task clones the repo, creates a per-issue worktree on `agent/issue-<n>`, and spawns an agent into it with the substituted prompt (PRD #120 M2.1–M2.3).
@@ -5704,7 +5836,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### scheduler/dispatch/014 — Concurrent single-agent dispatch seeds survive a deterministic boot-window swallow and are confirmed after retry, whether the producer identifies itself before or after the write.
 - **Layer:** L2 synthetic PTY-attached (real deck and daemon, five real dispatch worktrees, scripted Claude-shaped stand-ins that post hooks through the real CLI; no LLM). The deck-selected executable is named `claude` so `AgentType::from_command` resolves its frozen spawn record as ClaudeCode — the ordinary `default_command = "claude …"` production shape. `DOT_AGENT_DECK_SESSION_START_WAIT_MS` pins the readiness gate to 3 s so the fallback write path is reached in seconds rather than the production 30 s.
 - **Agent:** four one-write-swallowing hook stand-ins retain the existing controls, including `seed-late-claim`, which withholds its genuine start for 6 s to stage issue #570. The fifth pane (`seed-two-write-flush`) is a deterministic two-stage launcher: a `wrapper_fork` start declares standing, the launcher consumes attempts 1 and 2 while emitting only non-generational reporting evidence between them, then stage two posts a genuine Claude start and emits `UserPromptSubmit` for later non-empty input. Every stand-in reads a WHOLE pane submission rather than a line, because a multi-line payload reaches the pane as one bracketed paste and an agent TUI treats it as one input (issue #1182): reading a line at a time was equivalent only while every dispatch payload was single-line, and once PRD #220 Phase 2 appended the completion instruction it shredded one payload into eight `submissions`, none of them confirmable.
-- **Asserts:** all five concurrent `dispatch --single` panes durably expose the dispatch payload built around their own seed — the caller's task verbatim, then the daemon's appended completion instruction — and the written/unconfirmed/confirmed lifecycle under distinct delivery IDs. The original four each retain their swallowed-first-write recovery contract; the fifth records exactly two `swallowed|<prompt>` lines followed by exactly one `confirmed|<prompt>`, requires a `prompt written to pane` line carrying `attempt=3` for its pane (rather than the state-set helper that erases attempt counts), and forbids any deadline `abandoning` line. RED before issue #666's implementation: attempts 3–8 are empty probes and the fifth pane abandons with `attempts=8`.
+- **Asserts:** as a PRECONDITION, before any delivery assertion, that the daemon logged each stand-in's first `SessionStart` before any terminal delivery line for that pane (`not retrying`, `stopped without confirmation`, `abandoning`) — `seed-<pane id>` for four panes, and `launcher-<pane id>` for `seed-two-write-flush`, whose genuine start follows two payload writes and so belongs to the delivery path rather than to its precondition. A retry is armed by that announcement, and without the check a stand-in that never announced itself failed after the whole wait as `confirmed=false`, blaming the delivery path (issue #531); on failure it names the pane, the stand-in's own `stand-in-readiness.log` trail and the `SessionStart` lines the daemon did log. Then, that all five concurrent `dispatch --single` panes durably expose the dispatch payload built around their own seed — the caller's task verbatim, then the daemon's appended completion instruction — and the written/unconfirmed/confirmed lifecycle under distinct delivery IDs. The original four each retain their swallowed-first-write recovery contract; the fifth records exactly two `swallowed|<prompt>` lines followed by exactly one `confirmed|<prompt>`, requires a `prompt written to pane` line carrying `attempt=3` for its pane (rather than the state-set helper that erases attempt counts), and forbids any deadline `abandoning` line. RED before issue #666's implementation: attempts 3–8 are empty probes and the fifth pane abandons with `attempts=8`.
 - **Does not assert:** the retry's internal state representation or real-agent boot behavior (covered by `scheduler/dispatch/015`); the sub-150 ms production window in which #570 was actually observed (the late claim is staged as strictly post-write instead); the refusal side for a pane the deck cannot vouch for (covered by `scheduler/dispatch/016`).
 - **Platform coverage:** mac+linux.
 

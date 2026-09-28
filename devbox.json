@@ -20,8 +20,7 @@
     "curl":                         "8.17.0",
     "ripgrep":                      "15.2.0",
     "python314Packages.pyte":       "0.8.2",
-    "nodejs": {
-      "version":        "24.12.0",
+    "github:NixOS/nixpkgs/nixos-26.05#nodejs_24": {
       "disable_plugin": true
     },
     "pnpm":                       "11.22.0",

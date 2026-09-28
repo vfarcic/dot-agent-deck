@@ -261,7 +261,15 @@ On every launch, the TUI performs a build-version handshake with the running dae
 
 You are never forced to upgrade-and-restart just to keep working: declining the prompt keeps you on the existing daemon, and you can finish or detach your agents and relaunch later, at which point (with no agents running) the daemon restarts silently.
 
-If the TUI is not attached to a terminal (CI, scripts, piped stdout) **and** agents are running, it cannot prompt for the restart, so it prints a recovery hint to stderr and exits non-zero. In that case, run `dot-agent-deck daemon stop` explicitly before relaunching — see [Recycling the local daemon](#recycling-the-local-daemon) below. (With no agents running, the non-interactive case still restarts silently.)
+**The one exception is an upgrade that changes the attach protocol** — the wire the TUI and the daemon speak, which only a release that breaks compatibility changes. A TUI cannot attach to a daemon on a different protocol: the dashboard would look normal while every event it could not decode was silently dropped. So in that case the prompt says the new binary cannot attach, and declining exits instead of attaching, with a message like:
+
+```text
+error: daemon speaks attach protocol v11, but this binary speaks v10
+```
+
+Nothing is stopped: the daemon and its agents keep running. To keep working with them, relaunch with the build the daemon came from — the message names it. To move onto the new binary, run `dot-agent-deck daemon stop` (which stops those agents), then relaunch. With no agents running, a protocol change is handled like any other upgrade: the daemon restarts silently.
+
+If the TUI is not attached to a terminal (CI, scripts, piped stdout) **and** agents are running, it cannot prompt for the restart, so it prints a recovery hint to stderr and exits non-zero — the protocol message above, when the attach protocol changed. In that case, run `dot-agent-deck daemon stop` explicitly before relaunching — see [Recycling the local daemon](#recycling-the-local-daemon) below. (With no agents running, the non-interactive case still restarts silently.)
 
 See [Troubleshooting › Delegate prompts silently no-op after staying on an older daemon](troubleshooting.md#delegate-prompts-silently-no-op-after-staying-on-an-older-daemon) for the symptom you'll see if you keep an older daemon and then expect newer features to work against it.
 

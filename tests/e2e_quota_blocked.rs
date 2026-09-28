@@ -270,13 +270,25 @@ fn assert_blocked(deck: &TuiDeck, role: &str, kind: &str) {
 }
 
 fn quota_deck(bin: &Path, fifo: &Path, transcript: &Path) -> TuiDeck {
-    let deck = TuiDeck::builder()
+    quota_deck_with_env(bin, fifo, transcript, &[])
+}
+
+fn quota_deck_with_env(
+    bin: &Path,
+    fifo: &Path,
+    transcript: &Path,
+    env: &[(&str, &str)],
+) -> TuiDeck {
+    let mut builder = TuiDeck::builder()
         .with_pty_size(160, 45)
         .impersonating_pane_signals()
         .with_env("PATH", path_with_standins(bin))
         .with_env("QUOTA_TRIGGER_FIFO", fifo.to_string_lossy())
-        .with_env("QUOTA_TRANSCRIPT_PATH", transcript.to_string_lossy())
-        .launch_with_fixture("minimal");
+        .with_env("QUOTA_TRANSCRIPT_PATH", transcript.to_string_lossy());
+    for (key, value) in env {
+        builder = builder.with_env(*key, *value);
+    }
+    let deck = builder.launch_with_fixture("minimal");
     // The isolated HOME deliberately has no installed agent directories.
     // Exercise the same deck installers explicitly before spawning stand-ins.
     for agent in ["claude-code", "opencode"] {
@@ -349,8 +361,10 @@ else:
         {'type':'event_msg','payload':{'type':'token_count','turn_id':'turn-714',
             'rate_limits':{'rate_limit_reached_type':'workspace_member_credits_depleted'}}},
         {'type':'event_msg','payload':{'type':'task_complete','turn_id':'turn-714',
-            'error':{'codex_error_info':'usage_limit_exceeded',
-                     'message':'structured-provider-detail-sentinel'}}}
+            'error':json.loads(os.environ['QUOTA_CODEX_ERROR'])
+                if 'QUOTA_CODEX_ERROR' in os.environ else
+                {'codex_error_info':'usage_limit_exceeded',
+                 'message':'structured-provider-detail-sentinel'}}}
     ]
     with open(path, 'a') as rollout:
         for record in records:
@@ -592,6 +606,52 @@ fn status_blocked_018_codex_rollout_blocks_a_launcher_started_codex() {
     wait_for_role(&deck, "worker");
     release_standin(&fifo, &deck, "worker");
     assert_blocked(&deck, "worker", "credits_depleted");
+    assert_codex_non_quota_failure_is_error();
+}
+
+/// The `task_complete` error real Codex 0.156.1 wrote for a turn that asked for
+/// a model the account cannot use, verbatim from a rollout on the development
+/// machine (2026-09-27, issue #1359).
+const OBSERVED_CODEX_MODEL_ERROR: &str = r#"{"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-nonexistent-model-1359' model is not supported when using Codex with a ChatGPT account.\"}}","codex_error_info":"other"}"#;
+
+/// Scenario: A launcher-started Codex stand-in announces its rollout through
+/// the installed hooks, then appends a `task_complete` whose error is not a
+/// quota (issue #1359). Its card and daemon status end in Error, never Blocked
+/// and never left on Thinking.
+fn assert_codex_non_quota_failure_is_error() {
+    let fixture = common::race_safe_tempdir();
+    let bin = fixture.path().join("bin");
+    let fifo = fixture.path().join("codex-trigger");
+    let transcript = fixture.path().join("rollout-1359.jsonl");
+    trigger_fifo(&fifo);
+    std::fs::write(&transcript, "").expect("create rollout");
+    install_structured_standin(&bin, "codex");
+    write_agent(&bin, "launch-codex", "exec codex");
+    let deck = quota_deck_with_env(
+        &bin,
+        &fifo,
+        &transcript,
+        &[("QUOTA_CODEX_ERROR", OBSERVED_CODEX_MODEL_ERROR)],
+    );
+    deck.wait_for_string("No active agents");
+    write_orchestration(&deck, &[("worker", "launch-codex", "codex")]);
+    open_orchestration(&deck);
+    wait_for_role(&deck, "worker");
+    release_standin(&fifo, &deck, "worker");
+    assert!(
+        common::wait_until(Duration::from_secs(20), || {
+            role_status(&deck, "worker").as_deref() == Some("Error")
+                && has_role_badge(&deck.snapshot_grid(), "worker", "Error")
+        }),
+        "a non-quota Codex failure did not end in Error: {}\n{}",
+        status_document(&deck),
+        deck.snapshot_grid()
+    );
+    assert!(
+        !deck.snapshot_grid().contains("Blocked"),
+        "a non-quota Codex failure must never show Blocked:\n{}",
+        deck.snapshot_grid()
+    );
 }
 
 /// Scenario: A Claude worker reports a blocked provider through its installed
