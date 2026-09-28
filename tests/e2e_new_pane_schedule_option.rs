@@ -328,3 +328,47 @@ fn new_pane_010_issue_dispatch_option_flag_gated() {
          it is present.\nGrid:\n{off_grid}"
     );
 }
+
+/// Scenario: Open the New Agent form in a project that declares a legacy
+/// `[[modes]]` entry alongside an orchestration. The form remains usable,
+/// warns in the bottom status line, and offers the surviving Mode chips without
+/// a chip for the removed workspace mode.
+#[spec("prompt/new-pane/018")]
+#[test]
+fn new_pane_018_legacy_workspace_modes_warn_and_continue() {
+    let deck = TuiDeck::launch_with_fixture("legacy-workspace-mode");
+    deck.wait_for_string("No active agents");
+
+    deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
+    deck.send_keys(b" "); // confirm current directory → New Agent form
+    deck.wait_for_string("Mode:");
+
+    let grid = deck.snapshot_grid();
+    let mode_row = grid
+        .lines()
+        .find(|line| line.contains("Mode:"))
+        .unwrap_or_else(|| panic!("the New Agent form should remain open.\nGrid:\n{grid}"));
+    assert!(mode_row.contains("[No mode]"), "Grid:\n{grid}");
+    assert!(mode_row.contains("[Orch: keep-orch]"), "Grid:\n{grid}");
+    assert!(mode_row.contains("[schedule]"), "Grid:\n{grid}");
+    assert!(mode_row.contains("[dispatcher]"), "Grid:\n{grid}");
+
+    // The centered modal leaves the bottom status line visible. Check that
+    // line directly, so a warning in unrelated content cannot satisfy this.
+    let status_line = grid
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    assert!(
+        status_line
+            .to_ascii_lowercase()
+            .contains("workspace modes were removed"),
+        "opening a legacy project should warn in the visible bottom status line.\n\
+         Status line: {status_line:?}\nGrid:\n{grid}"
+    );
+    assert!(
+        !mode_row.contains("legacy-mode-xyz"),
+        "the removed workspace mode must not appear in the Mode chips.\nGrid:\n{grid}"
+    );
+}

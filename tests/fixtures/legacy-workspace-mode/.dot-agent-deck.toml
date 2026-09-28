@@ -1,0 +1,10 @@
+[[modes]]
+name = "legacy-mode-xyz"
+
+[[orchestrations]]
+name = "keep-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat"
+start = true

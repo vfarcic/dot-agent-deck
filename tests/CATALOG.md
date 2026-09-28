@@ -1713,6 +1713,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the daemon-owned delivery paths (`spawn::run_delivery`, pinned by `scheduler/dispatch/014` and `/015`), which route through `latch_generation` and were never affected; the real-agent shape (`prompt/new-pane/016`); or that the daemon's own card-surfacing `SessionStart` reaches the same gate — that trigger is pinned at L1 by `prompt/pane-input/036`, since it is broadcast-only and the interactive spawn path does not emit one.
 - **Platform coverage:** mac+linux (the stand-in is `/bin/sh` plus `stty`/`dd`).
 
+##### prompt/new-pane/018 — A legacy `[[modes]]` declaration warns while the New Agent form keeps the surviving Mode choices (issue #1199).
+- **Layer:** L2 PTY-attached, lane 1 (`#![cfg(feature = "e2e")]`).
+- **Agent:** none (the form is inspected without submitting it).
+- **Asserts:** opening the form with `legacy-workspace-mode` shows the `Mode:` row, proving the deck continued; that row retains `[No mode]`, `[Orch: keep-orch]`, `[schedule]`, and `[dispatcher]` but has no `legacy-mode-xyz` chip. The bottom status line remains visible below the centered modal and contains `workspace modes were removed`, case-insensitively.
+- **Does not assert:** the warning's exact wording or its stderr copy on exit; spawning an agent or opening a tab.
+- **Platform coverage:** mac+linux.
+
 ### Focus / navigation
 
 #### focus/dashboard
