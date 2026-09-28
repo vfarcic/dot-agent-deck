@@ -914,10 +914,11 @@ pub enum AgentPtyError {
     PreparedDirChanged(&'static str),
     /// Issue #544: a first write given a deadline by
     /// [`AgentPtyRegistry::write_and_submit_guarded_first_write_within`] ran
-    /// out of it doing something OTHER than waiting for the user's draft —
-    /// queued on the writer, or writing. Whatever it had written so far stays
-    /// written, exactly as when a caller's own timeout cancelled the send.
-    #[error("deadline elapsed while writing")]
+    /// out of it before writing a byte, doing something OTHER than waiting
+    /// for the user's draft — queued on the writer, or in `revalidate`.
+    /// Nothing was written: a write that has started is never cut short by
+    /// the deadline, so it reports its real outcome instead.
+    #[error("deadline elapsed before the write began")]
     DeadlineElapsed,
 }
 
@@ -8701,13 +8702,18 @@ impl AgentPtyRegistry {
     }
 
     /// [`Self::write_and_submit_guarded_first_write_detailed`] with a deadline
-    /// on everything the write does OTHER than wait for the draft: queueing on
-    /// the writer, `revalidate`, and the write itself. Time spent waiting for
-    /// the draft moves `deadline` later by exactly that much, so a write that
-    /// never waited is bounded by `deadline` itself — what a caller's own
-    /// `timeout` around the immediate entry gave it — and one that did is not
-    /// dropped for having waited. Past the (moved) deadline the call returns
-    /// [`AgentPtyError::DeadlineElapsed`].
+    /// on everything the write does BEFORE its first byte OTHER than wait for
+    /// the draft: queueing on the writer and `revalidate`. Time spent waiting
+    /// for the draft moves `deadline` later by exactly that much, so a write
+    /// that never waited is bounded by `deadline` itself and one that did is
+    /// not dropped for having waited. Past the (moved) deadline, with nothing
+    /// written, the call returns [`AgentPtyError::DeadlineElapsed`].
+    ///
+    /// Once the payload write has started it runs to completion — its
+    /// `SUBMIT_DELAY` and CR included — and reports and records its real
+    /// outcome, however far past the deadline that takes it (PR #1398
+    /// re-review): cancelling it there would strand our bytes in the pane,
+    /// unsubmitted and with no #424 record that they are there.
     ///
     /// Issue #544, PR #1398 review: the spawn seed used to wrap the deferring
     /// entry in its own timeout widened by the whole cap, which let time that
@@ -9027,6 +9033,18 @@ impl AgentPtyRegistry {
         // record. A write that then fails cleanly is logged as a failure
         // below, which is why the notice says only that the draft MAY have
         // been sent.
+        //
+        // Issue #544 (PR #1398 re-review): the deadline's last word. It bounds
+        // everything up to the first byte and nothing after it — checked here
+        // too, because `timeout_at` polls its future first, so a writer lock or
+        // `revalidate` that was ready at once passes it even past the deadline.
+        // From here the write runs to completion and its real outcome is
+        // classified and recorded below: cancelling it after the payload went
+        // in would strand our bytes in the box, unsubmitted and with no #424
+        // record that they are there.
+        if within(deferred).is_some_and(|at| Instant::now() >= at) {
+            return Err(AgentPtyError::DeadlineElapsed);
+        }
         if capped {
             tracing::warn!(
                 pane_id = %pane_id,
@@ -9044,13 +9062,10 @@ impl AgentPtyRegistry {
                 detail: crate::draft_deferral::DRAFT_CAP_NOTICE,
             });
         }
-        let delivery = before_write_deadline(within(deferred), async {
-            match mode {
-                SubmitMode::Submit => deliver_payload_and_submit(w.daemon(), &payload).await,
-                SubmitMode::Notice => deliver_payload_as_notice(w.daemon(), &payload).await,
-            }
-        })
-        .await?;
+        let delivery = match mode {
+            SubmitMode::Submit => deliver_payload_and_submit(w.daemon(), &payload).await,
+            SubmitMode::Notice => deliver_payload_as_notice(w.daemon(), &payload).await,
+        };
         match delivery {
             // Issue #424 F1: bytes of OURS are now in this pane, which is what
             // makes a later submit-only probe meaningful and a later repeat of
@@ -18688,6 +18703,74 @@ mod spawn_tests {
             sent.deferred >= Duration::from_millis(700),
             "{:?}",
             sent.deferred
+        );
+        registry.shutdown_all();
+    }
+
+    /// Issue #544 (PR #1398 re-review): a first write's deadline bounds only
+    /// what happens BEFORE its first byte. Once the payload is in the pane the
+    /// write runs to completion — its `SUBMIT_DELAY` and CR included — and is
+    /// recorded exactly like any other, however late that makes it. A deadline
+    /// that cancelled it mid-write would leave our bytes in the box unsubmitted
+    /// and with no #424 record that they are there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_first_write_deadline_never_cancels_a_write_already_under_way() {
+        const PANE: &str = "issue-544-mid-write";
+        const TEXT: &str = "MIDWRITE-SENTINEL";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+
+        // No draft and a free writer, so everything up to the first byte takes
+        // well under a millisecond — and the deadline then falls inside the
+        // write's own `SUBMIT_DELAY`, after the payload and before the CR.
+        let started = Instant::now();
+        let deadline = started + SUBMIT_DELAY / 2;
+        let sent = tokio::time::timeout(
+            Duration::from_secs(5),
+            registry.write_and_submit_guarded_first_write_within(
+                PANE,
+                TEXT,
+                &agent,
+                || async { true },
+                started,
+                deadline,
+            ),
+        )
+        .await
+        .expect("bounded");
+        assert!(
+            Instant::now() >= deadline,
+            "precondition: the write must outlive its deadline"
+        );
+        let sent = sent.expect(
+            "a deadline that passes after the payload is written must not cancel the write",
+        );
+        assert_eq!(
+            sent.detail,
+            GuardedSendDetail::Outcome(GuardedSend::Applied)
+        );
+
+        // The CR went out: `cat` received a complete line and copied it back.
+        let snapshot = crate::test_pty_wait::wait_for_drained_lines(&registry, &agent, 1).await;
+        assert_eq!(
+            String::from_utf8_lossy(&snapshot).matches(TEXT).count(),
+            2,
+            "the line discipline's echo and cat's copy of the submitted line: {:?}",
+            String::from_utf8_lossy(&snapshot)
+        );
+        // And the write is on record: after the user types, a repeat of these
+        // bytes is recognised as one (#424 F1).
+        registry.note_user_input(PANE);
+        assert!(
+            registry.user_typed_since_writing_payload(PANE, TEXT),
+            "the automatic-write record for the payload must exist"
         );
         registry.shutdown_all();
     }

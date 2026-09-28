@@ -1838,7 +1838,10 @@ async fn guarded_submit(
 /// moves it later by exactly the time spent waiting for the draft and by
 /// nothing else: a write that never waited is bounded by `deadline` as it was
 /// before the gate existed, and time queued behind another writer cannot
-/// borrow the draft's allowance (PR #1398 review). `deadline` is then moved
+/// borrow the draft's allowance (PR #1398 review). It bounds only the time
+/// before the first byte: a write already under way runs to completion and is
+/// classified by what it actually did (PR #1398 re-review), so an expiry here
+/// is a refusal with nothing written. `deadline` is then moved
 /// by the same wait, so the confirmation chain after the write still gets the
 /// same span it did before — which is also what keeps
 /// [`crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`] a bound on how long a
