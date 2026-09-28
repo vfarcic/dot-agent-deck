@@ -54,7 +54,7 @@ Actions — the footer buttons mirror the keys, shown as `[Add a]` `[Edit e]` `[
 Both doors below open the same guided authoring agent:
 
 - **From the Schedules dialog** — press **`s`** on the dashboard, then **`a`** / **`[Add]`** to author a new one (or **`e`** / **`[Edit]`** to start from an existing row's values). First a **directory picker** (the dir you choose becomes the authoring agent's working directory, and is pre-seeded as the schedule's own working directory), then a small **New Schedule** / **Edit Schedule** form with a **Dir** and a free-text **Command** field (pre-filled from your `default_command`). Confirm to start the authoring agent in that directory running that command; **`Esc`** / **`[Cancel]`** returns you to the dialog.
-- **From the New Agent form** — open it (`Ctrl+n`), confirm a directory, and cycle the **Mode** field to the end — past your project's workload modes — to the built-in **`schedule`** option (marked `authoring (one-off)`).
+- **From the New Agent form** — open it (`Ctrl+n`), confirm a directory, and cycle the **Mode** field — past your project's orchestrations — to the built-in **`schedule`** option (marked `authoring (one-off)`).
 
 Either way a throwaway authoring agent opens — running your chosen agent command, which defaults to your configured [`default_command`](configuration.md#default-command) and falls back to `claude` when that is unset — and walks you through it. It:
 

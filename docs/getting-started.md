@@ -92,16 +92,6 @@ Once you have a config, starting an orchestration tab is the same as opening any
 
 For the full reference, examples, and configuration options, see [Orchestration](orchestration.md).
 
-## Working with Modes
-
-Modes let you pair an agent with live command output in a tabbed workspace — useful for keeping test runners, log streams, or kubectl output visible alongside your agent. They are defined per-project in `.dot-agent-deck.toml`.
-
-![A mode tab in action — agent pane on the left, with live Git status, kubectl pods, and kubectl events stacked on the right](./img/modes.png)
-
-To set one up, let an agent generate the config (`Ctrl+d` then `g`), run `dot-agent-deck init` for a starter template, or write `[[modes]]` blocks manually. Then press `Ctrl+n`, navigate to the project directory, cycle the **Mode** field to your mode name, and press `Enter`.
-
-For the full configuration reference and more examples, see [Workspace Modes](workspace-modes.md).
-
 ## Dispatching Work in the Background
 
 Dispatcher mode lets you start work without stopping what you are doing. Tell a dispatcher pane what you want started — "work on the search bug" — and it sets up a separate, isolated copy of your repository and puts an agent, or a whole team, to work there. Start several and they run in parallel without colliding with each other or with your working tree.

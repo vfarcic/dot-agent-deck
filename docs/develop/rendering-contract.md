@@ -56,8 +56,8 @@ Two consequences follow, and both are load-bearing:
 **Removed** — every ad hoc `embedded.resize_pane_pty(...)` call that computed its own dimensions from a local view of the layout:
 
 - Tab open / close paths (`src/ui.rs`, around the `resize_pane_pty` calls near ~1348, ~1354, ~1423, ~1510).
-- Reactive pane recreation (`src/ui.rs`, ~6196 and nearby).
-- Mode switch.
+- Reactive pane recreation (`src/ui.rs`, ~6196 and nearby) — since gone entirely: workspace modes, and with them reactive panes and mode switches, were removed in #1199.
+- Mode switch (likewise removed in #1199).
 - Orchestration role transitions.
 
 The next frame's layout-driven resize handles all of these.
@@ -98,7 +98,7 @@ There is no path that renders before resizing, or resizes after rendering.
 
 ## Convergence
 
-Every trigger that changes the visible shape — terminal resize, tab open/close, mode switch, reactive pane recreation, orchestration role transition — converges to the same three steps:
+Every trigger that changes the visible shape — terminal resize, tab open/close, orchestration role transition (and, until workspace modes were removed in #1199, mode switch and reactive pane recreation) — converges to the same three steps:
 
 ```text
 recompute layout  ->  resize PTYs to match  ->  render
@@ -119,6 +119,6 @@ The contract is measured against the M1 failure-mode catalog under `tests/` (one
 ## References
 
 - PRD #84 — `prds/done/84-rendering-layer-rework.md` (Problem, Solution, Milestones).
-- `src/ui.rs` — `render_frame`, `render_mode_tab`, the resize helpers, and the `Event::Resize` handler.
+- `src/ui.rs` — `render_frame`, the resize helpers, and the `Event::Resize` handler. (`render_mode_tab` was here until #1199 removed workspace modes.)
 - `src/terminal_widget.rs` — `TerminalWidget::render` (the clamp + row window to be removed).
 - `src/embedded_pane.rs` — `resize_pane_pty` (the one resize primitive).

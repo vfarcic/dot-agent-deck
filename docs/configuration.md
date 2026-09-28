@@ -44,56 +44,54 @@ dot-agent-deck config set default_dir ""
 
 ## Project Configuration
 
-Per-project workspace modes are defined in `.dot-agent-deck.toml` at the project root. This file is loaded automatically when you select a directory in the New Agent form.
+Per-project settings live in `.dot-agent-deck.toml` at the project root. This file is loaded automatically when you select a directory in the New Agent form. Today it holds [orchestrations](orchestration.md) and a few top-level keys.
 
 ### Quick Example
 
 ```toml
-[[modes]]
-name = "dev"
+[[orchestrations]]
+name = "my-project"
 
-[[modes.panes]]
-command = "git log --oneline -20"
-name = "Recent Commits"
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude"
+start = true
+description = "Coordinates the work and delegates it to the other roles"
 
-[[modes.rules]]
-pattern = "cargo\\s+(build|test|check)"
-watch = false
+[[orchestrations.roles]]
+name = "coder"
+command = "claude"
+description = "Implements the changes the orchestrator delegates"
 ```
 
 ### Schema Overview
 
 | Block | Key Fields |
 |---|---|
-| `[[modes]]` | `name` (required), `agent` (optional), `init_command` (optional), `panes`, `rules`, `reactive_panes` (default: 2) |
-| `[[modes.panes]]` | `command` (required), `name` (optional label), `watch` (default: true) |
-| `[[modes.rules]]` | `pattern` (regex, required), `watch` (bool), `interval` (seconds) |
 | `[[orchestrations]]` | `name` (optional), `default` (bool, default: false), `extends` (optional), `roles` |
 
-For the full reference and more examples, see [Workspace Modes](workspace-modes.md). Orchestrations live in the same file under `[[orchestrations]]`; see [Orchestration](orchestration.md#configuration-reference). `default` and `extends` only matter to a project that defines **several** orchestrations, and are explained under [More than one orchestration](orchestration.md#more-than-one-orchestration).
+For the full reference, see [Orchestration](orchestration.md#configuration-reference). `default` and `extends` only matter to a project that defines **several** orchestrations, and are explained under [More than one orchestration](orchestration.md#more-than-one-orchestration).
+
+**A `[[modes]]` block is ignored with a warning.** Workspace modes were removed in [#1199](https://github.com/vfarcic/dot-agent-deck/issues/1199); a file that still declares one keeps loading, the TUI shows a warning the first time the New Agent form reads it in a session, and `dot-agent-deck validate` reports it. Delete the block to clear the warning. See [Workspace Modes (removed)](workspace-modes.md) for what to use instead.
 
 ### Naming the agent a command launches
 
 The deck identifies which agent a pane runs by reading the first word of its command, so `claude`, `codex`, `opencode --model gpt-4o` and `/usr/local/bin/pi` all resolve by themselves. A command that starts the agent through something else does not — `devbox run -- codex`, `mise exec -- codex`, `nix develop -c codex`, `make codex`, `./run-codex.sh` — because nothing about a launcher reveals what it will end up starting. Such a pane shows **No agent** and gets no status tracking, and for Codex it stays that way until you give it its first task.
 
-The optional `agent` key says what the command cannot. It takes one of `claude`, `opencode`, `pi`, `codex`, `devin`, and it goes on the block that owns the command:
+The optional `agent` key says what the command cannot. It takes one of `claude`, `opencode`, `pi`, `codex`, `devin`, and it goes on the role that owns the command:
 
 ```toml
-[[modes]]
-name = "review"
-agent = "codex"          # this mode's agent pane runs Codex
-
 [[orchestrations.roles]]
 name = "reviewer"
 command = "devbox run -- codex --sandbox workspace-write"
-agent = "codex"          # …and so does this role
+agent = "codex"          # this role's command launches Codex
 ```
 
-An unrecognised name resolves to no agent rather than to a guess, and `dot-agent-deck validate` warns about it by name. Omitting the key leaves behaviour exactly as before, so no existing config needs to change. Full details in [Orchestration](orchestration.md#declaring-the-agent-behind-a-launcher-command) and [Workspace Modes](workspace-modes.md#declaring-the-agent-behind-a-launcher-command).
+An unrecognised name resolves to no agent rather than to a guess, and `dot-agent-deck validate` warns about it by name. Omitting the key leaves behaviour exactly as before, so no existing config needs to change. Full details in [Orchestration](orchestration.md#declaring-the-agent-behind-a-launcher-command).
 
 ### Top-Level Keys
 
-These belong to no block, which makes their placement load-bearing: TOML assigns every key after a table header to that table, so a top-level key **must appear above the first `[[modes]]` or `[[orchestrations]]` header in the file**. Appended at the end it silently becomes a key of whichever table came last, where nothing reads it — the file still parses, `dot-agent-deck validate` still reports `Config is valid.`, and the default stays in effect. A misplaced key gives you no signal at all.
+These belong to no block, which makes their placement load-bearing: TOML assigns every key after a table header to that table, so a top-level key **must appear above the first table header in the file** — the first `[[orchestrations]]`, `[features]` or any other. Appended at the end it silently becomes a key of whichever table came last, where nothing reads it — the file still parses, `dot-agent-deck validate` still reports `Config is valid.`, and the default stays in effect. A misplaced key gives you no signal at all.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -101,4 +99,48 @@ These belong to no block, which makes their placement load-bearing: TOML assigns
 
 ### Scaffolding
 
-Run `dot-agent-deck init` inside a project directory to generate a starter `.dot-agent-deck.toml`.
+#### `dot-agent-deck init`
+
+Run `dot-agent-deck init` inside a project directory to generate a starter `.dot-agent-deck.toml`:
+
+```bash
+cd your-project
+dot-agent-deck init
+```
+
+The generated file is a commented orchestration starter you can edit. It will not overwrite an existing config. `--path <dir>` writes it into another directory instead of the current one.
+
+#### Agent-assisted config generation
+
+When you open the New Agent form (`Ctrl+n`) for a directory without a `.dot-agent-deck.toml`, a yellow tip suggests pressing `g` on the dashboard to create one.
+
+From the dashboard, press `g` on an agent's card to open a dialog with three options (navigate with arrow keys, confirm with Enter):
+
+- **Yes** — sends a prompt to the agent asking it to analyze the project, propose an orchestration config, and write it after your approval. [Quick setup](orchestration.md#quick-setup) walks through what the agent does.
+- **No** — dismisses the dialog; the hint stays on the card.
+- **Never** — suppresses the hint permanently for this directory.
+
+After the agent creates the file, press `Ctrl+n`, select the project directory, and cycle the **Mode** field to the orchestration it wrote.
+
+To disable the hint globally: `dot-agent-deck config set auto_config_prompt false`.
+
+#### Config validation
+
+Run `dot-agent-deck validate` to check your config for issues:
+
+```bash
+cd your-project
+dot-agent-deck validate
+```
+
+It checks your orchestrations — duplicate names, the role count, exactly one `start = true` role, empty or duplicate role names, empty commands, and unknown `agent` names, among others; [Validate your config](orchestration.md#validate-your-config) covers the multi-orchestration checks. A leftover `[[modes]]` block is reported as a warning saying workspace modes were removed and the block can be deleted. Only errors make `validate` exit non-zero, so a config whose only finding is that warning still exits `0`.
+
+#### `dot-agent-deck watch`
+
+A standalone command that re-executes a shell command at a fixed interval with clean terminal output, similar to the Linux `watch` utility:
+
+```bash
+dot-agent-deck watch --interval 2 "kubectl get pods"
+```
+
+The command clears the screen between executions and shows output as it is produced. Press `Ctrl+C` to stop.

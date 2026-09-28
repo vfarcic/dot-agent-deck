@@ -4,6 +4,8 @@
 **Priority**: High
 **Created**: 2026-08-05
 
+> **Update (#1199):** workspace modes were removed in [#1199](https://github.com/vfarcic/dot-agent-deck/issues/1199), so the mode tabs this PRD mentions no longer exist. Where it says "dashboard and mode tabs", read the dashboard; where it says a non-focused pane needs "a mode tab or a tiled dashboard" to reproduce, a tiled dashboard is now the case.
+
 ## Problem Statement
 
 Three separate users have reported "copy is broken" — [#315](https://github.com/vfarcic/dot-agent-deck/issues/315) (macOS/iTerm2), [#96](https://github.com/vfarcic/dot-agent-deck/issues/96) (GNOME Terminal, closed with a tmux workaround), [#98](https://github.com/vfarcic/dot-agent-deck/issues/98) (the workaround itself), plus a Konsole report inside #96. They are not three bugs. They are one feature with four independent defects, none of which has ever been documented or tested.

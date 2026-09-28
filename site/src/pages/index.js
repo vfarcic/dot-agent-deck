@@ -49,7 +49,7 @@ import styles from './index.module.css';
  * The pages the closing panel hands the visitor, in the order to read them.
  *
  * "Workspace modes" was the third of these and is now "Dispatcher mode".
- * Modes are being removed (issue #1199) and the page dropped its modes
+ * Modes were removed (issue #1199) and the page dropped its modes
  * principle in the same pass, so leaving a door onto the modes reference would
  * have pointed the one visitor who followed the page's argument at the one
  * feature it deliberately stopped making. Dispatching, meanwhile, is the

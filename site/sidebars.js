@@ -11,7 +11,6 @@ const sidebars = {
       link: { type: 'doc', id: 'orchestration' },
       items: ['idle-workers-and-notifications'],
     },
-    'workspace-modes',
     'dispatcher-mode',
     'scheduled-tasks',
     'configuration',

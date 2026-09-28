@@ -63,17 +63,15 @@ The fastest way to get an orchestration config is to let an agent generate it fr
 4. Review the proposal. The agent will list each role and explain why it chose it.
 5. Tell the agent what to drop or change — or confirm as-is — and it writes `.dot-agent-deck.toml` to your project root.
 
-The generated file includes both `[[modes]]` and `[[orchestrations]]`. You can remove either section if you only need one.
-
-To write the config by hand, use the [configuration reference](#configuration-reference) later on this page as a guide. `dot-agent-deck init` generates a modes-only starter template — it does not include an orchestration block.
+To write the config by hand, run `dot-agent-deck init` for a commented orchestration starter, or use the [configuration reference](#configuration-reference) later on this page as a guide.
 
 ## Starting an orchestration tab
 
-Opening an orchestration tab uses the same `Ctrl+n` flow as a regular pane, but the **Mode** field selects an orchestration instead of a workspace mode.
+Opening an orchestration tab uses the same `Ctrl+n` flow as a regular pane, but the **Mode** field selects an orchestration instead of `No mode`.
 
 1. Press `Ctrl+n` to open the New Agent form.
 2. Use `Enter` to step into directories and `Space` to select the project directory that contains your `.dot-agent-deck.toml` with an `[[orchestrations]]` block.
-3. In the unified form, use `Left`/`Right` (or `h`/`l`) to cycle the **Mode** field past any workspace modes until the orchestration name appears.
+3. In the unified form, use `Left`/`Right` (or `h`/`l`) to cycle the **Mode** field until the orchestration name appears.
 4. Press `Enter`. The command field is not used for orchestration tabs — each role pane is launched with its own [`command`](#configuration-reference) from the config.
 
 A new tab opens with one pane per role. The role cards appear on the left sidebar; the orchestrator's pane is active on the right. Each pane has the role's `command` running inside it.
@@ -275,8 +273,6 @@ Notes on how it behaves:
 - The declaration **wins over the command**. If you declare `agent = "codex"` on a role whose command runs Claude, you get Codex, so keep the two in step.
 - It is re-read from `.dot-agent-deck.toml` on every delegation, exactly like `command` is. Edit either one and the next `clear = true` delegation picks it up — you do not have to recreate the role's pane.
 - Leaving `agent` out, or leaving it empty, changes nothing: the deck reads the command as it always has. Existing configs need no edit.
-
-For a mode's agent pane the same key lives on `[[modes]]` — see [Workspace Modes](workspace-modes.md#declaring-the-agent-behind-a-launcher-command).
 
 ### Minimal example
 
@@ -682,6 +678,6 @@ If you run two orchestration tabs from different directories that happen to have
 ## See also
 
 - [Idle Workers & Notifications](idle-workers-and-notifications.md) — the timeout that reports a silent worker to the orchestrator, and an example recipe for notifying yourself
-- [Workspace Modes](workspace-modes.md) — the simpler tab type that pairs an agent with live side panes
+- [Dispatcher Mode](dispatcher-mode.md) — start a single agent or a whole orchestration in an isolated copy of the repository
 - [Configuration](configuration.md) — global and project-level configuration options
 - [Keyboard Shortcuts](keyboard-shortcuts.md) — all keybindings, including tab navigation

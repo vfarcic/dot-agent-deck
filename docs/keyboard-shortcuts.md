@@ -9,7 +9,7 @@ title: Keyboard Shortcuts
 
 Every keyboard action below is also reachable with the mouse. Every clickable control shows its keyboard shortcut inline, so the on-screen controls double as a legend. On a dashboard card, a single click selects it and a double click focuses its pane.
 
-**The wheel goes to whatever the pointer is over.** It scrolls the focused pane while the pointer is inside that pane — or a mode tab's side pane when the pointer is over one. Elsewhere on the deck the wheel does nothing: over the card list, the stats bar, the tab bar, the bottom button bar, a pane's border, or a pane that is not the focused one, it is dropped — the same way a click that lands on nothing is. Point at the pane you want to scroll. (The card grid has no scroll of its own — it moves only as a consequence of moving the selection.) An open dialog is its own case: while the Schedules manager is up it takes the wheel for its own list, and the other modals swallow it rather than let it reach the pane behind them.
+**The wheel goes to whatever the pointer is over.** It scrolls the focused pane while the pointer is inside that pane. Elsewhere on the deck the wheel does nothing: over the card list, the stats bar, the tab bar, the bottom button bar, a pane's border, or a pane that is not the focused one, it is dropped — the same way a click that lands on nothing is. Point at the pane you want to scroll. (The card grid has no scroll of its own — it moves only as a consequence of moving the selection.) An open dialog is its own case: while the Schedules manager is up it takes the wheel for its own list, and the other modals swallow it rather than let it reach the pane behind them.
 
 In command mode the wheel always drives Agent Deck's own scrollback and is never forwarded to the agent, so a full-screen TUI cannot move under you while you read. While you are typing in a pane, the wheel goes to the agent if the agent has mouse reporting enabled — and it carries the cell the pointer is actually on, which is why a wheel from outside the pane is dropped rather than delivered at the nearest edge.
 
@@ -24,7 +24,7 @@ In command mode the wheel always drives Agent Deck's own scrollback and is never
 | `Ctrl+T` | Toggle stacked / tiled layout — stacked shows only the focused pane at full height, tiled shows every pane at once | Any mode |
 | `Ctrl+L` | Toggle the orchestration sidebar/pane-column split ratio between 34/66 and 25/75 (applies to every orchestration tab) | **Orchestration tabs, command mode only** |
 | `Ctrl+Z` | Zoom the focused agent pane — it takes the whole frame. Press again to restore. See [`Ctrl+Z` zooms the focused agent pane](#ctrlz-zooms-the-focused-agent-pane). | **Dashboard and orchestration tabs, command mode only** |
-| `Ctrl+W` | Close the selected pane on the dashboard, or tear down an entire mode tab — after a confirmation. The dashboard tab itself cannot be closed. | **Command mode only** |
+| `Ctrl+W` | Close the selected pane on the dashboard, or an entire orchestration tab — after a confirmation. The dashboard tab itself cannot be closed. | **Command mode only** |
 | `Ctrl+E` | **Experimental — off by default.** Toggle the command-entry lock on an orchestration tab. See [`Ctrl+E` locks command entry to the orchestrator pane](#ctrle-locks-command-entry-to-the-orchestrator-pane). | **Command mode only, on an orchestration tab**, with the `experimental` flag on |
 | `Ctrl+C` | In a pane, sent to the agent as SIGINT. In command mode, opens the quit dialog — see [Dialogs](#dialogs). | Any mode |
 
@@ -38,6 +38,12 @@ Three other cues follow the mode:
 - **Dimming and a banner.** Command mode dims the focused pane and overlays `COMMAND MODE — Ctrl+D to type`. The banner clears after a moment, or when you press a command-mode key. A key that isn't bound to anything keeps it up — that is the moment you most likely thought you were talking to the agent.
 - **The selected card.** It keeps its `▸ ` marker in both modes, but its highlight is de-emphasised while you are typing in a pane.
 
+### Reading and typing into a pane
+
+**Reading a pane in command mode.** Command mode is the safe resting state — the one mode in which a stray keystroke cannot reach an agent — and you can read in it. Pane content stays fully readable (dimmed, never blanked), and the focused pane scrolls there, by wheel and by `PageUp` / `PageDown`. The wheel is never forwarded to the agent's mouse protocol in command mode, so a full-screen TUI running in the pane cannot scroll under you while you read. How far back a pane scrolls is decided by the agent running in it, not by the mode: an agent that repaints its transcript in place rather than letting lines scroll off the top leaves nothing to scroll back through, in command mode or any other. See [How far back you can scroll depends on the agent](#how-far-back-you-can-scroll-depends-on-the-agent).
+
+**Typing into a pane.** Press `Enter` on the selected card (or `1`–`9` to jump to one) to type directly into its pane. `Ctrl+c` sends SIGINT to the pane's process, and `Ctrl+d` returns you to command mode. This is the mode the bottom-bar chip calls ` TYPING `, and the only one in which the focused pane shows a cursor. `PageUp` / `PageDown` belong to the program running in the pane here — they are sent through to it rather than scrolling the deck's view.
+
 ### `Ctrl+W` closes only from command mode
 
 `Ctrl+W` is delete-previous-word in shells, readline, and vim. So while you are typing in a pane it is sent straight through and deletes a word — it does not close anything. Press `Ctrl+D` first, and `Ctrl+W` there asks you to confirm before closing.
@@ -50,7 +56,7 @@ The confirmation defaults to **Cancel**, so an accidental `Ctrl+W` followed by a
 
 With the flag on, typing into a **worker** pane on an orchestration tab is locked by default. Keystrokes still reach the orchestrator's pane; aimed at a worker they are dropped, and the bottom bar says `Pane locked — Ctrl+d then Ctrl+e to unlock`. Press `Ctrl+D`, then `Ctrl+E`, and the deck reports `Pane entry: unlocked`. `Ctrl+E` leaves you in command mode, so press `Ctrl+D` again to type.
 
-This is not a read-only mode. Dashboard and mode tabs are untouched, and every pane still shows live output and scrolls normally. Why the pause is worth it is covered in [Typing into a worker is locked by default](orchestration.md#typing-into-a-worker-is-locked-by-default-experimental).
+This is not a read-only mode. The dashboard is untouched, and every pane still shows live output and scrolls normally. Why the pause is worth it is covered in [Typing into a worker is locked by default](orchestration.md#typing-into-a-worker-is-locked-by-default-experimental).
 
 - **`Ctrl+E` is command-mode only**, because it is readline's `end-of-line` inside a pane.
 - **The lock is one setting for the whole deck**, adopted by newly opened orchestration tabs, and not saved across restarts — every deck starts locked.
@@ -67,7 +73,6 @@ Nothing is stopped while zoomed, only hidden. What that costs on an orchestratio
 - **Command mode only**, so `Ctrl+Z` inside a pane still suspends whatever is running there.
 - **Zoom follows focus.** Jump to another role with `1`–`9` while zoomed and you stay zoomed on that agent.
 - **Per-tab, and never saved.** Each tab remembers its own zoom, a tab you open later starts unzoomed, and reattaching returns the full view.
-- **A Mode tab has no sidebar to reclaim**, so `Ctrl+Z` reaches the pane there as ordinary input.
 
 The agent reflows to the new width both ways, so nothing is lost or garbled.
 
@@ -83,18 +88,6 @@ The tab bar appears when more than one tab is open.
 | `Shift+Tab` / `Left` / `h` | Previous tab — **only in command mode** |
 
 The command-mode-only keys reach the agent instead while you are typing in a pane, so press `Ctrl+D` first.
-
-## Mode Tab
-
-Command mode, when a mode tab is active.
-
-| Key | Action |
-|---|---|
-| `j` / `Down` | Focus next pane (cycles: agent → side panes → agent) |
-| `k` / `Up` | Focus previous pane (cycles: agent → last side pane → … → agent) |
-| `Enter` | Start typing into the selected pane (agent pane if none selected) |
-| `Esc` | Deselect side pane (return focus indicator to agent) |
-| Mouse click | Click a side pane to select it; click the agent pane to deselect |
 
 ## Dashboard
 
@@ -148,12 +141,12 @@ It can look like "scrolling works fine outside Agent Deck": scrolling up during 
 
 Directory lists loop end-to-end, and the `..` parent entry stays visible even when a filter is active.
 
-## New Agent / Mode Form
+## New Agent Form
 
 | Key | Action |
 |---|---|
 | `Tab` / `Shift+Tab` | Switch between fields |
-| `Left` / `Right` / `h` / `l` | Cycle mode selector (when modes available) |
+| `Left` / `Right` / `h` / `l` | Cycle the **Mode** field (`No mode`, the project's orchestrations, and the built-in `schedule` and `dispatcher` options) |
 | `Enter` | Confirm field / submit form |
 | `Esc` | Cancel |
 
@@ -213,7 +206,7 @@ help = "F1"                      # open help with F1 instead of ?
 |---|---|---|
 | `dashboard` | `Ctrl+d` | Toggle between command mode and the pane — any mode |
 | `new_pane` | `Ctrl+n` | New agent (directory picker → name + command) — any mode |
-| `close_pane` | `Ctrl+w` | Close selected agent / tear down mode tab, with confirmation — **command mode only** |
+| `close_pane` | `Ctrl+w` | Close selected agent / orchestration tab, with confirmation — **command mode only** |
 | `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout — any mode |
 | `toggle_orchestration_lock` | `Ctrl+e` | **Experimental — requires the `experimental` flag.** Toggle the orchestration command-entry lock — **command mode only, on an orchestration tab** |
 | `toggle_orchestration_split` | `Ctrl+l` | Toggle the orchestration split between 34/66 and 25/75, for every orchestration tab — **orchestration tabs, command mode only** |

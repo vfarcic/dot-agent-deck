@@ -76,11 +76,13 @@ The position is stored with the rest of your saved workspace, so it is per-machi
 
 Agent Deck keeps your saved workspace current as you work — after every new agent, rename, tab, and agent change, and again whenever you disconnect — so what it brings back is your most recent setup, never a stale copy from the last time you happened to quit. That is what makes recovery worthwhile after an unexpected shutdown: you return to where you actually were, not to a workspace from days ago.
 
-### Mode and orchestration tabs come back too
+### Orchestration tabs come back too
 
-Mode tabs return in full — the tab and its name, the agent pane and its command, and every side pane. Orchestration tabs return too, with the orchestrator and its prompt, the role panes in their original order, and the start-role cursor where you left it.
+Orchestration tabs return in full, with the orchestrator and its prompt, the role panes in their original order, and the start-role cursor where you left it.
 
-In every case only the workspace structure is restored, not an agent's internal conversation. If something in your project's `.dot-agent-deck.toml` has changed since you last ran it — the file is missing, a mode or orchestration was renamed, or a role was removed — Agent Deck shows a clear warning and brings that pane back as a plain dashboard pane instead of a broken tab.
+In every case only the workspace structure is restored, not an agent's internal conversation. If something in your project's `.dot-agent-deck.toml` has changed since you last ran it — the file is missing, an orchestration was renamed, or a role was removed — Agent Deck shows a clear warning and brings that pane back as a plain dashboard pane instead of a broken tab.
+
+A pane saved from a workspace-mode tab, from a release before [workspace modes were removed](workspace-modes.md), comes back the same way: as a plain pane on the dashboard, with a warning. Its side panes are not restored.
 
 ### Starting Fresh
 

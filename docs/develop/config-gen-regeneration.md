@@ -7,7 +7,7 @@ The deck ships an AI config generator: in the TUI, the `generate-config` action 
 ## Where the tooling lives
 
 - `examples/render_config_gen_prompt.rs` — prints the **exact** post-render prompt the deck would send for a directory (`config_gen::config_gen_prompt`, with `{dir}` and `{roles}` interpolated). The auditable "what was sent" capture.
-- `examples/diff_config.rs` — region-structured diff between a regenerated config and a project's live config, parsed with the deck's own `ProjectConfig` types so field semantics (defaults for `watch`, `reactive_panes`, `clear`, …) match the running binary. Emits Markdown grouped by region.
+- `examples/diff_config.rs` — region-structured diff between a regenerated config and a project's live config, parsed with the deck's own `ProjectConfig` types so field semantics (defaults such as `clear`, …) match the running binary. Emits Markdown grouped by region.
 - `assets/config_gen_prompt.md`, `assets/roles.toml` — the prompt and role library under study/edit. They are embedded into the binary via `include_str!` in `src/config_gen.rs`, so editing the asset is enough to change behavior (rebuild required for the example to pick it up).
 
 Build the toolchain with the project's pinned Rust (rustup shims are broken in this repo — see the toolchain note in team memory): prefix `PATH` with `.devbox/nix/profile/default/bin`, or run inside `devbox shell`.
@@ -42,7 +42,7 @@ cat >> /tmp/gen-input.md <<'EOF'
 - You ARE allowed to read the repo with your tools — perform step 1's discovery yourself.
 - Do NOT ask the user anything and do NOT wait for confirmation; skip step 5's negotiation.
 - Do NOT write or modify ANY file in the repo. You have write tools but must not use them — skip step 6's file write entirely; only print the config.
-- Output a short (≤1 paragraph) rationale, then the COMPLETE proposed `.dot-agent-deck.toml` (modes, plus an orchestration if one applies) in a single fenced ```toml block, and nothing after it.
+- Output a short (≤1 paragraph) rationale, then the COMPLETE proposed `.dot-agent-deck.toml` (its orchestration) in a single fenced ```toml block, and nothing after it.
 EOF
 
 # 3. Generate from INSIDE the repo with tools enabled, model pinned to the deck default.
@@ -65,7 +65,7 @@ Everything lands in `/tmp` (or `$CLAUDE_JOB_DIR/tmp`) — nothing is committed t
 
 ### Diff-tool pairing caveat
 
-`diff_config` matches modes and orchestrations **by name**, and the generator picks those names nondeterministically (the prompt does not — and should not — dictate them). When a regenerated name differs from the live config's, the tool reports the roles as disjoint (all B-only + U-only) instead of pairing them field-by-field, which *understates* the real overlap. To get a role-paired diff, copy the regenerated config and align only the cosmetic mode/orchestration `name = "…"` lines to the live config's names before diffing. (`name` lines for modes/orchestrations don't collide with role names, so a targeted string replace is safe.)
+`diff_config` matches orchestrations **by name**, and the generator picks those names nondeterministically (the prompt does not — and should not — dictate them). When a regenerated name differs from the live config's, the tool reports the roles as disjoint (all B-only + U-only) instead of pairing them field-by-field, which *understates* the real overlap. To get a role-paired diff, copy the regenerated config and align only the cosmetic orchestration `name = "…"` lines to the live config's names before diffing. (`name` lines for orchestrations don't collide with role names, so a targeted string replace is safe.)
 
 ## The date gate (apply before treating any delta as a signal)
 

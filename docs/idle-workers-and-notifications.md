@@ -12,7 +12,7 @@ The second is an **example recipe**: how one project (this one) wires its orches
 
 If you take one thing from this page, take the split: **the deck produces the signal an agent structurally cannot produce about itself; your agent decides what the signal means.**
 
-**Both parts require an [orchestration](orchestration.md).** Idle-worker detection watches *delegations*, and a delegation only exists inside an orchestration tab — so a plain agent pane, a workspace mode, and a single-agent schedule never produce an idle prompt, however long they run. Part 2 is orchestration-scoped for the same reason: the recipe is text in an orchestrator's `prompt_template`, and only an orchestration has an orchestrator. If you do not run orchestrations, nothing here applies to your setup yet.
+**Both parts require an [orchestration](orchestration.md).** Idle-worker detection watches *delegations*, and a delegation only exists inside an orchestration tab — so a plain agent pane and a single-agent schedule never produce an idle prompt, however long they run. Part 2 is orchestration-scoped for the same reason: the recipe is text in an orchestrator's `prompt_template`, and only an orchestration has an orchestrator. If you do not run orchestrations, nothing here applies to your setup yet.
 
 ## Part 1 — Idle-worker detection
 
@@ -66,7 +66,7 @@ The value is read **per delegation**, from the `.dot-agent-deck.toml` in the orc
 
 ### Where the key goes — read this before you file a bug
 
-> **A misplaced `worker_response_timeout_minutes` is silently ignored, and nothing will tell you.** It is a top-level scalar, so in TOML it must appear **above the first table header** — above the first `[[modes]]` or `[[orchestrations]]` in the file. Appended to the end of a config, it becomes a key of whatever table came last, where it means nothing. The config still parses, `dot-agent-deck validate` still says `Config is valid.` (unknown keys inside tables are accepted for forward compatibility), and your detector quietly keeps using the 120-minute default.
+> **A misplaced `worker_response_timeout_minutes` is silently ignored, and nothing will tell you.** It is a top-level scalar, so in TOML it must appear **above the first table header** — above the first `[[orchestrations]]` (or any other table header) in the file. Appended to the end of a config, it becomes a key of whatever table came last, where it means nothing. The config still parses, `dot-agent-deck validate` still says `Config is valid.` (unknown keys inside tables are accepted for forward compatibility), and your detector quietly keeps using the 120-minute default.
 
 This is the single most likely reason for "I set the timeout and nothing changed", so it is worth seeing both shapes side by side.
 
@@ -97,7 +97,7 @@ command = "claude"
 start = true
 ```
 
-Comments and blank lines before the first table are fine; the rule is only about table headers. If your file starts with `[[modes]]` on line one, the key goes on line one and `[[modes]]` moves down.
+Comments and blank lines before the first table are fine; the rule is only about table headers. If your file starts with `[[orchestrations]]` on line one, the key goes on line one and `[[orchestrations]]` moves down.
 
 ### What the feature guarantees
 

@@ -4,6 +4,8 @@
 **Priority**: Medium
 **Created**: 2026-08-01
 
+> **Update (#1199):** workspace modes were removed in [#1199](https://github.com/vfarcic/dot-agent-deck/issues/1199), so mode tabs no longer exist and `docs/workspace-modes.md` is now a removal stub. Read the mode-tab bullet, the M3 milestone and Open Question 2 below as moot; the toggle now governs two tab types — the dashboard and orchestration tabs.
+
 ## Problem Statement
 
 `ui.pane_layout` is a single global field (`src/ui.rs:1531`, default `Stacked`) toggled by `Ctrl+T` (`src/ui.rs:6481`) and read by all three `render_terminal_panes` call sites — dashboard, mode tabs and orchestration tabs. One switch governs three tab types whose needs are not the same, and in two of the three neither setting is right:

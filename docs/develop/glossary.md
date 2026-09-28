@@ -46,8 +46,8 @@ These were compared across both clients and the protocol and needed no change; t
 - **prompt** vs **task** — two concepts, not two words for one: a prompt is text sent to an agent, a task is a unit of work handed to an orchestration.
 - **connect** / **detach** — the same in both clients.
 - **rename** — the verb matches; its object is **agent** (above).
-- **tab** (TUI) vs **group** (desktop) — different presentations of an orchestration's or mode's agents, not two words for one thing. The wire name `TabMembership` stays.
-- **workspace mode** (`[[modes]]`) — "mode" in both clients.
+- **tab** (TUI) vs **group** (desktop) — different presentations of an orchestration's agents, not two words for one thing. The wire name `TabMembership` stays.
+- **workspace mode** (`[[modes]]`) — removed in [#1199](https://github.com/vfarcic/dot-agent-deck/issues/1199). The word survives in the deprecated wire variant `TabMembership::Mode`, kept so older and newer builds interoperate, and in the desktop's grouping of records an older TUI tagged with a mode.
 - **Agent Profiles** and **fleet** — desktop-only features with no TUI counterpart. The multi-daemon view is "All daemons".
 
 ## Known exceptions
@@ -73,7 +73,7 @@ Places that deliberately keep an old word, and why.
 One spelling, more than one concept. Each meaning is legitimate; read the word from its context rather than renaming one meaning to rescue the other.
 
 - **session** — (a) the saved layout the TUI restores ("Session — Panes auto-saved continuously", "failed to save session", `snapshot`); (b) the agent CLI's own session (`SessionStart` / `SessionEnd` hook events, "Session started"); (c) the identity of the output stream a pane is attached to, which the TUI's input-delivery messages check before they send keystrokes ("History-only session cannot accept live input", "Input not delivered: session is history-only", "Input not delivered: the pane's session changed", and the "history-only session" / "wrong session" reasons in `src/ui.rs`). Sense (c) is the target the daemon writes input into (`Writable` and `SendResult` in `src/event.rs`): a history-only session — a wrapped Codex agent, for one, whose keystrokes reach it through the terminal it inherited rather than a handle the daemon holds — cannot take input from the dashboard, and a send whose handle no longer maps to the session it was meant for is reported as the wrong session. The strings keep the word because they describe that stream rather than the agent. The word for a running agent is **agent**, not session.
-- **mode** — workspace mode (`[[modes]]`), input mode (command mode / PaneInput mode), and layout mode ("Layout: {mode}").
+- **mode** — input mode (command mode / PaneInput mode), layout mode ("Layout: {mode}"), the New Agent form's **Mode** field (`No mode`, an orchestration, `schedule`, `dispatcher`), and dispatcher mode. Workspace mode (`[[modes]]`) was a fourth sense until #1199 removed it.
 - **workflow** — in the desktop, the pipeline of stages and nodes that issue #1043 owns (`workflow-node`, "No workflow nodes reported", `WorkflowStage`). The word for an orchestration is **orchestration**, not workflow.
 - **dispatch** — the TUI's `dot-agent-deck dispatch` verb, which creates a worktree and an isolated line of work. It is not the word for handing work to a role; that is **delegate**, which is why the desktop's "dispatched" edge status became "delegated".
 - **run** — the desktop's Runs screen and its run vocabulary belong to #1043.

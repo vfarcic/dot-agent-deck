@@ -30,7 +30,7 @@
  *
  * Remote environments and the desktop app are real but secondary -- they are
  * about WHERE the deck runs, not what it does -- and they keep the bands they
- * already had. Workspace modes are being REMOVED (issue #1199), so they are
+ * already had. Workspace modes were REMOVED (issue #1199), so they are
  * gone from the marketing surface entirely.
  *
  * The four-step story arc was rebuilt on that basis. The old ending, "walk
@@ -213,7 +213,7 @@ export const why = {
 
 /**
  * The design decisions the page argues from. "Focus-mode side panes" was the
- * third of these and is GONE: workspace modes are being removed (issue #1199,
+ * third of these and is GONE: workspace modes were removed (issue #1199,
  * "they do not work well"), and a marketing page should not advertise a
  * feature on its way out.
  *
