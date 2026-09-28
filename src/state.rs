@@ -1740,7 +1740,7 @@ fn work_done_footer(role: &str) -> String {
          ```bash\n\
          {bin} work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
          ```\n\n\
-         Anything outside that allowlist is rewritten by your own shell before {bin} \
+         Anything outside that allowlist is rewritten by your own shell before the deck \
          sees it: backticks and `$(…)` are executed and replaced by their output (usually empty), \
          `$VAR` becomes its value or nothing, a balanced inner `\"` is removed and changes how the \
          rest of the argument is quoted, a `\\` before `$`, a backtick, `\"` or `\\` removes \
@@ -1767,6 +1767,21 @@ fn work_done_footer(role: &str) -> String {
 /// lives in the task file instead of the injected pane prompt.
 pub fn compose_delegate_prompt(task_body: &str) -> String {
     task_body.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Stand-in for the deck's command word in notice prose that goes through
+/// [`compose_delegate_prompt`], swapped for the real word by
+/// [`with_deck_command_word`] only AFTER the whitespace collapse (issue #549
+/// review): the word is an absolute path, and collapsing a run of spaces inside
+/// a quoted path would name a different file. No whitespace, and no character
+/// the scrubbed pane id interpolated beside it can contain.
+const DECK_BIN_SLOT: &str = "@@DOT_AGENT_DECK_BIN@@";
+
+/// Replace [`DECK_BIN_SLOT`] in an already-collapsed notice with
+/// [`crate::platform::paths::binary_name`]. That word contains no control
+/// character (`is_prose_safe_path`), so the notice stays one line.
+fn with_deck_command_word(notice: String) -> String {
+    notice.replace(DECK_BIN_SLOT, &crate::platform::paths::binary_name())
 }
 
 /// PRD #126 test/e2e seam: overrides the resolved worker-response timeout with
@@ -1977,10 +1992,11 @@ pub fn describe_blocked_workers(blocked: &[crate::event::BlockedWorker]) -> Stri
 /// place to undo that. A plain restart of a healthy worker is refused with its own
 /// message, which is where `--force` is learned.
 pub fn busy_worker_remedy() -> String {
+    let bin = crate::platform::paths::binary_name();
     format!(
         "Wait for its work-done before delegating to it again. If that earlier task is \
          genuinely abandoned, re-send with --supersede to dispatch anyway. Restarting the worker \
-         with `dot-agent-deck pane restart` also retires what it owed, and an unanswered \
+         with `{bin} pane restart` also retires what it owed, and an unanswered \
          delegation stops counting {} days after it was issued.",
         crate::agent_pty::DELEGATION_COMMISSION_TTL.as_secs() / (24 * 60 * 60)
     )
@@ -3920,7 +3936,8 @@ fn compose_delegate_silence_notice(window: std::time::Duration, pane_text: Optio
 ///   covers what remains: a `work-done` arriving after this report is to be
 ///   trusted over it.
 pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
-    compose_delegate_prompt(&format!(
+    let bin = DECK_BIN_SLOT;
+    with_deck_command_word(compose_delegate_prompt(&format!(
         "⚠ delegated worker exited without work-done (dot-agent-deck daemon report) - a report \
          from the dot-agent-deck daemon, not a message from a person or an agent: the process \
          behind pane {worker_pane_id} ended and no work-done was ever received for its \
@@ -3928,10 +3945,10 @@ pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
          it was sent just before the process ended: trust it over this report. Otherwise check \
          that pane's scrollback for what happened and decide how to proceed - if this needs the \
          user, notify the user; otherwise re-delegate or reassign the task. That worker still \
-         counts as owing it, so re-delegating to the same role needs `dot-agent-deck pane \
+         counts as owing it, so re-delegating to the same role needs `{bin} pane \
          restart <role>` first, or `delegate --supersede`. The daemon log names the role and how \
          long it had been delegated."
-    ))
+    )))
 }
 
 /// The single-line report the daemon SUBMITS into the ORCHESTRATOR's pane when
@@ -4028,7 +4045,8 @@ pub(crate) fn spawn_lift_replaced_quota_blocks(
 ///   orchestrator is told to check the card first, and to keep waiting if the
 ///   worker is working again.
 pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
-    compose_delegate_prompt(&format!(
+    let bin = DECK_BIN_SLOT;
+    with_deck_command_word(compose_delegate_prompt(&format!(
         "⚠ delegated worker blocked by a provider usage limit (dot-agent-deck daemon report) - a \
          report from the dot-agent-deck daemon, not a message from a person or an agent: the \
          agent behind pane {worker_pane_id} is alive but it reports that its provider usage \
@@ -4037,9 +4055,9 @@ pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
          Blocked, reassign the task to a role backed by a different provider or account, or \
          notify the user if this needs them; if it is working again, keep waiting. That worker \
          still counts as owing the task, so re-delegating to the same role needs \
-         `dot-agent-deck pane restart <role>` first, or `delegate --supersede`. The daemon log \
+         `{bin} pane restart <role>` first, or `delegate --supersede`. The daemon log \
          names the role."
-    ))
+    )))
 }
 
 /// The notice written into the ORCHESTRATOR's pane when a `clear = true`
@@ -13232,9 +13250,8 @@ mod tests {
 
     /// Scenario: Build a worker task file's `## When done` footer and check
     /// that both its `work-done` command examples name what `binary_name()`
-    /// resolves for the running process — under `cargo test` the throwaway
-    /// test binary is never on `$PATH`, so this is its own absolute
-    /// `current_exe()` path, never the crate's baked-in literal name.
+    /// resolves for the running process — its own absolute `current_exe()`
+    /// path (issue #549), never the crate's baked-in literal name.
     #[spec("orchestration/delegate/017")]
     #[test]
     fn delegate_017_work_done_footer_names_the_running_binary() {
