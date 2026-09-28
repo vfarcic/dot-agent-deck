@@ -348,6 +348,67 @@
   gap: 4.5rem;
 }
 
+/*
+ * The Terminal UI | Desktop app switch above the rows. It sits inside the
+ * story's flex column, so the column's 4.5rem gap would push the first row a
+ * full beat away from it; the negative bottom margin keeps it reading as the
+ * rows' own control rather than as a section of its own.
+ */
+.storySwitch {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  margin-bottom: -2rem;
+}
+
+.storySwitchLabel {
+  font-size: 0.8rem;
+  color: var(--c-dim);
+  margin-right: 0.25rem;
+}
+
+.storySwitchButton {
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--c-dim);
+  background: transparent;
+  border: 1px solid var(--c-line);
+  border-radius: 999px;
+  padding: 0.3rem 0.95rem;
+  cursor: pointer;
+}
+
+.storySwitchButton:hover {
+  color: var(--c-ink);
+}
+
+.storySwitchButton[aria-pressed='true'] {
+  color: var(--c-teal);
+  background: var(--c-teal-soft);
+  border-color: var(--c-teal);
+}
+
+.storySwitchButton:focus-visible {
+  outline: 2px solid var(--c-teal);
+  outline-offset: 2px;
+}
+
+/*
+ * At phone width the label and both buttons do not fit on one line, and
+ * letting them wrap strands one button on a line of its own. Give the label
+ * the whole first line instead, so the two choices always sit side by side.
+ */
+@media (max-width: 480px) {
+  .storySwitchLabel {
+    flex-basis: 100%;
+    text-align: center;
+    margin-right: 0;
+  }
+}
+
 .storyRow,
 .storyRowFlip {
   display: grid;

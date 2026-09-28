@@ -329,3 +329,7 @@ Every image in the Docs plan's screenshot table is on its page. **Both clients, 
 ### 2026-09-28 — Archived
 
 All eight milestones complete. M8 is delivered by `release.yml`'s `docs` job, which publishes `main` on every release — the first release after this merges publishes these docs; no separate `/publish-docs` run is needed. PRD moved to `prds/done/`.
+
+### 2026-09-28 — Home page story rows cover both clients
+
+A review of the PR found that the home page's "How it works" rows (01–04) still described only the terminal UI, in their copy and in all four frames; M5 had added a separate two-clients section and left them alone. Their copy now covers both clients: row 01 is "Start an agent" and names both Ctrl+n and New agent, and rows 02–04 name the card and the tab alongside the row and the group. A **Terminal UI | Desktop app** switch above the rows chooses the frames, and it shares its stored choice with the docs' `groupId="client"` tabs, so a reader's pick carries between the two. Rows 01–03 use the generated desktop frames `new-agent`, `dashboard-fleet` and `orchestration`. Row 04 has no desktop frame, because the desktop fixture has no dispatcher transcript to capture, so under Desktop it keeps the terminal UI frame and its caption says so.

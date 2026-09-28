@@ -597,6 +597,31 @@ export const screenshots = {
     caption:
       'Two units up from one dispatcher pane, and neither of them is a single agent — each is a whole 6-role orchestration, in its own copy of the repository, both cut from main at the same commit. The yellow arrow marks the ask that follows: keep three running at a time, start a fresh one whenever a slot frees, stop at twenty — which the pane reads back as eighteen still to go.',
   },
+  /*
+   * The desktop app's frames for the story rows. Unlike the terminal UI's
+   * frames above, which are captures of real decks at work, these come from
+   * `cargo docs-screenshots` (docs/develop/docs-screenshots.md) and show the
+   * app's fixture data, so a recapture after a UI change is one command. The
+   * alt text and captions are written against the committed frames.
+   */
+  newAgentDesktop: {
+    src: '/img/new-agent-desktop.png',
+    alt: 'The desktop app’s New agent dialog over the Agent dashboard — daemon Local daemon, directory /home/dev/demo-project, a Mode row offering No mode, Orch: demo-loop, schedule and dispatcher, Name demo-project, an empty Command field, and Discard and Create agent buttons',
+    caption:
+      'The desktop app’s New agent dialog makes the same choice, after asking which daemon to start the agent on. demo-loop is not built in: it is the orchestration this directory defines.',
+  },
+  deckDesktop: {
+    src: '/img/dashboard-fleet-desktop.png',
+    alt: 'The desktop app’s Agent dashboard showing All daemons: a Local daemon section with four standalone agents and a dev@build-box section with two, each row showing its status, running or waiting, its name and its uptime, under counters reading 6 agents, 3 running, 3 waiting and daemons 2/2',
+    caption:
+      'Two daemons on one dashboard, this machine and a remote build box, each in its own section with its own New agent button.',
+  },
+  parallelDesktop: {
+    src: '/img/orchestration-desktop.png',
+    alt: 'The desktop app’s Agent dashboard with a demo-loop orchestration group below the standalone agents: 01 planner, marked ORCHESTRATOR, and 02 builder, both running, with a Close button on the group’s header',
+    caption:
+      'In the desktop app an orchestration is a group: its roles in order, the one you message marked ORCHESTRATOR, and one Close for all of them.',
+  },
 };
 
 export const audience = {
@@ -611,49 +636,60 @@ export const audience = {
 };
 
 /**
- * The four story rows. Each step names the `screenshots` entry it carries, so
- * the page joins copy to frame BY NAME -- `step.shot` -- rather than by lining
- * two arrays up positionally. Reordering the steps or inserting one therefore
- * carries each row's image, alt text and caption with it; the positional form
- * mispaired them silently, which is what `bc6f0abe` had to repair by hand.
- * `screenshots` is declared above, so a typo here is `undefined` and the first
- * property read fails the build rather than rendering the wrong frame.
+ * The four story rows. Each step names the `screenshots` entries it carries,
+ * so the page joins copy to frame BY NAME -- `step.shots.tui` and
+ * `step.shots.desktop` -- rather than by lining two arrays up positionally.
+ * Reordering the steps or inserting one therefore carries each row's images,
+ * alt text and captions with it; the positional form mispaired them silently,
+ * which is what `bc6f0abe` had to repair by hand. `screenshots` is declared
+ * above, so a typo here is `undefined` and the first property read fails the
+ * build rather than rendering the wrong frame.
  *
- * `shot` is OPTIONAL. A step without one renders as a single centred column
- * rather than as half a two-column row with the picture missing. Every step
- * carries one today; the branch is kept for the next row written before its
- * frame is taken, which is how row 04 shipped while `dispatch.webp` was being
- * captured.
+ * The copy is written for BOTH clients (PRD #1321): each capability here lives
+ * in the daemon, so the terminal UI and the desktop app both have it, and where
+ * the two present it differently -- a card or a row, a tab or a group -- the
+ * body names both. The frames follow a switch above the rows, which shares its
+ * choice with the docs' TUI | Desktop tabs (`groupId="client"`).
+ *
+ * `shots` is OPTIONAL, and so is either half of it. A step with no frame at
+ * all renders as a single centred column rather than as half a two-column row
+ * with the picture missing. A step with only a terminal UI frame shows it
+ * under both settings of the switch, with `desktopNote` saying so in place of
+ * a desktop caption; row 04 is that case, because the dispatcher's work is a
+ * conversation in an agent's pane and the desktop fixture has no dispatcher
+ * transcript to capture.
  *
  * The arc is an escalation, and each rung is a shipped feature rather than a
- * restatement of the one before it: one pane, then many of them visible at
+ * restatement of the one before it: one agent, then many of them visible at
  * once, then one agent running the others, then whole new lines of work
  * starting in their own copies of the repo without you setting any of it up.
  */
 export const workflow = [
   {
     step: '01',
-    title: 'Open a pane',
-    body: 'Ctrl+n, pick a directory, and choose what starts there. A single agent on the command you give it. A full multi-agent orchestration, in its own tab. A dispatcher you can ask for isolated work. Or a scheduled task, written here and fired later by the deck itself.',
-    shot: screenshots.newPane,
+    title: 'Start an agent',
+    body: 'Pick a directory and choose what starts there: Ctrl+n in the terminal UI, New agent in the desktop app. A single agent on the command you give it. A full multi-agent orchestration, every role at once. A dispatcher you can ask for isolated work. Or a scheduled task, written here and fired later by the deck itself.',
+    shots: {tui: screenshots.newPane, desktop: screenshots.newAgentDesktop},
   },
   {
     step: '02',
     title: 'Watch every one of them',
-    body: 'Every pane gets a card: what it is doing right now, the tool it is running, its directory, its last prompt. Live, with nothing for you to wire up. The more agents you run, the tighter the cards get — the deck would rather shrink them than make you go looking for one.',
-    shot: screenshots.deck,
+    body: 'Every agent shows up live, with what it is doing right now, the tool it is running, its directory and its last prompt, and nothing for you to wire up. In the terminal UI each one gets a card, and the cards get tighter the more agents you run, because the deck would rather shrink them than make you go looking for one. In the desktop app each one gets a row with the columns you choose, and one dashboard can hold the agents of several daemons, on this machine and on remote ones.',
+    shots: {tui: screenshots.deck, desktop: screenshots.deckDesktop},
   },
   {
     step: '03',
     title: 'Let one agent run the others',
-    body: 'Define the roles your project needs — orchestrator, coder, reviewer, release — and one agent hands each piece of work to the right one. Every worker starts fresh, with only the context it was given, and you watch the hand-offs land in the other panes. If a worker goes quiet, the deck tells the orchestrator, so a stalled run does not sit there unnoticed.',
-    shot: screenshots.parallel,
+    body: 'Define the roles your project needs — orchestrator, coder, reviewer, release — and one agent hands each piece of work to the right one. Every worker starts fresh, with only the context it was given, and you watch the hand-offs land: across the orchestration’s tab in the terminal UI, down its group in the desktop app. If a worker goes quiet, the deck tells the orchestrator, so a stalled run does not sit there unnoticed.',
+    shots: {tui: screenshots.parallel, desktop: screenshots.parallelDesktop},
   },
   {
     step: '04',
     title: 'Send work off on its own',
-    body: 'Ask a dispatcher pane for something — “work on the search bug” — and it makes a separate copy of your repository and puts an agent, or a whole orchestration, to work inside it. It works in that copy rather than in your working tree, so start as many as you like and carry on with what you were doing. Each unit arrives on the deck as a card or a tab, and reports back when it is done.',
-    shot: screenshots.dispatch,
+    body: 'Ask a dispatcher for something — “work on the search bug” — and it makes a separate copy of your repository and puts an agent, or a whole orchestration, to work inside it. It works in that copy rather than in your working tree, so start as many as you like and carry on with what you were doing. Each unit arrives on the deck, as a card or a tab in the terminal UI and as a row or a group in the desktop app, and reports back when it is done.',
+    shots: {tui: screenshots.dispatch},
+    desktopNote:
+      'Shown in the terminal UI. In the desktop app a dispatcher is an agent like any other: you talk to it in its pane, and the units it starts appear on the dashboard.',
   },
 ];
 

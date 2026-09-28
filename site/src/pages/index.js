@@ -1,6 +1,7 @@
 import {Fragment} from 'react';
 import Layout from '@theme/Layout';
 import Link from '@docusaurus/Link';
+import {useStorageSlot} from '@docusaurus/theme-common';
 import {
   agents,
   agentsNote,
@@ -60,7 +61,7 @@ const doorPages = [
   {
     to: docLinks.gettingStarted,
     title: 'Getting started',
-    body: 'Install it, open your first pane, and read the card it gives you.',
+    body: 'Install it, start your first agent, and read what the deck shows you about it.',
   },
   {
     to: docLinks.orchestration,
@@ -114,10 +115,47 @@ const COUNT_WORDS = ['No', 'One', 'Two', 'Three', 'Four', 'Five', 'Six'];
  * layout the row takes. `landing-content.js` carries the arithmetic.
  */
 function storyRowClass(step, index) {
-  if (!step.shot) {
+  if (!step.shots) {
     return styles.storyRowSolo;
   }
   return index % 2 === 0 ? styles.storyRow : styles.storyRowFlip;
+}
+
+/**
+ * The two clients the story's frames can come from. The values are the ones
+ * the docs' `<Tabs groupId="client">` use, and the switch reads and writes the
+ * same storage slot those tabs do (`docusaurus.tab.client`), so a reader who
+ * picks Desktop in the docs finds the home page on Desktop too, and the other
+ * way round. `useStorageSlot` reads nothing during the static render, so the
+ * page is built showing the terminal UI and switches after hydration when the
+ * reader's stored choice says otherwise.
+ */
+const STORY_CLIENTS = [
+  {value: 'tui', label: 'Terminal UI'},
+  {value: 'desktop', label: 'Desktop app'},
+];
+
+function useStoryClient() {
+  const [stored, slot] = useStorageSlot('docusaurus.tab.client');
+  const client = STORY_CLIENTS.some((c) => c.value === stored) ? stored : 'tui';
+  return [client, (value) => slot.set(value)];
+}
+
+/**
+ * The frame a step shows for the chosen client, and the caption under it. A
+ * step with no desktop frame keeps its terminal UI frame under Desktop and
+ * says so, through `desktopNote`, instead of leaving a hole in the row.
+ */
+function storyFrame(step, client) {
+  if (client === 'desktop' && step.shots.desktop) {
+    return {shot: step.shots.desktop, caption: step.shots.desktop.caption};
+  }
+  const shot = step.shots.tui ?? step.shots.desktop;
+  const caption =
+    client === 'desktop' && !step.shots.desktop && step.desktopNote
+      ? step.desktopNote
+      : shot.caption;
+  return {shot, caption};
 }
 
 /*
@@ -146,6 +184,7 @@ function InstallPill({command}) {
 }
 
 export default function Home() {
+  const [storyClient, setStoryClient] = useStoryClient();
   return (
     <Layout
       title="Run your coding agents in parallel"
@@ -247,30 +286,51 @@ export default function Home() {
             <h2 id="story-title" className={styles.visuallyHidden}>
               How it works
             </h2>
-            {workflow.map((step, i) => (
-              <div key={step.step} className={storyRowClass(step, i)}>
-                <div className={styles.storyText}>
-                  <span className={styles.storyStep}>{step.step}</span>
-                  <h3>{step.title}</h3>
-                  <p>{step.body}</p>
+            <div
+              className={styles.storySwitch}
+              role="group"
+              aria-label="Show the screenshots from">
+              <span className={styles.storySwitchLabel} aria-hidden="true">
+                Screenshots from
+              </span>
+              {STORY_CLIENTS.map((c) => (
+                <button
+                  key={c.value}
+                  type="button"
+                  className={styles.storySwitchButton}
+                  aria-pressed={storyClient === c.value}
+                  onClick={() => setStoryClient(c.value)}>
+                  {c.label}
+                </button>
+              ))}
+            </div>
+            {workflow.map((step, i) => {
+              const frame = step.shots ? storyFrame(step, storyClient) : null;
+              return (
+                <div key={step.step} className={storyRowClass(step, i)}>
+                  <div className={styles.storyText}>
+                    <span className={styles.storyStep}>{step.step}</span>
+                    <h3>{step.title}</h3>
+                    <p>{step.body}</p>
+                  </div>
+                  {frame ? (
+                    <figure
+                      className={
+                        frame.shot.tall
+                          ? `${styles.storyFigure} ${styles.storyFigureTall}`
+                          : styles.storyFigure
+                      }>
+                      <img
+                        src={frame.shot.src}
+                        alt={frame.shot.alt}
+                        loading="lazy"
+                      />
+                      <figcaption>{frame.caption}</figcaption>
+                    </figure>
+                  ) : null}
                 </div>
-                {step.shot ? (
-                  <figure
-                    className={
-                      step.shot.tall
-                        ? `${styles.storyFigure} ${styles.storyFigureTall}`
-                        : styles.storyFigure
-                    }>
-                    <img
-                      src={step.shot.src}
-                      alt={step.shot.alt}
-                      loading="lazy"
-                    />
-                    <figcaption>{step.shot.caption}</figcaption>
-                  </figure>
-                ) : null}
-              </div>
-            ))}
+              );
+            })}
           </section>
 
           <section className={styles.audience}>
