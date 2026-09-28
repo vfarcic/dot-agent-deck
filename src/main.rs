@@ -2129,7 +2129,10 @@ async fn run_tui_session() -> ExitCode {
     //     declines (`ProceedOnExisting`, keep the existing daemon — D4
     //     never-strand).
     //   - Agents + non-TTY: prints the recovery hint to stderr and exits
-    //     non-zero (the only non-zero-exit path).
+    //     non-zero.
+    // Issue #405: a daemon on another attach protocol is never attached to —
+    // a build-id match or a declined restart exits non-zero with a refusal
+    // instead (`ProtocolMismatch`); the restart arms above are unchanged.
     // Errors are already user-visible inside the helper, so we render no
     // further message here.
     let mut handshake = build_version_handshake::ensure_compatible_daemon_or_die(&endpoint).await;
@@ -2169,7 +2172,12 @@ async fn run_tui_session() -> ExitCode {
     }
     let handshake_outcome = match handshake {
         Ok(outcome) => outcome,
-        Err(build_version_handshake::HandshakeError::MismatchAborted) => {
+        // Both already printed their message inside the helper; issue #405's
+        // protocol refusal left the daemon and its agents running.
+        Err(
+            build_version_handshake::HandshakeError::MismatchAborted
+            | build_version_handshake::HandshakeError::ProtocolMismatch { .. },
+        ) => {
             return ExitCode::FAILURE;
         }
         Err(e) => {

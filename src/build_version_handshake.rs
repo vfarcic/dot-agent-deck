@@ -26,8 +26,22 @@
 //! - **Agents running + Non-TTY** (CI, piped stdout): the restart is
 //!   mandatory but can't get consent on a pipe, so print a daemon-recovery
 //!   hint to stderr and exit non-zero. No prompt is rendered; the
-//!   documented recovery is `dot-agent-deck daemon stop`. This is the only
-//!   non-zero-exit path.
+//!   documented recovery is `dot-agent-deck daemon stop`.
+//!
+//! **Protocol skew (issue #405).** Before any of that, the reply's
+//! `server_version` is compared with this binary's
+//! [`PROTOCOL_VERSION`](crate::daemon_protocol::PROTOCOL_VERSION) — exact
+//! equality, as the desktop's `classify_handshake` requires. A daemon on another
+//! protocol can be restarted by the arms above, because a fresh daemon speaks
+//! ours, but it is never attached to: across a skew the dashboard renders
+//! normally while every event this binary cannot decode is dropped. So a skew
+//! with a *matching* build id takes the mismatch path rather than returning
+//! [`HandshakeOutcome::Match`]; the prompt says declining will exit; and
+//! declining — or the non-TTY arm — prints a refusal naming both protocol
+//! numbers and returns [`HandshakeError::ProtocolMismatch`], leaving the daemon
+//! and its agents running. The never-strand rule (D4) is kept in the sense that
+//! nothing is stopped; what moves is how the user reaches those agents — with
+//! the daemon's own build, which the refusal names.
 //!
 //! The handshake runs unconditionally — even when
 //! [`ensure_external_daemon_or_die`] just lazy-spawned the daemon and
@@ -78,7 +92,9 @@ pub enum HandshakeOutcome {
     /// the restart on a TTY (any dismiss key). The existing (older) daemon
     /// is kept and the caller proceeds to attach to it UNCHANGED — the user
     /// keeps their running agents (PRD #161 D4 never-strand). The caller
-    /// must NOT re-spawn the daemon.
+    /// must NOT re-spawn the daemon. Only returned when the daemon speaks this
+    /// binary's attach protocol; across a protocol skew the same decline is
+    /// [`HandshakeError::ProtocolMismatch`] (issue #405).
     ProceedOnExisting,
 }
 
@@ -108,6 +124,14 @@ pub enum HandshakeError {
     /// present). The user-facing remediation is
     /// `dot-agent-deck daemon stop --force`.
     TerminateTimedOut,
+    /// Issue #405: the daemon speaks another attach protocol and this binary
+    /// did not restart it — agents were running and the user declined the
+    /// restart, or stdout is not a terminal so nobody could be asked. The
+    /// daemon and its agents are left running. The actionable refusal is
+    /// already on stderr (printed inside [`ensure_compatible_daemon_or_die`]),
+    /// so callers translate this into a failed exit without rendering more.
+    /// `daemon` is `None` when the reply carried no `server_version` at all.
+    ProtocolMismatch { daemon: Option<u32>, local: u32 },
     /// The platform's termination call itself failed: `libc::kill` on Unix
     /// (EPERM if the daemon belongs to a different user — shouldn't happen
     /// because the attach socket is already trust-checked uid-equal — or ESRCH
@@ -123,6 +147,20 @@ impl std::fmt::Display for HandshakeError {
             Self::Probe(e) => write!(f, "build-version handshake probe failed: {e}"),
             Self::PeerPid(e) => write!(f, "build-version handshake peer-pid lookup failed: {e}"),
             Self::MismatchAborted => write!(f, "build-version handshake aborted by user"),
+            Self::ProtocolMismatch {
+                daemon: Some(daemon),
+                local,
+            } => write!(
+                f,
+                "daemon speaks attach protocol v{daemon}, but this binary speaks v{local}"
+            ),
+            Self::ProtocolMismatch {
+                daemon: None,
+                local,
+            } => write!(
+                f,
+                "daemon predates the attach-protocol version field; this binary speaks v{local}"
+            ),
             Self::TerminateTimedOut => write!(
                 f,
                 "daemon did not exit within {}s after SIGTERM; try `dot-agent-deck daemon stop --force`",
@@ -140,10 +178,12 @@ impl std::error::Error for HandshakeError {}
 /// mismatch, returning once the laptop can safely attach — either to a
 /// freshly-restarted daemon ([`HandshakeOutcome::Recovered`]) or to the
 /// existing one when the user declined the restart
-/// ([`HandshakeOutcome::ProceedOnExisting`]). The only `Err` return is the
+/// ([`HandshakeOutcome::ProceedOnExisting`]). The `Err` returns are the
 /// agents-running non-TTY mandatory-restart path
-/// ([`HandshakeError::MismatchAborted`], after a stderr hint) and genuine
-/// pre-flight failures (probe / peer-pid / SIGTERM).
+/// ([`HandshakeError::MismatchAborted`], after a stderr hint), a daemon on
+/// another attach protocol that was not restarted
+/// ([`HandshakeError::ProtocolMismatch`], after a stderr refusal — issue #405),
+/// and genuine pre-flight failures (probe / peer-pid / SIGTERM).
 ///
 /// PRD M2.3 — runs unconditionally, even when
 /// [`crate::daemon_attach::ensure_external_daemon_or_die`] just lazy-spawned
@@ -170,8 +210,19 @@ pub async fn ensure_compatible_daemon_or_die(
     let local_build = local_build_id();
     let probe = probe_daemon(attach_path).await?;
 
+    // Issue #405: read the daemon's attach protocol FIRST, before any build-id
+    // branching, because it decides which branches may end in an attach. A
+    // daemon on another protocol can be restarted (a fresh one speaks ours) but
+    // never attached to: the dashboard would render normally while every event
+    // this binary cannot decode was dropped. So a skew turns `Match` into the
+    // mismatch path, and turns declining the restart into a refusal rather than
+    // `ProceedOnExisting`. Exact equality, as the desktop's `classify_handshake`
+    // requires — see `ProtocolCheck` for why not a directional rule.
+    let protocol = ProtocolCheck::of(probe.response.server_version);
     let daemon_build = probe.response.build_version.clone();
-    if daemon_build.as_deref() == Some(local_build.as_str()) {
+    if protocol == ProtocolCheck::Compatible
+        && daemon_build.as_deref() == Some(local_build.as_str())
+    {
         tracing::debug!(
             target: "build_version_handshake",
             local_build,
@@ -241,14 +292,38 @@ pub async fn ensure_compatible_daemon_or_die(
         target: "build_version_handshake",
         local_build,
         daemon_build = ?daemon_build,
+        daemon_protocol = ?probe.response.server_version,
         live_agents = agents.len(),
         "local daemon build_version handshake: mismatch, agents present — consent path"
     );
 
+    // Issue #405: the refusal both non-restart exits below take when the
+    // protocol differs. Printed here, like the build-id hint, so callers render
+    // nothing further.
+    let refuse_protocol = |daemon_protocol: Option<u32>| {
+        eprint!(
+            "{}",
+            render_protocol_refusal(
+                daemon_protocol,
+                daemon_build.as_deref(),
+                &local_build,
+                &agents
+            )
+        );
+        HandshakeError::ProtocolMismatch {
+            daemon: daemon_protocol,
+            local: PROTOCOL_VERSION,
+        }
+    };
+
     // (c) Agents present + non-TTY: the restart is mandatory but can't get
     // consent on a pipe, so print the daemon-recovery hint to stderr and
-    // exit non-zero. This is the only non-zero-exit path.
+    // exit non-zero. Under a protocol skew the hint is the protocol refusal,
+    // which says why this binary cannot simply attach.
     if !std::io::stdout().is_terminal() {
+        if let ProtocolCheck::Skewed { daemon } = protocol {
+            return Err(refuse_protocol(daemon));
+        }
         let msg = render_non_tty_error(daemon_build.as_deref(), &local_build);
         eprint!("{msg}");
         return Err(HandshakeError::MismatchAborted);
@@ -266,17 +341,58 @@ pub async fn ensure_compatible_daemon_or_die(
             daemon_build_for_prompt.as_deref(),
             &local_build_for_prompt,
             &agents_for_prompt,
+            protocol,
         )
     })
     .await
     .map_err(|e| HandshakeError::Probe(io::Error::other(format!("prompt task join: {e}"))))?;
 
-    match decision {
+    match (decision, protocol) {
         // Decline keeps the existing (older) daemon: proceed to attach to
         // it unchanged so the user's running agents stay reachable (PRD
         // #161 D4 never-strand). The caller must NOT re-spawn.
-        InteractiveDecision::Decline => Ok(HandshakeOutcome::ProceedOnExisting),
-        InteractiveDecision::Restart => terminate_and_recover(&probe, endpoint).await,
+        (InteractiveDecision::Decline, ProtocolCheck::Compatible) => {
+            Ok(HandshakeOutcome::ProceedOnExisting)
+        }
+        // Issue #405: declining still keeps the daemon and its agents — nothing
+        // is stopped — but this binary cannot attach to it, so it exits with
+        // the refusal, which names the build that CAN attach.
+        (InteractiveDecision::Decline, ProtocolCheck::Skewed { daemon }) => {
+            Err(refuse_protocol(daemon))
+        }
+        (InteractiveDecision::Restart, _) => terminate_and_recover(&probe, endpoint).await,
+    }
+}
+
+/// Issue #405 — whether the daemon's advertised attach protocol
+/// ([`AttachResponse::server_version`]) is the one this binary speaks.
+///
+/// **Exact equality**, the rule the desktop's `classify_handshake` applies, and
+/// deliberately not a directional one. An older daemon paired with a newer TUI
+/// happens to be decodable after some bumps — the older daemon cannot emit
+/// variants it never had — but that is a property of which variants one bump
+/// added, not something [`PROTOCOL_VERSION`]'s contract promises, and a
+/// `server_version <= PROTOCOL_VERSION` rule would silently bless the next bump
+/// for which it is false. A reply with no `server_version` at all predates the
+/// field and is skewed too; issue #326 is where "unknown" and "ancient" may one
+/// day be told apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolCheck {
+    /// `server_version == Some(PROTOCOL_VERSION)`.
+    Compatible,
+    /// Anything else. `daemon` is what the daemon advertised, if anything.
+    Skewed { daemon: Option<u32> },
+}
+
+impl ProtocolCheck {
+    fn of(server_version: Option<u32>) -> Self {
+        if server_version == Some(PROTOCOL_VERSION) {
+            Self::Compatible
+        } else {
+            Self::Skewed {
+                daemon: server_version,
+            }
+        }
     }
 }
 
@@ -689,10 +805,16 @@ fn render_non_tty_error(daemon_build: Option<&str>, local_build: &str) -> String
 /// reply's `running_agents`) and offers a single-key consent: `s` to
 /// restart (stopping the agents), any other key to keep the existing
 /// daemon and continue.
+///
+/// Issue #405: under a protocol skew the prompt says so, and its decline key is
+/// relabelled — declining still keeps the daemon and its agents, but this binary
+/// exits instead of attaching, so "keep current daemon" alone would promise an
+/// attach that is not coming.
 fn render_mismatch_prompt(
     daemon_build: Option<&str>,
     local_build: &str,
     agents: &[String],
+    protocol: ProtocolCheck,
 ) -> String {
     let daemon_display = daemon_build.unwrap_or("<unknown>");
     let mut out = String::new();
@@ -702,6 +824,13 @@ fn render_mismatch_prompt(
     ));
     out.push_str(&format!("   running daemon:  {daemon_display}\n"));
     out.push_str(&format!("   this binary:     {local_build}\n"));
+    if let ProtocolCheck::Skewed { daemon } = protocol {
+        out.push('\n');
+        out.push_str(&format!(
+            "   This binary cannot attach to it: {}.\n",
+            describe_protocol_skew(daemon)
+        ));
+    }
     out.push('\n');
     out.push_str("   Restarting to upgrade will stop these agents:\n");
     for name in agents {
@@ -710,7 +839,90 @@ fn render_mismatch_prompt(
         out.push_str(&format!("   {}\n", sanitize_for_prompt(name, false)));
     }
     out.push('\n');
-    out.push_str("   [S] restart daemon and continue   [any other key] keep current daemon\n");
+    match protocol {
+        ProtocolCheck::Compatible => out.push_str(
+            "   [S] restart daemon and continue   [any other key] keep current daemon\n",
+        ),
+        ProtocolCheck::Skewed { .. } => out.push_str(
+            "   [S] restart daemon and continue   [any other key] exit, leaving the daemon running\n",
+        ),
+    }
+    out
+}
+
+/// Issue #405 — the protocol half of the refusal's first line, shared with the
+/// prompt so both say it the same way.
+fn describe_protocol_skew(daemon: Option<u32>) -> String {
+    match daemon {
+        Some(daemon) => format!(
+            "the daemon speaks attach protocol v{daemon}, but this binary speaks v{PROTOCOL_VERSION}"
+        ),
+        None => format!(
+            "the daemon predates the attach-protocol version field, and this binary speaks \
+             v{PROTOCOL_VERSION}"
+        ),
+    }
+}
+
+/// Issue #405 — the refusal printed when this binary will not attach to a
+/// daemon on another attach protocol. Trailing newline included.
+///
+/// It has to be actionable because agents may be running under that daemon:
+/// it names both protocol numbers, both builds and the agents, says the
+/// daemon was left running, and gives both ways out — the daemon's own build,
+/// which keeps the agents, or `daemon stop`, which is stated to stop them.
+/// Everything the daemon supplied (its build id, agent names) goes through
+/// [`sanitize_for_prompt`] with newlines stripped, as the build-id hint does.
+fn render_protocol_refusal(
+    daemon_protocol: Option<u32>,
+    daemon_build: Option<&str>,
+    local_build: &str,
+    agents: &[String],
+) -> String {
+    let daemon_display = sanitize_for_prompt(daemon_build.unwrap_or("<unknown>"), false);
+    let local_display = sanitize_for_prompt(local_build, false);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "error: {}\n",
+        HandshakeError::ProtocolMismatch {
+            daemon: daemon_protocol,
+            local: PROTOCOL_VERSION,
+        }
+    ));
+    out.push_str(&format!("   running daemon:  {daemon_display}\n"));
+    out.push_str(&format!("   this binary:     {local_display}\n"));
+    out.push('\n');
+    out.push_str(
+        "   Not attaching: across an attach-protocol change the dashboard would look normal\n\
+         \x20  while every event this binary cannot decode was silently dropped.\n",
+    );
+    out.push('\n');
+    if agents.is_empty() {
+        out.push_str(
+            "   The daemon is still running; this binary could not tell which agents are\n\
+             \x20  running under it.\n",
+        );
+    } else {
+        out.push_str(&format!(
+            "   The daemon is still running, and so are its {n} agent(s):\n",
+            n = agents.len()
+        ));
+        for name in agents {
+            out.push_str(&format!("   {}\n", sanitize_for_prompt(name, false)));
+        }
+    }
+    out.push('\n');
+    let own_build = match daemon_build {
+        Some(_) => format!("the daemon's own build ({daemon_display})"),
+        None => "the build that started the daemon".to_string(),
+    };
+    out.push_str(&format!(
+        "   To keep them: attach with {own_build} instead of this binary.\n"
+    ));
+    out.push_str(
+        "   To use this binary: `dot-agent-deck daemon stop` (which stops those agents too),\n\
+         \x20  then relaunch.\n",
+    );
     out
 }
 
@@ -736,6 +948,7 @@ fn interactive_prompt(
     daemon_build: Option<&str>,
     local_build: &str,
     agents: &[String],
+    protocol: ProtocolCheck,
 ) -> InteractiveDecision {
     use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -747,7 +960,7 @@ fn interactive_prompt(
         }
     }
 
-    let prompt = render_mismatch_prompt(daemon_build, local_build, agents);
+    let prompt = render_mismatch_prompt(daemon_build, local_build, agents, protocol);
     let raw_ok = enable_raw_mode().is_ok();
     let _guard = raw_ok.then_some(RawModeGuard);
 
@@ -864,6 +1077,270 @@ mod tests {
         );
     }
 
+    /// Issue #405 — a scripted daemon on a Unix socket in a tempdir that answers
+    /// every `hello` with `server_version` / `build_version` as given and ONE
+    /// running agent. The agent is load-bearing for safety, not just for the
+    /// scenario: `peer_pid()` on this socket is the TEST process, so a path that
+    /// reached `terminate_and_recover` would SIGTERM the test itself. A non-zero
+    /// `running_agents` keeps every run off the silent-restart arm, and the
+    /// callers skip when stdout is a terminal, which keeps them off the prompt.
+    #[cfg(unix)]
+    async fn scripted_daemon(
+        server_version: Option<u32>,
+        build_version: String,
+    ) -> (
+        tempfile::TempDir,
+        LocalEndpoint,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use crate::daemon_protocol::{KIND_REQ, bind_attach_listener, read_frame, write_resp};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("skewed-daemon.sock");
+        let listener = bind_attach_listener(&path).expect("bind scripted daemon");
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+            {
+                let Ok(Some((KIND_REQ, _payload))) = read_frame(&mut stream).await else {
+                    continue;
+                };
+                let resp = AttachResponse {
+                    server_version,
+                    build_version: Some(build_version.clone()),
+                    ..AttachResponse::hello(PROTOCOL_VERSION)
+                }
+                .with_running_agents(RunningAgentsSummary {
+                    count: 1,
+                    names: vec!["alpha".into()],
+                });
+                let _ = write_resp(&mut stream, &resp).await;
+            }
+        });
+        (dir, LocalEndpoint::at(path), server)
+    }
+
+    /// Issue #405 — under `--nocapture` on a terminal, the agents-present arm
+    /// would render the interactive prompt and block on a keypress. These tests
+    /// are about the non-TTY outcome, so they step aside rather than hang.
+    #[cfg(unix)]
+    fn stdout_is_a_terminal_so_skip(test: &str) -> bool {
+        if std::io::stdout().is_terminal() {
+            eprintln!("SKIP: {test}: stdout is a terminal, which would reach the prompt");
+            return true;
+        }
+        false
+    }
+
+    /// Issue #405 — the defect as reported: a daemon whose build id matches but
+    /// whose attach protocol does not must NOT be attached to. Build-id equality
+    /// normally implies protocol equality, but two uncommitted builds of one
+    /// commit share a `-dirty` id, so `Match` alone never proved it. Pre-fix
+    /// this returned `Ok(Match)` — attached — without reading `server_version`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn protocol_skew_is_refused_even_when_build_ids_match() {
+        if stdout_is_a_terminal_so_skip("protocol_skew_is_refused_even_when_build_ids_match") {
+            return;
+        }
+        let newer = PROTOCOL_VERSION + 1;
+        let (_dir, endpoint, server) = scripted_daemon(Some(newer), local_build_id()).await;
+        let result = ensure_compatible_daemon_or_die(&endpoint).await;
+        server.abort();
+        match result {
+            Ok(outcome) => panic!(
+                "attached ({outcome:?}) to a daemon speaking protocol v{newer} from a binary \
+                 speaking v{PROTOCOL_VERSION}"
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains(&format!("v{newer}"))
+                        && msg.contains(&format!("v{PROTOCOL_VERSION}")),
+                    "the refusal must name both protocol versions, got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Issue #405 — the reproduction's own pairing: build ids differ AND the
+    /// protocol differs, agents are live, stdout is a pipe. Pre-fix this exited
+    /// with the build-id hint alone, which never says the two cannot talk.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn protocol_skew_with_agents_on_a_pipe_is_refused_naming_the_protocol() {
+        if stdout_is_a_terminal_so_skip(
+            "protocol_skew_with_agents_on_a_pipe_is_refused_naming_the_protocol",
+        ) {
+            return;
+        }
+        let older = PROTOCOL_VERSION - 1;
+        let (_dir, endpoint, server) =
+            scripted_daemon(Some(older), "0.1.0-g0000old".to_string()).await;
+        let result = ensure_compatible_daemon_or_die(&endpoint).await;
+        server.abort();
+        let err = result.expect_err("a protocol-skewed daemon with live agents must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("v{older}")) && msg.contains(&format!("v{PROTOCOL_VERSION}")),
+            "the refusal must name both protocol versions, got: {msg}"
+        );
+    }
+
+    /// Issue #405 — a daemon that predates the version field (no
+    /// `server_version` at all) is refused too, matching the desktop's
+    /// `classify_handshake`, which requires `Some(PROTOCOL_VERSION)` exactly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_without_a_protocol_version_is_refused() {
+        if stdout_is_a_terminal_so_skip("daemon_without_a_protocol_version_is_refused") {
+            return;
+        }
+        let (_dir, endpoint, server) = scripted_daemon(None, local_build_id()).await;
+        let result = ensure_compatible_daemon_or_die(&endpoint).await;
+        server.abort();
+        let err = result.expect_err("a daemon with no protocol version must not be attached to");
+        assert!(
+            err.to_string().contains("predates"),
+            "the refusal must say the daemon predates the version field, got: {err}"
+        );
+    }
+
+    /// Issue #405 control — the same scripted daemon at THIS build's protocol and
+    /// build id still matches, so the refusals above are attributable to the
+    /// protocol number and not to the scripted daemon itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn matching_protocol_and_build_still_match() {
+        let (_dir, endpoint, server) =
+            scripted_daemon(Some(PROTOCOL_VERSION), local_build_id()).await;
+        let result = ensure_compatible_daemon_or_die(&endpoint).await;
+        server.abort();
+        assert_eq!(
+            result.expect("an identical daemon must be attached to"),
+            HandshakeOutcome::Match
+        );
+    }
+
+    #[test]
+    fn protocol_check_is_exact_equality() {
+        // Issue #405: the desktop's `classify_handshake` rule, both directions.
+        assert_eq!(
+            ProtocolCheck::of(Some(PROTOCOL_VERSION)),
+            ProtocolCheck::Compatible
+        );
+        for other in [Some(PROTOCOL_VERSION - 1), Some(PROTOCOL_VERSION + 1), None] {
+            assert_eq!(
+                ProtocolCheck::of(other),
+                ProtocolCheck::Skewed { daemon: other },
+                "{other:?} must not be compatible with v{PROTOCOL_VERSION}"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_refusal_names_versions_builds_agents_and_both_ways_out() {
+        // Issue #405: pinned character for character. The user may have live
+        // agents under this daemon, so the message says they are still running,
+        // names them, and offers the way out that keeps them before the one
+        // that stops them.
+        let msg = render_protocol_refusal(
+            Some(PROTOCOL_VERSION + 1),
+            Some("0.44.0-g1111new"),
+            "0.43.0-g0000old",
+            &["alpha".into(), "beta".into()],
+        );
+        let expected = format!(
+            "error: daemon speaks attach protocol v{newer}, but this binary speaks v{local}\n\
+             \x20  running daemon:  0.44.0-g1111new\n\
+             \x20  this binary:     0.43.0-g0000old\n\
+             \n\
+             \x20  Not attaching: across an attach-protocol change the dashboard would look normal\n\
+             \x20  while every event this binary cannot decode was silently dropped.\n\
+             \n\
+             \x20  The daemon is still running, and so are its 2 agent(s):\n\
+             \x20  alpha\n\
+             \x20  beta\n\
+             \n\
+             \x20  To keep them: attach with the daemon's own build (0.44.0-g1111new) instead of this binary.\n\
+             \x20  To use this binary: `dot-agent-deck daemon stop` (which stops those agents too),\n\
+             \x20  then relaunch.\n",
+            newer = PROTOCOL_VERSION + 1,
+            local = PROTOCOL_VERSION,
+        );
+        assert_eq!(msg, expected);
+    }
+
+    #[test]
+    fn protocol_refusal_for_a_daemon_that_predates_the_field_and_unknown_agents() {
+        // No `server_version`, no build id, and agents that could not be listed
+        // (`AgentsPresent { names: [] }`): every placeholder must still read.
+        let msg = render_protocol_refusal(None, None, "0.43.0-g0000old", &[]);
+        assert!(
+            msg.starts_with(&format!(
+                "error: daemon predates the attach-protocol version field; this binary speaks \
+                 v{PROTOCOL_VERSION}\n"
+            )),
+            "got: {msg}"
+        );
+        assert!(msg.contains("running daemon:  <unknown>\n"), "got: {msg}");
+        assert!(
+            msg.contains("this binary could not tell which agents are\n"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("To keep them: attach with the build that started the daemon instead"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn protocol_refusal_sanitizes_daemon_supplied_text() {
+        // The build id and agent names came over the wire; an ESC, a bidi
+        // override or a newline in them must not reach the terminal or add lines.
+        let msg = render_protocol_refusal(
+            Some(PROTOCOL_VERSION + 1),
+            Some("0.44.0-g\u{1b}[2J\u{202e}new"),
+            "0.43.0",
+            &["ev\nil\u{1b}".into()],
+        );
+        assert!(
+            !msg.contains('\u{1b}') && !msg.contains('\u{202e}'),
+            "{msg:?}"
+        );
+        assert!(msg.contains("running daemon:  0.44.0-g[2Jnew\n"), "{msg:?}");
+        assert!(msg.contains("\n   evil\n"), "{msg:?}");
+    }
+
+    #[test]
+    fn mismatch_prompt_under_protocol_skew_says_decline_exits() {
+        // Issue #405: declining can no longer attach, so the prompt must not
+        // promise "keep current daemon" as if it would — it names the skew and
+        // says the decline exits with the daemon left running.
+        let out = render_mismatch_prompt(
+            Some("0.44.0-g1111new"),
+            "0.43.0-g0000old",
+            &["alpha".into()],
+            ProtocolCheck::Skewed {
+                daemon: Some(PROTOCOL_VERSION + 1),
+            },
+        );
+        assert!(
+            out.contains(&format!(
+                "   This binary cannot attach to it: the daemon speaks attach protocol v{}, but \
+                 this binary speaks v{PROTOCOL_VERSION}.\n",
+                PROTOCOL_VERSION + 1
+            )),
+            "got: {out}"
+        );
+        assert!(
+            out.ends_with(
+                "   [S] restart daemon and continue   [any other key] exit, leaving the daemon running\n"
+            ),
+            "got: {out}"
+        );
+        assert!(!out.contains("keep current daemon"), "got: {out}");
+    }
+
     #[test]
     fn non_tty_error_message_names_both_build_ids() {
         let msg = render_non_tty_error(Some("0.25.0-gabc1234"), "0.25.0-gdeadbee-dirty");
@@ -929,6 +1406,7 @@ mod tests {
             Some("0.31.0-g0000old"),
             "0.31.1-g1111new",
             &["zeta-live-77".into(), "alpha-2".into()],
+            ProtocolCheck::Compatible,
         );
         let expected = "⚠  Daemon version mismatch  (2 agent(s) running)\n\
              \x20  running daemon:  0.31.0-g0000old\n\
@@ -947,7 +1425,12 @@ mod tests {
         // The new single-consent model: `s` restarts (stopping agents); any
         // other key keeps the current daemon (decline = proceed-on-existing,
         // D4 never-strand). No abort/quit wording survives.
-        let out = render_mismatch_prompt(Some("old"), "new", &["only".into()]);
+        let out = render_mismatch_prompt(
+            Some("old"),
+            "new",
+            &["only".into()],
+            ProtocolCheck::Compatible,
+        );
         assert!(
             out.contains("[S] restart daemon and continue"),
             "must offer the single `s` restart consent, got: {out:?}"
@@ -971,7 +1454,8 @@ mod tests {
         // The header form is "(N agent(s) running)" with a literal "(s)" —
         // no clever singular/plural switching. Pin it so a future "be
         // helpful" cleanup doesn't drift the string.
-        let single = render_mismatch_prompt(Some("a"), "b", &["only".into()]);
+        let single =
+            render_mismatch_prompt(Some("a"), "b", &["only".into()], ProtocolCheck::Compatible);
         assert!(
             single.contains("(1 agent(s) running)"),
             "single-agent header must keep the literal '(s)', got: {single:?}"
@@ -982,7 +1466,12 @@ mod tests {
     fn mismatch_prompt_renders_unknown_daemon_build() {
         // A pre-PRD-103 daemon omits `build_version`; the prompt surfaces
         // the `<unknown>` placeholder rather than an empty span.
-        let out = render_mismatch_prompt(None, "0.31.1-g1111new", &["only".into()]);
+        let out = render_mismatch_prompt(
+            None,
+            "0.31.1-g1111new",
+            &["only".into()],
+            ProtocolCheck::Compatible,
+        );
         assert!(
             out.contains("running daemon:  <unknown>"),
             "missing daemon build_version must surface <unknown>, got: {out:?}"
