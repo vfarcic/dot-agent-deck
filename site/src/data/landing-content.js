@@ -393,7 +393,7 @@ export const installRoutes = [
   },
   {
     name: 'Desktop app (alpha)',
-    detail: 'Outside the CLI’s support expectations, from the releases page. Install the CLI as well: the app connects to a daemon that is already running, and starts none of its own. Each release’s notes say whether its .dmg is signed and notarized; the .deb is unsigned, so check it as below before installing it.',
+    detail: 'Outside the CLI’s support expectations, from the releases page. A release can ship without one or both desktop packages, so check the assets on the release you open; the CLI ships even when they do not. The app connects to a daemon that is already running and starts none of its own: on Linux the .deb installs the dot-agent-deck CLI alongside the app, and on macOS install the CLI too, or start the daemon from the copy inside the app bundle, as the install steps describe. Each release’s notes say whether its .dmg is signed and notarized; the .deb is unsigned, so check it as below before installing it.',
     code: null,
     files: [
       'dot-agent-deck-desktop-alpha-macos-arm64.dmg',
