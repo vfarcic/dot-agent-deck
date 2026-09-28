@@ -457,7 +457,7 @@ pub fn is_valid_cwd(value: &str) -> bool {
 
 /// Which tab a daemon-tracked agent pane belonged to at spawn time
 /// (PRD #76 M2.12). Echoed back via `list_agents` so the TUI can rebuild
-/// the user's mode/orchestration tab structure on reconnect instead of
+/// the user's orchestration tab structure on reconnect instead of
 /// stranding every hydrated pane on the dashboard.
 ///
 /// Validation: the embedded `name` follows the same `is_valid_display_name`
@@ -1289,7 +1289,7 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
 
     // PRD #20 blocker-3: apply the Wrapper integration strategy at the COMMON
     // spawn boundary. Every launch path that reaches a real child — fresh/plain
-    // new-pane, plain/mode RESTORE, orchestration role, scheduler single/role,
+    // new-pane, plain RESTORE, orchestration role, scheduler single/role,
     // issue-dispatch single/role, and respawn — funnels through here, so a
     // Wrapper-strategy agent (Codex) is wrapped into
     // `dot-agent-deck wrap --agent <name> -- <command>` exactly once regardless
@@ -1299,8 +1299,7 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     // non-Wrapper agents, so native agents and pre-wrapped commands are
     // untouched. The BARE command remains the persisted/user-facing metadata
     // upstream (Command field, last_command, SavedPane.command) — only the
-    // actual exec here is transformed. Mode panes type their command into a
-    // shell rather than passing it here; those seams wrap at the type site.
+    // actual exec here is transformed.
     let resolved_agent = opts
         .agent_type
         .clone()
@@ -2372,7 +2371,7 @@ pub struct RunningAgent {
     /// Captured from [`SpawnOptions::tab_membership`] after validation;
     /// invalid values are stored as `None` (same drop pattern as
     /// `display_name`). The TUI uses this on reconnect to rebuild
-    /// mode/orchestration tabs instead of stranding every hydrated pane
+    /// orchestration tabs instead of stranding every hydrated pane
     /// on the dashboard. `None` means dashboard pane (or an older daemon
     /// predating this field — wire-format `skip_serializing_if` keeps the
     /// hydration path backwards compatible).
@@ -2749,7 +2748,7 @@ pub struct AgentRecord {
     /// `None` means either the agent was a dashboard pane, the spawn
     /// supplied an invalid value (dropped at capture), or the daemon ran
     /// an older binary that didn't persist this field. The TUI uses this
-    /// to rebuild mode/orchestration tabs on reconnect.
+    /// to rebuild orchestration tabs on reconnect.
     /// `skip_serializing_if` keeps the wire shape backwards-compatible
     /// with daemons predating this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6577,7 +6576,8 @@ impl AgentPtyRegistry {
     /// PRD #126 M1 audit (finding 2): the orchestration membership of the live
     /// agent on `pane_id`, per its registry `tab_membership`. `None` when no live
     /// agent owns the pane, or when it carries no orchestration membership (a
-    /// dashboard/mode pane, or a pane spawned without membership metadata).
+    /// dashboard pane, a legacy `TabMembership::Mode` pane from an older TUI,
+    /// or a pane spawned without membership metadata).
     ///
     /// The idle watch uses it twice: to refuse delivery into a pane that has
     /// since been re-homed into a *different* orchestration (because `None` is

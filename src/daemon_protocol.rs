@@ -1568,7 +1568,7 @@ pub enum AttachRequest {
     /// aimed at the wrong machine.
     ///
     /// `pane_ids` is every pane the confirmed close would tear down (one for a
-    /// dashboard card, all of them for a Mode/Orchestration tab), because a
+    /// dashboard card, all of them for an orchestration tab), because a
     /// multi-role orchestration shares ONE worktree across its role panes and
     /// any of them resolves it. The reply is best-effort: the caller renders no
     /// warning on any error, which is the same way it treats a down daemon.
@@ -4135,8 +4135,8 @@ async fn handle_connection(
                     // the worker pane and orchestrator pane purely from
                     // daemon state — no TUI round-trip, no broadcast hop.
                     // We do this only for orchestration panes; dashboard
-                    // and mode panes don't participate in delegate
-                    // dispatch.
+                    // panes (and a legacy `TabMembership::Mode` pane)
+                    // don't participate in delegate dispatch.
                     if let (Some(pane_id), Some(meta)) =
                         (pane_id_env.as_deref(), orchestration_meta)
                     {

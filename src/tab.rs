@@ -3420,8 +3420,9 @@ mod tests {
         );
 
         // (d) Only ids the DAEMON supplied are honoured. Everything else on
-        // screen — every pane on the daemon-empty rebuild path, and a Mode
-        // tab's locally-spawned side panes on the warm one — carries a fresh
+        // screen — every pane on the daemon-empty rebuild path (and, until
+        // #1199 removed them, a Mode tab's locally-spawned side panes on the
+        // warm one) — carries a fresh
         // `allocate_id` counter that matches a remembered number by
         // coincidence, so honouring one can focus the WRONG pane. `live-coder`
         // below WOULD resolve, which is what makes dropping it observable.

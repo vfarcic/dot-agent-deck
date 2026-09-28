@@ -358,7 +358,7 @@ pub(crate) enum PaneLayout {
 
 /// Describes which panes to render and how to lay them out, based on the active tab.
 enum ActiveTabView {
-    /// Dashboard tab: show all panes except those managed by mode tabs.
+    /// Dashboard tab: show all panes except those managed by orchestration tabs.
     Dashboard {
         exclude_pane_ids: Vec<String>,
         /// PRD #313: mirrors `Tab::Dashboard::zoomed`. Travels on the snapshot
@@ -1806,7 +1806,8 @@ fn submit_debounce_duration(
     SUBMIT_DEBOUNCE.checked_sub(elapsed).unwrap_or_default()
 }
 
-/// PRD #127 M3.1: a mode's `seed_prompt` queued for delivery to its agent pane,
+/// PRD #127 M3.1: a single-agent card's `seed_prompt` (a built-in option — see
+/// `BuiltinOption`) queued for delivery to its pane,
 /// gated exactly like the orchestrator's spawn-time role prompt — agent-ready
 /// (SessionStart, fast path) or a 10s timeout (slow path), plus the
 /// `SPAWN_TIME_READINESS_BUFFER`, then an atomic `write_and_submit_to_pane`.
@@ -2004,8 +2005,8 @@ struct UiState {
     /// focused-pane sync (M4) reactivates the highlight only on a genuine focus
     /// *transition* — when the focused pane CHANGED to a visible dashboard card
     /// — not on a steady-state focus the tab-switch restore leaves in place
-    /// (e.g. a Mode tab's agent pane, which is a dashboard card and stays
-    /// focused on return). Without this, switching away and back re-armed the
+    /// (first seen with a workspace-mode tab's agent pane, which was also a
+    /// dashboard card; Mode tabs were removed in #1199). Without this, switching away and back re-armed the
     /// highlight a tab switch had cleared (violating SC1).
     last_focused_pane_id: Option<String>,
     /// PRD #341 M6: which pane the user was typing into as of the previous
@@ -2141,8 +2142,8 @@ struct UiState {
     /// why the state set moments ago does not apply here.
     ///
     /// What is deck-global is WHERE the value lives, not how far it reaches:
-    /// the gate still matches only [`Tab::Orchestration`], so Dashboard and
-    /// Mode tabs are never gated whatever this says. Not persisted — every
+    /// the gate still matches only [`Tab::Orchestration`], so the Dashboard is
+    /// never gated whatever this says. Not persisted — every
     /// deck starts locked.
     command_entry_locked: bool,
     /// Warnings collected during session save/restore, flushed after terminal restore.
@@ -2181,7 +2182,7 @@ struct UiState {
     #[allow(dead_code)]
     button_rects: Vec<(Action, Rect)>,
     /// PRD #80 M3: screen rects of each tab's `[×]` close affordance, paired
-    /// with the tab index to close (only closeable Mode/Orchestration tabs;
+    /// with the tab index to close (only closeable orchestration tabs;
     /// the Dashboard at index 0 is excluded). Populated each render, consulted
     /// on a mouse Down/Up AFTER `button_rects` but BEFORE `tab_header_rects`,
     /// so the `[×]` beats the surrounding header.
@@ -2363,7 +2364,7 @@ struct UiState {
     /// submit-CR-aware mode on slower environments. Cleared when the
     /// prompt finally fires (entry never re-added).
     orchestration_ready_since: HashMap<TabId, std::time::Instant>,
-    /// PRD #127 M3.1: mode `seed_prompt`s waiting for their agent pane to be
+    /// PRD #127 M3.1: single-agent cards' `seed_prompt`s waiting for their pane to be
     /// ready before the gated atomic submit. Gated on the spawn-time readiness
     /// buffer, then delivered with `write_and_submit_to_pane`.
     pending_seed_prompts: Vec<PendingSeedPrompt>,
@@ -3769,12 +3770,12 @@ pub fn fill_dead_slots_with_placeholders(
     }
 }
 
-/// PRD #127 M3.1: deliver a mode's `seed_prompt` to its agent pane once the
+/// PRD #127 M3.1: deliver a single-agent card's `seed_prompt` to its pane once the
 /// agent is ready, gated exactly like the orchestrator's spawn-time role prompt
 /// (`SessionStart` fast path / 10s timeout slow path, then the
 /// `SPAWN_TIME_READINESS_BUFFER`, then an atomic `write_and_submit_to_pane`).
-/// A mode without a `seed_prompt` never enqueues one, so this is a no-op for
-/// plain modes (no regression).
+/// A card without a `seed_prompt` never enqueues one, so this is a no-op for
+/// ordinary panes (no regression).
 fn process_pending_seed_prompts(
     ui: &mut UiState,
     pane: &Arc<dyn PaneController>,
@@ -5358,7 +5359,7 @@ fn process_pending_orchestration_surfaces(
 ///
 /// [`AppState::apply_daemon_pane_closed`] has already dropped the pane's
 /// sessions and registration, in broadcast order; this drops the pane's local
-/// attachment, its slot in a Mode/Orchestration tab, and its `UiState` maps. A
+/// attachment, its slot in an orchestration tab, and its `UiState` maps. A
 /// tab left with no live pane goes too — [`TabManager::forget_externally_closed_pane`]
 /// — together with its dead-slot placeholder cards, and focus follows
 /// [`close_tab_by_index`]: a user on that tab is returned to the Dashboard and
@@ -6022,7 +6023,7 @@ pub enum Action {
     /// `[New Agent Ctrl+N]` button — distinct from [`Action::SpawnPane`], which
     /// is the *result* of submitting the new-pane form.
     NewPane,
-    /// PRD #80: close the selected pane — or the entire mode/orchestration tab
+    /// PRD #80: close the selected pane — or the entire orchestration tab
     /// it belongs to (Ctrl+W).
     ///
     /// PRD #241 M3: this is now a *request*, not the teardown itself. Both
@@ -6080,7 +6081,7 @@ pub enum Action {
     /// for the click that produced it.
     SelectTab(usize),
     /// PRD #80 M3: close the tab at this index — the outcome of clicking a
-    /// Mode/Orchestration tab's `[×]` affordance, reusing Ctrl+W's tab-teardown
+    /// orchestration tab's `[×]` affordance, reusing Ctrl+W's tab-teardown
     /// semantics for the clicked tab (not necessarily the active one).
     CloseTab(usize),
     /// PRD #80 M4: select the dashboard card at this index — the outcome of a
@@ -6834,24 +6835,23 @@ pub struct CloseConfirmState {
 /// therefore which words the dialog is allowed to use.
 ///
 /// The dialog used to read `Close selected pane?` for every target, which is a
-/// lie on a Mode or Orchestration tab: that close takes the whole tab and every
+/// lie on an orchestration tab: that close takes the whole tab and every
 /// pane in it. Crucially the lie was NOT fixable by branching on
 /// [`CloseTarget`], because `CloseTarget::Session` does not mean "one card" —
 /// the confirmed close resolves the armed session, discovers its pane belongs to
-/// a Mode/Orchestration tab, and closes that entire tab. Only a plain dashboard
+/// an orchestration tab, and closes that entire tab. Only a plain dashboard
 /// pane reaches the one-pane branch. So the wording is derived from
 /// [`resolve_close_plan`], the single function the teardown itself branches on,
 /// and the two cannot disagree without the close changing shape.
 ///
 /// Deliberately carries no pane COUNT. A number here would have to be recomputed
-/// against a moving world (reactive pools grow and shrink, roles die into dead
-/// slots), and a confidently wrong "3 panes" is worse than no number at all.
+/// against a moving world (roles die into dead slots), and a confidently wrong "3 panes" is worse than no number at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CloseScope {
     /// Exactly one plain dashboard pane and its card.
     #[default]
     Pane,
-    /// A whole Mode / Orchestration tab: every pane it owns.
+    /// A whole orchestration tab: every pane it owns.
     Tab,
 }
 
@@ -6873,7 +6873,7 @@ pub enum CloseScope {
 /// confirmation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseTarget {
-    /// A Mode / Orchestration tab, keyed by its [`TabId`] (stable across
+    /// An orchestration tab, keyed by its [`TabId`] (stable across
     /// tab-strip reordering and index shifts, unlike the position).
     Tab(TabId),
     /// A dashboard card, keyed by its session id (stable across filtering,
@@ -6989,7 +6989,7 @@ const CLOSE_CONFIRM_OPTION_COUNT: usize = 2;
 /// [`Action::CloseSelected`] has two doors — the `close_pane` chord and the
 /// persistent `[Close]` button — and both must confirm. `has_target` is the
 /// caller's answer to "is anything actually armed?": an active
-/// Mode/Orchestration tab, or a selected dashboard card with a live pane. With
+/// orchestration tab, or a selected dashboard card with a live pane. With
 /// nothing armed the close stays the pre-existing no-op and no modal opens, so
 /// an unarmed dashboard can never be talked into closing card 0.
 pub fn close_confirmation_for_action(
@@ -7038,7 +7038,7 @@ fn arm_close_confirmation(
 /// teardown in `Action::ConfirmCloseSelected`, which matches directly on the
 /// returned plan. Before this existed the dialog inferred its copy from the
 /// [`CloseTarget`] variant, which is not the same question — a
-/// `CloseTarget::Session` whose pane belongs to a Mode/Orchestration tab closes
+/// `CloseTarget::Session` whose pane belongs to an orchestration tab closes
 /// that whole tab, so "Session" never implied "one pane".
 ///
 /// `None` means a confirmed close would do nothing: the armed tab or session is
@@ -7049,7 +7049,7 @@ fn resolve_close_plan(
     snapshot: &AppState,
 ) -> Option<ClosePlan> {
     match target {
-        // PR #151 (e2e layout_002 regression): a Mode/Orchestration TAB is a
+        // PR #151 (e2e layout_002 regression): an orchestration TAB is a
         // close target in its own right, independent of the dashboard selection
         // (which is `None` while such a tab is active). PRD #241 review F1:
         // resolve the ARMED tab's id back to its current index rather than
@@ -7234,7 +7234,7 @@ fn kept_worktree_headline(kept: &KeptWorktree) -> &'static str {
 /// [`resolve_close_plan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClosePlan {
-    /// Tear down the Mode/Orchestration tab at this index and every pane it
+    /// Tear down the orchestration tab at this index and every pane it
     /// owns.
     Tab { index: usize },
     /// Tear down exactly one plain dashboard pane and drop its card.
@@ -7257,7 +7257,7 @@ impl ClosePlan {
 /// close in `dispatch_action`, so the dialog can never be raised for a close
 /// that would then turn out to be a no-op:
 ///
-/// * an active Mode/Orchestration tab is closable regardless of the dashboard
+/// * an active orchestration tab is closable regardless of the dashboard
 ///   selection (PR #151 / `dashboard/selection/016`), and
 /// * otherwise the dashboard needs a REAL active selection whose session owns a
 ///   pane (PRD #113 finding 2 / `dashboard/selection/012` — no card-0
@@ -7958,8 +7958,6 @@ fn dispatch_normal_mode_key(
 ///   that card's session id; then resolve `selected_session_id` to its
 ///   index (clearing it and returning `0` when it's no longer present).
 /// - **Orchestration**: same, keyed by role pane id.
-/// - **Mode**: returns `None` — mode tabs render via a separate path, so
-///   `selected_index` must be left untouched.
 ///
 /// The caller passes the active tab, so a pane focused while another tab
 /// is active can never rewrite a different tab's selection — the gating
@@ -8037,14 +8035,15 @@ pub fn sync_and_derive_selection(
 /// per-deck remembered Enter-restore selection so one deck can't leak its armed
 /// index into another's restore. There is only ever one Dashboard, so it needs
 /// no id; each Orchestration tab is keyed by its stable [`TabId`] so multiple
-/// orchestrations each keep their own remembered role. `Mode` tabs are not decks.
+/// orchestrations each keep their own remembered role.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum DeckKey {
     Dashboard,
     Orchestration(TabId),
 }
 
-/// The [`DeckKey`] for a tab, or `None` for a non-deck (`Mode`) tab.
+/// The [`DeckKey`] for a tab. (`None` was for the non-deck `Mode` tab, which
+/// issue #1199 removed; every remaining tab kind is a deck.)
 fn deck_key(tab: &Tab) -> Option<DeckKey> {
     match tab {
         Tab::Dashboard { .. } => Some(DeckKey::Dashboard),
@@ -8207,14 +8206,11 @@ fn reconcile_dashboard_selection(
 /// satisfy.
 fn reconcile_pane_input_scrollback(ui: &mut UiState, pane: &dyn PaneController) {
     // PRD #341 (code-review finding 3): `PaneInput` with NOTHING focused is a
-    // state that LIES, and it is reachable — a focused reactive side pane can
-    // vanish with no successor (`remap_focus_after_reactive_change` clears the
-    // tab's remembered id and returns none, so the caller focuses nothing).
-    // `Action::ForwardToPane` then silently drops every keystroke for want of a
-    // `focused_pane_id`, while the chip says ` TYPING ` and a Mode tab's renderer
-    // can still paint the live cursor from its own visual fallback
-    // (`visual_focus_id`) — a cursor and a typing label over a pane that receives
-    // nothing. That is precisely the contradiction M1 removed in the other
+    // state that LIES. It was first reached through a Mode tab (removed in
+    // #1199): a focused reactive side pane could vanish with no successor, so
+    // the caller focused nothing. `Action::ForwardToPane` then silently drops
+    // every keystroke for want of a `focused_pane_id` while the chip says
+    // ` TYPING ` — a typing label over a pane that receives nothing. That is precisely the contradiction M1 removed in the other
     // direction, so leave `PaneInput`: command mode is the honest answer AND the
     // safe resting state. Guessing a replacement pane to focus would be worse — a
     // wrong guess sends the user's keystrokes somewhere they did not intend.
@@ -8261,9 +8257,9 @@ fn reconcile_pane_input_scrollback(ui: &mut UiState, pane: &dyn PaneController) 
 /// highlight stays inactive because `reconcile_dashboard_selection` only
 /// reactivates on a focus *transition* and the pre-seed below makes the restored
 /// focus a steady state (no transition): a card never *looks* selected until the
-/// user re-arms it with Enter. (A Mode tab's agent pane stays focused on return
-/// and *is* a dashboard card, but the same transition guard keeps it from
-/// re-arming — see PR #151.)
+/// user re-arms it with Enter. (A workspace-mode tab's agent pane, removed in
+/// #1199, stayed focused on return and *was* a dashboard card; the same
+/// transition guard kept it from re-arming — see PR #151.)
 fn switch_tab_with_focus(
     tab_manager: &mut TabManager,
     target_index: usize,
@@ -8528,7 +8524,7 @@ fn is_plain_printable(key: &KeyEvent) -> bool {
 ///
 /// `claimed_before_mode_handler` reports whether one of the dispatch loop's
 /// earlier resolution passes (jump-to-card, the global shortcuts, focused-pane
-/// scroll, tab cycling, mode-tab navigation) took the key. Those all resolve
+/// scroll, tab cycling) took the key. Those all resolve
 /// bindings, and some of them — the scroll keys — legitimately report
 /// `Action::Continue`, so the flag has to be carried rather than re-derived from
 /// `resolved`.
@@ -9350,16 +9346,9 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
 }
 
 // ---------------------------------------------------------------------------
-// Reactive pane routing — extract new Bash commands from session events
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // TUI entry point
 // ---------------------------------------------------------------------------
 
-/// Tear down every non-dashboard tab (mode + orchestration) and unregister
-/// their pane IDs from `state`.
-///
 /// PRD #80: control-flow signal returned by [`dispatch_action`]. Most actions
 /// mutate state and yield [`Flow::Continue`]; the quit/stop/detach actions
 /// yield [`Flow::Break`] so the caller breaks the TUI's outer loop.
@@ -9581,10 +9570,7 @@ pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) 
 ///   keystroke would never reach the PTY. Un-resolving it here is what lets it
 ///   fall through to `ForwardToPane([0x1a])`, exactly as `Ctrl+l` stays
 ///   readline's clear-screen and `Ctrl+w` stays word-delete while you type.
-/// - **Tab type** — a Mode tab is two pane regions (agent left, side panes
-///   right), not sidebar-plus-panes, so "hide the sidebar and take the frame"
-///   has no meaning there and claiming the chord would be pure loss. The
-///   Dashboard and an Orchestration tab ARE the same shape — both are a card
+/// - **Tab type** — the Dashboard and an Orchestration tab ARE the same shape — both are a card
 ///   sidebar beside a stack of agent panes, and they even share
 ///   `right_column_pane_dims` — so both zoom.
 ///
@@ -9845,7 +9831,7 @@ fn hit_test_card(card_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<usi
 /// dashboard layout.
 ///
 /// PRD #241: the ONE tab teardown. Every door that destroys a tab — the `Ctrl+W`
-/// chord on an active Mode/Orchestration tab, a `[×]` click on the tab strip,
+/// chord on an active orchestration tab, a `[×]` click on the tab strip,
 /// and a confirmed close on a dashboard card whose pane lives inside such a tab
 /// — resolves to [`ClosePlan::Tab`] and lands here, so they cannot drift apart
 /// in what they remove or what they report.
@@ -9918,7 +9904,7 @@ fn close_tab_by_index(
             ));
         }
     }
-    // Closing the active mode/orchestration tab returns focus to the
+    // Closing the active orchestration tab returns focus to the
     // dashboard, so leave PaneInput just like the Ctrl+W path does.
     if ui.mode == UiMode::PaneInput {
         ui.mode = UiMode::Normal;
@@ -9928,7 +9914,7 @@ fn close_tab_by_index(
     {
         ui.selected_index = Some(idx - 1);
     }
-    // PRD #89 M1.2 — closing a mode/orchestration tab (via `[×]` click or the
+    // PRD #89 M1.2 — closing an orchestration tab (via `[×]` click or the
     // CloseTab action) is a meaningful state change; keep the snapshot fresh.
     ui.mark_session_dirty();
 }
@@ -10153,14 +10139,9 @@ fn dispatch_action(
         // Both card-shaped tab kinds are handled, because they are the same
         // shape: a card sidebar on the left and a stack of agent panes on the
         // right, differing only in the percentage (33/67 vs a `Ctrl+l`-toggled
-        // 34/66-or-25/75) and in which panes they scope to. A Mode tab is
-        // deliberately absent — it is two pane regions rather than
-        // sidebar-plus-panes, so "hide the sidebar" has no meaning there; see
-        // the follow-up issue referenced in the PRD.
-        //
-        // The `match` arm has the same job the split's `matches!` guard does —
-        // unreachable on a Mode tab (`scope_zoom` un-resolves the key there),
-        // but a no-op rather than a surprise if that ever changes.
+        // 34/66-or-25/75) and in which panes they scope to. (Mode tabs, two
+        // pane regions rather than sidebar-plus-panes, were deliberately left
+        // out until issue #1199 removed them.)
         Action::ToggleZoom => {
             let flag = match tab_manager.active_tab_mut() {
                 Tab::Orchestration { zoomed, .. } | Tab::Dashboard { zoomed, .. } => Some(zoomed),
@@ -10300,8 +10281,7 @@ fn dispatch_action(
                         ));
                     }
                 }
-                // A whole Mode/Orchestration tab: the agent pane plus every side
-                // or role pane. Reached both from a tab that was active when the
+                // A whole orchestration tab: every role pane. Reached both from a tab that was active when the
                 // chord landed AND from a dashboard card whose pane turns out to
                 // live in such a tab — which is why the dialog said "this tab
                 // and all its panes" either way.
@@ -10364,7 +10344,7 @@ fn dispatch_action(
             }
             // PRD #89 M1.3 — Ctrl+W close-pane is a detach path; flush a fresh
             // snapshot reflecting the surviving workspace (every sub-path above:
-            // closable-tab close, mode/orchestration tab close, plain pane).
+            // orchestration tab close, plain pane).
             ui.mark_session_dirty();
         }
         // Ctrl+PageDown: next tab (clamped, gated on a visible tab bar).
@@ -11530,7 +11510,7 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
     // last_command is set, so closing every pane doesn't discard the recorded
     // command; clear only when BOTH are empty (today's no-state behavior).
     // Issue #949: the remembered position joins that condition, so a deck whose
-    // panes all live in mode/orchestration tabs (no `pane_metadata` entry of
+    // panes all live in orchestration tabs (no `pane_metadata` entry of
     // their own) does not have its position deleted by the very same write that
     // was meant to record it. `capture_focus_snapshot` answers `None` for a
     // Dashboard-only deck, so a genuinely stateless deck still clears the file.
@@ -11616,7 +11596,7 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
 ///
 /// On `Err`, the caller surfaces the reason via `session_warnings` and falls
 /// back to a PLAIN dashboard pane (never a half-broken orchestration tab),
-/// mirroring the mode-tab drift Path D/E fallback (PRD #69).
+/// as the mode-tab drift Path D/E fallback did (PRD #69; modes removed in #1199).
 ///
 /// On `Ok`, returns the resolved config AND the validated start-role index to
 /// honor (the SAVED cursor, bounds-checked — PRD #89 review-fix F2/F3), so the
@@ -12445,9 +12425,9 @@ pub fn run_tui(
     // Issue #949 — the pane ids the DAEMON supplied on this startup, which is
     // exactly the set whose ids are a stable identity across processes (the
     // daemon captured each into its agent's `DOT_AGENT_DECK_PANE_ID` and echoed
-    // it back on `list_agents`). Empty on the daemon-empty path, and it
-    // deliberately excludes a Mode tab's SIDE panes, which the hydration block
-    // below spawns fresh from the project config rather than adopting. Consumed
+    // it back on `list_agents`). Empty on the daemon-empty path. (It also
+    // excluded a Mode tab's locally-spawned SIDE panes until issue #1199
+    // removed them.) Consumed
     // by `SavedFocus::retain_pane_ids` at the restore seam after both blocks.
     let mut daemon_pane_ids: HashSet<String> = HashSet::new();
 
@@ -12820,7 +12800,7 @@ pub fn run_tui(
         // PRD #84 M4: the post-hydration resize sweep is gone. The panes were
         // rebuilt from the daemon's existing PTYs (or seeded at 24×80), and the
         // per-frame `resize_panes_to_layout` (invariant 2) sizes the active tab
-        // on the very first frame; a background mode/orchestration tab is sized
+        // on the very first frame; a background orchestration tab is sized
         // the frame it becomes active — before it is ever rendered — so no tab
         // is shown at the wrong dims.
     }
@@ -12866,8 +12846,8 @@ pub fn run_tui(
             // success we `continue`; on drift (config gone, orchestration
             // renamed/removed, role set changed) we push a clear warning NAMING
             // the orchestration and fall through to the plain-pane restore below
-            // — never a half-broken tab (mirrors the mode-tab Path D/E fallback,
-            // PRD #69). Unlike warm-daemon hydration (session/restore/007), this
+            // — never a half-broken tab (as the mode-tab Path D/E fallback did,
+            // PRD #69; modes removed in #1199). Unlike warm-daemon hydration (session/restore/007), this
             // path REPLAYS the saved `orchestrator_prompt` to the start role —
             // there is no live agent with the prompt already in scrollback.
             if let Some(ref orch_snap) = saved_pane.orchestration {
@@ -13157,8 +13137,9 @@ pub fn run_tui(
     // later Tab-away-and-back from dumping the user on that tab's start role.
     //
     // Only the ids the DAEMON supplied survive into the restore. Every other
-    // pane on screen — all of them on the daemon-empty rebuild path, and a Mode
-    // tab's locally-spawned side panes on the warm one — carries a fresh
+    // pane on screen — all of them on the daemon-empty rebuild path (and, until
+    // #1199 removed them, a Mode tab's locally-spawned side panes on the warm
+    // one) — carries a fresh
     // `allocate_id` counter that matches a remembered number by coincidence
     // rather than by identity, so honouring one can focus the WRONG terminal
     // instead of merely failing to restore. `SavedFocus::retain_pane_ids` has
@@ -13336,8 +13317,6 @@ pub fn run_tui(
         // longer snap the selection of another (the cross-tab leak this
         // PRD fixes). A remembered id that's no longer in the filtered
         // list is cleared and the selection falls back to the first card.
-        // Mode tabs render via the early-return path below, so
-        // `selected_index` is irrelevant there and left as clamped.
         let focused_pane_now = pane.focused_pane_id();
         let filtered_ids: Vec<(&str, Option<&str>)> = filtered
             .iter()
@@ -13946,7 +13925,7 @@ pub fn run_tui(
         // here used to credit it with ferrying the orchestrator's *initial*
         // prompt across the agent-ready gate, which is the job of
         // `deliver_orchestrator_prompt`, called a few lines above.
-        // PRD #127 M3.1: deliver any mode `seed_prompt`s whose agent pane has
+        // PRD #127 M3.1: deliver any single-agent card `seed_prompt`s whose pane has
         // become ready (gated, like orchestrations).
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
 
@@ -14132,7 +14111,7 @@ pub fn run_tui(
                 // Issue #142: the Schedules manager owns the wheel while
                 // it is open — handled BEFORE the generic overlay swallow below
                 // so the wheel scrolls the manager's own list instead of merely
-                // being eaten (and instead of leaking to the side pane the
+                // being eaten (and instead of leaking to the pane the
                 // centered dialog covers). The manager has no independent list
                 // offset: one wheel notch moves `scheduled_selected` by one row
                 // exactly like `j`/`k`, and the rendered viewport follows it
@@ -14852,11 +14831,9 @@ pub fn run_tui(
         } // end inner event-drain loop
     }
 
-    // Snapshot the session for auto-restore *before* tearing down mode
-    // tabs. The teardown loop unregisters every mode-tab pane id from
-    // `state.managed_pane_ids`; if the snapshot ran after teardown, the
-    // `retain` step would drop the mode-tab agent pane (which carries
-    // `mode = Some(...)`) and the mode field would never reach disk (PRD #69).
+    // Snapshot the session for auto-restore on exit. (This once had to run
+    // before a mode-tab teardown loop that unregistered mode-tab pane ids
+    // (PRD #69); workspace modes were removed in #1199.)
     {
         let live_panes = state.blocking_read().managed_pane_ids.clone();
 
@@ -15089,7 +15066,7 @@ fn render_tab_strip(
         );
         x = after;
 
-        // Close affordance for Mode/Orchestration tabs (never the Dashboard).
+        // Close affordance for orchestration tabs (never the Dashboard).
         if *closeable.get(i).unwrap_or(&false) && x < end {
             let glyph_start = x;
             let (after, _) = buf.set_span(x, area.y, &Span::styled("[×]", style), end - x);
@@ -15482,8 +15459,8 @@ fn pane_stack_rects(
 /// PRD #84 M4 (invariant 2) — derive each local pane's PTY size from its layout
 /// rect and commit only the deltas. Runs once per frame, after
 /// `compute_frame_layout` and before `terminal.draw`, so every layout-changing
-/// path (resize, tab open/close, mode switch, reactive pane recreation,
-/// orchestration role transition) converges here instead of pushing its own
+/// path (resize, tab open/close, mode switch, orchestration role
+/// transition) converges here instead of pushing its own
 /// `resize_pane_pty` from a private dimension calculation.
 ///
 /// A pane whose target inner area has a zero dimension (a `Tiled` pane with no
@@ -15900,7 +15877,7 @@ fn render_frame(
     // draw, then read its decay state ONCE and thread that one value into every
     // pane-rendering path below. Doing it here — rather than at each
     // `render_terminal_panes` call — means every tab type asks the same question
-    // at the same instant, so a Dashboard pane and a Mode-tab pane can never
+    // at the same instant, so a Dashboard pane and an orchestration pane can never
     // disagree about whether the banner is up. `visibility` latches the TTL
     // collapse, which is why it takes `&mut`.
     //
@@ -15984,12 +15961,11 @@ fn render_frame(
     // one `if zoomed` in the layout, and no second one here. Issue #749: it is
     // bound in the SAME destructure as the rects it has to agree with, so no
     // other layout value is in scope for this function to reach for by
-    // accident — the single source is compiler-enforced, not conventional. A
-    // Mode tab carries no pane layout of its own and returns before the binding
-    // exists, which is why this cannot be resolved above the branch.
+    // accident — the single source is compiler-enforced, not conventional.
     //
-    // Branch on the content the layout pass resolved. Mode tabs render and
-    // return here; dashboard / orchestration fall through to the card grid.
+    // Destructure the content the layout pass resolved: dashboard and
+    // orchestration tabs both render as the card grid. (Mode tabs rendered and
+    // returned here until issue #1199 removed them.)
     let (dashboard_area, panes_area, pane_ids, pane_rects, pane_layout) = match &layout.content {
         FrameContent::Cards {
             dashboard_area,
@@ -16822,7 +16798,7 @@ fn render_terminal_panes(
     //   Cyan `focused` accent and the painted cursor appear ONLY when the pane is
     //   actually live; in command mode the border falls through to the agent's
     //   status colour and thickens instead, which is what makes the mode visible
-    //   on a full-screen mode tab where nothing else on screen changes.
+    //   on the pane itself.
     // * command mode (`mode == Normal`) — should the focused pane be dimmed and
     //   the banner drawn? Every OTHER mode (a modal, an inline filter/rename row)
     //   is also not `PaneInput`, but those already cover the screen or own the
@@ -16836,8 +16812,9 @@ fn render_terminal_panes(
     // PRD #84: per-pane OUTER rects (aligned 1:1 with `pane_ids`) precomputed by
     // `compute_frame_layout` — the SAME rects `resize_panes_to_layout` sized the
     // PTYs to this frame. `Some` => draw into exactly those; `None` => recompute
-    // via `pane_stack_rects` (used by callers without a `FrameLayout` rect list,
-    // e.g. the mode-tab agent / side panes).
+    // via `pane_stack_rects` (used by callers without a `FrameLayout` rect list —
+    // the L1 render seams in this file's tests; every production caller passes
+    // `Some` since issue #1199 removed the mode-tab agent / side panes).
     precomputed_rects: Option<&[Rect]>,
     // Injected by L1 notice-lifecycle coverage; live frames pass the same `now`
     // used for every other transient render state in that frame.
@@ -16910,8 +16887,8 @@ fn render_terminal_panes(
     let mut focused_screen: Option<std::sync::Arc<std::sync::Mutex<vt100::Parser>>> = None;
     // PRD #611 M2: outer rects of panes whose cannot-scroll notice is still
     // live, collected per pane as they are drawn. Keyed by the pane that armed
-    // it rather than by focus — this is the ONE shared path the dashboard, the
-    // orchestrator pane and the mode tabs all render through, so no tab-type or
+    // it rather than by focus — this is the ONE shared path the dashboard and
+    // the orchestration tabs render through, so no tab-type or
     // agent-name branch is needed to scope it (PRD #611: worker panes need no
     // exclusion because a pane nobody scrolls never arms one).
     let mut notice_rects: Vec<Rect> = Vec::new();
@@ -17655,8 +17632,8 @@ fn render_bottom_bar(
     extra_buttons: &[Button],
 ) {
     // PRD #341 M2: the mode chip owns cell 0 of the bar wherever the bar has one
-    // — the context-rich Cards path (Dashboard / Orchestration), the global-only
-    // Mode-tab path, and the PaneInput row alike — so the current mode is stated
+    // — the context-rich Cards path (Dashboard / Orchestration) and the
+    // PaneInput row alike — so the current mode is stated
     // in words in the SAME screen position on every tab, in both modes.
     // Everything else in the bar draws into what it leaves.
     //
@@ -23101,7 +23078,7 @@ mod tests {
     }
 
     // PRD #76 M2.15: pin the layout-math helpers so a future change to the
-    // mode-tab / dashboard render layout can't silently divorce spawn-time
+    // orchestration / dashboard render layout can't silently divorce spawn-time
     // dims from resize-time dims. The helpers are the single source of
     // truth for both `AgentSpawnOptions.rows/cols` (spawn) and
     // `resize_pane_pty` (resize); if one diverges from the render, the
@@ -23634,7 +23611,7 @@ mod tests {
     }
 
     /// Issue #317: build a plain dashboard card — one session owning a pane
-    /// that belongs to no Mode/Orchestration tab, so it reaches
+    /// that belongs to no orchestration tab, so it reaches
     /// `resolve_close_plan`'s one-pane branch.
     fn state_with_card(session_id: &str, pane_id: &str, agent_id: Option<&str>) -> AppState {
         let mut state = AppState::default();
@@ -24170,8 +24147,9 @@ mod tests {
             "a card-sidebar tab in command mode must claim the zoom toggle"
         );
 
-        // No card sidebar (a Mode tab), any mode -> un-resolved, so `Ctrl+Z`
-        // reaches the PTY.
+        // No card sidebar, any mode -> un-resolved, so `Ctrl+Z` reaches the
+        // PTY. (No tab kind has lacked a sidebar since issue #1199 removed Mode
+        // tabs; this pins `scope_zoom`'s own contract.)
         for mode in [UiMode::Normal, UiMode::PaneInput] {
             assert!(
                 scope_zoom(zoom(), false, mode).is_none(),
@@ -37376,7 +37354,7 @@ mod tests {
         let inside_buffer = SPAWN_TIME_READINESS_TIMEOUT + std::time::Duration::from_millis(1);
         let past_buffer = SPAWN_TIME_READINESS_TIMEOUT + SPAWN_TIME_READINESS_BUFFER;
 
-        // --- `process_pending_seed_prompts` (a mode's seed). -----------------
+        // --- `process_pending_seed_prompts` (a single-agent card's seed). ----
         const SEED_PANE: &str = "fallback-buffer-seed-pane";
         let seed_controller = Arc::new(RecordingPaneController::default());
         let seed_writes = seed_controller.writes.clone();
