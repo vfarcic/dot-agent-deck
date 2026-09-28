@@ -3216,6 +3216,21 @@ fn legacy_mode_hydration_warning(mode_names: &[&str]) -> Option<String> {
     ))
 }
 
+/// Issue #1199: the repository-supplied fields of the hydration log line for a
+/// legacy workspace-mode pane, escaped for deck.log — `(cwd, mode)`.
+///
+/// The mode name comes from an older repository's `.dot-agent-deck.toml`, so it
+/// gets [`escape_id_for_log`](crate::config_validation::escape_id_for_log)'s
+/// control + bidi escaping and identifier clamp, the same as the
+/// `session_warnings` line above. The cwd is a filesystem path: it gets the same
+/// control + bidi escaping but no clamp, so a long path stays useful in the log.
+fn legacy_mode_hydration_log_fields(cwd: &str, mode_name: &str) -> (String, String) {
+    (
+        crate::config_validation::escape_for_terminal(cwd).into_owned(),
+        crate::config_validation::escape_id_for_log(mode_name),
+    )
+}
+
 /// Issue #1199: the one `session_warnings` line for a saved pane that belonged
 /// to a workspace-mode tab, which the restore brought back as a plain pane.
 fn legacy_mode_restore_warning(pane_name: &str, mode_name: &str) -> String {
@@ -12538,9 +12553,10 @@ pub fn run_tui(
                     agent_id,
                     pane_id,
                 } => {
+                    let (safe_cwd, safe_mode) = legacy_mode_hydration_log_fields(cwd, mode_name);
                     tracing::warn!(
-                        cwd = %cwd,
-                        mode = %mode_name,
+                        cwd = %safe_cwd,
+                        mode = %safe_mode,
                         agent_id = %agent_id,
                         pane_id = %pane_id,
                         "hydration: pane was started as a workspace mode's agent pane; workspace modes were removed (#1199), placing it on the dashboard"
@@ -25354,6 +25370,25 @@ mod tests {
         assert!(line.contains("#1199"), "{line}");
         assert!(line.contains("k8s-ops") && line.contains("dev"), "{line}");
         assert!(line.contains("dashboard"), "{line}");
+    }
+
+    /// Issue #1199: the hydration log line's repository-supplied fields reach
+    /// deck.log escaped — a mode name carrying ESC and a newline, and a cwd
+    /// carrying a newline, cannot forge or repaint a log record — and the cwd is
+    /// not clamped the way an identifier is.
+    #[test]
+    fn legacy_mode_hydration_log_fields_escape_control_characters() {
+        let long_dir = "d".repeat(300);
+        let cwd = format!("/work/{long_dir}\nFORGED cwd");
+        let (safe_cwd, safe_mode) =
+            legacy_mode_hydration_log_fields(&cwd, "k8s\u{1b}[2J\nFORGED mode");
+
+        assert!(!safe_mode.contains('\u{1b}'), "{safe_mode:?}");
+        assert!(!safe_mode.contains('\n'), "{safe_mode:?}");
+        assert_eq!(safe_mode, "k8s\\u{1b}[2J\\nFORGED mode");
+
+        assert!(!safe_cwd.contains('\n'), "{safe_cwd:?}");
+        assert_eq!(safe_cwd, format!("/work/{long_dir}\\nFORGED cwd"));
     }
 
     /// Issue #1199: a saved session pane that belonged to a workspace-mode tab
