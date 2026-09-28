@@ -100,7 +100,10 @@ fn claude_hook_via_cli(deck: &TuiDeck, pane_id: &str, payload: &serde_json::Valu
 /// turn's `Bash` starts (the card reads Working) and ends, the turn stops (the
 /// card reads Idle), then a background agent under the same session starts a
 /// `Bash` call that never ends and `SubagentStop` follows. The card must still
-/// read Idle, and keep reading it, rather than flipping back to Working.
+/// read Idle, and keep reading it, rather than flipping back to Working. Then
+/// another background subagent raises a permission request (the card reads
+/// Needs Input) and fails with a `StopFailure`: the card must go back to Idle
+/// (issue #1364).
 #[spec("hooks/delivery/008")]
 #[test]
 fn delivery_008_background_subagent_tool_call_does_not_flip_idle_card_to_working() {
@@ -199,5 +202,53 @@ fn delivery_008_background_subagent_tool_call_does_not_flip_idle_card_to_working
         "card still reads Idle after the background agent's unfinished call",
         std::time::Duration::from_secs(2),
         |g| card_reads("Idle")(g) && !g.contains("Working"),
+    );
+
+    // Issue #1364: a background subagent asks for permission — the card reads
+    // Needs Input, which also proves that needle can appear — and then fails
+    // (`StopFailure`, which the hook CLI turns into the `SubagentStop` it
+    // stands in for). Its prompt is gone, so the card must return to Idle,
+    // not keep asking, and not turn Working, Error or Blocked.
+    const PROMPTING_SUBAGENT: &str = "b9d0f1e2a3c4d5e6";
+    claude_hook_via_cli(
+        &deck,
+        PANE,
+        &payload(
+            "PermissionRequest",
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "rm -rf target"},
+                "agent_id": PROMPTING_SUBAGENT,
+                "agent_type": "general-purpose",
+            }),
+        ),
+    );
+    deck.wait_until_grid(
+        "card reads Needs Input on the background subagent's permission request",
+        card_reads("Needs Input"),
+    );
+    claude_hook_via_cli(
+        &deck,
+        PANE,
+        &payload(
+            "StopFailure",
+            serde_json::json!({
+                "error": "rate_limit",
+                "last_assistant_message": "API Error: rate limit",
+                "agent_id": PROMPTING_SUBAGENT,
+                "agent_type": "general-purpose",
+            }),
+        ),
+    );
+    deck.wait_until_grid_then_hold(
+        "card leaves Needs Input for Idle once the prompting subagent has ended",
+        std::time::Duration::from_secs(2),
+        |g| {
+            card_reads("Idle")(g)
+                && !g.contains("Needs Input")
+                && !g.contains("Working")
+                && !g.contains("Blocked")
+                && !g.contains("Error")
+        },
     );
 }
