@@ -198,7 +198,7 @@ Use the name of the file you downloaded. If it does not report a verified attest
 1. Open the `.dmg` and drag **Agent Deck** to **Applications**.
 2. Launch **Agent Deck** from Applications. macOS should ask only to confirm opening an app downloaded from the internet.
 
-If macOS instead reports the app as damaged or from an unidentified developer, do not override it; [report it](https://github.com/vfarcic/dot-agent-deck/issues). The `xattr` command the CLI binary may need is not needed for a signed `.dmg`.
+If macOS instead reports the app as damaged or from an unidentified developer, what to do depends on that release's notes. When they say the `.dmg` is signed and notarized, do not override the warning; [report it](https://github.com/vfarcic/dot-agent-deck/issues). The `xattr` command the CLI binary may need is not needed for a signed `.dmg`. When they say that release's `.dmg` is unsigned, the warning is expected: once the download has passed [the provenance check above](#verify-the-download), follow the workaround those notes give.
 
 The app bundle carries its own copy of the `dot-agent-deck` binary, at `/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck`, and does not put it on your `PATH`. To have `dot-agent-deck` in a terminal, install the CLI too ([Homebrew](#homebrew-macos--linux) or [a binary](#download-binary)), at the same version as the app.
 
@@ -232,10 +232,11 @@ Whichever way it starts, the daemon installs the agent hooks on startup, so agen
 
 ### Keep the app and the daemon on the same release
 
-The desktop app checks the daemon's build when it connects. A daemon from another release, such as one started by a Homebrew CLI you have not upgraded, can show **Incompatible daemon** on the Dashboard instead of your agents:
+The desktop app checks the daemon's protocol and its declared compatibility breaks when it connects. A daemon from another release, such as one started by a Homebrew CLI you have not upgraded, is handled in one of three ways:
 
-- When the two builds speak the same protocol and only their build stamps differ, the note says so, and **Connect anyway** connects for the rest of that session.
-- When the protocols differ, the app cannot read that daemon at all. Upgrade whichever side is older and restart the daemon with the matching binary: `dot-agent-deck daemon restart`, then start it again with the TUI or `daemon serve`. The [daemon's refusal guards](#recycling-the-local-daemon) apply.
+- When the two builds speak the same protocol and no declared compatibility break sits between them, the app connects normally, even though their build stamps differ.
+- When they speak the same protocol but one side declares a compatibility break the other lacks, the Dashboard shows **Incompatible daemon** with a note naming the break and which side is behind. **Connect anyway** connects for the rest of that session, at the risk of the app reading some of the daemon's information with the wrong meaning.
+- When the protocols differ, the Dashboard shows **Incompatible daemon**, the app cannot read that daemon at all, and there is no Connect anyway. Upgrade whichever side is older and restart the daemon with the matching binary: `dot-agent-deck daemon restart`, then start it again with the TUI or `daemon serve`. The [daemon's refusal guards](#recycling-the-local-daemon) apply.
 
 So upgrade the CLI and the desktop app together.
 

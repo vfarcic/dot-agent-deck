@@ -85,7 +85,7 @@ A daemon section shows one of these instead of its agents:
 | **Daemon disconnected** | Nothing is answering at that daemon's address. Start a daemon (see [Installation → How the desktop app gets a daemon](../installation.md#how-the-desktop-app-gets-a-daemon)), then press **Reconnect**. |
 | **Waiting for this daemon** | The app is still connecting to it. Its agents appear when it answers. |
 | **Daemon not configured** | A remote daemon in Settings has no socket path yet. Open [Settings → Daemons](daemons.md) and press **Test connection**, which finds it. |
-| **Incompatible daemon** | A daemon answered, but this build of the app cannot read its agent list. When the note says only the build stamps differ, **Connect anyway** connects for this session. Otherwise, run a daemon from the same release as the app. |
+| **Incompatible daemon** | A daemon answered, but the app will not use it: either it speaks another protocol, or a declared compatibility break sits between the two builds. For a declared break, the note names it and **Connect anyway** connects for this session. For a protocol difference nothing overrides it. Either way, the fix is a daemon from the same release as the app (see [Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release)). |
 | **No agents are running yet** | The daemon is healthy and owns no agents: what a fresh install looks like. Press **New agent**. |
 
 ![The desktop app's dashboard with a healthy daemon and no agents: “No agents are running yet”](/img/dashboard-empty-desktop.png)
