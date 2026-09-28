@@ -1283,8 +1283,9 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
 ///   `as_command` does with a cwd that fails its `is_dir()` filter.
 /// * **Both:** a relative program that exists under the cwd string is exec'd
 ///   by `/bin/sh` from the child's own working directory rather than by the
-///   path portable-pty would have built from that string
-///   ([`exec_program_from_child_cwd`]).
+///   path portable-pty would have built from that string, and only once it
+///   is checked to be an executable regular file there — otherwise the spawn
+///   fails ([`exec_program_from_child_cwd`]).
 ///
 /// **The premise the Linux path rests on, read from the toolchain's own std
 /// source (rustc 1.97.1, `library/std/src/sys/process/unix/unix.rs`)** rather
@@ -1373,10 +1374,10 @@ const EXEC_FROM_CWD_SCRIPT: &str = r#"exec "$0" "$@""#;
 /// whenever it `exists()` in the parent. For a Linux prepared start the cwd
 /// string is `/proc/self/fd/N`, so the exec path became
 /// `/proc/self/fd/N/<program>`, which no longer resolves in the child:
-/// `close_random_fds` has closed `N` by then, and the spawn failed. That is the
-/// case this rewrites, and only it — the condition is portable-pty's own, so a
-/// program portable-pty would have found on `PATH` or taken as absolute is left
-/// exactly as it was.
+/// `close_random_fds` has closed `N` by then, and the child's exec failed. That
+/// is the case this rewrites, and only it — the condition is portable-pty's
+/// own, so a program portable-pty would have found on `PATH` or taken as
+/// absolute is left exactly as it was.
 ///
 /// The program becomes `/bin/sh -c 'exec "$0" "$@"' ./<program> <args…>`, an
 /// absolute interpreter that portable-pty passes through untouched. The name
@@ -1402,17 +1403,55 @@ const EXEC_FROM_CWD_SCRIPT: &str = r#"exec "$0" "$@""#;
 /// string, so no `/proc` path reaches the exec (its existence is checked
 /// relative to the spawning process's own cwd, which is portable-pty's
 /// behaviour on every spawn, prepared or not).
+///
+/// **A program the child could not exec fails the spawn, not the pane** (Qodo
+/// finding on PR #1407). Wrapped, the exec is the shell's, which fails inside
+/// an already-started PTY, so before rewriting, [`probe_program_in_child_cwd`]
+/// requires the target to be a regular file the daemon's effective ids may
+/// execute, asked of the directory the child will enter — `dir`, the held
+/// descriptor, on Linux, and the cwd pathname elsewhere. A failure is a spawn
+/// error carrying the probe's errno (`EACCES` for a non-regular target, as
+/// `execve` answers for a directory) and no program bytes.
+///
+/// **Measured, and narrower than "a direct exec used to fail the spawn":** with
+/// portable-pty 0.8.1 no exec failure reaches `spawn()` at all —
+/// `close_random_fds`, its `pre_exec`, closes std's exec-error pipe, so the
+/// parent reads EOF and reports success. The only spawn-time errors are
+/// portable-pty's own pre-checks in `search_path`: `access(X_OK)` on an
+/// absolute program, the same filter on each `PATH` candidate, and a name found
+/// nowhere. So an **unprepared** start of a non-executable `./prog` under its
+/// cwd still looks started and dies in the child, as it always has; this probe
+/// gives a prepared start the check portable-pty applies to an absolute
+/// program, plus the regular-file test that `access` does not make.
+///
+/// **What still fails only inside the child:** an exec error neither probe can
+/// see — chiefly a `#!` line naming an interpreter that does not exist (pinned
+/// by `spawn_in_leaves_a_bad_interpreter_to_fail_inside_the_child`), and a
+/// target changed between the probe and the child's `exec`. That matches every
+/// other route: a bad-interpreter script spawned by absolute path, through
+/// `PATH`, or by bare name under the cwd also looks started and exits in the
+/// child (all three measured against [`spawn`]), and a multi-word command runs
+/// its program from a shell's `-c`, where every exec failure is the child's.
 #[cfg(unix)]
-fn exec_program_from_child_cwd(cmd: &mut CommandBuilder, cwd: &std::ffi::OsStr) {
+fn exec_program_from_child_cwd(
+    cmd: &mut CommandBuilder,
+    cwd: &std::ffi::OsStr,
+    dir: Option<std::os::fd::BorrowedFd<'_>>,
+) -> Result<(), AgentPtyError> {
     use std::os::unix::ffi::OsStrExt as _;
     let argv = cmd.get_argv_mut();
     let Some(program) = argv.first() else {
-        return;
+        return Ok(());
     };
     let program_path = std::path::Path::new(program);
     if !program_path.is_relative() || !std::path::Path::new(cwd).join(program_path).exists() {
-        return;
+        return Ok(());
     }
+    probe_program_in_child_cwd(dir, cwd, program_path).map_err(|e| {
+        AgentPtyError::Spawn(format!(
+            "the relative program cannot be executed from the prepared directory: {e}"
+        ))
+    })?;
     let mut relative = std::ffi::OsString::new();
     if !program.as_bytes().contains(&b'/') {
         relative.push("./");
@@ -1426,6 +1465,49 @@ fn exec_program_from_child_cwd(cmd: &mut CommandBuilder, cwd: &std::ffi::OsStr) 
         relative,
     ];
     argv.extend(rest);
+    Ok(())
+}
+
+/// Whether `program` names, relative to where the child will be, a regular
+/// file the daemon's effective ids may execute — the two properties `execve`
+/// checks that a caller can ask about in advance. Symlinks are followed, as
+/// `execve` follows them.
+///
+/// With `dir` both probes are `*at` calls against that descriptor, so they see
+/// the directory object the child enters, whatever its pathname names by now;
+/// without it they resolve `cwd`/`program` from the daemon's own cwd, the same
+/// route the child's `chdir` takes. A non-regular target is `EACCES`, which is
+/// what `execve` answers for a directory.
+#[cfg(unix)]
+fn probe_program_in_child_cwd(
+    dir: Option<std::os::fd::BorrowedFd<'_>>,
+    cwd: &std::ffi::OsStr,
+    program: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let (dirfd, path) = match dir {
+        Some(fd) => (fd.as_raw_fd(), program.to_path_buf()),
+        None => (libc::AT_FDCWD, std::path::Path::new(cwd).join(program)),
+    };
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `path` is NUL-terminated and outlives the call; `st` is written
+    // by a successful `fstatat` before it is read.
+    if unsafe { libc::fstatat(dirfd, path.as_ptr(), st.as_mut_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fstatat` returned 0, so it filled `st`.
+    let st = unsafe { st.assume_init() };
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+    }
+    // SAFETY: as for `fstatat` above.
+    if unsafe { libc::faccessat(dirfd, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The Linux half of [`prepared_spawn_cwd`]: `/proc/self/fd/<fd>` when it
@@ -1667,7 +1749,13 @@ fn spawn_with_dir(
     #[cfg(unix)]
     if let Some(dir) = verified_dir {
         let cwd = prepared_spawn_cwd(opts.cwd, dir)?;
-        exec_program_from_child_cwd(&mut cmd, &cwd);
+        // Probe the program against the held descriptor where the child enters
+        // it (Linux), and by pathname where the child does too.
+        #[cfg(target_os = "linux")]
+        let probe_dir = Some(std::os::fd::AsFd::as_fd(dir));
+        #[cfg(not(target_os = "linux"))]
+        let probe_dir = None;
+        exec_program_from_child_cwd(&mut cmd, &cwd, probe_dir)?;
         cmd.cwd(cwd);
     }
     #[cfg(not(unix))]
@@ -15078,18 +15166,137 @@ mod spawn_tests {
         }
     }
 
-    /// The rewrite behind the test above fires only where portable-pty would
-    /// have joined the program onto the cwd string, and keeps every argument.
+    /// Qodo finding on PR #1407: a relative program that exists in the verified
+    /// directory but cannot be exec'd there — a regular file without execute
+    /// permission, a directory, a symlink to either — fails `spawn_in` itself,
+    /// as a direct exec of it did before the `/bin/sh` rewrite. Without the
+    /// check the rewrite spawned a shell that failed inside the PTY, so the pane
+    /// looked started. A dangling symlink is not rewritten at all (portable-pty's
+    /// `exists()` follows it) and fails in portable-pty's own `PATH` lookup.
+    ///
+    /// On Linux the verified directory is then replaced by one holding an
+    /// executable of the same name, so a check that consulted the pathname
+    /// instead of the held directory object would pass and fail this.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_in_refuses_a_relative_program_the_verified_directory_cannot_exec() {
+        use std::os::unix::fs::PermissionsExt as _;
+        type Plant = fn(&std::path::Path);
+        let cases: [(&str, Plant); 4] = [
+            ("a non-executable regular file", |p| {
+                std::fs::write(p, b"#!/bin/sh\necho x > marker\n").expect("file");
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+            }),
+            ("a directory", |p| {
+                std::fs::create_dir(p).expect("dir");
+            }),
+            ("a symlink to a non-executable file", |p| {
+                let target = p.with_extension("target");
+                std::fs::write(&target, b"#!/bin/sh\necho x > marker\n").expect("file");
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
+                    .expect("chmod");
+                std::os::unix::fs::symlink(&target, p).expect("symlink");
+            }),
+            ("a dangling symlink", |p| {
+                std::os::unix::fs::symlink(p.with_extension("missing"), p).expect("symlink");
+            }),
+        ];
+
+        for (what, plant) in cases {
+            for program in ["./dad-1233-not-executable", "dad-1233-not-executable-bare"] {
+                let root = tempfile::tempdir().expect("create tempdir");
+                let dir = root.path().join("d");
+                std::fs::create_dir(&dir).expect("create the project dir");
+                let name = program.trim_start_matches("./");
+                plant(&dir.join(name));
+                let verified = crate::project_resolve::VerifiedProjectDir::open(&dir)
+                    .expect("open the project dir");
+                if cfg!(target_os = "linux") {
+                    std::fs::rename(&dir, dir.with_extension("old"))
+                        .expect("move the verified directory away");
+                    std::fs::create_dir(&dir).expect("put a replacement at the verified path");
+                    let decoy = dir.join(name);
+                    std::fs::write(&decoy, b"#!/bin/sh\necho x > wrong\n").expect("decoy");
+                    std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755))
+                        .expect("chmod");
+                }
+
+                let path = dir.to_str().expect("utf-8 tempdir");
+                let result = spawn_in(
+                    SpawnOptions {
+                        command: Some(program),
+                        cwd: Some(path),
+                        env: vec![("SHELL".into(), "/bin/sh".into())],
+                        ..SpawnOptions::default()
+                    },
+                    &verified,
+                );
+                let Err(err) = result else {
+                    panic!("{what} ({program}): the spawn must fail, not start a shell");
+                };
+                assert!(
+                    matches!(err, AgentPtyError::Spawn(_)),
+                    "{what} ({program}): expected a spawn error, got {err:?}"
+                );
+                assert!(
+                    !dir.join("wrong").exists(),
+                    "{what} ({program}): the replacement's program ran"
+                );
+            }
+        }
+    }
+
+    /// What the check above deliberately leaves to the child: an executable
+    /// regular file whose `#!` interpreter does not exist passes both probes, so
+    /// the rewritten start spawns and its shell's `exec` fails inside the PTY.
+    /// Pinned so the residual documented on [`exec_program_from_child_cwd`] is
+    /// measured, not assumed.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_in_leaves_a_bad_interpreter_to_fail_inside_the_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("create tempdir");
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).expect("create the project dir");
+        let script = dir.join("bad-interp");
+        std::fs::write(&script, b"#!/nonexistent/dad-1233-interpreter\n").expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let verified =
+            crate::project_resolve::VerifiedProjectDir::open(&dir).expect("open the project dir");
+
+        let path = dir.to_str().expect("utf-8 tempdir");
+        let pty = spawn_in(
+            SpawnOptions {
+                command: Some("./bad-interp"),
+                cwd: Some(path),
+                env: vec![("SHELL".into(), "/bin/sh".into())],
+                ..SpawnOptions::default()
+            },
+            &verified,
+        )
+        .expect("the probes cannot see a missing interpreter, so the spawn starts");
+        let mut child = pty.child;
+        let status = child.wait().expect("wait should succeed");
+        assert!(!status.success(), "the shell's exec must fail: {status:?}");
+    }
+
+    /// The rewrite behind `spawn_in_runs_a_relative_program_from_the_verified_directory`
+    /// fires only where portable-pty would have joined the program onto the cwd
+    /// string, and keeps every argument.
     #[cfg(unix)]
     #[test]
     fn exec_program_from_child_cwd_rewrites_only_a_program_found_under_the_cwd() {
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("create tempdir");
-        std::fs::write(dir.path().join("here"), b"").expect("a program in the cwd");
+        let here = dir.path().join("here");
+        std::fs::write(&here, b"").expect("a program in the cwd");
+        // Executable, so the probe in front of the rewrite lets it through.
+        std::fs::set_permissions(&here, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let cwd = dir.path().as_os_str();
         let argv = |program: &str| {
             let mut cmd = CommandBuilder::new(program);
             cmd.arg("--flag");
-            exec_program_from_child_cwd(&mut cmd, cwd);
+            exec_program_from_child_cwd(&mut cmd, cwd, None).expect("an executable program");
             cmd.get_argv()
                 .iter()
                 .map(|a| a.to_string_lossy().into_owned())
