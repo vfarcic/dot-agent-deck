@@ -1423,6 +1423,21 @@ fn with_attached_tui(
     // delivery differently and makes a delivered delegate briefly look
     // undelivered.
     focus_role(tui, plan, ROLE_REVIEWER)?;
+    // The delegate names `reviewer` too, and the daemon writes ITS task pointer
+    // only after that worker's own readiness wait — for a stand-in the deck
+    // cannot identify, the full timeout, ending a few seconds after coder's
+    // pointer (tell 3's signal) and so right inside this step. Typing a hook
+    // command into the reviewer's shell before it lands races that write: the
+    // pointer text arrives on the same input line and the shell runs
+    // `agent-event --type running Read .dot-agent-deck/worker-task-reviewer.md
+    // …`, which the CLI rejects as an unexpected argument, so the status half of
+    // tell 4 fails with no event ever reaching the daemon. Measured on `main`
+    // and on three branches alike while running #320's rule-12 check (the
+    // sandbox TUI stream carries that exact line). Wait for the pointer to be
+    // painted in the reviewer's pane first. Bounded: the tells, not this wait,
+    // decide the verdict.
+    let reviewer_pointer = format!("worker-task-{ROLE_REVIEWER}.md");
+    let _ = tui.wait_for_grid(UI_TIMEOUT, |g| g.contains(&reviewer_pointer));
     let work_done_sentinel = format!("XVER-WORKDONE-{nonce}");
     g.preconnect_logged(
         &format!("pane: {} work-done", cast.pane_cli_label),
