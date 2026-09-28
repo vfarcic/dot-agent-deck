@@ -203,6 +203,14 @@ enum Commands {
         #[arg(long)]
         done: bool,
     },
+    /// Acknowledge that a delegated task reached you, so the deck stops
+    /// re-sending its pointer. Run it with the delivery id your task file names
+    /// (`d-` plus 8 hex characters). Always exits 0: a failed acknowledgement
+    /// is harmless, and the task goes on either way.
+    Ack {
+        /// The delivery id from the task file, e.g. `d-7f3a9c21`.
+        delivery_id: String,
+    },
     /// Report an agent lifecycle state so the pane's card status updates
     /// (PRD #201 M1.2). Used by an agent's extension (e.g. the bundled Pi
     /// extension) to drive status with NO hook installed: it rides the
@@ -699,6 +707,66 @@ fn parse_delegate_reply(line: &str) -> Option<dot_agent_deck::event::DelegateRes
 /// `accepted: false` — a refusal invented out of a line that is not an ack.
 /// Filtering on the marker is what keeps an unrecognised daemon reported as
 /// success rather than as a failure the sender did not have.
+/// Issue #1383: what `ack` got back, including the two cases it decides without
+/// asking the daemon.
+enum AckReply {
+    /// The argument is not shaped like a delivery id.
+    Malformed,
+    /// No `DOT_AGENT_DECK_PANE_ID`: not run from a deck-managed pane.
+    NoPane,
+    Socket(dot_agent_deck::hook::SocketReply),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AckStream {
+    Stdout,
+    Stderr,
+}
+
+/// Issue #1383: what `ack` prints, and where. Its exit code is 0 for every
+/// reply, which is the one deliberate divergence from
+/// [`send_signal_and_report_ack`]: a worker told to acknowledge before anything
+/// else must never be derailed from its task by a failed acknowledgement. The
+/// daemon keeps re-sending the pointer in that case, which the task file tells
+/// the worker to expect.
+///
+/// `NoReply` is reported as acknowledged for the same reason
+/// [`send_signal_and_report_ack`] reports it as success — nothing here is
+/// evidence that it failed — and an older daemon, which does not know `ack`,
+/// answers exactly that way.
+fn ack_report(reply: &AckReply) -> (AckStream, String) {
+    use dot_agent_deck::hook::SocketReply;
+    const CARRY_ON: &str = "this is harmless — carry on with your task.";
+    let not_confirmed = |why: &str| {
+        (
+            AckStream::Stderr,
+            format!("Could not confirm receipt with the deck ({why}); {CARRY_ON}"),
+        )
+    };
+    match reply {
+        AckReply::Malformed => not_confirmed("that is not a delivery id"),
+        AckReply::NoPane => not_confirmed("not running inside a dot-agent-deck managed pane"),
+        AckReply::Socket(SocketReply::Unreachable) => not_confirmed("the deck is not reachable"),
+        AckReply::Socket(SocketReply::NoReply) => (
+            AckStream::Stdout,
+            "Acknowledged. Carry on with your task.".to_string(),
+        ),
+        AckReply::Socket(SocketReply::Line(line)) => match parse_signal_ack(line) {
+            Some(ack) if !ack.accepted => not_confirmed(&format!(
+                "the deck refused it{}",
+                ack.reason
+                    .as_deref()
+                    .map(|r| format!(": {r}"))
+                    .unwrap_or_default()
+            )),
+            _ => (
+                AckStream::Stdout,
+                "Acknowledged. Carry on with your task.".to_string(),
+            ),
+        },
+    }
+}
+
 fn parse_signal_ack(line: &str) -> Option<dot_agent_deck::event::SignalAck> {
     serde_json::from_str::<dot_agent_deck::event::SignalAck>(line)
         .ok()
@@ -1328,6 +1396,37 @@ fn main() -> ExitCode {
                 }
             };
             send_signal_and_report_ack(&json, "work-done", "work-done report")
+        }
+        Some(Commands::Ack { delivery_id }) => {
+            let reply = match (
+                dot_agent_deck::delegate_retry::is_valid_delivery_id(&delivery_id),
+                std::env::var(DOT_AGENT_DECK_PANE_ID),
+            ) {
+                (false, _) => AckReply::Malformed,
+                (true, Err(_)) => AckReply::NoPane,
+                (true, Ok(pane_id)) => {
+                    let msg = dot_agent_deck::event::DaemonMessage::Ack(
+                        dot_agent_deck::event::AckSignal {
+                            pane_id,
+                            delivery_id,
+                            agent_id: std::env::var(DOT_AGENT_DECK_AGENT_ID).ok(),
+                            token: dot_agent_deck::hook_provenance::token_from_env(),
+                        },
+                    );
+                    match serde_json::to_string(&msg) {
+                        Ok(json) => {
+                            AckReply::Socket(dot_agent_deck::hook::send_and_await_signal_ack(&json))
+                        }
+                        Err(_) => AckReply::Malformed,
+                    }
+                }
+            };
+            let (stream, message) = ack_report(&reply);
+            match stream {
+                AckStream::Stdout => println!("{message}"),
+                AckStream::Stderr => eprintln!("{message}"),
+            }
+            ExitCode::SUCCESS
         }
         Some(Commands::AgentEvent { r#type }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
@@ -3897,5 +3996,64 @@ mod tests {
                  must be treated as unverifiable, not as success: {line}"
             );
         }
+    }
+
+    /// Issue #1383: `ack` exits 0 whatever happens, and says on stderr — never
+    /// as a failure — when receipt could not be confirmed.
+    #[test]
+    fn ack_report_is_never_a_failure_and_says_what_happened() {
+        use dot_agent_deck::hook::SocketReply;
+        let accepted =
+            serde_json::to_string(&dot_agent_deck::event::SignalAck::accepted()).unwrap();
+        let refused = serde_json::to_string(&dot_agent_deck::event::SignalAck::refused(
+            "missing_token",
+            "no token",
+        ))
+        .unwrap();
+        let cases = [
+            (
+                AckReply::Socket(SocketReply::Line(accepted)),
+                AckStream::Stdout,
+            ),
+            (AckReply::Socket(SocketReply::NoReply), AckStream::Stdout),
+            (
+                AckReply::Socket(SocketReply::Line("not json".to_string())),
+                AckStream::Stdout,
+            ),
+            (
+                AckReply::Socket(SocketReply::Line(refused)),
+                AckStream::Stderr,
+            ),
+            (
+                AckReply::Socket(SocketReply::Unreachable),
+                AckStream::Stderr,
+            ),
+            (AckReply::Malformed, AckStream::Stderr),
+            (AckReply::NoPane, AckStream::Stderr),
+        ];
+        for (reply, expected) in cases {
+            let (stream, message) = ack_report(&reply);
+            assert_eq!(stream, expected, "{message}");
+            match stream {
+                AckStream::Stdout => {
+                    assert_eq!(message, "Acknowledged. Carry on with your task.")
+                }
+                AckStream::Stderr => {
+                    assert!(message.starts_with("Could not confirm receipt with the deck ("));
+                    assert!(message.ends_with("this is harmless — carry on with your task."));
+                }
+            }
+        }
+        let (_, refused_message) = ack_report(&AckReply::Socket(SocketReply::Line(
+            serde_json::to_string(&dot_agent_deck::event::SignalAck::refused(
+                "missing_token",
+                "no token",
+            ))
+            .unwrap(),
+        )));
+        assert!(
+            refused_message.contains("missing_token"),
+            "{refused_message}"
+        );
     }
 }

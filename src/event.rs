@@ -1280,6 +1280,18 @@ pub enum DaemonMessage {
     /// [`Self::RestartRole`].
     #[serde(rename = "spawn_role")]
     SpawnRole(SpawnRoleSignal),
+    /// Issue #1383: a worker acknowledges that its delegated task reached it
+    /// (`dot-agent-deck ack <delivery-id>`), so the daemon stops re-sending the
+    /// task pointer. Fire-and-forget like [`Self::WorkDone`]: the gate answers a
+    /// [`SignalAck`] and the handler produces nothing further.
+    ///
+    /// Additive on the unversioned hook socket, so it does NOT move the attach
+    /// `PROTOCOL_VERSION`. An older daemon decodes it as neither a
+    /// `DaemonMessage` nor an [`AgentEvent`] (it carries none of an event's
+    /// required fields), logs it as malformed and answers nothing, which the CLI
+    /// reports as harmless.
+    #[serde(rename = "ack")]
+    Ack(AckSignal),
 }
 
 impl DaemonMessage {
@@ -1298,6 +1310,7 @@ impl DaemonMessage {
             DaemonMessage::ListTargets(r) => &r.pane_id,
             DaemonMessage::RestartRole(s) => &s.pane_id,
             DaemonMessage::SpawnRole(s) => &s.pane_id,
+            DaemonMessage::Ack(s) => &s.pane_id,
         }
     }
 
@@ -1312,6 +1325,7 @@ impl DaemonMessage {
             DaemonMessage::ListTargets(r) => r.token.as_deref(),
             DaemonMessage::RestartRole(s) => s.token.as_deref(),
             DaemonMessage::SpawnRole(s) => s.token.as_deref(),
+            DaemonMessage::Ack(s) => s.token.as_deref(),
         }
     }
 
@@ -1326,6 +1340,7 @@ impl DaemonMessage {
             DaemonMessage::ListTargets(_) => "list_targets",
             DaemonMessage::RestartRole(_) => "restart_role",
             DaemonMessage::SpawnRole(_) => "spawn_role",
+            DaemonMessage::Ack(_) => "ack",
         }
     }
 
@@ -1373,7 +1388,7 @@ impl DaemonMessage {
             // and would tell a caller that guessed a pane id that the pane
             // exists.
             DaemonMessage::GetSeed(_) => serde_json::to_string(&GetSeedResponse { seed: None }),
-            DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) => {
+            DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) | DaemonMessage::Ack(_) => {
                 serde_json::to_string(&SignalAck::refused(reason, message))
             }
         };
@@ -1384,9 +1399,9 @@ impl DaemonMessage {
     /// provenance gate, or `None` for a verb whose own handler answers on the
     /// connection.
     ///
-    /// Only the two fire-and-forget verbs are `Some`, and the exhaustive `match`
-    /// is what enforces the invariant the hook loop depends on: **exactly one
-    /// line per message**. `delegate`, `restart_role`, `spawn_role`,
+    /// Only the three fire-and-forget verbs (`work_done`, `dispatch`, and since
+    /// issue #1383 `ack`) are `Some`, and the exhaustive `match` is what enforces
+    /// the invariant the hook loop depends on: **exactly one line per message**. `delegate`, `restart_role`, `spawn_role`,
     /// `list_targets` and `get_seed` all write their own response after their
     /// handler runs, so an admission line here would be a second one and the
     /// caller — which reads exactly one line — would take the ack for the answer.
@@ -1400,7 +1415,7 @@ impl DaemonMessage {
     /// succeeded.
     pub fn provenance_ack_reply(&self) -> Option<String> {
         match self {
-            DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) => {
+            DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) | DaemonMessage::Ack(_) => {
                 serde_json::to_string(&SignalAck::accepted()).ok()
             }
             DaemonMessage::Delegate(_)
@@ -2365,6 +2380,30 @@ pub enum DispatchShape {
     },
 }
 
+/// Issue #1383: payload of [`DaemonMessage::Ack`], sent by a worker via
+/// `dot-agent-deck ack <delivery-id>`.
+///
+/// Deliberately carries NO `session_id`, `agent_type`, `event_type` or
+/// `timestamp`: an older daemon that does not know the `ack` tag falls back to
+/// decoding the line as an [`AgentEvent`], and those are the fields that decode
+/// requires. Without them the line is rejected as malformed instead of being
+/// ingested as a status event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AckSignal {
+    pub pane_id: String,
+    /// The delivery id from the task file, `^d-[0-9a-f]{8}$`
+    /// ([`crate::delegate_retry::is_valid_delivery_id`]). Validated by the daemon
+    /// before any lookup or log line.
+    pub delivery_id: String,
+    /// The sender's `DOT_AGENT_DECK_AGENT_ID`, so an older generation's ack cannot
+    /// stop a newer generation's retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// The hook capability token; see [`WorkDoneSignal::token`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
 /// Signal sent by a worker via `dot-agent-deck work-done`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkDoneSignal {
@@ -3269,5 +3308,74 @@ mod tests {
         .expect("unknown keys are ignored");
         assert!(ack.is_signal_ack());
         assert!(ack.accepted);
+    }
+
+    fn ack_message() -> DaemonMessage {
+        DaemonMessage::Ack(AckSignal {
+            pane_id: "pane-7".to_string(),
+            delivery_id: "d-7f3a9c21".to_string(),
+            agent_id: Some("agent-3".to_string()),
+            token: Some("tok".to_string()),
+        })
+    }
+
+    /// Issue #1383: `ack` rides the hook socket under the `ack` tag and
+    /// round-trips.
+    #[test]
+    fn ack_signal_round_trips_with_the_ack_tag() {
+        let json = serde_json::to_string(&ack_message()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["message_type"], "ack");
+        assert_eq!(value["delivery_id"], "d-7f3a9c21");
+        match serde_json::from_str::<DaemonMessage>(&json).unwrap() {
+            DaemonMessage::Ack(sig) => {
+                assert_eq!(sig.pane_id, "pane-7");
+                assert_eq!(sig.agent_id.as_deref(), Some("agent-3"));
+                assert_eq!(sig.token.as_deref(), Some("tok"));
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+        let bare: DaemonMessage = serde_json::from_str(
+            r#"{"message_type":"ack","pane_id":"p","delivery_id":"d-00000000"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            bare,
+            DaemonMessage::Ack(AckSignal {
+                agent_id: None,
+                token: None,
+                ..
+            })
+        ));
+    }
+
+    /// Issue #1383, cross-version case (a): an older daemon that does not know
+    /// the `ack` tag falls back to decoding the line as an `AgentEvent`. It must
+    /// fail there too, or that daemon would ingest the ack as a status event.
+    #[test]
+    fn an_ack_line_never_decodes_as_an_agent_event() {
+        let json = serde_json::to_string(&ack_message()).unwrap();
+        assert!(serde_json::from_str::<AgentEvent>(&json).is_err());
+    }
+
+    /// Issue #1383: `ack` joins the fire-and-forget family — attested by its
+    /// pane, answered at the gate with a `SignalAck` either way.
+    #[test]
+    fn ack_is_gated_and_answered_like_work_done() {
+        let msg = ack_message();
+        assert_eq!(msg.claimed_pane(), "pane-7");
+        assert_eq!(msg.presented_token(), Some("tok"));
+        assert_eq!(msg.verb(), "ack");
+        let accepted: SignalAck =
+            serde_json::from_str(&msg.provenance_ack_reply().expect("answered at the gate"))
+                .unwrap();
+        assert!(accepted.is_signal_ack() && accepted.accepted);
+        let refused: SignalAck = serde_json::from_str(
+            &msg.provenance_refusal_reply("missing_token", "no token")
+                .expect("a refusal is answered"),
+        )
+        .unwrap();
+        assert!(refused.is_signal_ack() && !refused.accepted);
+        assert_eq!(refused.reason.as_deref(), Some("missing_token"));
     }
 }

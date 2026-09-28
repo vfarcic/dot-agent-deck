@@ -3674,8 +3674,8 @@ impl PaneInputState {
     /// Issue #424 H3: a terminator SUBMITS the input box. Whatever we had put
     /// there is now the agent's problem and not ours, so every payload record
     /// for this pane stops guarding — which is what lets an ordinary later
-    /// delivery of the same fixed text (a delegate worker pointer is
-    /// deliberately the same one-line path across hand-offs) be admitted instead
+    /// delivery of the same fixed text (a delegate worker pointer re-sent in
+    /// place by issue #1383's retry is byte-identical) be admitted instead
     /// of matching a finished delivery's digest and being refused before writing
     /// a byte. The user-input clock still advances, so the blind probe stays
     /// refused: the box the probe wanted to submit is gone either way.
@@ -4225,6 +4225,8 @@ pub struct AgentPtyRegistry {
     focus_applied: tokio::sync::watch::Sender<u64>,
     /// Issue #714: see [`Self::codex_rollout_arms`].
     codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms,
+    /// Issue #1383: see [`Self::pending_deliveries`].
+    pending_deliveries: crate::delegate_retry::PendingDeliveries,
 }
 
 /// PRD #1105 — the shortest gap between two focus passes, and so the bound on
@@ -5711,7 +5713,15 @@ impl AgentPtyRegistry {
             focus_pass: Mutex::new(()),
             focus_applied: tokio::sync::watch::Sender::new(0),
             codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms::default(),
+            pending_deliveries: crate::delegate_retry::PendingDeliveries::default(),
         }
+    }
+
+    /// Issue #1383: the delegate deliveries a retry loop is watching, one per
+    /// worker pane. Held here because the dispatch path and the hook loop's
+    /// `ack` and `work-done` handlers share this registry and nothing else.
+    pub fn pending_deliveries(&self) -> &crate::delegate_retry::PendingDeliveries {
+        &self.pending_deliveries
     }
 
     /// Issue #714: the queue through which the daemon's hook loop asks its
@@ -9450,8 +9460,8 @@ impl AgentPtyRegistry {
         // Issue #424 H3: the predicate is keyed on the bytes AND scoped to the
         // lifetime of the delivery that wrote them, which is what keeps it from
         // refusing an ordinary later delivery of the same fixed text — a delegate
-        // worker pointer is deliberately identical across hand-offs, so equal
-        // payloads are the normal case, not an exotic one. See
+        // pointer re-sent in place (issue #1383) is identical to the first write,
+        // so equal payloads are the normal case, not an exotic one. See
         // [`Self::user_typed_since_writing_payload`] for the full lifecycle.
         if matches!(mode, SubmitMode::Submit) {
             let refuse = if payload.is_empty() {
@@ -18366,8 +18376,8 @@ mod spawn_tests {
     ///
     /// This is the pairing the fix turns on. #715's refusal is the right answer
     /// while bytes of ours are sitting in that input box and the wrong one once
-    /// they are gone: kept unconditionally it costs a delegation (the worker
-    /// pointer is the same fixed one-liner on every hand-off) to guard a box
+    /// they are gone: kept unconditionally it costs a delegation (a worker
+    /// pointer re-sent in place is byte-identical, issue #1383) to guard a box
     /// that is already clean, which is #424's prompt-loss half wearing #715's
     /// clothes.
     #[cfg(unix)]

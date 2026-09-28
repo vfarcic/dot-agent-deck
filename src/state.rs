@@ -4394,7 +4394,18 @@ fn delegate_no_event_window(
 /// all: `AgentType::from_command` cannot see through a `devbox run …` / `mise` /
 /// `npm run` launcher, and the learned badge is set from an incoming hook event,
 /// which is precisely what is missing.
-fn compose_delegate_silence_notice(window: std::time::Duration, pane_text: Option<&str>) -> String {
+///
+/// Issue #1383: `redeliveries` is how many times the in-place retry re-sent the
+/// pointer for this delivery. When that is non-zero the report says so,
+/// because "the pointer may never have reached it" reads differently once the
+/// deck has already tried again in the same process — the next step is the
+/// orchestrator's, not another wait. Only the wording changes; delivery, the
+/// identity gate and the fenced pane capture are the silence report's own.
+fn compose_delegate_silence_notice(
+    window: std::time::Duration,
+    pane_text: Option<&str>,
+    redeliveries: u32,
+) -> String {
     let window = if window < std::time::Duration::from_secs(1) {
         format!("{} ms", window.as_millis())
     } else {
@@ -4412,10 +4423,19 @@ fn compose_delegate_silence_notice(window: std::time::Duration, pane_text: Optio
                  may never have started, or the task pointer may never have reached it."
             .to_string(),
     };
+    // One spelling for every count, "1 times" included: the sentence is the
+    // documented, greppable form of this report.
+    let retried = match redeliveries {
+        0 => String::new(),
+        n => format!(
+            " The deck re-sent the task pointer into the same process {n} times and none of them \
+             produced an event."
+        ),
+    };
     compose_delegate_prompt(&format!(
         "⚠ delegated worker went quiet (dot-agent-deck daemon report) - a report from the \
          dot-agent-deck daemon, not a message from a person or an agent: a delegated worker \
-         received its task pointer but then emitted no agent event within {window}. {evidence} \
+         received its task pointer but then emitted no agent event within {window}.{retried} {evidence} \
          Check its pane and decide how to proceed - if this needs the user, notify the user; \
          otherwise keep waiting, re-delegate, or reassign. The daemon log names the worker pane \
          and role (RUST_LOG=pane_write=trace also has the delivered bytes)."
@@ -4671,7 +4691,7 @@ pub(crate) fn compose_respawn_failed_notice(worker_pane_id: &str) -> String {
 /// agent-specific evidence (a `Stop`-derived `Idle` from Claude *does* imply a
 /// turn; OpenCode's identically-typed startup `session.idle` does not) without
 /// another signature change.
-fn worker_event_proves_delivery(event: &AgentEvent) -> bool {
+pub(crate) fn worker_event_proves_delivery(event: &AgentEvent) -> bool {
     match event.event_type {
         // Lifecycle: emitted by a booting or dying agent that never saw the prompt.
         EventType::SessionStart | EventType::SessionEnd => false,
@@ -4812,6 +4832,10 @@ struct SilenceWatch {
     window: std::time::Duration,
     /// The only place the report is allowed to be written.
     target: SilenceReportTarget,
+    /// Issue #1383: the in-place retry's count of re-deliveries, set by the
+    /// dispatch when one is armed for this delivery, so the report can say how
+    /// many there were. `None` when no retry runs.
+    redeliveries: Option<Arc<std::sync::atomic::AtomicU32>>,
 }
 
 /// PRD #249 M3: make an undelivered delegate visible instead of silent.
@@ -4871,6 +4895,7 @@ fn arm_delegate_silence_watch(
 ) {
     let SilenceWatch {
         window,
+        redeliveries,
         target:
             SilenceReportTarget {
                 pane_id: orchestrator_pane_id,
@@ -4981,7 +5006,11 @@ fn arm_delegate_silence_watch(
         // orchestrator agent captured when the delegate was ISSUED) and the same
         // revalidation closure. Only the delivery tail moved — the gate that
         // `scheduler/idle-worker/008` and `/014` pin is untouched.
-        let notice = compose_delegate_silence_notice(window, pane_text.as_deref());
+        let notice = compose_delegate_silence_notice(
+            window,
+            pane_text.as_deref(),
+            redeliveries.map_or(0, |count| count.load(std::sync::atomic::Ordering::SeqCst)),
+        );
         let revalidate_registry = Arc::clone(&registry);
         let revalidate_pane = orchestrator_pane_id.clone();
         let revalidate_worker = worker_pane_id.clone();
@@ -5545,8 +5574,9 @@ async fn probe_delegate_submit(
 /// caller here: two silent workers on one orchestration reporting a blank pane
 /// in the same window compose byte-for-byte equal reports
 /// (`scheduler/idle-worker/017`), the idle prompt is a role name plus a COARSE
-/// elapsed time, and the delegate task pointer is deliberately the same fixed
-/// one-liner on every hand-off.
+/// elapsed time, and the delegate task pointer is the same one-liner every time
+/// issue #1383's in-place retry re-sends it (a new delegation carries a new
+/// delivery id, so two hand-offs no longer repeat each other byte for byte).
 ///
 /// `Some(Ambiguous)` deliberately does NOT release it, even though it is just as
 /// one-shot. It is by definition a PARTIAL write — some payload bytes reached
@@ -5620,10 +5650,28 @@ pub(crate) fn settle_one_shot_payload_record(
 /// path is role-interpolated, via [`role_path_slug`]'s readable-slug-plus-digest
 /// form, so two workers sharing a cwd are not handed the same report path (see
 /// [`work_done_footer`] for the exact strength of that claim).
-pub fn compose_worker_task_file(prompt_template: Option<&str>, task: &str, role: &str) -> String {
+///
+/// Issue #1383: with a `delivery_id`, an "acknowledge first" header
+/// ([`crate::delegate_retry::task_file_ack_header`]) is PREPENDED, so the first
+/// thing a worker reads is the command that stops the daemon re-sending its
+/// pointer. `None` keeps the file exactly as it was before #1383.
+pub fn compose_worker_task_file(
+    prompt_template: Option<&str>,
+    task: &str,
+    role: &str,
+    delivery_id: Option<&str>,
+) -> String {
     let body = match prompt_template {
         Some(tpl) if !tpl.trim().is_empty() => format!("{tpl}\n\n## Task\n\n{task}"),
         _ => task.to_string(),
+    };
+    let body = match delivery_id {
+        Some(id) => format!(
+            "{}\n\n{}",
+            crate::delegate_retry::task_file_ack_header(id),
+            body
+        ),
+        None => body,
     };
     format!("{}\n\n{}", body.trim_end(), work_done_footer(role))
 }
@@ -6911,14 +6959,25 @@ pub(crate) fn latch_generation(
 ///
 /// Extracted from [`dispatch_one_owned`] so the fallback policy is unit-testable
 /// without standing up a registry, a broadcast channel and a live pane.
+///
+/// Issue #1383: with a `delivery_id`, both shapes end in
+/// [`crate::delegate_retry::pointer_suffix`] (` [delivery d-…]`), and the
+/// task-file content — the file, or the inlined body — opens with the
+/// acknowledgement header. The pointer is therefore no longer byte-identical
+/// across hand-offs, which the #424/#715 notes in [`dispatch_one_owned`] take
+/// into account.
 fn resolve_delegate_task_body(
     cwd: Option<&str>,
     prompt_template: Option<&str>,
     task: &str,
     target_role: &str,
     pane_id: &str,
+    delivery_id: Option<&str>,
 ) -> String {
-    let file_content = compose_worker_task_file(prompt_template, task, target_role);
+    let suffix = delivery_id
+        .map(crate::delegate_retry::pointer_suffix)
+        .unwrap_or_default();
+    let file_content = compose_worker_task_file(prompt_template, task, target_role, delivery_id);
     let Some(cwd) = cwd else {
         // Defensive: the daemon's StartAgent handler always records
         // `pane_cwd_map` for orchestration panes (see `daemon_protocol.rs`), so
@@ -6928,7 +6987,7 @@ fn resolve_delegate_task_body(
             pane_id = %pane_id,
             "delegate: no cwd recorded for worker pane — inlining task body"
         );
-        return file_content;
+        return format!("{file_content}{suffix}");
     };
 
     let safe_name = sanitize_role_name(target_role);
@@ -6942,7 +7001,7 @@ fn resolve_delegate_task_body(
         &file_name,
         &file_content,
     ) {
-        Ok(_) => format!("Read .dot-agent-deck/{file_name} for your task."),
+        Ok(_) => format!("Read .dot-agent-deck/{file_name} for your task.{suffix}"),
         Err(e) => {
             warn!(
                 file = %file_name,
@@ -6953,7 +7012,7 @@ fn resolve_delegate_task_body(
                 "delegate: failed to write worker task file — inlining task body instead of \
                  pointing the worker at a file that does not exist"
             );
-            file_content
+            format!("{file_content}{suffix}")
         }
     }
 }
@@ -7211,6 +7270,17 @@ async fn dispatch_one_owned(
     // Issue #544 (PR #1398 review): no longer queued behind another dispatch,
     // so the idle-worker watch's clock may run again.
     pointer_queue.dequeue();
+    // Issue #1383: a new delegation to this pane ends any older delivery's retry
+    // loop before this dispatch writes anything. Under the dispatch lock, which
+    // the loop also takes before each re-delivery, so an older pointer can never
+    // land after this one.
+    if registry.pending_deliveries().supersede(&pane_id) {
+        tracing::debug!(
+            pane_id = %pane_id,
+            role = %target_role,
+            "delegate: a newer delegation superseded the pane's pending delivery retry"
+        );
+    }
     // Issue #590: from here on this dispatch's commission is "the caller's own"
     // rather than "in flight" to `retire_commissions_of_replaced_agent`, which
     // is why the guard goes now and only whether it existed is kept.
@@ -7264,12 +7334,18 @@ async fn dispatch_one_owned(
     let prompt_template = role_config
         .as_ref()
         .and_then(|r| r.prompt_template.as_deref());
+    // Issue #1383: the id this delivery is acknowledged and retried under. Minted
+    // on every delegation, so the pointer and the task file look the same whether
+    // or not a retry is armed for it — a Pi seed and a delivery with the retry
+    // switched off carry one too, and an `ack` of theirs is a logged no-op.
+    let delivery_id = crate::delegate_retry::mint_delivery_id();
     let task_body = resolve_delegate_task_body(
         cwd.as_deref(),
         prompt_template,
         &task,
         &target_role,
         &pane_id,
+        Some(&delivery_id),
     );
     // The single-line pointer the worker receives ("Read
     // .dot-agent-deck/worker-task-<role>.md for your task."). Computed here so
@@ -8410,7 +8486,7 @@ async fn dispatch_one_owned(
     // accounting the early arming exists to preserve — and would also refuse if a
     // close began during the waits above, where reuse instead lets the watch
     // task's already-live cancellation channel retire it on its own.
-    let silence = match (silence_watch, reserved_silence.take()) {
+    let mut silence = match (silence_watch, reserved_silence.take()) {
         (Some(watch), Some(armed)) => Some((watch, armed, event_tx.subscribe())),
         (Some(watch), None) => registry
             .arm_silence_watch(
@@ -8449,6 +8525,43 @@ async fn dispatch_one_owned(
     // CR began a turn, so the loop sees proof of delivery and returns before it
     // ever probes.
     let late_readiness_rx = late_readiness_rearm.as_ref().map(|_| event_tx.subscribe());
+    // Issue #1383: decide BEFORE the write whether this delivery may be retried in
+    // place, and if so register it and subscribe now. Subscribing first is the
+    // silence watch's reason above: a fast agent's first `Thinking` must not land
+    // before the loop can see it. Registering first means an `ack` can never
+    // arrive for a delivery the daemon does not know about yet.
+    //
+    // Armed independently of the silent-worker report, for #1031's reason below:
+    // the e2e harness pins that report off, and a delivery fix must not inherit a
+    // diagnostic's switch.
+    //
+    // Only for a worker whose agent the deck can identify — declared on the role,
+    // derived from its command, or recorded at spawn. An unidentified agent has no
+    // channel that could ever report a turn, so every re-delivery could be a
+    // duplicate (the rule-20 gap `docs/orchestration.md` names).
+    let retry_schedule = crate::delegate_retry::RetrySchedule::from_env();
+    let retry_agent_type = role_config
+        .as_ref()
+        .and_then(|role| role.resolved_agent_type())
+        .or_else(|| {
+            expected_worker_agent_id
+                .as_deref()
+                .and_then(|id| registry.pre_write_believed_agent_type(id))
+        });
+    let pending_retry = match expected_worker_agent_id.as_deref() {
+        Some(worker_agent_id)
+            if retry_schedule.is_enabled()
+                && crate::delegate_retry::agent_type_supports_retry(retry_agent_type.as_ref()) =>
+        {
+            let rx = event_tx.subscribe();
+            let armed =
+                registry
+                    .pending_deliveries()
+                    .arm(&pane_id, &delivery_id, worker_agent_id, None);
+            Some((armed, rx))
+        }
+        _ => None,
+    };
     // Legacy PTY injection for every non-pi-native path: claude / opencode
     // workers, and `clear = false` pi workers (which get no fresh
     // `session_start` for the extension to pull on). The pi-native `clear =
@@ -8668,8 +8781,12 @@ async fn dispatch_one_owned(
     // delivery of the same bytes. That is not hypothetical: the worker pointer
     // is deliberately the same fixed one-liner across hand-offs, so the next
     // delegation to a worker the user has typed into was refused before writing
-    // a byte, logged only, with its silence watch cancelled. Released here, at
-    // the write, rather than left to the 60 s TTL. Only when something was
+    // a byte, logged only, with its silence watch cancelled. (Issue #1383: a
+    // pointer now ends in its delivery id, so a LATER delegation's pointer no
+    // longer matches an earlier one's leftovers; the byte-identical repeat is now
+    // the in-place retry re-sending the same delivery, which is exactly why this
+    // record has to be released on `Applied` before that retry runs.) Released
+    // here, at the write, rather than left to the 60 s TTL. Only when something was
     // actually written — a refusal created no record, and releasing then would
     // consume a concurrent delivery's.
     //
@@ -8682,8 +8799,8 @@ async fn dispatch_one_owned(
     //
     // The cost of that is sharper here than at the two report sites, and was
     // weighed rather than swept in: refusing a repeat costs a DELEGATION —
-    // work that never starts — not merely a diagnostic, and the pointer's fixed
-    // text makes the repeat GUARANTEED byte-identical rather than merely likely.
+    // work that never starts — not merely a diagnostic, and a re-delivery of the
+    // same pointer (#1383) is GUARANTEED byte-identical rather than merely likely.
     // Taken anyway, because the refusal is neither silent nor unaccounted: the
     // later delegation takes the `RefusedUserInput` arm above, which publishes a
     // `DeliveryNotice` naming exactly this cause on the worker's card, and
@@ -8772,6 +8889,67 @@ async fn dispatch_one_owned(
             target_role.clone(),
             orchestration.clone(),
         );
+    }
+    // Issue #1383: start the in-place retry, or release its registration. Armed
+    // above the `silence` destructuring for the same reason as #1031's recovery.
+    //
+    // Only over an `Applied` first write, the same line #1031 draws: an
+    // `Ambiguous` write may have left a PREFIX of the pointer in the composer, and
+    // a retype would submit that prefix and the pointer as one turn.
+    let redeliveries = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut retry_armed = false;
+    if let Some((armed_retry, retry_rx)) = pending_retry {
+        let retry_seq = armed_retry.seq;
+        match (submit_outcome, expected_worker_agent_id.as_deref()) {
+            (Some(crate::agent_pty::GuardedSend::Applied), Some(worker_agent_id)) => {
+                let silence_seq = silence.as_ref().map(|(_, armed, _)| armed.seq);
+                registry
+                    .pending_deliveries()
+                    .attach_silence_seq(&pane_id, retry_seq, silence_seq);
+                tracing::info!(
+                    pane_id = %pane_id,
+                    role = %target_role,
+                    delivery_id = %delivery_id,
+                    schedule_ms = ?retry_schedule
+                        .waits()
+                        .iter()
+                        .map(|wait| wait.as_millis())
+                        .collect::<Vec<_>>(),
+                    "delegate: task pointer written; re-sending it into the same process on \
+                     this schedule until the worker begins a turn or acknowledges it"
+                );
+                crate::delegate_retry::spawn(crate::delegate_retry::DeliveryRetry {
+                    registry: Arc::clone(&registry),
+                    event_rx: retry_rx,
+                    armed: armed_retry,
+                    schedule: retry_schedule.clone(),
+                    pane_id: pane_id.clone(),
+                    worker_agent_id: worker_agent_id.to_string(),
+                    role: target_role.clone(),
+                    delivery_id: delivery_id.clone(),
+                    pointer: one_liner.clone(),
+                    orchestration: orchestration.clone(),
+                    redeliveries: Arc::clone(&redeliveries),
+                    silence_report_armed: delivered && silence.is_some(),
+                });
+                retry_armed = true;
+            }
+            _ => {
+                registry.pending_deliveries().finish(&pane_id, retry_seq);
+            }
+        }
+    }
+    // Issue #1383: with the retry armed, the silent-worker report is the "not
+    // delivered" report for the whole schedule rather than a second one fired in
+    // the middle of it — so its window covers the schedule, plus a second of
+    // slack for the last re-delivery's own write. This exceeds
+    // `MAX_DELEGATE_NO_EVENT_WINDOW` for this delivery only; the clamp still
+    // governs the report whenever the retry is off.
+    if retry_armed && let Some((watch, _, _)) = silence.as_mut() {
+        watch.window = watch
+            .window
+            .max(retry_schedule.total_span() + std::time::Duration::from_secs(1));
+        watch.redeliveries = Some(Arc::clone(&redeliveries));
     }
     let Some((watch, armed, rx)) = silence else {
         return;
@@ -10673,6 +10851,7 @@ impl AppState {
                             agent_id: registry.pane_current_agent_id(&orchestrator_pane_id),
                             orchestration: orchestration.clone(),
                         },
+                        redeliveries: None,
                     },
                 );
 
@@ -11536,6 +11715,18 @@ impl AppState {
         // case it exists to surface. See
         // [`AgentPtyRegistry::retire_silence_watch`] for why the accounting
         // cannot simply borrow the idle detector's generation.
+        // Issue #1383: a completion proves the pointer landed, so the pane's
+        // in-place retry stops too. Above every early return, like the two
+        // retirements around it.
+        if registry
+            .pending_deliveries()
+            .retire_on_work_done(&signal.pane_id)
+        {
+            tracing::debug!(
+                pane_id = %signal.pane_id,
+                "work-done: stopped the delegate delivery retry (delivery is proven)"
+            );
+        }
         match registry.retire_silence_watch(&signal.pane_id) {
             crate::agent_pty::SilenceWatchRetirement::Nothing => {}
             crate::agent_pty::SilenceWatchRetirement::Cancelled { seq } => {
@@ -14121,6 +14312,7 @@ mod tests {
             "Implement the thing.",
             "coder",
             "pane-1",
+            None,
         );
 
         assert_eq!(
@@ -14164,6 +14356,7 @@ mod tests {
             "Implement the thing.",
             "coder",
             "pane-1",
+            None,
         );
 
         assert!(
@@ -14194,6 +14387,7 @@ mod tests {
             "Implement the thing.",
             "coder",
             "pane-1",
+            None,
         );
 
         assert!(
@@ -14206,10 +14400,89 @@ mod tests {
         );
     }
 
+    /// Issue #1383: with a delivery id, the acknowledgement header is the first
+    /// thing in the file and names the id and the binary; the template, the task
+    /// and the footer follow unchanged, and the inline-allowlist guard still
+    /// agrees with the footer.
+    #[test]
+    fn compose_worker_task_file_puts_the_ack_header_first() {
+        let with_id = compose_worker_task_file(
+            Some("You are coder."),
+            "Implement the thing.",
+            "coder",
+            Some("d-7f3a9c21"),
+        );
+        let bin = crate::platform::paths::binary_name();
+        assert!(
+            with_id.starts_with("## First: acknowledge this task"),
+            "{with_id}"
+        );
+        assert!(with_id.contains(&format!("{bin} ack d-7f3a9c21")));
+        let without = compose_worker_task_file(
+            Some("You are coder."),
+            "Implement the thing.",
+            "coder",
+            None,
+        );
+        assert!(
+            with_id.ends_with(&without),
+            "the header must be purely prepended: {with_id}"
+        );
+        assert!(without.starts_with("You are coder.\n\n## Task"));
+        assert_inline_allowlist_agrees_with_explanation(&with_id, "task file with ack header");
+    }
+
+    /// Issue #1383: the pointer ends with the delivery suffix and stays one line,
+    /// and the inline fallback carries the header and the same suffix.
+    #[test]
+    fn resolve_delegate_task_body_carries_the_delivery_id() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let pointer = compose_delegate_prompt(&resolve_delegate_task_body(
+            Some(cwd.path().to_str().expect("utf8 cwd")),
+            None,
+            "Implement the thing.",
+            "coder",
+            "pane-1",
+            Some("d-7f3a9c21"),
+        ));
+        assert_eq!(
+            pointer,
+            "Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-7f3a9c21]"
+        );
+        assert!(!pointer.contains('\n'));
+        let written = std::fs::read_to_string(
+            cwd.path()
+                .join(".dot-agent-deck")
+                .join("worker-task-coder.md"),
+        )
+        .expect("task file");
+        assert!(written.starts_with("## First: acknowledge this task"));
+        assert!(written.contains("ack d-7f3a9c21"));
+
+        let inline = compose_delegate_prompt(&resolve_delegate_task_body(
+            None,
+            None,
+            "Implement the thing.",
+            "coder",
+            "pane-1",
+            Some("d-7f3a9c21"),
+        ));
+        assert!(
+            inline.starts_with("## First: acknowledge this task"),
+            "{inline}"
+        );
+        assert!(inline.ends_with(" [delivery d-7f3a9c21]"), "{inline}");
+        assert!(inline.contains("Implement the thing."));
+    }
+
     #[test]
     fn compose_worker_task_file_appends_work_done_footer() {
-        let content =
-            compose_worker_task_file(Some("You are coder."), "Implement the thing.", "coder");
+        let content = compose_worker_task_file(
+            Some("You are coder."),
+            "Implement the thing.",
+            "coder",
+            None,
+        );
         let bin = crate::platform::paths::binary_name();
         assert!(content.starts_with("You are coder.\n\n## Task\n\nImplement the thing."));
         assert!(
@@ -14335,7 +14608,7 @@ mod tests {
         // self-sufficient and agree with its own explanation.
         assert_inline_allowlist_agrees_with_explanation(&content, "worker work-done footer");
 
-        let no_template = compose_worker_task_file(None, "Implement the fallback.", "coder");
+        let no_template = compose_worker_task_file(None, "Implement the fallback.", "coder", None);
         assert!(no_template.starts_with("Implement the fallback.\n\n## When done"));
     }
 
@@ -14346,8 +14619,12 @@ mod tests {
     #[spec("orchestration/delegate/017")]
     #[test]
     fn delegate_017_work_done_footer_names_the_running_binary() {
-        let content =
-            compose_worker_task_file(Some("You are coder."), "Implement the thing.", "coder");
+        let content = compose_worker_task_file(
+            Some("You are coder."),
+            "Implement the thing.",
+            "coder",
+            None,
+        );
         let bin = crate::platform::paths::binary_name();
 
         assert_ne!(
@@ -17312,7 +17589,8 @@ mod tests {
     /// frame it as bracketed paste (#187).
     #[test]
     fn compose_delegate_silence_notice_carries_no_untrusted_interpolation() {
-        let notice = compose_delegate_silence_notice(std::time::Duration::from_millis(600), None);
+        let notice =
+            compose_delegate_silence_notice(std::time::Duration::from_millis(600), None, 0);
 
         assert!(
             !notice.contains('\n'),
@@ -17328,7 +17606,7 @@ mod tests {
         );
         // A sub-second window reads in milliseconds; a longer one in human units.
         assert!(
-            compose_delegate_silence_notice(std::time::Duration::from_secs(30), None)
+            compose_delegate_silence_notice(std::time::Duration::from_secs(30), None, 0)
                 .contains("within 30 seconds"),
             "a whole-second window must not be rendered as milliseconds"
         );
@@ -17338,12 +17616,30 @@ mod tests {
     /// text must arrive framed and introduced as untrusted, and a pane with
     /// nothing on it must be reported as blank rather than silently producing
     /// the same wording as one the daemon actually read.
+    /// Issue #1383: a report after in-place re-deliveries says how many there
+    /// were; with none it reads exactly as before.
+    #[test]
+    fn compose_delegate_silence_notice_states_the_redelivery_count() {
+        let window = std::time::Duration::from_secs(30);
+        let plain = compose_delegate_silence_notice(window, None, 0);
+        assert!(!plain.contains("re-sent"), "{plain}");
+        let retried = compose_delegate_silence_notice(window, None, 3);
+        assert!(
+            retried.contains(
+                "The deck re-sent the task pointer into the same process 3 times and none of \
+                 them produced an event."
+            ),
+            "{retried}"
+        );
+        assert!(!retried.contains('\n'));
+    }
+
     #[test]
     fn compose_delegate_silence_notice_reports_the_pane_instead_of_asserting_a_cause() {
         let fenced = quote_untrusted_pane_text(&["Ask the agent to do anything".to_string()])
             .expect("a non-empty pane line quotes");
         let reported =
-            compose_delegate_silence_notice(std::time::Duration::from_secs(30), Some(&fenced));
+            compose_delegate_silence_notice(std::time::Duration::from_secs(30), Some(&fenced), 0);
 
         assert!(
             !reported.contains('\n'),
@@ -17365,7 +17661,7 @@ mod tests {
             "with the pane's screen in hand the notice must stop asserting a cause: {reported:?}"
         );
 
-        let blank = compose_delegate_silence_notice(std::time::Duration::from_secs(30), None);
+        let blank = compose_delegate_silence_notice(std::time::Duration::from_secs(30), None, 0);
         assert!(
             blank.contains("rendered nothing at all"),
             "a pane with no screen to report must say so: {blank:?}"
@@ -17670,6 +17966,7 @@ mod tests {
                     agent_id: None,
                     orchestration: None,
                 },
+                redeliveries: None,
             }),
             PointerQueueClock::new(registry.clone(), worker_pane.to_string(), None),
             None,
@@ -17880,7 +18177,8 @@ mod tests {
         const UNSETTLED_PANE: &str = "silence-report-unsettled-orchestrator";
 
         let registry = Arc::new(AgentPtyRegistry::new());
-        let report = compose_delegate_silence_notice(std::time::Duration::from_millis(600), None);
+        let report =
+            compose_delegate_silence_notice(std::time::Duration::from_millis(600), None, 0);
 
         let spawn_orchestrator = |pane: &str| {
             registry
@@ -18031,7 +18329,8 @@ mod tests {
         const APPLIED_PANE: &str = "silence-report-applied-orchestrator";
 
         let registry = Arc::new(AgentPtyRegistry::new());
-        let report = compose_delegate_silence_notice(std::time::Duration::from_millis(600), None);
+        let report =
+            compose_delegate_silence_notice(std::time::Duration::from_millis(600), None, 0);
         assert!(
             !is_exactly_drainable(&report),
             "the premise of this whole test: the production silence report carries a non-ASCII \
@@ -18312,8 +18611,8 @@ mod tests {
     /// the way `dispatch_one_owned` does — one `Applied`, and two faulted into a
     /// genuine `Ambiguous`, of which one pane's writer recovers in time for the
     /// drain's erases and one does not. The user types into all three and the
-    /// NEXT delegation's pointer — the same fixed one-liner, so guaranteed
-    /// byte-identical — follows: only the pane whose bytes are still in its
+    /// same pointer again — a re-delivery under the same delivery id, so
+    /// guaranteed byte-identical — follows: only the pane whose bytes are still in its
     /// input box may refuse it.
     #[cfg(unix)]
     #[spec("orchestration/delegate/031")]
@@ -18346,6 +18645,11 @@ mod tests {
         // The production pointer, built the way `dispatch_one_owned` builds it:
         // resolve the task body (which writes the worker task file) and compose
         // the single-line pointer at it.
+        //
+        // Issue #1383: a production pointer now carries its delivery id, so two
+        // DELEGATIONS no longer type identical bytes. The same delivery re-sent in
+        // place by the retry does, byte for byte, and that is the repeat this pins
+        // now — hence one fixed id for both calls.
         let pointer_for = |task: &str| {
             compose_delegate_prompt(&resolve_delegate_task_body(
                 Some(cwd_path),
@@ -18353,15 +18657,16 @@ mod tests {
                 task,
                 "coder",
                 DRAINED_PANE,
+                Some("d-0123abcd"),
             ))
         };
         let one_liner = pointer_for("Implement the first thing.");
         assert_eq!(
             one_liner,
             pointer_for("Implement a completely different second thing."),
-            "the pointer is deliberately the same fixed one-liner on every hand-off, so a later \
-             delegation's bytes are GUARANTEED identical rather than merely likely — which is \
-             what makes releasing this record on an ambiguous submit reachable in practice"
+            "the pointer names only the role's task file and the delivery id, so a re-delivery's \
+             bytes are GUARANTEED identical rather than merely likely — which is what makes \
+             releasing this record on an ambiguous submit reachable in practice"
         );
         assert!(
             is_exactly_drainable(&one_liner),

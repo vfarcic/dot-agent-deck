@@ -18,6 +18,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use common::{TuiDeck, TuiDeckBuilder};
+use dot_agent_deck::agent_pty::TabMembership;
 use dot_agent_deck::event::{AgentType, EventType};
 use dot_agent_deck::state::DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS;
 use spec::spec;
@@ -38,6 +39,7 @@ const CLAUDE_SENTINEL_CONTENT: &str = "PRD249_CLAUDE_RESPAWN_OK";
 
 const OPENCODE_SENTINEL: &str = "prd249-opencode-respawn-8a62f4.txt";
 const OPENCODE_SENTINEL_CONTENT: &str = "PRD249_OPENCODE_RESPAWN_OK";
+const OPENCODE_RETRY_SENTINEL: &str = "delegate-retry-fixture-6d3e9a.sentinel";
 
 /// Test-only forwarding seam for the M2 observation run, and since issue #243
 /// round 4 for re-bracketing the no-signal buffer on a machine the shipped value
@@ -510,4 +512,132 @@ fn delegate_015_real_opencode_worker_acts_on_clear_true_delegate() {
             declared_launcher: Some("opencode"),
         },
     );
+}
+
+fn worker_agent_id(deck: &TuiDeck) -> Option<String> {
+    common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| {
+            matches!(
+                &record.tab_membership,
+                Some(TabMembership::Orchestration { role_name, .. })
+                    if role_name == WORKER_ROLE
+            )
+        })
+        .map(|record| record.id)
+}
+
+/// Scenario: Open a PTY-attached orchestration with a real interactive OpenCode worker, then delegate while its replacement is still booting by removing the readiness buffer. The worker must list a uniquely named fixture file and report its name through `work-done` without another respawn; the daemon log records whether an in-place re-delivery was needed.
+#[spec("orchestration/delegate/045")]
+#[test]
+#[cfg(unix)]
+fn delegate_045_real_opencode_recovers_early_pointer_in_place() {
+    skip_unless!(common::check_opencode_available());
+
+    let worker_command = format!("opencode --model {} --auto", common::opencode_test_model());
+    let deck = TuiDeck::builder()
+        .with_pty_size(180, 45)
+        .with_env("PATH", path_with_binary_dir())
+        .with_env(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, "0")
+        .with_env(
+            "DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS",
+            "5000,10000,20000",
+        )
+        .with_imported_opencode_credentials()
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+
+    let work = deck.workdir();
+    std::fs::write(
+        work.join(OPENCODE_RETRY_SENTINEL),
+        "fixture for the real worker\n",
+    )
+    .expect("write uniquely named fixture sentinel");
+    std::fs::write(
+        work.join(".dot-agent-deck.toml"),
+        orchestration_toml(&worker_command, None),
+    )
+    .expect("write real OpenCode orchestration config");
+    std::fs::write(
+        work.join(DELEGATE_TASK_FILE),
+        "Use your shell to list the files in the current working directory. Find the one filename \
+         beginning with delegate-retry-fixture- and ending with .sentinel. Then run \
+         dot-agent-deck work-done --task with a short report containing that exact filename. \
+         Do not guess the filename and do not stop before work-done succeeds.\n",
+    )
+    .expect("write delegated file-list task");
+    write_executable(&work.join(ORCHESTRATOR_SCRIPT), ORCHESTRATOR_BODY);
+
+    open_orchestration(&deck);
+    deck.wait_for_string(WORKER_ROLE);
+    assert!(
+        common::wait_until(Duration::from_secs(20), || worker_agent_id(&deck).is_some()),
+        "the real worker role never acquired a daemon record; grid:\n{}",
+        deck.snapshot_grid()
+    );
+    let initial_id = worker_agent_id(&deck).expect("initial worker checked above");
+
+    // The initial OpenCode need not finish booting. Delegation respawns it with
+    // clear=true, and the zero buffer sends the first pointer into that new
+    // process as early as the deck permits.
+    std::fs::write(work.join(DELEGATE_TRIGGER), "").expect("release delegate trigger");
+    let delegate_log = work.join(ORCHESTRATOR_LOG);
+    assert!(
+        common::wait_until(Duration::from_secs(30), || {
+            std::fs::read_to_string(&delegate_log).is_ok_and(|log| log.contains("delegate exit=0"))
+        }),
+        "the real delegate CLI did not finish; orchestrator_log={:?}; grid:\n{}",
+        std::fs::read_to_string(&delegate_log).unwrap_or_default(),
+        deck.snapshot_grid()
+    );
+    let replacement_id = worker_agent_id(&deck).expect("replacement worker has a daemon record");
+    assert_ne!(
+        initial_id, replacement_id,
+        "clear=true must replace the first worker before the task pointer is sent"
+    );
+
+    // Focus the real worker pane so the recording and failure grid show what
+    // OpenCode did with the delegated pointer, not only the role card.
+    deck.send_bytes(b"\x04");
+    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.send_bytes(b"2");
+    let work_done = work.join(".dot-agent-deck/work-done-coder.md");
+    let completed = common::wait_until(Duration::from_secs(95), || {
+        std::fs::read_to_string(&work_done)
+            .is_ok_and(|report| report.contains(OPENCODE_RETRY_SENTINEL))
+    });
+    let daemon_log = std::fs::read_to_string(work.join("state/daemon.log"))
+        .unwrap_or_else(|error| format!("<daemon log unavailable: {error}>"));
+    let retry_lines: Vec<&str> = daemon_log
+        .lines()
+        .filter(|line| {
+            line.contains("delegate retry: no proof the worker received its task pointer")
+        })
+        .collect();
+    assert!(
+        completed,
+        "the REAL OpenCode worker did not report the listed sentinel through work-done; \
+         first pointer was sent during boot, in-place retries={}; report={:?}; \
+         orchestrator_log={:?}; retry_lines={retry_lines:?}; grid:\n{}",
+        retry_lines.len(),
+        std::fs::read_to_string(&work_done).unwrap_or_default(),
+        std::fs::read_to_string(&delegate_log).unwrap_or_default(),
+        deck.snapshot_grid()
+    );
+    assert_eq!(
+        worker_agent_id(&deck).as_deref(),
+        Some(replacement_id.as_str()),
+        "the worker must complete inside the same process that received the first pointer"
+    );
+    if retry_lines.is_empty() {
+        eprintln!(
+            "delegate_045: OpenCode accepted the first pointer before a scheduled retry; \
+             this run proves completion but did not exercise recovery"
+        );
+    } else {
+        eprintln!(
+            "delegate_045: {} in-place re-delivery attempt(s) occurred before work-done",
+            retry_lines.len()
+        );
+    }
 }

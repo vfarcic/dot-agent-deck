@@ -158,10 +158,22 @@ async fn wait_for_snapshot_needle(
     needle: &[u8],
     timeout: Duration,
 ) -> Vec<u8> {
+    wait_for_snapshot_match(registry, agent_id, timeout, |snap| {
+        snapshot_contains(snap, needle)
+    })
+    .await
+}
+
+async fn wait_for_snapshot_match(
+    registry: &AgentPtyRegistry,
+    agent_id: &str,
+    timeout: Duration,
+    matches: impl Fn(&[u8]) -> bool,
+) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Ok(snap) = registry.snapshot(agent_id)
-            && snap.windows(needle.len()).any(|w| w == needle)
+            && matches(&snap)
         {
             return snap;
         }
@@ -176,6 +188,21 @@ fn snapshot_contains(snapshot: &[u8], needle: &[u8]) -> bool {
     snapshot
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+/// The pointer now has a short delivery-id suffix before Enter. Keep the
+/// original assertion that the same submitted line contains both the pointer
+/// and its CR, while allowing that suffix between them.
+fn snapshot_contains_pointer_then_submit(snapshot: &[u8]) -> bool {
+    snapshot
+        .windows(POINTER.len())
+        .position(|window| window == POINTER)
+        .is_some_and(|offset| {
+            snapshot[offset + POINTER.len()..]
+                .iter()
+                .take(32)
+                .any(|byte| *byte == b'\r')
+        })
 }
 
 /// Poll a condition on REAL wall-clock time after a paused Tokio clock has
@@ -508,8 +535,6 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
         String::from_utf8_lossy(&cat_ready)
     );
 
-    let mut submitted_pointer = POINTER.to_vec();
-    submitted_pointer.push(b'\r');
     // Issue #709: the delegate's own delivery, and the one wait in this fixture
     // whose length is part of what the caller asserts — so the two arms are
     // budgeted differently ON PURPOSE.
@@ -526,11 +551,11 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
     } else {
         Duration::from_millis(buffer_ms) + common::load_scaled(POINTER_DELIVERY_SLACK)
     };
-    let snapshot = wait_for_snapshot_needle(
+    let snapshot = wait_for_snapshot_match(
         &daemon.registry,
         &new_agent_id,
-        &submitted_pointer,
         pointer_wait,
+        snapshot_contains_pointer_then_submit,
     )
     .await;
     SlowReadinessResult {
@@ -1360,8 +1385,6 @@ fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
                 "the synthetic readiness window drifted outside its intended measurement band: {:?}",
                 buffered.measured_readiness_window
             );
-            let mut submitted_pointer = POINTER.to_vec();
-            submitted_pointer.push(b'\r');
             assert!(
                 snapshot_contains(&buffered.snapshot, POINTER),
                 "the 1000 ms readiness buffer did not deliver the delegate pointer after the measured {:?} input-readiness window; snapshot = {:?}",
@@ -1369,7 +1392,7 @@ fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
                 String::from_utf8_lossy(&buffered.snapshot)
             );
             assert!(
-                snapshot_contains(&buffered.snapshot, &submitted_pointer),
+                snapshot_contains_pointer_then_submit(&buffered.snapshot),
                 "the delegate pointer was not followed by its submit CR after the readiness buffer; snapshot = {:?}",
                 String::from_utf8_lossy(&buffered.snapshot)
             );

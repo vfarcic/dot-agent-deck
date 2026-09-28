@@ -190,13 +190,36 @@ The role's pane does not even have to exist. If you closed it, or its agent died
 
 A freshly started agent needs a moment before it accepts input, so a `clear = true` task arrives after a short wait: about one to eight seconds for a plain `claude`, `codex`, `opencode` or `pi` command, depending on the agent. For a role launched through a wrapper such as `devbox run …`, declare the [`agent`](#declaring-the-agent-behind-a-launcher-command), or a Codex, Pi or OpenCode worker waits up to 30 seconds on every task.
 
-If tasks still go missing on your machine — the task text sits unsubmitted in the worker's input box, or the worker looks idle and never starts — raise the wait with the `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` environment variable, in milliseconds, on the process that starts the deck:
+A task that is still lost is [re-sent into the same worker](#a-lost-task-is-re-sent-into-the-same-worker). If tasks go missing on your machine regularly — the task text sits unsubmitted in the worker's input box, or the worker looks idle and never starts — raise the wait with the `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` environment variable, in milliseconds, on the process that starts the deck:
 
 ```bash
 DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=2000 dot-agent-deck
 ```
 
 The value replaces the deck's own wait for every agent rather than adding to it, and also applies to a schedule's first prompt. Values above `30000` are capped. If your machine needs more than a second, please [open an issue](https://github.com/vfarcic/dot-agent-deck/issues) — it helps tune the default.
+
+#### A lost task is re-sent into the same worker
+
+A task can still fail to reach a worker: the agent was still starting and swallowed it, or the task was typed into the worker's input box and sat there unsent. Either way the worker looks healthy and idle while the orchestrator waits for a `work-done` that never comes.
+
+So when a worker shows no sign of starting on its task, the deck sends it again **into the same worker** — it never restarts the worker to do it. If the task is sitting unsent in the worker's input box, the deck presses Enter for it rather than typing it a second time. With the default settings it tries three more times: about 20 seconds, 1 minute and 2 minutes 20 seconds after the first attempt. The worker's task file tells it that a task pointer it sees more than once is the same task, so a worker that does receive it twice should not start it twice.
+
+Each task file opens by asking the worker to run the deck's `ack` command, which tells the deck the task arrived. If your roles restrict which shell commands they may run, allow it alongside `work-done` — see [Context handoff](#context-handoff).
+
+If none of the re-sends gets a response, the orchestrator receives the [went-quiet report](idle-workers-and-notifications.md#the-reports), which says how many times the task was re-sent. With the default settings that is about three and a half minutes after the task was first sent, or later if the worker was still starting up or the task first [waited for your unsent draft](#a-deck-prompt-waits-while-you-have-an-unsent-draft). To change the timing, set `DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS` on the process that starts the deck to a comma-separated list of waits in milliseconds, each measured from the previous attempt; `0` turns the re-send off:
+
+```bash
+DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS=10000,20000 dot-agent-deck
+```
+
+The deck never sends the task on top of text you typed into a worker's pane. The first attempt [waits for your unsent draft](#a-deck-prompt-waits-while-you-have-an-unsent-draft) like any other message from the deck, and once the task has gone in, a re-send is skipped whenever you have typed into that pane since, so it does not submit a draft you started there.
+
+**Which workers are covered.** Claude Code, OpenCode, Devin and Pi workers get the full re-send. Two cases differ:
+
+- **Codex** workers get the Enter pressed for a task left in the input box, but the deck never types the task into a Codex worker a second time. The deck cannot always tell whether Codex took a task (see [Codex events not showing](troubleshooting.md#codex-events-not-showing)), so a second copy could start the same work twice.
+- **A role whose agent the deck cannot identify** — a launcher command such as `devbox run …` with no [`agent` line](#declaring-the-agent-behind-a-launcher-command) — gets no re-send, because the deck cannot hear such a worker start and every re-send could be a duplicate. Declare the agent and the role is covered.
+
+A Pi role with `clear = true` fetches its task itself rather than having it typed, so there is nothing to re-send.
 
 ### Parallel delegation
 
@@ -212,6 +235,7 @@ The deck teaches the orchestrator and the workers how to hand tasks and reports 
 
 - **Let every role write files.** A role launched with a restricted tool allowlist — `claude --allowedTools Bash Read`, say — stops at an approval prompt each time it tries, and an unattended pane waits there indefinitely. Add the file-writing tool to its allowlist, e.g. `--allowedTools Bash Read Write`.
 - **Write permission rules against the full path.** The commands the deck gives agents use the full path to the deck binary — `/home/you/.local/bin/dot-agent-deck work-done …`, not `dot-agent-deck work-done …`. A rule matching the command text, such as a Claude Code allow rule `Bash(dot-agent-deck work-done:*)`, does not match that, so write the rule against the path you see in the agent's pane.
+- **Allow `ack` wherever you allow `work-done`.** An allowlist scoped to individual commands, such as `Bash(/home/you/.local/bin/dot-agent-deck work-done:*)`, needs `Bash(/home/you/.local/bin/dot-agent-deck ack:*)` beside it. **When you upgrade to a release that [re-sends lost tasks](#a-lost-task-is-re-sent-into-the-same-worker), add that `ack` rule to every role whose allowlist names `work-done`**, or the worker stops at an approval prompt at the start of every task.
 
 ### Use a tracking file
 
@@ -647,6 +671,8 @@ The worker has not sent `work-done` for an earlier task, so it is still busy —
 ### Worker receives no task
 
 The role name in `--to` must match the `name` field in the config exactly (case-sensitive). Also check that the worker is in the same orchestration tab — you cannot delegate across tabs.
+
+If the delegation routed but the worker never started on it, the deck has been [re-sending it into the same worker](#a-lost-task-is-re-sent-into-the-same-worker), and the orchestrator gets the went-quiet report once the re-sends run out. The line typed into the worker's pane ends with a `[delivery …]` tag; search the daemon log for it to see each re-send and why they stopped. The deck writes that log only when logging is turned on, so [enable it](troubleshooting.md#enabling-debug-logs) and delegate again if it is off. A role launched through a command the deck cannot identify gets no re-send at all — declare its agent.
 
 ### A role card reads "No agent", or a Codex role stays blank until the first task
 
