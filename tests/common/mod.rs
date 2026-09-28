@@ -1896,9 +1896,10 @@ impl TuiDeck {
     /// `e2e_codex_wrapper.rs` retries Codex's Enter on the same outcome-based
     /// reasoning.
     ///
-    /// Only a `Thinking` event that arrives AFTER the prompt is typed counts,
-    /// so an earlier turn on the same agent cannot satisfy it, and its reported
-    /// prompt must match what was typed. On failure the panic starts with
+    /// Only a `Thinking` event that carries prompt text and arrives AFTER the
+    /// prompt is typed counts, so an earlier turn on the same agent — or a
+    /// prompt-less `Thinking` such as `PostCompact`'s — cannot satisfy it, and
+    /// its reported prompt must match what was typed. On failure the panic starts with
     /// `PROMPT NOT DELIVERED` or `PROMPT PARTIALLY DELIVERED` and names which
     /// step failed,
     /// so a lost prompt is never read as a regression in what the calling test
@@ -1920,9 +1921,14 @@ impl TuiDeck {
             .split_whitespace()
             .last()
             .expect("submit_claude_prompt: an empty prompt");
+        // Only a `Thinking` that carries prompt text is a submission. Claude
+        // Code's `UserPromptSubmit` always reports the prompt; the other hooks
+        // mapped to `Thinking` (`PostCompact`, for one) report none, and must
+        // not be read as "our prompt landed" (PR #1408 review).
         let is_submit = |e: &dot_agent_deck::event::AgentEvent| {
             e.agent_id.as_deref() == Some(agent_id)
                 && e.event_type == dot_agent_deck::event::EventType::Thinking
+                && e.user_prompt.is_some()
         };
         let before = events.snapshot().iter().filter(|e| is_submit(e)).count();
         self.send_keys(prompt.as_bytes());
@@ -1979,6 +1985,7 @@ impl TuiDeck {
                     // a `\r` taken as a newline before a later Enter submitted
                     // is the case the retry exists for.
                     if let Some(reported) = ev.user_prompt.as_deref() {
+                        // Always `Some` here — `is_submit` requires it.
                         assert!(
                             dot_agent_deck::prompt_delivery::prompt_submission_matches(
                                 prompt,
