@@ -4066,7 +4066,12 @@ pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
 ///   accompanying `warn!` already names the role together with the underlying
 ///   error, and both siblings carry none. The one interpolated value is the
 ///   WORKER's `pane_id_env`, already through
-///   [`crate::agent_pty::is_valid_pane_id_env`]'s `[A-Za-z0-9_-]` scrub.
+///   [`crate::agent_pty::is_valid_pane_id_env`]'s `[A-Za-z0-9_-]` scrub. That
+///   scrub restricts characters, not content: an orchestration pane's id
+///   embeds the sanitized, length-capped orchestration NAME
+///   (`spawn::next_pane_id`), which is config-supplied too. The residual is
+///   shared with every sibling that interpolates the id and is tracked
+///   family-wide in issue #1380.
 /// * **No error text either**, for the reason the respawn-error arm of
 ///   `dispatch_one_owned` always gave: `AgentPtyError::Spawn` can carry a
 ///   filesystem path or other host detail that does not belong in an agent's
