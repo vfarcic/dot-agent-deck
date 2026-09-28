@@ -737,25 +737,30 @@ where
     .map_err(|_| ProjectResolveError::Internal)
 }
 
-/// How long the daemon gives one `PrepareOrchestration` from the moment it
-/// reads the request (issue #1233 item 4).
+/// How long the daemon gives one `PrepareOrchestration`, from the moment its
+/// handler has validated the request and collected the seed candidates
+/// (issue #1233 item 4).
 ///
 /// **Ten seconds**, below the desktop's 15 s per-call bound, so a deck that
 /// advertises [`crate::daemon_protocol::CAP_PREPARE_DEADLINE`] answers before a
 /// client that bounds the call gives up on it. The bound covers the wait for a
 /// [`MAX_CONCURRENT_PROJECT_READS`] permit ([`run_bounded_answer`]) and the work
 /// itself ([`prepare_orchestration_before`]), and an expired preparation is
-/// **withdrawn** rather than merely answered late: no context file stays, no
-/// token stays live and the compatibility mirror is not touched. That is the
-/// property a client-side timeout alone could not give, because dropping the
-/// client's future stops none of the daemon's work.
+/// **withdrawn** rather than merely answered late: a token it issued is
+/// revoked, a context file it published is removed best effort
+/// ([`crate::orchestrator_context::withdraw_published_context`]), and it does
+/// not write the compatibility mirror. That is the property a client-side
+/// timeout alone could not give, because dropping the client's future stops
+/// none of the daemon's work.
 ///
 /// **The reply is bounded too, including when a blocking call stalls**
 /// (issue #1233 audit). [`run_bounded_answer`] answers "expired" at the
-/// deadline whether or not the blocking work has returned, and the
-/// [`ReplyLatch`] makes that answer binding on the work: a preparation that
-/// finishes afterwards finds the latch abandoned at its last gate, revokes its
-/// token and withdraws its file. A blocking call that never returns is still
+/// deadline unless the work committed first (and nothing blocking stands
+/// between a commit and its answer), and the [`ReplyLatch`] makes that answer
+/// binding on the work: a preparation still running refuses at its next
+/// deadline check — at the latest its last gate, where it finds the latch
+/// abandoned — revoking any token it issued and withdrawing any file it
+/// published. A blocking call that never returns is still
 /// not *interrupted* — a blocking thread cannot be cancelled — so it holds its
 /// permit and thread until it does; it just can no longer delay the answer or
 /// leave anything usable behind when it finishes.
@@ -768,7 +773,8 @@ pub const PREPARE_DEADLINE: std::time::Duration = std::time::Duration::from_secs
 /// The work calls [`ReplyLatch::commit`] at its last gate, after every side
 /// effect but the post-reply mirror; the reply calls [`ReplyLatch::abandon`]
 /// when its deadline fires first. Whichever gets there first wins, and the
-/// other learns it: a work that cannot commit withdraws everything it did, and
+/// other learns it: a work that cannot commit revokes its token and withdraws
+/// its file (not the directory creation or housekeeping its publish did), and
 /// a reply that cannot abandon waits for the answer the work is about to send
 /// (nothing blocking stands between a commit and that send).
 #[derive(Debug, Default)]
@@ -816,11 +822,13 @@ pub type AfterReply = Box<dyn FnOnce() + Send>;
 /// permit wait (issue #1233 item 4 and its audit).
 ///
 /// * `None` when the deadline passed before an answer: either no permit freed
-///   up (`f` never ran), or `f` had not answered and the [`ReplyLatch`] was
-///   abandoned — so `f`'s own last gate refuses and withdraws.
+///   up (`f` never ran), or `f` had not committed and the [`ReplyLatch`] was
+///   abandoned — so an `f` that checks the latch, as the preparation does at
+///   its last gate, refuses and withdraws.
 /// * `f` returns its answer and, optionally, work to run **after** the answer
-///   has gone: that work cannot delay the reply, and it only exists for an
-///   answer `f` committed.
+///   has gone: that work cannot delay the reply. This function runs it
+///   whenever `f` returns it; the preparation returns it only for an answer it
+///   committed.
 ///
 /// A blocking thread cannot be cancelled, so a stalled `f` keeps its thread and
 /// permit until it returns; what it cannot do is hold the reply.
@@ -1128,12 +1136,15 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
 /// blocking call.
 ///
 /// The ordering is the point, and it is what makes "a failed preparation starts
-/// no roles" true rather than aspirational: every step that can fail runs
-/// before anything observable is created, the publish is the last step with a
-/// side effect outside this process, and this function starts nothing. Roles are
-/// started by a later `StartAgent` sequence that never runs if this returns
-/// `Err`. (The token minted after the publish is an in-memory record, so it
-/// cannot exist for a preparation that failed.)
+/// no roles" true rather than aspirational: every step that can refuse the
+/// request on its own merits runs before anything observable is created, and
+/// this function starts nothing. Roles are started by a later `StartAgent`
+/// sequence that never runs if this returns `Err`. Since issue #1233 two things
+/// follow the publish: the compatibility mirror write, and — under
+/// [`prepare_orchestration_before`]'s deadline — a refusal that withdraws the
+/// publish best effort. (The token minted after the publish is an in-memory
+/// record; a preparation refused after minting it revokes it, so no live token
+/// outlasts a failed preparation.)
 ///
 /// **What the returned token binds, and why that is not a detail.** PRD #819's
 /// original design had this issue a token recording only its issuance time, and
@@ -1198,7 +1209,8 @@ pub fn prepare_orchestration_for_wire(
 ///
 /// The mirror is handed back rather than written so the caller can answer
 /// first — see [`crate::orchestrator_context::PendingMirror`]. Only a
-/// preparation that will be answered ever produces one.
+/// preparation that passed its last gate — committed to an answer — produces
+/// one.
 #[derive(Debug)]
 pub struct Prepared {
     answer: crate::event::PreparedOrchestration,
@@ -1224,9 +1236,9 @@ impl Prepared {
 /// The deadline is checked on entry, immediately before the publish,
 /// immediately after it, and — the **last gate** — after the token is issued,
 /// together with [`ReplyLatch::commit`]. Expired before the publish, nothing is
-/// written. Expired after it, the file just published is removed again
-/// ([`crate::orchestrator_context::withdraw_published_context`]) and no token is
-/// issued. Expired at the last gate, or with a `latch` the reply already
+/// written. Expired after it, the file just published is withdrawn, best
+/// effort ([`crate::orchestrator_context::withdraw_published_context`]), and no
+/// token is issued. Expired at the last gate, or with a `latch` the reply already
 /// abandoned, the token is revoked ([`crate::prep_token::revoke`]) and the file
 /// withdrawn. Every one of those answers [`preparation_expired_refusal`], and
 /// none of them writes the compatibility mirror: it is returned un-written in
@@ -1421,7 +1433,8 @@ pub fn prepare_orchestration_before(
     // performs. Checking before the issue — as this did until the audit — left
     // the issue itself, and everything after it, outside the deadline. From here
     // to the return nothing touches a filesystem, so a preparation that passes
-    // is answered, and one that fails leaves no live token and no file behind.
+    // has its answer sent without anything blocking in between, and one that
+    // fails leaves no live token and withdraws its file best effort.
     if expired() || !latch.is_none_or(ReplyLatch::commit) {
         warn!(
             project = %dir.display(),

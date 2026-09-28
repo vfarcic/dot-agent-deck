@@ -565,14 +565,18 @@ pub const CAP_PREPARE_WORKFLOW: &str = "prepare-workflow";
 /// [`crate::project_resolve::PREPARE_DEADLINE`].
 ///
 /// Names a BEHAVIOUR rather than a verb or a field, and what it promises is
-/// exactly three things: the preparation is answered within that deadline,
-/// including when a blocking filesystem call behind it stalls (the call keeps
-/// its thread; the answer does not wait for it); a preparation that expires is
-/// refused with [`PROJECT_ERR_PREPARATION_EXPIRED`] and leaves no context file,
-/// no live token and no mirror write behind — one still running at the
-/// deadline withdraws itself when it finishes; and every preparation
-/// publishes a file of its own, so even one answered late cannot replace a
-/// retry's. Together those are what make a CLIENT-side bound on the call safe:
+/// exactly three things: the preparation is answered at that deadline at the
+/// latest — or just past it, when the work committed first, with nothing
+/// blocking between that commit and the answer — including when a blocking
+/// filesystem call behind it stalls (the call keeps its thread; the answer does
+/// not wait for it); a preparation that expires is refused with
+/// [`PROJECT_ERR_PREPARATION_EXPIRED`], leaves no live token, writes no mirror,
+/// and withdraws any context file it published, best effort — one still
+/// running at the deadline does so at its next deadline check; and every
+/// preparation publishes a file of its own, so even one answered late cannot
+/// replace a retry's (the fixed-name mirror, which binds nothing, can still end
+/// up with either's bytes). Together those are what make a CLIENT-side bound on
+/// the call safe:
 /// the desktop wraps its preparation in its per-call timeout only against a
 /// daemon that names this, and keeps waiting an older one out. Nothing on the
 /// wire depends on it, so an older daemon simply does not name it.
@@ -1114,13 +1118,13 @@ pub const PROJECT_ERR_AMBIGUOUS_ORCHESTRATION: &str = "ambiguous-orchestration";
 
 /// Issue #1233 item 4: the daemon did not finish a
 /// [`AttachRequest::PrepareOrchestration`] within
-/// [`crate::project_resolve::PREPARE_DEADLINE`], so it prepared nothing — no
-/// context file stays published and no token stays live (one minted before
-/// the last deadline check is revoked).
+/// [`crate::project_resolve::PREPARE_DEADLINE`], so nothing it prepared can be
+/// launched: no token stays live (one minted before the last deadline check is
+/// revoked), and a context file it published is withdrawn, best effort.
 ///
 /// **Retryable**, and about the daemon's load rather than the request, the
-/// [`PROJECT_ERR_BUSY`] class: the same request sent again is answered normally
-/// once the daemon's project permits free up. Not a contract break — a request
+/// [`PROJECT_ERR_BUSY`] class: the same request sent again can be answered
+/// normally once the daemon's project permits free up. Not a contract break — a request
 /// the daemon would have prepared is not now refused for what it asks, only
 /// for how long the daemon took — so it has no [`CONTRACT_BREAKS`] entry.
 pub const PROJECT_ERR_PREPARATION_EXPIRED: &str = "preparation-expired";
@@ -5093,9 +5097,10 @@ async fn handle_connection(
                     // that finishes late is withdrawn rather than answered.
                     //
                     // Its audit: the ANSWER is bounded, not only the permit
-                    // wait — a work still running at the deadline is answered
-                    // as expired and the shared latch makes it withdraw itself
-                    // when it finishes — and the compatibility mirror runs
+                    // wait — a work still running and uncommitted at the
+                    // deadline is answered as expired, and the shared latch
+                    // makes it withdraw itself by its last gate — and the
+                    // compatibility mirror runs
                     // after the answer has gone, only for a preparation that
                     // committed to one.
                     let deadline =

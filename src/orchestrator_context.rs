@@ -517,8 +517,8 @@ pub fn prepare_orchestrator_context(
 /// For a caller that still has a reason to withdraw the preparation after the
 /// publish — the daemon verb, whose deadline can expire between the publish and
 /// the reply (issue #1233 item 4). It calls [`mirror_orchestrator_context`]
-/// itself once the preparation is certain to be answered, so an expired
-/// preparation never touches the mirror.
+/// itself only for a preparation that committed to an answer, so a
+/// preparation refused as expired does not write the mirror.
 pub fn prepare_unmirrored_orchestrator_context(
     config: &OrchestrationConfig,
     cwd: &std::path::Path,
@@ -725,7 +725,9 @@ pub const CONTEXT_DIR_NAME: &str = ".dot-agent-deck";
 /// coordinator prompt names that file. This name is then refreshed with the same
 /// bytes, best effort ([`mirror_orchestrator_context`]), for readers that
 /// predate #1233: an older TUI's compaction re-arm reads the task back from here,
-/// and so do role commands and templates that hard-code the path. It holds the
+/// and so do role commands and templates that hard-code the path. So does this
+/// build's re-arm of a tab whose own path it does not know
+/// ([`reassert_orchestrator_prompt`] with `known: None`). It holds the
 /// latest publish in the project, so those readers keep the old semantics,
 /// including the old race. No preparation binding covers it. Retiring it is
 /// follow-up #1395.
@@ -1122,9 +1124,10 @@ fn open_context_dir(dir: &std::path::Path) -> Result<ContextDirGuard, ContextPub
 /// Compares device + inode from the **open handle's** `fstat` against a
 /// `symlink_metadata` of the path. This **detects** a `.dot-agent-deck`
 /// swapped between [`open_context_dir`] and the write. Since the issue #1233
-/// audit the writes themselves no longer depend on it — every create, rename
-/// and removal goes through the held descriptor ([`ContextDir`]), so a swap
-/// cannot redirect one — and what this check still guards is the *announced*
+/// audit the context and mirror writes themselves no longer depend on it —
+/// each of their creates, renames and removals goes through the held
+/// descriptor ([`ContextDir`]), so a swap cannot redirect one — and what this
+/// check still guards is the *announced*
 /// path: a publish whose directory no longer sits at the path the prompt names
 /// is refused rather than announced.
 #[cfg(unix)]
@@ -1143,17 +1146,19 @@ fn context_dir_unchanged(_guard: &ContextDirGuard, _dir: &std::path::Path) -> bo
 }
 
 /// The `.dot-agent-deck` directory a publish checked, **held open**, and the
-/// one handle every later write, rename and removal in it goes through (issue
-/// #1233 audit).
+/// handle the later creates, renames and removals of context and mirror files
+/// in it go through (issue #1233 audit). The retention sweep is the exception,
+/// below.
 ///
 /// On Unix every operation is `*at(2)` relative to the descriptor
 /// [`open_context_dir`] opened with `O_NOFOLLOW | O_DIRECTORY` — `openat` with
 /// `O_CREAT | O_EXCL | O_NOFOLLOW`, `renameat`, `unlinkat`, `fstatat` with
 /// `AT_SYMLINK_NOFOLLOW` — and each takes a **single name**, never a path. So
-/// once the checks have passed, no operation re-traverses the project pathname:
-/// a project renamed and replaced under a shared parent afterwards cannot
-/// redirect a create, the mirror's rename, a failure's cleanup, a withdrawal or
-/// the TUI's removal of a replaced file into another directory. Before the
+/// once the checks have passed, no operation through this handle re-traverses
+/// the project pathname: a project renamed and replaced under a shared parent
+/// afterwards cannot redirect a create, the mirror's rename, a failure's
+/// cleanup, a withdrawal or the TUI's removal of a replaced file into another
+/// directory. Before the
 /// audit each of those joined a name onto the path again, after the identity
 /// check, which is exactly the window it named.
 ///
@@ -1161,10 +1166,12 @@ fn context_dir_unchanged(_guard: &ContextDirGuard, _dir: &std::path::Path) -> bo
 /// so which `.dot-agent-deck` it is still depends on the project path at that
 /// moment; [`context_dir_unchanged`] then *detects* (does not prevent) the path
 /// moving before the write, and refuses rather than announcing a path that
-/// names another directory. The retention sweep ([`sweep_coordination_files`])
-/// still works by path. Off Unix the handle is the path and every operation is
-/// a path operation — the narrower guarantee [`open_context_dir`] states, and
-/// the reason the daemon verb is refused there.
+/// names another directory. The publish's housekeeping still works by path:
+/// the retention sweep ([`sweep_coordination_files`]) and the clone-local git
+/// exclude ([`ensure_git_excludes_context_dir`]). Off Unix the handle is the
+/// path and every operation is a path operation — the narrower guarantee
+/// [`open_context_dir`] states, and the reason the daemon verb is refused
+/// there.
 #[derive(Clone)]
 pub struct ContextDir {
     path: std::path::PathBuf,
@@ -1742,9 +1749,11 @@ pub fn withdraw_published_context(published: &PublishedContext) {
 /// (issue #1233's compatibility mirror).
 ///
 /// Called after a successful [`publish_orchestrator_context`], with the same
-/// bytes. A failure logs a `warn!` and is not returned: nothing current reads
-/// the mirror as authoritative, so it is no reason to fail a launch whose own
-/// file is already published. See [`CONTEXT_FILE_NAME`] for who still reads it.
+/// bytes. A failure logs a `warn!` and is not returned: the launch's own
+/// coordinator is pointed at its own file, not at the mirror, so it is no
+/// reason to fail a launch whose own file is already published — though a
+/// reader of the mirror, this build's re-arm of a tab whose path it does not
+/// know included, then gets an older publish's task. See [`CONTEXT_FILE_NAME`] for who still reads it.
 ///
 /// **Blocking.** Async callers go through [`crate::project_resolve::run_bounded`].
 pub fn mirror_orchestrator_context(project_dir: &std::path::Path, content: &str) {
