@@ -1962,15 +1962,13 @@ impl TuiDeck {
         }
         // The hook reports the submitted text truncated to 200 bytes, so the
         // match catches a prefix submitted short of that and a garbled one; a
-        // longer prefix is what the tail wait above exists to prevent.
-        // Trailing whitespace is ignored: a `\r` taken as a newline before a
-        // later Enter submitted is the case the retry exists for.
+        // longer prefix is what the tail wait above exists to prevent. The
+        // report is passed unchanged: the matcher already ignores exactly the
+        // trailing `\n`/`\r`/space/tab a `\r`-taken-as-newline would leave, and
+        // no wider (a trailing NBSP stays significant) (PR #1408 review).
         let is_ours = |e: &dot_agent_deck::event::AgentEvent| {
             e.user_prompt.as_deref().is_some_and(|reported| {
-                dot_agent_deck::prompt_delivery::prompt_submission_matches(
-                    prompt,
-                    reported.trim_end(),
-                )
+                dot_agent_deck::prompt_delivery::prompt_submission_matches(prompt, reported)
             })
         };
         // Submissions reported since typing began. The FIRST one carrying THIS
