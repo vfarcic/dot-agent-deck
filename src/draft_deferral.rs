@@ -231,9 +231,13 @@ impl DraftTracker {
     }
 
     /// Our own `Applied` SUBMIT write sent a CR, which submitted whatever was
-    /// in the box — the user's draft included.
+    /// in the box — the user's draft included. A hard reset exactly like the
+    /// user's own Enter in [`Self::feed_byte`]: a partial sequence left in the
+    /// parser (a lone `ESC`) is over too, or the user's next `]` would continue
+    /// it and swallow their typing as an OSC report (PR #1398 finding #15).
     pub(crate) fn clear(&mut self) {
         self.pending = false;
+        self.escape = Escape::Ground;
     }
 
     /// Feed one user byte. `submits` is whether it submitted the input box and
@@ -752,5 +756,17 @@ mod tests {
         feed(&mut tracker, b"draft");
         tracker.clear();
         assert!(!tracker.pending());
+    }
+
+    /// PR #1398 finding #15: a daemon submit resets the escape parser exactly
+    /// as a user submit does, so a stale lone `ESC` cannot turn later typing
+    /// into an OSC report.
+    #[test]
+    fn a_daemon_submit_resets_a_stale_escape_prefix() {
+        let mut tracker = DraftTracker::default();
+        feed(&mut tracker, b"\x1b");
+        tracker.clear();
+        feed(&mut tracker, b"]abc");
+        assert!(tracker.pending(), "typing after a daemon submit is a draft");
     }
 }
