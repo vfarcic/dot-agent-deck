@@ -75,9 +75,11 @@ A desktop deck carries fields a CLI-added one may not:
 | Field | Meaning |
 |---|---|
 | `id` | The desktop app's stable identifier for the deck. An entry without one gets one derived from its name. |
-| `jump_host` | A `Host` name from your `~/.ssh/config` to reach the deck through (`ssh -J`). The desktop app uses it; `connect` does not route through it yet. |
+| `jump_host` | A `Host` name from your `~/.ssh/config` to reach the deck through (`ssh -J`). Only the desktop app uses it — see below. |
 | `socket` | The deck's attach socket path on the host, which the desktop's **Test connection** discovers. `connect` does not need it. |
 | `user` | The login, stored separately only when it contains `@` itself (`dev@REALM`). Otherwise the login is written into `host` as `dev@build.example.com`, which is the form every version of `connect` understands. |
+
+**`connect` ignores `jump_host`.** A deck the desktop app reaches through a jump host is listed by `remote list`, but `dot-agent-deck connect <name>` opens a direct SSH connection to the deck's host and does not go through the jump host, so a host reachable only that way fails to connect from the terminal. Until `connect` supports it, add a `ProxyJump` line for that host to `~/.ssh/config`: `connect` runs your system `ssh`, which reads that file.
 
 The file stays hand-editable. Both clients change only the entry being edited and re-read the file at the moment they save, so a remote you add in a terminal while the desktop app is open is not overwritten by the app's next save. Keys neither client knows about, and comments, are kept.
 

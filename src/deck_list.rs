@@ -579,6 +579,12 @@ pub fn remove(path: &Path, which: DeckRef<'_>) -> Result<Option<RemoteEntry>, Re
 /// once at a time (the desktop, from several windows).
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// How many temp names [`write_atomic`] draws before giving up. The temp file
+/// is created with `create_new`, which never opens whatever already holds a
+/// name, so a leftover from a crashed run — or a symlink someone planted at the
+/// predictable name — costs one draw instead of every later save.
+const TEMP_NAME_ATTEMPTS: usize = 8;
+
 /// Atomically replace the file at `path` with `contents`. Creates the parent
 /// directory if missing. Writes via a sibling temp file with mode 0o600, then
 /// `rename(2)`s it into place — so a partial write or a crash mid-save can
@@ -591,7 +597,7 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), RemoteConfigError
     // `create_dir_all`, so the *directory* is owner-only too — the same call
     // `schedules.toml` already makes. The per-file DACL/mode protects the
     // contents; this protects the metadata (which remotes exist, by filename)
-    // when `DOT_AGENT_DECK_REMOTES_DIR` points somewhere shared. Create-only,
+    // when `DOT_AGENT_DECK_REMOTES` puts the file somewhere shared. Create-only,
     // so an existing directory is never surprise-tightened (PRD #127 S2).
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -612,32 +618,56 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), RemoteConfigError
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_else(|| "remotes.toml".to_string());
-    let tmp_path = parent.join(format!(
-        "{file_name}.{}.{}.tmp",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
 
     // PRD #42 M1: owner-only (0o600) creation mode comes from the platform
     // seam — `.mode(0o600)` on Unix; on Windows (#163) the DACL cannot be
     // supplied at create time, so the seam instead puts `WRITE_DAC` on the
     // handle, which is what lets the `set_file_owner_only` call below apply it.
-    let mut open_opts = std::fs::OpenOptions::new();
-    open_opts.create(true).write(true).truncate(true);
-    crate::platform::fsperm::set_create_mode_owner_only(&mut open_opts);
-    let mut tmp_file = open_opts
-        .open(&tmp_path)
-        .map_err(|source| RemoteConfigError::Io {
-            path: tmp_path.display().to_string(),
-            source,
-        })?;
+    //
+    // `create_new` (`O_CREAT|O_EXCL`), the way the desktop's `desktop.toml`
+    // save creates its temp file (issue #1350): the name is predictable, and
+    // `O_EXCL` refuses to follow a symlink planted there — it fails with
+    // `AlreadyExists` instead of writing through it to wherever it points. A
+    // taken name draws a fresh counter value, a bounded number of times.
+    let mut opened = None;
+    for _ in 0..TEMP_NAME_ATTEMPTS {
+        let tmp_path = parent.join(format!(
+            "{file_name}.{}.{}.tmp",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.create_new(true).write(true);
+        crate::platform::fsperm::set_create_mode_owner_only(&mut open_opts);
+        match open_opts.open(&tmp_path) {
+            Ok(file) => {
+                opened = Some((tmp_path, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(RemoteConfigError::Io {
+                    path: tmp_path.display().to_string(),
+                    source,
+                });
+            }
+        }
+    }
+    let Some((tmp_path, mut tmp_file)) = opened else {
+        return Err(RemoteConfigError::Io {
+            path: parent.display().to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "every temp file name tried for the save was already taken",
+            ),
+        });
+    };
 
     // Owner-only permissions BEFORE the first content byte (PRD #163 M4).
     //
     // Two reasons this runs here rather than after the write. (1) Defense in
-    // depth on Unix: a stale temp file from a crashed previous save would not
-    // have had `OpenOptions::mode()` re-applied, so the bits have to be set
-    // explicitly. (2) On Windows this call is not a re-assert but the *only*
+    // depth on Unix: the bits are asserted on the handle rather than trusted
+    // to the creation mode alone. (2) On Windows this call is not a re-assert but the *only*
     // place the protected current-user-only DACL is applied —
     // `std::fs::OpenOptions` has no `SECURITY_ATTRIBUTES` hook, so
     // `set_create_mode_owner_only` can only pre-authorize this call by putting
@@ -1042,5 +1072,49 @@ mod tests {
             address_key(&entry("a", "me@H.Example")),
             ("h.example".to_string(), Some("me".to_string()), 22)
         );
+    }
+
+    /// S1 of #1350's review: the temp name is predictable, so a symlink
+    /// planted there must never be followed — neither one pointing at a file
+    /// (which a plain `O_CREAT|O_TRUNC` would truncate and overwrite) nor a
+    /// dangling one (which it would create). The save draws past the taken
+    /// names, lands its bytes in `remotes.toml`, and leaves both targets alone.
+    ///
+    /// The counter is process-global and other tests save concurrently, so the
+    /// symlinks cover the next five draws rather than exactly one: however many
+    /// of those a sibling consumes, at most five of this save's eight draws hit
+    /// a planted name, and any draw that does must not follow it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_temp_name_is_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remotes.toml");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "untouched").unwrap();
+        let dangling = dir.path().join("created-through-a-symlink");
+        let next = TEMP_COUNTER.load(Ordering::Relaxed);
+        for (offset, target) in [&victim, &dangling, &victim, &dangling, &victim]
+            .into_iter()
+            .enumerate()
+        {
+            let name = format!(
+                "remotes.toml.{}.{}.tmp",
+                std::process::id(),
+                next + offset as u64
+            );
+            std::os::unix::fs::symlink(target, dir.path().join(name)).unwrap();
+        }
+
+        write_atomic(&path, "remotes = []\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "remotes = []\n");
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert!(!dangling.exists(), "a dangling symlink was written through");
     }
 }
