@@ -736,6 +736,60 @@ fn a_prepared_start_with_the_wrong_start_marker_is_refused() {
     expect_mismatch(&binding, &request, PreparationMismatch::StartMarkerDiffers);
 }
 
+/// Issue #523: the start marker a prepared start is checked against is the
+/// orchestrator SEAT — `OrchestrationConfig::orchestrator_role_index`, the rule
+/// the `Ctrl+n` tab and the dispatched spawn seat by — not the bare flag. For a
+/// config that flags no role but names one `orchestrator` (second, so a role-0
+/// fallback would be visibly wrong), marking the named role is accepted and
+/// marking the worker is refused. Before #523 the named role's marker was
+/// refused and an unmarked start registered no orchestrator at all.
+#[test]
+fn a_prepared_start_is_checked_against_the_orchestrator_seat() {
+    let dir = test_temp::tempdir().expect("mint the project sandbox");
+    std::fs::write(
+        dir.path().join(".dot-agent-deck.toml"),
+        r#"
+[[orchestrations]]
+name = "loop"
+
+[[orchestrations.roles]]
+name = "builder"
+command = "cat"
+description = "Implements the requested change"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat"
+"#,
+    )
+    .expect("seed the project config");
+    let project = std::fs::canonicalize(dir.path()).expect("canonicalize the project sandbox");
+    let (_token, binding) = prepare(&project, "A brief.");
+
+    let request = |role: &str, is_start_role: bool| {
+        let mut request = matching_request(&project);
+        if let Some(membership) = request.membership.as_mut() {
+            membership.role = role.into();
+            membership.is_start_role = is_start_role;
+        }
+        request
+    };
+    verify_prepared_start(&binding, &request("orchestrator", true))
+        .expect("the named role is this orchestration's orchestrator");
+    verify_prepared_start(&binding, &request("builder", false))
+        .expect("the worker starts as a worker");
+    expect_mismatch(
+        &binding,
+        &request("orchestrator", false),
+        PreparationMismatch::StartMarkerDiffers,
+    );
+    expect_mismatch(
+        &binding,
+        &request("builder", true),
+        PreparationMismatch::StartMarkerDiffers,
+    );
+}
+
 /// **What is deliberately NOT bound, and this test is the reason to keep it that
 /// way.** Per-launch command override is an existing, documented feature —
 /// `docs/develop/desktop-gui.md`: "The submitted command overrides the matching

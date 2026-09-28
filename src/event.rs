@@ -514,6 +514,61 @@ pub const DAEMON_PANE_CLOSED_METADATA_KEY: &str = "daemon_pane_closed";
 /// same reason as [`ORCHESTRATION_ORPHANED_METADATA_VALUE`].
 pub const DAEMON_PANE_CLOSED_METADATA_VALUE: &str = "1";
 
+/// `AgentEvent.metadata` key carrying the DAEMON's verdict on which generation
+/// of its pane a frame comes from (issue #320) — see [`GenerationVerdict`].
+///
+/// The daemon's `AgentPtyRegistry` knows each pane's current generation: the
+/// spawn reserving it, else the record no successor has taken it from. An
+/// attached TUI has no registry, so before this it ordered a takeover by the
+/// only evidence a frame carries — its type and its PRODUCER-supplied
+/// timestamp — and a late `SessionStart`, or a late frame stamped newer, from
+/// the OUTGOING generation retired the live card. The daemon now asks its
+/// registry in `ingest_event` and stamps the answer here, before the fan-out,
+/// so both sides order generations by the registry and neither by a clock.
+///
+/// **Daemon-authoritative**, like [`ORCHESTRATION_ORPHANED_METADATA_KEY`]:
+/// `ingest_event` REMOVES any incoming value before deciding. Absent when the
+/// frame names no pane or no agent id, when the registry holds no generation
+/// for the pane or has never published the frame's agent on it, and when it
+/// cannot answer — and absent on every frame an OLDER daemon relays, which a
+/// consumer reads exactly as it did before this key existed.
+///
+/// Additive on the wire in both directions, so no
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump: an older TUI ignores the
+/// key and keeps the timestamp rule it always had.
+pub const PANE_GENERATION_METADATA_KEY: &str = "pane_generation";
+
+/// The [`PANE_GENERATION_METADATA_KEY`] value for [`GenerationVerdict::Current`].
+pub const PANE_GENERATION_CURRENT: &str = "current";
+
+/// The [`PANE_GENERATION_METADATA_KEY`] value for [`GenerationVerdict::Displaced`].
+pub const PANE_GENERATION_DISPLACED: &str = "displaced";
+
+/// Issue #320: the daemon registry's answer to "is the generation this frame
+/// names its pane's CURRENT one?", for a frame naming both a pane and an agent
+/// id on a pane the registry holds a generation for. See
+/// [`PANE_GENERATION_METADATA_KEY`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationVerdict {
+    /// The frame's agent id is the pane's current generation.
+    Current,
+    /// The frame's agent id is a generation the registry itself published on
+    /// this pane earlier, and a different one is current now: it has been
+    /// replaced. An id the registry never published on the pane gets no
+    /// verdict at all rather than this one.
+    Displaced,
+}
+
+impl GenerationVerdict {
+    /// The fixed metadata value for this verdict.
+    pub fn metadata_value(self) -> &'static str {
+        match self {
+            GenerationVerdict::Current => PANE_GENERATION_CURRENT,
+            GenerationVerdict::Displaced => PANE_GENERATION_DISPLACED,
+        }
+    }
+}
+
 /// `AgentEvent.metadata` key declaring WHERE a `SessionStart` came from (PRD
 /// #225 M3). The wrapper adapter is the only INTENDED producer, with one of the
 /// three values [`WRAPPER_FORK_SESSION_START_ORIGIN`] /
@@ -953,6 +1008,18 @@ impl AgentEvent {
         self.metadata
             .get(ORCHESTRATION_ORPHANED_METADATA_KEY)
             .is_some_and(|v| v == ORCHESTRATION_ORPHANED_METADATA_VALUE)
+    }
+
+    /// Issue #320: the daemon's generation verdict for this frame (see
+    /// [`PANE_GENERATION_METADATA_KEY`]). `None` for every frame without one,
+    /// which includes every frame an older daemon relays; an unrecognised value
+    /// is also `None`, never a guess.
+    pub fn pane_generation_verdict(&self) -> Option<GenerationVerdict> {
+        match self.metadata.get(PANE_GENERATION_METADATA_KEY)?.as_str() {
+            PANE_GENERATION_CURRENT => Some(GenerationVerdict::Current),
+            PANE_GENERATION_DISPLACED => Some(GenerationVerdict::Displaced),
+            _ => None,
+        }
     }
 
     /// Issue #243: does this event carry the wrapper's INTERFACE-READY origin

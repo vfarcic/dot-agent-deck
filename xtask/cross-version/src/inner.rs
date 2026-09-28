@@ -354,7 +354,7 @@ impl Guard<'_> {
             None => Default::default(),
         };
         let mut details = Vec::new();
-        for path in &self.matrix.owned {
+        for path in self.matrix.held() {
             let inodes = isolation::listening_inodes(&listeners, path);
             if inodes.is_empty() {
                 return Err(Abort::Scenario(format!(
@@ -655,10 +655,12 @@ pub(crate) fn tail(s: &str, n: usize) -> String {
 /// ask — a client started before the daemon is listening is exactly the one
 /// that lazy-spawns. Returns the candidate the daemon bound.
 ///
-/// With one candidate this is "wait for the predicted pair". With two (a
-/// reverse `resolved` run, see [`EndpointMatrix::candidates`]) it is "wait for
-/// either pair", and the other pair is then held ABSENT by every pre-connect
-/// assertion from here on, exactly as a predicted matrix would hold it.
+/// With one candidate this is "wait for the predicted pair". With several (a
+/// `resolved` run with `XDG_RUNTIME_DIR` unset, see
+/// [`EndpointMatrix::candidates`]) it is "wait for whichever layout the daemon
+/// completes" ([`EndpointMatrix::select`]), and every address outside that
+/// layout is then held ABSENT by every pre-connect assertion from here on,
+/// exactly as a predicted matrix would hold it.
 fn wait_for_listeners(
     daemon: &mut SandboxProcess,
     candidates: &[EndpointMatrix],
@@ -675,20 +677,26 @@ fn wait_for_listeners(
         }
         let listeners = proc::unix_listeners().map_err(iso)?;
         let held = proc::socket_inodes(daemon.pid()).unwrap_or_default();
-        let bound = candidates.iter().find(|m| {
-            m.owned.iter().all(|p| {
+        let bound = EndpointMatrix::select(
+            candidates,
+            |p| {
                 let inodes = isolation::listening_inodes(&listeners, p);
                 !inodes.is_empty() && inodes.iter().all(|i| held.contains(i))
-            })
-        });
+            },
+            |p| !isolation::listening_inodes(&listeners, p).is_empty(),
+        );
         if let Some(m) = bound {
             return Ok(m.clone());
         }
         if Instant::now() >= deadline {
             return Err(Abort::Scenario(format!(
-                "the sandbox daemon never bound any of {:?} within {DAEMON_TIMEOUT:?}; the \
-                 namespace's listeners were {listeners:?}",
-                candidates.iter().map(|m| &m.owned).collect::<Vec<_>>()
+                "the sandbox daemon never completed any of the candidate layouts {:?} (each: \
+                 every address held by the daemon, every absent one unbound) within \
+                 {DAEMON_TIMEOUT:?}; the namespace's listeners were {listeners:?}",
+                candidates
+                    .iter()
+                    .map(|m| m.held().collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
             )));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -782,6 +790,11 @@ impl Cast {
         if side == "old" { "old-tui" } else { "new-tui" }
     }
 }
+
+/// A line only issue #405's protocol refusal prints — not the prompt, which also
+/// names the two protocol numbers — so finding it means the attaching TUI
+/// declined into an exit rather than into the daemon.
+const PROTOCOL_REFUSAL: &str = "Not attaching: across an attach-protocol change";
 
 /// The key that declines the build-version mismatch prompt.
 ///
@@ -895,16 +908,15 @@ fn drive(
     ev.daemon_endpoint = matrix.attach().display().to_string();
     if plan.matrices.len() > 1 {
         ev.isolated(format!(
-            "the {} daemon bound `{}` and `{}` — {} — out of {} candidate layouts; from here on \
-             every other candidate ({}) must be absent before any client connects",
+            "the {} daemon bound {} — {} — out of {} candidate layouts; from here on every other \
+             candidate ({}) must be absent before any client connects",
             cast.daemon_build,
-            matrix.owned[0].display(),
-            matrix.owned[1].display(),
-            if matrix.owns_per_uid(plan.uid) {
-                "the post-#1121 per-uid directory"
-            } else {
-                "the pre-#1121 flat fallback"
-            },
+            matrix
+                .held()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            matrix.layout(plan.uid),
             plan.matrices.len(),
             matrix
                 .absent
@@ -1220,7 +1232,8 @@ fn scenario(
     );
     g.preconnect_logged(&format!("{} TUI", cast.client_side), &plan.env, ev)?;
     let fallback_arm = plan.mode == EndpointMode::Resolved && !plan.keep_xdg_runtime_dir;
-    if fallback_arm && cast.direction == Direction::Forward {
+    let old_daemon_per_uid = g.matrix.owns_per_uid(plan.uid);
+    if fallback_arm && cast.direction == Direction::Forward && !old_daemon_per_uid {
         ev.isolated(format!(
             "fallback arm: the branch TUI starts with no `XDG_RUNTIME_DIR` and no socket override \
              in its environment, its own primary fallback `{}` is absent (no file, no listener), \
@@ -1233,16 +1246,43 @@ fn scenario(
             g.matrix.owned[1].display()
         ));
     }
+    if fallback_arm && cast.direction == Direction::Forward && old_daemon_per_uid {
+        ev.isolated(format!(
+            "fallback arm, per-uid layout: the branch TUI starts with no `XDG_RUNTIME_DIR` and no \
+             socket override in its environment. The {} daemon listens at {} — {}; every other \
+             candidate — {} — is absent (no file, no listener). A branch TUI that resolves the \
+             per-uid fallback reaches that daemon at its primary address, so this run does NOT \
+             exercise the compatibility read of the literal `/tmp` — only a previous release \
+             older than v0.41.1 leaves that read as the only way in.",
+            plan.previous,
+            g.matrix
+                .held()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            g.matrix.layout(plan.uid),
+            g.matrix
+                .absent
+                .iter()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if fallback_arm && cast.direction == Direction::Reverse {
         ev.isolated(format!(
             "fallback arm, reverse: the {} TUI starts with no `XDG_RUNTIME_DIR` and no socket \
-             override in its environment. The branch daemon listens at `{}` and `{}`; every \
-             other candidate — {} — is absent (no file, no listener). Whatever the old TUI \
-             reaches next is decided by its own resolution of the no-XDG, no-override fallback \
-             and nothing else.",
+             override in its environment. The branch daemon listens at {} — {}; every other \
+             candidate — {} — is absent (no file, no listener). Whatever the old TUI reaches \
+             next is decided by its own resolution of the no-XDG, no-override fallback and \
+             nothing else.",
             cast.client_build,
-            g.matrix.owned[0].display(),
-            g.matrix.owned[1].display(),
+            g.matrix
+                .held()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            g.matrix.layout(plan.uid),
             g.matrix
                 .absent
                 .iter()
@@ -1339,9 +1379,28 @@ fn with_attached_tui(
     // DECLINE_KEY). Accepting would SIGTERM the daemon under test and replace
     // it, which destroys the entire point of the run.
     tui.send(DECLINE_KEY);
-    if !tui.wait_for_grid(UI_TIMEOUT, |g| {
-        g.contains("XVER_") || g.contains(ROLE_ORCHESTRATOR)
-    }) {
+    // The prompt itself names the live roles, `orchestrator` among them, so a
+    // grid still showing it is NOT an attach: only a grid the prompt has left —
+    // the dashboard takes the alternate screen — counts as one. The refusal is
+    // printed below the prompt on the normal screen, so it is looked for first.
+    let attached_or_refused = tui.wait_for_grid(UI_TIMEOUT, |g| {
+        g.contains(PROTOCOL_REFUSAL)
+            || (!g.contains("Daemon version mismatch")
+                && (g.contains("XVER_") || g.contains(ROLE_ORCHESTRATOR)))
+    });
+    if tui.stream_text().contains(PROTOCOL_REFUSAL) {
+        ev.excerpt(
+            format!("{} TUI's protocol refusal", cast.client_side),
+            tail(&tui.stream_text(), 30),
+        );
+        return Err(Abort::Scenario(format!(
+            "{}: declining the prompt was REFUSED, not attached: the two builds speak different              attach protocols, and a TUI carrying issue #405's check will not attach across that              (the daemon and its roles were left running). That is the intended result of a              `PROTOCOL_VERSION` bump rather than a semantic break, and it leaves no attached              session to send a delegate or hooks through, so nothing below was measured.              old={} new={}",
+            tui.label,
+            ev.old_hello.trim(),
+            ev.new_hello.trim()
+        )));
+    }
+    if !attached_or_refused {
         return Err(Abort::Scenario(format!(
             "{}: after declining the prompt it never rendered the orchestration.\n=== grid ===\n{}",
             tui.label,
@@ -1423,6 +1482,39 @@ fn with_attached_tui(
     // delivery differently and makes a delivered delegate briefly look
     // undelivered.
     focus_role(tui, plan, ROLE_REVIEWER)?;
+    // The delegate names `reviewer` too, and the daemon writes ITS task pointer
+    // only after that worker's own readiness wait — for a stand-in the deck
+    // cannot identify, the full timeout, ending a few seconds after coder's
+    // pointer (tell 3's signal) and so right inside this step. Typing a hook
+    // command into the reviewer's shell before it lands races that write: the
+    // pointer text arrives on the same input line and the shell runs
+    // `agent-event --type running Read .dot-agent-deck/worker-task-reviewer.md
+    // …`, which the CLI rejects as an unexpected argument, so the status half of
+    // tell 4 fails with no event ever reaching the daemon. Measured on `main`
+    // and on three branches alike while running #320's rule-12 check (the
+    // sandbox TUI stream carries that exact line). Wait for the pointer to be
+    // painted in the reviewer's pane first. Bounded, and recorded either way:
+    // the tells, not this wait, decide the verdict, but a run that timed out
+    // here says so, so a tell-4 failure after it reads as the race it may be
+    // rather than as evidence about the contract (Qodo, PR #1389).
+    let reviewer_pointer = format!("worker-task-{ROLE_REVIEWER}.md");
+    if tui.wait_for_grid(UI_TIMEOUT, |g| g.contains(&reviewer_pointer)) {
+        ev.step(format!(
+            "waited for `{reviewer_pointer}` in the `{ROLE_REVIEWER}` pane before typing hook \
+             commands into its shell"
+        ));
+    } else {
+        ev.step(format!(
+            "`{reviewer_pointer}` never appeared in the `{ROLE_REVIEWER}` pane within {}s; the hook \
+             commands below may race the daemon's late write of it, so a tell-4 failure in this \
+             run is not evidence about the contract",
+            UI_TIMEOUT.as_secs()
+        ));
+        ev.excerpt(
+            "`reviewer` role pane when its task pointer had not appeared",
+            tui.grid(),
+        );
+    }
     let work_done_sentinel = format!("XVER-WORKDONE-{nonce}");
     g.preconnect_logged(
         &format!("pane: {} work-done", cast.pane_cli_label),
@@ -1616,7 +1708,14 @@ fn with_attached_tui(
         ),
     );
 
-    if plan.mode == EndpointMode::Resolved && cast.direction == Direction::Forward {
+    if plan.mode == EndpointMode::Resolved
+        && cast.direction == Direction::Forward
+        && !g.matrix.owns_per_uid(plan.uid)
+    {
+        // Only against an old daemon on the flat pair: against one that owns
+        // the per-uid directory itself (v0.41.1 on) the directory exists
+        // because that daemon made it, and says nothing about the branch.
+        //
         // The change that makes `resolved` mode necessary (issue #1121) claims
         // its compatibility read is READ-ONLY: a branch build that found the old
         // daemon at the legacy address must never bind, create or unlink
@@ -1648,10 +1747,14 @@ fn with_attached_tui(
             format!(
                 "fallback arm confirmed: with the matrix above holding before the branch TUI \
                  started, tell 1 (no second daemon) and tell 2 (the same listener on `{}` at both \
-                 ends) passing mean the branch TUI reached the {} daemon through the legacy flat \
-                 address",
+                 ends) passing mean the branch TUI reached the {} daemon through {}",
                 attach.display(),
-                plan.previous
+                plan.previous,
+                if g.matrix.owns_per_uid(plan.uid) {
+                    "the per-uid fallback it binds as its primary, not the compatibility read"
+                } else {
+                    "the legacy flat address"
+                }
             )
         } else {
             "fallback arm NOT confirmed: tell 1 or tell 2 did not pass, so which daemon the branch \
@@ -1854,7 +1957,7 @@ fn classify_undiscovered(
         Ok(()) if !daemon.has_exited() => {
             let now = proc::unix_listeners().map_err(iso)?;
             let held_now = proc::socket_inodes(daemon.pid()).map_err(iso)?;
-            g.matrix.owned.iter().all(|p| {
+            g.matrix.held().all(|p| {
                 let inodes = isolation::listening_inodes(&now, p);
                 !inodes.is_empty() && inodes.iter().all(|i| held_now.contains(i))
             })
@@ -1866,14 +1969,13 @@ fn classify_undiscovered(
         format!("the {} daemon is untouched by the old client's fallback", cast.daemon_side),
         if untouched { Verdict::Pass } else { Verdict::Fail },
         format!(
-            "pid {} {}; its recorded identity {}; it {} every endpoint the matrix says it owns ({})",
+            "pid {} {}; its recorded identity {}; it {} every endpoint the matrix says it holds ({})",
             daemon.pid(),
             if daemon.has_exited() { "has EXITED" } else { "is alive" },
             if daemon.identity.verify().is_ok() { "still verifies" } else { "NO LONGER verifies" },
             if untouched { "still holds" } else { "does NOT hold" },
             g.matrix
-                .owned
-                .iter()
+                .held()
                 .map(|p| format!("`{}`", p.display()))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -2082,8 +2184,7 @@ fn classify_undiscovered(
         dpid = daemon.pid(),
         owned = g
             .matrix
-            .owned
-            .iter()
+            .held()
             .map(|p| format!("`{}`", p.display()))
             .collect::<Vec<_>>()
             .join(" and "),
@@ -2801,9 +2902,12 @@ fn extract_prompt(stream: &str) -> String {
         return String::new();
     };
     let rest = &stream[start..];
-    let end = rest
-        .find("keep current daemon")
-        .map(|i| i + "keep current daemon".len())
+    // The second marker is the decline label a build carrying issue #405 prints
+    // when the two builds' attach protocols differ.
+    let end = ["keep current daemon", "exit, leaving the daemon running"]
+        .iter()
+        .filter_map(|m| rest.find(m).map(|i| i + m.len()))
+        .min()
         .unwrap_or(rest.len().min(600));
     rest[..end].replace('\r', "")
 }
@@ -2860,8 +2964,9 @@ pub fn compare_hellos(old_raw: &str, new_raw: &str) -> Result<Vec<String>, Strin
         )
     } else {
         format!(
-            "PROTOCOL_VERSION DIFFERS (old {:?}, branch {:?}). That is a hard floor, so the two \
-             builds refuse each other at the handshake rather than interoperating; read a failure \
+            "PROTOCOL_VERSION DIFFERS (old {:?}, branch {:?}). A TUI carrying issue #405's check \
+             refuses to attach across that, so the attaching TUI is expected to exit at the \
+             declined prompt rather than interoperate; read a failure \
              below as that refusal rather than as a semantic break",
             op, np
         )
@@ -2909,6 +3014,19 @@ mod tests {
         assert!(got.ends_with("keep current daemon"), "{got}");
         assert!(!got.contains('\r'));
         assert!(got.contains("0.41.0-gc19c7d7") && got.contains("0.41.0-g19385813"));
+    }
+
+    #[test]
+    fn extract_prompt_ends_at_the_protocol_skew_decline_label() {
+        // Issue #405: across a protocol skew the decline key is relabelled, and
+        // the refusal printed after it must not be swallowed into the prompt.
+        let stream = "⚠  Daemon version mismatch  (1 agent(s) running)\r\n\
+             \x20  This binary cannot attach to it: the daemon speaks attach protocol v9, but this binary speaks v10.\r\n\
+             \x20  [S] restart daemon and continue   [any other key] exit, leaving the daemon running\r\n\
+             error: daemon speaks attach protocol v9, but this binary speaks v10";
+        let got = extract_prompt(stream);
+        assert!(got.ends_with("exit, leaving the daemon running"), "{got}");
+        assert!(!got.contains("error:"), "{got}");
     }
 
     #[test]

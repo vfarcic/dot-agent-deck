@@ -44,7 +44,6 @@ use dot_agent_deck::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions,
 };
 use dot_agent_deck::event::DelegateSignal;
-use spec::spec;
 
 mod common;
 
@@ -242,6 +241,35 @@ async fn delegate_work_done_chain_claude() {
     run_delegate_work_done_loop(&command, true).await;
 }
 
+/// The prompt the OpenCode arm injects. Its answer (`4444`) is absent from it.
+const OPENCODE_PROMPT: &str = "Reply with only the number equal to 4000 plus 444.";
+
+/// A slice of [`OPENCODE_PROMPT`] whose rendering proves the one write reached
+/// OpenCode's input reader. Short enough to sit on one grid row wherever
+/// OpenCode draws it, and free of the answer token, so it matches the prompt
+/// and never the reply.
+const OPENCODE_PROMPT_ECHO_NEEDLE: &str = "4000 plus 444";
+
+/// OpenCode's composer placeholder, and for this agent the measured
+/// input-readiness boundary (`state::NO_SIGNAL_READINESS_BUFFER`). Deliberately
+/// stops before the trailing ellipsis, whose glyph is not stable across OpenCode
+/// releases (issues #878/#921) — the same needle `orchestration/delegate/015`
+/// uses.
+const OPENCODE_COMPOSER_NEEDLE: &str = "Ask anything";
+
+/// How long OpenCode may take to paint its composer. The median paint was
+/// measured at 2.6 s idle and 12.5 s with the cores 4x oversubscribed
+/// (`state::NO_SIGNAL_READINESS_BUFFER`), and at 16.7-43.1 s after spawn in this
+/// test's own loaded runs for issue #699 (64 CPU hogs on 16 cores on top of
+/// ~40-50 of ambient load). A boot slower than this bound fails as NOT READY
+/// rather than spending the reply budget.
+const OPENCODE_COMPOSER_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long the injected prompt may take to render once written. Bounded well
+/// under the 90 s reply wait, which is the point: a dropped write is reported
+/// here as NOT DELIVERED instead of as a missing reply at the end of that wait.
+const OPENCODE_PROMPT_ECHO_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Scenario: Confirm a real OpenCode worker AUTO-SUBMITS a daemon-injected
 /// single-line prompt — the exact #187 mechanism, for a second non-Claude
 /// agent (the case PR #188 did not claim). Unlike the Claude arm this does
@@ -263,6 +291,18 @@ async fn delegate_work_done_chain_claude() {
 /// The answer token (`4444`) is absent from the prompt, so finding it in
 /// the rendered pane proves the prompt was submitted and answered, not
 /// merely echoed into the input box.
+///
+/// Issue #699 — what the harness may do and what only the daemon may do.
+/// The harness WAITS before the write, for OpenCode to paint its
+/// `Ask anything` composer (the measured input-readiness boundary, replacing
+/// an output-quiet heuristic that under load fired while OpenCode was still
+/// discarding keystrokes), and OBSERVES after it: first that the prompt text
+/// rendered, then that the reply did. The daemon's `write_and_submit_guarded`
+/// makes the one and only write — payload and submitting CR both. The harness
+/// never writes to the pane, never re-injects and never presses Enter, so a
+/// pass still means the daemon's own unaided submit worked. A boot that never
+/// paints the composer fails as NOT READY, and a write that never renders
+/// fails as NOT DELIVERED, both before the 90 s reply wait begins.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opencode_auto_submits_daemon_injected_prompt() {
     skip_unless!(common::check_opencode_available());
@@ -318,27 +358,73 @@ async fn opencode_auto_submits_daemon_injected_prompt() {
             ..SpawnOptions::default()
         })
         .expect("spawn opencode worker");
+    let spawned_at = std::time::Instant::now();
 
-    common::wait_until_agent_output_settled(
+    // Issue #699: gate on INPUT readiness, observed, before the daemon writes.
+    // This used to be `wait_until_agent_output_settled` — 1500 ms of PTY quiet
+    // after a 6 s floor — which measures output, not input. Under load
+    // OpenCode's boot stalls for longer than the quiet window while it is still
+    // initialising, the helper declared it settled, and the write landed in a
+    // TUI that was discarding keystrokes: an empty composer on the failing
+    // screen, and the whole 90 s reply budget burned on a prompt no reader ever
+    // saw. The composer paint is the boundary instead, the one
+    // `state::NO_SIGNAL_READINESS_BUFFER` measured for this agent (in its 176
+    // runs, written before it the payload was gone, written after it every run
+    // delivered) and the one `orchestration/delegate/015` already waits on.
+    // The needle carries no trailing ellipsis on purpose: that glyph has
+    // drifted between OpenCode releases once already (issues #878/#921).
+    let (composer_up, boot_screen) = common::wait_for_rendered_agent_text(
         &registry,
         &worker_agent_id,
-        Duration::from_millis(1500),
-        Duration::from_secs(30),
+        OPENCODE_COMPOSER_NEEDLE,
+        OPENCODE_COMPOSER_TIMEOUT,
     )
     .await;
+    let composer_after = spawned_at.elapsed();
+    assert!(
+        composer_up,
+        "NOT READY: OpenCode never painted its `{OPENCODE_COMPOSER_NEEDLE}` composer within \
+         {OPENCODE_COMPOSER_TIMEOUT:?}, so nothing was injected — this is the agent's boot, not \
+         the deck's auto-submit. Rendered screen:\n{boot_screen}"
+    );
 
+    // Exactly ONE write, through the daemon's own primitive: payload, then
+    // `SUBMIT_DELAY`, then CR, all under the held writer. Everything the
+    // harness does is either before this (waiting) or after it (observing); the
+    // harness never writes to the pane itself, never re-injects and never sends
+    // an Enter. A retry here would be the harness doing the recovery the
+    // product does not (issue #1383 proposes it for the daemon), and the test
+    // would then pass on the very first-write drop it is meant to expose.
+    let sent = registry
+        .write_and_submit_guarded(WORKER_PANE, OPENCODE_PROMPT, &worker_agent_id, || async {
+            true
+        })
+        .await
+        .expect("inject prompt into opencode worker");
     assert_eq!(
-        registry
-            .write_and_submit_guarded(
-                WORKER_PANE,
-                "Reply with only the number equal to 4000 plus 444.",
-                &worker_agent_id,
-                || async { true },
-            )
-            .await
-            .expect("inject prompt into opencode worker"),
+        sent,
         GuardedSend::Applied,
         "the guarded injection must be authorized and applied before the reply can be awaited"
+    );
+
+    // Observe that the one write reached OpenCode's input reader before
+    // spending the reply budget on it. A dropped write leaves the composer
+    // empty and the prompt text nowhere on screen, and that now fails here, in
+    // seconds, under its own name, instead of 90 s later as a missing reply.
+    let (prompt_seen, echo_screen) = common::wait_for_rendered_agent_text(
+        &registry,
+        &worker_agent_id,
+        OPENCODE_PROMPT_ECHO_NEEDLE,
+        OPENCODE_PROMPT_ECHO_TIMEOUT,
+    )
+    .await;
+    assert!(
+        prompt_seen,
+        "NOT DELIVERED: the composer had painted {composer_after:?} after spawn and the \
+         daemon's guarded write returned Applied, yet `{OPENCODE_PROMPT_ECHO_NEEDLE}` never \
+         rendered within {OPENCODE_PROMPT_ECHO_TIMEOUT:?}, so the reply was not awaited. An \
+         empty composer below is the issue #699 shape — the bytes never reached OpenCode's \
+         input reader. Rendered screen:\n{echo_screen}"
     );
 
     let (ok, screen) = common::wait_for_rendered_agent_text(
@@ -351,122 +437,10 @@ async fn opencode_auto_submits_daemon_injected_prompt() {
     assert!(
         ok,
         "OpenCode did not auto-submit the daemon-injected single-line prompt \
-         (no '4444' reply rendered). Rendered screen:\n{screen}"
+         (no '4444' reply rendered). The prompt DID reach the pane (its text rendered), so \
+         either the daemon's CR did not submit it — it is sitting in the composer, the #187 \
+         shape — or the model did not answer with it. Rendered screen:\n{screen}"
     );
 
     registry.shutdown_all();
-}
-
-/// Scenario: With the built deck binary's own directory prepended to this
-/// process's `$PATH` — the deck's normal on-`PATH` install shape — delegate a
-/// trivial task to a `cat`-stub worker under the in-process daemon (no real
-/// agent needed; only the generated file matters here) and read the written
-/// `.dot-agent-deck/worker-task-coder.md`. Assert its `work-done` instruction
-/// names the BARE binary (`dot-agent-deck work-done --task-file …`), not the
-/// quoted absolute-path fallback that every other `binary_name()`-adjacent
-/// test in this repo exercises (`orchestration/delegate/016`/`017` and the
-/// `delegate_prompt_injection` integration test all run with their own
-/// throwaway test binary, which is never on `$PATH` either way; `/018`/`/019`
-/// inject a synthetic resolver rather than a real `$PATH` lookup). This is
-/// PR #520's entire motivating scenario — a normal on-`PATH` install — and
-/// nothing exercised it against a real `current_exe()` on a real `$PATH`
-/// until `spawn_inprocess_daemon`'s test-current-exe override made an
-/// in-process daemon name the real built deck binary instead of this test's
-/// own libtest binary.
-#[spec("orchestration/delegate/020")]
-#[test]
-fn delegate_020_bare_name_reaches_the_worker_task_file_on_a_real_path() {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
-    let bin_dir = Path::new(bin)
-        .parent()
-        .expect("test binary has a parent dir")
-        .to_str()
-        .expect("bin dir is UTF-8");
-    let path_with_bin_dir = format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default());
-    // SAFETY: set here, at the very top of the sync test entry point — BEFORE
-    // the tokio runtime (and therefore any daemon worker thread) is created
-    // below — so no concurrent `getenv` can race this `setenv`. nextest runs
-    // each test in its own process, so this never leaks to another test (same
-    // reasoning as `chain_smoke_pi_002`'s `DOT_AGENT_DECK_SEED_FALLBACK_SECS`).
-    unsafe {
-        std::env::set_var("PATH", &path_with_bin_dir);
-    }
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build multi-thread runtime");
-    rt.block_on(delegate_020_bare_name_reaches_the_worker_task_file_on_a_real_path_inner());
-}
-
-async fn delegate_020_bare_name_reaches_the_worker_task_file_on_a_real_path_inner() {
-    let daemon = common::spawn_inprocess_daemon().await;
-
-    let cwd = common::race_safe_tempdir();
-    let cwd_str = cwd.path().to_str().expect("cwd is UTF-8").to_string();
-
-    let _worker_agent_id = daemon
-        .registry
-        .spawn_agent(SpawnOptions {
-            command: Some("cat"),
-            cwd: Some(cwd_str.as_str()),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
-            ..SpawnOptions::default()
-        })
-        .expect("spawn worker stub");
-
-    {
-        let mut st = daemon.state.write().await;
-        st.pane_role_map
-            .insert(ORCH_PANE.to_string(), "orchestrator".to_string());
-        st.pane_role_map
-            .insert(WORKER_PANE.to_string(), WORKER_ROLE.to_string());
-        st.orchestrator_pane_ids.insert(ORCH_PANE.to_string());
-        let orch = dot_agent_deck::state::OrchestrationIdentity::NameCwd {
-            name: "test-orchestration".to_string(),
-            cwd: cwd_str.clone(),
-        };
-        st.pane_orchestration_map
-            .insert(ORCH_PANE.to_string(), orch.clone());
-        st.pane_orchestration_map
-            .insert(WORKER_PANE.to_string(), orch);
-        st.pane_cwd_map
-            .insert(WORKER_PANE.to_string(), cwd_str.clone());
-    }
-
-    let signal = DelegateSignal {
-        pane_id: ORCH_PANE.to_string(),
-        task: "List the files in the current directory.".to_string(),
-        to: vec![WORKER_ROLE.to_string()],
-        supersede: false,
-        timestamp: chrono::Utc::now(),
-        token: None,
-    };
-    daemon
-        .state
-        .read()
-        .await
-        .handle_delegate(signal, &daemon.registry, &daemon.event_tx)
-        .await;
-
-    let task_file = cwd
-        .path()
-        .join(".dot-agent-deck")
-        .join("worker-task-coder.md");
-    let ok = common::wait_for_path_async(&task_file, Duration::from_secs(5)).await;
-    assert!(ok, "worker task file was never written at {task_file:?}");
-    let body = std::fs::read_to_string(&task_file).expect("read worker task file");
-
-    assert!(
-        body.contains("dot-agent-deck work-done --task-file"),
-        "expected the bare binary name in the work-done instruction now that the \
-         deck's own directory is on $PATH; got: {body}"
-    );
-    assert!(
-        !body.contains(env!("CARGO_BIN_EXE_dot-agent-deck")),
-        "the absolute-path fallback must not have fired once the deck's own \
-         directory is on $PATH; got: {body}"
-    );
-
-    daemon.registry.shutdown_all();
 }

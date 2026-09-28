@@ -3162,6 +3162,40 @@ pub struct OrchestrationRoleSlot {
     pub is_start_role: bool,
 }
 
+/// Issue #523 review: the orchestrator seat of a tab rebuilt from live role
+/// panes (reconnect hydration, the live surface), and whether the TUI-side
+/// `orchestrator_pane_ids` mirror may register the pane in it.
+///
+/// `role_pane_ids` is the slot vector the caller actually kept (first pane
+/// wins per role index), so only a flag on a KEPT pane seats the tab — a flag
+/// on a discarded duplicate would otherwise seat, and mirror, the surviving
+/// unflagged pane at that index, which the daemon does not let delegate. With
+/// no kept flag the seat is the config's rule; the mirror is then allowed only
+/// if no slot was flagged at all (an older daemon, or a config that seats
+/// nothing else), since a discarded flag means the daemon's orchestrator is
+/// not on this tab.
+fn rebuilt_tab_seat(
+    config: &crate::project_config::OrchestrationConfig,
+    slots: &[OrchestrationRoleSlot],
+    role_pane_ids: &[Option<String>],
+) -> (usize, bool) {
+    let kept = |slot: &&OrchestrationRoleSlot| {
+        role_pane_ids
+            .get(slot.role_index)
+            .and_then(Option::as_deref)
+            == Some(slot.pane_id.as_str())
+    };
+    let kept_flagged: Vec<usize> = slots
+        .iter()
+        .filter(|slot| slot.is_start_role)
+        .filter(kept)
+        .map(|slot| slot.role_index)
+        .collect();
+    let seat = config.live_orchestrator_seat(kept_flagged.iter().copied());
+    let mirror = !kept_flagged.is_empty() || !slots.iter().any(|slot| slot.is_start_role);
+    (seat, mirror)
+}
+
 /// PRD #111: pick the `OrchestrationConfig` the hydration site uses
 /// when rebuilding an orchestration tab. Extracted from the hydration
 /// loop so the `local-wins / synthesise-otherwise` selection has a
@@ -5969,12 +6003,18 @@ fn surface_one_orchestration(
     // The tab bar shows whenever `tabs.len() > 1`, so the new label still paints
     // regardless of which tab is active.
     let prev_active = tab_manager.active_index();
-    match tab_manager.open_orchestration_tab_with_existing_role_panes(
+    // Issue #523 review: seated where the DAEMON registered the orchestrator
+    // (the memberships' `is_start_role`), so the tab focuses — and the mirror
+    // below registers — the pane that may delegate.
+    let (orch_idx, mirror_seat) =
+        rebuilt_tab_seat(&orch_config, &bucket.role_slots, &role_pane_ids);
+    match tab_manager.open_orchestration_tab_with_existing_role_panes_seated(
         &orch_config,
         &surface.cwd,
         role_pane_ids.clone(),
         bucket.display_title.as_deref(),
         bucket.orchestration_id.as_deref(),
+        Some(orch_idx),
     ) {
         Ok((tab_index, _)) => {
             if let Some(warning) = drift_warning {
@@ -6012,7 +6052,7 @@ fn surface_one_orchestration(
                     st.register_pane(pane_id.clone());
                     st.pane_role_map.insert(pane_id.clone(), role.name.clone());
                     st.pane_cwd_map.insert(pane_id.clone(), surface.cwd.clone());
-                    if role.start {
+                    if i == orch_idx && mirror_seat {
                         st.orchestrator_pane_ids.insert(pane_id.clone());
                     }
                 }
@@ -11141,12 +11181,13 @@ fn dispatch_action(
                                 // TUI-side router would silently hit, is on the
                                 // first of these registrations in
                                 // `surface_one_orchestration`.
+                                let orch_idx = orch_config.orchestrator_role_index();
                                 for (i, role) in orch_config.roles.iter().enumerate() {
                                     st.pane_role_map
                                         .insert(role_pane_ids[i].clone(), role.name.clone());
                                     st.pane_cwd_map
                                         .insert(role_pane_ids[i].clone(), dir_str.clone());
-                                    if role.start {
+                                    if i == orch_idx {
                                         st.orchestrator_pane_ids.insert(role_pane_ids[i].clone());
                                     }
                                 }
@@ -11167,8 +11208,10 @@ fn dispatch_action(
                                         .insert(role_pane_ids[i].clone(), declared);
                                 }
                             }
-                            let start_idx =
-                                orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+                            // Issue #523: the pane the tab seated as the
+                            // orchestrator — its `start_role_index`, by the one
+                            // rule — so the prompt goes where the focus did.
+                            let start_idx = orch_config.orchestrator_role_index();
                             // PRD #20 R20-003 (finding #5): capture the START
                             // role's delivery IDENTITY *now* — immediately after
                             // `open_orchestration_tab` created the role panes —
@@ -13305,14 +13348,21 @@ pub fn run_tui(
             // Now register the orchestrator pane mapping for any live
             // start role so M5 dispatch keeps routing work-done events
             // back to the right place.
-            let start_role_index = orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+            //
+            // Issue #523 review: where the DAEMON registered it, read off the
+            // surviving memberships — a restored tab may have been seated on a
+            // saved cursor the config would not pick (PRD #89 F3) — so focus
+            // and this mirror follow the pane that may delegate.
+            let (start_role_index, mirror_seat) =
+                rebuilt_tab_seat(&orch_config, &bucket.role_slots, &role_pane_ids);
             let orchestrator_pane = role_pane_ids.get(start_role_index).and_then(|s| s.clone());
-            match tab_manager.open_orchestration_tab_with_existing_role_panes(
+            match tab_manager.open_orchestration_tab_with_existing_role_panes_seated(
                 &orch_config,
                 &bucket.cwd,
                 role_pane_ids.clone(),
                 bucket.display_title.as_deref(),
                 bucket.orchestration_id.as_deref(),
+                Some(start_role_index),
             ) {
                 Ok((tab_index, _)) => {
                     if first_orchestration_tab_index.is_none() {
@@ -13361,7 +13411,7 @@ pub fn run_tui(
                             }
                             st.pane_role_map.insert(pane_id.clone(), role.name.clone());
                             st.pane_cwd_map.insert(pane_id.clone(), bucket.cwd.clone());
-                            if role.start {
+                            if i == start_role_index && mirror_seat {
                                 st.orchestrator_pane_ids.insert(pane_id.clone());
                             }
                         }
@@ -13483,7 +13533,16 @@ pub fn run_tui(
                         // start role once it signals readiness.
                         let replay_prompt = (!orch_snap.orchestrator_prompt.is_empty())
                             .then(|| orch_snap.orchestrator_prompt.clone());
-                        match tab_manager.open_orchestration_tab(
+                        // PRD #89 review-fix F3: honor the SAVED start cursor,
+                        // even when it differs from the role the config seats
+                        // now, so the prompt-delivery gate and the landing focus
+                        // target the role the user left as start. Issue #523
+                        // review: passed as the tab's SEAT rather than patched
+                        // onto `start_role_index` afterwards, so the membership
+                        // the daemon registers (who may `delegate`) and the Pi
+                        // seed name that same role — one orchestrator, not a
+                        // prompt on one pane and delegate rights on another.
+                        match tab_manager.open_orchestration_tab_seated(
                             &orch_config,
                             &saved_pane.dir,
                             replay_prompt,
@@ -13493,22 +13552,9 @@ pub fn run_tui(
                             // when unset falls back to the canonical name.
                             orch_snap.display_title.as_deref(),
                             spawn_dims,
+                            Some(saved_start_idx),
                         ) {
                             Ok((tab_idx, role_pane_ids)) => {
-                                // PRD #89 review-fix F3: honor the SAVED start
-                                // cursor. `open_orchestration_tab` computed
-                                // `start_role_index` from the config's `start`
-                                // flags; override it with the validated saved
-                                // index so the prompt-delivery gate (and the
-                                // landing focus) target the role the user left
-                                // as start, even when it differs from the config
-                                // default. The just-opened tab is the active tab.
-                                if let Tab::Orchestration {
-                                    start_role_index, ..
-                                } = tab_manager.active_tab_mut()
-                                {
-                                    *start_role_index = saved_start_idx;
-                                }
                                 // Snapshot each role pane's daemon agent_id before
                                 // the placeholder insert so the strict-equality
                                 // reuse guard accepts each role agent's first
@@ -13539,6 +13585,7 @@ pub fn run_tui(
                                     // TUI-side router would silently hit, is on
                                     // the first of these registrations in
                                     // `surface_one_orchestration`.
+                                    // The tab's seat — the saved cursor (above).
                                     for (i, role) in orch_config.roles.iter().enumerate() {
                                         st.pane_role_map
                                             .insert(role_pane_ids[i].clone(), role.name.clone());
@@ -13546,7 +13593,7 @@ pub fn run_tui(
                                             role_pane_ids[i].clone(),
                                             saved_pane.dir.clone(),
                                         );
-                                        if role.start {
+                                        if i == saved_start_idx {
                                             st.orchestrator_pane_ids
                                                 .insert(role_pane_ids[i].clone());
                                         }
@@ -24212,6 +24259,72 @@ pub fn render_new_pane_form_schedule_to_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #523 review (Qodo, PR #1388): a rebuilt tab is seated from the
+    /// memberships of the panes it KEPT. When the daemon reports two panes for
+    /// one role index (hydration keeps the first), a flag on the discarded
+    /// duplicate must not seat — or let the TUI mirror mark — the surviving,
+    /// unflagged pane, which the daemon does not let delegate.
+    #[test]
+    fn rebuilt_tab_seat_reads_only_the_panes_it_kept() {
+        let role = |name: &str, start: bool| crate::project_config::OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: "cat".to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        };
+        let config = crate::project_config::OrchestrationConfig {
+            name: "team".to_string(),
+            default: false,
+            roles: vec![role("orchestrator", true), role("coder", false)],
+        };
+        let slot = |role_index: usize, pane_id: &str, is_start_role: bool| OrchestrationRoleSlot {
+            role_index,
+            pane_id: pane_id.to_string(),
+            role_name: String::new(),
+            is_start_role,
+        };
+        let kept = |ids: &[&str]| -> Vec<Option<String>> {
+            ids.iter().map(|id| Some((*id).to_string())).collect()
+        };
+
+        // The daemon seated `coder` (a restored saved cursor): followed, mirrored.
+        assert_eq!(
+            rebuilt_tab_seat(
+                &config,
+                &[slot(0, "p0", false), slot(1, "p1", true)],
+                &kept(&["p0", "p1"])
+            ),
+            (1, true)
+        );
+        // Nothing flagged at all (an older daemon): the config's rule, mirrored.
+        assert_eq!(
+            rebuilt_tab_seat(
+                &config,
+                &[slot(0, "p0", false), slot(1, "p1", false)],
+                &kept(&["p0", "p1"])
+            ),
+            (0, true)
+        );
+        // The flag sits on a DISCARDED duplicate of role 1 (`p1-dup`): it does
+        // not seat role 1's surviving `p1`, and nothing is mirrored, because the
+        // pane the daemon lets delegate is not on this tab.
+        assert_eq!(
+            rebuilt_tab_seat(
+                &config,
+                &[
+                    slot(0, "p0", false),
+                    slot(1, "p1", false),
+                    slot(1, "p1-dup", true)
+                ],
+                &kept(&["p0", "p1"]),
+            ),
+            (0, false)
+        );
+    }
     use crate::authoring_seeds::{
         AuthoringKind, DISPATCHER_SEED_PROMPT, SCHEDULE_AUTHORING_SEED_PROMPT,
     };
@@ -42662,6 +42775,337 @@ mod tests {
         let cut = truncate_styled_segments(segments, 6);
         assert_eq!(title_text(&cut), " 1 ab…");
         assert!(!title_text(&cut).contains(char::is_control));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1369 — the status-line and empty-filter messages the glossary
+    // (#1045, PR #1342) reworded. Each test drives the real branch and then
+    // draws the whole frame into a `TestBackend`, pinning the text the user
+    // actually reads rather than only the `ui.status_message` field — so a
+    // later terminology regression in any of them fails here.
+    // -----------------------------------------------------------------------
+
+    /// Draw one full dashboard frame for `state` / `ui` into a 100x24
+    /// `TestBackend` and return every row, right-trimmed.
+    fn glossary_frame_rows(state: &AppState, ui: &mut UiState) -> Vec<String> {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let filtered = filter_sessions(state, ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                    zoomed: false,
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                    orchestration_statuses: vec![],
+                };
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    state,
+                    ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                    Utc::now(),
+                )
+            })
+            .unwrap();
+        buffer_to_string(terminal.backend().buffer())
+            .lines()
+            .map(|row| row.trim_end().to_string())
+            .collect()
+    }
+
+    /// The bottom (status) row of the frame `glossary_frame_rows` draws.
+    fn glossary_status_row(state: &SharedState, ui: &mut UiState) -> String {
+        let snapshot = state.blocking_read().clone();
+        glossary_frame_rows(&snapshot, ui)
+            .pop()
+            .expect("a 24-row frame has a bottom row")
+    }
+
+    /// The text of `ui.status_message`, for asserting the field and the
+    /// rendered row agree.
+    fn glossary_status_text(ui: &UiState) -> Option<&str> {
+        ui.status_message.as_ref().map(|(msg, _)| msg.as_str())
+    }
+
+    /// Scenario: Put two agents on the dashboard, apply a filter that matches
+    /// neither, and draw the frame. The sidebar must say "No agents match
+    /// filter." under a title counting `0/2 agent(s)` — the glossary's word,
+    /// not the old "sessions".
+    #[spec("dashboard/filter/005")]
+    #[test]
+    fn filter_005_zero_results_says_no_agents_match() {
+        let state = dashboard_snapshot(2);
+        let mut ui = default_ui();
+        ui.filter_text = "zzz-matches-nothing".to_string();
+        assert!(
+            filter_sessions(&state, &ui).is_empty(),
+            "precondition: the filter must hide every card"
+        );
+
+        let rows = glossary_frame_rows(&state, &mut ui);
+        let title = rows
+            .iter()
+            .find(|row| row.contains("dot-agent-deck"))
+            .expect("the dashboard title row is drawn");
+        let message = rows
+            .iter()
+            .find(|row| row.contains("match filter"))
+            .expect("the zero-result message is drawn");
+        insta::assert_snapshot!(
+            format!("{}\n{}", title.trim(), message.trim()),
+            @"
+            dot-agent-deck — 0/2 agent(s)
+            No agents match filter.
+            "
+        );
+    }
+
+    /// A controller whose every `focus_pane` fails with `CommandFailed` and
+    /// whose on-demand attach finds nothing — the genuinely stale card.
+    fn stale_card_pc() -> UnwiredPC {
+        UnwiredPC::new(false)
+    }
+
+    /// Scenario: Jump to a dashboard card (the `Ctrl+d` → digit path) whose
+    /// pane the daemon no longer has. The card is removed and the status line
+    /// reads "Removed stale agent: …" with the controller's reason.
+    #[spec("dashboard/status-message/001")]
+    #[test]
+    fn status_message_001_digit_jump_to_a_stale_card_says_removed_stale_agent() {
+        use tokio::sync::RwLock;
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        let pc = stale_card_pc();
+        let mut ui = default_ui();
+
+        assert!(focus_deck(0, &mut ui, &filtered, &snapshot, &state, &pc));
+
+        assert!(
+            !state.blocking_read().sessions.contains_key("s0"),
+            "precondition: the stale card is removed"
+        );
+        assert_eq!(
+            glossary_status_text(&ui),
+            Some("Removed stale agent: Pane p0 not found")
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  Removed stale agent: Pane p0 not found");
+    }
+
+    /// Scenario: Jump to a dashboard card that has no pane linked to it. The
+    /// deck stays on the dashboard and the status line reads "No pane linked
+    /// to agent <id>".
+    #[spec("dashboard/status-message/002")]
+    #[test]
+    fn status_message_002_digit_jump_to_a_paneless_card_says_no_pane_linked_to_agent() {
+        use tokio::sync::RwLock;
+        let mut snapshot = dashboard_snapshot(1);
+        snapshot.sessions.get_mut("s0").unwrap().pane_id = None;
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        let pc = stale_card_pc();
+        let mut ui = default_ui();
+
+        assert!(focus_deck(0, &mut ui, &filtered, &snapshot, &state, &pc));
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert_eq!(
+            glossary_status_text(&ui),
+            Some("No pane linked to agent s0")
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  No pane linked to agent s0");
+    }
+
+    /// Drive `Action::Focus` (Enter) on the one card of `snapshot` against `pc`.
+    fn glossary_enter_on_card(
+        snapshot: &AppState,
+        state: &SharedState,
+        pc: Arc<UnwiredPC>,
+        ui: &mut UiState,
+    ) {
+        let mut tab_manager = TabManager::new(pc.clone());
+        let filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        ui.selected_index = Some(0);
+        dispatch_action(
+            Action::Focus,
+            ui,
+            &*pc,
+            state,
+            &mut tab_manager,
+            snapshot,
+            &filtered,
+            Some("s0"),
+            Rect::new(0, 0, 100, 24),
+        );
+    }
+
+    /// Scenario: Press Enter on a dashboard card whose pane the daemon no
+    /// longer has. Enter carries its own copy of the stale-card branch, so it
+    /// is pinned separately: the status line reads "Removed stale agent: …".
+    #[spec("dashboard/status-message/003")]
+    #[test]
+    fn status_message_003_enter_on_a_stale_card_says_removed_stale_agent() {
+        use tokio::sync::RwLock;
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut ui = default_ui();
+
+        glossary_enter_on_card(&snapshot, &state, Arc::new(stale_card_pc()), &mut ui);
+
+        assert!(
+            !state.blocking_read().sessions.contains_key("s0"),
+            "precondition: the stale card is removed"
+        );
+        assert_eq!(
+            glossary_status_text(&ui),
+            Some("Removed stale agent: Pane p0 not found")
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  Removed stale agent: Pane p0 not found");
+    }
+
+    /// Scenario: Press Enter on a dashboard card that has no pane linked to
+    /// it. The deck stays on the dashboard and the status line reads "No pane
+    /// linked to agent <id>".
+    #[spec("dashboard/status-message/004")]
+    #[test]
+    fn status_message_004_enter_on_a_paneless_card_says_no_pane_linked_to_agent() {
+        use tokio::sync::RwLock;
+        let mut snapshot = dashboard_snapshot(1);
+        snapshot.sessions.get_mut("s0").unwrap().pane_id = None;
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut ui = default_ui();
+
+        glossary_enter_on_card(&snapshot, &state, Arc::new(stale_card_pc()), &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert_eq!(
+            glossary_status_text(&ui),
+            Some("No pane linked to agent s0")
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  No pane linked to agent s0");
+    }
+
+    /// Scenario: Ask for the config-generation prompt with no card selected.
+    /// There is nothing to send it to, so the prompt does not open and the
+    /// status line reads "No active agent to send prompt to."
+    #[spec("dashboard/status-message/005")]
+    #[test]
+    fn status_message_005_config_gen_without_a_target_says_no_active_agent() {
+        use tokio::sync::RwLock;
+        let snapshot = AppState::default();
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+
+        dispatch_action(
+            Action::RequestConfigGen,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 100, 24),
+        );
+
+        assert_ne!(ui.mode, UiMode::ConfigGenPrompt);
+        assert_eq!(
+            glossary_status_text(&ui),
+            Some("No active agent to send prompt to.")
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  No active agent to send prompt to.");
+    }
+
+    /// Scenario: Submit the new-agent form for a plain dashboard card and let
+    /// the controller create it. The deck enters the new pane and the status
+    /// line reads "Created agent <pane> in <dir>".
+    #[spec("dashboard/status-message/006")]
+    #[test]
+    fn status_message_006_successful_spawn_says_created_agent() {
+        use tokio::sync::RwLock;
+        let snapshot = AppState::default();
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+
+        dispatch_action(
+            Action::SpawnPane(Box::new(plain_card_request("/work/card"))),
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 100, 24),
+        );
+
+        assert_eq!(ui.mode, UiMode::PaneInput);
+        assert_eq!(
+            glossary_status_text(&ui),
+            Some("Created agent mock-pane-0 in /work/card")
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" TYPING  Created agent mock-pane-0 in /work/card                               [Command Mode Ctrl+D]");
+    }
+
+    /// Scenario: Submit the new-agent form for a plain dashboard card while
+    /// the controller refuses to create it. The deck stays on the dashboard
+    /// and the status line reads "New agent failed: …" with the reason.
+    #[spec("dashboard/status-message/007")]
+    #[test]
+    fn status_message_007_failed_spawn_says_new_agent_failed() {
+        use tokio::sync::RwLock;
+        let snapshot = AppState::default();
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let pc = Arc::new(RefusingPaneController {
+            error: "daemon refused the start".to_string(),
+            inner: CapturingPaneController::new(),
+        });
+        let mut tab_manager = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+
+        dispatch_action(
+            Action::SpawnPane(Box::new(plain_card_request("/work/card"))),
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 100, 24),
+        );
+
+        assert_ne!(ui.mode, UiMode::PaneInput);
+        assert_eq!(
+            glossary_status_text(&ui),
+            Some("New agent failed: Command failed: daemon refused the start")
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  New agent failed: Command failed: daemon refused the start");
     }
 }
 

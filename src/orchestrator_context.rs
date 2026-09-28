@@ -61,10 +61,13 @@ pub enum Attendance {
 /// delegation protocol instructions.
 pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     let mut content = String::new();
+    // Issue #523: written for the role the one rule seats, not for whichever
+    // role carries the bare flag — the pane this file is delivered into.
+    let orch_idx = config.orchestrator_role_index();
 
     // 1. Orchestrator's own prompt_template.
-    if let Some(start_role) = config.roles.iter().find(|r| r.start)
-        && let Some(ref tpl) = start_role.prompt_template
+    if let Some(orchestrator) = config.orchestrator_role()
+        && let Some(ref tpl) = orchestrator.prompt_template
     {
         content.push_str(tpl);
         content.push_str("\n\n");
@@ -72,8 +75,8 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
 
     // 2. Available agents list.
     content.push_str("## Available agents\n\n");
-    for role in &config.roles {
-        if role.start {
+    for (idx, role) in config.roles.iter().enumerate() {
+        if idx == orch_idx {
             continue;
         }
         let desc = role.description.as_deref().unwrap_or("(no description)");
@@ -144,7 +147,7 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          {bin} delegate --to <role-name> --task \"Short plain task description.\"\n\
          ```\n\n\
          Why the allowlist is that narrow: everything after `--task` is processed by **your own \
-         shell** before {bin} receives it. Backticks and `$(…)` are executed and \
+         shell** before the deck receives it. Backticks and `$(…)` are executed and \
          replaced by their output — usually empty — `$VAR` becomes its value or nothing, a \
          balanced inner `\"` is removed and changes how the rest of the argument is quoted, a \
          `\\` before `$`, a backtick, `\"` or `\\` removes itself, and a `\\` at the end of a \
@@ -2730,6 +2733,50 @@ mod tests {
         );
     }
 
+    /// Issue #523: the context is written FOR the orchestrator the rule seats,
+    /// not for whichever role carries the bare flag — so a role named
+    /// `orchestrator` with no `start = true` anywhere still gets its own
+    /// template and is not offered to itself as a worker, and a flagged role
+    /// beside a role that is merely NAMED `orchestrator` stays the reader.
+    #[test]
+    fn context_is_written_for_the_role_the_rule_seats() {
+        let unflagged = OrchestrationConfig {
+            default: false,
+            name: "digest".to_string(),
+            roles: vec![
+                role("coder", false, None, Some("Implements features")),
+                role("orchestrator", false, Some("You lead the team."), None),
+            ],
+        };
+        let c = build_orchestrator_context(&unflagged);
+        assert!(
+            c.contains("You lead the team."),
+            "the named orchestrator's own template:\n{c}"
+        );
+        assert!(c.contains("**coder**: Implements features"));
+        assert!(
+            !c.contains("**orchestrator**:"),
+            "the orchestrator is the reader, not one of its own agents:\n{c}"
+        );
+
+        let flagged_beside_name = OrchestrationConfig {
+            default: false,
+            name: "digest".to_string(),
+            roles: vec![
+                role(
+                    "orchestrator",
+                    false,
+                    Some("NOT THE READER"),
+                    Some("A worker"),
+                ),
+                role("lead", true, Some("You lead the team."), None),
+            ],
+        };
+        let c = build_orchestrator_context(&flagged_beside_name);
+        assert!(c.contains("You lead the team.") && !c.contains("NOT THE READER"));
+        assert!(c.contains("**orchestrator**: A worker") && !c.contains("**lead**:"));
+    }
+
     /// With a caller task (PRD #220 `dispatch --task`, PRD #120 per-issue prompt)
     /// the task rides INSIDE the file and the one-line pointer tells the
     /// orchestrator to CARRY IT OUT.
@@ -3511,9 +3558,8 @@ mod tests {
 
     /// Scenario: Build the orchestrator context and check that its `delegate`
     /// and `work-done` command examples name what `binary_name()` resolves
-    /// for the running process — under `cargo test` the throwaway test binary
-    /// is never on `$PATH`, so this is its own absolute `current_exe()` path,
-    /// never the crate's baked-in literal name.
+    /// for the running process — its own absolute `current_exe()` path (issue
+    /// #549), never the crate's baked-in literal name.
     #[spec("orchestration/delegate/016")]
     #[test]
     fn delegate_016_orchestrator_context_names_the_running_binary() {
