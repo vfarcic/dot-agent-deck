@@ -1539,8 +1539,22 @@ pub async fn ingest_event(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
     registry: &Arc<AgentPtyRegistry>,
-    mut event: AgentEvent,
+    event: AgentEvent,
 ) {
+    ingest_event_unless(state, event_tx, registry, event, || false).await;
+}
+
+/// [`ingest_event`], except that `stale` is asked once the `AppState` write
+/// lock is held, and a `true` drops the event before it is broadcast or
+/// applied. Asked under that lock so nothing the lock orders can slip between
+/// the verdict and the apply. Returns whether the event was ingested.
+async fn ingest_event_unless(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    mut event: AgentEvent,
+    stale: impl FnOnce() -> bool,
+) -> bool {
     // Issue #770: half of the orphan verdict, asked of the registry BEFORE the
     // `AppState` write lock is taken. Sequencing, not style: `has_live_pane`
     // takes the registry's own mutex, and every other path in the daemon that
@@ -1552,6 +1566,9 @@ pub async fn ingest_event(
         .as_deref()
         .is_some_and(|pane_id| registry.has_live_pane(pane_id));
     let mut state = state.write().await;
+    if stale() {
+        return false;
+    }
     // Issue #714: keep the registry's per-agent quota-block latch in step with
     // the card. A `QuotaBlocked` latches a fresh epoch for the pane's live
     // owner — the key the orchestrator notice below is claimed and re-checked
@@ -1612,6 +1629,7 @@ pub async fn ingest_event(
     if let Some((pane_id, agent_id, epoch)) = reported_block {
         notify_orchestrator_of_quota_block(registry, &pane_id, &agent_id, epoch);
     }
+    true
 }
 
 /// Issue #714: the one notice to the orchestrator of a worker whose block
@@ -1820,16 +1838,17 @@ fn queue_codex_rollout_arm(registry: &AgentPtyRegistry, event: &AgentEvent) {
     registry.codex_rollout_arms().push(command);
 }
 
-/// Issue #714: the daemon half of Codex quota detection
+/// Issues #714 and #1359: the daemon half of Codex failed-turn detection
 /// (`crate::codex_rollout_tail`).
 ///
 /// Every [`crate::codex_rollout_tail::POLL_INTERVAL`] it applies the arm
 /// commands the hook loop queued, then polls every armed tailer on a blocking
 /// thread — the file I/O happens there, outside every lock the daemon holds —
-/// and reports each block it finds as ONE `QuotaBlocked` event through
-/// [`ingest_event`], the same path, lock order and orchestrator notice a
-/// producer's report takes. The event is filed under the arming hook's session
-/// id, carries the registry agent, and is marked with
+/// and reports each failed turn it finds as ONE event through [`ingest_event`],
+/// the same path, lock order and orchestrator notice a producer's report takes:
+/// a `QuotaBlocked` for a usage limit, an `Error` for anything else. The event
+/// is filed under the arming hook's session id and carries the registry agent;
+/// a `QuotaBlocked` is also marked with
 /// [`crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY`] as the daemon's own.
 ///
 /// A poll with no armed tailer does no I/O at all. No internal shutdown signal —
@@ -1846,34 +1865,81 @@ async fn run_codex_rollout_monitor(
         for command in registry.codex_rollout_arms().drain() {
             tailers.apply(command);
         }
-        let blocks;
-        (tailers, blocks) = poll_codex_rollouts(&registry, tailers).await;
-        for block in blocks {
-            ingest_event(
-                &state,
-                &event_tx,
-                &registry,
-                codex_rollout_block_event(block),
-            )
-            .await;
+        let failures;
+        (tailers, failures) = poll_codex_rollouts(&registry, tailers).await;
+        for failure in failures {
+            report_codex_rollout_failure(&state, &event_tx, &registry, failure).await;
         }
     }
 }
 
+/// Issue #1359: report one failed turn a poll found — unless Codex has moved
+/// on to another turn since the poll began.
+///
+/// The poll runs on a blocking thread while the hook loop keeps going, so the
+/// agent's next `UserPromptSubmit` can put the card on Thinking before this
+/// failure is ingested, and the older turn's `Error` (or `QuotaBlocked`) would
+/// then repaint the newer turn's card (Qodo and Greptile on PR #1375). The hook
+/// loop queues that prompt's arm before it applies the prompt, and nothing
+/// drains the queue until the next tick, so a newer arm still queued when the
+/// `AppState` write lock is held is the proof: the failure is dropped. A
+/// prompt that has not reached the queue by then has not reached the card
+/// either, and lands after the failure.
+async fn report_codex_rollout_failure(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    failure: crate::codex_rollout_tail::CodexTurnFailure,
+) {
+    use crate::quota_signals::FailureOutcome;
+    let pane_id = failure.pane_id.clone();
+    let agent_id = failure.agent_id.clone();
+    let turn_id = failure.turn_id.clone();
+    let outcome = failure.outcome.clone();
+    let event = codex_rollout_failure_event(failure);
+    let superseded = || {
+        registry
+            .codex_rollout_arms()
+            .supersedes(&agent_id, &turn_id)
+    };
+    if !ingest_event_unless(state, event_tx, registry, event, superseded).await {
+        tracing::debug!(
+            agent_id = %escape_id_for_log(&agent_id),
+            "codex rollout: dropped a failed turn that a newer turn superseded"
+        );
+        return;
+    }
+    // Logged only once the card really changed, so a dropped stale failure
+    // never reads as a status change (Qodo on PR #1375).
+    match outcome {
+        FailureOutcome::Blocked { kind, .. } => warn!(
+            pane_id = %escape_id_for_log(&pane_id),
+            agent_id = %escape_id_for_log(&agent_id),
+            kind = kind.as_wire(),
+            "quota: the Codex session log records a usage-limit failure; marked Blocked"
+        ),
+        FailureOutcome::Error => warn!(
+            pane_id = %escape_id_for_log(&pane_id),
+            agent_id = %escape_id_for_log(&agent_id),
+            "the Codex session log records a failed turn; marked Error"
+        ),
+    }
+}
+
 /// Issue #714: one poll of `tailers` on a blocking thread, handing the set back
-/// with the blocks found. A poll that panicked loses the set rather than the
+/// with the failed turns found. A poll that panicked loses the set rather than the
 /// monitor: every agent's next Codex prompt arms afresh.
 async fn poll_codex_rollouts(
     registry: &Arc<AgentPtyRegistry>,
     mut tailers: crate::codex_rollout_tail::CodexRolloutTailers,
 ) -> (
     crate::codex_rollout_tail::CodexRolloutTailers,
-    Vec<crate::codex_rollout_tail::CodexBlock>,
+    Vec<crate::codex_rollout_tail::CodexTurnFailure>,
 ) {
     let registry = Arc::clone(registry);
     tokio::task::spawn_blocking(move || {
-        let blocks = tailers.tick(|pane_id, agent_id| registry.is_live_owner(pane_id, agent_id));
-        (tailers, blocks)
+        let failures = tailers.tick(|pane_id, agent_id| registry.is_live_owner(pane_id, agent_id));
+        (tailers, failures)
     })
     .await
     .unwrap_or_else(|e| {
@@ -1882,52 +1948,56 @@ async fn poll_codex_rollouts(
     })
 }
 
-/// Issue #714: the `QuotaBlocked` event the daemon reports for a block read
-/// from a Codex rollout.
-fn codex_rollout_block_event(block: crate::codex_rollout_tail::CodexBlock) -> AgentEvent {
+/// Issues #714 and #1359: the event the daemon reports for a failed turn read
+/// from a Codex rollout — `QuotaBlocked` for a usage limit, `Error` for any
+/// other failure. An `Error` carries no provider text, like the Claude Code
+/// `StopFailure` it gives parity with: the card shows the status, and the
+/// message stays in the rollout it came from.
+fn codex_rollout_failure_event(failure: crate::codex_rollout_tail::CodexTurnFailure) -> AgentEvent {
     use crate::quota_block::{
         QUOTA_BLOCKED_DETAIL_METADATA_KEY, QUOTA_BLOCKED_KIND_METADATA_KEY,
         QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, QUOTA_BLOCKED_SOURCE_CODEX_ROLLOUT,
         QUOTA_BLOCKED_SOURCE_METADATA_KEY,
     };
+    use crate::quota_signals::FailureOutcome;
     let now = chrono::Utc::now();
     let mut metadata = std::collections::HashMap::new();
-    metadata.insert(
-        QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
-        block.kind.as_wire().to_string(),
-    );
-    if let Some(at) = block.resets_at_ms {
-        metadata.insert(
-            QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY.to_string(),
-            at.to_string(),
-        );
-    }
-    if let Some(message) = block.message {
-        metadata.insert(QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(), message);
-    }
-    normalize_quota_blocked_metadata(&mut metadata, now.timestamp_millis());
-    metadata.insert(
-        QUOTA_BLOCKED_SOURCE_METADATA_KEY.to_string(),
-        QUOTA_BLOCKED_SOURCE_CODEX_ROLLOUT.to_string(),
-    );
-    warn!(
-        pane_id = %escape_id_for_log(&block.pane_id),
-        agent_id = %escape_id_for_log(&block.agent_id),
-        kind = block.kind.as_wire(),
-        "quota: the Codex session log records a usage-limit failure; marked Blocked"
-    );
+    let event_type = match failure.outcome {
+        FailureOutcome::Blocked { kind, resets_at_ms } => {
+            metadata.insert(
+                QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
+                kind.as_wire().to_string(),
+            );
+            if let Some(at) = resets_at_ms {
+                metadata.insert(
+                    QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY.to_string(),
+                    at.to_string(),
+                );
+            }
+            if let Some(message) = failure.message {
+                metadata.insert(QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(), message);
+            }
+            normalize_quota_blocked_metadata(&mut metadata, now.timestamp_millis());
+            metadata.insert(
+                QUOTA_BLOCKED_SOURCE_METADATA_KEY.to_string(),
+                QUOTA_BLOCKED_SOURCE_CODEX_ROLLOUT.to_string(),
+            );
+            crate::event::EventType::QuotaBlocked
+        }
+        FailureOutcome::Error => crate::event::EventType::Error,
+    };
     AgentEvent {
-        session_id: block.session_id,
+        session_id: failure.session_id,
         agent_type: crate::event::AgentType::Codex,
-        event_type: crate::event::EventType::QuotaBlocked,
+        event_type,
         tool_name: None,
         tool_detail: None,
         cwd: None,
         timestamp: now,
         user_prompt: None,
         metadata,
-        pane_id: Some(block.pane_id),
-        agent_id: Some(block.agent_id),
+        pane_id: Some(failure.pane_id),
+        agent_id: Some(failure.agent_id),
         agent_version: None,
         schema_version: None,
         live_target: None,
@@ -3996,6 +4066,66 @@ mod quota_admission_tests {
         assert_eq!(subagent.metadata.len(), 2, "{:?}", subagent.metadata);
         assert!(subagent.is_from_subagent());
     }
+
+    /// Issue #1359: a failed Codex turn read from the rollout becomes one
+    /// event for the card — `QuotaBlocked`, marked as the daemon's own, for a
+    /// usage limit, and `Error`, with no quota metadata and no provider text,
+    /// for any other failure — and each paints the card it names.
+    #[test]
+    fn codex_rollout_failures_report_blocked_or_error() {
+        use crate::codex_rollout_tail::CodexTurnFailure;
+        use crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY;
+        use crate::quota_signals::FailureOutcome;
+        let failure = |outcome| CodexTurnFailure {
+            pane_id: "pane-1".to_string(),
+            agent_id: "agent-1".to_string(),
+            session_id: "s".to_string(),
+            turn_id: "t1".to_string(),
+            outcome,
+            message: Some("provider text".to_string()),
+        };
+        let mut state = crate::state::AppState::default();
+        state.register_pane("pane-1".to_string());
+        state.apply_event(AgentEvent {
+            agent_type: AgentType::Codex,
+            agent_id: Some("agent-1".to_string()),
+            ..quota_frame(crate::event::EventType::Thinking)
+        });
+        assert_eq!(
+            state.sessions["s"].status,
+            crate::state::SessionStatus::Thinking
+        );
+
+        let error = codex_rollout_failure_event(failure(FailureOutcome::Error));
+        assert_eq!(error.event_type, crate::event::EventType::Error);
+        assert_eq!(error.agent_type, AgentType::Codex);
+        assert_eq!(error.session_id, "s");
+        assert_eq!(error.pane_id.as_deref(), Some("pane-1"));
+        assert_eq!(error.agent_id.as_deref(), Some("agent-1"));
+        assert!(error.metadata.is_empty(), "{:?}", error.metadata);
+        assert!(error.tool_detail.is_none());
+        state.apply_event(error);
+        assert_eq!(
+            state.sessions["s"].status,
+            crate::state::SessionStatus::Error
+        );
+
+        let block = codex_rollout_failure_event(failure(FailureOutcome::Blocked {
+            kind: crate::quota_block::BlockedKind::CreditsDepleted,
+            resets_at_ms: None,
+        }));
+        assert_eq!(block.event_type, crate::event::EventType::QuotaBlocked);
+        assert!(
+            block
+                .metadata
+                .contains_key(QUOTA_BLOCKED_SOURCE_METADATA_KEY)
+        );
+        state.apply_event(block);
+        assert_eq!(
+            state.sessions["s"].status,
+            crate::state::SessionStatus::Blocked
+        );
+    }
 }
 
 // PRD #42 M2/review: these tests bind a real Unix socket, chmod it via
@@ -4066,6 +4196,92 @@ mod hook_ingestion_tests {
                 if req.turn_id.as_deref() == Some("t1") && turn_id == "t1"),
             "{queued:?}"
         );
+        registry.shutdown_all();
+    }
+
+    /// Issue #1359 (Qodo on PR #1375): a poll that found turn `t1`'s failure
+    /// can finish after Codex's next `UserPromptSubmit` has put the card on
+    /// Thinking. That failure is stale and must not repaint the card. The hook
+    /// loop queues a prompt's arm before it applies the prompt, so the newer
+    /// arm is still in the queue when the failure is reported. A re-arm of the
+    /// same turn does not supersede it, and with no newer arm it is an Error.
+    #[tokio::test]
+    async fn a_codex_failure_superseded_by_a_newer_turn_does_not_repaint_the_card() {
+        use crate::codex_rollout_tail::{
+            CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY, CodexTurnFailure,
+        };
+        use crate::quota_signals::FailureOutcome;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let owner = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "codex-race".to_string(),
+                )]),
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane("codex-race".to_string());
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let prompt = |turn: &str| {
+            let mut event =
+                super::quota_admission_tests::quota_frame(crate::event::EventType::Thinking);
+            event.agent_type = AgentType::Codex;
+            event.pane_id = Some("codex-race".to_string());
+            event.agent_id = Some(owner.clone());
+            event.metadata.insert(
+                CODEX_TRANSCRIPT_PATH_METADATA_KEY.to_string(),
+                "/x/rollout-a.jsonl".to_string(),
+            );
+            event
+                .metadata
+                .insert(CODEX_TURN_ID_METADATA_KEY.to_string(), turn.to_string());
+            event
+        };
+        // The hook loop's order for a prompt: queue its arm, then apply it.
+        let submit = |turn: &'static str| {
+            let event = prompt(turn);
+            queue_codex_rollout_arm(&registry, &event);
+            ingest_event(&state, &event_tx, &registry, event)
+        };
+        let failure = || CodexTurnFailure {
+            pane_id: "codex-race".to_string(),
+            agent_id: owner.clone(),
+            session_id: "s".to_string(),
+            turn_id: "t1".to_string(),
+            outcome: FailureOutcome::Error,
+            message: None,
+        };
+        let status = || async { state.read().await.sessions["s"].status.clone() };
+
+        // Turn t1 is armed and the monitor has drained it; a poll finds its
+        // failure while turn t2 is submitted.
+        submit("t1").await;
+        registry.codex_rollout_arms().drain();
+        submit("t2").await;
+        report_codex_rollout_failure(&state, &event_tx, &registry, failure()).await;
+        assert_eq!(
+            status().await,
+            crate::state::SessionStatus::Thinking,
+            "the older turn's failure repainted the newer turn's card"
+        );
+
+        // A re-arm of the same turn does not supersede its own failure.
+        registry.codex_rollout_arms().drain();
+        submit("t1").await;
+        report_codex_rollout_failure(&state, &event_tx, &registry, failure()).await;
+        assert_eq!(status().await, crate::state::SessionStatus::Error);
+
+        // Control: nothing newer queued, so the failure is reported.
+        registry.codex_rollout_arms().drain();
+        submit("t1").await;
+        registry.codex_rollout_arms().drain();
+        report_codex_rollout_failure(&state, &event_tx, &registry, failure()).await;
+        assert_eq!(status().await, crate::state::SessionStatus::Error);
         registry.shutdown_all();
     }
 
