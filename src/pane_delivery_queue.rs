@@ -21,9 +21,16 @@
 //! deliveries still run concurrently, so one pane's draft delays nothing
 //! written anywhere else.
 //!
+//! A delivery that panics does not take the rest of its pane's queue with it:
+//! the drain task runs each delivery as a task of its own and awaits it, so
+//! the panic ends only that delivery — logged as a warning naming the pane,
+//! never its payload — and the task moves on to the next one in order. Its
+//! slot against the bound below is released either way.
+//!
 //! The bound is on deliveries pending across all panes,
-//! [`MAX_PENDING_PANE_DELIVERIES`], and therefore on drain tasks too (a task
-//! exists only for a pane with at least one pending delivery). At the bound
+//! [`MAX_PENDING_PANE_DELIVERIES`], and therefore on tasks too: a drain task
+//! exists only for a pane with at least one pending delivery, and runs at most
+//! one delivery task at a time. At the bound
 //! the enqueuing hook connection WAITS for a slot, holding its connection
 //! permit — backpressure onto new hook connections, never a dropped delivery.
 //! It is logged once per episode, an episode being a stretch during which at
@@ -49,7 +56,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 pub const MAX_PENDING_PANE_DELIVERIES: usize = 256;
 
 /// One queued delivery: a future that performs the write and logs its own
-/// outcome. Inert until the pane's drain task polls it.
+/// outcome. Inert until the pane's drain task spawns it.
 pub type PaneDelivery = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 type Queued = (PaneDelivery, OwnedSemaphorePermit);
@@ -126,10 +133,19 @@ impl PaneDeliveryQueues {
         if let Some(tx) = queues.get(pane_id) {
             match tx.send(queued) {
                 Ok(()) => return,
-                // The drain task is gone without removing its queue: a panic
-                // inside a delivery, or the runtime cancelling the task at
-                // shutdown. Start a fresh one.
-                Err(mpsc::error::SendError(returned)) => queued = returned,
+                // The drain task is gone without removing its queue. A
+                // delivery's panic no longer ends it (`drain` runs each one as
+                // a task of its own), so this is expected only when the
+                // runtime cancels it at shutdown — taking whatever was still
+                // queued with it. Start a fresh queue for this one.
+                Err(mpsc::error::SendError(returned)) => {
+                    tracing::warn!(
+                        pane_id = %pane_id,
+                        "a hook-loop pane delivery queue lost its drain task (runtime shutdown?); \
+                         deliveries still queued for this pane may have been dropped"
+                    );
+                    queued = returned;
+                }
             }
         }
         let (tx, rx) = mpsc::unbounded_channel();
@@ -155,10 +171,25 @@ impl PaneDeliveryQueues {
                     }
                 }
             };
-            let Some((delivery, _permit)) = next else {
+            let Some((delivery, permit)) = next else {
                 return;
             };
-            delivery.await;
+            // Run as a task of its own, so a panic inside one delivery —
+            // while polling it or while dropping it — ends that task and not
+            // this one, which would drop every delivery still queued behind
+            // it. Awaiting it keeps the pane's order and holds the slot until
+            // it is done. The panic payload may carry report text, so it is
+            // not logged.
+            if let Err(error) = tokio::spawn(delivery).await
+                && error.is_panic()
+            {
+                tracing::warn!(
+                    pane_id = %pane_id,
+                    "a hook-loop pane delivery panicked, so it may not have been written; the \
+                     deliveries queued behind it still run"
+                );
+            }
+            drop(permit);
         }
     }
 
@@ -289,6 +320,51 @@ mod tests {
         assert!(
             d_first,
             "a waiter after every earlier one finished starts a new episode"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_delivery_does_not_lose_the_ones_queued_behind_it_or_after_it() {
+        let capacity = 8;
+        let queues = PaneDeliveryQueues::with_capacity(capacity);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        // Held, so the panicking delivery and the two behind it are all
+        // queued before the drain task reaches any of them.
+        let (first, release_first) = held(&log, "first");
+        queues.enqueue("orch", first).await;
+        queues
+            .enqueue(
+                "orch",
+                Box::pin(async { panic!("a delivery panicked (test)") }),
+            )
+            .await;
+        queues.enqueue("orch", recording(&log, "second")).await;
+        queues.enqueue("orch", recording(&log, "third")).await;
+        release_first.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while queues.queued_panes() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the queue drained past the panic and was removed");
+        queues.enqueue("orch", recording(&log, "later")).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while queues.queued_panes() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the later delivery's queue drained");
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["first", "second", "third", "later"],
+            "a panicking delivery lost deliveries queued for the same pane"
+        );
+        assert_eq!(
+            queues.pending.available_permits(),
+            capacity,
+            "a slot was not released across the panic"
         );
     }
 
