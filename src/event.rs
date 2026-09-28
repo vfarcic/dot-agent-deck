@@ -719,6 +719,37 @@ pub const WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY: &str = "wrapper_output_classif
 /// The [`WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`] value.
 pub const WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE: &str = "1";
 
+/// Issue #559: `AgentEvent.metadata` key `dot-agent-deck wrap` stamps on EVERY
+/// event it emits — the fork-time and interface `SessionStart`s, each classified
+/// line, the exit-time `Idle`/`Error` — when it knows the wrapped agent's own
+/// submitted-prompt channel is not wired (value
+/// [`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE`]).
+///
+/// The wrapper never reports a submitted prompt itself: its emitter hardcodes
+/// `user_prompt: None`. A wrapped Codex pane's prompt reports come from Codex's
+/// NATIVE `UserPromptSubmit` hook, which runs only once the wrapper has recorded
+/// trust for it (`crate::wrap`'s `codex_spawn_prep`). That step is best-effort,
+/// and it fails on an ordinary launcher configuration — `codex` reachable only
+/// inside `devbox run codex-big`, so the wrapper's own `codex app-server` is
+/// `NotFound`. The pane's only producer is then the wrapper, whose events still
+/// declare `AgentType::Codex`, and a type-derived capability answer arms
+/// re-submission against a channel that can never confirm: a prompt that WAS
+/// delivered is typed in again.
+///
+/// Read by [`AgentEvent::reports_submitted_prompt`] and by
+/// [`crate::state::SessionState::prompt_reports_unavailable`], and it can only
+/// REMOVE standing. Any value counts, so a forged or garbled key makes an event
+/// count for less, never for more — the worst a forgery does is make a pane
+/// write its automatic prompt once instead of retrying it. It is not, and must
+/// not be treated as, an authentication marker: its ABSENCE proves nothing, and
+/// an event without it is answered from its type exactly as before.
+pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY: &str =
+    "wrapper_prompt_reports_unavailable";
+
+/// The [`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`] value the wrapper
+/// writes. Readers accept any value; see the key's docs.
+pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE: &str = "1";
+
 /// Issue #1354: the [`AgentEvent::metadata`] key naming the SUBAGENT an event
 /// came from, when the agent's hook payload says it came from one.
 ///
@@ -1040,6 +1071,29 @@ impl AgentEvent {
         self.metadata
             .get(WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY)
             .is_some_and(|v| v == WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE)
+    }
+
+    /// Issue #559: did this event's producer declare that no submitted-prompt
+    /// report will come from it (see
+    /// [`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`])? Presence of the
+    /// key, whatever its value, because the answer can only withdraw standing.
+    pub fn declares_prompt_reports_unavailable(&self) -> bool {
+        self.metadata
+            .contains_key(WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY)
+    }
+
+    /// Issue #559: can the producer of THIS event report a submitted prompt —
+    /// [`crate::prompt_delivery::agent_reports_submitted_prompt`] for its
+    /// declared type, withdrawn when the event itself declares that it cannot
+    /// ([`Self::declares_prompt_reports_unavailable`]).
+    ///
+    /// Every daemon-side capability read goes through this rather than through
+    /// the type, because the type is what a wrapper declares on behalf of the
+    /// agent it hosts and says nothing about whether that agent's reporting
+    /// channel exists.
+    pub fn reports_submitted_prompt(&self) -> bool {
+        crate::prompt_delivery::agent_reports_submitted_prompt(&self.agent_type)
+            && !self.declares_prompt_reports_unavailable()
     }
 
     /// Issue #424 D4: was this event SYNTHESIZED BY THE DAEMON rather than

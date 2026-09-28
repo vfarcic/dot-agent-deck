@@ -1554,11 +1554,21 @@ async fn deliver(
     // producer assertions wherever they appear, so an unmarked start arriving
     // afterwards would otherwise arm the full replacement payload, and the blind
     // submit CRs after it, against a pane that may be a shell.
-    let can_report_prompts = observed
-        .observed_producer
-        .as_ref()
-        .is_some_and(crate::prompt_delivery::agent_reports_submitted_prompt)
-        || drained_capability;
+    //
+    // Issue #559: `observed_producer_reports`, not the producer's type. For a
+    // wrapped Codex the gate is released by the WRAPPER's interface fact, whose
+    // type is Codex whether or not Codex's native prompt hook was trusted; the
+    // wrapper says which on the event, and only that says whether a report can
+    // ever come.
+    let can_report_prompts = observed.observed_producer_reports || drained_capability;
+    tracing::debug!(
+        pane_id,
+        observed_producer = ?observed.observed_producer,
+        observed_producer_reports = observed.observed_producer_reports,
+        drained_capability,
+        can_report_prompts,
+        "scheduled spawn: whether an unconfirmed write may be re-submitted"
+    );
     // Issue #424 F4: the launcher handoff is STANDING, not capability, so it is
     // recorded rather than folded into the answer above. Arming here instead
     // would put the one replacement payload on the retry schedule's clock —
@@ -1748,7 +1758,8 @@ fn drain_pre_write_events(
                     None => continue,
                     Some(_) => {}
                 }
-                if crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type) {
+                // Issue #559: the event's own answer, not its type's.
+                if event.reports_submitted_prompt() {
                     *can_report_prompts = true;
                 }
                 // Issue #666, facts G ∧ I ∧ W for the GAP call. Identity is
@@ -4149,7 +4160,58 @@ mod tests {
         assert_eq!(declared, AgentType::ClaudeCode);
     }
 
-    /// Scenario: Hold detached spawn prompts in confirmation backoff while their target or evidence disappears, and verify every terminal, cancelled, or unauthenticated-capability watch finishes without stale retry bytes. Then vary deck-spawn standing and its trusted producer type, launcher-handoff standing, the event-declared producer type, attempt count, and generation replay around a genuine post-write start: only cases whose trusted and declared types both establish a pre-prompt Claude start may carry one additional payload, while controls receive bare submit probes or stop terminally.
+    /// Issue #559: the drain — pre-write in `deliver`, and in the gap before
+    /// each retry — reads a frame's capability from the frame, so a wrapper
+    /// that declared its Codex's native prompt hook untrusted contributes none,
+    /// while the same frame without the declaration still does (the control).
+    #[test]
+    fn a_drained_wrapper_frame_declaring_no_prompt_reports_is_not_capability() {
+        const PANE_ID: &str = "drain-559-pane";
+        const AGENT_ID: &str = "drain-559-agent";
+
+        for marked in [false, true] {
+            let (tx, mut rx) = broadcast::channel(8);
+            let mut event = typed_prompt_watch_event(
+                PANE_ID,
+                AGENT_ID,
+                &format!("{PANE_ID}-session"),
+                EventType::Thinking,
+                AgentType::Codex,
+                false,
+            );
+            event.metadata.insert(
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
+            );
+            if marked {
+                event.metadata.insert(
+                    crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY.to_string(),
+                    crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE.to_string(),
+                );
+            }
+            let _ = tx.send(BroadcastMsg::Event(event));
+            let mut generation = None;
+            let mut capability = false;
+            let mut agent_start = None;
+            assert_eq!(
+                drain_pre_write_events(
+                    &mut rx,
+                    PANE_ID,
+                    AGENT_ID,
+                    &mut generation,
+                    &mut capability,
+                    &mut agent_start,
+                ),
+                None
+            );
+            assert_eq!(
+                capability, !marked,
+                "marked={marked}: a drained frame's capability is the frame's own answer"
+            );
+        }
+    }
+
+    /// Scenario: Hold detached spawn prompts in confirmation backoff while their target or evidence disappears, and verify every terminal, cancelled, or unauthenticated-capability watch finishes without stale retry bytes; a deck-spawned Codex pane whose only post-write producer is a `wrap` that declared Codex's native prompt hook untrusted is never retyped, while its undeclared twin is (issue #559). Then vary deck-spawn standing and its trusted producer type, launcher-handoff standing, the event-declared producer type, attempt count, and generation replay around a genuine post-write start: only cases whose trusted and declared types both establish a pre-prompt Claude start may carry one additional payload, while controls receive bare submit probes or stop terminally.
     #[spec("scheduler/dispatch/016")]
     #[serial_test::serial(prompt_confirmation_tasks)]
     #[tokio::test]
@@ -4543,6 +4605,99 @@ mod tests {
                 .any(|window| window == SPAWNED_PROMPT.as_bytes()),
             "a producer identifying itself after the write must still arm the retry on a pane the deck spawned as a reporting agent, or the dispatch prompt is written and never submitted (#570); output={:?}",
             String::from_utf8_lossy(&spawned_output)
+        );
+
+        // Issue #559: the same deck-spawned standing, for a pane the deck
+        // spawned as CODEX, whose only post-write producer is `wrap` — its
+        // interface-ready start and one classified line, under the wrapper's
+        // own session, exactly as `crate::wrap`'s emitter sends them. Unmarked
+        // is a wrapped Codex whose native hooks were trusted: before its first
+        // submit the wrapper is its only producer too, and it must keep the
+        // #570 retry (the control). Marked is the wrapper declaring that trust
+        // could NOT be recorded, so no report of a submission can be counted
+        // on: retyping there can type a delivered task in a second time.
+        let wrapper_only_retry_lands = |prompt_reports_unavailable: bool| async move {
+            let pane_id = format!("wrapper-only-codex-{prompt_reports_unavailable}");
+            let prompt = format!("WRAPPER-ONLY-CODEX-RETRY-{prompt_reports_unavailable}");
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let agent_id = spawn_typed_byte_target(&registry, &pane_id, Some(AgentType::Codex));
+            let (tx, rx) = broadcast::channel(8);
+            let confirmation = tokio::spawn(confirm_prompt_delivery(
+                registry.clone(),
+                rx,
+                ConfirmationTask {
+                    pane_id: pane_id.clone(),
+                    agent_id: agent_id.clone(),
+                    prompt: prompt.clone(),
+                    delivery_id: format!("wrapper-only-codex-{prompt_reports_unavailable}"),
+                    generation: None,
+                    can_report_prompts: false,
+                    confirmation_floor: Duration::ZERO,
+                    deadline: Instant::now() + Duration::from_secs(3),
+                },
+            ));
+            for (event_type, key, value) in [
+                (
+                    EventType::SessionStart,
+                    crate::event::SESSION_START_ORIGIN_METADATA_KEY,
+                    crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN,
+                ),
+                (
+                    EventType::Thinking,
+                    crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY,
+                    crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE,
+                ),
+            ] {
+                let mut event = typed_prompt_watch_event(
+                    &pane_id,
+                    &agent_id,
+                    &format!("{pane_id}-session"),
+                    event_type,
+                    AgentType::Codex,
+                    false,
+                );
+                event.metadata.insert(key.to_string(), value.to_string());
+                if prompt_reports_unavailable {
+                    event.metadata.insert(
+                        crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY.to_string(),
+                        crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE.to_string(),
+                    );
+                }
+                tx.send(BroadcastMsg::Event(event))
+                    .expect("send wrapper-only producer event");
+            }
+            // The control waits for the retry's own echo (issue #892) rather
+            // than betting a fixed interval on it; the declared case can only
+            // observe an absence, so its sleep IS the observation — the first
+            // window is 500 ms (floor zero), so a retry that is going to land
+            // has landed by 750 ms, the forged twin's reasoning above.
+            let output = if prompt_reports_unavailable {
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                registry.snapshot(&agent_id).expect("wrapper-only snapshot")
+            } else {
+                wait_for_detached_payload_echo(&registry, &agent_id, &prompt).await
+            };
+            confirmation.abort();
+            let _ = confirmation.await;
+            drop(tx);
+            registry.shutdown_all();
+            (payload_echoes(&output, &prompt) > 0, output)
+        };
+        let (control_retried, control_output) = wrapper_only_retry_lands(false).await;
+        assert!(
+            control_retried,
+            "control: a deck-spawned wrapped Codex pane whose wrapper declares nothing must keep \
+             the #570 retry — reading 'only the wrapper has spoken' as 'cannot report' would \
+             take it from every healthy Codex pane; output={:?}",
+            String::from_utf8_lossy(&control_output)
+        );
+        let (degraded_retried, degraded_output) = wrapper_only_retry_lands(true).await;
+        assert!(
+            !degraded_retried,
+            "a deck-spawned Codex pane whose only producer is a wrapper that declared Codex's \
+             native prompt hook untrusted was retyped — a task that WAS delivered is submitted a \
+             second time, and nothing on that pane can ever confirm it (issue #559); output={:?}",
+            String::from_utf8_lossy(&degraded_output)
         );
 
         // Issue #666, cases A-H. These run concurrently so the real PTY and

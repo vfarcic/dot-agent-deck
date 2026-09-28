@@ -1529,3 +1529,145 @@ fn codex_hooks_011_a_trailing_surplus_handler_is_still_swept() {
         "the user's handler keeps handler_idx 1: {rules:?}"
     );
 }
+
+/// Run the real wrapper around `program` inside a deck-managed pane (a pane id
+/// is set, so the trust step runs), with `path` as its WHOLE `$PATH` and a real
+/// hook socket collecting every event it emits.
+///
+/// `path` is the variable issue #559 turns on: the trust step shells a bare
+/// `codex app-server` resolved against the WRAPPER's `$PATH`, so a `codex` that
+/// exists only inside the launcher (`devbox run codex-big`) is `NotFound` there.
+/// Everything else is [`run_wrapped_program`]'s isolation — a seeded durable
+/// deck in `deck_home`, a pinned `CODEX_HOME` — for the same reasons.
+fn run_wrapped_program_collecting_events(
+    program: &std::path::Path,
+    codex_home: &std::path::Path,
+    fixture_dir: &std::path::Path,
+    deck_home: &std::path::Path,
+    hook_response: &str,
+    path: &str,
+) -> (Output, Vec<dot_agent_deck::event::AgentEvent>) {
+    use std::io::Read as _;
+
+    let socket = fixture_dir.join("hook.sock");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket).expect("bind wrapper event socket");
+    let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["wrap", "--agent", "codex", "--"])
+        .arg(program)
+        .env("PATH", path)
+        .env("HOME", deck_home)
+        .env("CODEX_HOME", codex_home)
+        .env("CODEX_ARGS_RECORD", fixture_dir.join("args.txt"))
+        .env("CODEX_HOME_RECORD", fixture_dir.join("home.txt"))
+        .env("CODEX_HOOK_LIST_RESPONSE", hook_response)
+        .env("DOT_AGENT_DECK_PANE_ID", "codex-prompt-reports-pane")
+        .env("DOT_AGENT_DECK_AGENT_ID", "codex-prompt-reports-agent")
+        .env("DOT_AGENT_DECK_SOCKET", &socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run wrapper collecting its events");
+    // The pipe path sends every event synchronously before the wrapper exits,
+    // so each one is already a queued connection by now.
+    listener
+        .set_nonblocking(true)
+        .expect("make wrapper event listener nonblocking");
+    let mut events = Vec::new();
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("read the queued event blocking");
+                let mut json = String::new();
+                stream
+                    .read_to_string(&mut json)
+                    .expect("read wrapper event");
+                events.push(serde_json::from_str(json.trim()).expect("parse wrapper event"));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("accept wrapper event: {error}"),
+        }
+    }
+    (output, events)
+}
+
+/// Scenario: Run the real wrapper in a deck-managed pane twice around a Codex launcher script, collecting every event it emits. Once with a `codex` app-server stand-in on its PATH that lists the deck's hook, so trust is recorded; once with no `codex` on its PATH at all — a launcher like `devbox run codex-big` whose `codex` exists only inside it — so trust cannot be recorded. Only the second run may declare, on every event, that no submitted-prompt report will come from this pane.
+#[spec("codex/trust/005")]
+#[test]
+fn codex_trust_005_untrusted_hooks_are_declared_on_every_wrapper_event() {
+    use dot_agent_deck::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY;
+
+    for trust_reachable in [true, false] {
+        let fixture = test_temp::tempdir().expect("create wrapper fixture");
+        let home = test_temp::tempdir().expect("create Codex home");
+        let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+        let deck_command = expected_hook_command(
+            seed_durable_binary(deck_home.path())
+                .to_str()
+                .expect("durable path is UTF-8"),
+        );
+        let fake_codex = write_fake_codex(fixture.path());
+        let launcher = fixture.path().join("launcher.sh");
+        write_fake_program(&launcher);
+        let response = hook_list_response(vec![own_home_entry(&deck_command, 0, "sha256:deck")]);
+        let path = if trust_reachable {
+            fixture_path(fixture.path())
+        } else {
+            // The system directories only: no `codex` anywhere, as on a host
+            // where it is reachable solely through the launcher.
+            std::fs::remove_file(&fake_codex).expect("take codex off the wrapper's PATH");
+            "/usr/bin:/bin".to_string()
+        };
+
+        let (output, events) = run_wrapped_program_collecting_events(
+            &launcher,
+            home.path(),
+            fixture.path(),
+            deck_home.path(),
+            &response,
+            &path,
+        );
+
+        assert!(output.status.success(), "wrapper failed: {output:?}");
+        let trusted = home.path().join("config.toml").exists();
+        assert_eq!(
+            trusted,
+            trust_reachable,
+            "precondition (trust_reachable={trust_reachable}): the trust step {} have recorded \
+             anything; stderr={}",
+            if trust_reachable { "must" } else { "cannot" },
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            events.len() >= 2,
+            "expected at least the fork-time start and the exit-time event; events={events:?}"
+        );
+        let declaring: Vec<bool> = events
+            .iter()
+            .map(|event| {
+                event
+                    .metadata
+                    .contains_key(WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY)
+            })
+            .collect();
+        if trust_reachable {
+            assert!(
+                declaring.iter().all(|declared| !declared),
+                "a wrapper that recorded trust for Codex's hooks must declare nothing: Codex's \
+                 own UserPromptSubmit will report, and declaring otherwise would take every \
+                 healthy Codex pane's retry away; events={events:?}"
+            );
+        } else {
+            assert!(
+                declaring.iter().all(|declared| *declared),
+                "a wrapper that could not record trust must say so on EVERY event — the \
+                 fork-time start included, since it is the first thing the deck learns the pane \
+                 is Codex from — or the deck reads the pane as able to confirm a delivery and \
+                 types a delivered prompt in again (issue #559); events={events:?}"
+            );
+        }
+    }
+}

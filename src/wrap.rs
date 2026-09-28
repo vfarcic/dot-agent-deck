@@ -118,25 +118,41 @@ pub static GENERIC: RuleSet = RuleSet {
     idle_markers: &[],
 };
 
-/// PRD #20 M7 — the Codex (`codex exec --json`) rule set.
+/// The Codex rule set: every non-blank line is activity, and nothing else.
 ///
-/// Codex emits one compact JSON object per line on stdout (JSONL). Rather than
-/// wait for process-exit quiescence like the generic set, we key card state off
-/// the record's `type` discriminator: a `turn.completed` record ends the turn
-/// (Idle) while the process is still alive, an `error` record is a failure, and
-/// every other record (`turn.started`, `item.started` reasoning /
-/// `command_execution`, …) is active work via the generic non-blank fallback.
-/// Markers match the compact `"type":"…"` discriminator specifically so
-/// incidental occurrences of the word "error" inside reasoning/command text
-/// never flip the card. Selected by [`ruleset_for`] when the resolved agent is
-/// [`AgentType::Codex`]; no change to [`classify_line_with`] or the runtime.
+/// **It deliberately recognises no error and no idle line, and that is the
+/// whole of its content** (issue #540). What the wrapper spawns for Codex is
+/// the interactive `codex` TUI ([`wrap_launch_command`]), and that process
+/// paints ANSI redraws: issue #540's direct PTY captures of a 12 s idle boot and
+/// of a full submit-and-respond turn contained no `"type":…` JSON record at all. This set
+/// used to match the `"type":"error"` / `"type":"turn.completed"` markers of
+/// `codex exec --json` — a mode the deck never selects itself — so it read as a
+/// working classification path while matching nothing the pane's process ever
+/// printed, and every line fell through to `Working` exactly as it does now.
+///
+/// It is still its own set rather than [`GENERIC`], because [`GENERIC`]'s word
+/// markers would be WRONG here: the TUI redraws the conversation, so a reply or
+/// a command that merely mentions "error" would flip a working Codex card to
+/// `Error`. What a wrapped Codex card shows beyond "printed something" comes
+/// from elsewhere — tool, prompt, turn-end and error detail from Codex's native
+/// hooks (`crate::codex_hooks_manage`), a quota block from its rollout log
+/// (`crate::codex_rollout_tail`), and `Idle`/`Error` at process exit from this
+/// wrapper's reap loop. Matching the TUI's rendered text instead was rejected:
+/// it is fragile against reflow and redraw, and every such line would still
+/// only ever prove output, which is why the events it produces are marked
+/// (`crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`) and prove nothing
+/// about a submitted prompt (issue #559).
+///
+/// A user who configures `codex exec --json` as a pane command gets the same
+/// rules: its `turn.completed` / `error` records read as activity, and the card
+/// settles when the process exits, which for `exec` follows its final record.
 pub static CODEX: RuleSet = RuleSet {
-    error_markers: &["\"type\":\"error\""],
-    idle_markers: &["\"type\":\"turn.completed\""],
+    error_markers: &[],
+    idle_markers: &[],
 };
 
 /// Select the line-classification [`RuleSet`] for a resolved agent type. Codex
-/// gets its JSONL-aware [`CODEX`] rules; every other (or unknown) agent falls
+/// gets its activity-only [`CODEX`] rules; every other (or unknown) agent falls
 /// back to the agent-agnostic [`GENERIC`] rules. This is the M7 seam that keeps
 /// per-agent patterns as data — a new agent adds a `RuleSet` and an arm here,
 /// not new runtime control flow.
@@ -207,11 +223,10 @@ impl Detector {
         self.observe_detected(classify_line_with(line, self.rules))
     }
 
-    /// Debounce an already-classified event. The JSON-aware Codex path
-    /// ([`classify_codex_line`]) classifies the line itself and feeds the
-    /// result here so it shares the same one-event-per-state-change debouncing
-    /// as the generic substring path. `None` (blank / unclassifiable line)
-    /// never changes state.
+    /// Debounce an already-classified event, so a caller that classifies a line
+    /// itself shares the same one-event-per-state-change debouncing as
+    /// [`Self::observe`]. `None` (blank / unclassifiable line) never changes
+    /// state.
     pub fn observe_detected(&mut self, detected: Option<DetectedEvent>) -> Option<DetectedEvent> {
         let detected = detected?;
         if self.last == Some(detected) {
@@ -221,33 +236,6 @@ impl Detector {
             Some(detected)
         }
     }
-}
-
-/// PRD #20 finding #11: classify one line of Codex output. Codex emits JSONL
-/// (`codex exec --json` writes one compact JSON object per line) and the
-/// interactive `codex` TUI mixes JSON events with plain redraw text. Parse the
-/// top-level `type` discriminator with `serde_json` (robust to insignificant
-/// whitespace and field reordering, unlike a raw substring match), mapping:
-/// `turn.completed` → `Idle`, `turn.failed` / `error` → `Error`, and every
-/// other record (`turn.started`, `item.started` reasoning / command execution,
-/// …) → `Working`. A non-JSON line (the interactive channel's plain text)
-/// falls back to the substring [`CODEX`] rules, so bare `codex` still surfaces
-/// activity instead of staying stuck until process exit.
-pub fn classify_codex_line(line: &str) -> Option<DetectedEvent> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
-        && let Some(kind) = value.get("type").and_then(|t| t.as_str())
-    {
-        return Some(match kind {
-            "turn.completed" | "task.completed" => DetectedEvent::Idle,
-            "turn.failed" | "task.failed" | "error" => DetectedEvent::Error,
-            _ => DetectedEvent::Working,
-        });
-    }
-    classify_line_with(trimmed, &CODEX)
 }
 
 impl Default for Detector {
@@ -272,6 +260,12 @@ struct Emitter {
     /// — the session is `history-only`. Stamped on the card so a wrapped Codex
     /// pane renders view-only and refuses live input (M4).
     live_target: LiveTarget,
+    /// Issue #559: stamp
+    /// [`crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`] on every
+    /// event, because this wrapper could not get the hooks that would report a
+    /// submitted prompt trusted for the agent it hosts. Decided once, before the first emit, by
+    /// [`codex_spawn_prep`]; see [`CodexSpawnPrep::prompt_reports_unavailable`].
+    prompt_reports_unavailable: bool,
 }
 
 impl Emitter {
@@ -357,7 +351,20 @@ impl Emitter {
     /// Issue #243 audit F3: build the [`AgentEvent`] without sending it, so a
     /// caller that must not block on the daemon can do the (cheap, pure) build on
     /// its own thread and hand only the serialized line to a sender.
-    fn build_event(&self, event_type: EventType, metadata: HashMap<String, String>) -> AgentEvent {
+    fn build_event(
+        &self,
+        event_type: EventType,
+        mut metadata: HashMap<String, String>,
+    ) -> AgentEvent {
+        // Issue #559: here, the one funnel every emit shares, so no event this
+        // wrapper sends — the fork-time start included, which is what surfaces
+        // the card before anything else — can reach the deck without it.
+        if self.prompt_reports_unavailable {
+            metadata.insert(
+                crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE.to_string(),
+            );
+        }
         AgentEvent {
             session_id: self.session_id.clone(),
             agent_type: self.agent_type.clone(),
@@ -807,6 +814,30 @@ struct CodexSpawnPrep {
     /// `CODEX_HOME` to set explicitly on the spawned child's environment (finding
     /// #2). `None` when this invocation installs no Codex hooks / resolves no home.
     pinned_home: Option<std::path::PathBuf>,
+    /// Issue #559: this wrapper hosts a Codex whose native hooks it could not get
+    /// TRUSTED in this spawn, so no submitted-prompt report can be counted on —
+    /// Codex runs none of the deck's hooks until they are trusted, and
+    /// `UserPromptSubmit` is one of them. The wrapper's own
+    /// events cannot stand in: they never carry a prompt. Every event is then
+    /// marked ([`Emitter::prompt_reports_unavailable`]) so the deck stops reading
+    /// "this pane is Codex" as "this pane can confirm a delivery".
+    ///
+    /// `true` for a Codex identity whenever the trust step did not record at
+    /// least one deck hook: the step was skipped (no pane and a non-`codex`
+    /// program), the install produced nothing to trust, `codex app-server` could
+    /// not be run — the ordinary `devbox run codex-big` host, where `codex`
+    /// exists only inside the launcher — or it recorded nothing.
+    ///
+    /// **It reports what THIS spawn could establish, and can be wrong in the
+    /// safe direction.** A trust record an earlier `hooks install` wrote from a
+    /// shell that could reach `codex` still makes Codex run the hooks, and this
+    /// spawn cannot see that without the very app-server it failed to reach. The
+    /// cost of that case is a delivery that is written once and not retried —
+    /// the pre-#548 behaviour — rather than one retyped into a pane that took it. `false` for every
+    /// other identity: the wrapper installs nothing for them and so knows
+    /// nothing about their channels, and the deck keeps answering those from
+    /// the type as it always has.
+    prompt_reports_unavailable: bool,
 }
 
 /// PRD #20 W1 spawn wiring. Decides, for this wrap invocation, whether to install
@@ -852,6 +883,7 @@ fn codex_spawn_prep(
     // path it installed with, and that value is what reaches the trust write
     // below (issue #730).
     let mut installed_binary = None;
+    let mut deck_hooks_trusted = false;
     let pinned_home = if installs_hooks {
         installed_binary = crate::codex_hooks_manage::auto_install();
         crate::codex_hooks_manage::active_codex_home()
@@ -878,22 +910,29 @@ fn codex_spawn_prep(
             // the only thing that would have refuted it was logged below the
             // level anyone runs. One line per Codex spawn, on a path that
             // already writes one when it fails.
-            Ok(outcome) if outcome.trusted() > 0 => tracing::info!(
-                count = outcome.trusted(),
-                "codex: recorded scoped trust for deck hooks"
-            ),
+            Ok(outcome) if outcome.trusted() > 0 => {
+                deck_hooks_trusted = true;
+                tracing::info!(
+                    count = outcome.trusted(),
+                    "codex: recorded scoped trust for deck hooks"
+                )
+            }
             Ok(outcome) => tracing::debug!(
                 count = outcome.trusted(),
                 "codex: recorded scoped trust for deck hooks"
             ),
             Err(e) => tracing::warn!(
                 "codex: could not record scoped hook trust ({e}); deck events degrade to stdout \
-                 classification"
+                 classification, and this pane's automatic prompts are written once and not \
+                 retried, since the deck cannot tell whether one arrived"
             ),
         }
     }
 
-    CodexSpawnPrep { pinned_home }
+    CodexSpawnPrep {
+        pinned_home,
+        prompt_reports_unavailable: codex_identity && !deck_hooks_trusted,
+    }
 }
 
 /// PRD #20 R20-002: the last catchable termination signal delivered to the
@@ -2033,18 +2072,9 @@ impl<W: Write> Write for ActivityWriter<W> {
 /// resulting card event, if the state changed. Shared by every wrap tee (the PTY
 /// master pump and the redirected-descriptor pipe pumps) so one coherent session
 /// state drives the card.
-fn classify_and_emit(
-    line: &str,
-    detector: &Arc<Mutex<Detector>>,
-    emitter: &Emitter,
-    is_codex: bool,
-) {
+fn classify_and_emit(line: &str, detector: &Arc<Mutex<Detector>>, emitter: &Emitter) {
     let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
-    let ev = if is_codex {
-        det.observe_detected(classify_codex_line(line))
-    } else {
-        det.observe(line)
-    };
+    let ev = det.observe(line);
     drop(det);
     if let Some(ev) = ev {
         // Issue #714: marked, because this classifier calls every printed line
@@ -2141,15 +2171,6 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
         }
     };
 
-    let emitter = Arc::new(Emitter {
-        agent_type,
-        session_id,
-        pane_id,
-        agent_id,
-        cwd,
-        live_target,
-    });
-
     // PRD #20 W1: install the deck's native Codex hooks into the active
     // CODEX_HOME (for a `codex` program OR a deck-spawned Codex-identity launcher)
     // and record SCOPED, hash-pinned trust for exactly those hooks so Codex runs
@@ -2158,8 +2179,22 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     // PRD #20 Greptile finding #2: the returned `pinned_home` is set explicitly
     // on the spawned child so the home the deck installed into and trusted is
     // exactly the home Codex loads.
-    let CodexSpawnPrep { pinned_home } =
-        codex_spawn_prep(program, &emitter.agent_type, emitter.pane_id.as_deref());
+    // Issue #559: before the emitter exists, because its outcome decides what
+    // every event — the first one included — says about prompt reports.
+    let CodexSpawnPrep {
+        pinned_home,
+        prompt_reports_unavailable,
+    } = codex_spawn_prep(program, &agent_type, pane_id.as_deref());
+
+    let emitter = Arc::new(Emitter {
+        agent_type,
+        session_id,
+        pane_id,
+        agent_id,
+        cwd,
+        live_target,
+        prompt_reports_unavailable,
+    });
 
     // R20-012 / finding #11: genuine per-descriptor routing. Detect the
     // tty-or-redirected nature of EACH standard descriptor independently. If any
@@ -2326,9 +2361,8 @@ fn run_wrap_pty(
 
     // One shared detector across every tee so the card reflects a single
     // coherent session state. PRD #20 M7: the rule set is keyed off the resolved
-    // agent type; Codex uses JSON-aware classification, any other command keeps
-    // the generic fallback. Recover from a poisoned mutex instead of panicking.
-    let is_codex = emitter.agent_type == AgentType::Codex;
+    // agent type ([`ruleset_for`]). Recover from a poisoned mutex instead of
+    // panicking.
     let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
         &emitter.agent_type,
     ))));
@@ -2369,7 +2403,7 @@ fn run_wrap_pty(
                     watch,
                 },
                 |line| {
-                    classify_and_emit(line, &detector, &emitter, is_codex);
+                    classify_and_emit(line, &detector, &emitter);
                 },
             );
             output_done.store(true, Ordering::SeqCst);
@@ -2379,26 +2413,10 @@ fn run_wrap_pty(
     };
 
     // Redirected output descriptors: tee each pipe to the matching real fd.
-    let out_pipe_thread = pipe_out.map(|r| {
-        spawn_pipe_tee(
-            r,
-            libc::STDOUT_FILENO,
-            emitter,
-            &detector,
-            is_codex,
-            Some(&interface),
-        )
-    });
-    let err_pipe_thread = pipe_err.map(|r| {
-        spawn_pipe_tee(
-            r,
-            libc::STDERR_FILENO,
-            emitter,
-            &detector,
-            is_codex,
-            Some(&interface),
-        )
-    });
+    let out_pipe_thread = pipe_out
+        .map(|r| spawn_pipe_tee(r, libc::STDOUT_FILENO, emitter, &detector, Some(&interface)));
+    let err_pipe_thread = pipe_err
+        .map(|r| spawn_pipe_tee(r, libc::STDERR_FILENO, emitter, &detector, Some(&interface)));
 
     // Input pump (outer stdin → inner master when stdin is a terminal, else →
     // the child's stdin pipe). Detached: on child exit the main loop returns and
@@ -2626,27 +2644,12 @@ fn run_wrap_pipe(
 
     // One shared detector across both output streams so the card reflects a
     // single coherent state (mirrors the PTY path).
-    let is_codex = emitter.agent_type == AgentType::Codex;
     let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
         &emitter.agent_type,
     ))));
 
-    let out_thread = spawn_pipe_tee(
-        child_stdout,
-        libc::STDOUT_FILENO,
-        emitter,
-        &detector,
-        is_codex,
-        None,
-    );
-    let err_thread = spawn_pipe_tee(
-        child_stderr,
-        libc::STDERR_FILENO,
-        emitter,
-        &detector,
-        is_codex,
-        None,
-    );
+    let out_thread = spawn_pipe_tee(child_stdout, libc::STDOUT_FILENO, emitter, &detector, None);
+    let err_thread = spawn_pipe_tee(child_stderr, libc::STDERR_FILENO, emitter, &detector, None);
 
     // Input pump (outer stdin → child stdin, verbatim). On EOF/close of our
     // stdin, dropping `child_stdin` closes it so an EOF-sensitive child finishes.
@@ -2723,7 +2726,6 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
     out_fd: RawFd,
     emitter: &Arc<Emitter>,
     detector: &Arc<Mutex<Detector>>,
-    is_codex: bool,
     interface: Option<&Arc<InterfaceWatch>>,
 ) -> std::thread::JoinHandle<()> {
     let emitter = Arc::clone(emitter);
@@ -2742,11 +2744,11 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
                 watch,
             },
             |line| {
-                classify_and_emit(line, &detector, &emitter, is_codex);
+                classify_and_emit(line, &detector, &emitter);
             },
         ),
         None => tee(reader, FdWriter(out_fd), |line| {
-            classify_and_emit(line, &detector, &emitter, is_codex);
+            classify_and_emit(line, &detector, &emitter);
         }),
     })
 }

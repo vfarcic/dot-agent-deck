@@ -848,6 +848,26 @@ pub struct SessionState {
     /// there is no un-orphaning edge to watch for and clearing on the next
     /// unmarked event would just make the badge flicker.
     pub orchestration_orphaned: bool,
+    /// Issue #559: this session's producer DECLARED that it will never report a
+    /// submitted prompt — an event arrived carrying
+    /// [`crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`], which
+    /// `dot-agent-deck wrap` stamps on everything it emits once it knows the
+    /// wrapped Codex's native `UserPromptSubmit` hook is not trusted.
+    ///
+    /// Per SESSION rather than per event because [`AppState::apply_event`]
+    /// folds every frame one agent sends on one pane into one session: the
+    /// wrapper's own events and the agent's native ones share it, so the answer
+    /// has to outlive the frame that carried it and the bounded
+    /// `recent_events` journal both.
+    ///
+    /// STICKY once set, like [`Self::orchestration_orphaned`], because the
+    /// marker can only withdraw standing: an unmarked event must not be able to
+    /// restore a capability the producer itself disclaimed. Not carried by
+    /// [`SessionSnapshot`] — a reconnecting TUI starts it `false` and learns it
+    /// again from the wrapper's next event, and the spawn-time deliveries that
+    /// read it belong to the TUI that spawned the pane, not to one that
+    /// reattached later. See [`Self::confirmation_producer`].
+    pub prompt_reports_unavailable: bool,
 }
 
 impl SessionState {
@@ -882,6 +902,14 @@ impl SessionState {
             last_activity_ms: Some(self.last_activity.timestamp_millis()),
             blocked: self.blocked.clone(),
         }
+    }
+
+    /// Issue #559: this session as a candidate confirmation producer — its
+    /// declared agent type, and whether the session's producer declared it
+    /// cannot report a submitted prompt ([`Self::prompt_reports_unavailable`]).
+    /// The input [`crate::prompt_delivery::pane_confirmation_capability`] takes.
+    pub fn confirmation_producer(&self) -> (&AgentType, bool) {
+        (&self.agent_type, self.prompt_reports_unavailable)
     }
 
     /// PRD #20 M3/blocker-2: the current live-target descriptor of this session,
@@ -5287,11 +5315,12 @@ pub(crate) fn agent_is_wrapper_interface_ready(agent_type: Option<&AgentType>) -
 ///
 /// * **is a session up** (`ready`) — the gate's original question, which decides
 ///   when the prompt is written;
-/// * **which producer owns this pane** (`observed_producer`) — whether an
-///   unconfirmed write could EVER be confirmed
-///   ([`crate::prompt_delivery::agent_reports_submitted_prompt`]). Answered ONLY
-///   by the event that satisfied the gate: a skipped boot-provenance start names
-///   an intent, not a reporting channel (issue #424 D4);
+/// * **which producer owns this pane** (`observed_producer`, and
+///   `observed_producer_reports` for issue #559) — whether an unconfirmed write
+///   could EVER be confirmed ([`AgentEvent::reports_submitted_prompt`]).
+///   Answered ONLY by the event that satisfied the gate: a skipped
+///   boot-provenance start names an intent, not a reporting channel (issue #424
+///   D4);
 /// * **which conversation the prompt is going into** (`generation`) — dropping
 ///   this is what left the confirmation loop unbound, free to adopt whatever
 ///   announced itself next, which after an unobserved rollover is the SUCCESSOR.
@@ -5324,6 +5353,18 @@ pub(crate) struct SessionStartWait {
     /// gate on its fork-time start rather than being skipped, so it is still
     /// recorded and still arms.
     pub(crate) observed_producer: Option<AgentType>,
+    /// Issue #559: whether the event that satisfied the gate came from a
+    /// producer that can report a submitted prompt
+    /// ([`AgentEvent::reports_submitted_prompt`]) — the answer
+    /// [`Self::observed_producer`]'s type gives, unless that same event
+    /// declared its producer cannot.
+    ///
+    /// This is the read `crate::spawn` arms re-submission from, and it is kept
+    /// apart from the type because for a Wrapper-strategy agent the gate is
+    /// satisfied by the WRAPPER's interface fact: the type is Codex either way,
+    /// and only the wrapper knows whether Codex's native prompt hook was
+    /// trusted. `false` wherever `observed_producer` is `None`.
+    pub(crate) observed_producer_reports: bool,
     /// Issue #424 F4: this pane declared, BEFORE the prompt was written, that
     /// what we were about to write into is a LAUNCHER with a real agent coming
     /// behind it — a `SessionStart` carrying
@@ -5424,6 +5465,7 @@ impl SessionStartWait {
             ready: false,
             generation: None,
             observed_producer: None,
+            observed_producer_reports: false,
             launcher_handoff,
             observed_interface: false,
         }
@@ -5510,7 +5552,10 @@ pub(crate) async fn wait_for_session_start(
     // released on it, and `upgrade_deadline` is when it will be if nothing
     // stronger turns up. See [`INTERFACE_UPGRADE_WINDOW`] for why the weak fact
     // is provisional and [`interface_upgrade_window`] for whose it is.
-    let mut provisional_settled: Option<AgentType> = None;
+    // Issue #559: with the producer's own answer to "can you report a
+    // submitted prompt", taken from the SAME event, so the release on it below
+    // cannot arm what that event disclaimed.
+    let mut provisional_settled: Option<(AgentType, bool)> = None;
     let mut upgrade_deadline: Option<tokio::time::Instant> = None;
     loop {
         // The loop is bounded by whichever comes first: the caller's own
@@ -5545,11 +5590,9 @@ pub(crate) async fn wait_for_session_start(
                         // the FIRST one — a later `wrapper_fork` start naming a
                         // different type must not revise the belief the
                         // post-write declaration will have to match.
-                        if launcher_handoff.is_none()
-                            && crate::prompt_delivery::agent_reports_submitted_prompt(
-                                &event.agent_type,
-                            )
-                        {
+                        // Issue #559: through the event, so a launcher whose wrapper
+                        // declared the agent's prompt hook untrusted withholds it.
+                        if launcher_handoff.is_none() && event.reports_submitted_prompt() {
                             launcher_handoff = Some(event.agent_type.clone());
                         }
                         tracing::debug!(
@@ -5616,7 +5659,8 @@ pub(crate) async fn wait_for_session_start(
                         && event.is_wrapper_interface_settled_session_start()
                         && provisional_settled.is_none()
                     {
-                        provisional_settled = Some(event.agent_type.clone());
+                        provisional_settled =
+                            Some((event.agent_type.clone(), event.reports_submitted_prompt()));
                         upgrade_deadline = Some(tokio::time::Instant::now() + upgrade_window);
                         tracing::debug!(
                             pane_id,
@@ -5632,10 +5676,12 @@ pub(crate) async fn wait_for_session_start(
                     }
                     let genuine = !event.is_wrapper_session_start();
                     let observed_interface = event.is_wrapper_interface_ready_session_start();
+                    let observed_producer_reports = event.reports_submitted_prompt();
                     return SessionStartWait {
                         ready: true,
                         generation: genuine.then_some((event.session_id, event.timestamp)),
                         observed_producer: Some(event.agent_type),
+                        observed_producer_reports,
                         launcher_handoff,
                         observed_interface,
                     };
@@ -5714,10 +5760,10 @@ fn resolve_expired_wait(
     pane_id: &str,
     agent_id: &str,
     upgrade_window: std::time::Duration,
-    provisional_settled: Option<AgentType>,
+    provisional_settled: Option<(AgentType, bool)>,
     launcher_handoff: Option<AgentType>,
 ) -> SessionStartWait {
-    let Some(observed_producer) = provisional_settled else {
+    let Some((observed_producer, observed_producer_reports)) = provisional_settled else {
         return SessionStartWait::unready(launcher_handoff);
     };
     tracing::debug!(
@@ -5742,6 +5788,7 @@ fn resolve_expired_wait(
         ready: true,
         generation: None,
         observed_producer: Some(observed_producer),
+        observed_producer_reports,
         launcher_handoff,
         observed_interface: false,
     }
@@ -5776,8 +5823,9 @@ pub(crate) enum PromptWatch {
     /// The window elapsed with no confirmation. `can_report_prompts` records
     /// whether an event was seen from this exact agent whose producer is
     /// capable of reporting SUBMITTED PROMPT TEXT
-    /// ([`crate::prompt_delivery::agent_reports_submitted_prompt`]) — the only
-    /// proof that a re-submission could ever be confirmed.
+    /// ([`AgentEvent::reports_submitted_prompt`], which issue #559 routes through
+    /// the event so a wrapper's declaration can withdraw its type's answer) —
+    /// the only proof that a re-submission could ever be confirmed.
     ///
     /// Reviewer finding B4: this used to be `hooked`, set by ANY event carrying
     /// the agent's id. Pi emits exactly such events and hardcodes
@@ -5835,8 +5883,7 @@ pub(crate) enum PromptWatch {
 /// reported prompt is the evidence, and gating on `EventType::Thinking` would
 /// silently exclude any future agent that reports a submission under a
 /// different type. Which producers can report one at all is a separate
-/// question, answered by
-/// [`crate::prompt_delivery::agent_reports_submitted_prompt`].
+/// question, answered per event by [`AgentEvent::reports_submitted_prompt`].
 ///
 /// Matching requires an EXACT, non-optional `agent_id` plus the pane.
 ///
@@ -5914,8 +5961,9 @@ pub(crate) async fn wait_for_prompt_submission(
                 if let Some(changed) = latch_generation(generation, &event) {
                     return changed;
                 }
-                can_report_prompts |=
-                    crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type);
+                // Issue #559: through the event, not its type — a wrapper that
+                // declared its agent's prompt hook untrusted proves nothing here.
+                can_report_prompts |= event.reports_submitted_prompt();
                 // Issue #666, facts G ∧ I ∧ W. Identity is already enforced above
                 // (exact `agent_id`, exact pane); W holds because the caller
                 // drained the channel before it wrote, so everything this loop
@@ -8657,6 +8705,7 @@ impl AppState {
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                prompt_reports_unavailable: false,
             },
         );
         session_id
@@ -12012,6 +12061,7 @@ impl AppState {
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                prompt_reports_unavailable: false,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -12342,6 +12392,13 @@ impl AppState {
         // older daemon must not clear a verdict a newer one already reported.
         if event.is_orchestration_orphaned() {
             session.orchestration_orphaned = true;
+        }
+
+        // Issue #559: the same one-way shape, for the same reason — the marker
+        // only withdraws standing, so no later frame may restore it. See
+        // `SessionState::prompt_reports_unavailable`.
+        if event.declares_prompt_reports_unavailable() {
+            session.prompt_reports_unavailable = true;
         }
 
         // PRD #20 blocker-2: keep the live-target durable across the bounded
@@ -15026,9 +15083,9 @@ mod tests {
     /// `orchestration/delegate/029`'s fixture was changed to one that reaches its
     /// interface. It is not cosmetic to leave uncovered: the outcome differs from
     /// the unready fallback in exactly two fields, and the second one is
-    /// load-bearing. `observed_producer` is what
-    /// [`crate::prompt_delivery::agent_reports_submitted_prompt`] reads to decide
-    /// `can_report_prompts` in [`crate::spawn`] — i.e. whether an unconfirmed
+    /// load-bearing. `observed_producer`, with `observed_producer_reports` beside
+    /// it since issue #559, is what decides `can_report_prompts` in
+    /// [`crate::spawn`] — i.e. whether an unconfirmed
     /// write could EVER be confirmed — so a regression that collapsed this branch
     /// into the fallback would silently disarm re-submission for every wrapped
     /// agent that never leaves cooked mode.
@@ -15041,6 +15098,124 @@ mod tests {
     /// fast tier to assert nothing.
     ///
     /// The clock is paused, so the 30 s window costs no wall time at all.
+    /// Issue #559: every daemon-side capability read of a WRAPPER's event —
+    /// the interface fact that releases the gate, the settled fact that releases
+    /// it on expiry, and a post-write frame in the confirmation watch — answers
+    /// from the event, so a wrapper that declared its Codex's native prompt hook
+    /// untrusted arms nothing while still releasing the gate. The unmarked twin
+    /// of each is the control: a wrapper that declares nothing leaves Codex's
+    /// answer standing, which is what keeps a healthy wrapped Codex's retry.
+    #[tokio::test(start_paused = true)]
+    async fn a_wrapper_declaring_its_agents_prompt_hook_untrusted_arms_no_resubmission() {
+        const PANE: &str = "wrapped-codex-pane";
+        const AGENT: &str = "agent-559";
+
+        fn wrapper_event(
+            event_type: EventType,
+            key: &str,
+            value: &str,
+            prompt_reports_unavailable: bool,
+        ) -> AgentEvent {
+            let mut metadata = HashMap::from([(key.to_string(), value.to_string())]);
+            if prompt_reports_unavailable {
+                metadata.insert(
+                    crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY.to_string(),
+                    crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE.to_string(),
+                );
+            }
+            AgentEvent {
+                session_id: format!("{PANE}-session"),
+                agent_type: AgentType::Codex,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata,
+                pane_id: Some(PANE.to_string()),
+                agent_id: Some(AGENT.to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+
+        let window = interface_upgrade_window(Some(&AgentType::Codex));
+        for marked in [false, true] {
+            for origin in [
+                crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN,
+                crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN,
+            ] {
+                let (tx, mut rx) = broadcast::channel(8);
+                // The fork-time start first, as the wrapper sends it: the gate
+                // SKIPS it for Codex and records it as launcher-handoff standing
+                // only when its producer can report.
+                for origin in [crate::event::WRAPPER_FORK_SESSION_START_ORIGIN, origin] {
+                    tx.send(BroadcastMsg::Event(wrapper_event(
+                        EventType::SessionStart,
+                        crate::event::SESSION_START_ORIGIN_METADATA_KEY,
+                        origin,
+                        marked,
+                    )))
+                    .expect("the receiver is alive");
+                }
+                let observed = wait_for_session_start(
+                    &mut rx,
+                    PANE,
+                    AGENT,
+                    SESSION_START_WAIT_TIMEOUT,
+                    window,
+                )
+                .await;
+                assert!(
+                    observed.ready,
+                    "{origin} (marked={marked}): the declaration is about reporting, never \
+                     about readiness, so the gate is released either way"
+                );
+                assert_eq!(observed.observed_producer, Some(AgentType::Codex));
+                assert_eq!(
+                    observed.observed_producer_reports, !marked,
+                    "{origin} (marked={marked}): the gate's capability answer must be the \
+                     event's, so a wrapper that disclaimed the prompt hook arms no retry"
+                );
+                assert_eq!(
+                    observed.launcher_handoff,
+                    (!marked).then_some(AgentType::Codex),
+                    "{origin} (marked={marked}): a declared type may only withhold standing, \
+                     and a declaration that no report will come withholds it"
+                );
+            }
+
+            let (tx, mut rx) = broadcast::channel(8);
+            tx.send(BroadcastMsg::Event(wrapper_event(
+                EventType::Thinking,
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY,
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE,
+                marked,
+            )))
+            .expect("the receiver is alive");
+            let mut generation = None;
+            let watch = wait_for_prompt_submission(
+                &mut rx,
+                PANE,
+                AGENT,
+                "the delivered task",
+                &mut generation,
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+            assert_eq!(
+                watch,
+                PromptWatch::Elapsed {
+                    can_report_prompts: !marked,
+                    agent_start: None,
+                },
+                "marked={marked}: a post-write wrapper frame's capability is the event's"
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_expired_upgrade_window_releases_on_the_weak_fact_rather_than_timing_out() {
         const PANE: &str = "worker-pane";
@@ -15113,15 +15288,20 @@ mod tests {
             "a window that saw nothing at all establishes nothing"
         );
 
-        // Difference 2: WHICH producer owns the pane. This is the field that
-        // feeds `agent_reports_submitted_prompt`, and therefore whether an
-        // unconfirmed delivery can ever be confirmed.
+        // Difference 2: WHICH producer owns the pane, and whether it can
+        // report — the fields that decide whether an unconfirmed delivery can
+        // ever be confirmed.
         assert_eq!(
             settled.observed_producer,
             Some(AgentType::Codex),
             "the released fact names its producer, which is what decides whether a re-submission \
              could ever be confirmed"
         );
+        assert!(
+            settled.observed_producer_reports,
+            "a wrapper that declares nothing leaves Codex's own answer standing"
+        );
+        assert!(!nothing.observed_producer_reports);
         assert_eq!(
             nothing.observed_producer, None,
             "a timeout names no producer — nothing was observed"
@@ -17090,6 +17270,7 @@ mod tests {
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                prompt_reports_unavailable: false,
             },
         );
 
