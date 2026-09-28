@@ -1281,6 +1281,10 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
 /// * **Both:** a pathname that is not a directory at spawn time is refused,
 ///   never silently replaced by `$HOME` — which is what portable-pty's
 ///   `as_command` does with a cwd that fails its `is_dir()` filter.
+/// * **Both:** a relative program that exists under the cwd string is exec'd
+///   by `/bin/sh` from the child's own working directory rather than by the
+///   path portable-pty would have built from that string
+///   ([`exec_program_from_child_cwd`]).
 ///
 /// **The premise the Linux path rests on, read from the toolchain's own std
 /// source (rustc 1.97.1, `library/std/src/sys/process/unix/unix.rs`)** rather
@@ -1352,6 +1356,76 @@ fn prepared_spawn_cwd(
         }
         Ok(path.into())
     }
+}
+
+/// The inline program [`exec_program_from_child_cwd`] hands `/bin/sh`: exec the
+/// command name it was given as `$0`, with every remaining argument, and no
+/// other interpretation — `$0` is quoted, so the name is never split or globbed.
+#[cfg(unix)]
+const EXEC_FROM_CWD_SCRIPT: &str = r#"exec "$0" "$@""#;
+
+/// Make a prepared start's relative program resolve **in the child**, against
+/// the directory the child entered, rather than in the parent against the cwd
+/// string (issue #1233 review, PR #1407).
+///
+/// portable-pty 0.8.1's `search_path` resolves a relative `argv[0]` — a bare
+/// name included — by joining it onto the cwd string first, and uses that join
+/// whenever it `exists()` in the parent. For a Linux prepared start the cwd
+/// string is `/proc/self/fd/N`, so the exec path became
+/// `/proc/self/fd/N/<program>`, which no longer resolves in the child:
+/// `close_random_fds` has closed `N` by then, and the spawn failed. That is the
+/// case this rewrites, and only it — the condition is portable-pty's own, so a
+/// program portable-pty would have found on `PATH` or taken as absolute is left
+/// exactly as it was.
+///
+/// The program becomes `/bin/sh -c 'exec "$0" "$@"' ./<program> <args…>`, an
+/// absolute interpreter that portable-pty passes through untouched. The name
+/// keeps a `/` (a bare one gets `./`), so the shell's `exec` looks it up
+/// relative to its working directory, never on `PATH` — the same file
+/// portable-pty's cwd-first lookup chose.
+///
+/// **This does not reopen the rename-and-replace window for the program.**
+/// Resolving `<project path>/<program>` in the parent would have: the child
+/// would sit in the verified directory object while executing whatever the
+/// pathname named by then. Here the only lookup of the program that counts is
+/// the child's own `exec`, and it runs after the `chdir`, relative to the
+/// directory that `chdir` entered — on Linux the verified object itself, and on
+/// every other Unix whatever the pathname named at that `chdir`, so program and
+/// working directory can never come from two different directories. The
+/// parent's `exists()` is only the decision to rewrite, made against the same
+/// cwd string portable-pty uses.
+///
+/// Not affected either way: a multi-word command, which is already a shell's
+/// `-c` string resolved by that shell in its own cwd (the Codex `wrap` rewrite
+/// is always multi-word, so it is one); an absolute program; and a relative
+/// `PATH` entry, which portable-pty joins onto the program without the cwd
+/// string, so no `/proc` path reaches the exec (its existence is checked
+/// relative to the spawning process's own cwd, which is portable-pty's
+/// behaviour on every spawn, prepared or not).
+#[cfg(unix)]
+fn exec_program_from_child_cwd(cmd: &mut CommandBuilder, cwd: &std::ffi::OsStr) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let argv = cmd.get_argv_mut();
+    let Some(program) = argv.first() else {
+        return;
+    };
+    let program_path = std::path::Path::new(program);
+    if !program_path.is_relative() || !std::path::Path::new(cwd).join(program_path).exists() {
+        return;
+    }
+    let mut relative = std::ffi::OsString::new();
+    if !program.as_bytes().contains(&b'/') {
+        relative.push("./");
+    }
+    relative.push(program);
+    let rest = argv.split_off(1);
+    *argv = vec![
+        crate::platform::shell::fixed_command_shell("/bin/sh").into(),
+        "-c".into(),
+        EXEC_FROM_CWD_SCRIPT.into(),
+        relative,
+    ];
+    argv.extend(rest);
 }
 
 /// The Linux half of [`prepared_spawn_cwd`]: `/proc/self/fd/<fd>` when it
@@ -1592,7 +1666,9 @@ fn spawn_with_dir(
     // Issue #1233 item 2: as late as the parent can decide it. See `spawn_in`.
     #[cfg(unix)]
     if let Some(dir) = verified_dir {
-        cmd.cwd(prepared_spawn_cwd(opts.cwd, dir)?);
+        let cwd = prepared_spawn_cwd(opts.cwd, dir)?;
+        exec_program_from_child_cwd(&mut cmd, &cwd);
+        cmd.cwd(cwd);
     }
     #[cfg(not(unix))]
     if let Some(never) = verified_dir {
@@ -14934,6 +15010,102 @@ mod spawn_tests {
             !dir.join("marker").exists(),
             "the child ran in the replacement at the verified path"
         );
+    }
+
+    /// Issue #1233 review (PR #1407): a prepared start whose program is a
+    /// relative name that exists in the verified directory — `./run.sh`, or a
+    /// bare `runme` that portable-pty looks up in the cwd before `PATH` — runs
+    /// that program from the verified directory.
+    ///
+    /// portable-pty 0.8.1's `search_path` joins such a program onto the cwd
+    /// string, which for a Linux prepared start is `/proc/self/fd/N`, and
+    /// `close_random_fds` closes `N` in the child before the exec — so without
+    /// the deck resolving it the spawn failed with `ENOENT`. The replacement at
+    /// the old path holds same-named programs writing a different marker, so a
+    /// fix that resolved the program through the pathname fails this too.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_in_runs_a_relative_program_from_the_verified_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        fn script(dir: &std::path::Path, name: &str, marker: &str) {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho x > {marker}\n")).expect("script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        for program in ["./run.sh", "runme"] {
+            let root = tempfile::tempdir().expect("create tempdir");
+            let dir = root.path().join("d");
+            std::fs::create_dir(&dir).expect("create the project dir");
+            let name = program.trim_start_matches("./");
+            script(&dir, name, "marker");
+            let verified = crate::project_resolve::VerifiedProjectDir::open(&dir)
+                .expect("open the project dir");
+            // Only Linux enters the directory object; every other Unix refuses
+            // a replaced path, so the replacement half is Linux-only.
+            let old = if cfg!(target_os = "linux") {
+                let old = dir.with_extension("old");
+                std::fs::rename(&dir, &old).expect("move the verified directory away");
+                std::fs::create_dir(&dir).expect("put a replacement at the verified path");
+                script(&dir, name, "wrong");
+                old
+            } else {
+                dir.clone()
+            };
+
+            let path = dir.to_str().expect("utf-8 tempdir");
+            let pty = spawn_in(
+                SpawnOptions {
+                    command: Some(program),
+                    cwd: Some(path),
+                    env: vec![("SHELL".into(), "/bin/sh".into())],
+                    ..SpawnOptions::default()
+                },
+                &verified,
+            )
+            .unwrap_or_else(|e| panic!("{program}: spawn should succeed: {e:?}"));
+            let mut child = pty.child;
+            let status = child.wait().expect("wait should succeed");
+            assert!(status.success(), "{program}: the script failed: {status:?}");
+            assert!(
+                old.join("marker").exists(),
+                "{program}: the verified directory's program must have run there"
+            );
+            assert!(
+                !old.join("wrong").exists() && !dir.join("wrong").exists(),
+                "{program}: the replacement's program ran"
+            );
+        }
+    }
+
+    /// The rewrite behind the test above fires only where portable-pty would
+    /// have joined the program onto the cwd string, and keeps every argument.
+    #[cfg(unix)]
+    #[test]
+    fn exec_program_from_child_cwd_rewrites_only_a_program_found_under_the_cwd() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        std::fs::write(dir.path().join("here"), b"").expect("a program in the cwd");
+        let cwd = dir.path().as_os_str();
+        let argv = |program: &str| {
+            let mut cmd = CommandBuilder::new(program);
+            cmd.arg("--flag");
+            exec_program_from_child_cwd(&mut cmd, cwd);
+            cmd.get_argv()
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        for untouched in ["/bin/sh", "not-in-the-cwd", "./not-in-the-cwd"] {
+            assert_eq!(argv(untouched), [untouched, "--flag"], "{untouched}");
+        }
+        for (program, name) in [("here", "./here"), ("./here", "./here")] {
+            assert_eq!(
+                argv(program),
+                ["/bin/sh", "-c", EXEC_FROM_CWD_SCRIPT, name, "--flag"],
+                "{program}"
+            );
+        }
     }
 
     /// Issue #1233 audit: on Linux a `/proc/self/fd` that does not answer, or
