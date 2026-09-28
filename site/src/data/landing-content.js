@@ -444,31 +444,16 @@ export const desktop = {
  * describes what is IN the frame rather than what the row argues, so a
  * recapture that changes what a frame shows is a one-file correction.
  *
- * `tall` is an OPTIONAL layout flag on an entry, read by `index.js`. It says
- * "this frame is far enough from the others' shape that the row falls out of
- * step with its neighbours", and the measure is how tall the frame stands, in
- * multiples of the figure column's own width, when the story is at its 1120px
- * maximum. Rows 01 and 03 set the house shape at 0.58 and 0.56.
- *
- * `tall` means "much closer to 4:3 than the 16:9 the other rows carry", and
- * TWO rows now carry it. `busy-deck-real.webp` is 2554x1936 and
- * `dispatch.webp` is 2550x1964, so at the column's full width they stand 0.76
- * and 0.77 -- about a third taller than rows 01 and 03. The flag caps their
- * width above the two-column breakpoint instead of cropping them, which brings
- * them to 0.59 and 0.60. Cropping would cut off exactly the edges each frame
- * is carried for: row 02's sidebar cards and footer counts, row 04's two
- * directory paths. `index.module.css` carries the division and the note on
- * what two capped rows out of four look like together.
- *
- * There WAS a `wide` flag, for the opposite deviation, and it left with the
- * frame that needed it. The old `dispatch.webp` was a 1946x482 band (4.04)
- * that no width cap could fix -- capping a width only makes a frame shorter,
- * and that one was already short -- so the flag stacked its row instead, text
- * over a full-measure frame. The maintainer's own capture replaced it at 1.30
- * and left nothing flagged `wide`, so the flag, its branch in `index.js` and
- * `.storyRowWide` went with it rather than sitting in the tree as a dead
- * option. `.storyRowSolo` stayed: the figure-less case is still genuinely
- * optional, and its own comment says so.
+ * There WERE two layout flags on these entries, `tall` and `wide`, and both
+ * left when the story stopped alternating text and one frame side by side
+ * (PRD #1321). They existed to keep a two-column row in step with its
+ * neighbours: `wide` stacked a row whose frame was a 4.04 band, and `tall`
+ * capped the width of the two near-4:3 frames, `busy-deck-real.webp` and
+ * `dispatch.webp`, so they stood no taller than the 16:9 rows. Each step now
+ * puts its text over the terminal UI's and the desktop app's frames side by
+ * side, each frame at half the story's width and the top edges aligned, so a
+ * taller frame no longer pushes a row out of step with anything, and neither
+ * flag has a job left.
  *
  * What changed, frame by frame:
  *
@@ -537,11 +522,6 @@ export const desktop = {
  *   The sidebar's single card (`Prmt: Why is 450 red?`) and the pane's token
  *   counter are both incidental to what the row argues, so neither the alt nor
  *   the caption reaches for them.
- *
- *   It carries `tall` where the old frame carried `wide`: 2550x1964 is 1.30, a
- *   hair squarer than row 02's 1.32, against the old band's 4.04. See the
- *   flag's own note above for the arithmetic, and `index.module.css` for what
- *   the cap does to the row.
  * - `reattach.png` leaves the page with the "walk away" row it illustrated.
  *   The maintainer's verdict on that frame was "I'm not sure I understand" it,
  *   and the diagnosis is that the idea has no moment to photograph: detaching
@@ -579,7 +559,6 @@ export const screenshots = {
   },
   deck: {
     src: '/img/busy-deck-real.webp',
-    tall: true,
     alt: 'A deck with the Dashboard and four orchestration tabs along the top and six agent cards down the sidebar — ClaudeCode, Pi, OpenCode and Codex filling the orchestrator, coder, reviewer, auditor, tester and release roles, two marked Working and the rest Idle — the cards all laid out the same way, with the directory, the last prompt, the command last run, the time since the last activity and a tool count, over a footer reading 23 active, 2 working, 1 thinking, 20 idle',
     caption:
       'Four different agent clients — Claude Code, Pi, OpenCode and Codex — running side by side under one orchestrator, and the deck reads all of them the same way: the same card, the same live status, whichever client is behind it. The header counts the six sessions in view out of the deck’s 25; the footer counts every agent it is holding: 23 active, 2 working, 1 thinking, 20 idle.',
@@ -592,7 +571,6 @@ export const screenshots = {
   },
   dispatch: {
     src: '/img/dispatch.webp',
-    tall: true,
     alt: 'A deck with the Dashboard and three mixed · dot-agent-deck… orchestration tabs along the top, and a dispatcher pane reading “Confirmed — both units are now up:” over voice-control → /home/vfarcic/code/dot-agent-deck-dispatch-voice-control (#802) and product-website → /home/vfarcic/code/dot-agent-deck-dispatch-product-website (#1021), then “Both cut from main at d7bbbd39, each a 6-role mixed orchestration.” A yellow arrow drawn onto the screenshot points down at the request below that, which asks for three dispatched agents or teams at a time and a stop at twenty in total; the reply reads it back as a standing loop with eighteen still to dispatch. The footer counts 17 active agents, 1 working and 1 thinking',
     caption:
       'Two units up from one dispatcher pane, and neither of them is a single agent — each is a whole 6-role orchestration, in its own copy of the repository, both cut from main at the same commit. The yellow arrow marks the ask that follows: keep three running at a time, start a fresh one whenever a slot frees, stop at twenty — which the pane reads back as eighteen still to go.',
@@ -648,16 +626,17 @@ export const audience = {
  * The copy is written for BOTH clients (PRD #1321): each capability here lives
  * in the daemon, so the terminal UI and the desktop app both have it, and where
  * the two present it differently -- a card or a row, a tab or a group -- the
- * body names both. The frames follow a switch above the rows, which shares its
- * choice with the docs' TUI | Desktop tabs (`groupId="client"`).
+ * body names both. Both clients' frames are shown at once, side by side under
+ * the text, each labelled with its client: the home page deliberately does not
+ * make the reader pick one, which is what the docs' TUI | Desktop tabs do.
  *
  * `shots` is OPTIONAL, and so is either half of it. A step with no frame at
- * all renders as a single centred column rather than as half a two-column row
- * with the picture missing. A step with only a terminal UI frame shows it
- * under both settings of the switch, with `desktopNote` saying so in place of
- * a desktop caption; row 04 is that case, because the dispatcher's work is a
- * conversation in an agent's pane and the desktop fixture has no dispatcher
- * transcript to capture.
+ * all is text alone. A step with one client's frame shows it alone, centred at
+ * the width a frame has in the other rows; row 04 is that case, because the
+ * dispatcher's work is a conversation in an agent's pane and the desktop
+ * fixture has no dispatcher transcript to capture, so its `desktopNote` is
+ * added to the terminal UI frame's caption to say what the desktop app does
+ * there instead.
  *
  * The arc is an escalation, and each rung is a shipped feature rather than a
  * restatement of the one before it: one agent, then many of them visible at
@@ -689,7 +668,7 @@ export const workflow = [
     body: 'Ask a dispatcher for something — “work on the search bug” — and it makes a separate copy of your repository and puts an agent, or a whole orchestration, to work inside it. It works in that copy rather than in your working tree, so start as many as you like and carry on with what you were doing. Each unit arrives on the deck, as a card or a tab in the terminal UI and as a row or a group in the desktop app, and reports back when it is done.',
     shots: {tui: screenshots.dispatch},
     desktopNote:
-      'Shown in the terminal UI. In the desktop app a dispatcher is an agent like any other: you talk to it in its pane, and the units it starts appear on the dashboard.',
+      'In the desktop app a dispatcher is an agent like any other: you talk to it in its pane, and the units it starts appear on the dashboard.',
   },
 ];
 

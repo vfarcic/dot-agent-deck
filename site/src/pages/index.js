@@ -1,7 +1,6 @@
 import {Fragment} from 'react';
 import Layout from '@theme/Layout';
 import Link from '@docusaurus/Link';
-import {useStorageSlot} from '@docusaurus/theme-common';
 import {
   agents,
   agentsNote,
@@ -104,58 +103,27 @@ const doorPages = [
 const COUNT_WORDS = ['No', 'One', 'Two', 'Three', 'Four', 'Five', 'Six'];
 
 /**
- * Which layout a story row takes. A step with no frame stands alone;
- * everything else alternates sides down the page.
- *
- * A `wide` flag used to take a third branch here, stacking the text over a
- * full-measure frame for the old row 04 band. That frame is gone and the flag
- * went with it, so no row leaves the alternation any more. The surviving
- * `tall` flag is read below, on the <figure> rather than on the row: it caps
- * how wide a frame runs inside its own column and does not change which
- * layout the row takes. `landing-content.js` carries the arithmetic.
- */
-function storyRowClass(step, index) {
-  if (!step.shots) {
-    return styles.storyRowSolo;
-  }
-  return index % 2 === 0 ? styles.storyRow : styles.storyRowFlip;
-}
-
-/**
- * The two clients the story's frames can come from. The values are the ones
- * the docs' `<Tabs groupId="client">` use, and the switch reads and writes the
- * same storage slot those tabs do (`docusaurus.tab.client`), so a reader who
- * picks Desktop in the docs finds the home page on Desktop too, and the other
- * way round. `useStorageSlot` reads nothing during the static render, so the
- * page is built showing the terminal UI and switches after hydration when the
- * reader's stored choice says otherwise.
+ * The frames a story step shows, in order: the terminal UI's, then the desktop
+ * app's (PRD #1321). The home page shows both clients at once rather than
+ * asking the reader to choose one, so each frame carries its client's name as
+ * a label above it. A step missing one client's frame shows the other alone,
+ * and row 04, which has no desktop frame, adds `desktopNote` to its caption to
+ * say what the desktop app does there instead.
  */
 const STORY_CLIENTS = [
-  {value: 'tui', label: 'Terminal UI'},
-  {value: 'desktop', label: 'Desktop app'},
+  {key: 'tui', label: 'Terminal UI'},
+  {key: 'desktop', label: 'Desktop app'},
 ];
 
-function useStoryClient() {
-  const [stored, slot] = useStorageSlot('docusaurus.tab.client');
-  const client = STORY_CLIENTS.some((c) => c.value === stored) ? stored : 'tui';
-  return [client, (value) => slot.set(value)];
-}
-
-/**
- * The frame a step shows for the chosen client, and the caption under it. A
- * step with no desktop frame keeps its terminal UI frame under Desktop and
- * says so, through `desktopNote`, instead of leaving a hole in the row.
- */
-function storyFrame(step, client) {
-  if (client === 'desktop' && step.shots.desktop) {
-    return {shot: step.shots.desktop, caption: step.shots.desktop.caption};
+function storyFrames(step) {
+  if (!step.shots) {
+    return [];
   }
-  const shot = step.shots.tui ?? step.shots.desktop;
-  const caption =
-    client === 'desktop' && !step.shots.desktop && step.desktopNote
-      ? step.desktopNote
-      : shot.caption;
-  return {shot, caption};
+  return STORY_CLIENTS.filter((c) => step.shots[c.key]).map((c) => ({
+    key: c.key,
+    label: c.label,
+    shot: step.shots[c.key],
+  }));
 }
 
 /*
@@ -184,7 +152,6 @@ function InstallPill({command}) {
 }
 
 export default function Home() {
-  const [storyClient, setStoryClient] = useStoryClient();
   return (
     <Layout
       title="Run your coding agents in parallel"
@@ -286,47 +253,41 @@ export default function Home() {
             <h2 id="story-title" className={styles.visuallyHidden}>
               How it works
             </h2>
-            <div
-              className={styles.storySwitch}
-              role="group"
-              aria-label="Show the screenshots from">
-              <span className={styles.storySwitchLabel} aria-hidden="true">
-                Screenshots from
-              </span>
-              {STORY_CLIENTS.map((c) => (
-                <button
-                  key={c.value}
-                  type="button"
-                  className={styles.storySwitchButton}
-                  aria-pressed={storyClient === c.value}
-                  onClick={() => setStoryClient(c.value)}>
-                  {c.label}
-                </button>
-              ))}
-            </div>
-            {workflow.map((step, i) => {
-              const frame = step.shots ? storyFrame(step, storyClient) : null;
+            {workflow.map((step) => {
+              const frames = storyFrames(step);
               return (
-                <div key={step.step} className={storyRowClass(step, i)}>
+                <div key={step.step} className={styles.storyRow}>
                   <div className={styles.storyText}>
                     <span className={styles.storyStep}>{step.step}</span>
                     <h3>{step.title}</h3>
                     <p>{step.body}</p>
                   </div>
-                  {frame ? (
-                    <figure
+                  {frames.length > 0 ? (
+                    <div
                       className={
-                        frame.shot.tall
-                          ? `${styles.storyFigure} ${styles.storyFigureTall}`
-                          : styles.storyFigure
+                        frames.length === 1
+                          ? `${styles.storyFigures} ${styles.storyFiguresSingle}`
+                          : styles.storyFigures
                       }>
-                      <img
-                        src={frame.shot.src}
-                        alt={frame.shot.alt}
-                        loading="lazy"
-                      />
-                      <figcaption>{frame.caption}</figcaption>
-                    </figure>
+                      {frames.map((f) => (
+                        <figure key={f.key} className={styles.storyFigure}>
+                          <span className={styles.storyFigureLabel}>
+                            {f.label}
+                          </span>
+                          <img
+                            src={f.shot.src}
+                            alt={f.shot.alt}
+                            loading="lazy"
+                          />
+                          <figcaption>
+                            {f.shot.caption}
+                            {f.key === 'tui' && !step.shots.desktop && step.desktopNote
+                              ? ` ${step.desktopNote}`
+                              : null}
+                          </figcaption>
+                        </figure>
+                      ))}
+                    </div>
                   ) : null}
                 </div>
               );
