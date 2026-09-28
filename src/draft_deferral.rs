@@ -198,7 +198,8 @@ const MAX_STRING_LEN: u16 = 4096;
 /// (`ESC[…$y`), window reports (`ESC[…t`), any CSI with a private marker, and
 /// OSC and DCS strings. Nor do the bracketed-paste markers themselves
 /// (`ESC[200~`, `ESC[201~`): an empty paste sends nothing into the box, so
-/// only the bytes between them count. One ambiguity is accepted: xterm encodes a modified `F3`
+/// only the bytes between them count. Inside a paste only `ESC[201~` is a
+/// marker; an `ESC[200~` there is pasted text and sets the bit. One ambiguity is accepted: xterm encodes a modified `F3`
 /// as `ESC[1;5R`, the shape of a CPR, so that key does not set the bit. The
 /// deck's own encoder sends `F3` as `ESC O R` and is unaffected.
 ///
@@ -317,13 +318,21 @@ impl DraftTracker {
                 },
                 0x40..=0x7e => {
                     // Exactly the bytes `crate::agent_pty`'s paste framing
-                    // matches, so the two agree on what a marker is.
-                    let paste_marker = byte == b'~' && len == 3 && matches!(code, Some(200 | 201));
+                    // matches, so the two agree on what a marker is. Inside a
+                    // paste only the closing marker is framing: an opening one
+                    // there is pasted text, and that framing stays in the paste
+                    // across it (a paste cannot nest), so it is content here too.
+                    let paste_marker = byte == b'~'
+                        && len == 3
+                        && match code {
+                            Some(201) => true,
+                            Some(200) => !paste,
+                            _ => false,
+                        };
                     if paste_marker {
                         return Escape::Ground;
                     }
                     if paste {
-                        // Inside a paste, only the closing marker is framing.
                         self.pending = true;
                         return Escape::Ground;
                     }
@@ -692,6 +701,17 @@ mod tests {
         feed_paste(&mut tracker, b"");
         feed(&mut tracker, b"y");
         assert!(tracker.pending());
+    }
+
+    /// PR #1398 re-review: inside a paste only the CLOSING marker is framing.
+    /// A literal `ESC[200~` in the pasted text is content — a paste cannot
+    /// nest, so `crate::agent_pty`'s stream stays in the paste across it — and
+    /// an empty box holding just that text holds a draft.
+    #[test]
+    fn a_pasted_opening_marker_is_content() {
+        let mut tracker = DraftTracker::default();
+        feed_paste(&mut tracker, b"\x1b[200~");
+        assert!(tracker.pending(), "a pasted ESC[200~ did not set the bit");
     }
 
     #[test]

@@ -18451,6 +18451,23 @@ mod spawn_tests {
         assert!(!stream.draft.pending());
     }
 
+    /// Issue #544 (PR #1398 re-review): a literal `ESC[200~` pasted into an
+    /// empty box is content. The stream's paste framing stays in the paste
+    /// across it — a paste cannot nest — and the draft bit, reading the same
+    /// framing, counts it: the two agree that only `ESC[201~` ends the paste.
+    #[test]
+    fn a_pasted_opening_marker_is_a_draft_and_leaves_the_paste_open() {
+        let mut stream = UserInputStream::default();
+        assert!(!stream.feed(b"\x1b[200~\x1b[200~"));
+        assert!(stream.in_paste, "a nested opening marker left the paste");
+        assert!(stream.draft.pending(), "a pasted ESC[200~ is not a draft");
+        // Still in the paste, so this newline is content, not a submit.
+        assert!(!stream.feed(b"\r"));
+        assert!(!stream.feed(b"\x1b[201~"));
+        assert!(!stream.in_paste);
+        assert!(stream.draft.pending());
+    }
+
     /// Issue #544: a pane that changes hands, or closes, starts with no draft.
     #[test]
     fn draft_bit_is_reset_by_forget_pane_and_forget_closed_pane() {
