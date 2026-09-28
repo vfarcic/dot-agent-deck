@@ -61,6 +61,8 @@ If a Codex card still shows only coarse status with no tool or prompt detail, ch
 3. **Re-run the install manually** to see any error the silent startup step swallowed: `dot-agent-deck hooks install --agent codex`.
 4. **Approve them by hand as a fallback:** run Codex once and approve the deck's hooks in its interactive `/hooks` review. Codex remembers that trust for subsequent runs.
 
+While those hooks are not trusted — or if you switch the deck's `UserPromptSubmit` hook off in Codex's `/hooks` list — Codex also cannot tell the deck that it received an automatic prompt — a mode's seed, an orchestration role's first task, a dispatched unit's task. The deck then types such a prompt in **once** and does not retry it, rather than risk giving Codex the same task twice. If a Codex pane's automatic prompt sometimes goes missing, fixing the trust step above is also the fix for that.
+
 Trust is pinned to each hook's exact content, so it deliberately fails *closed*: if a definition changes underneath a trust record, Codex refuses to run it and the card falls back to coarse status rather than running something unreviewed. Re-running the install re-records trust for the new content.
 
 ### Codex as a role or worker: allow sandbox network access

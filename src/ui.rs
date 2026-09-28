@@ -4570,7 +4570,7 @@ fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, 
                 .sessions
                 .values()
                 .filter(|session| session.pane_id.as_deref() == Some(pane_id))
-                .map(|session| &session.agent_type),
+                .map(SessionState::confirmation_producer),
         ) == ConfirmationCapability::Reports;
     }
 }
@@ -4720,7 +4720,7 @@ fn delivery_capability(
             ConfirmationCapability::Unknown
         };
     }
-    pane_confirmation_capability(pane_sessions().map(|session| &session.agent_type))
+    pane_confirmation_capability(pane_sessions().map(SessionState::confirmation_producer))
 }
 
 /// Issue #424 (reviewer MEDIUM, C6): has this pane produced evidence since our
@@ -22311,6 +22311,7 @@ pub fn render_orchestration_frame_to_buffer(
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                prompt_reports_unavailable: false,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -23102,6 +23103,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                prompt_reports_unavailable: false,
             },
         );
     }
@@ -25125,6 +25127,7 @@ mod tests {
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                prompt_reports_unavailable: false,
             },
         );
         state
@@ -28500,6 +28503,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            prompt_reports_unavailable: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -31281,6 +31285,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            prompt_reports_unavailable: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -32222,6 +32227,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            prompt_reports_unavailable: false,
         }
     }
 
@@ -32571,6 +32577,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            prompt_reports_unavailable: false,
         };
 
         // Spacious: get all 3
@@ -32608,6 +32615,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            prompt_reports_unavailable: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -32636,6 +32644,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            prompt_reports_unavailable: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -40381,7 +40390,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Write an orchestrator prompt into a Codex pane, then let a render pass run 8.45 s later — the latency issue #637 reports for a genuine Codex confirmation — before the agent's submission report arrives. No second write may reach the pane before that report, which then finalizes the role on the one write; separately, a pane whose report never comes is still re-submitted once the confirmation floor has passed.
+    /// Scenario: Write an orchestrator prompt into a Codex pane, then let a render pass run 8.45 s later — the latency issue #637 reports for a genuine Codex confirmation — before the agent's submission report arrives. No second write may reach the pane before that report, which then finalizes the role on the one write; separately, a pane whose report never comes is still re-submitted once the confirmation floor has passed — unless the pane's only producer is a `wrap` that declared Codex's native prompt hook untrusted, which gets exactly one write and a finalized role (issue #559).
     #[spec("prompt/pane-input/041")]
     #[test]
     fn pane_input_041_retry_waits_out_a_slow_genuine_confirmation() {
@@ -40496,6 +40505,143 @@ mod tests {
             "a delivery that is never confirmed must still be re-submitted once the floor passes \
              — the fix must not trade the double submit for a missing one"
         );
+
+        // Issue #559: the same never-confirmed delivery into a pane whose ONLY
+        // producer is `dot-agent-deck wrap` — production-shaped, so the pane's
+        // placeholder is untyped and `Codex` comes solely from the wrapper's own
+        // events. `prompt_reports_unavailable` is what the wrapper stamps when it
+        // could not record trust for Codex's native hooks.
+        let wrapper_only = |prompt_reports_unavailable: bool| {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+                InjectedSendOutcome::Applied,
+                attempts.clone(),
+            ));
+            let created = std::time::Instant::now();
+            let tab_id: TabId = 559;
+            let mut ui = default_ui();
+            ui.orchestration_prompt_anchor_at.insert(tab_id, created);
+            ui.orchestration_ready_since.insert(
+                tab_id,
+                created
+                    .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("ready timestamp"),
+            );
+            let snapshot =
+                wrapper_only_prompt_snapshot(PANE_ID, AGENT_ID, prompt_reports_unavailable);
+            let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+            let mut prompt = Some(PROMPT.to_string());
+            for offset in [
+                std::time::Duration::ZERO,
+                // A second past the floor, where the reporting control retries.
+                crate::prompt_delivery::SLOW_CONFIRMATION_LATENCY
+                    + std::time::Duration::from_secs(1),
+            ] {
+                deliver_orchestrator_prompt(
+                    &mut ui,
+                    pane.as_ref(),
+                    &snapshot,
+                    created.checked_add(offset).expect("pass timestamp"),
+                    tab_id,
+                    &[PANE_ID.to_string()],
+                    0,
+                    &mut role_statuses,
+                    &mut prompt,
+                );
+            }
+            (attempts.load(Ordering::SeqCst), prompt, role_statuses)
+        };
+
+        let (control_attempts, _, _) = wrapper_only(false);
+        assert_eq!(
+            control_attempts, 2,
+            "control: a wrapped Codex pane whose hooks WERE trusted keeps its retry — before its \
+             first submit the wrapper is its only producer too, so reading 'wrapper-only' as \
+             'cannot report' would take recovery away from every healthy Codex pane"
+        );
+        let (degraded_attempts, degraded_prompt, degraded_roles) = wrapper_only(true);
+        assert_eq!(
+            degraded_attempts, 1,
+            "a Codex pane whose only producer is the wrapper, and whose wrapper declared that \
+             Codex's native prompt hook is not trusted, had its delivered prompt submitted a \
+             second time — nothing on that pane can ever confirm it (issue #559)"
+        );
+        assert!(
+            degraded_prompt.is_none(),
+            "the one write is final for a pane that cannot report, so the prompt is not held"
+        );
+        assert_eq!(degraded_roles, [OrchestrationRoleStatus::Working]);
+    }
+
+    /// Issue #559: a pane whose only producer is `dot-agent-deck wrap` hosting
+    /// Codex — the shape a wrapped Codex pane has before its first submit, and
+    /// for its whole life when the wrapper could not record trust for Codex's
+    /// native hooks.
+    ///
+    /// Production-shaped where [`ready_prompt_snapshot`] is not: the placeholder
+    /// is UNTYPED (every spawn-time-prompt site inserts it with `None`; see
+    /// [`spawn_time_agent_ready`]), so the pane's `Codex` comes only from the
+    /// wrapper's own events. Those are the fork-time `SessionStart` and one
+    /// classified line, both under the wrapper's `{pane}-session` id and the
+    /// pane's agent id, exactly as `crate::wrap`'s emitter builds them. The
+    /// classified line carries the pane id, which advances the pane's hook
+    /// session, so issue #1005's readiness fast path is open here just as it is
+    /// for a real wrapped pane that has painted its interface.
+    /// `prompt_reports_unavailable` adds the marker the wrapper stamps on every
+    /// event when the trust step failed.
+    fn wrapper_only_prompt_snapshot(
+        pane_id: &str,
+        agent_id: &str,
+        prompt_reports_unavailable: bool,
+    ) -> AppState {
+        let mut snapshot = AppState::default();
+        snapshot.register_pane(pane_id.to_string());
+        snapshot.insert_placeholder_session(
+            pane_id.to_string(),
+            None,
+            None,
+            Some(agent_id.to_string()),
+        );
+        for (event_type, key, value) in [
+            (
+                EventType::SessionStart,
+                crate::event::SESSION_START_ORIGIN_METADATA_KEY,
+                crate::event::WRAPPER_FORK_SESSION_START_ORIGIN,
+            ),
+            (
+                EventType::Thinking,
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY,
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE,
+            ),
+        ] {
+            let mut metadata = HashMap::from([(key.to_string(), value.to_string())]);
+            if prompt_reports_unavailable {
+                metadata.insert(
+                    crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY.to_string(),
+                    crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE.to_string(),
+                );
+            }
+            snapshot.apply_event(AgentEvent {
+                session_id: format!("{pane_id}-session"),
+                agent_type: AgentType::Codex,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata,
+                pane_id: Some(pane_id.to_string()),
+                agent_id: Some(agent_id.to_string()),
+                agent_version: None,
+                schema_version: Some(crate::event::AGENT_EVENT_SCHEMA_VERSION),
+                live_target: Some(crate::event::LiveTarget {
+                    kind: crate::event::TargetKind::Pty,
+                    writable: crate::event::Writable::Live,
+                }),
+            });
+        }
+        snapshot
     }
 
     /// Scenario: Keep a seed prompt provisional after its PTY accepts the bytes, then inject matching text without an agent id, from another pane, and from before the write, plus unrelated target-pane text. None may confirm or disarm the retry; only fresh matching text carrying the target identity finalizes it.

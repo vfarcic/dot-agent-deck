@@ -827,6 +827,35 @@ pub struct CodexHookEntry {
     /// will also emit `true` is a **serde argument** — a field serialized
     /// unconditionally has no `skip_serializing_if` — and not a measurement.
     pub is_managed: Option<bool>,
+    /// The user's on/off toggle for this entry, from Codex's `/hooks` browser —
+    /// orthogonal to trust, and never written by the deck (issue #730). `None`
+    /// when the listing omitted it, which Codex itself reads as `true`
+    /// (measured on 0.149.0: a record carrying only `trusted_hash` reported
+    /// `enabled: true`).
+    ///
+    /// Issue #559: read to decide whether a trusted `UserPromptSubmit` will
+    /// actually run — a trusted but disabled prompt hook reports nothing, so a
+    /// wrapper must not vouch for it. See [`TrustOutcome::reports_prompts`].
+    pub enabled: Option<bool>,
+}
+
+impl CodexHookEntry {
+    /// The `<event_snake>` segment of [`Self::key`]
+    /// (`<sourcePath>:<event_snake>:<group_idx>:<handler_idx>`), read from the
+    /// right so a `:` inside the source path cannot shift it.
+    pub fn event_snake(&self) -> Option<&str> {
+        let mut parts = self.key.rsplitn(4, ':');
+        let (_handler, _group, event) = (parts.next()?, parts.next()?, parts.next()?);
+        parts.next()?;
+        Some(event)
+    }
+
+    /// Issue #559: is this Codex's `UserPromptSubmit` hook, switched on? The
+    /// one entry whose running is what lets a wrapped Codex pane confirm an
+    /// automatic prompt.
+    fn is_enabled_prompt_hook(&self) -> bool {
+        self.event_snake() == Some("user_prompt_submit") && self.enabled != Some(false)
+    }
 }
 
 /// Ask Codex itself for every hook it would load for `cwd` under `home`.
@@ -1252,6 +1281,7 @@ fn parse_hooks_list(response: &Value) -> std::io::Result<Vec<CodexHookEntry>> {
                 // opposite defaults, so the decision belongs there and not in
                 // the decoder. See `CodexHookEntry::is_managed`.
                 is_managed: hook.get("isManaged").and_then(Value::as_bool),
+                enabled: hook.get("enabled").and_then(Value::as_bool),
             });
         }
     }
@@ -1396,8 +1426,10 @@ pub fn deck_owned_entries<'a>(
 /// [`warn_if_our_own_entry_was_unrecognisable`] exists to break.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustOutcome {
-    /// `n` entries were trusted, `n >= 1`.
-    Trusted(usize),
+    /// `count` entries were trusted, `count >= 1`. `reports_prompts` says
+    /// whether one of them is the deck's `UserPromptSubmit` hook with the user's
+    /// toggle not off — see [`Self::reports_prompts`].
+    Trusted { count: usize, reports_prompts: bool },
     /// Nothing in Codex's listing was ELIGIBLE for a trust write — which is
     /// wider than "Codex enumerated no entry of the deck's" and must not be
     /// reported as that (Greptile P2 on PR #1029). Three ways in: the deck's
@@ -1422,9 +1454,28 @@ impl TrustOutcome {
     /// that only wants the count does not have to match.
     pub fn trusted(self) -> usize {
         match self {
-            Self::Trusted(count) => count,
+            Self::Trusted { count, .. } => count,
             Self::NothingListed | Self::Unrecognised { .. } => 0,
         }
+    }
+
+    /// Issue #559: will Codex report a submitted prompt through the deck's
+    /// hooks after this write — did it trust the deck's `UserPromptSubmit`
+    /// entry, and is that entry not switched off?
+    ///
+    /// Narrower than [`Self::trusted`] on purpose: a positive count can be made
+    /// entirely of OTHER hooks, and the deck preserves a user's
+    /// `enabled = false` on the prompt hook, so "some deck hook is trusted" is
+    /// not "prompts will be reported". `crate::wrap` stamps every event it emits
+    /// as unable to report when this is `false`.
+    pub fn reports_prompts(self) -> bool {
+        matches!(
+            self,
+            Self::Trusted {
+                reports_prompts: true,
+                ..
+            }
+        )
     }
 }
 
@@ -1467,11 +1518,14 @@ pub fn trust_deck_hooks_in(
 ) -> std::io::Result<TrustOutcome> {
     let expected = expected_hook_command(binary_path);
     let entries = list_hooks_in(home, cwd)?;
-    let records: Vec<(String, String)> =
-        deck_owned_entries(&entries, home, DeckCommandMatch::Exact(&expected))
-            .into_iter()
-            .map(|entry| (entry.key.clone(), entry.current_hash.clone()))
-            .collect();
+    let eligible = deck_owned_entries(&entries, home, DeckCommandMatch::Exact(&expected));
+    // Issue #559: taken from the same eligible set the records are, so it can
+    // only name an entry this call is about to trust.
+    let reports_prompts = eligible.iter().any(|entry| entry.is_enabled_prompt_hook());
+    let records: Vec<(String, String)> = eligible
+        .into_iter()
+        .map(|entry| (entry.key.clone(), entry.current_hash.clone()))
+        .collect();
     if records.is_empty() {
         // The warn is the diagnosis; its count is what tells the two causes of
         // zero apart, so the caller gets it too rather than having to read a log
@@ -1489,7 +1543,10 @@ pub fn trust_deck_hooks_in(
             upsert_trust_record(state, key, hash);
         }
     })?;
-    Ok(TrustOutcome::Trusted(records.len()))
+    Ok(TrustOutcome::Trusted {
+        count: records.len(),
+        reports_prompts,
+    })
 }
 
 /// Say something when a trust write recorded NOTHING even though the listing
@@ -1996,6 +2053,7 @@ mod tests {
             current_hash: "sha256:deadbeef".to_string(),
             trust_status: "untrusted".to_string(),
             is_managed: Some(false),
+            enabled: None,
         };
         let ours = home.path().join("hooks.json");
         let expected = expected_hook_command("/abs/dot-agent-deck");

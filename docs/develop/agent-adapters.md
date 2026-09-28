@@ -87,16 +87,16 @@ pub static ALL: &[&AgentSpec] = &[&CLAUDE_CODE, &OPEN_CODE, &PI, &CODEX];
 
 ### 3. Wire the integration strategy
 
-**If you are reusing the `Wrapper` strategy (the cheap path — Codex, Gemini):** you write *no new mechanism*, only *data*. Add a [`RuleSet`] in [`src/wrap.rs`](../../src/wrap.rs) and select it by agent type in `ruleset_for`:
+**If you are reusing the `Wrapper` strategy (the cheap path — Codex, Gemini):** you write *no new mechanism*, only *data*. Add a [`RuleSet`] in [`src/wrap.rs`](../../src/wrap.rs) and select it by agent type in `ruleset_for`. **Write its markers against a capture of the process the wrapper actually spawns**, not against a documented output mode it does not launch — Codex's set is the cautionary case (issue #540):
 
 ```rust
 pub static CODEX: RuleSet = RuleSet {
-    // `codex exec --json` emits one compact JSON object per line (JSONL); key
-    // card state off the record's `type` discriminator rather than guessing
-    // from free text. Matching the quoted discriminator keeps an incidental
-    // "error" inside reasoning/command text from flipping the card.
-    error_markers: &["\"type\":\"error\""],
-    idle_markers: &["\"type\":\"turn.completed\""],
+    // Interactive `codex` paints ANSI redraws and no JSON record, so there is
+    // no line that means "error" or "turn over". Empty rather than GENERIC:
+    // GENERIC's word markers would flip a working card to Error whenever the
+    // redrawn conversation mentions "error".
+    error_markers: &[],
+    idle_markers: &[],
 };
 
 fn ruleset_for(agent_type: &AgentType) -> &'static RuleSet {
@@ -111,7 +111,9 @@ The wrapper runtime (`run_wrap`, `tee`, `Detector`) does not change — the `Det
 
 #### Codex is a **hybrid**: native hooks under the wrapper (PRD #20 W1)
 
-Stdout scraping cannot reach full parity for *interactive* Codex — bare `codex` paints an ANSI TUI on stdout with no JSON, so the coarse `CODEX` `RuleSet` above can only ever see a wall of redraw text (it never reliably reaches `Idle`/`Error` mid-session and emits no tool/prompt detail). Codex 0.144.4, however, ships a **Claude-Code-compatible native hooks engine**. So Codex keeps `IntegrationStrategy::Wrapper` as its **PTY host + hook injector**, but its rich events come from **native hooks**, not the classifier — the `CODEX` `RuleSet` above is retained only as a coarse fallback.
+Stdout scraping cannot reach full parity for *interactive* Codex — bare `codex` paints an ANSI TUI on stdout with no JSON, so the classifier only ever sees a wall of redraw text: it reports that the TUI printed something, never `Idle` or `Error` mid-session, and no tool or prompt detail. Until issue #540 the `CODEX` set matched `codex exec --json`'s `"type":"error"` / `"type":"turn.completed"` records, which read as a working classification path while matching nothing the spawned process prints — issue #540's direct PTY captures of an idle boot and of a full turn found no JSON record at all. Codex 0.144.4, however, ships a **Claude-Code-compatible native hooks engine**. So Codex keeps `IntegrationStrategy::Wrapper` as its **PTY host + hook injector**, but its rich events come from **native hooks**, not the classifier, and outside them a wrapped Codex card settles at process exit.
+
+**What the classifier's events prove, and what they do not.** Every event the classifier emits is marked `wrapper_output_classified` (issue #714): it proves output, not work, so it cannot clear a Blocked card. And no wrapper event ever carries a submitted prompt — the emitter hardcodes `user_prompt: None` — so whether a wrapped Codex pane can confirm an automatic prompt depends entirely on its native `UserPromptSubmit` hook. When the trust step in item 2 below does not trust the deck's own `UserPromptSubmit` entry with the user's `/hooks` toggle on — it could not run, recorded nothing, recorded only other hooks, or found the prompt hook switched off — the wrapper stamps `wrapper_prompt_reports_unavailable` on everything it emits, and both delivery implementations read that pane as unable to report: the prompt is written once and never retried (issue #559). The marker can only withdraw standing — a forged one makes a pane write once instead of retrying, and its absence proves nothing.
 
 Concretely, when the deck starts (and again whenever the wrapper launches a real `codex`):
 
@@ -160,7 +162,7 @@ Two mechanisms make that true:
 
 Note `dot-agent-deck wrap --agent claude -- codex` installs no Codex hooks and records no trust — the Codex path is gated on Codex *identity*, not on the program name. And the deck never resolves or verifies the executable: with the bypass gone there is nothing dangerous to hand out, so no launch form has to be rejected for being unrecognizable.
 
-If Codex still won't run the deck's hooks, the usual cause is a launcher that re-exports `CODEX_HOME` (the deck's pin only reaches the child it spawns) — drop that re-export, or trust the deck's hooks once through Codex's interactive `/hooks` review in that home. Until then the card falls back to the coarse stdout classifier: degraded status, no tool/prompt detail.
+If Codex still won't run the deck's hooks, the usual cause is a launcher that re-exports `CODEX_HOME` (the deck's pin only reaches the child it spawns) — drop that re-export, or trust the deck's hooks once through Codex's interactive `/hooks` review in that home. Until then the card falls back to the coarse stdout classifier: degraded status, no tool/prompt detail. When it is the wrapper's own trust step that failed, automatic prompts into that pane are also written once and not retried — see *What the classifier's events prove* above. A `CODEX_HOME` re-export is **not** caught that way (issue #559's residual): the wrapper did record trust, in the home it pinned, so it declares nothing, and the deck keeps treating the pane as able to confirm a delivery through hooks that never fire.
 
 #### The readiness contract every Wrapper adapter must satisfy (PRD #225)
 
@@ -296,8 +298,8 @@ Because the card renderer reads `agent_registry::spec(&session.agent_type).badge
 Adding an agent is only "done" when it is covered at every layer the shipped agents are. Mirror the Codex test set:
 
 - **Fast-tier unit tests** for the registry identity and detection — that the new type resolves from its basename, the `AgentSpec` fields are what you expect, and the strategy is correct. See [`tests/codex_adapter.rs`](../../tests/codex_adapter.rs) (`codex_detect_001_registry_identity_is_complete`).
-- **Wrapper `RuleSet` classification tests** (if reusing the wrapper) — that realistic agent output lines map to the right `DetectedEvent`. See the JSONL cases in `codex_adapter.rs` (`codex_wrap_001_jsonl_output_maps_to_dashboard_states`) and the pure-function tests in `src/wrap.rs`.
-- **A synthetic e2e** (`e2e_*.rs`, gated by `#[cfg(feature = "e2e")]`) — a PTY-attached test driving a deterministic stand-in that emits realistic agent output, asserting the event stream *and* the visible dashboard card. See `codex_wrap_001_synthetic_jsonl_reaches_dashboard` in [`tests/e2e_codex_wrapper.rs`](../../tests/e2e_codex_wrapper.rs).
+- **Wrapper `RuleSet` classification tests** (if reusing the wrapper) — that realistic agent output lines map to the right `DetectedEvent`. See `codex_adapter.rs` (`codex_wrap_001_codex_output_is_activity_only`, which pins that interactive Codex output never classifies as `Error` or `Idle`) and the pure-function tests in `src/wrap.rs`.
+- **A synthetic e2e** (`e2e_*.rs`, gated by `#[cfg(feature = "e2e")]`) — a PTY-attached test driving a deterministic stand-in that emits realistic agent output, asserting the event stream *and* the visible dashboard card. See `codex_wrap_001_synthetic_codex_reaches_dashboard` in [`tests/e2e_codex_wrapper.rs`](../../tests/e2e_codex_wrapper.rs).
 - **A real-agent e2e** — the same PTY-attached shape, but driving the *real* agent on a **cheap model** through a cheap, deterministic-enough operation (list a directory and report a uniquely-named fixture **sentinel file**, so the assertion survives LLM phrasing variance). See `codex_live_001_real_model_lists_sentinel_in_wrapped_pane`. Real-agent tests live in **lane 2** — the `e2e-live` half of the L2 suite, which since issue #502 runs on a developer's machine and **nowhere in CI**, because no test that reaches a real agent runs on a runner ([`e2e-lanes.md`](e2e-lanes.md)). So a new adapter's real-agent test is only as good as the last time somebody ran `cargo test-e2e-live <filter>`: run it yourself before trusting it, and again whenever you touch the adapter. [CLAUDE.md rule 4](../../CLAUDE.md) is the bar: **at least one test per major feature must validate it as a user actually uses and sees it.**
 - **A skip harness** — add a `check_<agent>_available` helper (and credential import if the agent needs auth) to [`tests/common/mod.rs`](../../tests/common/mod.rs), modelled on `check_codex_available`, so a missing/unauthenticated CLI cleanly *skips* the real-agent test rather than failing it. Keep the model the gate probes and the model the tests launch the SAME value (for Codex, `common::codex_test_model()`), or the suite can skip for a reason the scenario would not have hit — a skip reads as a pass, so a wrong gate is silent no-coverage. That helper's default (`gpt-5.1-codex-mini`) is reachable only with **ChatGPT-subscription** Codex credentials; a host whose `~/.codex/auth.json` is an **API key** gets `404 Not Found: Model not found` from `/v1/responses` for the whole `codex-*` family, so on such a host export `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5-nano` (or any cheap model the key can reach) to run the real-Codex tests.
 
