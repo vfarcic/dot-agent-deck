@@ -1960,42 +1960,43 @@ impl TuiDeck {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        // The hook reports the submitted text truncated to 200 bytes, so the
+        // match catches a prefix submitted short of that and a garbled one; a
+        // longer prefix is what the tail wait above exists to prevent.
+        // Trailing whitespace is ignored: a `\r` taken as a newline before a
+        // later Enter submitted is the case the retry exists for.
+        let is_ours = |e: &dot_agent_deck::event::AgentEvent| {
+            e.user_prompt.as_deref().is_some_and(|reported| {
+                dot_agent_deck::prompt_delivery::prompt_submission_matches(
+                    prompt,
+                    reported.trim_end(),
+                )
+            })
+        };
+        // Submissions reported since typing began. The FIRST one carrying THIS
+        // prompt is the answer, rather than the first by position: an earlier
+        // turn's event delivered late — after the count above, before the
+        // keystrokes — then cannot stand in for ours, and cannot fail the
+        // helper either, because its text does not match (PR #1408 review).
+        let since_typing = || -> Vec<dot_agent_deck::event::AgentEvent> {
+            events
+                .snapshot()
+                .into_iter()
+                .filter(|e| is_submit(e))
+                .skip(before)
+                .collect()
+        };
         let mut enters = 0_usize;
         loop {
             self.send_keys(b"\r");
             enters += 1;
             let attempt_end = (Instant::now() + CLAUDE_SUBMIT_RETRY).min(deadline);
             while Instant::now() < attempt_end {
-                if let Some(ev) = events
-                    .snapshot()
-                    .into_iter()
-                    .filter(|e| is_submit(e))
-                    .nth(before)
-                {
+                if let Some(ev) = since_typing().into_iter().find(|e| is_ours(e)) {
                     if enters > 1 {
                         eprintln!(
                             "[harness] submit_claude_prompt: Claude Code accepted the prompt \
                              only after Enter #{enters}"
-                        );
-                    }
-                    // The hook reports the submitted text truncated to 200
-                    // bytes, so this catches a prefix submitted short of that
-                    // and a garbled one; a longer prefix is what the tail wait
-                    // above exists to prevent. Trailing whitespace is ignored:
-                    // a `\r` taken as a newline before a later Enter submitted
-                    // is the case the retry exists for.
-                    if let Some(reported) = ev.user_prompt.as_deref() {
-                        // Always `Some` here — `is_submit` requires it.
-                        assert!(
-                            dot_agent_deck::prompt_delivery::prompt_submission_matches(
-                                prompt,
-                                reported.trim_end()
-                            ),
-                            "PROMPT PARTIALLY DELIVERED: Claude Code submitted {reported:?}, \
-                             which is not the prompt the test typed ({prompt:?}), so what the \
-                             agent does next is not evidence about the calling test's \
-                             assertions.\nFinal grid:\n{}",
-                            self.snapshot_grid()
                         );
                     }
                     return ev;
@@ -2003,6 +2004,19 @@ impl TuiDeck {
                 std::thread::sleep(Duration::from_millis(20));
             }
             if Instant::now() >= deadline {
+                let others: Vec<String> = since_typing()
+                    .into_iter()
+                    .filter_map(|e| e.user_prompt)
+                    .collect();
+                if !others.is_empty() {
+                    panic!(
+                        "PROMPT PARTIALLY DELIVERED: within {budget:?} Claude Code submitted \
+                         {others:?}, none of which is the prompt the test typed ({prompt:?}), \
+                         so what the agent does next is not evidence about the calling test's \
+                         assertions.\nFinal grid:\n{}",
+                        self.snapshot_grid()
+                    );
+                }
                 panic!(
                     "PROMPT NOT DELIVERED: the prompt is on screen but {enters} Enter(s) within \
                      {budget:?} of typing it produced no UserPromptSubmit (Thinking) event for \
