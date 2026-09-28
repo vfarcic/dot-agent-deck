@@ -6799,11 +6799,14 @@ mod tests {
     /// rather than a coincidence.
     fn prepared_orchestration() -> PreparedOrchestration {
         PreparedOrchestration {
-            context_path: "/canonical/project/.dot-agent-deck/orchestrator-context.md".into(),
+            context_path: "/canonical/project/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md"
+                .into(),
             path: "/canonical/project".into(),
             token: "prep-token-1".into(),
             roles: vec![config_role("planner", true), config_role("builder", false)],
-            prompt: "Read .dot-agent-deck/orchestrator-context.md and carry out your task.".into(),
+            prompt: "Read .dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md and \
+                     carry out your task."
+                .into(),
         }
     }
 
@@ -7526,7 +7529,7 @@ command = "configured-planner"
             [Ok(SendResult::NoLiveTarget), Ok(SendResult::Applied)],
             Ok(SendResult::Applied),
         );
-        let seed = "Read .dot-agent-deck/orchestrator-context.md and wait.";
+        let seed = "Read .dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md and wait.";
 
         let launched = launch_orchestration(
             &daemon,

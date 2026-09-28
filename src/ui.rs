@@ -4205,6 +4205,25 @@ fn schedule_send_retry(
     entry.next_attempt_at = now + send_retry_delay(entry.attempts);
 }
 
+/// Issue #1233: point an orchestration tab at the context file its re-arm just
+/// published, and remove the file it replaced.
+///
+/// Published context files are never rewritten, so every re-arm publishes a new
+/// one, and the tab's previous file is no longer named by anything the tab will
+/// deliver. The removal is best effort; a file it misses is swept once it ages
+/// past the coordination retention window
+/// (`orchestrator_context::is_sweepable_coordination_name`).
+fn replace_orchestration_context_path(
+    slot: &mut Option<std::path::PathBuf>,
+    new: std::path::PathBuf,
+) {
+    if let Some(old) = slot.replace(new)
+        && slot.as_deref() != Some(old.as_path())
+    {
+        let _ = std::fs::remove_file(&old);
+    }
+}
+
 /// PRD #20 R20-003/R20-004: capture the delivery identity for an automatic
 /// prompt just queued for `pane_id` — the daemon agent id currently bound to the
 /// pane (so a later respawn/rebind is caught daemon-side), the current session id
@@ -11016,12 +11035,20 @@ fn dispatch_action(
                     // opened by the person now looking at it, so the template's
                     // user gates mean what they say. `Attended` + no task is
                     // byte-for-byte the pre-#222 text.
-                    let prompt = prepare_orchestrator_prompt(
+                    let published = prepare_orchestrator_prompt(
                         &orch_config,
                         &dir_str,
                         None,
                         Attendance::Attended,
                     );
+                    // Issue #1233: the tab keeps the file its prompt names, so
+                    // a compaction or `/clear` re-arm reads the task back from
+                    // this orchestration's own context rather than from the
+                    // project's shared mirror.
+                    let (prompt, context_path) = match published {
+                        Some(p) => (Some(p.prompt), Some(p.context_path)),
+                        None => (None, None),
+                    };
                     // PRD #89 M2b.2: keep a copy of the prepared prompt for the
                     // capture snapshot below — `prompt` itself is moved into
                     // `open_orchestration_tab`. Empty when the orchestration
@@ -11063,7 +11090,8 @@ fn dispatch_action(
                         display_title.as_deref(),
                         spawn_dims,
                     ) {
-                        Ok((_tab_idx, role_pane_ids)) => {
+                        Ok((tab_idx, role_pane_ids)) => {
+                            tab_manager.set_orchestration_context_path(tab_idx, context_path);
                             // PRD #110 followup: snapshot each role
                             // pane's daemon agent_id before the
                             // placeholder insert so the strict-
@@ -14566,6 +14594,7 @@ pub fn run_tui(
                 orchestrator_prompt,
                 config,
                 cwd,
+                context_path,
                 ..
             } = tab
             {
@@ -14653,7 +14682,8 @@ pub fn run_tui(
                         // The former reads that section back off the existing
                         // file first and carries it forward, falling back to
                         // today's no-task behavior when there is none.
-                        && let Some(prompt) = reassert_orchestrator_prompt(config, cwd)
+                        && let Some(published) =
+                            reassert_orchestrator_prompt(config, cwd, context_path.as_deref())
                     {
                         // This re-arm may be SUPERSEDING a still-open cycle
                         // that already landed a write and is only waiting on
@@ -14672,7 +14702,8 @@ pub fn run_tui(
                         ui.prompt_delivery.remove(start_pane_id.as_str());
                         ui.orchestration_ready_since.remove(id);
 
-                        *orchestrator_prompt = Some(prompt);
+                        *orchestrator_prompt = Some(published.prompt);
+                        replace_orchestration_context_path(context_path, published.context_path);
                         ui.orchestration_prompted.remove(id);
                         // Re-anchor the delivery deadline to NOW:
                         // `deliver_orchestrator_prompt` abandons once
@@ -14720,6 +14751,7 @@ pub fn run_tui(
                 orchestrator_prompt,
                 config,
                 cwd,
+                context_path,
                 ..
             } = tab
             {
@@ -14805,12 +14837,18 @@ pub fn run_tui(
                         // rewriting, so a dispatched orchestration's task
                         // survives a `/clear` re-assertion instead of being
                         // silently replaced with the no-task pointer.
-                        if let Some(prompt) = reassert_orchestrator_prompt(config, cwd) {
+                        if let Some(published) =
+                            reassert_orchestrator_prompt(config, cwd, context_path.as_deref())
+                        {
                             ui.send_retry_backoff.remove(start_pane_id.as_str());
                             ui.prompt_delivery.remove(start_pane_id.as_str());
                             ui.orchestration_ready_since.remove(id);
 
-                            *orchestrator_prompt = Some(prompt);
+                            *orchestrator_prompt = Some(published.prompt);
+                            replace_orchestration_context_path(
+                                context_path,
+                                published.context_path,
+                            );
                             ui.orchestration_prompted.remove(id);
                             ui.orchestration_prompt_anchor_at.insert(*id, orch_now);
                             ui.orchestration_remit_clear_reasserted_at
@@ -28718,12 +28756,20 @@ mod tests {
         let cwd = dir.path().to_str().unwrap();
         let prompt = prepare_orchestrator_prompt(&config, cwd, None, Attendance::Attended);
         assert!(prompt.is_some());
-        let prompt = prompt.unwrap();
-        // One-liner referencing the file.
-        assert!(prompt.contains("orchestrator-context.md"));
+        let published = prompt.unwrap();
+        let prompt = published.prompt;
+        // One-liner referencing the file this publish wrote (issue #1233), by
+        // its path relative to the project.
+        let file_path = published.context_path;
+        let file_name = file_path.file_name().unwrap().to_str().unwrap();
+        assert!(file_name.starts_with("orchestrator-context-") && file_name.ends_with(".md"));
+        assert!(prompt.contains(&format!(".dot-agent-deck/{file_name}")));
         assert!(!prompt.contains('\n'));
         // File was written with full content.
-        let file_path = dir.path().join(".dot-agent-deck/orchestrator-context.md");
+        assert_eq!(
+            file_path.parent(),
+            Some(dir.path().join(".dot-agent-deck").as_path())
+        );
         assert!(file_path.exists());
         let content = std::fs::read_to_string(file_path).unwrap();
         assert!(content.contains("Available agents"));

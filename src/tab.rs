@@ -198,6 +198,17 @@ pub enum Tab {
         /// `(cwd, name)` tuple that cannot tell two same-named, same-cwd
         /// orchestration instances apart.
         orchestration_id: Option<String>,
+        /// Issue #1233: the per-publish coordinator-context file this tab's
+        /// pending or last delivered prompt names, so the compaction and
+        /// `/clear` re-arm reads the task back from this orchestration's own
+        /// file (`orchestrator_context::reassert_orchestrator_prompt`). Set when
+        /// the TUI's `Ctrl+n` opens the tab and replaced by every re-arm.
+        /// `None` for a tab rebuilt from the daemon's records
+        /// ([`TabManager::open_orchestration_tab_with_existing_role_panes`]):
+        /// the daemon does not record the path yet, so such a tab re-arms from
+        /// the project's compatibility mirror, as before #1233 — follow-up
+        /// #1395.
+        context_path: Option<std::path::PathBuf>,
     },
 }
 
@@ -1160,12 +1171,28 @@ impl TabManager {
             // than minting a second one — this tab's identity and its role
             // panes' daemon-side identity must be the same token.
             orchestration_id: Some(orchestration_id.clone()),
+            // Issue #1233: set by the caller that published the context
+            // (`set_orchestration_context_path`), which knows the file.
+            context_path: None,
         });
 
         let index = self.tabs.len() - 1;
         self.active_index = index;
 
         Ok((index, role_pane_ids))
+    }
+
+    /// Issue #1233: record which per-publish context file the orchestration tab
+    /// at `index` was opened with ([`Tab::Orchestration`]'s `context_path`). A
+    /// no-op for any other tab or an index out of range.
+    pub fn set_orchestration_context_path(
+        &mut self,
+        index: usize,
+        path: Option<std::path::PathBuf>,
+    ) {
+        if let Some(Tab::Orchestration { context_path, .. }) = self.tabs.get_mut(index) {
+            *context_path = path;
+        }
     }
 
     /// PRD #76 M2.12: hydration entry point for mode tabs. Same flow as
@@ -1316,6 +1343,9 @@ impl TabManager {
             // a hydrated/restored tab comes back with the full supervisory view.
             zoomed: false,
             orchestration_id: orchestration_id.map(str::to_string),
+            // Issue #1233: the daemon's records carry no context path yet, so a
+            // hydrated tab re-arms from the compatibility mirror (#1395).
+            context_path: None,
         });
 
         let index = self.tabs.len() - 1;
@@ -2508,6 +2538,7 @@ mod tests {
             split_narrow: false,
             zoomed: false,
             orchestration_id: None,
+            context_path: None,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -2542,6 +2573,7 @@ mod tests {
             split_narrow: false,
             zoomed: false,
             orchestration_id: None,
+            context_path: None,
         };
         assert_eq!(
             crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(1)),

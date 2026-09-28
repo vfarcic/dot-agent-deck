@@ -433,6 +433,22 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// cached handshake rather than a fresh one. No existing field changed
 /// meaning: a request that sets none of them is answered as before.
 ///
+/// **Issue #1233 contributes no bump for giving each preparation its own
+/// coordinator-context file.** Nothing on the wire moved:
+/// [`crate::event::PreparedOrchestration`]'s `context_path` and `prompt` keep
+/// their shape and their documented meaning — where this preparation's context
+/// was published, and the line that points the coordinator at it — and only the
+/// file name they carry changed, from the fixed `orchestrator-context.md` to
+/// `orchestrator-context-<32 hex>.md`. A desktop of either age delivers the
+/// `prompt` it is handed verbatim. The pairing that could have regressed is an
+/// older TUI re-arming a daemon-published orchestration after compaction, which
+/// reads the task back from the fixed name; the daemon still refreshes that name
+/// as a compatibility mirror, so that pairing keeps exactly its pre-#1233
+/// behaviour. Every pairing is today's behaviour or better, so no
+/// [`CONTRACT_BREAKS`] entry and no `.breaking.md` for this half of the issue.
+/// Retiring the mirror is follow-up #1395, and is the point at which that
+/// pairing has to be argued again.
+///
 /// # Where this constant is enforced
 ///
 /// **Exactly one call site refuses on it: the desktop.**
@@ -9179,14 +9195,18 @@ mod tests {
     /// Issue #1045: a preparation to put on the wire in the tests below.
     fn sample_prepared() -> crate::event::PreparedOrchestration {
         crate::event::PreparedOrchestration {
-            context_path: "/p/.dot-agent-deck/orchestrator-context.md".into(),
+            context_path:
+                "/p/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md".into(),
             path: "/p".into(),
             token: "prep-1".into(),
             roles: vec![crate::event::ProjectRole {
                 name: "orchestrator".into(),
                 start: true,
             }],
-            prompt: "Read .dot-agent-deck/orchestrator-context.md for your role.".into(),
+            prompt:
+                "Read .dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md \
+                     for your role."
+                    .into(),
         }
     }
 

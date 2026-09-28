@@ -1467,7 +1467,7 @@ mod tests {
     /// A pure composer test rather than a spawned one: the single-agent prompt is
     /// delivered into a PTY and never written to disk, so there is no artefact to
     /// assert on the way the orchestration test asserts on
-    /// `orchestrator-context.md`. `dispatch/return/003` covers the same
+    /// `orchestrator-context-<id>.md`. `dispatch/return/003` covers the same
     /// instruction arriving at a real dispatched unit end to end.
     #[test]
     fn a_single_dispatch_prompt_tells_the_unit_to_report_when_it_finishes() {
@@ -1737,10 +1737,24 @@ mod tests {
             result.message
         );
 
-        let context = worktree.join(".dot-agent-deck/orchestrator-context.md");
+        // Issue #1233: the orchestration's own per-publish file, not the
+        // compatibility mirror beside it.
+        let context = std::fs::read_dir(worktree.join(".dot-agent-deck"))
+            .expect("list the dispatched worktree's .dot-agent-deck")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(crate::orchestrator_context::CONTEXT_FILE_PREFIX)
+                            && name.ends_with(".md")
+                    })
+            })
+            .expect("the dispatched orchestration must publish its own context file");
         let content = std::fs::read_to_string(&context).unwrap_or_else(|e| {
             panic!(
-                "the dispatched orchestration must get an orchestrator-context.md at {} \
+                "the dispatched orchestration must get a context file at {} \
                  (its absence is exactly why workers sat idle): {e}",
                 context.display()
             )

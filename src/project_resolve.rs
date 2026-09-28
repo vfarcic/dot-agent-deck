@@ -1013,15 +1013,21 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
 /// **What the returned token binds, and why that is not a detail.** PRD #819's
 /// original design had this issue a token recording only its issuance time, and
 /// the audit of the finished branch showed that binds nothing usable: the
-/// orchestrator context is published at a path fixed per project, so a second
-/// preparation in the same project replaces the first's artifact while the
-/// first's token is still inside its TTL. The record now carries the canonical
-/// directory and its inode identity, the config revision, the orchestration and
-/// the published bytes' digest and inode ([`crate::prep_token::PrepBinding`]),
-/// and every spawn presenting the token re-checks all of it
-/// ([`revalidate_preparation`]). The **second** preparation is the one whose
-/// artifact is on disk and whose token validates; the first is refused at its
-/// spawn rather than launched against the wrong brief.
+/// orchestrator context was then published at a path fixed per project, so a
+/// second preparation in the same project replaced the first's artifact while
+/// the first's token was still inside its TTL. The record now carries the
+/// canonical directory and its inode identity, the config revision, the
+/// orchestration and the published bytes' digest and inode
+/// ([`crate::prep_token::PrepBinding`]), and every spawn presenting the token
+/// re-checks all of it ([`revalidate_preparation`]).
+///
+/// **Since issue #1233 each preparation publishes its own file**
+/// (`orchestrator-context-<32 hex>.md`), and the prompt it returns names that
+/// file, so two preparations in one project each keep their own context and both
+/// tokens stay valid — including after the first launch's last role has started,
+/// the window the binding alone could not cover. The fixed
+/// `orchestrator-context.md` is refreshed afterwards as a compatibility mirror
+/// and is bound by nothing.
 ///
 /// **One canonical string, carried end to end.** `path` is canonicalised once,
 /// here, and the same `PathBuf` is what the config is read from, what the
@@ -1165,8 +1171,8 @@ pub fn prepare_orchestration_for_wire(
     // --- bind the record to what was just approved.
     //
     // PRD #819's audit finding: a token that records only its issuance time
-    // binds nothing, so a launch can present a live token and spawn against an
-    // artifact some *other* preparation published at the same fixed path. The
+    // binds nothing, so a launch could present a live token and spawn against an
+    // artifact some *other* preparation published at the then-fixed path. The
     // record therefore carries the canonical directory and its inode identity,
     // the config revision resolved against, the orchestration, and the exact
     // published bytes' digest and inode — and every spawn presenting the token
@@ -1214,9 +1220,11 @@ pub fn prepare_orchestration_for_wire(
 /// **These checks are PRD #819's audit fix, and without them the token means
 /// nothing at all.** The original design recorded only
 /// `(token, issued_at)`, so nothing here was possible: two clients preparing in
-/// the same project overwrite one fixed file, both tokens stay inside the TTL,
-/// and the earlier launch spawns a coordinator pointed at a path now holding the
-/// later client's brief. The record now carries what it approved
+/// the same project overwrote one fixed file, both tokens stayed inside the TTL,
+/// and the earlier launch spawned a coordinator pointed at a path then holding
+/// the later client's brief. (Issue #1233 has since given each preparation a
+/// file of its own, so that interleaving no longer replaces anything; these
+/// checks now catch a context changed by something other than a preparation.) The record now carries what it approved
 /// ([`crate::prep_token::PrepBinding`]) and this function re-checks every part
 /// of it:
 ///
@@ -1227,8 +1235,8 @@ pub fn prepare_orchestration_for_wire(
 /// 3. the config still reads and its [`config_revision`] is unchanged;
 /// 4. the orchestration is still defined, with roles, under the prepared name;
 /// 5. the published coordinator context is the same **inode** and the same
-///    **bytes** — which is what catches the interleaving above, since a second
-///    publish `rename(2)`s a fresh inode over the destination.
+///    **bytes** — a file deleted and recreated under its name, or rewritten in
+///    place, is caught.
 ///
 /// **It is the conjunction that carries the claim, not any single check**, and
 /// two of them are individually defeasible: an inode number is reusable
@@ -1530,9 +1538,10 @@ pub enum PreparationStale {
     ContextNotRegularFile,
     /// What sits there is larger than this daemon publishes.
     ContextTooLarge,
-    /// Same path, different inode — which is what a second publish's
-    /// `rename(2)` produces, and therefore the interleaving case PRD #819's
-    /// audit found.
+    /// Same path, different inode — the file was deleted and recreated. Before
+    /// issue #1233 this was what a second preparation's publish produced (the
+    /// interleaving PRD #819's audit found); a publish now writes a file of its
+    /// own, so it is what something other than the deck produces.
     ContextReplaced,
     /// Same inode, different bytes — an in-place rewrite, which a `>` redirect
     /// or another tool's `fs::write` performs.
@@ -1993,6 +2002,24 @@ command = "cat"
     /// disclosure tests are asserting against a payload that genuinely reaches
     /// the error, not one the renderer happens to omit.
     const MALFORMED: &str = "bogus = \u{1b}[31mPWNED\u{1b}[0m\n";
+
+    /// Every `orchestrator-context*` entry in `dir`'s `.dot-agent-deck` — the
+    /// per-publish files and the compatibility mirror alike (issue #1233).
+    fn published_contexts(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir.join(crate::orchestrator_context::CONTEXT_DIR_NAME))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("orchestrator-context")
+                    })
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 
     fn write_project(dir: &Path, toml: &str) {
         std::fs::write(dir.join(CONFIG_FILE_NAME), toml).expect("seed project config");
@@ -2705,9 +2732,7 @@ command = "cat"
         let project = root.join("staleness-project");
         std::fs::create_dir_all(&project).expect("create the project dir");
         write_project(&project, SMALL_PROJECT);
-        let context = project
-            .join(crate::orchestrator_context::CONTEXT_DIR_NAME)
-            .join(crate::orchestrator_context::CONTEXT_FILE_NAME);
+        let context_dir = project.join(crate::orchestrator_context::CONTEXT_DIR_NAME);
 
         let stale = config_revision("something else entirely");
         let refusal = prepare_orchestration_for_wire(
@@ -2723,9 +2748,9 @@ command = "cat"
             "expected the stable stale-revision code, got {refusal}"
         );
         assert!(
-            !context.exists(),
-            "the revision check must run before the publish, but {} was written",
-            context.display()
+            published_contexts(&project).is_empty(),
+            "the revision check must run before the publish, but {} holds a context",
+            context_dir.display()
         );
 
         // The matching revision goes through, so the refusal above is about
@@ -2741,7 +2766,8 @@ command = "cat"
             &[],
         )
         .expect("a matching revision must be accepted");
-        assert_eq!(Path::new(&prepared.context_path), context);
+        let context = Path::new(&prepared.context_path);
+        assert_eq!(context.parent(), Some(context_dir.as_path()));
         assert!(context.is_file(), "and the context is published");
         assert!(
             !prepared.token.is_empty(),
@@ -2810,10 +2836,12 @@ command = "cat"
         .expect("a launch through the alias must resolve and publish");
 
         assert_eq!(
-            Path::new(&prepared.context_path),
-            project
-                .join(crate::orchestrator_context::CONTEXT_DIR_NAME)
-                .join(crate::orchestrator_context::CONTEXT_FILE_NAME),
+            Path::new(&prepared.context_path).parent(),
+            Some(
+                project
+                    .join(crate::orchestrator_context::CONTEXT_DIR_NAME)
+                    .as_path()
+            ),
             "the context must land under the canonical directory, not under the alias"
         );
         assert!(
