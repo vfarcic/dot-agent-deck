@@ -4687,6 +4687,11 @@ fn window_ends_capture(event: &tauri::WindowEvent) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Issue #1350: the decks a pre-#1350 build kept in `desktop.toml` move to
+    // the shared `remotes.toml` here, once per launch and before anything below
+    // reads a snapshot — `appearance::init()` is the first — so the first
+    // snapshot already shows them and `load_snapshot` stays read-only.
+    settings::migrate_legacy_decks();
     let app = tauri::Builder::default()
         .manage(DesktopState::default())
         // PRD #802 M7: the capture session. Opens no device until a `start`.
@@ -5673,6 +5678,10 @@ mod tests {
     /// user could do about it from inside this app.
     #[test]
     fn a_refused_inhibit_does_not_take_voice_with_it() {
+        // `voice_status` reads the speech settings through `load_snapshot`, so
+        // point it at files this test owns rather than the developer's real
+        // `desktop.toml` and `remotes.toml` (issue #1350).
+        let _settings = crate::settings::IsolatedSettingsEnv::new();
         let source =
             voice::StubSource::tone(voice::AudioFormat::new(voice::TARGET_SAMPLE_RATE, 1), 1.0);
         let voice_state = VoiceState {

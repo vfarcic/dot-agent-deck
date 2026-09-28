@@ -2236,17 +2236,19 @@ pub fn load_snapshot() -> DesktopSettingsSnapshot {
 ///
 /// The remote decks come from `remotes.toml`, not from `desktop.toml`: the rows
 /// in [`EndpointSettings::remote`] are what [`crate::decks::load_rows`] read
-/// there, and `desktop.toml` supplies the selection. A document a pre-#1350
-/// build wrote still carries its `[[endpoints.remote]]` rows, and this is where
-/// they move — once, see [`migrate_legacy_rows`]. A deck list that cannot be
+/// there, and `desktop.toml` supplies the selection. A deck list that cannot be
 /// read is logged and yields no remote decks rather than failing the load;
 /// every edit to it refuses until it is fixed, so nothing is lost.
+///
+/// **Read-only.** This is polled — up to four times a second while voice
+/// control is listening — so it writes nothing. A document a pre-#1350 build
+/// wrote still carries its `[[endpoints.remote]]` rows; those move once, at
+/// startup and before the first snapshot, in [`migrate_legacy_decks`], never
+/// here.
 pub(crate) fn load_snapshot_at(path: &Path, remotes: &Path) -> DesktopSettingsSnapshot {
     let (mut settings, problem) = load_document(path);
     if let Some(problem) = &problem {
         log_document_problem(problem);
-    } else {
-        migrate_legacy_rows(path, remotes, &mut settings);
     }
     attach_deck_rows(&mut settings, remotes);
     DesktopSettingsSnapshot {
@@ -3088,21 +3090,33 @@ fn attach_deck_rows(settings: &mut DesktopSettings, remotes: &Path) {
     }
 }
 
+/// [`migrate_legacy_decks_at`] against [`settings_path`] and the shared deck
+/// list. Called once, from `run()`, before anything reads a snapshot — so the
+/// first snapshot served already shows the moved decks, and [`load_snapshot`]
+/// never has to write (issue #1350).
+pub fn migrate_legacy_decks() {
+    migrate_legacy_decks_at(&settings_path(), &crate::decks::remotes_path());
+}
+
 /// Move the `[[endpoints.remote]]` rows a pre-#1350 build kept in the settings
 /// document at `path` into the deck list at `remotes`, once (issue #1350).
 ///
 /// **Order is the crash-safety argument.** `remotes.toml` is written first,
 /// then the rows are removed from `desktop.toml`. A crash between the two
-/// leaves the rows in both, and the next load runs this again — which adds
+/// leaves the rows in both, and the next launch runs this again — which adds
 /// nothing, because [`crate::decks::migrate`] skips a row whose id the deck
 /// list already holds. The reverse order could lose a deck.
 ///
 /// A selection naming a row that merged into an existing deck with an id of its
-/// own is re-pointed at that id, in the document and in `settings`, so the
-/// selected deck survives. A failure is logged and leaves both files as they
-/// were for the next launch to retry.
-fn migrate_legacy_rows(path: &Path, remotes: &Path, settings: &mut DesktopSettings) {
-    let Some(endpoints) = settings.endpoints.as_mut() else {
+/// own is re-pointed at that id in the document, so the selected deck survives.
+/// A document this build cannot read is left alone, and any failure is logged
+/// and leaves both files as they were for the next launch to retry.
+pub(crate) fn migrate_legacy_decks_at(path: &Path, remotes: &Path) {
+    let (settings, problem) = load_document(path);
+    if problem.is_some() {
+        return;
+    }
+    let Some(endpoints) = settings.endpoints.as_ref() else {
         return;
     };
     if endpoints.remote.is_empty() {
@@ -3119,12 +3133,6 @@ fn migrate_legacy_rows(path: &Path, remotes: &Path, settings: &mut DesktopSettin
     };
     if let Err(error) = remove_legacy_rows(path, &remap) {
         eprintln!("{}", error.detail());
-        return;
-    }
-    if let Selection::One(id) = &endpoints.selection
-        && let Some((_, to)) = remap.iter().find(|(from, _)| from == id)
-    {
-        endpoints.selection = Selection::One(to.clone());
     }
 }
 
@@ -3364,7 +3372,7 @@ fn publish(parent: &Path, path: &Path, contents: &str) -> Result<(), SettingsWri
 
 /// Remove `[[endpoints.remote]]` from the settings document at `path`, and
 /// re-point `endpoints.selection` through `remap` — the second half of the
-/// issue-#1350 migration ([`migrate_legacy_rows`]).
+/// issue-#1350 migration ([`migrate_legacy_decks_at`]).
 ///
 /// A targeted edit of the document rather than a [`save_to`]: the rows are
 /// deleted outright instead of being merged down to an empty list, and every
@@ -4336,20 +4344,80 @@ fn unpredictable_suffix() -> u64 {
     hasher.finish()
 }
 
+/// `settings_path` and [`crate::decks::remotes_path`] read the environment, and
+/// the environment is process-global while `cargo test` runs the crate's tests
+/// as threads in one process. Every test that does not go through
+/// [`load_snapshot`] drives [`load_document`] and [`save_to`] with an explicit
+/// path instead, so this lock serialises only the handful that set
+/// [`SETTINGS_PATH_ENV`] — in this module and, through
+/// [`IsolatedSettingsEnv`], in any other — against each other.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Points [`SETTINGS_PATH_ENV`] and the deck list's `DOT_AGENT_DECK_REMOTES`
+/// at a fresh temp directory for as long as it lives, under
+/// [`ENV_TEST_LOCK`], and restores both on drop (issue #1350).
+///
+/// For a test outside this module that reaches [`load_snapshot`] indirectly —
+/// `voice_status` does, through the speech settings — so it reads a document
+/// it owns rather than the developer's real `desktop.toml` and `remotes.toml`.
+#[cfg(test)]
+pub(crate) struct IsolatedSettingsEnv {
+    _dir: tempfile::TempDir,
+    prior: [(&'static str, Option<std::ffi::OsString>); 2],
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl IsolatedSettingsEnv {
+    pub(crate) fn new() -> Self {
+        let guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().expect("settings tempdir");
+        let settings = dir.path().join(SETTINGS_FILE_NAME);
+        let remotes = dir.path().join("remotes.toml");
+        let prior = [
+            (SETTINGS_PATH_ENV, std::env::var_os(SETTINGS_PATH_ENV)),
+            (
+                "DOT_AGENT_DECK_REMOTES",
+                std::env::var_os("DOT_AGENT_DECK_REMOTES"),
+            ),
+        ];
+        // SAFETY: every test that mutates these two variables holds
+        // ENV_TEST_LOCK for the whole mutation, and the prior values are
+        // restored before it is released.
+        unsafe {
+            std::env::set_var(SETTINGS_PATH_ENV, &settings);
+            std::env::set_var("DOT_AGENT_DECK_REMOTES", &remotes);
+        }
+        Self {
+            _dir: dir,
+            prior,
+            _guard: guard,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for IsolatedSettingsEnv {
+    fn drop(&mut self) {
+        for (name, value) in &self.prior {
+            // SAFETY: still under ENV_TEST_LOCK — `_guard` drops after this.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model_service::{DEFAULT_TOKEN_CEILING, MAX_TOKEN_CEILING, MIN_TOKEN_CEILING};
-    use std::sync::Mutex;
-
-    /// `settings_path` is the only thing here that reads the environment, and
-    /// the environment is process-global while `cargo test` runs a module's
-    /// tests as threads in one process. Every test that does not go through
-    /// [`load_snapshot`] drives [`load_document`] and [`save_to`] with an
-    /// explicit path instead, so this lock serialises only the handful below
-    /// that set [`SETTINGS_PATH_ENV`] — against each other and against
-    /// themselves.
-    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// The CLI's override for the deck list's path, which
     /// [`crate::decks::remotes_path`] honours — set beside
@@ -9622,10 +9690,10 @@ level = 1.0
     }
 
     /// D6: a pre-#1350 document's `[[endpoints.remote]]` rows move into the
-    /// shared list on load — merged with a CLI deck at the same address rather
-    /// than duplicated — the rows leave `desktop.toml` and everything else in it
-    /// stays, and the selection follows its deck to the id it now has. Loading
-    /// again changes neither file.
+    /// shared list at startup — merged with a CLI deck at the same address
+    /// rather than duplicated — the rows leave `desktop.toml` and everything
+    /// else in it stays, and the selection follows its deck to the id it now
+    /// has. Migrating again changes neither file.
     #[test]
     fn legacy_desktop_rows_move_to_the_shared_list_once_and_the_selection_survives() {
         let dir = tempdir();
@@ -9652,6 +9720,7 @@ level = 1.0
         )
         .unwrap();
 
+        migrate_legacy_decks_at(&path, &remotes);
         let snapshot = load_snapshot_at(&path, &remotes);
         assert_eq!(snapshot.problem, None);
         let endpoints = snapshot.settings.endpoints.as_ref().unwrap();
@@ -9677,13 +9746,33 @@ level = 1.0
             std::fs::read_to_string(&path).unwrap(),
             std::fs::read_to_string(&remotes).unwrap(),
         );
+        migrate_legacy_decks_at(&path, &remotes);
         assert_eq!(load_snapshot_at(&path, &remotes), snapshot);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), document_before);
         assert_eq!(std::fs::read_to_string(&remotes).unwrap(), registry_before);
     }
 
+    /// B1 of #1350's review: loading a snapshot writes nothing, even against a
+    /// document that still carries pre-#1350 rows. It is polled up to four
+    /// times a second while voice control listens, and a poll that migrates
+    /// is a poll that can rewrite a user's real files from a test.
+    #[test]
+    fn loading_a_snapshot_never_migrates_or_writes() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let remotes = dir.path().join("remotes.toml");
+        let legacy = "version = 1\n\n[endpoints]\nselection = \"desk1\"\n\n\
+                      [[endpoints.remote]]\nhost = \"fresh.example\"\nid = \"desk1\"\n";
+        std::fs::write(&path, legacy).unwrap();
+
+        let snapshot = load_snapshot_at(&path, &remotes);
+        assert_eq!(snapshot.problem, None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+        assert!(!remotes.exists(), "a snapshot created the shared list");
+    }
+
     /// A crash between the two writes leaves the rows in both files; the next
-    /// load must finish the move without adding anything twice.
+    /// launch must finish the move without adding anything twice.
     #[test]
     fn a_migration_interrupted_after_the_shared_list_was_written_completes_cleanly() {
         let dir = tempdir();
@@ -9694,6 +9783,7 @@ level = 1.0
         std::fs::write(&path, legacy).unwrap();
         crate::decks::migrate(&remotes, &[deck_row("desk1", "fresh.example")]).unwrap();
 
+        migrate_legacy_decks_at(&path, &remotes);
         let snapshot = load_snapshot_at(&path, &remotes);
         assert_eq!(row_ids(&snapshot.settings), ["desk1"]);
         assert_eq!(
