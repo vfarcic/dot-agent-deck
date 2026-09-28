@@ -5124,6 +5124,17 @@ async fn handle_connection(
                                 // two preparations' mirror writes can finish in
                                 // either order; `mirror_into`'s ordering guard keeps
                                 // the earlier publish from landing over the later.
+                                //
+                                // Accepted residual of that order (Qodo, PR #1407):
+                                // a reader of the fixed `orchestrator-context.md`
+                                // that acts the instant the reply arrives can still
+                                // read the PREVIOUS mirror until this write lands
+                                // (or keep it, if the write fails). Writing it first
+                                // would let a stalled write hold the reply past the
+                                // deadline. The authoritative context is the
+                                // per-preparation file the prompt names; the mirror
+                                // serves only compatibility readers — see
+                                // `PendingMirror`.
                                 let (answer, mirror) = prepared.into_parts();
                                 let after: crate::project_resolve::AfterReply =
                                     Box::new(move || mirror.write());

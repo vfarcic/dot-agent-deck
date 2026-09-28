@@ -1942,6 +1942,16 @@ fn mirror_order_slot(key: MirrorDirKey) -> std::sync::Arc<std::sync::Mutex<u64>>
 /// same blocking thread, so a slow or stalled mirror write can neither delay
 /// the reply past the deadline nor happen for a preparation that was answered
 /// as expired — one that is withdrawn never produces a `PendingMirror`.
+///
+/// **The cost of that order, accepted rather than fixed** (Qodo finding on PR
+/// #1407): a reader of the fixed `orchestrator-context.md` that acts the
+/// moment the reply arrives can still read the **previous** mirror until this
+/// write lands, and keeps it if the write fails. The coordinator prompt the
+/// reply carries does not read it: it names the per-preparation file this
+/// preparation published before answering. The mirror serves only
+/// compatibility readers — a pre-#1233 TUI's compaction re-arm, a TUI tab
+/// hydrated from the daemon's records without a path (#1395), and role
+/// commands or templates that hard-code the fixed path.
 #[derive(Debug)]
 pub struct PendingMirror {
     dir: ContextDir,
