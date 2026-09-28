@@ -3107,6 +3107,18 @@ pub fn migrate_legacy_decks() {
 /// nothing, because [`crate::decks::migrate`] skips a row whose id the deck
 /// list already holds. The reverse order could lose a deck.
 ///
+/// **Only the `desktop.toml` half is locked across processes.** Removing the
+/// rows holds [`acquire_save_lock`]; the `remotes.toml` half goes through
+/// [`dot_agent_deck::deck_list::edit`], whose lock is in-process only. Two
+/// desktop instances launching together can therefore both run
+/// [`crate::decks::migrate`] against the same file, and that is safe only
+/// because the migration is idempotent — a row whose id the deck list already
+/// holds is skipped — and the write is a temp file plus an atomic rename. An
+/// instance that reads after the other's rename adds nothing; two that read
+/// the same original both write the same decks under the same ids (only the
+/// `added_at` stamps can differ), and the last rename wins whole. Either way
+/// the list ends with each legacy deck once.
+///
 /// A selection naming a row that merged into an existing deck with an id of its
 /// own is re-pointed at that id in the document, so the selected deck survives.
 /// A document this build cannot read is left alone, and any failure is logged
@@ -4359,7 +4371,14 @@ fn unpredictable_suffix() -> u64 {
 #[cfg(test)]
 pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Points [`SETTINGS_PATH_ENV`] and the deck list's `DOT_AGENT_DECK_REMOTES`
+/// The CLI's override for the deck list's path, which
+/// [`crate::decks::remotes_path`] honours — set beside [`SETTINGS_PATH_ENV`] by
+/// [`IsolatedSettingsEnv`] and by every test that goes through [`load_snapshot`]
+/// or [`save`], so none of them reads the developer's real `remotes.toml`.
+#[cfg(test)]
+const REMOTES_PATH_ENV: &str = "DOT_AGENT_DECK_REMOTES";
+
+/// Points [`SETTINGS_PATH_ENV`] and the deck list's [`REMOTES_PATH_ENV`]
 /// at a fresh temp directory for as long as it lives, under
 /// [`ENV_TEST_LOCK`], and restores both on drop (issue #1350).
 ///
@@ -4384,17 +4403,14 @@ impl IsolatedSettingsEnv {
         let remotes = dir.path().join("remotes.toml");
         let prior = [
             (SETTINGS_PATH_ENV, std::env::var_os(SETTINGS_PATH_ENV)),
-            (
-                "DOT_AGENT_DECK_REMOTES",
-                std::env::var_os("DOT_AGENT_DECK_REMOTES"),
-            ),
+            (REMOTES_PATH_ENV, std::env::var_os(REMOTES_PATH_ENV)),
         ];
         // SAFETY: every test that mutates these two variables holds
         // ENV_TEST_LOCK for the whole mutation, and the prior values are
         // restored before it is released.
         unsafe {
             std::env::set_var(SETTINGS_PATH_ENV, &settings);
-            std::env::set_var("DOT_AGENT_DECK_REMOTES", &remotes);
+            std::env::set_var(REMOTES_PATH_ENV, &remotes);
         }
         Self {
             _dir: dir,
@@ -4423,12 +4439,6 @@ impl Drop for IsolatedSettingsEnv {
 mod tests {
     use super::*;
     use crate::model_service::{DEFAULT_TOKEN_CEILING, MAX_TOKEN_CEILING, MIN_TOKEN_CEILING};
-
-    /// The CLI's override for the deck list's path, which
-    /// [`crate::decks::remotes_path`] honours — set beside
-    /// [`SETTINGS_PATH_ENV`] by every test that goes through [`load_snapshot`]
-    /// or [`save`], so none of them reads the developer's real `remotes.toml`.
-    const REMOTES_PATH_ENV: &str = "DOT_AGENT_DECK_REMOTES";
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("settings tempdir")
