@@ -25,13 +25,14 @@
 //! [`MAX_PENDING_PANE_DELIVERIES`], and therefore on drain tasks too (a task
 //! exists only for a pane with at least one pending delivery). At the bound
 //! the enqueuing hook connection WAITS for a slot, holding its connection
-//! permit — backpressure onto new hook connections, logged once per episode,
-//! and never a dropped delivery.
+//! permit — backpressure onto new hook connections, never a dropped delivery.
+//! It is logged once per episode, an episode being a stretch during which at
+//! least one enqueue is waiting for a slot.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -57,9 +58,27 @@ type Queued = (PaneDelivery, OwnedSemaphorePermit);
 pub struct PaneDeliveryQueues {
     queues: Mutex<HashMap<String, mpsc::UnboundedSender<Queued>>>,
     pending: Arc<Semaphore>,
-    /// Whether the bound is currently holding, so the warning fires on the
-    /// transition into saturation rather than once per waiting delivery.
-    at_cap: AtomicBool,
+    /// How many enqueues are waiting for a slot, so the warning fires when the
+    /// first one starts waiting and not again until every one of them is done.
+    waiting: AtomicUsize,
+}
+
+/// One enqueue's membership of [`PaneDeliveryQueues::waiting`], released when
+/// it stops waiting — including by being dropped mid-wait.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    /// Returns the membership and whether this waiter starts an episode.
+    fn enter(waiting: &'a AtomicUsize) -> (Self, bool) {
+        let first = waiting.fetch_add(1, Ordering::Relaxed) == 0;
+        (Self(waiting), first)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl PaneDeliveryQueues {
@@ -73,7 +92,7 @@ impl PaneDeliveryQueues {
         Arc::new(Self {
             queues: Mutex::new(HashMap::new()),
             pending: Arc::new(Semaphore::new(max_pending)),
-            at_cap: AtomicBool::new(false),
+            waiting: AtomicUsize::new(0),
         })
     }
 
@@ -87,7 +106,8 @@ impl PaneDeliveryQueues {
         let permit = match Arc::clone(&self.pending).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                if !self.at_cap.swap(true, Ordering::Relaxed) {
+                let (_waiting, first) = Waiting::enter(&self.waiting);
+                if first {
                     tracing::warn!(
                         pane_id = %pane_id,
                         max_pending = MAX_PENDING_PANE_DELIVERIES,
@@ -95,12 +115,10 @@ impl PaneDeliveryQueues {
                          drafts); new ones wait for a slot and hold their hook connection meanwhile"
                     );
                 }
-                let permit = Arc::clone(&self.pending)
+                Arc::clone(&self.pending)
                     .acquire_owned()
                     .await
-                    .expect("the pending-delivery semaphore is never closed");
-                self.at_cap.store(false, Ordering::Relaxed);
-                permit
+                    .expect("the pending-delivery semaphore is never closed")
             }
         };
         let mut queues = self.queues.lock().unwrap();
@@ -108,8 +126,9 @@ impl PaneDeliveryQueues {
         if let Some(tx) = queues.get(pane_id) {
             match tx.send(queued) {
                 Ok(()) => return,
-                // The drain task is gone without removing its queue, which only
-                // a panic inside a delivery can do. Start a fresh one.
+                // The drain task is gone without removing its queue: a panic
+                // inside a delivery, or the runtime cancelling the task at
+                // shutdown. Start a fresh one.
                 Err(mpsc::error::SendError(returned)) => queued = returned,
             }
         }
@@ -251,6 +270,26 @@ mod tests {
         .await
         .expect("the waiting delivery ran");
         assert_eq!(*log.lock().unwrap(), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn one_saturation_episode_warns_once_however_its_waiters_interleave() {
+        let waiting = AtomicUsize::new(0);
+        let (a, a_first) = Waiting::enter(&waiting);
+        let (b, b_first) = Waiting::enter(&waiting);
+        assert!(a_first && !b_first);
+        // The first waiter getting its slot does not end the episode while
+        // another is still waiting, so a waiter arriving now does not re-warn.
+        drop(a);
+        let (c, c_first) = Waiting::enter(&waiting);
+        assert!(!c_first);
+        drop(b);
+        drop(c);
+        let (_d, d_first) = Waiting::enter(&waiting);
+        assert!(
+            d_first,
+            "a waiter after every earlier one finished starts a new episode"
+        );
     }
 
     #[tokio::test]
