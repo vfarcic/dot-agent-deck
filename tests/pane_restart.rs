@@ -1140,8 +1140,8 @@ fn pane_restart_013_force_restart_cancels_the_silent_worker_notice() {
 /// and the waiting task must either reach the replacement worker as a submitted
 /// line or produce a delivery notice, without carrying the old draft forward.
 #[test]
-#[spec("pane/restart/014")]
-fn pane_restart_014_draft_wait_does_not_block_restart_or_lose_delegate() {
+#[spec("pane/restart/015")]
+fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
     let _env = EnvRestore::set(&[
         ("DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS", "60000"),
         ("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "0"),

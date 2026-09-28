@@ -127,9 +127,9 @@ fn assert_cli_success(output: &Output, name: &str) {
 /// Scenario: Type a draft into the focused worker pane, then delegate through
 /// the real CLI. The pointer must stay absent until Enter, and the worker PTY
 /// must show the user's draft and the pointer on separate submitted lines.
-#[spec("orchestration/delegate/039")]
+#[spec("orchestration/delegate/041")]
 #[test]
-fn orchestration_delegate_039_pointer_waits_for_attached_worker_draft() {
+fn orchestration_delegate_041_pointer_waits_for_attached_worker_draft() {
     let deck = launch_orchestration("60000");
     focus_worker(&deck);
     let worker = role(&deck, "worker");

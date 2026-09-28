@@ -3527,18 +3527,18 @@ without depending on the config struct API.
 - **Does not assert:** that the marker is authentic (it is not; the re-price is gated on the frozen launch record and can only make a write later, both pinned by `hold_readiness_buffer`'s unit tests); a real wrapper producing the two facts in this order across the 30 s window (`orchestration/delegate/026` runs the real wrapper on the pre-release upgrade); the scheduler seam (`scheduler/spawn/010`).
 - **Platform coverage:** mac+linux (unix-only — daemon-owned PTYs and a POSIX shell stand-in).
 
-##### orchestration/delegate/039 — An attached worker draft delays a real delegate pointer until Enter (issue #544).
-- **Layer:** L2, lane 1, PTY-attached (real TUI and delegate CLI).
-- **Agent:** none (`orch-deck` cat roles).
-- **Asserts:** the focused worker shows a draft while the pointer remains absent for three seconds; Enter leaves the draft and pointer as separate submitted lines in the worker PTY.
-- **Does not assert:** native agent editor behavior, retry policy, or any real-agent action on the task file.
-- **Platform coverage:** mac+linux.
-
 ##### orchestration/delegate/040 — A capped draft wait eventually delivers the real delegate pointer (issue #544).
 - **Layer:** L2, lane 1, PTY-attached (real TUI and delegate CLI).
 - **Agent:** none (`orch-deck` cat roles).
 - **Asserts:** an unsent worker draft delays the pointer, then the configured two-second cap allows delivery without dropping it; after a synthetic agent event gives the worker a renderable session, its card badge is not Error while the pointer is deferred and becomes Error after cap delivery.
 - **Does not assert:** that the draft remains private after cap expiry, native agent behavior, or that the card renders the notice text (a pre-existing gap for every `DeliveryNotice`). The notice detail is asserted at the sink by `scheduler/dispatch/023`.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/041 — An attached worker draft delays a real delegate pointer until Enter (issue #544).
+- **Layer:** L2, lane 1, PTY-attached (real TUI and delegate CLI).
+- **Agent:** none (`orch-deck` cat roles).
+- **Asserts:** the focused worker shows a draft while the pointer remains absent for three seconds; Enter leaves the draft and pointer as separate submitted lines in the worker PTY.
+- **Does not assert:** native agent editor behavior, retry policy, or any real-agent action on the task file.
 - **Platform coverage:** mac+linux.
 
 #### orchestration/work-done
@@ -5116,7 +5116,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** a real agent's hook (`orchestration/delegate/014` covers a real Claude worker through a `clear = true` respawn); the late non-start frame stamped newer, or the incoming generation's older-stamped first frame, which `daemon::hook_ingestion_tests` pins at the ingestion seam and `status/supersede/019` / `/020` at the card layer.
 - **Platform coverage:** mac+linux (the e2e tier is Unix-only).
 
-##### pane/restart/014 — Restart replies promptly while a delegate waits on a worker's unsent draft (PR #1398 finding #12).
+##### pane/restart/015 — Restart replies promptly while a delegate waits on a worker's unsent draft (PR #1398 finding #12).
 - **Layer:** L1/fast (in-process real delegate and restart handlers against daemon-owned `cat` panes; no socket or LLM).
 - **Agent:** none (`cat` stand-ins make the draft and task pointer visible in PTY snapshots).
 - **Asserts:** an unsent draft keeps the queued delegate pointer out of the old worker pane; `pane restart --force` succeeds within eight seconds, below the CLI's fourteen-second reply budget; the waiting delegate then reaches the replacement as a submitted line or produces an explicit delivery notice, without the old draft reaching the replacement.
