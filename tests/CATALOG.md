@@ -4214,6 +4214,18 @@ without depending on the config struct API.
 - **Does not assert:** the live-surface rebuild (`surface_one_orchestration`), which shares the seat helper `rebuilt_tab_seat` and its unit test `ui::tests::rebuilt_tab_seat_reads_only_the_panes_it_kept` (the discarded-duplicate case included); that `delegate` from the reattached tab routes (daemon-side, unchanged by a reattach); a remembered focus, which wins over the seat (`session/restore/016`); the landing frame itself, which draws card 0 when nothing is focused whatever the seat.
 - **Platform coverage:** mac+linux.
 
+##### session/restore/022 — A saved pane from a removed workspace mode restores as a plain dashboard card (issue #1199).
+- **Layer:** L2 (real-binary PTY via `TuiDeck`, `tests/e2e_session_restore.rs`; an older `session.toml` is staged before launch).
+- **Agent:** none (`sleep 600`; no LLM).
+- **Asserts:** the legacy pane is visible as a dashboard card, the old mode name is absent from the tab strip, and the deck stays responsive through a clean detach. The post-exit terminal stream contains the saved-mode `session_warnings` line naming both pane and mode.
+- **Platform coverage:** mac+linux.
+
+##### session/restore/023 — A daemon agent from a removed workspace mode reattaches as a plain dashboard card (issue #1199).
+- **Layer:** L2 (real-binary PTY via `TuiDeck`, `tests/e2e_session_restore.rs`; a warm `daemon serve` is seeded over the attach protocol with `TabMembership::Mode`).
+- **Agent:** none (`sleep 600`; no LLM).
+- **Asserts:** the hydrated agent is visible as a dashboard card, the old mode name is absent from the tab strip, and the deck stays responsive through a clean detach. The post-exit terminal stream contains the hydration `session_warnings` line naming the old mode.
+- **Platform coverage:** mac+linux.
+
 ### Live session status on reconnect (PRD #162)
 
 These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must attach the live, event-derived session state (a `SessionSnapshot` on each `AgentRecord`) so reconnected cards show real status instead of `Idle`/"No agent". The data already exists in `AppState.sessions` (built by `apply_event`, unchanged); this PRD only exposes it. The wire field `live: Option<SessionSnapshot>` is additive/optional — no `PROTOCOL_VERSION` bump.

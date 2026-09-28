@@ -23,6 +23,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use common::TuiDeck;
+use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, TabMembership};
+use dot_agent_deck::daemon_protocol::AttachRequest;
+use dot_agent_deck::event::AgentType;
 use spec::spec;
 
 /// Stage a saved-session `session.toml` at `session_file` describing each
@@ -1524,5 +1527,144 @@ fn restore_019_cold_start_honours_the_remembered_tab_but_not_a_rebuilt_pane_id()
         "a cold start must honour the remembered Dashboard, ignore the rebuilt pane id, and \
          come up in command mode.\nGrid:\n{}",
         deck.snapshot_grid()
+    );
+}
+
+/// Detach through the quit dialog and return the complete terminal stream,
+/// including warnings written to stderr after terminal mode is restored.
+fn detach_and_collect_output(deck: &mut TuiDeck) -> String {
+    if deck.snapshot_grid().contains("[Command Mode Ctrl+D]") {
+        deck.send_keys(b"\x04");
+        deck.wait_for_absence("[Command Mode Ctrl+D]");
+    }
+    deck.send_keys(b"\x03");
+    deck.wait_for_string("Quit dot-agent-deck?");
+    deck.send_keys(b"\r");
+    assert_eq!(
+        deck.wait_for_exit_within(Duration::from_secs(30)),
+        Some(true),
+        "the deck must stay responsive through a clean detach-quit"
+    );
+    deck.stream_text()
+}
+
+/// Scenario: Start the real TUI with an older session snapshot whose pane has a
+/// workspace mode name. The pane appears as a dashboard card without a mode
+/// tab, and a clean detach prints the legacy-mode warning.
+#[spec("session/restore/022")]
+#[test]
+fn restore_022_legacy_mode_snapshot_becomes_dashboard_card() {
+    let session_dir = common::race_safe_tempdir();
+    let session_file = session_dir.path().join("session.toml");
+    stage_session_snapshot(
+        &session_file,
+        session_dir.path(),
+        &[("old-pane", "sleep 600")],
+    );
+    let mut snapshot = std::fs::read_to_string(&session_file).expect("read staged snapshot");
+    snapshot.push_str("mode = \"legacy-ops\"\n");
+    std::fs::write(&session_file, snapshot).expect("stage legacy mode field");
+
+    let mut deck = TuiDeck::builder()
+        .with_pty_size(160, 40)
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_file.to_str().expect("session path is UTF-8"),
+        )
+        .launch_with_fixture("plain-project");
+
+    deck.wait_until_grid("legacy pane is shown on a dashboard card", |grid| {
+        grid.lines()
+            .any(|line| line.contains("No agent · old-pane"))
+            && grid
+                .lines()
+                .next()
+                .is_some_and(|header| header.contains("dot-agent-deck — 1 agent(s)"))
+            && !grid.contains("legacy-ops")
+    });
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("legacy-ops"),
+        "a legacy snapshot must not open a mode tab; grid:\n{grid}"
+    );
+
+    let output = detach_and_collect_output(&mut deck);
+    let warning = "Workspace modes were removed (#1199): pane 'old-pane' was saved in mode 'legacy-ops' and was restored as a plain pane.";
+    assert!(
+        output.contains(warning),
+        "the clean exit must print the saved-mode warning to the terminal; output:\n{output}"
+    );
+}
+
+/// Scenario: Seed a running daemon agent with the old workspace-mode membership,
+/// then attach a fresh real TUI. It shows the agent as a dashboard card with no
+/// mode tab and prints the hydration warning after a clean detach.
+#[spec("session/restore/023")]
+#[test]
+fn restore_023_legacy_mode_daemon_agent_becomes_dashboard_card() {
+    let daemon = common::spawn_daemon_serve(None, "0");
+    let project = common::harness_tempdir().expect("create project directory");
+    let cwd = std::fs::canonicalize(project.path())
+        .expect("canonicalize project directory")
+        .to_string_lossy()
+        .into_owned();
+    let response = daemon
+        .send_attach_request(&AttachRequest::StartAgent {
+            command: Some("sleep 600".into()),
+            cwd: Some(cwd),
+            rows: 24,
+            cols: 80,
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.into(),
+                "legacy-mode-0123456789abcdef".into(),
+            )],
+            display_name: Some("old-agent".into()),
+            tab_membership: Some(TabMembership::Mode {
+                name: "legacy-ops".into(),
+            }),
+            agent_type: AgentType::from_command(Some("sleep 600")),
+            seed: None,
+            authoring_kind: None,
+        })
+        .expect("start legacy-mode agent over attach socket");
+    assert!(
+        response.ok,
+        "daemon rejected legacy-mode agent: {:?}",
+        response.error
+    );
+    daemon.wait_for_agent_count(1, Duration::from_secs(10));
+
+    let mut deck = TuiDeck::builder()
+        .with_pty_size(160, 40)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        )
+        .launch_with_fixture("minimal");
+
+    deck.wait_until_grid("legacy daemon agent is shown on a dashboard card", |grid| {
+        grid.lines()
+            .any(|line| line.contains("No agent · old-agent"))
+            && grid
+                .lines()
+                .next()
+                .is_some_and(|header| header.contains("dot-agent-deck — 1 agent(s)"))
+            && !grid.contains("legacy-ops")
+    });
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("legacy-ops"),
+        "reattaching a legacy-mode agent must not open a mode tab; grid:\n{grid}"
+    );
+
+    let output = detach_and_collect_output(&mut deck);
+    let warning = "Workspace modes were removed (#1199): panes started under mode(s) legacy-ops were placed on the dashboard as plain panes.";
+    assert!(
+        output.contains(warning),
+        "the clean exit must print the daemon-mode warning to the terminal; output:\n{output}"
     );
 }
