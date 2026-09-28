@@ -62,10 +62,15 @@ pub const MAX_DRAFT_DEFER_CAP: Duration = Duration::from_secs(600);
 /// waiting write per tick.
 pub const DRAFT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-/// The fixed card text published when a first write has waited out the whole
-/// cap and is about to be written on top of the draft — published just before
-/// the bytes go in, so the card already says so when the prompt appears. Must
-/// contain the word `draft`: `scheduler/dispatch/023` keys on it.
+/// The fixed `DeliveryNotice` detail published when a first write has waited
+/// out the whole cap and is about to be written on top of the draft — published
+/// just before the bytes go in. The daemon's sink carries it on a synthetic
+/// `Error` event, as `tool_detail` and under `DELIVERY_NOTICE_METADATA_KEY`,
+/// but no client renders that text today: the TUI's session card shows only
+/// the `Error` badge, and the desktop app shows the `error` status and a
+/// generic error entry. The readable record of why is the `warn!` logged beside
+/// the publish, present only when the daemon runs with `DOT_AGENT_DECK_LOG`.
+/// Must contain the word `draft`: `scheduler/dispatch/023` keys on it.
 pub const DRAFT_CAP_NOTICE: &str = "a deck prompt waited for the unsent draft in this pane until \
                                     the draft-deferral cap and was then submitted on top of it, so \
                                     your draft may have been sent together with it";

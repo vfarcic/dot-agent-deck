@@ -8586,8 +8586,10 @@ impl AgentPtyRegistry {
     /// The wait ends when the user submits or clears the draft (`Enter`,
     /// `Ctrl+U`, `Ctrl+C`), or when [`Self::draft_defer_cap`] has passed since
     /// `started`. At the cap the write goes ahead exactly as the immediate entry
-    /// would, with a `warn!` and one [`DeliveryNotice`] on the pane's card,
-    /// because a prompt that never arrives is the worse outcome (#424). It
+    /// would, with a `warn!` and one [`DeliveryNotice`] that marks the pane's
+    /// session `Error` (no card shows the notice's text; see
+    /// [`crate::draft_deferral::DRAFT_CAP_NOTICE`]), because a prompt that
+    /// never arrives is the worse outcome (#424). It
     /// never refuses on account of the draft; every other refusal is the
     /// immediate entry's, re-checked on each pass so a pane that closes or
     /// changes hands during the wait is refused exactly as it would be before
@@ -9019,10 +9021,12 @@ impl AgentPtyRegistry {
         // AMBIGUOUS and must not be blind-retried.
         // Issue #544: the wait ran to the cap with the draft still pending, so
         // this write goes ahead on top of it — today's behaviour, degraded but
-        // not dropped. Reported BEFORE the bytes go in, so the card says so by
-        // the time the prompt is visible in the pane; a write that then fails
-        // cleanly is logged as a failure below, and the card says only that
-        // the draft MAY have been sent.
+        // not dropped. Published BEFORE the bytes go in. What a user sees of
+        // it is the pane's session turning `Error`; no card renders
+        // `DRAFT_CAP_NOTICE`'s text, so the `warn!` below is the readable
+        // record. A write that then fails cleanly is logged as a failure
+        // below, which is why the notice says only that the draft MAY have
+        // been sent.
         if capped {
             tracing::warn!(
                 pane_id = %pane_id,
