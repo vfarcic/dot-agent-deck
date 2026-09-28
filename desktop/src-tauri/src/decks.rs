@@ -226,7 +226,11 @@ pub fn edits(base: &[RemoteEndpointSettings], next: &[RemoteEndpointSettings]) -
     out
 }
 
-/// Apply `edits` to the registry at `path`, each against a fresh read.
+/// Apply `edits` to the registry at `path` as **one** edit: every change lands
+/// against one fresh read of the file, and all of them are published by one
+/// rename or none is (issue #1350's review — a save used to publish each edit
+/// separately, so a later one failing left the earlier ones on disk while the
+/// save reported failure).
 ///
 /// - **Add** appends a row — or, if a row with that id already exists (the
 ///   webview's base was older than the file), updates it instead of adding a
@@ -236,34 +240,48 @@ pub fn edits(base: &[RemoteEndpointSettings], next: &[RemoteEndpointSettings]) -
 /// - **Remove** drops the row and nothing else. It does not offer `remote
 ///   remove`'s cleanup of a binary the CLI installed on the host; that is a
 ///   follow-up, and dropping the row is what `remote remove` itself does.
+///
+/// No edits touch nothing — not even the lock — so a save that changed only
+/// the theme never waits on a `remote add` in a terminal.
 pub fn apply(path: &Path, edits: &[DeckEdit]) -> Result<(), RemoteConfigError> {
-    for edit in edits {
-        match edit {
-            DeckEdit::Add(row) => deck_list::edit(path, |document| {
-                let entries = document.entries()?;
-                match entries
+    if edits.is_empty() {
+        return Ok(());
+    }
+    deck_list::edit(path, |document| {
+        for edit in edits {
+            let entries = document.entries()?;
+            let position = |id: &EndpointId| {
+                entries
                     .iter()
-                    .position(|entry| deck_list::deck_id(entry) == row.id.as_str())
-                {
+                    .position(|entry| DeckRef::Id(id.as_str()).matches(entry))
+            };
+            match edit {
+                DeckEdit::Add(row) => match position(&row.id) {
                     Some(index) => {
                         let mut entry = entries[index].clone();
                         apply_fields(&mut entry, None, row);
-                        document.replace(index, &entry)
+                        document.replace(index, &entry)?;
                     }
-                    None => document.push(&new_entry(row, &entries)),
+                    None => document.push(&new_entry(row, &entries))?,
+                },
+                DeckEdit::Update { before, after } => {
+                    if let Some(index) = position(&after.id) {
+                        let mut entry = entries[index].clone();
+                        apply_fields(&mut entry, Some(before), after);
+                        if entry != entries[index] {
+                            document.replace(index, &entry)?;
+                        }
+                    }
                 }
-            })?,
-            DeckEdit::Update { before, after } => {
-                deck_list::update(path, DeckRef::Id(after.id.as_str()), |entry| {
-                    apply_fields(entry, Some(before), after)
-                })?;
-            }
-            DeckEdit::Remove(id) => {
-                deck_list::remove(path, DeckRef::Id(id.as_str()))?;
+                DeckEdit::Remove(id) => {
+                    if let Some(index) = position(id) {
+                        document.remove(index);
+                    }
+                }
             }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Merge the rows a pre-#1350 build kept in `desktop.toml` into the registry
@@ -562,6 +580,64 @@ mod tests {
         assert_eq!(entry.version, "0.43.0");
         assert_eq!(entry.jump_host.as_deref(), Some("bastion"));
         assert_eq!(entry.host, "dev@build.example.com");
+    }
+
+    /// Issue #1350's review: one save's deck edits are one transaction. The
+    /// second edit here is refused — another writer hand-edited the deck's host
+    /// into one ssh would misread, and changing its login rewrites that host —
+    /// so the first edit, an add, must not be published either.
+    #[test]
+    fn a_batch_whose_later_edit_fails_publishes_none_of_it() {
+        let (_dir, path) = registry(CLI_ROW);
+        let before = load_rows(&path).unwrap().remove(0);
+        let hand_edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("dev@build.example.com", "dev@bad host");
+        std::fs::write(&path, &hand_edited).unwrap();
+
+        let mut after = before.clone();
+        after.user = Some(SshUser::parse("ops").unwrap());
+        let result = apply(
+            &path,
+            &[
+                DeckEdit::Add(row("fedcba9876543210", "new.example")),
+                DeckEdit::Update { before, after },
+            ],
+        );
+        assert!(
+            matches!(result, Err(RemoteConfigError::InvalidAddress { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            hand_edited,
+            "the add before the failing edit was published"
+        );
+    }
+
+    #[test]
+    fn a_batch_lands_every_edit_in_one_write() {
+        let (_dir, path) = registry(CLI_ROW);
+        let prod = load_rows(&path).unwrap().remove(0);
+        let mut moved = prod.clone();
+        moved.port = SshPort::parse(2200).unwrap();
+        apply(
+            &path,
+            &[
+                DeckEdit::Add(row("aaaa", "a.example")),
+                DeckEdit::Add(row("bbbb", "b.example")),
+                DeckEdit::Update {
+                    before: prod,
+                    after: moved,
+                },
+                DeckEdit::Remove(EndpointId::parse("aaaa").unwrap()),
+            ],
+        )
+        .unwrap();
+        let rows = load_rows(&path).unwrap();
+        let ids: Vec<_> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["n-prod", "bbbb"]);
+        assert_eq!(rows[0].port.get(), 2200);
     }
 
     #[test]
