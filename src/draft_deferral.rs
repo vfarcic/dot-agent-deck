@@ -130,8 +130,10 @@ pub fn decide_first_write(
 enum Escape {
     #[default]
     Ground,
-    /// An `ESC` whose meaning the next byte decides.
-    Esc,
+    /// An `ESC` whose meaning the next byte decides. `paste` when it arrived
+    /// inside a bracketed paste, where it is content unless it opens the
+    /// closing paste marker.
+    Esc { paste: bool },
     /// `ESC [` — collecting a CSI sequence.
     Csi {
         /// A private marker (`<`, `=`, `>`, `?`) as the first parameter byte.
@@ -140,6 +142,13 @@ enum Escape {
         params: bool,
         dollar: bool,
         len: u8,
+        /// The parameters read as one decimal number while they are nothing
+        /// but digits, `None` once anything else appears — enough to tell the
+        /// paste markers `ESC[200~` / `ESC[201~` from every other `~` key.
+        code: Option<u16>,
+        /// Started inside a bracketed paste: every sequence but the closing
+        /// marker is content there.
+        paste: bool,
     },
     /// `ESC O` — an SS3 key (F1–F4, application-mode arrows).
     Ss3,
@@ -182,7 +191,9 @@ const MAX_STRING_LEN: u16 = 4096;
 /// SGR and X10 mouse (`ESC[<…M`/`m`, `ESC[M` + 3 bytes), focus (`ESC[I`,
 /// `ESC[O`), CPR (`ESC[…R`), DA (`ESC[…c`), DSR (`ESC[…n`), DECRPM
 /// (`ESC[…$y`), window reports (`ESC[…t`), any CSI with a private marker, and
-/// OSC and DCS strings. One ambiguity is accepted: xterm encodes a modified `F3`
+/// OSC and DCS strings. Nor do the bracketed-paste markers themselves
+/// (`ESC[200~`, `ESC[201~`): an empty paste sends nothing into the box, so
+/// only the bytes between them count. One ambiguity is accepted: xterm encodes a modified `F3`
 /// as `ESC[1;5R`, the shape of a CPR, so that key does not set the bit. The
 /// deck's own encoder sends `F3` as `ESC O R` and is unaffected.
 ///
@@ -223,12 +234,30 @@ impl DraftTracker {
         const BEL: u8 = 0x07;
         match self.escape {
             Escape::Ground => self.ground(byte, in_paste),
-            Escape::Esc => match byte {
+            Escape::Esc { paste: true } => match byte {
                 b'[' => Escape::Csi {
                     private: false,
                     params: false,
                     dollar: false,
                     len: 0,
+                    code: Some(0),
+                    paste: true,
+                },
+                // Pasted content after all: count the ESC and read this byte
+                // afresh, still inside the paste.
+                _ => {
+                    self.pending = true;
+                    self.ground(byte, in_paste)
+                }
+            },
+            Escape::Esc { paste: false } => match byte {
+                b'[' => Escape::Csi {
+                    private: false,
+                    params: false,
+                    dollar: false,
+                    len: 0,
+                    code: Some(0),
+                    paste: false,
                 },
                 b']' => Escape::Osc { len: 0, esc: false },
                 b'P' => Escape::Dcs { len: 0, esc: false },
@@ -236,7 +265,7 @@ impl DraftTracker {
                 // The first ESC was a key of its own; this one starts afresh.
                 ESC => {
                     self.pending = true;
-                    Escape::Esc
+                    Escape::Esc { paste: false }
                 }
                 // `Alt+<key>`, `Alt+Enter`, `Alt+Backspace`: an edit.
                 _ => {
@@ -249,6 +278,8 @@ impl DraftTracker {
                 params,
                 dollar,
                 len,
+                code,
+                paste,
             } => match byte {
                 0x30..=0x3f => {
                     if len >= MAX_CSI_LEN {
@@ -256,11 +287,19 @@ impl DraftTracker {
                         return Escape::Ground;
                     }
                     let is_private = !params && matches!(byte, b'<' | b'=' | b'>' | b'?');
+                    let code = code.and_then(|code| match byte {
+                        b'0'..=b'9' => code
+                            .checked_mul(10)
+                            .and_then(|code| code.checked_add(u16::from(byte - b'0'))),
+                        _ => None,
+                    });
                     Escape::Csi {
                         private: private || is_private,
                         params: true,
                         dollar,
                         len: len + 1,
+                        code,
+                        paste,
                     }
                 }
                 0x20..=0x2f => Escape::Csi {
@@ -268,8 +307,22 @@ impl DraftTracker {
                     params,
                     dollar: dollar || byte == b'$',
                     len: len.saturating_add(1),
+                    code: None,
+                    paste,
                 },
                 0x40..=0x7e => {
+                    // Exactly the bytes `crate::agent_pty`'s paste framing
+                    // matches, so the two agree on what a marker is.
+                    let paste_marker =
+                        byte == b'~' && len == 3 && matches!(code, Some(200 | 201));
+                    if paste_marker {
+                        return Escape::Ground;
+                    }
+                    if paste {
+                        // Inside a paste, only the closing marker is framing.
+                        self.pending = true;
+                        return Escape::Ground;
+                    }
                     if !params && byte == b'M' {
                         return Escape::X10 { remaining: 3 };
                     }
@@ -307,7 +360,7 @@ impl DraftTracker {
                         Escape::Ground
                     } else {
                         // An unterminated string followed by a new sequence.
-                        self.escape = Escape::Esc;
+                        self.escape = Escape::Esc { paste: false };
                         self.step(byte, in_paste)
                     };
                 }
@@ -340,7 +393,9 @@ impl DraftTracker {
 
     fn ground(&mut self, byte: u8, in_paste: bool) -> Escape {
         match byte {
-            0x1b if !in_paste => Escape::Esc,
+            // Inside a paste an ESC is content — unless it opens the closing
+            // marker, which `Escape::Esc { paste: true }` decides.
+            0x1b => Escape::Esc { paste: in_paste },
             0x15 | 0x03 if !in_paste => {
                 self.pending = false;
                 Escape::Ground
@@ -565,6 +620,92 @@ mod tests {
             tracker.feed_byte(byte, false, true);
             assert!(tracker.pending(), "{byte:#x}");
         }
+    }
+
+    /// Feed `bytes` wrapped in bracketed-paste markers, with the paste framing
+    /// `crate::agent_pty`'s stream supplies: the state BEFORE each byte, so the
+    /// opening marker is outside the paste and the closing one inside it.
+    fn feed_paste(tracker: &mut DraftTracker, bytes: &[u8]) {
+        for &byte in b"\x1b[200~" {
+            tracker.feed_byte(byte, false, false);
+        }
+        for &byte in bytes {
+            tracker.feed_byte(byte, false, true);
+        }
+        for &byte in b"\x1b[201~" {
+            tracker.feed_byte(byte, false, true);
+        }
+    }
+
+    #[test]
+    fn an_empty_paste_does_not_set_the_bit() {
+        let mut tracker = DraftTracker::default();
+        feed_paste(&mut tracker, b"");
+        assert!(!tracker.pending(), "the paste markers alone set the bit");
+        // Split across writes, as a client may send them.
+        let mut tracker = DraftTracker::default();
+        let chunks: [(&[u8], bool); 5] = [
+            (b"\x1b[2", false),
+            (b"00~", false),
+            (b"\x1b", true),
+            (b"[201", true),
+            (b"~", true),
+        ];
+        for (chunk, in_paste) in chunks {
+            for &byte in chunk {
+                tracker.feed_byte(byte, false, in_paste);
+            }
+        }
+        assert!(!tracker.pending(), "a split empty paste set the bit");
+    }
+
+    #[test]
+    fn paste_markers_do_not_clear_a_draft() {
+        let mut tracker = DraftTracker::default();
+        feed(&mut tracker, b"draft");
+        feed_paste(&mut tracker, b"");
+        assert!(tracker.pending());
+    }
+
+    #[test]
+    fn pasted_content_still_sets_the_bit() {
+        let contents: [&[u8]; 6] = [
+            b"x",
+            b"\x1b",
+            b"\x1b\x1b",
+            b"\x1b[I",
+            b"\x1b[<64;10;5M",
+            b"\x1b]10;rgb:ffff/ffff/ffff\x07",
+        ];
+        for content in contents {
+            let mut tracker = DraftTracker::default();
+            feed_paste(&mut tracker, content);
+            assert!(tracker.pending(), "pasted {content:?} did not set the bit");
+        }
+        // An end marker right after pasted text leaves the bit set, and text
+        // typed after an empty paste sets it.
+        let mut tracker = DraftTracker::default();
+        feed_paste(&mut tracker, b"");
+        feed(&mut tracker, b"y");
+        assert!(tracker.pending());
+    }
+
+    #[test]
+    fn only_the_exact_marker_bytes_are_framing() {
+        // Other `~` keys, and near-misses of the marker, are still keys.
+        for key in [
+            &b"\x1b[2~"[..],
+            b"\x1b[20~",
+            b"\x1b[202~",
+            b"\x1b[0200~",
+            b"\x1b[2000~",
+            b"\x1b[200;1~",
+            b"\x1b[200$~",
+        ] {
+            assert!(pending_after(key), "{key:?} did not set the bit");
+        }
+        assert!(!pending_after(b"\x1b[200~"));
+        assert!(!pending_after(b"\x1b[201~"));
     }
 
     #[test]
