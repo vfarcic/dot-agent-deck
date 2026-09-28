@@ -1,6 +1,6 @@
 # PRD #1321: User docs for both clients — common, TUI and desktop sections, with screenshots
 
-**Status**: In progress — M1–M7 done (2026-09-27); M8 open, delivered by the next release after this merges
+**Status**: Complete (2026-09-28)
 **Priority**: Medium
 **Created**: 2026-09-27
 **Issue**: [#1321](https://github.com/vfarcic/dot-agent-deck/issues/1321)
@@ -44,7 +44,7 @@ The install page **absorbs #765**: which desktop artifact to download for which 
 - Screenshots are added across the docs in general, not only to the desktop part.
 - A feature common to both clients that is illustrated with a screenshot gets one from **each** client, shown as tabs (TUI | Desktop) so the page does not double in length.
 - Screenshots go stale, and that is accepted; the work does not wait for a final version.
-- **Screenshots come from `cargo docs-screenshots`** (issue #1322, [`docs/develop/docs-screenshots.md`](../docs/develop/docs-screenshots.md)), not from hand captures. Each new screenshot is a new or extended scenario in that tool's registry (`xtask/screenshots/src/scenarios.rs`, with its TUI capture in `tests/e2e_docs_screenshots.rs` and its desktop capture in `desktop/screenshots/desktop.shot.ts`), so it can be regenerated when the UI changes. A feature both clients have uses the **same** scenario name on both, depicting the same state, which is what makes the TUI | Desktop tabs possible (`dashboard` is the worked example). A screen the tool genuinely cannot reach is the exception, and is recorded as such where it is used.
+- **Screenshots come from `cargo docs-screenshots`** (issue #1322, [`docs/develop/docs-screenshots.md`](../../docs/develop/docs-screenshots.md)), not from hand captures. Each new screenshot is a new or extended scenario in that tool's registry (`xtask/screenshots/src/scenarios.rs`, with its TUI capture in `tests/e2e_docs_screenshots.rs` and its desktop capture in `desktop/screenshots/desktop.shot.ts`), so it can be regenerated when the UI changes. A feature both clients have uses the **same** scenario name on both, depicting the same state, which is what makes the TUI | Desktop tabs possible (`dashboard` is the worked example). A screen the tool genuinely cannot reach is the exception, and is recorded as such where it is used.
 
 ### 6. A skill that makes agents consider screenshots whenever they change docs
 
@@ -263,7 +263,7 @@ Target: the release after the one carrying #1045 and #746.
 - [x] **M5** — Home page presents both clients
 - [x] **M6** — Screenshots added across the docs via `cargo docs-screenshots`, with TUI | Desktop tabs for common features
 - [x] **M7** — Project-local skill for evaluating screenshots on docs changes
-- [ ] **M8** — Docs published (`publish-docs`)
+- [x] **M8** — Docs published (`publish-docs`) — delivered by `release.yml`'s `docs` job, which publishes `main` on every release — the first release after this merges publishes these docs; no separate `/publish-docs` run
 
 ## Risks
 
@@ -325,3 +325,7 @@ Every image in the Docs plan's screenshot table is on its page. **Both clients, 
 **Tests and reel.** The branch adds no `#[spec]` tests and no `[reel]` entries in `tests/CATALOG.md`, so there is no recorded run and no demo reel clip for this PRD.
 
 **M8** stays open, for the reason given in the M6 entry: `release.yml`'s `docs` job publishes the docs with the first release cut after this branch merges to `main`.
+
+### 2026-09-28 — Archived
+
+All eight milestones complete. M8 is delivered by `release.yml`'s `docs` job, which publishes `main` on every release — the first release after this merges publishes these docs; no separate `/publish-docs` run is needed. PRD moved to `prds/done/`.
