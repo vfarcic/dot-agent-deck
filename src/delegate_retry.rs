@@ -318,9 +318,16 @@ pub fn classify_event(event: &AgentEvent) -> EventVerdict {
 /// What the worker's screen shows about this delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Composer {
-    /// The delivery id is on screen: the pointer is most likely sitting in the
-    /// composer, unsubmitted. The re-delivery is the submit-only probe alone.
-    PointerVisible,
+    /// The delivery id ends on the cursor's row: the pointer is most likely
+    /// sitting in the composer, unsubmitted. The re-delivery is the submit-only
+    /// probe, and after an unanswered grace one more Enter (issue #1243).
+    PointerInComposer,
+    /// The delivery id is on screen, but not on the cursor's row: most likely a
+    /// submitted pointer still in the transcript above an input box that holds
+    /// something else, or nothing. The re-delivery is the submit-only probe and
+    /// nothing more — no second Enter into that other input, and no second
+    /// copy of a pointer that was most likely already submitted.
+    PointerInHistory,
     /// The screen shows nothing at all, and the PTY was resized since the
     /// pointer was typed. A resize drops the scrollback ring the screen is read
     /// from, so a blank screen then says nothing about the composer — an agent
@@ -332,22 +339,41 @@ pub enum Composer {
     Absent,
 }
 
-/// Classify the worker's visible screen for `delivery_id`.
+/// Classify the worker's screen for `delivery_id`. `screen_rows` is every row
+/// of the screen, blank ones included, and `cursor_row` indexes it.
 ///
 /// Searches each row, and then every row concatenated with everything but ASCII
 /// letters, digits and `-` stripped out, so an id split by a line wrap — with a
 /// composer's border glyphs and padding around the split — is still found.
 ///
-/// **Biased toward [`Composer::PointerVisible`] on purpose.** A false positive,
-/// for example a submitted pointer still visible in the transcript, costs a
-/// retype that never happens. A false negative costs a probe's grace and then,
-/// if the worker stays silent through it, a second copy of the pointer.
+/// **Where the id is decides between the two `Pointer*` answers.** The pointer
+/// ends with its delivery id, and an agent's input box leaves the terminal
+/// cursor right after what was typed into it — measured on Claude Code 2.1.284
+/// and Codex 0.156.1, both with a visible cursor on the composer row, directly
+/// after the id, and Claude Code with three non-blank rows (border and footers)
+/// below it. So the id is in the composer when it ENDS on the cursor's row: on
+/// that row whole, or starting on the row above it across a wrap — or when it
+/// ends on the row above and the cursor's row holds nothing but the rest of the
+/// pointer (`after_id`, the pointer's text after the id: its closing `]`, which
+/// wraps alone when the id fills a row). Anywhere else it is transcript. A row-count window from the bottom would not do: Claude
+/// Code's footers put the composer's id three rows up, and a submitted pointer
+/// directly above an empty input box sits only two rows further.
+///
+/// **Biased away from [`Composer::Absent`] on purpose.** Any sight of the id,
+/// history included, rules out a retype: a false positive costs a retype that
+/// never happens, and a false negative costs a probe's grace and then, if the
+/// worker stays silent through it, a second copy of the pointer. Within the
+/// visible answers the bias runs the other way — an agent that parks its cursor
+/// away from typed text reads as [`Composer::PointerInHistory`] and forgoes the
+/// second Enter, which the next re-delivery's probe makes up for.
 ///
 /// `resized_since_write` is whether the PTY geometry moved since the pointer
 /// was last typed; see [`Composer::Unreadable`].
 pub fn classify_composer(
     screen_rows: &[String],
+    cursor_row: usize,
     delivery_id: &str,
+    after_id: &str,
     resized_since_write: bool,
 ) -> Composer {
     if resized_since_write && screen_rows.iter().all(|row| row.trim().is_empty()) {
@@ -356,19 +382,67 @@ pub fn classify_composer(
     if delivery_id.is_empty() {
         return Composer::Absent;
     }
-    if screen_rows.iter().any(|row| row.contains(delivery_id)) {
-        return Composer::PointerVisible;
+    let rest_of_pointer_on_cursor_row = || {
+        let rest = glyphs_only(after_id);
+        let row = screen_rows
+            .get(cursor_row)
+            .map(|row| glyphs_only(row))
+            .unwrap_or_default();
+        !row.is_empty() && rest.ends_with(&row)
+    };
+    if id_ends_on_row(screen_rows, cursor_row, delivery_id)
+        || (cursor_row > 0
+            && id_ends_on_row(screen_rows, cursor_row - 1, delivery_id)
+            && rest_of_pointer_on_cursor_row())
+    {
+        return Composer::PointerInComposer;
     }
     let squeezed: String = screen_rows
         .iter()
-        .flat_map(|row| row.chars())
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .map(|row| squeeze_id_chars(row))
         .collect();
-    if squeezed.contains(delivery_id) {
-        Composer::PointerVisible
+    if screen_rows.iter().any(|row| row.contains(delivery_id)) || squeezed.contains(delivery_id) {
+        Composer::PointerInHistory
     } else {
         Composer::Absent
     }
+}
+
+/// Only ASCII letters, digits and `-`: what survives a wrap and a border.
+fn squeeze_id_chars(row: &str) -> String {
+    row.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect()
+}
+
+/// `text` without whitespace and box-drawing or block glyphs (U+2500..=U+259F),
+/// which is what a composer's border and padding add around its content.
+fn glyphs_only(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace() && !('\u{2500}'..='\u{259F}').contains(c))
+        .collect()
+}
+
+/// Whether `delivery_id` ends on row `row`: whole on it, or wrapped onto it
+/// from the row above.
+fn id_ends_on_row(screen_rows: &[String], row: usize, delivery_id: &str) -> bool {
+    let Some(current) = screen_rows.get(row) else {
+        return false;
+    };
+    if current.contains(delivery_id) {
+        return true;
+    }
+    let above = row
+        .checked_sub(1)
+        .and_then(|above| screen_rows.get(above))
+        .map(|above| squeeze_id_chars(above))
+        .unwrap_or_default();
+    let joined = format!("{above}{}", squeeze_id_chars(current));
+    // A match that ends inside `above` is a copy on the row above, not one that
+    // wraps onto this row.
+    joined
+        .match_indices(delivery_id)
+        .any(|(start, _)| start + delivery_id.len() > above.len())
 }
 
 /// Handed back by [`PendingDeliveries::arm`] to the loop that owns the record.
@@ -818,7 +892,9 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
             // nothing to submit.
             //
             // Issue #1243: a pointer the screen DOES show waits out the same
-            // grace and then gets a second Enter, never a copy. Measured against
+            // grace and then, if it is still in the input box, gets a second
+            // Enter, never a copy; one showing only in the transcript gets
+            // neither (see `Composer::PointerInHistory`). Measured against
             // Claude Code: once a CR has been taken into a paste, the composer
             // holds the pointer and an empty line, the next Enter is swallowed
             // and the one after it submits, in every case observed (3 lost
@@ -895,8 +971,8 @@ enum Phase {
     /// empty one.
     Probe,
     /// After a probe went unanswered: type the pointer again over a screen that
-    /// does not show it, or press Enter once more over one that does (issue
-    /// #1243).
+    /// does not show it, press Enter once more over an input box that holds it
+    /// (issue #1243), or do nothing when it shows only in the transcript.
     Retype,
 }
 
@@ -955,19 +1031,52 @@ async fn redeliver(
         return Attempt::Skipped;
     }
     let composer = match registry.snapshot_with_pty_size(worker_agent_id) {
-        Ok((bytes, rows, cols)) => classify_composer(
-            &crate::pane_screen_text::visible_tail_lines(&bytes, rows, cols, rows as usize),
-            delivery_id,
-            registry.geometry_changes_of(worker_agent_id) != *pointer_epoch,
-        ),
+        Ok((bytes, rows, cols)) => {
+            let (screen_rows, cursor_row) =
+                crate::pane_screen_text::visible_rows_and_cursor(&bytes, rows, cols)
+                    .unwrap_or_default();
+            classify_composer(
+                &screen_rows,
+                cursor_row,
+                delivery_id,
+                pointer
+                    .rsplit_once(delivery_id)
+                    .map_or("", |(_, after_id)| after_id),
+                registry.geometry_changes_of(worker_agent_id) != *pointer_epoch,
+            )
+        }
         Err(_) => return Attempt::Stop(RetryEnd::AgentExited),
     };
+    // Only the SECOND Enter is scoped to the input box (auditor M2 / reviewer
+    // LOW-1). The probe is the same bare Enter whatever the screen shows:
+    // `Absent` gets it on no evidence at all, and the probe exists because the
+    // screen cannot be trusted to show what the input box holds — a worker
+    // that never reads its terminal has its pointer echoed and "submitted" by
+    // the line discipline, and an agent that parks its cursor away from typed
+    // text (Devin and Pi were not measured) would show a pointer stuck in its
+    // composer as history. Withholding the probe there would forfeit the
+    // recovery on a reading that is only a heuristic.
     let text = match (phase, composer) {
         (Phase::Probe, _) => "",
-        // The unanswered Enter left it on screen: it is in the composer and a
-        // copy would double it. Press Enter once more instead (issue #1243, see
-        // the loop).
-        (Phase::Retype, Composer::PointerVisible) => "",
+        // The unanswered Enter left it in the composer: a copy would double
+        // it. Press Enter once more instead (issue #1243, see the loop).
+        (Phase::Retype, Composer::PointerInComposer) => "",
+        // Only in the transcript: the input box holds something else, or
+        // nothing, and an Enter there would submit that. The pointer most
+        // likely went in already, so no copy either.
+        (Phase::Retype, Composer::PointerInHistory) => {
+            info!(
+                pane_id = %escape_id_for_log(pane_id),
+                role = %escape_id_for_log(role),
+                delivery_id = %delivery_id,
+                attempt,
+                total_attempts,
+                "delegate retry: after the Enter the pointer shows only above the worker's input \
+                 box, not in it; not pressing Enter into whatever that box holds, and not \
+                 retyping a pointer that most likely went in"
+            );
+            return Attempt::Skipped;
+        }
         (Phase::Retype, Composer::Unreadable) => {
             info!(
                 pane_id = %escape_id_for_log(pane_id),
@@ -1017,6 +1126,17 @@ async fn redeliver(
             // the pane's writer must stop it here, under that writer, rather
             // than type bytes after it. The ack path does not take the dispatch
             // lock, so the check above cannot cover that wait.
+            //
+            // Issue #1383 audit (M3), accepted residual: this runs ONCE, before
+            // the payload. An ack that lands after it — during the
+            // `SUBMIT_DELAY` between the payload and the CR — does not stop the
+            // CR: a probe or second Enter still writes its one `\r`, and a
+            // retype, whose pointer bytes are already in the PTY by then, still
+            // writes the `\r` that submits them. An ack means the agent is
+            // already working, so what that costs is one CR, or one queued copy
+            // of the pointer, in the composer of a worker that has its task.
+            // Serialising the ack against this write was judged not worth
+            // holding the ack path on the pane writer for.
             if !revalidate_registry
                 .pending_deliveries()
                 .is_current(&revalidate_pane, seq)
@@ -1052,8 +1172,8 @@ async fn redeliver(
                 classification = ?composer,
                 "delegate retry: no proof the worker received its task pointer; {}",
                 match (phase, composer) {
-                    (Phase::Probe, Composer::PointerVisible) =>
-                        "the pointer is visible on its screen, so pressed Enter instead of retyping it",
+                    (Phase::Probe, Composer::PointerInComposer) =>
+                        "the pointer is in its input box, so pressed Enter instead of retyping it",
                     (Phase::Probe, Composer::Unreadable) =>
                         "its screen was cleared by a resize since the pointer went in, so pressed \
                          Enter rather than risk typing a second copy",
@@ -1061,8 +1181,11 @@ async fn redeliver(
                         "the pointer is not on its screen, which cannot tell an empty input box \
                          from one holding it unshown, so pressed Enter first; the pointer is \
                          retyped only if the worker stays silent",
-                    (Phase::Retype, Composer::PointerVisible) =>
-                        "the pointer is still on its screen after the Enter, and an agent that \
+                    (Phase::Probe, Composer::PointerInHistory) =>
+                        "the pointer shows on its screen but not in its input box, so pressed \
+                         Enter rather than type a second copy; no second Enter follows",
+                    (Phase::Retype, Composer::PointerInComposer) =>
+                        "the pointer is still in its input box after the Enter, and an agent that \
                          took the first CR into a paste swallows the next Enter, so pressed Enter \
                          once more rather than retyping it",
                     (Phase::Retype, _) =>
@@ -1339,15 +1462,20 @@ mod tests {
         lines.iter().map(|l| l.to_string()).collect()
     }
 
+    /// The last row, where a screen that ends in its input line has its cursor.
+    fn last(screen: &[String]) -> usize {
+        screen.len().saturating_sub(1)
+    }
+
     #[test]
-    fn classify_composer_finds_the_id_on_a_row() {
+    fn classify_composer_finds_the_id_on_the_cursor_row() {
         let screen = rows(&[
             "welcome",
             "> Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-7f3a9c21]",
         ]);
         assert_eq!(
-            classify_composer(&screen, "d-7f3a9c21", false),
-            Composer::PointerVisible
+            classify_composer(&screen, last(&screen), "d-7f3a9c21", "]", false),
+            Composer::PointerInComposer
         );
     }
 
@@ -1355,8 +1483,8 @@ mod tests {
     fn classify_composer_finds_an_id_split_across_rows() {
         let screen = rows(&["> Read … for your task. [delivery d-7f3a", "9c21]"]);
         assert_eq!(
-            classify_composer(&screen, "d-7f3a9c21", false),
-            Composer::PointerVisible
+            classify_composer(&screen, last(&screen), "d-7f3a9c21", "]", false),
+            Composer::PointerInComposer
         );
     }
 
@@ -1367,8 +1495,99 @@ mod tests {
             "┃ 9c21]                                                          ┃",
         ]);
         assert_eq!(
-            classify_composer(&screen, "d-7f3a9c21", false),
-            Composer::PointerVisible
+            classify_composer(&screen, last(&screen), "d-7f3a9c21", "]", false),
+            Composer::PointerInComposer
+        );
+    }
+
+    /// The id fills its row exactly and only the pointer's closing `]` wraps
+    /// onto the cursor's row — measured at 77 columns, which is where
+    /// `orchestration/delegate/043`'s worker pane lands. Bare, and inside
+    /// OpenCode-style border glyphs.
+    #[test]
+    fn classify_composer_an_id_whose_closing_bracket_wrapped_is_in_the_composer() {
+        let bare = rows(&[
+            "Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-7f3a9c21",
+            "]",
+        ]);
+        assert_eq!(
+            classify_composer(&bare, 1, "d-7f3a9c21", "]", false),
+            Composer::PointerInComposer
+        );
+        let bordered = rows(&[
+            "┃  Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-",
+            "┃  7f3a9c21",
+            "┃  ]",
+        ]);
+        assert_eq!(
+            classify_composer(&bordered, 2, "d-7f3a9c21", "]", false),
+            Composer::PointerInComposer
+        );
+        // Anything but the rest of the pointer on the cursor's row is another
+        // input: an empty prompt glyph, or text.
+        for cursor_row in ["❯", "> x", "]]"] {
+            let screen = rows(&[
+                "Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-7f3a9c21",
+                cursor_row,
+            ]);
+            assert_eq!(
+                classify_composer(&screen, 1, "d-7f3a9c21", "]", false),
+                Composer::PointerInHistory,
+                "cursor row {cursor_row:?}"
+            );
+        }
+    }
+
+    /// Claude Code 2.1.284's measured layout: the cursor on the composer row,
+    /// right after the id, with a border and two footer rows below it.
+    #[test]
+    fn classify_composer_reads_the_composer_above_claude_codes_footers() {
+        let screen = rows(&[
+            "▝▜██████▀  Haiku 4.5",
+            "",
+            "──────────",
+            "❯ Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-7f3a9c21]",
+            "──────────",
+            "⚠ Transcript saving is off",
+            "⏸ manual mode on",
+        ]);
+        assert_eq!(
+            classify_composer(&screen, 3, "d-7f3a9c21", "]", false),
+            Composer::PointerInComposer
+        );
+    }
+
+    /// Auditor M2 / reviewer LOW-1: a submitted pointer still in the transcript,
+    /// directly above an empty input box, is not a pointer in the composer —
+    /// whether the box is bordered or a bare prompt line.
+    #[test]
+    fn classify_composer_an_id_in_history_above_an_empty_composer_is_not_in_it() {
+        let bordered = rows(&[
+            "> Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-7f3a9c21]",
+            "──────────",
+            "❯",
+            "──────────",
+            "? for shortcuts",
+        ]);
+        assert_eq!(
+            classify_composer(&bordered, 2, "d-7f3a9c21", "]", false),
+            Composer::PointerInHistory
+        );
+        let bare = rows(&[
+            "> Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-7f3a9c21]",
+            "> ",
+        ]);
+        assert_eq!(
+            classify_composer(&bare, 1, "d-7f3a9c21", "]", false),
+            Composer::PointerInHistory,
+            "a whole copy on the row above is not a wrap onto the cursor row"
+        );
+        // The same screen with the cursor parked above the composer, as a cooked
+        // terminal leaves it after a submitted line.
+        let submitted = rows(&["READY> [delivery d-7f3a9c21]", ""]);
+        assert_eq!(
+            classify_composer(&submitted, 1, "d-7f3a9c21", "]", false),
+            Composer::PointerInHistory
         );
     }
 
@@ -1376,15 +1595,15 @@ mod tests {
     fn classify_composer_ignores_another_delivery_and_a_blank_screen() {
         let screen = rows(&["> Read … for your task. [delivery d-00000000]"]);
         assert_eq!(
-            classify_composer(&screen, "d-7f3a9c21", false),
+            classify_composer(&screen, 0, "d-7f3a9c21", "]", false),
             Composer::Absent
         );
         assert_eq!(
-            classify_composer(&[], "d-7f3a9c21", false),
+            classify_composer(&[], 0, "d-7f3a9c21", "]", false),
             Composer::Absent
         );
         assert_eq!(
-            classify_composer(&rows(&["", "   "]), "d-7f3a9c21", false),
+            classify_composer(&rows(&["", "   "]), 1, "d-7f3a9c21", "]", false),
             Composer::Absent
         );
     }
@@ -1392,17 +1611,23 @@ mod tests {
     #[test]
     fn classify_composer_a_screen_blanked_by_a_resize_is_unreadable() {
         assert_eq!(
-            classify_composer(&[], "d-7f3a9c21", true),
+            classify_composer(&[], 0, "d-7f3a9c21", "]", true),
             Composer::Unreadable
         );
         // A screen the agent has repainted since is read as usual.
         assert_eq!(
-            classify_composer(&rows(&["> "]), "d-7f3a9c21", true),
+            classify_composer(&rows(&["> "]), 0, "d-7f3a9c21", "]", true),
             Composer::Absent
         );
         assert_eq!(
-            classify_composer(&rows(&["> [delivery d-7f3a9c21]"]), "d-7f3a9c21", true),
-            Composer::PointerVisible
+            classify_composer(
+                &rows(&["> [delivery d-7f3a9c21]"]),
+                0,
+                "d-7f3a9c21",
+                "]",
+                true
+            ),
+            Composer::PointerInComposer
         );
     }
 
@@ -1680,24 +1905,46 @@ mod loop_tests {
         fx.stop();
     }
 
+    /// A pointer the worker's input box still holds after the probe — echoed,
+    /// with the cursor left on its row (raw mode echoes a CR as a return to
+    /// column 0 of the same row) — gets one more Enter, and is never typed
+    /// again.
     #[tokio::test]
-    async fn retry_loop_presses_enter_instead_of_retyping_a_visible_pointer() {
-        let fx = Fixture::start("retry-probe", true).await;
+    async fn retry_loop_presses_enter_twice_on_a_pointer_left_in_the_composer() {
+        let fx = Fixture::start_with("retry-probe", "stty raw").await;
         let (handle, redeliveries) = fx.deliver_and_retry("150,150").await;
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
         assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
-        let lines = fx.received_lines(5).await;
-        assert_eq!(
-            lines.iter().filter(|l| l.contains(ID)).count(),
-            1,
-            "a pointer visible on screen must never be typed a second time: {lines:?}"
-        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let raw = std::fs::read_to_string(&fx.sink).unwrap_or_default();
         // Issue #1243: per re-delivery, the probe and, with the pointer still
-        // on screen after the grace, one more Enter.
+        // in the input box after the grace, one more Enter.
+        assert_eq!(
+            raw,
+            format!("{POINTER}\r\r\r\r\r"),
+            "the first write, then two re-deliveries of two Enters each"
+        );
+        fx.stop();
+    }
+
+    /// Auditor M2 / reviewer LOW-1: a pointer that shows only in the transcript
+    /// — a cooked terminal submitted it and left the cursor on the empty line
+    /// below — gets the probe Enter and nothing more: no second Enter into the
+    /// input box below it, and no second copy.
+    #[tokio::test]
+    async fn retry_loop_presses_no_second_enter_when_the_pointer_is_only_in_history() {
+        let fx = Fixture::start("retry-history", true).await;
+        let (handle, redeliveries) = fx.deliver_and_retry("150,150").await;
+        assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
+        assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
+        fx.received_lines(3).await;
+        // Past the loop's end, so a late fourth line would be in the sink too.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let lines = fx.received_lines(3).await;
         assert_eq!(
             lines,
-            [POINTER, "", "", "", ""],
-            "two re-deliveries of two Enters each: {lines:?}"
+            [POINTER, "", ""],
+            "one probe Enter per re-delivery, no second Enter and no copy: {lines:?}"
         );
         fx.stop();
     }

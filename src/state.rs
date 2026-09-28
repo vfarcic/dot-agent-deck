@@ -14551,6 +14551,30 @@ mod tests {
         assert!(inline.contains("Implement the thing."));
     }
 
+    /// Issue #1243 review INFO-1: the echo gate waits for the pointer's last
+    /// word, and the retry reads the screen for the delivery id. Those must be
+    /// the same string, so a pointer-format change that splits them — a suffix
+    /// after the id, a separator the squeeze keeps — goes red here instead of
+    /// silently leaving every delegate on the gate's full timeout.
+    #[test]
+    fn delegate_pointer_echo_token_is_its_delivery_id() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let delivery_id = crate::delegate_retry::mint_delivery_id();
+        let pointer = compose_delegate_prompt(&resolve_delegate_task_body(
+            Some(cwd.path().to_str().expect("utf8 cwd")),
+            Some("You are coder."),
+            "Implement the thing.",
+            "coder",
+            "pane-1",
+            Some(&delivery_id),
+        ));
+        assert_eq!(
+            crate::submit_echo::echo_token(pointer.as_bytes()),
+            Some(delivery_id),
+            "pointer: {pointer:?}"
+        );
+    }
+
     #[test]
     fn compose_worker_task_file_appends_work_done_footer() {
         let content = compose_worker_task_file(

@@ -32,6 +32,23 @@
 //! delegate pointer takes it, because it is the write #1243 lost and a
 //! delegation is one write. Other automatic writes keep the fixed delay.
 //!
+//! **A heuristic, not an attestation.** The watch counts the token anywhere
+//! on the screen, not in the input box, so output that shows it before the
+//! agent paints the payload — a worker or a process in its repository printing
+//! the delivery id, which its task file names — releases the CR early. Such a
+//! spoof is same-user, reaches only that worker's own submit, and at worst
+//! makes it as early as the fixed `SUBMIT_DELAY` the gate replaced; the
+//! delegate's in-place retry (issue #1383) recovers a pointer left unsubmitted
+//! that way. `docs/develop/hook-provenance.md` records it beside the other
+//! same-user signals the retry trusts.
+//!
+//! **Bounded work, not just a bounded wait.** The parser is as large as the
+//! pane and the screen is rescanned after every batch of output, both inside
+//! the pane's writer; a pane over [`MAX_ECHO_WATCH_CELLS`] gets no gate, and
+//! the deadline is checked between chunks as well as while waiting for one, so
+//! sustained output cannot hold the writer past [`SUBMIT_ECHO_BOUND`] by more
+//! than one chunk's parse.
+//!
 //! **Eligible payloads** are single-line printable text up to
 //! [`MAX_ECHO_GATED_PAYLOAD`] bytes whose last word has at least
 //! [`MIN_TOKEN_CHARS`] matchable characters. A multi-line payload is
@@ -56,6 +73,16 @@ pub const MAX_ECHO_GATED_PAYLOAD: usize = 512;
 /// The fewest matchable characters the payload's last word may have. Shorter
 /// tokens are too likely to be on screen already, or to be formed by chance.
 pub const MIN_TOKEN_CHARS: usize = 6;
+
+/// The largest pane, in character cells, that gets a gate. Above it the
+/// submit keeps the fixed `SUBMIT_DELAY`.
+///
+/// PTY axes are accepted up to 4096 each (`agent_pty::PTY_RESIZE_DIM_MAX`), so
+/// without a cap one attach client's geometry sizes a 16.7-million-cell parser
+/// that is rescanned after every output chunk while the pane's writer is held.
+/// 500,000 covers any terminal a person can look at: an 8K display (7680 x
+/// 4320 px) filled by a 6 x 12 px font is 1280 x 360 = 460,800 cells.
+pub const MAX_ECHO_WATCH_CELLS: u32 = 500_000;
 
 /// How a gated wait ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +155,9 @@ impl EchoWatch {
         if rows < 2 || cols < 2 {
             return None;
         }
+        if u32::from(rows) * u32::from(cols) > MAX_ECHO_WATCH_CELLS {
+            return None;
+        }
         let mut watch = Self {
             parser: vt100::Parser::new(rows, cols, 0),
             rx,
@@ -160,6 +190,11 @@ impl EchoWatch {
             if self.occurrences() > self.baseline {
                 return EchoOutcome::Rendered;
             }
+            // `timeout_at` polls the receive before the deadline, so with
+            // output queued it would never time out on its own.
+            if tokio::time::Instant::now() >= deadline {
+                return EchoOutcome::TimedOut;
+            }
             let chunk = match tokio::time::timeout_at(deadline, self.rx.recv()).await {
                 Err(_) => return EchoOutcome::TimedOut,
                 Ok(Ok(chunk)) => chunk,
@@ -168,19 +203,28 @@ impl EchoWatch {
             if !self.feed(&chunk) {
                 return EchoOutcome::Unreadable;
             }
-            // Take whatever else is already queued before re-reading the screen.
-            loop {
-                match self.rx.try_recv() {
-                    Ok(chunk) => {
-                        if !self.feed(&chunk) {
-                            return EchoOutcome::Unreadable;
-                        }
-                    }
-                    Err(broadcast::error::TryRecvError::Empty) => break,
-                    Err(_) => return EchoOutcome::Unreadable,
-                }
+            if let Err(outcome) = self.drain(deadline) {
+                return outcome;
             }
         }
+    }
+
+    /// Take whatever else is already queued before the screen is re-read, up
+    /// to `deadline`: output that keeps arriving must not hold the writer past
+    /// it.
+    fn drain(&mut self, deadline: tokio::time::Instant) -> Result<(), EchoOutcome> {
+        while tokio::time::Instant::now() < deadline {
+            match self.rx.try_recv() {
+                Ok(chunk) => {
+                    if !self.feed(&chunk) {
+                        return Err(EchoOutcome::Unreadable);
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Empty) => return Ok(()),
+                Err(_) => return Err(EchoOutcome::Unreadable),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -284,6 +328,62 @@ mod tests {
         let watch = EchoWatch::new(b"", rx, 24, 80, POINTER).expect("eligible");
         drop(tx);
         assert_eq!(watch.wait(SUBMIT_ECHO_BOUND).await, EchoOutcome::Unreadable);
+    }
+
+    /// Auditor M5: a pane over the cell cap gets no gate (the caller then
+    /// keeps the fixed delay); one at the cap still does.
+    #[test]
+    fn new_refuses_a_pane_over_the_cell_cap() {
+        let (_tx, rx) = channel();
+        assert!(EchoWatch::new(b"", rx, 4096, 4096, POINTER).is_none());
+        let (_tx, rx) = channel();
+        assert!(EchoWatch::new(b"", rx, 1000, 501, POINTER).is_none());
+        let (_tx, rx) = channel();
+        assert!(
+            EchoWatch::new(b"", rx, 1000, 500, POINTER).is_some(),
+            "exactly {MAX_ECHO_WATCH_CELLS} cells is within the cap"
+        );
+    }
+
+    /// Auditor M5: queued output does not keep a wait going past its bound —
+    /// neither the receive (which returns queued chunks before it looks at the
+    /// deadline) nor the drain behind it.
+    #[tokio::test(start_paused = true)]
+    async fn wait_stops_at_the_bound_with_output_still_queued() {
+        let (tx, rx) = channel();
+        let watch = EchoWatch::new(b"", rx, 24, 80, POINTER).expect("eligible");
+        for _ in 0..8 {
+            tx.send(Arc::new(b"chatter ".to_vec())).unwrap();
+        }
+        tx.send(Arc::new(b"[delivery d-7f3a9c21]".to_vec()))
+            .unwrap();
+        assert_eq!(
+            watch.wait(Duration::ZERO).await,
+            EchoOutcome::TimedOut,
+            "a queued chunk was read past the deadline"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_reads_nothing_once_the_deadline_has_passed() {
+        let (tx, rx) = channel();
+        let mut watch = EchoWatch::new(b"", rx, 24, 80, POINTER).expect("eligible");
+        tx.send(Arc::new(b"[delivery d-7f3a9c21]".to_vec()))
+            .unwrap();
+        let passed = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(watch.drain(passed), Ok(()));
+        assert_eq!(
+            watch.occurrences(),
+            watch.baseline,
+            "the drain fed a chunk after its deadline"
+        );
+        // Before the deadline it drains as it always did.
+        assert_eq!(
+            watch.drain(tokio::time::Instant::now() + Duration::from_secs(1)),
+            Ok(())
+        );
+        assert_eq!(watch.occurrences(), watch.baseline + 1);
     }
 
     #[test]

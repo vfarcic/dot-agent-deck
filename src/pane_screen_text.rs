@@ -103,6 +103,34 @@ pub fn visible_tail_lines(snapshot: &[u8], rows: u16, cols: u16, max_lines: usiz
     tail
 }
 
+/// Issue #1383: every row of the rendered screen, blank ones included so the
+/// index is a screen row, and the row the terminal cursor is on.
+///
+/// Rows are trimmed and rule-collapsed like [`visible_tail_lines`]'s. `None`
+/// when the snapshot is empty or the parser panicked (the same vt100 0.16.2
+/// short-pane edge case [`visible_tail_lines`] contains).
+pub fn visible_rows_and_cursor(
+    snapshot: &[u8],
+    rows: u16,
+    cols: u16,
+) -> Option<(Vec<String>, usize)> {
+    if snapshot.is_empty() {
+        return None;
+    }
+    let (rows, cols) = parser_init_dims(rows, cols);
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(snapshot);
+        let screen = parser.screen();
+        let lines = screen
+            .rows(0, cols)
+            .map(|row| collapse_rules(row.trim()))
+            .collect::<Vec<_>>();
+        (lines, usize::from(screen.cursor_position().0))
+    }))
+    .ok()
+}
+
 /// Shrink runs of one repeated non-alphanumeric character to
 /// [`MAX_REPEATED_RULE_RUN`], leaving everything else byte-for-byte alone.
 fn collapse_rules(line: &str) -> String {
@@ -178,6 +206,17 @@ mod tests {
             visible_tail_lines(b"content\r\n", 0, 0, MAX_REPORTED_ROWS),
             vec!["content".to_string()]
         );
+    }
+
+    #[test]
+    fn visible_rows_and_cursor_reports_the_cursor_row_and_keeps_blank_rows() {
+        let (rows, cursor) =
+            visible_rows_and_cursor(b"history\r\n\r\n> typed\x1b[4;1Hfooter\x1b[3;8H", 24, 80)
+                .expect("parsed");
+        assert_eq!(&rows[..4], ["history", "", "> typed", "footer"]);
+        assert_eq!(rows.len(), 24, "every screen row, so the index is a row");
+        assert_eq!(cursor, 2);
+        assert_eq!(visible_rows_and_cursor(b"", 24, 80), None);
     }
 
     #[test]
