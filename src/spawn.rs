@@ -1378,6 +1378,11 @@ async fn deliver(
         }
         Some(mut rx) => {
             let timeout = session_start_wait_timeout().min(remaining_before(deadline));
+            // Issue #724: taken before the wait for the reason the delegate path
+            // takes its own — see `crate::state::hold_readiness_buffer`. A
+            // resubscription rather than `rx` itself, because the pre-write drain
+            // below has to see every event queued on `rx`.
+            let mut interface_watch = rx.resubscribe();
             // Issue #243: the scheduler shares the gate, so it shares the
             // upgrade window — and it needs it at least as much, since this path
             // applies no post-readiness buffer after a readiness fact at all.
@@ -1447,7 +1452,18 @@ async fn deliver(
                      agent's interface, which is not on its own input-readiness; holding the \
                      prompt for the post-readiness buffer"
                 );
-                tokio::time::sleep(buffer).await;
+                crate::state::hold_readiness_buffer(
+                    Some(&mut interface_watch),
+                    pane_id,
+                    agent_id,
+                    buffer,
+                    crate::state::weak_fact_buffer_reprice(
+                        &observed,
+                        registry.agent_spawned_as_wrapper_host(agent_id),
+                    ),
+                    Some(deadline),
+                )
+                .await;
             }
             (Some(rx), observed)
         }
