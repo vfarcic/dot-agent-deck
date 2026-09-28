@@ -365,6 +365,11 @@ pub(crate) const NO_SIGNAL_READINESS_BUFFER: std::time::Duration =
 /// clear — it is a line-oriented REPL, and the measurement above says nothing
 /// about it — so the weak fact, the timeout fallback and every non-wrapper
 /// readiness fact keep [`DELEGATE_READINESS_BUFFER`] unchanged.
+///
+/// Issue #724 adds the one exception, and it is still this fact that is being
+/// priced: when the strong fact lands while a weak fact's buffer is RUNNING, it
+/// re-prices what is left of that buffer to this value measured from its own
+/// arrival, and never to anything shorter. See [`hold_readiness_buffer`].
 pub(crate) const WRAPPER_INTERFACE_READINESS_BUFFER: std::time::Duration =
     std::time::Duration::from_millis(5000);
 
@@ -848,6 +853,26 @@ pub struct SessionState {
     /// there is no un-orphaning edge to watch for and clearing on the next
     /// unmarked event would just make the badge flicker.
     pub orchestration_orphaned: bool,
+    /// Issue #559: this session's producer DECLARED that it will never report a
+    /// submitted prompt — an event arrived carrying
+    /// [`crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`], which
+    /// `dot-agent-deck wrap` stamps on everything it emits once it knows the
+    /// wrapped Codex's native `UserPromptSubmit` hook is not trusted.
+    ///
+    /// Per SESSION rather than per event because [`AppState::apply_event`]
+    /// folds every frame one agent sends on one pane into one session: the
+    /// wrapper's own events and the agent's native ones share it, so the answer
+    /// has to outlive the frame that carried it and the bounded
+    /// `recent_events` journal both.
+    ///
+    /// STICKY once set, like [`Self::orchestration_orphaned`], because the
+    /// marker can only withdraw standing: an unmarked event must not be able to
+    /// restore a capability the producer itself disclaimed. Not carried by
+    /// [`SessionSnapshot`] — a reconnecting TUI starts it `false` and learns it
+    /// again from the wrapper's next event, and the spawn-time deliveries that
+    /// read it belong to the TUI that spawned the pane, not to one that
+    /// reattached later. See [`Self::confirmation_producer`].
+    pub prompt_reports_unavailable: bool,
 }
 
 impl SessionState {
@@ -882,6 +907,14 @@ impl SessionState {
             last_activity_ms: Some(self.last_activity.timestamp_millis()),
             blocked: self.blocked.clone(),
         }
+    }
+
+    /// Issue #559: this session as a candidate confirmation producer — its
+    /// declared agent type, and whether the session's producer declared it
+    /// cannot report a submitted prompt ([`Self::prompt_reports_unavailable`]).
+    /// The input [`crate::prompt_delivery::pane_confirmation_capability`] takes.
+    pub fn confirmation_producer(&self) -> (&AgentType, bool) {
+        (&self.agent_type, self.prompt_reports_unavailable)
     }
 
     /// PRD #20 M3/blocker-2: the current live-target descriptor of this session,
@@ -5347,11 +5380,12 @@ pub(crate) fn agent_is_wrapper_interface_ready(agent_type: Option<&AgentType>) -
 ///
 /// * **is a session up** (`ready`) — the gate's original question, which decides
 ///   when the prompt is written;
-/// * **which producer owns this pane** (`observed_producer`) — whether an
-///   unconfirmed write could EVER be confirmed
-///   ([`crate::prompt_delivery::agent_reports_submitted_prompt`]). Answered ONLY
-///   by the event that satisfied the gate: a skipped boot-provenance start names
-///   an intent, not a reporting channel (issue #424 D4);
+/// * **which producer owns this pane** (`observed_producer`, and
+///   `observed_producer_reports` for issue #559) — whether an unconfirmed write
+///   could EVER be confirmed ([`AgentEvent::reports_submitted_prompt`]).
+///   Answered ONLY by the event that satisfied the gate: a skipped
+///   boot-provenance start names an intent, not a reporting channel (issue #424
+///   D4);
 /// * **which conversation the prompt is going into** (`generation`) — dropping
 ///   this is what left the confirmation loop unbound, free to adopt whatever
 ///   announced itself next, which after an unobserved rollover is the SUCCESSOR.
@@ -5384,6 +5418,18 @@ pub(crate) struct SessionStartWait {
     /// gate on its fork-time start rather than being skipped, so it is still
     /// recorded and still arms.
     pub(crate) observed_producer: Option<AgentType>,
+    /// Issue #559: whether the event that satisfied the gate came from a
+    /// producer that can report a submitted prompt
+    /// ([`AgentEvent::reports_submitted_prompt`]) — the answer
+    /// [`Self::observed_producer`]'s type gives, unless that same event
+    /// declared its producer cannot.
+    ///
+    /// This is the read `crate::spawn` arms re-submission from, and it is kept
+    /// apart from the type because for a Wrapper-strategy agent the gate is
+    /// satisfied by the WRAPPER's interface fact: the type is Codex either way,
+    /// and only the wrapper knows whether Codex's native prompt hook was
+    /// trusted. `false` wherever `observed_producer` is `None`.
+    pub(crate) observed_producer_reports: bool,
     /// Issue #424 F4: this pane declared, BEFORE the prompt was written, that
     /// what we were about to write into is a LAUNCHER with a real agent coming
     /// behind it — a `SessionStart` carrying
@@ -5476,6 +5522,15 @@ pub(crate) struct SessionStartWait {
     /// `false` for every other outcome, INCLUDING the timeout: a wait that
     /// established nothing is more reason to hold the prompt, not less.
     pub(crate) observed_interface: bool,
+    /// Issue #724: the gate was released on the wrapper's WEAK interface fact
+    /// because the upgrade window over it expired — the one outcome after which
+    /// the strong fact can still arrive while the caller is paying the buffer.
+    ///
+    /// Read only by [`weak_fact_buffer_reprice`], and on its own it grants
+    /// nothing: that also requires the deck's own launch record to say the pane
+    /// is a wrapper host, and what it can buy is a LATER write, never an earlier
+    /// one (see [`hold_readiness_buffer`]).
+    pub(crate) released_on_settled_guess: bool,
 }
 
 impl SessionStartWait {
@@ -5484,8 +5539,10 @@ impl SessionStartWait {
             ready: false,
             generation: None,
             observed_producer: None,
+            observed_producer_reports: false,
             launcher_handoff,
             observed_interface: false,
+            released_on_settled_guess: false,
         }
     }
 }
@@ -5570,7 +5627,10 @@ pub(crate) async fn wait_for_session_start(
     // released on it, and `upgrade_deadline` is when it will be if nothing
     // stronger turns up. See [`INTERFACE_UPGRADE_WINDOW`] for why the weak fact
     // is provisional and [`interface_upgrade_window`] for whose it is.
-    let mut provisional_settled: Option<AgentType> = None;
+    // Issue #559: with the producer's own answer to "can you report a
+    // submitted prompt", taken from the SAME event, so the release on it below
+    // cannot arm what that event disclaimed.
+    let mut provisional_settled: Option<(AgentType, bool)> = None;
     let mut upgrade_deadline: Option<tokio::time::Instant> = None;
     loop {
         // The loop is bounded by whichever comes first: the caller's own
@@ -5605,11 +5665,9 @@ pub(crate) async fn wait_for_session_start(
                         // the FIRST one — a later `wrapper_fork` start naming a
                         // different type must not revise the belief the
                         // post-write declaration will have to match.
-                        if launcher_handoff.is_none()
-                            && crate::prompt_delivery::agent_reports_submitted_prompt(
-                                &event.agent_type,
-                            )
-                        {
+                        // Issue #559: through the event, so a launcher whose wrapper
+                        // declared the agent's prompt hook untrusted withholds it.
+                        if launcher_handoff.is_none() && event.reports_submitted_prompt() {
                             launcher_handoff = Some(event.agent_type.clone());
                         }
                         tracing::debug!(
@@ -5676,7 +5734,8 @@ pub(crate) async fn wait_for_session_start(
                         && event.is_wrapper_interface_settled_session_start()
                         && provisional_settled.is_none()
                     {
-                        provisional_settled = Some(event.agent_type.clone());
+                        provisional_settled =
+                            Some((event.agent_type.clone(), event.reports_submitted_prompt()));
                         upgrade_deadline = Some(tokio::time::Instant::now() + upgrade_window);
                         tracing::debug!(
                             pane_id,
@@ -5692,12 +5751,15 @@ pub(crate) async fn wait_for_session_start(
                     }
                     let genuine = !event.is_wrapper_session_start();
                     let observed_interface = event.is_wrapper_interface_ready_session_start();
+                    let observed_producer_reports = event.reports_submitted_prompt();
                     return SessionStartWait {
                         ready: true,
                         generation: genuine.then_some((event.session_id, event.timestamp)),
                         observed_producer: Some(event.agent_type),
+                        observed_producer_reports,
                         launcher_handoff,
                         observed_interface,
+                        released_on_settled_guess: false,
                     };
                 }
             }
@@ -5774,10 +5836,10 @@ fn resolve_expired_wait(
     pane_id: &str,
     agent_id: &str,
     upgrade_window: std::time::Duration,
-    provisional_settled: Option<AgentType>,
+    provisional_settled: Option<(AgentType, bool)>,
     launcher_handoff: Option<AgentType>,
 ) -> SessionStartWait {
-    let Some(observed_producer) = provisional_settled else {
+    let Some((observed_producer, observed_producer_reports)) = provisional_settled else {
         return SessionStartWait::unready(launcher_handoff);
     };
     tracing::debug!(
@@ -5802,8 +5864,160 @@ fn resolve_expired_wait(
         ready: true,
         generation: None,
         observed_producer: Some(observed_producer),
+        observed_producer_reports,
         launcher_handoff,
         observed_interface: false,
+        released_on_settled_guess: true,
+    }
+}
+
+/// Issue #724: the buffer a strong interface fact would re-price an in-flight
+/// buffer to, or `None` when nothing may re-price it.
+///
+/// `Some` only when BOTH hold, and each half is one of #716's guards restated:
+///
+/// * the gate was released on the wrapper's weak output-settled fact
+///   ([`SessionStartWait::released_on_settled_guess`]), so the buffer in flight
+///   is the ORDINARY one and the strong fact, if it lands during it, carries
+///   information the pricing did not have. Every other release — the strong fact
+///   itself, a native `SessionStart`, the timeout — is left exactly as it was;
+/// * `spawned_as_wrapper_host`, read by the caller from
+///   [`crate::agent_pty::AgentPtyRegistry::agent_spawned_as_wrapper_host`] —
+///   the deck's frozen launch-shape record, never the badge on an arriving event.
+///   The marker is producer-writable, so a pane the deck did not exec under
+///   `dot-agent-deck wrap` cannot be re-priced by claiming it was.
+///
+/// The value is [`wrapper_interface_readiness_buffer`], so an operator's
+/// `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` wins here as it does on every
+/// other path.
+pub(crate) fn weak_fact_buffer_reprice(
+    wait: &SessionStartWait,
+    spawned_as_wrapper_host: bool,
+) -> Option<std::time::Duration> {
+    (wait.released_on_settled_guess && spawned_as_wrapper_host)
+        .then(wrapper_interface_readiness_buffer)
+}
+
+/// Issue #724: what one [`hold_readiness_buffer`] ended on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadinessHold {
+    /// The buffer the gate started with ran out, and nothing re-priced it.
+    Elapsed,
+    /// The wrapper's strong interface fact landed while the buffer was running
+    /// and the hold ended no sooner than the re-priced buffer measured from it.
+    Repriced,
+}
+
+/// Issue #724: pay a post-readiness `buffer`, and re-price it if the wrapper's
+/// STRONG interface fact lands while it is still running.
+///
+/// The one place the delegate gate ([`dispatch_one_owned`]) and the scheduler's
+/// ([`crate::spawn`]) wait out a buffer that may be re-priced, so the rule below
+/// cannot drift between them. With `reprice_to` `None` — every release
+/// [`weak_fact_buffer_reprice`] does not admit — this is `sleep(buffer)` and
+/// nothing else.
+///
+/// # What re-pricing is
+///
+/// The gate released on the weak output-settled fact and started the ordinary
+/// buffer. If the strong raw-input fact for the SAME pane and agent then lands
+/// before that buffer is over, the full-screen TUI it announces is only now
+/// initialising, and [`WRAPPER_INTERFACE_READINESS_BUFFER`] is the interval
+/// measured against how long that goes on eating input. So the hold now ends at
+/// `max(the buffer's own end, arrival + reprice_to)`.
+///
+/// # Re-pricing never moves the write EARLIER, by construction
+///
+/// That `max` is the property #716 protects, kept structural rather than left to
+/// the constants. The interface marker is forgeable — the daemon's hook socket
+/// accepts a raw `AgentEvent` with a free-form `metadata` map — so a producer
+/// that could post one to move this deadline earlier could land the write inside
+/// codex-cli's non-monotonic init loss window, which is the failure the buffer
+/// exists for. With the `max`, the most a forgery can do on a genuine wrapper
+/// host is lengthen one hold, once: only the FIRST strong fact is read, the
+/// extension is bounded by `reprice_to` (itself clamped to 30 s when the
+/// operator sets it) and by `ceiling`, and a pane that is not a wrapper host is
+/// never re-priced at all. Delaying a write is strictly less than the same uid
+/// can already do through the attach socket. Nothing here can SKIP or SHORTEN a
+/// buffer, which is what #716 deleted the zero-buffer branch for.
+///
+/// Note it also does not CANCEL the buffer on the strong fact. Raw mode is not
+/// input-readiness — codex-cli takes it at TUI init and keeps eating keystrokes
+/// until a teardown-and-repaint — so the strong fact selects which buffer is
+/// paid and when it starts, never whether one is.
+///
+/// # The watch
+///
+/// `watch` is a receiver the caller took with [`broadcast::Receiver::resubscribe`]
+/// BEFORE the readiness wait began, so a strong fact that lands in the instant
+/// between the wait returning and this starting is still in it. Anything it
+/// holds that the wait also saw is harmless: had the wait seen a strong fact it
+/// would have released on it, and `reprice_to` would be `None`. A strong fact
+/// read from its backlog is priced from when it is READ here, which is at or
+/// after when it arrived — the later, safe direction. A lagged or closed watch
+/// falls back to the unrepriced buffer, which is the behaviour before this
+/// issue.
+///
+/// `ceiling` bounds a re-priced hold the way the scheduler bounds every wait by
+/// its delivery deadline; the delegate path passes `None`.
+pub(crate) async fn hold_readiness_buffer(
+    watch: Option<&mut broadcast::Receiver<BroadcastMsg>>,
+    pane_id: &str,
+    agent_id: &str,
+    buffer: std::time::Duration,
+    reprice_to: Option<std::time::Duration>,
+    ceiling: Option<std::time::Instant>,
+) -> ReadinessHold {
+    let deadline = tokio::time::Instant::now() + buffer;
+    let (Some(watch), Some(reprice_to)) = (watch, reprice_to) else {
+        tokio::time::sleep_until(deadline).await;
+        return ReadinessHold::Elapsed;
+    };
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => return ReadinessHold::Elapsed,
+            received = watch.recv() => match received {
+                Ok(BroadcastMsg::Event(event))
+                    if event.event_type == EventType::SessionStart
+                        && event.pane_id.as_deref() == Some(pane_id)
+                        && event.agent_id.as_deref() == Some(agent_id)
+                        && event.is_wrapper_interface_ready_session_start() =>
+                {
+                    let priced = ceiling.map_or(reprice_to, |ceiling| {
+                        reprice_to.min(ceiling.saturating_duration_since(std::time::Instant::now()))
+                    });
+                    let repriced = deadline.max(tokio::time::Instant::now() + priced);
+                    tracing::debug!(
+                        pane_id,
+                        agent_id,
+                        remaining_ms = deadline
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .as_millis(),
+                        repriced_ms = repriced
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .as_millis(),
+                        "readiness buffer: the wrapper's strong raw-input observation landed \
+                         while the weak output-settled fact's buffer was running; re-pricing \
+                         what is left of it from this arrival, never shortening it"
+                    );
+                    tokio::time::sleep_until(repriced).await;
+                    return ReadinessHold::Repriced;
+                }
+                // Issue #717's grouping: not evidence about this pane either way.
+                Ok(
+                    BroadcastMsg::Event(_)
+                    | BroadcastMsg::OrchestrationSurface(_)
+                    | BroadcastMsg::WorktreeKept(_)
+                    | BroadcastMsg::Unknown,
+                ) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => {
+                    tokio::time::sleep_until(deadline).await;
+                    return ReadinessHold::Elapsed;
+                }
+            },
+        }
     }
 }
 
@@ -5836,8 +6050,9 @@ pub(crate) enum PromptWatch {
     /// The window elapsed with no confirmation. `can_report_prompts` records
     /// whether an event was seen from this exact agent whose producer is
     /// capable of reporting SUBMITTED PROMPT TEXT
-    /// ([`crate::prompt_delivery::agent_reports_submitted_prompt`]) — the only
-    /// proof that a re-submission could ever be confirmed.
+    /// ([`AgentEvent::reports_submitted_prompt`], which issue #559 routes through
+    /// the event so a wrapper's declaration can withdraw its type's answer) —
+    /// the only proof that a re-submission could ever be confirmed.
     ///
     /// Reviewer finding B4: this used to be `hooked`, set by ANY event carrying
     /// the agent's id. Pi emits exactly such events and hardcodes
@@ -5895,8 +6110,7 @@ pub(crate) enum PromptWatch {
 /// reported prompt is the evidence, and gating on `EventType::Thinking` would
 /// silently exclude any future agent that reports a submission under a
 /// different type. Which producers can report one at all is a separate
-/// question, answered by
-/// [`crate::prompt_delivery::agent_reports_submitted_prompt`].
+/// question, answered per event by [`AgentEvent::reports_submitted_prompt`].
 ///
 /// Matching requires an EXACT, non-optional `agent_id` plus the pane.
 ///
@@ -5974,8 +6188,9 @@ pub(crate) async fn wait_for_prompt_submission(
                 if let Some(changed) = latch_generation(generation, &event) {
                     return changed;
                 }
-                can_report_prompts |=
-                    crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type);
+                // Issue #559: through the event, not its type — a wrapper that
+                // declared its agent's prompt hook untrusted proves nothing here.
+                can_report_prompts |= event.reports_submitted_prompt();
                 // Issue #666, facts G ∧ I ∧ W. Identity is already enforced above
                 // (exact `agent_id`, exact pane); W holds because the caller
                 // drained the channel before it wrote, so everything this loop
@@ -6956,6 +7171,10 @@ async fn dispatch_one_owned(
                 // operator after a readiness declaration for a worker that never
                 // started. The dead-replacement check below reports it instead.
                 let mut replacement_died = false;
+                // Issue #724: taken BEFORE the wait, so a strong interface fact
+                // that lands between the wait returning and the buffer starting
+                // is still seen by [`hold_readiness_buffer`] below.
+                let mut interface_watch = event_rx.resubscribe();
                 let wait = if has_readiness_signal {
                     tokio::select! {
                         biased;
@@ -7421,7 +7640,20 @@ async fn dispatch_one_owned(
                             );
                             return;
                         }
-                        _ = tokio::time::sleep(buffer) => {}
+                        _ = hold_readiness_buffer(
+                            Some(&mut interface_watch),
+                            &pane_id,
+                            &new_agent_id,
+                            buffer,
+                            // Issue #724: a strong fact landing while the weak
+                            // fact's buffer runs re-prices it. Read from the
+                            // frozen launch record, like guard 2 above.
+                            weak_fact_buffer_reprice(
+                                &wait,
+                                registry.agent_spawned_as_wrapper_host(&new_agent_id),
+                            ),
+                            None,
+                        ) => {}
                     }
                 }
                 // Issue #1031: the standing for a late-readiness submit recovery,
@@ -8760,6 +8992,7 @@ impl AppState {
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                prompt_reports_unavailable: false,
             },
         );
         session_id
@@ -12251,6 +12484,7 @@ impl AppState {
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                prompt_reports_unavailable: false,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -12581,6 +12815,13 @@ impl AppState {
         // older daemon must not clear a verdict a newer one already reported.
         if event.is_orchestration_orphaned() {
             session.orchestration_orphaned = true;
+        }
+
+        // Issue #559: the same one-way shape, for the same reason — the marker
+        // only withdraws standing, so no later frame may restore it. See
+        // `SessionState::prompt_reports_unavailable`.
+        if event.declares_prompt_reports_unavailable() {
+            session.prompt_reports_unavailable = true;
         }
 
         // PRD #20 blocker-2: keep the live-target durable across the bounded
@@ -15321,9 +15562,9 @@ mod tests {
     /// `orchestration/delegate/029`'s fixture was changed to one that reaches its
     /// interface. It is not cosmetic to leave uncovered: the outcome differs from
     /// the unready fallback in exactly two fields, and the second one is
-    /// load-bearing. `observed_producer` is what
-    /// [`crate::prompt_delivery::agent_reports_submitted_prompt`] reads to decide
-    /// `can_report_prompts` in [`crate::spawn`] — i.e. whether an unconfirmed
+    /// load-bearing. `observed_producer`, with `observed_producer_reports` beside
+    /// it since issue #559, is what decides `can_report_prompts` in
+    /// [`crate::spawn`] — i.e. whether an unconfirmed
     /// write could EVER be confirmed — so a regression that collapsed this branch
     /// into the fallback would silently disarm re-submission for every wrapped
     /// agent that never leaves cooked mode.
@@ -15336,6 +15577,124 @@ mod tests {
     /// fast tier to assert nothing.
     ///
     /// The clock is paused, so the 30 s window costs no wall time at all.
+    /// Issue #559: every daemon-side capability read of a WRAPPER's event —
+    /// the interface fact that releases the gate, the settled fact that releases
+    /// it on expiry, and a post-write frame in the confirmation watch — answers
+    /// from the event, so a wrapper that declared its Codex's native prompt hook
+    /// untrusted arms nothing while still releasing the gate. The unmarked twin
+    /// of each is the control: a wrapper that declares nothing leaves Codex's
+    /// answer standing, which is what keeps a healthy wrapped Codex's retry.
+    #[tokio::test(start_paused = true)]
+    async fn a_wrapper_declaring_its_agents_prompt_hook_untrusted_arms_no_resubmission() {
+        const PANE: &str = "wrapped-codex-pane";
+        const AGENT: &str = "agent-559";
+
+        fn wrapper_event(
+            event_type: EventType,
+            key: &str,
+            value: &str,
+            prompt_reports_unavailable: bool,
+        ) -> AgentEvent {
+            let mut metadata = HashMap::from([(key.to_string(), value.to_string())]);
+            if prompt_reports_unavailable {
+                metadata.insert(
+                    crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY.to_string(),
+                    crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE.to_string(),
+                );
+            }
+            AgentEvent {
+                session_id: format!("{PANE}-session"),
+                agent_type: AgentType::Codex,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata,
+                pane_id: Some(PANE.to_string()),
+                agent_id: Some(AGENT.to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+
+        let window = interface_upgrade_window(Some(&AgentType::Codex));
+        for marked in [false, true] {
+            for origin in [
+                crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN,
+                crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN,
+            ] {
+                let (tx, mut rx) = broadcast::channel(8);
+                // The fork-time start first, as the wrapper sends it: the gate
+                // SKIPS it for Codex and records it as launcher-handoff standing
+                // only when its producer can report.
+                for origin in [crate::event::WRAPPER_FORK_SESSION_START_ORIGIN, origin] {
+                    tx.send(BroadcastMsg::Event(wrapper_event(
+                        EventType::SessionStart,
+                        crate::event::SESSION_START_ORIGIN_METADATA_KEY,
+                        origin,
+                        marked,
+                    )))
+                    .expect("the receiver is alive");
+                }
+                let observed = wait_for_session_start(
+                    &mut rx,
+                    PANE,
+                    AGENT,
+                    SESSION_START_WAIT_TIMEOUT,
+                    window,
+                )
+                .await;
+                assert!(
+                    observed.ready,
+                    "{origin} (marked={marked}): the declaration is about reporting, never \
+                     about readiness, so the gate is released either way"
+                );
+                assert_eq!(observed.observed_producer, Some(AgentType::Codex));
+                assert_eq!(
+                    observed.observed_producer_reports, !marked,
+                    "{origin} (marked={marked}): the gate's capability answer must be the \
+                     event's, so a wrapper that disclaimed the prompt hook arms no retry"
+                );
+                assert_eq!(
+                    observed.launcher_handoff,
+                    (!marked).then_some(AgentType::Codex),
+                    "{origin} (marked={marked}): a declared type may only withhold standing, \
+                     and a declaration that no report will come withholds it"
+                );
+            }
+
+            let (tx, mut rx) = broadcast::channel(8);
+            tx.send(BroadcastMsg::Event(wrapper_event(
+                EventType::Thinking,
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY,
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE,
+                marked,
+            )))
+            .expect("the receiver is alive");
+            let mut generation = None;
+            let watch = wait_for_prompt_submission(
+                &mut rx,
+                PANE,
+                AGENT,
+                "the delivered task",
+                &mut generation,
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+            assert_eq!(
+                watch,
+                PromptWatch::Elapsed {
+                    can_report_prompts: !marked,
+                    agent_start: None,
+                },
+                "marked={marked}: a post-write wrapper frame's capability is the event's"
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_expired_upgrade_window_releases_on_the_weak_fact_rather_than_timing_out() {
         const PANE: &str = "worker-pane";
@@ -15408,15 +15767,20 @@ mod tests {
             "a window that saw nothing at all establishes nothing"
         );
 
-        // Difference 2: WHICH producer owns the pane. This is the field that
-        // feeds `agent_reports_submitted_prompt`, and therefore whether an
-        // unconfirmed delivery can ever be confirmed.
+        // Difference 2: WHICH producer owns the pane, and whether it can
+        // report — the fields that decide whether an unconfirmed delivery can
+        // ever be confirmed.
         assert_eq!(
             settled.observed_producer,
             Some(AgentType::Codex),
             "the released fact names its producer, which is what decides whether a re-submission \
              could ever be confirmed"
         );
+        assert!(
+            settled.observed_producer_reports,
+            "a wrapper that declares nothing leaves Codex's own answer standing"
+        );
+        assert!(!nothing.observed_producer_reports);
         assert_eq!(
             nothing.observed_producer, None,
             "a timeout names no producer — nothing was observed"
@@ -15438,6 +15802,285 @@ mod tests {
         assert!(!nothing.observed_interface);
         assert_eq!(settled.launcher_handoff, None);
         assert_eq!(nothing.launcher_handoff, None);
+        // Issue #724: and the outcome records that it WAS the weak fact that
+        // released it, which is the half of the re-pricing standing the wait
+        // owns. A timeout that saw nothing has nothing to re-price.
+        assert!(settled.released_on_settled_guess);
+        assert!(!nothing.released_on_settled_guess);
+    }
+
+    /// Issue #724: a wrapper interface `SessionStart` carrying `origin`, for
+    /// `pane` and `agent`, as the wrapper's emitter builds one.
+    fn wrapper_interface_start(origin: &str, pane: &str, agent: &str) -> AgentEvent {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            origin.to_string(),
+        );
+        AgentEvent {
+            session_id: "wrap-codex-1".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some(pane.to_string()),
+            agent_id: Some(agent.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// Issue #724: run one [`hold_readiness_buffer`] on a paused clock while
+    /// `posts` are sent at their offsets from its start, and report how long
+    /// the hold lasted and what it ended on.
+    ///
+    /// The watch is subscribed before anything is posted, exactly as both call
+    /// sites take theirs before the readiness wait.
+    async fn run_hold(
+        buffer: std::time::Duration,
+        reprice_to: Option<std::time::Duration>,
+        posts: Vec<(std::time::Duration, AgentEvent)>,
+    ) -> (std::time::Duration, ReadinessHold) {
+        let (tx, mut watch) = broadcast::channel(16);
+        let started = tokio::time::Instant::now();
+        let poster = tokio::spawn(async move {
+            for (at, event) in posts {
+                tokio::time::sleep_until(started + at).await;
+                let _ = tx.send(BroadcastMsg::Event(event));
+            }
+            // Keep the sender alive past the hold, so a closed channel is never
+            // what ended it.
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        });
+        let outcome = hold_readiness_buffer(
+            Some(&mut watch),
+            "worker-pane",
+            "agent-1",
+            buffer,
+            reprice_to,
+            None,
+        )
+        .await;
+        let held = started.elapsed();
+        poster.abort();
+        (held, outcome)
+    }
+
+    /// Issue #724: the re-price itself, at the shipped defaults. The gate
+    /// released on the weak output-settled fact and started the ordinary
+    /// 1000 ms buffer; the strong raw-input fact lands 300 ms into it. What is
+    /// left of the ordinary buffer is replaced by the 5000 ms interface buffer
+    /// measured from THAT arrival — not paid out on the weak fact's schedule,
+    /// and not cancelled either, since raw mode is not input-readiness.
+    ///
+    /// The control is the same hold with nothing posted: it ends on the
+    /// ordinary buffer, so the difference is the strong fact and nothing else.
+    #[tokio::test(start_paused = true)]
+    async fn a_strong_fact_during_the_weak_fact_buffer_reprices_it_from_its_arrival() {
+        let strong_at = std::time::Duration::from_millis(300);
+        let (held, outcome) = run_hold(
+            DELEGATE_READINESS_BUFFER,
+            Some(WRAPPER_INTERFACE_READINESS_BUFFER),
+            vec![(
+                strong_at,
+                wrapper_interface_start(
+                    crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN,
+                    "worker-pane",
+                    "agent-1",
+                ),
+            )],
+        )
+        .await;
+        assert_eq!(outcome, ReadinessHold::Repriced);
+        assert!(
+            held >= strong_at + WRAPPER_INTERFACE_READINESS_BUFFER,
+            "held {held:?}: the strong fact landed {strong_at:?} into the weak fact's buffer, so \
+             the write owes the full interface buffer from then"
+        );
+        assert!(
+            held < strong_at
+                + WRAPPER_INTERFACE_READINESS_BUFFER
+                + std::time::Duration::from_millis(5),
+            "held {held:?}: the re-price is measured from the strong fact's arrival, not added \
+             on top of the buffer already paid"
+        );
+
+        let (held, outcome) = run_hold(
+            DELEGATE_READINESS_BUFFER,
+            Some(WRAPPER_INTERFACE_READINESS_BUFFER),
+            vec![],
+        )
+        .await;
+        assert_eq!(outcome, ReadinessHold::Elapsed);
+        assert!(
+            held >= DELEGATE_READINESS_BUFFER
+                && held < DELEGATE_READINESS_BUFFER + std::time::Duration::from_millis(5),
+            "held {held:?}: with no strong fact the weak fact's own buffer is all that is paid"
+        );
+    }
+
+    /// Issue #724: re-pricing can never move a write EARLIER, whatever the two
+    /// values are. `reprice_to` shorter than what is left of the buffer — which
+    /// the shipped defaults never produce, and which is exactly what a forged
+    /// marker would want — leaves the buffer's own end in place. This is the
+    /// property #716 deleted the zero-buffer branch to protect.
+    #[tokio::test(start_paused = true)]
+    async fn a_reprice_never_ends_a_buffer_sooner_than_it_would_have_ended() {
+        let buffer = std::time::Duration::from_millis(5000);
+        let (held, outcome) = run_hold(
+            buffer,
+            Some(std::time::Duration::from_millis(1000)),
+            vec![(
+                std::time::Duration::from_millis(100),
+                wrapper_interface_start(
+                    crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN,
+                    "worker-pane",
+                    "agent-1",
+                ),
+            )],
+        )
+        .await;
+        assert_eq!(outcome, ReadinessHold::Repriced);
+        assert!(
+            held >= buffer,
+            "held {held:?}: a strong fact shortened a buffer already in flight"
+        );
+    }
+
+    /// Issue #724: only the STRONG fact, for THIS pane and THIS agent, and only
+    /// the first one, re-prices. The weak fact again, a plain `SessionStart`, and
+    /// a strong fact naming another pane or agent all leave the buffer as it was;
+    /// a second strong fact cannot walk the deadline forward again.
+    #[tokio::test(start_paused = true)]
+    async fn only_the_first_matching_strong_fact_reprices_a_buffer() {
+        use crate::event::{
+            WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN as READY,
+            WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN as SETTLED,
+        };
+        let mut plain = wrapper_interface_start(READY, "worker-pane", "agent-1");
+        plain.metadata.clear();
+        let at = std::time::Duration::from_millis(200);
+        for (label, event) in [
+            (
+                "the weak fact again",
+                wrapper_interface_start(SETTLED, "worker-pane", "agent-1"),
+            ),
+            ("an unmarked SessionStart", plain),
+            (
+                "another pane's strong fact",
+                wrapper_interface_start(READY, "other-pane", "agent-1"),
+            ),
+            (
+                "another agent's strong fact",
+                wrapper_interface_start(READY, "worker-pane", "agent-2"),
+            ),
+        ] {
+            let (held, outcome) = run_hold(
+                DELEGATE_READINESS_BUFFER,
+                Some(WRAPPER_INTERFACE_READINESS_BUFFER),
+                vec![(at, event)],
+            )
+            .await;
+            assert_eq!(outcome, ReadinessHold::Elapsed, "{label}");
+            assert!(
+                held < DELEGATE_READINESS_BUFFER + std::time::Duration::from_millis(5),
+                "{label} re-priced the buffer: held {held:?}"
+            );
+        }
+
+        let strong = || wrapper_interface_start(READY, "worker-pane", "agent-1");
+        let (held, _) = run_hold(
+            DELEGATE_READINESS_BUFFER,
+            Some(WRAPPER_INTERFACE_READINESS_BUFFER),
+            vec![
+                (at, strong()),
+                (std::time::Duration::from_millis(900), strong()),
+            ],
+        )
+        .await;
+        assert!(
+            held < at + WRAPPER_INTERFACE_READINESS_BUFFER + std::time::Duration::from_millis(5),
+            "held {held:?}: a second strong fact extended a hold the first had already priced"
+        );
+    }
+
+    /// Issue #724: a strong fact that was already queued on the watch when the
+    /// hold began — it landed in the instant between the readiness wait
+    /// returning and the buffer starting — still re-prices it. That is why both
+    /// call sites subscribe the watch before the wait rather than after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_strong_fact_queued_before_the_hold_began_still_reprices_it() {
+        let (held, outcome) = run_hold(
+            DELEGATE_READINESS_BUFFER,
+            Some(WRAPPER_INTERFACE_READINESS_BUFFER),
+            vec![(
+                std::time::Duration::ZERO,
+                wrapper_interface_start(
+                    crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN,
+                    "worker-pane",
+                    "agent-1",
+                ),
+            )],
+        )
+        .await;
+        assert_eq!(outcome, ReadinessHold::Repriced);
+        assert!(held >= WRAPPER_INTERFACE_READINESS_BUFFER, "held {held:?}");
+    }
+
+    /// Issue #724: who may be re-priced at all. Both halves are required — the
+    /// gate released on the weak fact, AND the deck's own launch record says it
+    /// spawned the pane as a wrapper host — so a forged strong marker on a pane
+    /// the deck never wrapped cannot re-price anything, and neither can a strong
+    /// fact after any other kind of release. With `None` the hold ignores every
+    /// event and pays the buffer it was given.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_weak_fact_release_on_a_wrapper_host_may_be_repriced() {
+        let released_on_weak = SessionStartWait {
+            ready: true,
+            released_on_settled_guess: true,
+            ..SessionStartWait::default()
+        };
+        let released_on_strong = SessionStartWait {
+            ready: true,
+            observed_interface: true,
+            ..SessionStartWait::default()
+        };
+        assert_eq!(
+            weak_fact_buffer_reprice(&released_on_weak, true),
+            Some(wrapper_interface_readiness_buffer())
+        );
+        assert_eq!(
+            weak_fact_buffer_reprice(&released_on_weak, false),
+            None,
+            "a pane the deck did not spawn as a wrapper host is priced on what the deck knows, \
+             not on a marker a producer can post"
+        );
+        assert_eq!(weak_fact_buffer_reprice(&released_on_strong, true), None);
+        assert_eq!(
+            weak_fact_buffer_reprice(&SessionStartWait::default(), true),
+            None
+        );
+
+        let (held, outcome) = run_hold(
+            DELEGATE_READINESS_BUFFER,
+            weak_fact_buffer_reprice(&released_on_weak, false),
+            vec![(
+                std::time::Duration::from_millis(300),
+                wrapper_interface_start(
+                    crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN,
+                    "worker-pane",
+                    "agent-1",
+                ),
+            )],
+        )
+        .await;
+        assert_eq!(outcome, ReadinessHold::Elapsed);
+        assert!(held < DELEGATE_READINESS_BUFFER + std::time::Duration::from_millis(5));
     }
 
     /// PRD #249 M1: the readiness buffer's env seam. `0` must stay reachable —
@@ -17385,6 +18028,7 @@ mod tests {
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                prompt_reports_unavailable: false,
             },
         );
 

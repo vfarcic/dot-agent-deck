@@ -33,6 +33,12 @@
 /// (`tests/agent_event.rs`, `tests/orchestration_delegate.rs`).
 pub mod synthetic_agent;
 
+/// Issue #701: a machine-wide load reading taken over each test process's own
+/// window and appended to every panic the harness's hook renders, so a failure
+/// caused by a starved machine labels itself instead of looking identical to a
+/// regression. The module header has the signals and what they do not prove.
+pub(crate) mod load_context;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -99,6 +105,17 @@ pub const WRAP_TEST_MAX_LIFETIME_SECS: &str = "120";
 /// yet" cannot be mistaken for "the child produced the wrong thing", which is
 /// precisely what a 2 s ceiling did on a 16-core box at load average 44.
 pub const CHILD_BOOT_BASE: Duration = Duration::from_secs(8);
+
+/// Issue #701: base ceiling, before [`load_scaled`], on the whole of
+/// [`TuiDeck::submit_claude_prompt`] — the typed prompt reaching the screen
+/// and then Claude Code's `UserPromptSubmit` hook firing, under one deadline. On a healthy run the
+/// hook lands a few seconds before `ToolStart`, and every wait here returns the
+/// instant it holds, so the ceiling is paid only by a prompt that was lost.
+pub const CLAUDE_PROMPT_SUBMIT_BASE: Duration = Duration::from_secs(20);
+
+/// Issue #701: how long [`TuiDeck::submit_claude_prompt`] waits for the hook
+/// after one Enter before pressing it again.
+pub const CLAUDE_SUBMIT_RETRY: Duration = Duration::from_secs(3);
 
 /// Issue #709: the 1-minute load average per CPU, or `None` where this platform
 /// does not publish one cheaply.
@@ -1833,6 +1850,159 @@ impl TuiDeck {
     #[cfg(unix)]
     pub fn subscribe_events(&self) -> EventSub {
         EventSub::open(&self.attach_socket).expect("open SubscribeEvents stream")
+    }
+
+    /// Issue #701: type `prompt` into a real interactive Claude Code pane that
+    /// has painted `? for shortcuts`, submit it, and return the `Thinking`
+    /// event (Claude Code's `UserPromptSubmit` hook) that proves it landed.
+    ///
+    /// **Why Enter is its own step, retried on the outcome.** Sent in one burst
+    /// with the text, the `\r` can reach Claude Code inside the same read as the
+    /// tail of the prompt, and is then taken as part of a paste — a newline in
+    /// the input rather than a submit. Measured on `shell_activity_005` under 48
+    /// busy-loops on 16 CPUs: 3 of 3 runs ended with the whole prompt sitting
+    /// unsubmitted in the input box, nothing but `SessionStart` in the event
+    /// stream, and a 120 s `ToolStart` timeout that read as the model declining
+    /// to use Bash. So this waits until `probe` — a space-free substring of
+    /// `prompt`, so line wrapping cannot split it — is on screen and followed by
+    /// the prompt's last word before the first Enter, and the same load then passed 3 of 3 with that first Enter
+    /// submitting every time. Enter is repeated until the hook fires as a
+    /// backstop for a `\r` that still lands inside the burst; a repeat on an
+    /// input that already submitted lands on an empty prompt.
+    /// `e2e_codex_wrapper.rs` retries Codex's Enter on the same outcome-based
+    /// reasoning.
+    ///
+    /// Only a `Thinking` event that carries prompt text and arrives AFTER the
+    /// prompt is typed counts, so an earlier turn on the same agent — or a
+    /// prompt-less `Thinking` such as `PostCompact`'s — cannot satisfy it, and
+    /// its reported prompt must match what was typed. On failure the panic starts with
+    /// `PROMPT NOT DELIVERED` or `PROMPT PARTIALLY DELIVERED` and names which
+    /// step failed,
+    /// so a lost prompt is never read as a regression in what the calling test
+    /// asserts about the agent's behaviour.
+    #[cfg(unix)]
+    pub fn submit_claude_prompt(
+        &self,
+        events: &EventSub,
+        agent_id: &str,
+        prompt: &str,
+        probe: &str,
+    ) -> dot_agent_deck::event::AgentEvent {
+        assert!(
+            prompt.contains(probe) && !probe.contains(char::is_whitespace) && !probe.is_empty(),
+            "submit_claude_prompt: the probe {probe:?} must be a non-empty, space-free \
+             substring of the prompt"
+        );
+        let tail = prompt
+            .split_whitespace()
+            .last()
+            .expect("submit_claude_prompt: an empty prompt");
+        // Only a `Thinking` that carries prompt text is a submission. Claude
+        // Code's `UserPromptSubmit` always reports the prompt; the other hooks
+        // mapped to `Thinking` (`PostCompact`, for one) report none, and must
+        // not be read as "our prompt landed" (PR #1408 review).
+        let is_submit = |e: &dot_agent_deck::event::AgentEvent| {
+            e.agent_id.as_deref() == Some(agent_id)
+                && e.event_type == dot_agent_deck::event::EventType::Thinking
+                && e.user_prompt.is_some()
+        };
+        let before = events.snapshot().iter().filter(|e| is_submit(e)).count();
+        self.send_keys(prompt.as_bytes());
+        // ONE deadline for both halves, so the helper reports its own failure
+        // well inside a test's nextest kill window instead of being killed
+        // between two back-to-back ceilings.
+        let budget = load_scaled(CLAUDE_PROMPT_SUBMIT_BASE);
+        let deadline = Instant::now() + budget;
+        // The probe proves the text up to it rendered; the prompt's LAST word
+        // appearing after it proves the rest did. Word-wrap moves a whole word
+        // to the next row rather than splitting it, so a space-free token is
+        // matchable on one row.
+        let typed = || {
+            let grid = self.snapshot_grid();
+            let Some(at) = grid.find(probe) else {
+                return false;
+            };
+            let after = &grid[at + probe.len()..];
+            probe.ends_with(tail) || after.contains(tail)
+        };
+        while !typed() {
+            if Instant::now() >= deadline {
+                panic!(
+                    "PROMPT NOT DELIVERED: the typed prompt never finished rendering in Claude \
+                     Code's input — no {probe:?} followed by its last word {tail:?} within \
+                     {budget:?} — so nothing after this point was exercised.\nFinal grid:\n{}",
+                    self.snapshot_grid()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The hook reports the submitted text truncated to 200 bytes, so the
+        // match catches a prefix submitted short of that and a garbled one; a
+        // longer prefix is what the tail wait above exists to prevent. The
+        // report is passed unchanged: the matcher already ignores exactly the
+        // trailing `\n`/`\r`/space/tab a `\r`-taken-as-newline would leave, and
+        // no wider (a trailing NBSP stays significant) (PR #1408 review).
+        let is_ours = |e: &dot_agent_deck::event::AgentEvent| {
+            e.user_prompt.as_deref().is_some_and(|reported| {
+                dot_agent_deck::prompt_delivery::prompt_submission_matches(prompt, reported)
+            })
+        };
+        // Submissions reported since typing began. The FIRST one carrying THIS
+        // prompt is the answer, rather than the first by position: an earlier
+        // turn's event delivered late — after the count above, before the
+        // keystrokes — then cannot stand in for ours, and cannot fail the
+        // helper either, because its text does not match (PR #1408 review).
+        let since_typing = || -> Vec<dot_agent_deck::event::AgentEvent> {
+            events
+                .snapshot()
+                .into_iter()
+                .filter(|e| is_submit(e))
+                .skip(before)
+                .collect()
+        };
+        let mut enters = 0_usize;
+        loop {
+            self.send_keys(b"\r");
+            enters += 1;
+            let attempt_end = (Instant::now() + CLAUDE_SUBMIT_RETRY).min(deadline);
+            while Instant::now() < attempt_end {
+                if let Some(ev) = since_typing().into_iter().find(|e| is_ours(e)) {
+                    if enters > 1 {
+                        eprintln!(
+                            "[harness] submit_claude_prompt: Claude Code accepted the prompt \
+                             only after Enter #{enters}"
+                        );
+                    }
+                    return ev;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if Instant::now() >= deadline {
+                let others: Vec<String> = since_typing()
+                    .into_iter()
+                    .filter_map(|e| e.user_prompt)
+                    .collect();
+                if !others.is_empty() {
+                    panic!(
+                        "PROMPT PARTIALLY DELIVERED: within {budget:?} Claude Code submitted \
+                         {others:?}, none of which is the prompt the test typed ({prompt:?}), \
+                         so what the agent does next is not evidence about the calling test's \
+                         assertions.\nFinal grid:\n{}",
+                        self.snapshot_grid()
+                    );
+                }
+                panic!(
+                    "PROMPT NOT DELIVERED: the prompt is on screen but {enters} Enter(s) within \
+                     {budget:?} of typing it produced no UserPromptSubmit (Thinking) event for \
+                     agent {agent_id:?}. The keystrokes never became a submitted prompt, so \
+                     nothing after this point was exercised — this is not a regression in what \
+                     the calling test asserts; the load context below says whether the machine \
+                     was starved at the time.\nObserved events: {:#?}\nFinal grid:\n{}",
+                    events.snapshot(),
+                    self.snapshot_grid()
+                );
+            }
+        }
     }
 
     /// The spawned deck's process id, when the PTY backend reports one. For a
@@ -3667,6 +3837,8 @@ pub fn install_credential_redaction() {
             store.append(&mut ambient);
             normalise_redactions(&mut store);
         }
+        // Issue #701: the baseline the panic-time load report is measured from.
+        load_context::arm();
         std::panic::set_hook(Box::new(|info| {
             let payload = panic_payload_text(info.payload());
             let location = info
@@ -3678,6 +3850,9 @@ pub fn install_credential_redaction() {
                 .unwrap_or("<unnamed>")
                 .to_string();
             let mut rendered = format_redacted_panic(&thread, &location, &payload);
+            // Issue #701: machine-wide numbers only, nothing a test rendered, so
+            // it carries no credential and needs no redaction pass.
+            rendered.push_str(&load_context::failure_report());
             // Same shape the default hook produces, so a failure still reads
             // the way a contributor expects. A backtrace carries symbol names
             // rather than data, but it is redacted too — free, and one less
@@ -8660,6 +8835,11 @@ pub(crate) fn temp_space_problem(path: &Path) -> Option<String> {
 pub(crate) fn harness_temp_root() -> &'static Path {
     HARNESS_TEMP_ROOT
         .get_or_init(|| {
+            // Issue #701: this is the choke point every harness temp dir passes
+            // through, including headless tests that never obtain a grid, so it
+            // is where the panic hook — and with it the load baseline — gets
+            // installed for them. Idempotent; a no-op when already installed.
+            install_credential_redaction();
             let choice = harness_temp_base();
             for warning in &choice.warnings {
                 eprintln!("[harness] WARNING: {warning}");

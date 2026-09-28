@@ -943,15 +943,28 @@ pub fn prompt_submission_accumulated(expected: &str, reported: &str) -> bool {
 /// capability the whole confirmation design rests on, as distinct from merely
 /// reporting a lifecycle.
 ///
-/// Reviewer finding B4. Claude Code and Devin post `UserPromptSubmit` through
-/// the native hook engine, Codex's wrapper synthesizes the same shape, and
-/// OpenCode forwards `session.prompt` — all four land as an event carrying
-/// `user_prompt` (`crate::hook`). **Pi cannot**: its extension reaches the
+/// Reviewer finding B4. Claude Code, Devin and Codex post `UserPromptSubmit`
+/// through their native hook engines, and OpenCode forwards `session.prompt` —
+/// all four land as an event carrying `user_prompt` (`crate::hook`). **Pi
+/// cannot**: its extension reaches the
 /// daemon through the `agent-event` subcommand, which hardcodes
 /// `user_prompt: None`, so a Pi pane emits perfectly well-formed status frames
 /// carrying the right pane and agent ids and never a single submitted prompt.
 /// Arming re-submission off those frames retypes the prompt until the deadline
 /// into an agent that may already be working on it.
+///
+/// **This answers for the AGENT, and a type is not always the agent speaking.**
+/// Issue #559: `dot-agent-deck wrap`'s own events declare `AgentType::Codex` on
+/// the agent's behalf while never carrying a submitted prompt — the wrapper's
+/// emitter hardcodes `user_prompt: None`, and its stdout classifier reads every
+/// printed line as `Thinking`. For Codex the `true` below is therefore a claim
+/// about Codex's NATIVE hooks, which report only once the wrapper has recorded
+/// trust for them. When that step fails the wrapper says so on every event it
+/// emits ([`crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`]), and
+/// the capability reads — [`crate::event::AgentEvent::reports_submitted_prompt`]
+/// per event, [`pane_confirmation_capability`] per pane — withdraw the answer
+/// this function gives for the type. Call one of those rather than this
+/// wherever the question is about a specific producer.
 ///
 /// [`AgentType::None`] is BOTH "unrecognized binary" and the `#[serde(other)]`
 /// forward-compat landing pad for an agent type this build has never heard of,
@@ -1015,15 +1028,26 @@ pub enum ConfirmationCapability {
     Unknown,
 }
 
-/// Resolve [`ConfirmationCapability`] from the agent types currently declared on
-/// one pane's sessions. Any reporting producer wins; otherwise a recognized
-/// non-reporting one settles it; otherwise the answer is not yet known.
+/// Resolve [`ConfirmationCapability`] from one pane's sessions, each given as
+/// its declared agent type and whether its producer DECLARED that it cannot
+/// report a submitted prompt
+/// ([`crate::state::SessionState::confirmation_producer`]). Any reporting
+/// producer wins; otherwise a recognized non-reporting one settles it; otherwise
+/// the answer is not yet known.
+///
+/// Issue #559: a session whose producer declared itself unable to report is a
+/// RECOGNIZED producer that cannot — `CannotReport`, the Pi answer — whatever
+/// its type says. That is a wrapped Codex whose native hooks the wrapper could
+/// not get trusted: the pane's only producer is then the wrapper, whose events
+/// name Codex and never carry a prompt. Only the declaration moves the answer,
+/// and only toward the safe side; a session that declares nothing is answered
+/// from its type exactly as before.
 pub fn pane_confirmation_capability<'a>(
-    agent_types: impl Iterator<Item = &'a AgentType>,
+    producers: impl Iterator<Item = (&'a AgentType, bool)>,
 ) -> ConfirmationCapability {
     let mut capability = ConfirmationCapability::Unknown;
-    for agent_type in agent_types {
-        if agent_reports_submitted_prompt(agent_type) {
+    for (agent_type, prompt_reports_unavailable) in producers {
+        if agent_reports_submitted_prompt(agent_type) && !prompt_reports_unavailable {
             return ConfirmationCapability::Reports;
         }
         if *agent_type != AgentType::None {
