@@ -2001,6 +2001,8 @@ mod tests {
         /// The `TabMembership` each `create_pane_with_options` call carried,
         /// in call order — what the daemon would register the pane as.
         memberships: Mutex<Vec<Option<crate::agent_pty::TabMembership>>>,
+        /// The Pi native seed each `create_pane_with_options` call carried.
+        seeds: Mutex<Vec<Option<String>>>,
     }
 
     impl MockPaneController {
@@ -2010,6 +2012,7 @@ mod tests {
                 focused: Mutex::new(None),
                 focus_calls: Mutex::new(Vec::new()),
                 memberships: Mutex::new(Vec::new()),
+                seeds: Mutex::new(Vec::new()),
             }
         }
 
@@ -2043,6 +2046,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(opts.tab_membership.clone());
+            self.seeds.lock().unwrap().push(opts.seed.clone());
             let resolved = crate::agent_pty::resolve_display_name(opts.display_name, command);
             Ok((self.create_pane(command, cwd)?, resolved))
         }
@@ -2219,6 +2223,49 @@ mod tests {
                 Some(role_ids[want].as_str()),
                 "[{case}] default focus lands on the orchestrator"
             );
+        }
+    }
+
+    /// Issue #523 × PRD #201: the Pi native seed follows the seat too. A Pi
+    /// orchestrator that is NAMED `orchestrator` but flags no `start` is seeded
+    /// with the orchestrator prompt at spawn (and the tab drops its PTY-injection
+    /// copy); before #523 the seed keyed on the bare flag, so no pane was seeded
+    /// and the prompt fell back to injection into role 0.
+    #[test]
+    fn pi_seed_goes_to_the_seated_orchestrator() {
+        let role = |name: &str, command: &str| OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: command.to_string(),
+            start: false,
+            description: None,
+            prompt_template: None,
+            clear: false,
+        };
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let config = OrchestrationConfig {
+            default: false,
+            name: "seat".to_string(),
+            roles: vec![role("coder", "echo coder"), role("orchestrator", "pi")],
+        };
+        let (idx, _) = tm
+            .open_orchestration_tab(&config, "/work", Some("go".into()), None, (24, 80))
+            .expect("open orchestration tab");
+        assert_eq!(
+            *pc.seeds.lock().unwrap(),
+            vec![None, Some("go".to_string())],
+            "only the seated Pi orchestrator is seeded"
+        );
+        match &tm.tabs[idx] {
+            Tab::Orchestration {
+                orchestrator_prompt,
+                ..
+            } => assert_eq!(
+                *orchestrator_prompt, None,
+                "a natively seeded prompt is not also injected"
+            ),
+            _ => panic!("expected an orchestration tab"),
         }
     }
 
