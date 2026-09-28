@@ -385,11 +385,12 @@ json_escape() {
 "#;
 
 /// The file, in each dispatch worktree, where a [`write_swallowing_agent`]
-/// stand-in records how far it got with its genuine `SessionStart`: `posting`
-/// just before it shells out to `dot-agent-deck hook`, then
-/// `hook-exited|<status>` once that subprocess returns.
+/// stand-in records how far it got with each `SessionStart` it posts:
+/// `posting|<session prefix>` just before it shells out to
+/// `dot-agent-deck hook`, then `hook-exited|<session prefix>|<status>` once that
+/// subprocess returns.
 ///
-/// Issue #531: the daemon's `Received event` line says whether the announcement
+/// Issue #531: the daemon's `Received event` line says whether an announcement
 /// ARRIVED, and this trail says what the stand-in did, so a missing one can be
 /// told apart as "never reached its announcement", "stuck in the hook
 /// subprocess" or "the hook returned and nothing arrived". The last one needs
@@ -397,18 +398,34 @@ json_escape() {
 /// discards `send_to_socket`'s result and returns success either way.
 const STAND_IN_READINESS_LOG: &str = "stand-in-readiness.log";
 
-/// The POSIX-sh lines a [`write_swallowing_agent`] stand-in announces its
-/// genuine start with — a `SessionStart` whose session id is `seed-<pane id>`,
-/// which [`genuine_session_start_received`] looks for — bracketed by the
-/// [`STAND_IN_READINESS_LOG`] trail. `bin` is already shell-quoted.
-fn genuine_session_start_sh(bin: &str) -> String {
+/// The POSIX-sh lines a [`write_swallowing_agent`] stand-in posts a
+/// `SessionStart` with — session id `<session_prefix>-<pane id>`, plus
+/// `metadata` when it is non-empty — bracketed by the
+/// [`STAND_IN_READINESS_LOG`] trail, exiting `exit_code` if the hook fails.
+/// `bin` is already shell-quoted.
+fn session_start_sh(bin: &str, session_prefix: &str, metadata: &str, exit_code: u8) -> String {
     format!(
-        "printf 'posting\\n' >> {STAND_IN_READINESS_LOG}\n\
-         printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"seed-%s\"}}' \"$DOT_AGENT_DECK_PANE_ID\" | {bin} hook --agent claude-code >/dev/null 2>&1\n\
+        "printf 'posting|{session_prefix}\\n' >> {STAND_IN_READINESS_LOG}\n\
+         printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"{session_prefix}-%s\"{metadata}}}' \"$DOT_AGENT_DECK_PANE_ID\" | {bin} hook --agent claude-code >/dev/null 2>&1\n\
          hook_status=$?\n\
-         printf 'hook-exited|%s\\n' \"$hook_status\" >> {STAND_IN_READINESS_LOG}\n\
-         [ \"$hook_status\" -eq 0 ] || exit 97\n"
+         printf 'hook-exited|{session_prefix}|%s\\n' \"$hook_status\" >> {STAND_IN_READINESS_LOG}\n\
+         [ \"$hook_status\" -eq 0 ] || exit {exit_code}\n"
     )
+}
+
+/// The session-id prefix of the FIRST `SessionStart` the stand-in dispatched as
+/// `name` posts — the one that depends on nothing but the stand-in having
+/// started. For every pane but one that is its genuine `seed-` start. The
+/// two-stage pane posts its genuine start only from stage two, which it
+/// reaches only after swallowing two payload writes, so that start is
+/// downstream of the delivery path under test; its launcher-origin
+/// `launcher-` start is the announcement that owes nothing to delivery.
+fn first_announcement_prefix(name: &str) -> &'static str {
+    if name.contains("two-write-flush") {
+        "launcher"
+    } else {
+        "seed"
+    }
 }
 
 fn stand_in_readiness_trail(deck: &TuiDeck, name: &str) -> String {
@@ -423,20 +440,57 @@ fn session_start_log_lines(log: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Whether the daemon logged receiving the genuine `SessionStart` that
-/// [`genuine_session_start_sh`] posts from the pane `pane_id` — as opposed to
-/// `seed-two-write-flush`'s earlier launcher-origin one, whose session id is
-/// `launcher-<pane id>`. The trailing space keeps pane `3` from matching `33`.
-fn genuine_session_start_received(log: &str, pane_id: &str) -> bool {
-    let session_field = format!("session_id=seed-{pane_id} ");
-    session_start_log_lines(log)
-        .iter()
-        .any(|line| line.contains(&session_field))
+/// The daemon's lines for a delivery it has STOPPED trying — the ones that
+/// mean an announcement arriving afterwards can no longer arm a retry.
+const TERMINAL_DELIVERY_MARKERS: [&str; 3] = [
+    "delivery cannot be confirmed by this agent, not retrying",
+    "prompt delivery stopped without confirmation",
+    "prompt delivery unconfirmed at the deadline; abandoning",
+];
+
+/// Where one stand-in's first announcement stands, read from the daemon log in
+/// order.
+#[derive(Debug, PartialEq)]
+enum Announcement {
+    /// Logged before any terminal delivery line for the pane.
+    InTime,
+    /// Not logged, and the daemon is still trying to deliver.
+    Pending,
+    /// The daemon stopped trying before it logged one, so no retry was armed.
+    TooLate,
 }
 
-/// One line of evidence per case whose genuine `SessionStart` the daemon has
-/// not logged yet; empty once every stand-in has announced itself.
-fn unannounced_stand_ins(deck: &TuiDeck, log: &str, cases: &[(&str, &str)]) -> Vec<String> {
+fn announcement(log: &str, pane_id: &str, session_prefix: &str) -> Announcement {
+    // The trailing space keeps pane `3` from matching `33`, and the quotes do
+    // the same for the delivery lines' `pane_id="…"` field.
+    let session_field = format!("session_id={session_prefix}-{pane_id} ");
+    let pane_field = format!("pane_id=\"{pane_id}\"");
+    for line in log.lines() {
+        if line.contains("Received event")
+            && line.contains("event_type=SessionStart")
+            && line.contains(&session_field)
+        {
+            return Announcement::InTime;
+        }
+        if line.contains(&pane_field)
+            && TERMINAL_DELIVERY_MARKERS
+                .iter()
+                .any(|marker| line.contains(marker))
+        {
+            return Announcement::TooLate;
+        }
+    }
+    Announcement::Pending
+}
+
+/// One line of evidence per case whose first announcement is not
+/// [`Announcement::InTime`], with that state; empty once every stand-in has
+/// announced itself in time to arm a retry.
+fn unannounced_stand_ins(
+    deck: &TuiDeck,
+    log: &str,
+    cases: &[(&str, &str)],
+) -> Vec<(Announcement, String)> {
     let records = common::agent_records_on(deck.attach_socket_path());
     cases
         .iter()
@@ -446,13 +500,17 @@ fn unannounced_stand_ins(deck: &TuiDeck, log: &str, cases: &[(&str, &str)]) -> V
                 .iter()
                 .find(|record| record.display_name.as_deref() == Some(display_name.as_str()))
                 .and_then(|record| record.pane_id_env.clone());
-            match pane_id {
-                Some(pane_id) if genuine_session_start_received(log, &pane_id) => None,
-                pane_id => Some(format!(
-                    "{name}: pane_id={pane_id:?}, stand-in trail={:?}",
+            let prefix = first_announcement_prefix(name);
+            let state = pane_id
+                .as_deref()
+                .map_or(Announcement::Pending, |id| announcement(log, id, prefix));
+            (state != Announcement::InTime).then(|| {
+                let evidence = format!(
+                    "{name}: {state:?}, expected session_id={prefix}-<pane id>, pane_id={pane_id:?}, stand-in trail={:?}",
                     stand_in_readiness_trail(deck, name)
-                )),
-            }
+                );
+                (state, evidence)
+            })
         })
         .collect()
 }
@@ -468,7 +526,15 @@ fn write_swallowing_agent(workdir: &Path) -> PathBuf {
     let path = workdir.join("claude");
     let stage_two = workdir.join("claude-stage-two");
     let bin = shell_quote(env!("CARGO_BIN_EXE_dot-agent-deck"));
-    let genuine_start = genuine_session_start_sh(&bin);
+    let genuine_start = session_start_sh(&bin, "seed", "", 97);
+    let launcher_start = session_start_sh(
+        &bin,
+        "launcher",
+        &format!(
+            ",\"metadata\":{{\"{SESSION_START_ORIGIN_METADATA_KEY}\":\"{WRAPPER_FORK_SESSION_START_ORIGIN}\"}}"
+        ),
+        96,
+    );
     let stage_two_body = format!(
         "#!/bin/sh\n{STAND_IN_SH_PRELUDE}\
          {genuine_start}\
@@ -482,7 +548,7 @@ fn write_swallowing_agent(workdir: &Path) -> PathBuf {
         "#!/bin/sh\n{STAND_IN_SH_PRELUDE}\
          case \"$DOT_AGENT_DECK_PANE_ID\" in\n\
            *two-write-flush*)\n\
-             printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"launcher-%s\",\"metadata\":{{\"{SESSION_START_ORIGIN_METADATA_KEY}\":\"{WRAPPER_FORK_SESSION_START_ORIGIN}\"}}}}' \"$DOT_AGENT_DECK_PANE_ID\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 96\n\
+             {launcher_start}\
              read_submission || exit 0\n\
              printf 'swallowed|%s\\n' \"$submission\" >> prompt-attempts.log\n\
              printf '{{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"launcher-%s\",\"tool_name\":\"Bootstrap\"}}' \"$DOT_AGENT_DECK_PANE_ID\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 99\n\
@@ -524,7 +590,7 @@ fn write_default_command_config(command: &str) -> tempfile::TempDir {
     dir
 }
 
-/// Scenario: Launch five concurrent single-agent dispatches through hook-emitting stand-ins: four swallow one seed, while a two-stage launcher declares a wrapper handoff, destroys both payload writes, then starts a genuine Claude-shaped reader. The daemon must first log every stand-in's genuine `SessionStart`, and a missing one fails as a named harness precondition rather than as a delivery verdict; then every pane must durably confirm the dispatch payload built around its own seed — the caller's task at its head, then the daemon's appended completion instruction; the two-stage pane must record two swallowed copies, receive the payload on attempt 3 exactly once, and never be abandoned.
+/// Scenario: Launch five concurrent single-agent dispatches through hook-emitting stand-ins: four swallow one seed, while a two-stage launcher declares a wrapper handoff, destroys both payload writes, then starts a genuine Claude-shaped reader. The daemon must first log each stand-in's first announcement (the two-stage pane's launcher-origin start, everyone else's genuine one) before it stops trying to deliver to that pane, and a missing or too-late one fails as a named harness precondition rather than as a delivery verdict; then every pane must durably confirm the dispatch payload built around its own seed — the caller's task at its head, then the daemon's appended completion instruction; the two-stage pane must record two swallowed copies, receive the payload on attempt 3 exactly once, and never be abandoned.
 #[spec("scheduler/dispatch/014")]
 #[test]
 fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
@@ -589,35 +655,52 @@ fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
     let outputs = dispatch_concurrently(&deck, &caller_pane, &cases);
     assert_dispatch_commands_succeeded(&cases, &outputs);
 
-    // Issue #531: each retry this test is about is armed by the stand-in's own
-    // genuine `SessionStart` — before the write for the first three panes,
-    // after it for `seed-late-claim` (#570) and for the two-stage pane's second
-    // stage. A pane whose announcement never reaches the daemon gets one write
-    // and no retry, and the confirmation assertion below then reports it as
-    // `confirmed=false` after its whole wait, which blames the delivery path
-    // for a stand-in that never started. So establish that precondition first,
-    // under its own name. The bound is the daemon's own delivery deadline, far
-    // more than a passing run needs: the slowest announcer, `seed-late-claim`,
-    // sleeps LATE_CLAIM_SESSION_START_DELAY_SECS first, and in a measured run
-    // the last genuine start was logged 6.4 s after the first.
+    // Issue #531: each retry this test is about is armed by a stand-in's
+    // announcement. A pane whose announcement never reaches the daemon gets
+    // one write and no retry — the daemon logs it as "delivery cannot be
+    // confirmed by this agent, not retrying" — and the confirmation assertion
+    // below then reported it as `confirmed=false` after its whole wait, which
+    // blames the delivery path for a stand-in that never started. So establish
+    // that precondition first, under its own name, for the one announcement
+    // per pane that owes nothing to delivery (`first_announcement_prefix`),
+    // and only count it when the daemon logged it BEFORE it stopped trying to
+    // deliver to that pane: one that arrives afterwards can no longer arm
+    // anything. A pane the daemon gives up on without one ends the wait at
+    // once rather than at the bound. The bound is a backstop past the daemon's
+    // own delivery deadline, far more than a passing run needs: the slowest
+    // first announcer, `seed-late-claim`, sleeps
+    // LATE_CLAIM_SESSION_START_DELAY_SECS first, and in a measured run the
+    // last genuine start was logged 6.4 s after the first.
     let log_path = deck.workdir().join(log_name);
     let read_log = || std::fs::read_to_string(&log_path).unwrap_or_default();
-    let announced = common::wait_until(AUTOMATIC_PROMPT_DEADLINE, || {
-        unannounced_stand_ins(&deck, &read_log(), &cases).is_empty()
+    let readiness_bound = AUTOMATIC_PROMPT_DEADLINE + Duration::from_secs(15);
+    common::wait_until(readiness_bound, || {
+        let gaps = unannounced_stand_ins(&deck, &read_log(), &cases);
+        gaps.is_empty()
+            || gaps
+                .iter()
+                .any(|(state, _)| *state == Announcement::TooLate)
     });
-    if !announced {
-        let log = read_log();
+    let log = read_log();
+    let unannounced = unannounced_stand_ins(&deck, &log, &cases);
+    if !unannounced.is_empty() {
         panic!(
-            "PRECONDITION, not a delivery verdict: the daemon logged no genuine SessionStart \
-             from these stand-ins within {AUTOMATIC_PROMPT_DEADLINE:?}, so their deliveries \
-             were never armed for a retry and the delivery assertions would fail them for a \
-             reason that is not the delivery path's. \
-             A trail ending at `posting` is a stand-in stuck in its `dot-agent-deck hook` \
-             subprocess; `hook-exited|0` with no daemon line is a hook that returned without \
-             its event arriving; no trail is a stand-in that never reached its announcement.\n{}\n\
-             SessionStart lines the daemon did log:\n{}",
-            unannounced_stand_ins(&deck, &log, &cases).join("\n"),
-            session_start_log_lines(&log).join("\n")
+            "PRECONDITION, not a delivery verdict: these stand-ins did not announce themselves \
+             in time to arm a retry, so the delivery assertions would fail them for a reason \
+             that is not the delivery path's. `TooLate` is a pane the daemon stopped trying to \
+             deliver to before it logged the announcement; `Pending` is one with neither by \
+             {readiness_bound:?}. In the trail, ending at `posting` is a stand-in stuck in its \
+             `dot-agent-deck hook` subprocess; `hook-exited|…|0` with no daemon line is a hook \
+             that returned without its event arriving; no trail is a stand-in that never \
+             reached its announcement.\n{}\nSessionStart lines the daemon did log:\n{}\n\
+             delivery lifecycle:\n{}",
+            unannounced
+                .iter()
+                .map(|(_, evidence)| evidence.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            session_start_log_lines(&log).join("\n"),
+            delivery_log_evidence(&log)
         );
     }
 
