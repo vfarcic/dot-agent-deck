@@ -873,15 +873,23 @@ fn resolve_binary_name(current_exe: std::io::Result<PathBuf>) -> String {
     let Ok(absolute) = std::path::absolute(&path) else {
         return DEFAULT_BINARY_NAME.to_string();
     };
-    match absolute
-        .to_str()
-        .map(strip_replaced_binary_suffix)
-        .filter(|path_str| is_prose_safe_path(path_str))
-    {
-        Some(path_str) => posix_command_word(path_str, cfg!(windows))
-            .unwrap_or_else(|| DEFAULT_BINARY_NAME.to_string()),
-        None => DEFAULT_BINARY_NAME.to_string(),
+    let Some(path_str) = absolute.to_str().map(strip_replaced_binary_suffix) else {
+        return DEFAULT_BINARY_NAME.to_string();
+    };
+    if !is_prose_safe_path(path_str) {
+        // Not silent: the bare name this falls back to is resolved through the
+        // agent's own `$PATH`, which is the #549 exposure, so the operator has
+        // to be able to find out why their generated instructions carry it.
+        tracing::warn!(
+            path = ?path_str,
+            "the running deck's path contains a backtick or a control character, which would \
+             break the generated agent instructions it is written into; naming the deck as \
+             `{DEFAULT_BINARY_NAME}` instead, which an agent resolves through its own PATH. \
+             Move the deck to a path without those characters."
+        );
+        return DEFAULT_BINARY_NAME.to_string();
     }
+    posix_command_word(path_str, cfg!(windows)).unwrap_or_else(|| DEFAULT_BINARY_NAME.to_string())
 }
 
 /// Whether `path` can be interpolated into the generated **text** — not just
