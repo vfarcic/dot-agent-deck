@@ -60,6 +60,30 @@ use crate::remote_tunnel::{
 /// the CLI does.
 pub const UNMANAGED_VERSION: &str = "unmanaged";
 
+/// The largest `remotes.toml` this module (and `RemotesFile::load`) will read.
+///
+/// A row is a few hundred bytes, so 1 MiB is thousands of decks — far past any
+/// real list — while turning a path that points at `/dev/zero` or a multi-GB
+/// file into a named read error instead of an out-of-memory kill. The desktop's
+/// own `desktop.toml` is capped the same way (`MAX_SETTINGS_BYTES`, 256 KiB);
+/// this one is larger because it is a list the user grows.
+pub const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
+
+/// Read the registry at `path`, bounded: `Ok(None)` when it does not exist, and
+/// an ordinary [`RemoteConfigError::Io`] — the "cannot read `remotes.toml`"
+/// every caller already reports — when it is not a regular file (a FIFO, a
+/// device, a directory; a symlink is followed and its target judged) or is
+/// larger than [`MAX_REGISTRY_BYTES`]. See
+/// [`crate::bounded_read::read_config_file`].
+pub fn read_registry(path: &Path) -> Result<Option<String>, RemoteConfigError> {
+    crate::bounded_read::read_config_file(path, MAX_REGISTRY_BYTES).map_err(|source| {
+        RemoteConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        }
+    })
+}
+
 /// The longest deck name [`validate_deck_name`] accepts.
 pub const MAX_DECK_NAME_BYTES: usize = 64;
 
@@ -673,17 +697,7 @@ where
     let _guard = EDIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let original = match std::fs::read_to_string(path) {
-        Ok(contents) => Some(contents),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(source) => {
-            return Err(RemoteConfigError::Io {
-                path: path.display().to_string(),
-                source,
-            }
-            .into());
-        }
-    };
+    let original = read_registry(path)?;
     let mut document = DeckDocument::open(path, original.as_deref())?;
     let value = f(&mut document)?;
     let rendered = document.doc.to_string();
@@ -1515,6 +1529,88 @@ added_at = "2026-01-01T00:00:00+00:00"
             address_key(&entry("a", "me@H.Example")),
             ("h.example".to_string(), Some("me".to_string()), 22)
         );
+    }
+
+    /// Issue #1350's review: the registry is read on the desktop's startup and
+    /// snapshot paths from a path `DOT_AGENT_DECK_REMOTES` can move, so a FIFO
+    /// there must be refused rather than block, and the refusal must be the
+    /// ordinary read error — from the loader and from an edit alike.
+    #[cfg(unix)]
+    #[test]
+    fn a_registry_path_that_is_a_fifo_is_a_read_error_not_a_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remotes.toml");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
+        // call, and `mkfifo` only reads through it.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = path.clone();
+        std::thread::spawn(move || {
+            let loaded = RemotesFile::load(&probe).map(|_| ());
+            let edited = remove(&probe, DeckRef::Name("a")).map(|_| ());
+            let _ = tx.send((loaded, edited));
+        });
+        let (loaded, edited) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reading a FIFO must return promptly, not block");
+        for (what, result) in [("load", loaded), ("edit", edited)] {
+            match result {
+                Err(RemoteConfigError::Io { source, .. }) => assert!(
+                    source.to_string().contains("a FIFO, not a regular file"),
+                    "{what}: {source}"
+                ),
+                other => panic!("{what}: expected a read error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_oversized_registry_is_a_read_error_and_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let at_limit = format!("{}\n", "#".repeat(MAX_REGISTRY_BYTES as usize - 1));
+        let path = registry(&dir, &at_limit);
+        assert!(
+            RemotesFile::load(&path).unwrap().remotes.is_empty(),
+            "the limit is a limit"
+        );
+
+        let over = format!("{at_limit}\n");
+        std::fs::write(&path, &over).unwrap();
+        for result in [
+            RemotesFile::load(&path).map(|_| ()),
+            add(&path, entry("a", "a.example"))
+                .map(|_| ())
+                .map_err(|error| match error {
+                    AddDeckError::Config(error) => error,
+                    other => panic!("expected a read error, got {other:?}"),
+                }),
+        ] {
+            match result {
+                Err(RemoteConfigError::Io { source, .. }) => assert!(
+                    source
+                        .to_string()
+                        .contains(&format!("larger than the {MAX_REGISTRY_BYTES}-byte limit")),
+                    "{source}"
+                ),
+                other => panic!("expected a read error, got {other:?}"),
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), over);
+    }
+
+    /// A symlinked `remotes.toml` (a dotfile manager's) is followed, and its
+    /// target judged: a link to a regular file loads.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_registry_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = registry(&dir, "");
+        add(&real, entry("a", "a.example")).unwrap();
+        let link = dir.path().join("linked.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(RemotesFile::load(&link).unwrap().remotes.len(), 1);
     }
 
     /// Issue #1350's review: parsing split a folded login at the first `@` and

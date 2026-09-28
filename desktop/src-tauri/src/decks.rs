@@ -416,6 +416,32 @@ mod tests {
         assert_eq!(load_rows(&path).unwrap(), [added]);
     }
 
+    /// Issue #1350's review: `load_rows` runs on startup and on every settings
+    /// snapshot, so a FIFO at the registry path must come back as the ordinary
+    /// "cannot read the deck list" error — which the snapshot logs and shows
+    /// as no remote decks — instead of blocking the app.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_registry_path_is_an_error_not_a_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remotes.toml");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
+        // call, and `mkfifo` only reads through it.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_rows(&path).map(|rows| rows.len()));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("load_rows must return promptly on a FIFO");
+        assert!(
+            matches!(result, Err(RemoteConfigError::Io { .. })),
+            "{result:?}"
+        );
+    }
+
     /// Issue #1350's review: `remote add dev@REALM@host` stores the UPN login
     /// folded into `host`, which the CLI's validation accepts (it splits at the
     /// last `@`, as ssh does). The desktop's conversion used to split at the

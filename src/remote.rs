@@ -1081,18 +1081,18 @@ pub enum RemoteConfigError {
 }
 
 impl RemotesFile {
-    /// Load the registry from `path`. Missing file → empty registry.
+    /// Load the registry from `path`. Missing file → empty registry. Bounded:
+    /// a path that is not a regular file, or is over
+    /// [`crate::deck_list::MAX_REGISTRY_BYTES`], is a read error (issue #1350).
     pub fn load(path: &Path) -> Result<Self, RemoteConfigError> {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => toml::from_str(&contents).map_err(|source| RemoteConfigError::Parse {
-                path: path.display().to_string(),
-                source,
-            }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(source) => Err(RemoteConfigError::Io {
-                path: path.display().to_string(),
-                source,
-            }),
+        match crate::deck_list::read_registry(path)? {
+            Some(contents) => {
+                toml::from_str(&contents).map_err(|source| RemoteConfigError::Parse {
+                    path: path.display().to_string(),
+                    source,
+                })
+            }
+            None => Ok(Self::default()),
         }
     }
 
