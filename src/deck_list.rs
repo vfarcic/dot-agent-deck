@@ -825,7 +825,10 @@ fn unwritable(path: &str, reason: &str) -> RemoteConfigError {
 /// **A symlinked registry is edited at its target** ([`publish_path`]): the
 /// lock, the read, the temp file and the rename all use the file the link
 /// resolves to, so the link survives and a writer that came in through the
-/// link and one that came in through the target take the same lock.
+/// link and one that came in through the target take the same lock. The path
+/// is resolved **once**, before the lock, and published by [`write_resolved`],
+/// which does not resolve it again — so the rename lands on the file that was
+/// locked and read even if the registry is swapped for a symlink mid-edit.
 pub fn edit<T, E>(path: &Path, f: impl FnOnce(&mut DeckDocument) -> Result<T, E>) -> Result<T, E>
 where
     E: From<RemoteConfigError>,
@@ -860,7 +863,7 @@ where
             "the edit would leave the file unreadable, so nothing was written",
         )
     })?;
-    write_atomic(path, &rendered)?;
+    write_resolved(path, &rendered)?;
     Ok(value)
 }
 
@@ -941,7 +944,7 @@ pub fn remove(path: &Path, which: DeckRef<'_>) -> Result<Option<RemoteEntry>, Re
 /// An absent path stays as given, so a first `remote add` still creates the
 /// file where the configuration says. A **dangling** symlink is refused rather
 /// than followed to create its target: that target can be anywhere, and the
-/// directories on the way would be created owner-only by [`write_atomic`] — a
+/// directories on the way would be created owner-only by [`write_resolved`] — a
 /// link left behind by a half-applied dotfile checkout, or planted, should not
 /// decide where the deck list and its parent directories appear. Reads already
 /// see such a link as an empty registry, so the refusal is on write only and
@@ -977,7 +980,7 @@ fn publish_path(path: &Path) -> Result<std::path::PathBuf, RemoteConfigError> {
 /// once at a time (the desktop, from several windows).
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// How many temp names [`write_atomic`] draws before giving up. The temp file
+/// How many temp names [`write_resolved`] draws before giving up. The temp file
 /// is created with `create_new`, which never opens whatever already holds a
 /// name, so a leftover from a crashed run — or a symlink someone planted at the
 /// predictable name — costs one draw instead of every later save.
@@ -990,11 +993,25 @@ const TEMP_NAME_ATTEMPTS: usize = 8;
 /// the final file is owner-only (0o600) regardless of the user's umask.
 ///
 /// A `path` that is a symlink is written at its target ([`publish_path`]), so
-/// the link is kept rather than replaced by a plain file.
+/// the link is kept rather than replaced by a plain file. The path is resolved
+/// once, here; the write itself is [`write_resolved`], which [`edit`] calls
+/// directly with the path it already resolved and locked.
 pub fn write_atomic(path: &Path, contents: &str) -> Result<(), RemoteConfigError> {
-    use std::io::Write;
+    write_resolved(&publish_path(path)?, contents)
+}
 
-    let path = &publish_path(path)?;
+/// [`write_atomic`] at a path [`publish_path`] has **already** resolved, which
+/// it does not resolve again: the temp file goes beside `path` and the rename
+/// lands on `path` itself, whatever `path` has become since.
+///
+/// [`edit`] resolves once and then locks, reads and publishes at that one
+/// path. Resolving a second time here would let a registry swapped for a
+/// symlink between the two resolutions redirect the rename onto a file the
+/// edit neither locked nor read (issue #1350's review). `rename(2)` does not
+/// follow a symlink at its destination, so such a link is replaced rather than
+/// written through.
+fn write_resolved(path: &Path, contents: &str) -> Result<(), RemoteConfigError> {
+    use std::io::Write;
 
     // PRD #163 auditor: create the parent through the fsperm seam, not plain
     // `create_dir_all`, so the *directory* is owner-only too — the same call
@@ -2063,6 +2080,43 @@ added_at = "2026-01-01T00:00:00+00:00"
         assert_eq!(target.user.as_deref(), Some("dev@REALM"));
         assert_eq!(target.host, "build.example.com");
         assert_eq!(target.user_host(), "dev@REALM@build.example.com");
+    }
+
+    /// Issue #1350's review: [`edit`] resolves the registry path once and
+    /// publishes through [`write_resolved`], which must not resolve it again.
+    /// Here the resolved path's leaf is swapped for a symlink after resolution
+    /// — the state a mid-edit swap leaves — and the write lands on the path it
+    /// was given, replacing the link, instead of following it to a file the
+    /// edit never locked or read.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_at_a_resolved_path_does_not_follow_a_link_swapped_in_after_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = registry(&dir, "remotes = []\n");
+        let resolved = publish_path(&path).unwrap();
+        assert_eq!(resolved, path, "a plain file resolves to itself");
+        let victim = dir.path().join("victim.toml");
+        std::fs::write(&victim, "untouched").unwrap();
+        std::fs::remove_file(&resolved).unwrap();
+        std::os::unix::fs::symlink(&victim, &resolved).unwrap();
+
+        write_resolved(&resolved, "remotes = []\n# edited\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "untouched",
+            "the write followed a link swapped in after resolution"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&resolved)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolved).unwrap(),
+            "remotes = []\n# edited\n"
+        );
     }
 
     /// S1 of #1350's review: the temp name is predictable, so a symlink
