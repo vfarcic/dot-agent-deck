@@ -419,9 +419,10 @@ async fn list_agents_returns_empty_initially() {
 }
 
 // PRD #76 M2.12: `tab_membership` round-trips through the StartAgent →
-// list_agents wire path so the TUI can rebuild mode/orchestration tabs
-// on reconnect instead of stranding every hydrated pane on the
-// dashboard. Two end-to-end paths: Mode tab and Orchestration tab.
+// list_agents wire path so the TUI can rebuild orchestration tabs on
+// reconnect instead of stranding every hydrated pane on the dashboard. Two
+// end-to-end paths: the deprecated `TabMembership::Mode` variant (legacy
+// records an older TUI still sends) and Orchestration.
 
 async fn start_agent_with_membership(server: &Server, membership: TabMembership) -> String {
     let mut s = UnixStream::connect(&server.path).await.unwrap();

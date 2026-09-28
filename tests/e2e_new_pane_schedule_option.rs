@@ -155,7 +155,7 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     // ("Unable to spawn claude") and the layout never settles — a dependency on
     // a real agent binary this test never meant to have. `cat` is a real binary
     // that blocks on stdin, so the spawn deterministically succeeds; the
-    // card-vs-mode-tab layout renders independent of WHICH command is spawned,
+    // resulting layout renders independent of WHICH command is spawned,
     // which is exactly what this test asserts. Same drive as
     // `prompt/new-pane/013` in `e2e_new_pane_seed.rs`.
     deck.send_keys(b"\r"); // Mode → Name
@@ -173,7 +173,7 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     // Submitting closes the form; wait for the resulting layout to settle into
     // one of the two observable end-states: a single-agent dashboard card (the
     // dashboard's session-count title renders only on the Dashboard tab) or a
-    // 50/50 mode tab (a second tab whose strip carries a `×` close glyph).
+    // second tab (whose strip carries a `×` close glyph).
     deck.wait_for_absence("[Submit]"); // form closed
     deck.wait_until_grid("schedule submit settles into a card or a mode tab", |g| {
         g.contains("dot-agent-deck \u{2014}") || g.contains("×")

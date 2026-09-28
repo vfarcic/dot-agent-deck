@@ -366,7 +366,7 @@ fn mode_chip_001_bottom_bar_names_current_mode() {
     );
 }
 
-/// Scenario: Render the global-only Mode-tab bar, the context-rich Dashboard/Orchestration bar, and the PaneInput bar. Every context must keep the chip at the same left edge while retaining the destination-naming Ctrl+D button beside it.
+/// Scenario: Render the global-only bar, the context-rich Dashboard/Orchestration bar, and the PaneInput bar. Every context must keep the chip at the same left edge while retaining the destination-naming Ctrl+D button beside it.
 #[spec("mode/chip/002")]
 #[test]
 fn mode_chip_002_is_universal_and_keeps_destination_button() {

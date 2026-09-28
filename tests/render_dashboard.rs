@@ -1611,7 +1611,7 @@ fn palette_005_command_mode_focused_pane_drops_cyan_accent() {
     );
 
     // FOCUS SURVIVES: thickness takes over the job colour just gave up, so a
-    // multi-pane mode tab still shows which pane `Ctrl+D` / `Enter` returns to.
+    // multi-pane orchestration tab still shows which pane `Ctrl+D` / `Enter` returns to.
     let live_glyph = border_glyph_at_mid(&live);
     let parked_glyph = border_glyph_at_mid(&parked);
     assert_eq!(

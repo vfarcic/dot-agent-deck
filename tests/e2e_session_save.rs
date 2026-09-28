@@ -159,7 +159,7 @@ fn save_002_detach_path_writes_snapshot() {
 }
 
 /// Drive the new-pane dialog to open the single orchestration in the `orch-deck`
-/// fixture. With no `[[modes]]` defined the Mode chip row is `[No mode] [Orch:
+/// fixture. The Mode chip row is `[No mode] [Orch:
 /// demo-orch] [schedule]`, so ONE Right selects the orchestration; selecting an
 /// orchestration HIDES the Command field, so a second Enter submits the form.
 /// Mirrors `e2e_dashboard_selection`'s `open_orchestration`.

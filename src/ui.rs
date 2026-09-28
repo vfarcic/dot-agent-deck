@@ -607,10 +607,8 @@ fn resolve_authoring_command(default_command: &str) -> String {
 const DISPATCHER_MODE_NAME: &str = "dispatcher";
 
 /// Issue #1199: the built-in options at the end of the New Agent form's Mode
-/// row. None of them is a workspace mode — those were removed — and none ever
-/// opened a mode tab: each spawns a single seeded agent as a dashboard card.
-/// They used to ride on synthetic `ModeConfig`s purely for the chip name and
-/// the modal title; this carries exactly that and nothing else.
+/// row. Each spawns a single seeded agent as a dashboard card; this carries the
+/// chip name and the modal title and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BuiltinOption {
     /// PRD #127: author a scheduled task.
@@ -2004,9 +2002,8 @@ struct UiState {
     /// pane id as of the previous `reconcile_dashboard_selection` frame. The
     /// focused-pane sync (M4) reactivates the highlight only on a genuine focus
     /// *transition* — when the focused pane CHANGED to a visible dashboard card
-    /// — not on a steady-state focus the tab-switch restore leaves in place
-    /// (first seen with a workspace-mode tab's agent pane, which was also a
-    /// dashboard card; Mode tabs were removed in #1199). Without this, switching away and back re-armed the
+    /// — not on a steady-state focus the tab-switch restore leaves in place.
+    /// Without this, switching away and back re-armed the
     /// highlight a tab switch had cleared (violating SC1).
     last_focused_pane_id: Option<String>,
     /// PRD #341 M6: which pane the user was typing into as of the previous
@@ -8082,8 +8079,7 @@ enum DeckKey {
     Orchestration(TabId),
 }
 
-/// The [`DeckKey`] for a tab. (`None` was for the non-deck `Mode` tab, which
-/// issue #1199 removed; every remaining tab kind is a deck.)
+/// The [`DeckKey`] for a tab. Every tab kind is a deck.
 fn deck_key(tab: &Tab) -> Option<DeckKey> {
     match tab {
         Tab::Dashboard { .. } => Some(DeckKey::Dashboard),
@@ -8175,9 +8171,8 @@ fn resume_pane_input_target(
 /// PR #151 (manual-test fix): M4 reactivates only on a genuine focus
 /// TRANSITION — the focused pane id must have *changed* since the previous
 /// frame. The original code reactivated whenever the focused pane merely
-/// *mapped* to a card, which re-armed a just-cleared selection on tab return
-/// (the case that exposed it was a workspace-mode tab, removed in #1199, whose
-/// agent pane was also a dashboard card): a steady-state focus restored on
+/// *mapped* to a card, which re-armed a just-cleared selection on tab return:
+/// a steady-state focus restored on
 /// return is not a transition, so it no longer reactivates the highlight. The cyan
 /// focus border (driven by the controller's focus, not this function) is
 /// unaffected. Orchestration role panes are already excluded from the card
@@ -8246,9 +8241,8 @@ fn reconcile_dashboard_selection(
 /// satisfy.
 fn reconcile_pane_input_scrollback(ui: &mut UiState, pane: &dyn PaneController) {
     // PRD #341 (code-review finding 3): `PaneInput` with NOTHING focused is a
-    // state that LIES. It was first reached through a Mode tab (removed in
-    // #1199): a focused reactive side pane could vanish with no successor, so
-    // the caller focused nothing. `Action::ForwardToPane` then silently drops
+    // state that LIES: it arises when the focused pane vanishes with no
+    // successor and nothing is focused. `Action::ForwardToPane` then silently drops
     // every keystroke for want of a `focused_pane_id` while the chip says
     // ` TYPING ` — a typing label over a pane that receives nothing. That is precisely the contradiction M1 removed in the other
     // direction, so leave `PaneInput`: command mode is the honest answer AND the
@@ -8297,9 +8291,7 @@ fn reconcile_pane_input_scrollback(ui: &mut UiState, pane: &dyn PaneController) 
 /// highlight stays inactive because `reconcile_dashboard_selection` only
 /// reactivates on a focus *transition* and the pre-seed below makes the restored
 /// focus a steady state (no transition): a card never *looks* selected until the
-/// user re-arms it with Enter. (A workspace-mode tab's agent pane, removed in
-/// #1199, stayed focused on return and *was* a dashboard card; the same
-/// transition guard kept it from re-arming — see PR #151.)
+/// user re-arms it with Enter.
 fn switch_tab_with_focus(
     tab_manager: &mut TabManager,
     target_index: usize,
@@ -9767,7 +9759,7 @@ pub fn hit_test_button(button_rects: &[(Action, Rect)], col: u16, row: u16) -> O
 /// Deliberately an EXHAUSTIVE `match` with no `_` arm: this guard was originally
 /// a local `bool` in [`run_tui`], and `ScheduledTasks` — added long after — was
 /// simply forgotten, so wheeling over the Schedules dialog scrolled the
-/// mode-tab side pane behind it (issue #142). A wildcard arm would let the next
+/// pane behind it (issue #142). A wildcard arm would let the next
 /// new `UiMode` repeat that silently; without one, adding a variant fails to
 /// COMPILE until its modality is declared here.
 fn overlay_blocks_mouse(mode: &UiMode) -> bool {
@@ -10179,9 +10171,7 @@ fn dispatch_action(
         // Both card-shaped tab kinds are handled, because they are the same
         // shape: a card sidebar on the left and a stack of agent panes on the
         // right, differing only in the percentage (33/67 vs a `Ctrl+l`-toggled
-        // 34/66-or-25/75) and in which panes they scope to. (Mode tabs, two
-        // pane regions rather than sidebar-plus-panes, were deliberately left
-        // out until issue #1199 removed them.)
+        // 34/66-or-25/75) and in which panes they scope to.
         Action::ToggleZoom => {
             let flag = match tab_manager.active_tab_mut() {
                 Tab::Orchestration { zoomed, .. } | Tab::Dashboard { zoomed, .. } => Some(zoomed),
@@ -11022,8 +11012,7 @@ fn dispatch_action(
                         AgentSpawnOptions {
                             display_name: form_name,
                             // Issue #1199: a dashboard card has no tab
-                            // membership. (`TabMembership::Mode` is never
-                            // constructed again — workspace modes were removed.)
+                            // membership.
                             tab_membership: None,
                             rows: spawn_rows,
                             cols: spawn_cols,
@@ -11638,8 +11627,7 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
 ///   exists as saved.
 ///
 /// On `Err`, the caller surfaces the reason via `session_warnings` and falls
-/// back to a PLAIN dashboard pane (never a half-broken orchestration tab),
-/// as the mode-tab drift Path D/E fallback did (PRD #69; modes removed in #1199).
+/// back to a PLAIN dashboard pane (never a half-broken orchestration tab).
 ///
 /// On `Ok`, returns the resolved config AND the validated start-role index to
 /// honor (the SAVED cursor, bounds-checked — PRD #89 review-fix F2/F3), so the
@@ -12468,9 +12456,7 @@ pub fn run_tui(
     // Issue #949 — the pane ids the DAEMON supplied on this startup, which is
     // exactly the set whose ids are a stable identity across processes (the
     // daemon captured each into its agent's `DOT_AGENT_DECK_PANE_ID` and echoed
-    // it back on `list_agents`). Empty on the daemon-empty path. (It also
-    // excluded a Mode tab's locally-spawned SIDE panes until issue #1199
-    // removed them.) Consumed
+    // it back on `list_agents`). Empty on the daemon-empty path. Consumed
     // by `SavedFocus::retain_pane_ids` at the restore seam after both blocks.
     let mut daemon_pane_ids: HashSet<String> = HashSet::new();
 
@@ -12896,8 +12882,7 @@ pub fn run_tui(
             // success we `continue`; on drift (config gone, orchestration
             // renamed/removed, role set changed) we push a clear warning NAMING
             // the orchestration and fall through to the plain-pane restore below
-            // — never a half-broken tab (as the mode-tab Path D/E fallback did,
-            // PRD #69; modes removed in #1199). Unlike warm-daemon hydration (session/restore/007), this
+            // — never a half-broken tab. Unlike warm-daemon hydration (session/restore/007), this
             // path REPLAYS the saved `orchestrator_prompt` to the start role —
             // there is no live agent with the prompt already in scrollback.
             if let Some(ref orch_snap) = saved_pane.orchestration {
@@ -13184,9 +13169,7 @@ pub fn run_tui(
     // later Tab-away-and-back from dumping the user on that tab's start role.
     //
     // Only the ids the DAEMON supplied survive into the restore. Every other
-    // pane on screen — all of them on the daemon-empty rebuild path (and, until
-    // #1199 removed them, a Mode tab's locally-spawned side panes on the warm
-    // one) — carries a fresh
+    // pane on screen — all of them on the daemon-empty rebuild path — carries a fresh
     // `allocate_id` counter that matches a remembered number by coincidence
     // rather than by identity, so honouring one can focus the WRONG terminal
     // instead of merely failing to restore. `SavedFocus::retain_pane_ids` has
@@ -14878,9 +14861,7 @@ pub fn run_tui(
         } // end inner event-drain loop
     }
 
-    // Snapshot the session for auto-restore on exit. (This once had to run
-    // before a mode-tab teardown loop that unregistered mode-tab pane ids
-    // (PRD #69); workspace modes were removed in #1199.)
+    // Snapshot the session for auto-restore on exit.
     {
         let live_panes = state.blocking_read().managed_pane_ids.clone();
 
@@ -16011,8 +15992,7 @@ fn render_frame(
     // accident — the single source is compiler-enforced, not conventional.
     //
     // Destructure the content the layout pass resolved: dashboard and
-    // orchestration tabs both render as the card grid. (Mode tabs rendered and
-    // returned here until issue #1199 removed them.)
+    // orchestration tabs both render as the card grid.
     let (dashboard_area, panes_area, pane_ids, pane_rects, pane_layout) = match &layout.content {
         FrameContent::Cards {
             dashboard_area,
@@ -16861,7 +16841,7 @@ fn render_terminal_panes(
     // PTYs to this frame. `Some` => draw into exactly those; `None` => recompute
     // via `pane_stack_rects` (used by callers without a `FrameLayout` rect list —
     // the L1 render seams in this file's tests; every production caller passes
-    // `Some` since issue #1199 removed the mode-tab agent / side panes).
+    // `Some`).
     precomputed_rects: Option<&[Rect]>,
     // Injected by L1 notice-lifecycle coverage; live frames pass the same `now`
     // used for every other transient render state in that frame.
@@ -18596,8 +18576,7 @@ fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec
     ];
 
     let right: Vec<Line> = vec![
-        // Issue #1199: these two lines outlived the "Mode Tab" section they sat
-        // in — they describe every pane, not a mode tab.
+        // These two lines describe every pane.
         Line::styled("  Mouse", cyan),
         Line::from(""),
         Line::from("  Mouse click     Focus pane"),
@@ -22783,8 +22762,7 @@ pub fn render_dir_picker_to_buffer(
 /// renders clickable mode chips and `[Submit]` / `[Cancel]` buttons, which this
 /// seam's buffer then shows. Mirrors [`render_button_bar_to_buffer`].
 ///
-/// Issue #1199: this took workspace-mode names until modes were removed; an
-/// orchestration is now the only project-defined chip the row can carry.
+/// An orchestration is the only project-defined chip the row can carry.
 pub fn render_new_pane_form_to_buffer(
     orchestration_names: &[&str],
     width: u16,
@@ -24261,8 +24239,8 @@ mod tests {
         );
 
         // No card sidebar, any mode -> un-resolved, so `Ctrl+Z` reaches the
-        // PTY. (No tab kind has lacked a sidebar since issue #1199 removed Mode
-        // tabs; this pins `scope_zoom`'s own contract.)
+        // PTY. (Every current tab kind has a sidebar; this pins `scope_zoom`'s
+        // own contract.)
         for mode in [UiMode::Normal, UiMode::PaneInput] {
             assert!(
                 scope_zoom(zoom(), false, mode).is_none(),
@@ -26461,7 +26439,7 @@ mod tests {
     #[test]
     fn partition_mixed_input_preserves_order() {
         // dashboard pane, then a legacy mode pane (issue #1199: also a
-        // dashboard card now), then orchestration, in input order.
+        // dashboard card), then orchestration, in input order.
         let panes = vec![
             hydrated("1", "a-1", Some("/w"), None),
             hydrated(
@@ -30138,8 +30116,7 @@ mod tests {
 
         let mut ui = default_ui();
 
-        // --- Orchestration tab: the case the e2e (layout_002) caught, which
-        // was first seen on a workspace-mode tab (removed in #1199). ---
+        // --- Orchestration tab: the case the e2e (layout_002) caught. ---
         tab_manager
             .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
             .expect("open an orchestration tab");
@@ -32480,7 +32457,7 @@ mod tests {
     }
 
     /// Issue #1199: the Mode row's built-in options carry their own chip names
-    /// and the modal-title name — no workspace mode is ever among them.
+    /// and the modal-title name.
     #[test]
     fn unified_form_selected_builtin() {
         let mut f = NewPaneFormState::new(
@@ -32834,9 +32811,7 @@ mod tests {
     }
 
     /// PRD #220: submitting the dispatcher option must spawn a dashboard CARD
-    /// carrying its seed on the REQUEST. (It once rode on a synthetic workspace
-    /// mode, whose tab rendered a single agent at half width beside an empty
-    /// column; issue #1199 removed that path entirely.)
+    /// carrying its seed on the REQUEST.
     #[test]
     fn dispatcher_submits_as_a_dashboard_card() {
         let mut f = NewPaneFormState::new(
@@ -33029,7 +33004,7 @@ mod tests {
 
     // Issue #142 — every `UiMode`'s wheel modality is declared explicitly. The
     // bug was an OMISSION: `ScheduledTasks` was missing from the wheel-blocking
-    // guard, so wheeling over the manager dialog scrolled the mode-tab side pane
+    // guard, so wheeling over the manager dialog scrolled the pane
     // behind it. Listing all variants here (paired with the exhaustive `match` in
     // `overlay_blocks_mouse`, which has no `_` arm) makes a repeat of that
     // omission fail loudly rather than silently leak.
@@ -39341,8 +39316,7 @@ mod tests {
     /// confirm `gate_pane_input_key` passes an `Action::ForwardToPane` through
     /// UNCHANGED on the always-present Dashboard tab — the gate must still match
     /// only `Tab::Orchestration`, never widening onto other tab types now that
-    /// the lock it reads is deck-global. (It also covered a workspace-mode tab
-    /// until issue #1199 removed them; the Dashboard is now the only other kind.)
+    /// the lock it reads is deck-global.
     #[spec("orchestration/lock/005")]
     #[test]
     fn lock_005_dashboard_stays_ungated_when_deck_locked() {

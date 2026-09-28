@@ -73,7 +73,7 @@ fn write_beta_agent(deck: &TuiDeck) {
 }
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
-/// `orch-focus-lifecycle` fixture. With no `[[modes]]` defined the Mode chip
+/// `orch-focus-lifecycle` fixture. The Mode chip
 /// row is `[No mode] [Orch: focus-lifecycle] [schedule]`, so ONE Right
 /// selects the orchestration; selecting an orchestration hides the Command
 /// field, so a second Enter submits the form.
@@ -204,8 +204,8 @@ fn orchestration_007_ctrl_l_toggles_pane_column_split() {
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active agents");
 
-    // Same keystrokes as the `orch-focus-lifecycle` opener above: with no
-    // `[[modes]]` in the fixture, ONE Right selects `[Orch: demo-orch]`, and
+    // Same keystrokes as the `orch-focus-lifecycle` opener above: ONE Right
+    // selects `[Orch: demo-orch]`, and
     // selecting an orchestration hides the Command field so a second Enter
     // submits the form.
     open_orchestration(&deck);

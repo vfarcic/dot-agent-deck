@@ -234,7 +234,7 @@ fn assert_pane_never_saw(socket: &Path, pane: &RolePane, label: &str, needle: &s
 }
 
 /// Drive the production new-pane flow to open the fixture's single orchestration
-/// against the deck's CURRENT directory. With no `[[modes]]` in the fixture the
+/// against the deck's CURRENT directory. The
 /// Mode chip row is `[No mode] [Orch: route-iso] [schedule]`, so ONE Right
 /// selects the orchestration; selecting an orchestration HIDES the Command
 /// field, so the second Enter submits. Mirrors `e2e_session_save`'s

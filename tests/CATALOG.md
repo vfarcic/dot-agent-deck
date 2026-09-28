@@ -330,7 +330,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/selection/016 — The inactive-selection close no-op (012) does NOT suppress closing an active Orchestration tab via Ctrl+W.
 - **Layer:** L1 (in-process `dispatch_action(Action::CloseSelected)` against a recording `PaneController`).
 - **Agent:** none (a real Orchestration tab; no dashboard cards armed).
-- **Asserts:** with an Orchestration tab active and `selected_index == None`, dispatching `Action::CloseSelected` opens confirmation and `ConfirmCloseSelected` closes that tab (tab count drops back to the lone Dashboard). Bounds the `dashboard/selection/012` no-op gate: the inactive-selection guard suppresses an unarmed dashboard CARD, but an active TAB remains a valid confirmation target. Regression for the PR #151 e2e failure `e2e_render_contract::layout_002` (first seen on a workspace-mode tab, removed in #1199).
+- **Asserts:** with an Orchestration tab active and `selected_index == None`, dispatching `Action::CloseSelected` opens confirmation and `ConfirmCloseSelected` closes that tab (tab count drops back to the lone Dashboard). Bounds the `dashboard/selection/012` no-op gate: the inactive-selection guard suppresses an unarmed dashboard CARD, but an active TAB remains a valid confirmation target. Regression for the PR #151 e2e failure `e2e_render_contract::layout_002`.
 - **Does not assert:** per-pane PTY teardown / role-pane stop (covered by `tabs/orchestration/002`); the dashboard-card close no-op itself (covered by `dashboard/selection/012`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -1877,7 +1877,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### tabs/orchestration/005 — Enter restore is per-deck: the Orchestration deck restores ITS OWN previous role, not a Dashboard selection leaked through shared state.
 - **Layer:** L1 (in-process `switch_tab_with_focus` round-trip + `dashboard_focus_target`).
 - **Agent:** none (a real Orchestration tab with three roles; the Dashboard as the round-trip intermediate).
-- **Asserts:** arm the Orchestration deck on role 1, leave to the Dashboard, arm the Dashboard on card 2, then return to the (now inactive) Orchestration deck — Enter restores the Orchestration's OWN remembered role (index 1), NOT the Dashboard's leaked index 2. Pins per-deck independence of the Enter-restore state (the remembered selection must be stored per deck, not in a single shared field). Complements `tabs/orchestration/004` (which restores via a non-deck Mode-tab intermediate that can't clobber the shared field).
+- **Asserts:** arm the Orchestration deck on role 1, leave to the Dashboard, arm the Dashboard on card 2, then return to the (now inactive) Orchestration deck — Enter restores the Orchestration's OWN remembered role (index 1), NOT the Dashboard's leaked index 2. Pins per-deck independence of the Enter-restore state (the remembered selection must be stored per deck, not in a single shared field). Complements `tabs/orchestration/004` (which restores through an Orchestration → Orchestration round-trip and never visits the Dashboard).
 - **Does not assert:** the pane-focus side effect of activating the role; the Dashboard's own restore (covered by `dashboard/selection/008`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -1899,7 +1899,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness, `tests/e2e_orchestration_pane_column.rs`).
 - **Agent:** none (a `cat -v` pane on the Dashboard, no LLM tokens spent).
 - **Asserts:** on a Dashboard (non-orchestration) tab with a live `cat -v` pane in PaneInput mode, typing a unique sentinel then pressing `Ctrl+l` then Enter makes the pane echo `<sentinel>^L` — `cat -v` renders the received `0x0c` as the two characters `^L`, so the echo appears only if the raw byte actually reached the PTY. Pins the PRD #336 scope rule that `Action::ToggleOrchestrationSplit` claims `Ctrl+l` only on an orchestration tab; regression coverage for the Greptile P1 on PR #342, where the global resolver claimed it unconditionally and swallowed the key on every other tab.
-- **Does not assert:** the orchestration-tab toggle behavior itself (covered by `tabs/orchestration/007`); Mode-tab or other non-Dashboard tab types (Dashboard is sufficient to prove the missing tab-context check). Deliberately does NOT rely on a shell's readline `clear-screen` side effect, which depends on the host terminal setup and made an earlier version of this test fail where forwarding was in fact correct.
+- **Does not assert:** the orchestration-tab toggle behavior itself (covered by `tabs/orchestration/007`); other non-Dashboard tab types (Dashboard is sufficient to prove the missing tab-context check). Deliberately does NOT rely on a shell's readline `clear-screen` side effect, which depends on the host terminal setup and made an earlier version of this test fail where forwarding was in fact correct.
 - **Platform coverage:** mac+linux.
 
 ##### tabs/orchestration/009 — An orchestration tab's tab-bar label renders in the color of the single highest-priority state among its panes (PRD #333).
@@ -1964,14 +1964,14 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### tabs/selection/003 — Dashboard `selected_index` is derived from `selected_session_id` (PRD #83 M3).
 - **Layer:** L1 (in-process unit test; `src/tab.rs`).
 - **Agent:** none.
-- **Asserts:** `ui::sync_and_derive_selection` resolves a Dashboard `selected_session_id` to its card index, and adopts a focused pane that maps to a visible card. (It also pinned that the sync ignored a workspace-mode tab, until issue #1199 removed them.)
+- **Asserts:** `ui::sync_and_derive_selection` resolves a Dashboard `selected_session_id` to its card index, and adopts a focused pane that maps to a visible card.
 - **Does not assert:** the per-frame call site in `run_tui` (exercised by the L1 render test `dashboard/pane/005`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### tabs/selection/004 — Stale-id fallback clears the field and defaults (PRD #83 M4).
 - **Layer:** L1 (in-process unit test; `src/tab.rs`).
 - **Agent:** none.
-- **Asserts:** a remembered session/role id no longer in the filtered list is cleared and the selection falls back to index 0; two cards on one role pane can each hold the highlight. (The reactive-pane remap it also covered went with workspace modes in issue #1199.)
+- **Asserts:** a remembered session/role id no longer in the filtered list is cleared and the selection falls back to index 0; two cards on one role pane can each hold the highlight.
 - **Does not assert:** controller-level focus.
 - **Platform coverage:** mac+linux+windows.
 
@@ -3085,7 +3085,7 @@ without depending on the config struct API.
 ##### error/config/002 — Missing `.dot-agent-deck.toml` results in the **Mode** field showing only the default; the new-pane form still launches a plain pane.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** the form opens with the default mode selectable; submitting creates a dashboard pane (not a mode tab).
+- **Asserts:** the form opens with the default mode selectable; submitting creates a dashboard pane.
 - **Does not assert:** the absence-of-config tip rendering (covered by `dashboard/config-gen/001`).
 - **Platform coverage:** mac+linux.
 
@@ -3606,7 +3606,7 @@ without depending on the config struct API.
 ##### orchestration/lock/005 — The Dashboard is never gated, even while the deck-global lock is engaged.
 - **Layer:** L1 (`gate_pane_input_key` called directly against a real Dashboard tab).
 - **Agent:** none.
-- **Asserts:** with `ui.command_entry_locked = true` (the strongest case) and an EMPTY status map (so the `WaitingForInput` carve-out cannot fire and the pass-through can only come from the tab-kind match), `Action::ForwardToPane` passes through UNCHANGED on the Dashboard. (It covered a workspace-mode tab too, until issue #1199 removed them.) Guards the obvious mis-reading of deck-global storage as deck-global reach.
+- **Asserts:** with `ui.command_entry_locked = true` (the strongest case) and an EMPTY status map (so the `WaitingForInput` carve-out cannot fire and the pass-through can only come from the tab-kind match), `Action::ForwardToPane` passes through UNCHANGED on the Dashboard. Guards the obvious mis-reading of deck-global storage as deck-global reach.
 - **Does not assert:** the Orchestration-tab gate itself (`orchestration/lock/006`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -4183,7 +4183,7 @@ without depending on the config struct API.
 - **Layer:** L1 (in-process unit test; `src/tab.rs`, alongside `tabs/selection/*`, against the recording `MockPaneController`).
 - **Agent:** none.
 - **Asserts:** a deck with two orchestration tabs, the second active with its non-start `coder` role focused on the controller while the first separately remembers its own `coder`, captures a `SavedFocus` whose `active_pane` is the live focused pane and whose `tab_panes` carries BOTH tabs' roles. Applying that capture to a FRESH `TabManager` that rebuilt the same two tabs in the OPPOSITE order — what a reattach does, since warm-daemon hydration rebuilds in the daemon's bucket order rather than the order the user opened them, asserted here by requiring the remembered tab to land at a different index — answers the tab that OWNS the remembered pane, `restore_focus_on_switch_in` there returns `second-coder` (not the start-role fallback) and calls `focus_pane` with it, and switching to the other rebuilt tab restores `first-coder` too. That last step is the half the active tab alone cannot cover: proven non-vacuous by disabling the `tab_panes` loop, which reddens it.
-- **Does not assert:** the user-visible detach/reattach cycle against the real binary (`session/restore/016`); the degradation cases (`session/restore/018`); the TOML schema (`config/saved-session/002`); Mode-tab focus, whose `None`-means-agent-pane convention is exercised by `tabs/selection/002` and reached here only through the same `record_focus_on_tab` match arm.
+- **Does not assert:** the user-visible detach/reattach cycle against the real binary (`session/restore/016`); the degradation cases (`session/restore/018`); the TOML schema (`config/saved-session/002`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### session/restore/018 — A remembered position that no longer resolves degrades to today's fallback, a dead-slot id is never remembered, and a remembered Dashboard is a real position (issue #949).
@@ -6391,5 +6391,4 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 | `dot-agent-deck config get` / `config set` ([docs/configuration.md](../docs/configuration.md)) | Non-TUI; the underlying config field reflection is covered by pure-data tests (`*_get_set_field`, `*_get_set_fields`). |
 | `dot-agent-deck hooks install` / `uninstall` CLI commands ([docs/troubleshooting.md#hooks](../docs/troubleshooting.md)) | Auto-install path is catalogued as `hooks/install/001`–`003`; the explicit subcommand variants share the same install/uninstall code. A targeted L2 test will be added only if a divergence appears. |
 | Ghostty-specific Shift+Enter terminal config ([docs/troubleshooting.md#shiftenter-submits-instead-of-inserting-a-newline](../docs/troubleshooting.md)) | **No longer a skip** — PRD #227 showed the break was deck-side (`keyevent_to_bytes` collapsed `Enter + SHIFT` to a bare CR), so there IS a deck-side surface: it is now covered by `embed/key-forwarding/001`. Only the outer-terminal *configuration* itself (what a user types into `ghostty/config`) remains untestable here. |
-| Mode-tab card jump via `Enter` (broken per docs note → [#68](https://github.com/vfarcic/dot-agent-deck/issues/68)) | Documented as broken. The catalog will gain an entry once the bug is closed; until then leaving it uncovered avoids pinning the broken behavior. |
 | `--continue` "dashboard-first landing" detail ([docs/session-management.md#resuming-sessions](../docs/session-management.md)) | Implicit consequence of `session/restore/001`; not separately worth a catalog ID. Reconsider if the landing-tab logic ever has its own surface. |

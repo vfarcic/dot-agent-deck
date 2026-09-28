@@ -347,7 +347,7 @@ impl ContextRewriteWatcher {
 }
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
-/// `remit-reassert-orchestration` fixture. With no `[[modes]]` defined the
+/// `remit-reassert-orchestration` fixture. The
 /// Mode chip row is `[No mode] [Orch: remit-reassert] [schedule]`, so ONE
 /// Right selects the orchestration; selecting an orchestration hides the
 /// Command field, so a second Enter submits the form. Lands with the

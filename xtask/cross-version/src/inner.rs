@@ -2759,7 +2759,7 @@ pub(crate) fn main_ui_drawn(grid: &str) -> bool {
 /// Drive the production new-pane flow to open the fixture's single
 /// orchestration against the deck's current directory.
 ///
-/// With no `[[modes]]` in the fixture the mode-chip row is
+/// The mode-chip row is
 /// `[No mode] [Orch: xver] [schedule] …`, so ONE Right selects the
 /// orchestration; selecting one hides the Command field, so the second Enter
 /// submits.

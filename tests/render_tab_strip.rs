@@ -64,8 +64,7 @@ fn tab_label_modifier(buffer: &ratatui::buffer::Buffer, label: &str) -> Modifier
 /// Scenario: Render the tab strip twice. First with only the Dashboard tab
 /// (`closeable = [false]`) — the strip must contain NO `×` close glyph,
 /// proving the Dashboard tab has no close affordance. Then with Dashboard
-/// plus a Mode tab and an Orchestration tab (`closeable = [false, true,
-/// true]`) — exactly two `×` glyphs must render, one per closeable tab and
+/// plus two closeable tabs (`closeable = [false, true, true]`) — exactly two `×` glyphs must render, one per closeable tab and
 /// none for the Dashboard. RED until M3 renders the `[×]` affordance (today
 /// `render_tab_strip` draws no close glyph at all).
 #[spec("mouse/tabstrip/002")]
@@ -80,7 +79,7 @@ fn tabstrip_002_close_glyph_on_mode_orchestration_not_dashboard() {
         dashboard_only_text(&dashboard_only)
     );
 
-    // Dashboard + Mode + Orchestration: only the two non-Dashboard tabs get
+    // Dashboard + two closeable tabs: only the two non-Dashboard tabs get
     // a close glyph, so exactly two `×` render. A third would mean the
     // Dashboard wrongly gained one; zero means the affordance is missing.
     let three_tabs = render_tab_bar_to_buffer(

@@ -1319,7 +1319,7 @@ fn restore_016_reattach_restores_active_tab_and_focused_pane() {
     let mut first = launch_deck_against(&daemon, &session_file);
     first.wait_for_string("No active agents");
 
-    // Open the orchestration. With no `[[modes]]` in the fixture the mode-chip
+    // Open the orchestration. The mode-chip
     // row is `[No mode] [Orch: reattach-orch] [schedule]`, so ONE Right selects
     // it; selecting an orchestration hides the Command field, so a second Enter
     // submits the form.

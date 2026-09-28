@@ -499,14 +499,8 @@ impl SavedFocus {
     /// `EmbeddedPaneController::hydrate_from_daemon` reuses the very same value
     /// the previous TUI had. Every OTHER pane's id comes from `allocate_id`, a
     /// bare counter, and is reused across processes by coincidence rather than
-    /// by identity. Two such panes exist, and both were reported as one class:
-    ///
-    /// - on the daemon-EMPTY rebuild path, EVERY restored pane (pass an empty
-    ///   set there, and nothing id-shaped is honoured);
-    /// - on the warm-reattach path, the SIDE panes of a workspace-mode tab, which
-    ///   were not daemon-tracked. Issue #1199 removed mode tabs, so this case no
-    ///   longer arises; it is kept here as the reason the filter is shaped the
-    ///   way it is.
+    /// by identity. That is EVERY restored pane on the daemon-EMPTY rebuild
+    /// path (pass an empty set there, and nothing id-shaped is honoured).
     ///
     /// Reusing a counter is worse than useless rather than merely unhelpful: a
     /// startup that recreates the same panes in the same order happens to

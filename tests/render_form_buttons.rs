@@ -36,8 +36,7 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// render its existing field chrome (the `Name:` field and the ` New Agent `
 /// title). Before M8 the form showed only the single currently-selected option
 /// in a `◀ … ▶` cycler (so the non-selected chip labels were absent) and had no
-/// Submit/Cancel buttons; M8 added the chips + buttons. (Issue #1199: the seam
-/// took workspace-mode names until modes were removed.)
+/// Submit/Cancel buttons; M8 added the chips + buttons.
 #[spec("mouse/form/001")]
 #[test]
 fn form_001_renders_mode_chips_and_submit_cancel() {

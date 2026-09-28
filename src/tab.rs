@@ -82,8 +82,7 @@ pub enum OrchestrationRoleStatus {
 // A deck holds one Dashboard and a handful of orchestration tabs, stored once
 // in `TabManager::tabs` and matched on everywhere; boxing the large variant
 // would buy nothing measurable and cost a `Box` at every construction and
-// pattern. (The lint only started firing when issue #1199 removed the
-// mid-sized `Mode` variant.)
+// pattern.
 #[allow(clippy::large_enum_variant)]
 pub enum Tab {
     Dashboard {
@@ -430,9 +429,8 @@ impl TabManager {
         !pane_id.is_empty() && !crate::ui::is_dead_slot_pane_id(pane_id)
     }
 
-    /// Issue #949 — the tab that owns `pane_id`. Since issue #1199 removed mode
-    /// tabs (whose agent pane sat outside [`Self::tab_index_for_pane`]'s search)
-    /// this is exactly that lookup, which already rejects empty and dead-slot
+    /// Issue #949 — the tab that owns `pane_id`. This is exactly
+    /// [`Self::tab_index_for_pane`], which already rejects empty and dead-slot
     /// ids; the name is kept because it says what the focus-snapshot callers
     /// are asking.
     pub fn tab_index_owning_pane(&self, pane_id: &str) -> Option<usize> {
@@ -3694,9 +3692,7 @@ mod tests {
         );
 
         // (d) Only ids the DAEMON supplied are honoured. Everything else on
-        // screen — every pane on the daemon-empty rebuild path (and, until
-        // #1199 removed them, a Mode tab's locally-spawned side panes on the
-        // warm one) — carries a fresh
+        // screen — every pane on the daemon-empty rebuild path — carries a fresh
         // `allocate_id` counter that matches a remembered number by
         // coincidence, so honouring one can focus the WRONG pane. `live-coder`
         // below WOULD resolve, which is what makes dropping it observable.

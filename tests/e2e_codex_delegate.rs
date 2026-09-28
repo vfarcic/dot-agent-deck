@@ -278,8 +278,8 @@ fn delegate_task() -> String {
     )
 }
 
-/// Drive the new-pane dialog to open the generated orchestration. With no
-/// `[[modes]]` in the config the Mode chip row is `[No mode] [Orch: …]
+/// Drive the new-pane dialog to open the generated orchestration. The
+/// Mode chip row is `[No mode] [Orch: …]
 /// [schedule]`, so ONE Right selects the orchestration; selecting one HIDES the
 /// Command field, so the second Enter submits the form.
 fn open_orchestration(deck: &TuiDeck) {

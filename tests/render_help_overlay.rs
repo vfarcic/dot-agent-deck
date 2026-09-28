@@ -35,9 +35,8 @@ fn buffer_text_lower(buffer: &ratatui::buffer::Buffer) -> String {
 /// advertises (New Agent Ctrl+N, Close Ctrl+W, Toggle Layout Ctrl+T, Help ?,
 /// Quit Ctrl+C) and the key dashboard / navigation actions (filter `/`,
 /// rename, generate, tab switching, card nav). The labels must name agents
-/// and the schedule manager consistently. (Issue #1199 dropped the "Return to
-/// command mode" label, which lived only in the removed Mode Tab section; Ctrl+D
-/// stays documented under Global as "Toggle command / pane".)
+/// and the schedule manager consistently. Ctrl+D is documented under Global as
+/// "Toggle command / pane".
 /// Substring checks are
 /// case-insensitive so a `Ctrl+n` vs `Ctrl+N` casing difference between the
 /// overlay and the buttons does not fail the test — it pins that each

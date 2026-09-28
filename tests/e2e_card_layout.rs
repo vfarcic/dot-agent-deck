@@ -165,11 +165,8 @@ fn try_first_card(grid: &str) -> Option<CardSnapshot> {
                     // every layout exercised here — `ActiveTabView::Dashboard`
                     // and `Orchestration` both route through `split_cards_area`,
                     // which returns `(dashboard_area, panes_area)` in that
-                    // order. `ActiveTabView::Mode` is the concrete
-                    // counterexample (`src/ui.rs`: "50/50 horizontal split:
-                    // agent pane left, side panes right"), so pointing this test
-                    // at a Mode tab would invalidate the leftmost-complete-
-                    // rectangle selection below (review of #465, N2).
+                    // order, which the leftmost-complete-rectangle selection
+                    // below relies on (review of #465, N2).
                     if leftmost
                         .as_ref()
                         .is_none_or(|(start, row, _)| candidate_key < (*start, *row))

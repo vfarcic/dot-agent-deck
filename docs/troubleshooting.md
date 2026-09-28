@@ -331,7 +331,7 @@ DOT_AGENT_DECK_LOG=/tmp/my-debug.log dot-agent-deck
 
 On Windows the default is `dot-agent-deck.log` in the system temp directory — the one `%TEMP%` points at, usually `C:\Users\<you>\AppData\Local\Temp`. `/tmp` is not a Windows location, so there would be nothing there to write to.
 
-The log file captures session events, hook activity, mode-tab restoration, and any errors logged by the daemon. Attach the relevant excerpt when filing an issue. See [Configuration › Environment Variables](configuration.md#environment-variables) for the full list of variables.
+The log file captures session events, hook activity, session restoration, and any errors logged by the daemon. Attach the relevant excerpt when filing an issue. See [Configuration › Environment Variables](configuration.md#environment-variables) for the full list of variables.
 
 ### Turning the verbosity up
 

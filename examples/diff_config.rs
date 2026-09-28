@@ -11,8 +11,7 @@
 //! expands in a `<details>` block when it differs) are compared as rows in a
 //! table under the matched role, not as separate sections.
 //!
-//! Issue #1199: workspace modes (`[[modes]]` with its panes and rules) were
-//! removed, so they are no longer diffed; a leftover block is ignored on parse.
+//! Issue #1199: a `[[modes]]` block is not diffed; it is ignored on parse.
 //!
 //! Usage:
 //!   cargo run --quiet --example diff_config -- <baseline.toml> <improved.toml>

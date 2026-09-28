@@ -8,9 +8,7 @@ const CLEAR: &[u8] = b"\x1b[3J\x1b[2J\x1b[H";
 
 /// Run a command repeatedly at a fixed interval, clearing the screen between runs.
 ///
-/// The body of the standalone `dot-agent-deck watch` subcommand. (Workspace
-/// modes' persistent panes and reactive watch rules used it too, until issue
-/// #1199 removed them.)
+/// The body of the standalone `dot-agent-deck watch` subcommand.
 pub fn run_watch(interval_secs: u64, command: &str) -> ! {
     let sink = Mutex::new(std::io::stdout());
     let mut first = true;
@@ -30,9 +28,7 @@ pub fn run_watch(interval_secs: u64, command: &str) -> ! {
 /// printing it only after the process exited. Every fast command looked fine,
 /// but a command that does not exit (`tail -f`, `kubectl logs -f`, a dev
 /// server) produced a **permanently blank pane**: its bytes sat in the pipe
-/// forever. While workspace modes existed (removed in #1199), `watch = true`
-/// was the default for their persistent panes, so that trap was one config
-/// line away for any user, with no error and no hint.
+/// forever, with no error and no hint.
 ///
 /// The screen is therefore cleared lazily, on the **first byte of output**,
 /// rather than after the command exits. That keeps the property the old

@@ -75,9 +75,9 @@ mod tests {
     use crate::config_validation::validate_config;
     use crate::project_config::ProjectConfig;
 
-    /// Issue #1199: the starter `init` writes is an orchestration (workspace
-    /// modes were removed), and it is a config `dot-agent-deck validate` has
-    /// nothing to say about — not even a warning.
+    /// Issue #1199: the starter `init` writes is an orchestration, and it is a
+    /// config `dot-agent-deck validate` has nothing to say about — not even a
+    /// warning.
     #[test]
     fn template_parses_and_validates_cleanly() {
         let config: ProjectConfig = toml::from_str(TEMPLATE).expect("the init template parses");
