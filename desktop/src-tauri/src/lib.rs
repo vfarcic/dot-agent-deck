@@ -4030,8 +4030,16 @@ fn ambiguous_orchestration_refusal(orchestration: &str) -> String {
 ///
 /// Read from the cached handshake, so the residual is the usual one: a cached
 /// set that outlived a daemon replaced by an older build bounds a preparation
-/// that deck does not bound itself — the pre-#1233 hazard, for exactly that
-/// pairing, until the next handshake.
+/// that deck does not bound itself, until the next handshake. The concrete
+/// consequence is the pre-#1233 hazard for exactly that pairing: the desktop
+/// gives up at its own timeout while the older deck keeps preparing, the user
+/// retries, and the abandoned preparation — which that deck neither withdraws
+/// nor stops — can still publish afterwards over the retry's context at the
+/// fixed `orchestrator-context.md` that an older deck writes every launch to,
+/// so the retry's coordinator can read the abandoned launch's brief. Accepted
+/// (PR #1407 review): it needs the daemon replaced by an older build
+/// mid-session, and against an older deck the shared path is already that
+/// deck's behaviour.
 fn daemon_bounds_preparation(client: &DaemonClient) -> bool {
     client.cached_capabilities().is_some_and(|capabilities| {
         capabilities.supports(dot_agent_deck::daemon_protocol::CAP_PREPARE_DEADLINE)
