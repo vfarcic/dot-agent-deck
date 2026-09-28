@@ -459,14 +459,19 @@ pub struct PreparedContext {
     /// [`crate::prep_token::PrepBinding::context_digest`].
     pub content: String,
     /// The published file's inode identity, captured from the handle that
-    /// created and wrote it. A file deleted and recreated under the same name
-    /// has a different one, so this value is what makes "still the artifact this
+    /// created and wrote it — the value that makes "still the artifact this
     /// preparation published" checkable
-    /// ([`crate::prep_token::PrepBinding::context_identity`]).
+    /// ([`crate::prep_token::PrepBinding::context_identity`]). While this value
+    /// is alive, [`PreparedContext::held`] keeps the inode allocated, so no
+    /// other file can be handed its number; after it is dropped the number is
+    /// reusable, which is why the spawn-time check pairs it with the digest
+    /// ([`crate::prep_token::InodeIdentity`]).
     pub context_identity: Option<crate::prep_token::InodeIdentity>,
     /// The directory the file was published into, held open
     /// ([`PublishedContext::dir`]).
     pub dir: ContextDir,
+    /// The published file itself, held open ([`PublishedContext::held`]).
+    pub held: HeldContextFile,
 }
 
 impl PreparedContext {
@@ -476,6 +481,7 @@ impl PreparedContext {
             path: self.context_path.clone(),
             identity: self.context_identity,
             dir: self.dir.clone(),
+            held: self.held.clone(),
         }
     }
 }
@@ -539,6 +545,7 @@ pub fn prepare_unmirrored_orchestrator_context(
         context_path: published.path,
         context_identity: published.identity,
         dir: published.dir,
+        held: published.held,
         content,
     })
 }
@@ -782,7 +789,54 @@ pub struct PublishedContext {
     /// mirror write reaches that directory rather than whatever the path names
     /// later (issue #1233 audit).
     pub dir: ContextDir,
+    /// The file the publish created, held open so its inode stays allocated for
+    /// as long as this value (or a clone) lives. That is what makes
+    /// [`withdraw_published_context`]'s identity check exact: an inode number is
+    /// reusable once its inode is freed — ext4 hands the number just freed to
+    /// the next file created, measured on this very test
+    /// (`a_withdrawn_context_is_removed_unless_the_name_was_taken_over`, which
+    /// removed a replacement file at the same name until this was held) — and a
+    /// held inode is never freed.
+    pub held: HeldContextFile,
 }
+
+/// An open handle on a published context file, kept only to pin its inode
+/// ([`PublishedContext::held`]). Nothing reads or writes through it.
+///
+/// Held on Unix only. Off Unix there is no identity to pin
+/// ([`crate::prep_token::inode_identity`] answers `None` there), and an open
+/// handle would only delay the removal of the name.
+///
+/// Compares equal to every other `HeldContextFile`, like [`ContextDir`]: it
+/// exists so the value types carrying it can stay comparable, not as an
+/// identity check.
+#[derive(Clone, Default)]
+pub struct HeldContextFile(Option<std::sync::Arc<std::fs::File>>);
+
+impl HeldContextFile {
+    fn new(file: std::fs::File) -> Self {
+        if cfg!(unix) {
+            Self(Some(std::sync::Arc::new(file)))
+        } else {
+            Self(None)
+        }
+    }
+}
+
+impl std::fmt::Debug for HeldContextFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldContextFile")
+            .field("held", &self.0.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for HeldContextFile {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for HeldContextFile {}
 
 /// Why an orchestrator context was not published.
 ///
@@ -1595,7 +1649,7 @@ fn open_publish_dir(
 /// announcing a path (the prompt names `.dot-agent-deck/<name>` under the
 /// project) that by now names a different one.
 fn write_context_file(
-    mut file: std::fs::File,
+    file: &mut std::fs::File,
     dir: &ContextDir,
     content: &str,
 ) -> Result<Option<crate::prep_token::InodeIdentity>, ContextPublishError> {
@@ -1681,20 +1735,22 @@ pub fn publish_orchestrator_context(
 
     let mut created = false;
     let outcome = (|| {
-        let file = dir
+        let mut file = dir
             .create_new(&name)
             .map_err(ContextPublishError::TempCreate)?;
         created = true;
-        write_context_file(file, &dir, content)
+        let identity = write_context_file(&mut file, &dir, content)?;
+        Ok((identity, file))
     })();
 
     match outcome {
-        Ok(identity) => {
+        Ok((identity, file)) => {
             tidy_context_dir(project_dir, dir.path());
             Ok(PublishedContext {
                 path: final_path,
                 identity,
                 dir,
+                held: HeldContextFile::new(file),
             })
         }
         Err(e) => {
@@ -1717,10 +1773,14 @@ pub fn publish_orchestrator_context(
 /// Removes the published file from the directory it was published into —
 /// through the held [`ContextDir`], not by re-resolving `published.path` — and
 /// skips it when that entry no longer holds the inode the publish created: a
-/// file some other party put there since is left alone. (The check and the
-/// removal are two operations on one held directory, so this narrows rather
-/// than closes that case; the name is fresh and unannounced, so nothing but a
-/// guess can have put anything there.)
+/// file some other party put there since is left alone. The comparison is by
+/// `(dev, ino)`, and it can tell a replacement apart only because
+/// [`PublishedContext::held`] keeps the published inode allocated: a
+/// replacement created after ours was unlinked would otherwise be free to
+/// receive our freed number. (The check and the removal are still two
+/// operations on one held directory, so this narrows rather than closes that
+/// case; the name is fresh and unannounced, so nothing but a guess can have
+/// put anything there.)
 /// Best effort: a failure is logged, and the file is then an ordinary leftover
 /// that [`sweep_coordination_files`] removes once it ages out of the window.
 pub fn withdraw_published_context(published: &PublishedContext) {
@@ -1853,10 +1913,11 @@ fn write_mirror(dir: &ContextDir, content: &str) -> Result<(), ContextPublishErr
     let temp_name = temp_context_file_name();
 
     let outcome = (|| {
-        let file = dir
+        let mut file = dir
             .create_new(&temp_name)
             .map_err(ContextPublishError::TempCreate)?;
-        write_context_file(file, dir, content)?;
+        write_context_file(&mut file, dir, content)?;
+        drop(file);
         dir.rename(&temp_name, CONTEXT_FILE_NAME)
             .map_err(ContextPublishError::Publish)
     })();
@@ -2816,6 +2877,12 @@ mod tests {
 
     /// Issue #1233 item 4's withdrawal removes the file it published, and
     /// leaves one some other party put at that name alone.
+    ///
+    /// The replacement is created right after ours is unlinked, which on ext4
+    /// hands it our freed inode number — so this fails on a disk-backed
+    /// `TMPDIR` (the CI runners') unless the publish keeps its inode pinned
+    /// ([`PublishedContext::held`]). A tmpfs never reuses the number, which is
+    /// how it passed on a tmpfs `/tmp` and failed only in CI.
     #[cfg(unix)]
     #[test]
     fn a_withdrawn_context_is_removed_unless_the_name_was_taken_over() {
