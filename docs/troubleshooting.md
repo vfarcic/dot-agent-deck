@@ -125,6 +125,8 @@ After upgrading the `dot-agent-deck` binary, the new TUI can keep talking to a d
 
 This only happens when you are **deliberately** still on the older daemon. The common cause: you upgraded while agents were running, the launch prompt warned that restarting would stop them, and you **declined the restart to keep your agents** — which leaves the new TUI attached to the older daemon on purpose. (It can also happen with a very old, pre-handshake binary that attached without any version check.) With no agents running, the handshake restarts the daemon silently, so a fresh daemon at the new version is the normal outcome.
 
+When the upgrade changed the wire format itself — the attach protocol — declining does not leave you attached at all: the TUI refuses with `error: daemon speaks attach protocol vN, but this binary speaks vM` and exits, leaving the daemon and its agents running. See [Upgrading](installation.md#upgrading) for the two ways on from there.
+
 ### Symptom
 
 You upgrade `dot-agent-deck`, keep your running agents on the existing daemon, and delegate prompts arrive in the TUI as if they were queued — but the orchestration pipeline never moves. Other recently-added features may also fail to take effect without an obvious error.

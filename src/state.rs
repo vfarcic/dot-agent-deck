@@ -9,8 +9,8 @@ use crate::agent_pty::{AgentPtyRegistry, GuardedSendDetail};
 use crate::config_validation::{escape_id_for_log, sanitize_role_name};
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
-    LiveTarget, OrchestrationSurface, OrchestrationSurfaceRole, RestartRoleSignal, SpawnRoleSignal,
-    WorkDoneSignal, Writable,
+    GenerationVerdict, LiveTarget, OrchestrationSurface, OrchestrationSurfaceRole,
+    RestartRoleSignal, SpawnRoleSignal, WorkDoneSignal, Writable,
 };
 use crate::project_config::{
     DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, load_project_config,
@@ -1189,6 +1189,22 @@ pub trait AgentOwnership: Send + Sync {
     /// Does this process own the generation that an event naming
     /// `(pane_id, agent_id)` comes from? See the table above.
     fn generation_ownership(&self, pane_id: Option<&str>, agent_id: Option<&str>) -> Ownership;
+
+    /// Issue #320: which generation of `pane_id` is `agent_id`? `None` when
+    /// the registry holds no generation for the pane, has never seen `agent_id`
+    /// on it, or cannot answer — none of which is evidence either way.
+    ///
+    /// The pane's CURRENT generation is the spawn reserving it if one is in
+    /// flight, else the one record on it that no successor has taken it from —
+    /// the two facts [`Self::generation_ownership`]'s retirement rule reads,
+    /// asked of the pane instead of of one agent. A generation is `Displaced`
+    /// only when it is not that one AND the registry itself published it on
+    /// this pane earlier. An id the registry never published on the pane — an
+    /// invented one, or a genuine agent's id on a frame naming the wrong pane —
+    /// gets no verdict, so `Displaced` is reserved for a generation the
+    /// registry positively knows was replaced there. No clock is read, so no
+    /// producer-supplied timestamp can move the answer.
+    fn pane_generation_verdict(&self, pane_id: &str, agent_id: &str) -> Option<GenerationVerdict>;
 }
 
 /// Issue #454 round 3: the answer to an [`AgentOwnership`] question.
@@ -1240,6 +1256,14 @@ impl AgentOwnershipOracle {
             Some(o) => o.generation_ownership(pane_id, agent_id),
             None => Ownership::Unknown,
         }
+    }
+
+    fn pane_generation_verdict(&self, pane_id: &str, agent_id: &str) -> Option<GenerationVerdict> {
+        // A dropped registry cannot answer, which for this question is no
+        // verdict at all.
+        self.0
+            .upgrade()
+            .and_then(|o| o.pane_generation_verdict(pane_id, agent_id))
     }
 }
 
@@ -1740,7 +1764,7 @@ fn work_done_footer(role: &str) -> String {
          ```bash\n\
          {bin} work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
          ```\n\n\
-         Anything outside that allowlist is rewritten by your own shell before {bin} \
+         Anything outside that allowlist is rewritten by your own shell before the deck \
          sees it: backticks and `$(…)` are executed and replaced by their output (usually empty), \
          `$VAR` becomes its value or nothing, a balanced inner `\"` is removed and changes how the \
          rest of the argument is quoted, a `\\` before `$`, a backtick, `\"` or `\\` removes \
@@ -1767,6 +1791,21 @@ fn work_done_footer(role: &str) -> String {
 /// lives in the task file instead of the injected pane prompt.
 pub fn compose_delegate_prompt(task_body: &str) -> String {
     task_body.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Stand-in for the deck's command word in notice prose that goes through
+/// [`compose_delegate_prompt`], swapped for the real word by
+/// [`with_deck_command_word`] only AFTER the whitespace collapse (issue #549
+/// review): the word is an absolute path, and collapsing a run of spaces inside
+/// a quoted path would name a different file. No whitespace, and no character
+/// the scrubbed pane id interpolated beside it can contain.
+const DECK_BIN_SLOT: &str = "@@DOT_AGENT_DECK_BIN@@";
+
+/// Replace [`DECK_BIN_SLOT`] in an already-collapsed notice with
+/// [`crate::platform::paths::binary_name`]. That word contains no control
+/// character (`is_prose_safe_path`), so the notice stays one line.
+fn with_deck_command_word(notice: String) -> String {
+    notice.replace(DECK_BIN_SLOT, &crate::platform::paths::binary_name())
 }
 
 /// PRD #126 test/e2e seam: overrides the resolved worker-response timeout with
@@ -1977,10 +2016,11 @@ pub fn describe_blocked_workers(blocked: &[crate::event::BlockedWorker]) -> Stri
 /// place to undo that. A plain restart of a healthy worker is refused with its own
 /// message, which is where `--force` is learned.
 pub fn busy_worker_remedy() -> String {
+    let bin = crate::platform::paths::binary_name();
     format!(
         "Wait for its work-done before delegating to it again. If that earlier task is \
          genuinely abandoned, re-send with --supersede to dispatch anyway. Restarting the worker \
-         with `dot-agent-deck pane restart` also retires what it owed, and an unanswered \
+         with `{bin} pane restart` also retires what it owed, and an unanswered \
          delegation stops counting {} days after it was issued.",
         crate::agent_pty::DELEGATION_COMMISSION_TTL.as_secs() / (24 * 60 * 60)
     )
@@ -3921,7 +3961,8 @@ fn compose_delegate_silence_notice(window: std::time::Duration, pane_text: Optio
 ///   covers what remains: a `work-done` arriving after this report is to be
 ///   trusted over it.
 pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
-    compose_delegate_prompt(&format!(
+    let bin = DECK_BIN_SLOT;
+    with_deck_command_word(compose_delegate_prompt(&format!(
         "⚠ delegated worker exited without work-done (dot-agent-deck daemon report) - a report \
          from the dot-agent-deck daemon, not a message from a person or an agent: the process \
          behind pane {worker_pane_id} ended and no work-done was ever received for its \
@@ -3929,10 +3970,10 @@ pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
          it was sent just before the process ended: trust it over this report. Otherwise check \
          that pane's scrollback for what happened and decide how to proceed - if this needs the \
          user, notify the user; otherwise re-delegate or reassign the task. That worker still \
-         counts as owing it, so re-delegating to the same role needs `dot-agent-deck pane \
+         counts as owing it, so re-delegating to the same role needs `{bin} pane \
          restart <role>` first, or `delegate --supersede`. The daemon log names the role and how \
          long it had been delegated."
-    ))
+    )))
 }
 
 /// The single-line report the daemon SUBMITS into the ORCHESTRATOR's pane when
@@ -4029,7 +4070,8 @@ pub(crate) fn spawn_lift_replaced_quota_blocks(
 ///   orchestrator is told to check the card first, and to keep waiting if the
 ///   worker is working again.
 pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
-    compose_delegate_prompt(&format!(
+    let bin = DECK_BIN_SLOT;
+    with_deck_command_word(compose_delegate_prompt(&format!(
         "⚠ delegated worker blocked by a provider usage limit (dot-agent-deck daemon report) - a \
          report from the dot-agent-deck daemon, not a message from a person or an agent: the \
          agent behind pane {worker_pane_id} is alive but it reports that its provider usage \
@@ -4038,9 +4080,9 @@ pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
          Blocked, reassign the task to a role backed by a different provider or account, or \
          notify the user if this needs them; if it is working again, keep waiting. That worker \
          still counts as owing the task, so re-delegating to the same role needs \
-         `dot-agent-deck pane restart <role>` first, or `delegate --supersede`. The daemon log \
+         `{bin} pane restart <role>` first, or `delegate --supersede`. The daemon log \
          names the role."
-    ))
+    )))
 }
 
 /// The notice written into the ORCHESTRATOR's pane when a `clear = true`
@@ -5093,6 +5135,21 @@ fn lookup_orchestration_role_indexed(
     orchestration_name: &str,
     role_name: &str,
 ) -> Option<(usize, OrchestrationRoleConfig)> {
+    lookup_orchestration_role_seated(cwd, orchestration_name, role_name)
+        .map(|(index, role, _)| (index, role))
+}
+
+/// [`lookup_orchestration_role_indexed`], plus whether that role is the
+/// orchestration's orchestrator by
+/// [`crate::project_config::OrchestrationConfig::orchestrator_role_index`] —
+/// the one rule the spawn paths seat by (issue #523). Answered from the same
+/// read of the file, so the role and its seat cannot come from two versions of
+/// it.
+fn lookup_orchestration_role_seated(
+    cwd: &str,
+    orchestration_name: &str,
+    role_name: &str,
+) -> Option<(usize, OrchestrationRoleConfig, bool)> {
     let cfg = load_project_config(std::path::Path::new(cwd))
         .ok()
         .flatten()?;
@@ -5130,11 +5187,13 @@ fn lookup_orchestration_role_indexed(
         );
         return None;
     };
+    let orch_idx = orch.orchestrator_role_index();
     orch.roles
         .iter()
         .cloned()
         .enumerate()
         .find(|(_, r)| r.name == role_name)
+        .map(|(index, role)| (index, role, index == orch_idx))
 }
 
 /// PRD #225 M3: does this `SessionStart` mean "the agent can accept input", or
@@ -8472,6 +8531,49 @@ impl AppState {
             .map(|o| o.ownership(pane_id, agent_id))
     }
 
+    /// Issue #320: which generation of its pane does `event` come from, by
+    /// THIS process's registry? `None` without an oracle, for a frame naming no
+    /// pane or no agent id, and whenever the registry has no verdict (see
+    /// [`AgentOwnership::pane_generation_verdict`]) — the cases
+    /// [`Self::apply_event`] still orders by the historical rule.
+    fn registry_generation_verdict(&self, event: &AgentEvent) -> Option<GenerationVerdict> {
+        let (Some(pane_id), Some(agent_id)) = (event.pane_id.as_deref(), event.agent_id.as_deref())
+        else {
+            return None;
+        };
+        self.agent_ownership
+            .as_ref()?
+            .pane_generation_verdict(pane_id, agent_id)
+    }
+
+    /// Issue #320: does `event`'s pane hold a card naming `event`'s own agent?
+    /// What admits a displaced generation's `SessionEnd` — see the admission
+    /// check in [`Self::apply_event`].
+    fn pane_holds_own_card(&self, event: &AgentEvent) -> bool {
+        let (Some(pane_id), Some(agent_id)) = (event.pane_id.as_deref(), event.agent_id.as_deref())
+        else {
+            return false;
+        };
+        self.sessions.values().any(|session| {
+            session.pane_id.as_deref() == Some(pane_id)
+                && session.agent_id.as_deref() == Some(agent_id)
+        })
+    }
+
+    /// Issue #320: the generation verdict [`Self::apply_event`] orders a
+    /// takeover by. The daemon asks its registry; a process with none — an
+    /// attached TUI — reads the verdict the daemon stamped on the frame before
+    /// fanning it out ([`Self::stamp_pane_generation`]). A process WITH a
+    /// registry ignores any stamp: the one on a frame reaching it by another
+    /// route is not its own answer.
+    fn generation_verdict(&self, event: &AgentEvent) -> Option<GenerationVerdict> {
+        if self.agent_ownership.is_some() {
+            self.registry_generation_verdict(event)
+        } else {
+            event.pane_generation_verdict()
+        }
+    }
+
     /// PRD #120: record a daemon-spawned orchestration for the render loop to
     /// build into a live tab. Called from the event subscriber, which receives
     /// the [`BroadcastMsg::OrchestrationSurface`] but cannot touch the
@@ -8905,11 +9007,19 @@ impl AppState {
     /// `cwd` is the pane's own working directory (`pane_cwd_map`), which may
     /// differ per role; the orchestration IDENTITY passed in is what scopes
     /// routing, and is shared across every role of one orchestration.
+    ///
+    /// `is_orchestrator` is the caller's answer from
+    /// [`crate::project_config::orchestrator_index`], the one rule (issue
+    /// #523): the dispatched spawn passes `idx == orch_idx`, and the
+    /// `AttachRequest::StartAgent` handler passes the membership's
+    /// `is_start_role`, which the `Ctrl+n` tab computes by that same rule. The
+    /// decision cannot move in here: `StartAgent` registers one pane per
+    /// request and carries only that pane's membership, not the role list.
     pub fn register_orchestration_role(
         &mut self,
         pane_id: &str,
         role_name: &str,
-        is_start_role: bool,
+        is_orchestrator: bool,
         identity: OrchestrationIdentity,
         cwd: Option<&str>,
     ) {
@@ -8922,7 +9032,7 @@ impl AppState {
             self.pane_cwd_map
                 .insert(pane_id.to_string(), cwd.to_string());
         }
-        if is_start_role {
+        if is_orchestrator {
             self.orchestrator_pane_ids.insert(pane_id.to_string());
         }
     }
@@ -9232,6 +9342,26 @@ impl AppState {
             event.metadata.insert(
                 crate::event::ORCHESTRATION_ORPHANED_METADATA_KEY.to_string(),
                 crate::event::ORCHESTRATION_ORPHANED_METADATA_VALUE.to_string(),
+            );
+        }
+    }
+
+    /// Issue #320: stamp the registry's generation verdict onto `event` for the
+    /// fan-out (see [`crate::event::PANE_GENERATION_METADATA_KEY`]), so an
+    /// attached TUI orders a takeover by the same answer the daemon does. Any
+    /// incoming value is removed first — the marker is daemon-authoritative.
+    ///
+    /// Called by `ingest_event` under the same write lock as the daemon's own
+    /// `apply_event` of the same frame, so the stamp and the daemon's verdict
+    /// are read from one registry state.
+    pub fn stamp_pane_generation(&self, event: &mut AgentEvent) {
+        event
+            .metadata
+            .remove(crate::event::PANE_GENERATION_METADATA_KEY);
+        if let Some(verdict) = self.registry_generation_verdict(event) {
+            event.metadata.insert(
+                crate::event::PANE_GENERATION_METADATA_KEY.to_string(),
+                verdict.metadata_value().to_string(),
             );
         }
     }
@@ -9866,6 +9996,27 @@ impl AppState {
     /// `verb` names the action in the refusal message (e.g. `"delegate"`,
     /// `"restart a role"`). Returns the error message to embed in the
     /// caller's own response type, or `None` when the caller is authorized.
+    /// Issue #523 review: whether `pane spawn <role>` from `caller_pane_id`
+    /// asks for this orchestration's own orchestrator role. `config_seat` is
+    /// the config's answer for `role`.
+    ///
+    /// Answered from the instance, not the config: the caller has already
+    /// passed [`Self::refuse_unless_orchestrator_caller`], so ITS role is the
+    /// orchestrator this instance registered — which is the config's seat
+    /// except where a restored tab honoured a saved cursor (PRD #89 F3). The
+    /// config's answer is only the fallback for a caller with no role entry.
+    fn spawn_role_is_the_orchestrator(
+        &self,
+        caller_pane_id: &str,
+        role: &str,
+        config_seat: bool,
+    ) -> bool {
+        match self.pane_role_map.get(caller_pane_id) {
+            Some(caller_role) => caller_role == role,
+            None => config_seat,
+        }
+    }
+
     fn refuse_unless_orchestrator_caller(&self, pane_id: &str, verb: &str) -> Option<String> {
         if !self.pane_role_map.contains_key(pane_id) {
             // Issue #1082: the `pane_role_map` lookup just MISSED, so this id
@@ -10289,13 +10440,13 @@ pub async fn handle_spawn_role_with_state(
         let cwd = guard.orchestration_cwd_of(&signal.pane_id, registry);
         let identity = guard.pane_orchestration_map.get(&signal.pane_id).cloned();
 
-        let role_config_indexed = match (cwd.as_deref(), identity.as_ref()) {
+        let role_config_seated = match (cwd.as_deref(), identity.as_ref()) {
             (Some(c), Some(identity)) => {
-                lookup_orchestration_role_indexed(c, identity.name(), &signal.role)
+                lookup_orchestration_role_seated(c, identity.name(), &signal.role)
             }
             _ => None,
         };
-        let Some((role_index, role_config)) = role_config_indexed else {
+        let Some((role_index, role_config, is_orchestrator)) = role_config_seated else {
             return SpawnRoleResponse {
                 error: Some(format!(
                     "could not resolve role `{}` in this project's .dot-agent-deck.toml, so \
@@ -10324,7 +10475,11 @@ pub async fn handle_spawn_role_with_state(
         // orchestrator-command pane registered as a worker. Refuse
         // explicitly instead of relying on a routing helper whose exclusion
         // rule means something else here.
-        if role_config.start {
+        //
+        // Issue #523: the orchestrator by the one rule, not the bare `start`
+        // flag — a role named `orchestrator` in a toml that flags no role is
+        // this orchestration's orchestrator, and is not a spawnable worker.
+        if guard.spawn_role_is_the_orchestrator(&signal.pane_id, &signal.role, is_orchestrator) {
             return SpawnRoleResponse {
                 error: Some(format!(
                     "role `{}` is this orchestration's own start (orchestrator) role — it is \
@@ -10873,10 +11028,38 @@ impl AppState {
     /// cannot answer is not evidence that the incumbent is stale) and so does an
     /// absent oracle, which is what keeps every TUI-side and bare-`AppState`
     /// behaviour here byte-identical.
+    ///
+    /// Issue #320 puts that discriminator FIRST and lets it decide outright
+    /// whenever it has an answer. [`Self::generation_verdict`] asks which
+    /// generation of the pane the EVENT comes from — the daemon's registry
+    /// directly, an attached TUI through the daemon's stamp on the frame — and
+    /// the three grounds above are only the fallback for a frame it has no
+    /// answer for:
+    ///
+    /// * `Current` supersedes, whatever the frame's type or stamp. It is what
+    ///   lets case A's older-stamped first `Thinking` retire the outgoing card
+    ///   and case B's `SessionStart` retire the placeholder, on both sides.
+    /// * `Displaced` supersedes nothing, whatever the frame's type or stamp.
+    ///   This is the issue: the late `SessionStart` and the late newer-stamped
+    ///   frame from the OUTGOING agent both used to pass the first two grounds.
+    ///   [`Self::apply_event`] already refuses such a frame at admission, so
+    ///   this arm is the same rule restated where the ordering is decided.
+    ///
+    /// The fallback keeps the historical behaviour, residual included, for a
+    /// frame naming no pane or no agent id, an agent id the registry never
+    /// published on the pane, a pane the registry holds no generation for, a
+    /// registry that cannot answer, and a TUI attached to a daemon that
+    /// predates the stamp.
     fn supersedes_generation(&self, event: &AgentEvent, session: &SessionState) -> bool {
-        event.event_type == EventType::SessionStart
-            || event.timestamp >= session.last_activity
-            || self.generation_disowned(session)
+        match self.generation_verdict(event) {
+            Some(GenerationVerdict::Current) => true,
+            Some(GenerationVerdict::Displaced) => false,
+            None => {
+                event.event_type == EventType::SessionStart
+                    || event.timestamp >= session.last_activity
+                    || self.generation_disowned(session)
+            }
+        }
     }
 
     /// Issue #454 round 3: does the registry positively say the generation this
@@ -11049,6 +11232,40 @@ impl AppState {
         // the stable card id. This is the generation the daemon's send guard
         // compares against — see [`Self::pane_hook_session`].
         let incoming_session_id = event.session_id.clone();
+        // Issue #320: a frame from a generation the registry has seen DISPLACED
+        // from its pane may not claim that pane. For the daemon that is not a
+        // new refusal: with a generation on the pane, `owns_pane_event` below
+        // already refuses every frame from a displaced generation (the named
+        // agent is not the pane's owner, and a registration is subordinate to
+        // the pane's claim). What is new is the attached TUI, which has no
+        // registry and applies every frame the daemon relays — including the
+        // ones the daemon refused. It used to judge a late `SessionStart`, or a
+        // late frame stamped newer, from the OUTGOING agent by its type and its
+        // producer clock, and both retired the live card; it now reads the
+        // daemon's verdict off the frame. See
+        // [`crate::event::PANE_GENERATION_METADATA_KEY`].
+        //
+        // Only frames that CLAIM a generation, which is where the harm was. A
+        // `SessionEnd` claims none, and a generation displaced only by a
+        // successor's pending reservation can still have its card on screen —
+        // the successor has not reported, and its spawn may yet fail and hand
+        // the pane back. Refusing that agent's own end would leave its card
+        // showing an agent that has finished (Greptile, PR #1389;
+        // `status/supersede/021`). A displaced end keeps the path it had before
+        // this — but only when the pane still holds a card of the ENDING agent's
+        // own. The terminal branch below removes by session key, and Pi reports
+        // every generation under the pane-derived `{pane_id}-session` key, so a
+        // displaced end with no card of its own would otherwise remove the
+        // successor's card under that shared key and rebuild it as a bare
+        // placeholder (Qodo, PR #1389; `status/supersede/021`). When the agent
+        // does have a card on the pane, the reuse guard below lands the end on
+        // exactly that card. The daemon still refuses a displaced end at
+        // admission, as it did before #320.
+        if self.generation_verdict(&event) == Some(GenerationVerdict::Displaced)
+            && (event.event_type != EventType::SessionEnd || !self.pane_holds_own_card(&event))
+        {
+            return AppliedEvent::Rejected;
+        }
         // Only accept events from agents managed by our app.
         // Events without a pane_id (external agents) are rejected when we have
         // managed panes. Events with an unknown pane_id are rejected unless it
@@ -11417,20 +11634,13 @@ impl AppState {
         //     placeholder it must retire (`status/supersede/001`,
         //     `scheduler/live/004`).
         //
-        //     Residual, unchanged from pre-#284: a LATE `SessionStart`
-        //     from the OUTGOING agent would retire the live card. That
-        //     frame is not hypothetical — PRD #92 F9 followup-7
-        //     (see [`wait_for_session_start`]) documents a slow-booting
-        //     old agent firing one inside the subscribe→kill window —
-        //     but there it precedes the new agent's boot, so it lands
-        //     before the live card exists and the new agent's own start
-        //     retires it in turn. Ordering it correctly needs a per-pane
-        //     GENERATION discriminator, not a timestamp; `pane_hook_session`
-        //     already tracks one but is keyed on hook session ids the
-        //     retire path cannot resolve. Left as-is deliberately:
-        //     admitting it here is exactly the pre-existing behaviour
-        //     that ships in v0.35.0, so #284 neither widens nor narrows
-        //     it, and narrowing it on a timestamp is what broke case B.
+        //     A LATE `SessionStart` from the OUTGOING agent passes this
+        //     ground too, and would retire the live card. That frame is
+        //     not hypothetical — PRD #92 F9 followup-7 (see
+        //     [`wait_for_session_start`]) documents a slow-booting old
+        //     agent firing one inside the subscribe→kill window. Ordering it
+        //     needs a per-pane GENERATION discriminator, not a timestamp,
+        //     and issue #320 supplies one: see the paragraph after the next.
         //
         //   * A non-`SessionStart` frame (`Thinking`, `Idle`, tool
         //     traffic) is NOT self-describing: the generation change is
@@ -11449,7 +11659,29 @@ impl AppState {
         //     disarm the guard entirely; it is kept a high-water mark at
         //     the assignment site below (`status/supersede/004`).
         //
-        // Net effect on the retire predicate: still a pure WIDENING of
+        //     The same frame stamped at-or-newer passes this ground as
+        //     well, which is the sibling class #284 opened.
+        //
+        // Issue #320: both of those residuals are closed by asking the
+        // registry instead of the frame. The daemon knows each pane's
+        // current generation, and which generations it published on the
+        // pane before it ([`AgentOwnership::pane_generation_verdict`]); it
+        // asks directly, and stamps the answer on the frame for an attached
+        // TUI, which has no registry. A frame from the pane's CURRENT
+        // generation supersedes whatever it is stamped, and one from a
+        // generation the registry published there and has since seen
+        // replaced is refused at admission above — the late `SessionStart`
+        // and the late newer-stamped frame alike (`status/supersede/019`,
+        // `/020`). Case B is unaffected: the agent's real `SessionStart`
+        // names the pane's current generation, so it retires the
+        // placeholder on that ground (`scheduler/live/004`). The two
+        // grounds above now apply only to a frame the registry has no
+        // verdict on — an id it never published on the pane, a pane it
+        // holds nothing for, or a TUI attached to a daemon that predates
+        // the stamp — and there they keep both residuals exactly as
+        // before.
+        //
+        // Net effect of #284 on the retire predicate: a pure WIDENING of
         // the pre-#284 `SessionStart`-only gate. `SessionStart` is
         // admitted unconditionally, exactly as before, so every frame
         // that could retire before still retires on identical terms and
@@ -11459,7 +11691,13 @@ impl AppState {
         // (guarded) and the exclusion of `SessionEnd`, which only ever
         // NARROWS what may retire. Applying the monotonicity check to
         // `SessionStart` too — what the reverted `78f92b6` did — is
-        // what traded case B for case A.
+        // what traded case B for case A. Issue #320 narrows it by exactly
+        // one class — frames from a generation the registry has seen
+        // replaced on the pane, which the daemon's own admission already
+        // refused — and widens it by one: a current-generation frame the
+        // timestamp used to hold back. The stand-in replacement those two
+        // close-confirm tests inject names an id the registry never
+        // published, so it is still ordered by the grounds above.
         //
         // Backward-compat (auditor finding #3 follow-up; reaffirmed
         // against CodeRabbit PR #118 finding #1): skip the retire
@@ -13233,9 +13471,8 @@ mod tests {
 
     /// Scenario: Build a worker task file's `## When done` footer and check
     /// that both its `work-done` command examples name what `binary_name()`
-    /// resolves for the running process — under `cargo test` the throwaway
-    /// test binary is never on `$PATH`, so this is its own absolute
-    /// `current_exe()` path, never the crate's baked-in literal name.
+    /// resolves for the running process — its own absolute `current_exe()`
+    /// path (issue #549), never the crate's baked-in literal name.
     #[spec("orchestration/delegate/017")]
     #[test]
     fn delegate_017_work_done_footer_names_the_running_binary() {
@@ -14660,12 +14897,68 @@ mod tests {
 
     /// The dispatched spawn path registers its orchestrator by `orch_idx`, not
     /// by the raw `start = true` flag — which is the whole point, because
-    /// `orchestrator_role_index` falls back (role named `orchestrator` → any
-    /// `start = true` → role 0) where the bare flag is false for EVERY role of
-    /// an orchestration whose toml sets no `start`. Registering on the raw flag
+    /// `orchestrator_role_index` falls back (any `start = true` → role named
+    /// `orchestrator` → role 0, issue #523) where the bare flag is false for
+    /// EVERY role of an orchestration whose toml sets no `start`. Registering on the raw flag
     /// would leave such an orchestration with a context-bearing orchestrator
     /// that is still absent from `orchestrator_pane_ids`: the same bug this
     /// change fixes, for a narrower input.
+    /// Issue #523: `pane spawn`'s "that is the orchestrator" refusal reads the
+    /// seat from the one rule, so a role named `orchestrator` in a toml that
+    /// flags no role is refused as the orchestrator (it used to read the bare
+    /// flag and treat it as a spawnable worker), and a flagged role beside a
+    /// role merely named `orchestrator` is the seat while that named role is a
+    /// worker.
+    #[test]
+    fn lookup_orchestration_role_seated_reads_the_one_rule() {
+        let seat = |toml: &str, role: &str| -> Option<(usize, bool)> {
+            let cwd = tempfile::tempdir().expect("tempdir");
+            std::fs::write(cwd.path().join(".dot-agent-deck.toml"), toml).expect("write toml");
+            lookup_orchestration_role_seated(cwd.path().to_str().expect("utf8"), "team", role)
+                .map(|(index, _, is_orchestrator)| (index, is_orchestrator))
+        };
+        let unflagged = "[[orchestrations]]\nname = \"team\"\n\n\
+             [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"cat\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\n";
+        assert_eq!(seat(unflagged, "orchestrator"), Some((1, true)));
+        assert_eq!(seat(unflagged, "coder"), Some((0, false)));
+
+        let flagged = "[[orchestrations]]\nname = \"team\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\n\n\
+             [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"cat\"\nstart = true\n";
+        assert_eq!(seat(flagged, "lead"), Some((1, true)));
+        assert_eq!(seat(flagged, "orchestrator"), Some((0, false)));
+    }
+
+    /// Issue #523 review (Qodo, PR #1388): a restored tab can seat a role other
+    /// than the config's (PRD #89 F3 honours the saved cursor), and the daemon
+    /// registers that seat. `pane spawn <that role>` from its own orchestrator
+    /// must still be refused as the orchestrator — the config-seat check alone
+    /// let it through, and `delegate_targets` excludes orchestrator panes, so
+    /// the duplicate check would not catch it either. The config's seat,
+    /// meanwhile a live worker there, is not "the orchestrator".
+    #[test]
+    fn spawn_role_refuses_the_callers_own_seat_even_when_the_config_seats_another() {
+        let mut state = AppState::default();
+        let identity = instance("orch-restored-0");
+        // Config seats `orchestrator` (index 0); the restore seated `coder`.
+        state.register_orchestration_role("pane-0", "orchestrator", false, identity.clone(), None);
+        state.register_orchestration_role("pane-1", "coder", true, identity, None);
+
+        assert!(
+            state.spawn_role_is_the_orchestrator("pane-1", "coder", false),
+            "`coder` is the seat this instance registered, and it is asking for its own role"
+        );
+        assert!(
+            !state.spawn_role_is_the_orchestrator("pane-1", "orchestrator", true),
+            "the config's seat is a worker in this instance, not its orchestrator"
+        );
+        assert!(
+            !state.spawn_role_is_the_orchestrator("pane-1", "reviewer", false),
+            "an ordinary worker role is spawnable"
+        );
+    }
+
     #[test]
     fn register_orchestration_role_makes_orch_idx_the_orchestrator() {
         let roles: Vec<crate::spawn::RoleSpawn> = ["coder", "orchestrator", "tester"]
@@ -17305,6 +17598,24 @@ mod tests {
             } else {
                 Ownership::Unclaimed
             }
+        }
+
+        /// Issue #320: `panes` names each pane's CURRENT generation only, and
+        /// has no history, so it never answers `Displaced`. The registry's
+        /// verdict is pinned against a real `AgentPtyRegistry` in
+        /// `crate::daemon`'s ingestion tests.
+        fn pane_generation_verdict(
+            &self,
+            pane_id: &str,
+            agent_id: &str,
+        ) -> Option<GenerationVerdict> {
+            if self.mute {
+                return None;
+            }
+            self.panes
+                .get(pane_id)
+                .is_some_and(|owner| owner == agent_id)
+                .then_some(GenerationVerdict::Current)
         }
     }
 

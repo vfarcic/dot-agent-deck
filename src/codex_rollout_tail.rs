@@ -1,10 +1,13 @@
-//! Read a Codex session log for the outcome of a running turn (issue #714).
+//! Read a Codex session log for the outcome of a running turn (issues #714,
+//! #1359).
 //!
-//! Codex reports a provider usage-limit failure through no hook at all: an
-//! errored turn runs no `Stop` hook, and there is no failure hook. What it does
-//! do is write the failure into its rollout JSONL — a `task_complete` record
-//! whose `error.codex_error_info` is `usage_limit_exceeded`. So the daemon reads
-//! that file, and only while a turn is running.
+//! Codex reports a failed turn through no hook at all: an errored turn runs no
+//! `Stop` hook, and there is no failure hook. What it does do is write the
+//! failure into its rollout JSONL — a `task_complete` record carrying an
+//! `error`, whose `codex_error_info` is `usage_limit_exceeded` for a provider
+//! usage limit (reported as a quota block) and something else for every other
+//! failure (reported as an error). So the daemon reads that file, and only
+//! while a turn is running.
 //!
 //! * **Arming.** Codex's own `SessionStart` and `UserPromptSubmit` hooks carry
 //!   the rollout's `transcript_path`, and `UserPromptSubmit` the `turn_id`. The
@@ -40,8 +43,7 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Component, Path};
 use std::time::Duration;
 
-use crate::quota_block::BlockedKind;
-use crate::quota_signals::{CodexLineOutcome, CodexTurnWatch};
+use crate::quota_signals::{CodexLineOutcome, CodexTurnWatch, FailureOutcome};
 
 /// `AgentEvent.metadata` key on a Codex `SessionStart` / `UserPromptSubmit`
 /// event carrying the hook payload's `transcript_path` — the rollout to read.
@@ -138,7 +140,7 @@ impl ArmCommand {
 pub struct ArmRequest {
     pub pane_id: String,
     pub agent_id: String,
-    /// The arming hook's session id, which the block event is filed under.
+    /// The arming hook's session id, which the failure event is filed under.
     pub session_id: String,
     /// The rollout path, when this event carried one.
     pub path: Option<String>,
@@ -146,14 +148,17 @@ pub struct ArmRequest {
     pub turn_id: Option<String>,
 }
 
-/// A quota block read from a rollout, for the daemon to report.
+/// A failed turn read from a rollout, for the daemon to report: a quota block
+/// or, for any other failure, an error (issue #1359).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CodexBlock {
+pub struct CodexTurnFailure {
     pub pane_id: String,
     pub agent_id: String,
     pub session_id: String,
-    pub kind: BlockedKind,
-    pub resets_at_ms: Option<i64>,
+    /// The failed turn — what [`CodexRolloutArms::supersedes`] compares a
+    /// newer arm against.
+    pub turn_id: String,
+    pub outcome: FailureOutcome,
     /// The `task_complete` error message, unscrubbed.
     pub message: Option<String>,
 }
@@ -201,6 +206,26 @@ impl CodexRolloutArms {
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         pending.bytes = 0;
         pending.commands.drain(..).collect()
+    }
+
+    /// Whether a queued, not-yet-applied arm names a turn of `agent_id`'s other
+    /// than `turn_id` — so a failure the monitor found for `turn_id` belongs
+    /// to a turn Codex has already moved past (issue #1359). The hook loop
+    /// queues a prompt's arm BEFORE it applies the prompt to the card, so a
+    /// prompt already on the card is in this queue until the next tick drains
+    /// it.
+    pub fn supersedes(&self, agent_id: &str, turn_id: &str) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .commands
+            .iter()
+            .any(|command| match command {
+                ArmCommand::Arm(req) => {
+                    req.agent_id == agent_id && req.turn_id.as_deref().is_some_and(|t| t != turn_id)
+                }
+                ArmCommand::Disarm { .. } => false,
+            })
     }
 
     /// The total bytes currently queued. For tests and diagnostics.
@@ -307,12 +332,12 @@ impl CodexRolloutTailers {
 
     /// One poll: drop every tailer whose `(pane_id, agent_id)` is no longer a
     /// live owner, then read what each armed tailer's rollout has gained since
-    /// the last tick and return the blocks found. Does file I/O; the daemon
-    /// runs it on a blocking thread, outside every lock of its own.
-    pub fn tick(&mut self, is_live_owner: impl Fn(&str, &str) -> bool) -> Vec<CodexBlock> {
+    /// the last tick and return the failed turns found. Does file I/O; the
+    /// daemon runs it on a blocking thread, outside every lock of its own.
+    pub fn tick(&mut self, is_live_owner: impl Fn(&str, &str) -> bool) -> Vec<CodexTurnFailure> {
         self.tailers
             .retain(|agent_id, tailer| is_live_owner(&tailer.pane_id, agent_id));
-        let mut blocks = Vec::new();
+        let mut failures = Vec::new();
         for (agent_id, tailer) in self.tailers.iter_mut() {
             if tailer.watch.is_none() {
                 continue;
@@ -354,22 +379,26 @@ impl CodexRolloutTailers {
                     }
                 }
             }
-            if let Some(block) = read_tailer(tailer) {
-                blocks.push(CodexBlock {
+            let turn_id = tailer
+                .watch
+                .as_ref()
+                .map_or_else(String::new, |w| w.turn_id().to_owned());
+            if let Some((outcome, message)) = read_tailer(tailer) {
+                failures.push(CodexTurnFailure {
                     pane_id: tailer.pane_id.clone(),
                     agent_id: agent_id.clone(),
                     session_id: tailer.session_id.clone(),
-                    kind: block.0,
-                    resets_at_ms: block.1,
-                    message: block.2,
+                    turn_id,
+                    outcome,
+                    message,
                 });
             }
         }
-        blocks
+        failures
     }
 }
 
-type FoundBlock = (BlockedKind, Option<i64>, Option<String>);
+type FoundFailure = (FailureOutcome, Option<String>);
 
 /// Whether a read starting at `start` begins part-way through a line, so its
 /// first segment is the tail of a record and must be dropped. False at the
@@ -389,8 +418,8 @@ fn opens_mid_record(file: &File, start: u64) -> bool {
 }
 
 /// Read what `tailer`'s rollout gained since its last read, feeding each
-/// complete line to its watch. Returns the block the watch found, if any.
-fn read_tailer(tailer: &mut Tailer) -> Option<FoundBlock> {
+/// complete line to its watch. Returns the failure the watch found, if any.
+fn read_tailer(tailer: &mut Tailer) -> Option<FoundFailure> {
     let open = tailer.open.as_mut()?;
     let len = match open.file.metadata() {
         Ok(meta) => meta.len(),
@@ -451,12 +480,8 @@ fn read_tailer(tailer: &mut Tailer) -> Option<FoundBlock> {
         match outcome {
             CodexLineOutcome::Nothing => {}
             CodexLineOutcome::TurnEnded => ended = true,
-            CodexLineOutcome::Blocked {
-                kind,
-                resets_at_ms,
-                message,
-            } => {
-                found = Some((kind, resets_at_ms, message));
+            CodexLineOutcome::Failed { outcome, message } => {
+                found = Some((outcome, message));
                 ended = true;
             }
         }
@@ -521,6 +546,7 @@ pub fn open_rollout(path: &str) -> Result<File, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quota_block::BlockedKind;
     use spec::spec;
     use std::io::Write as _;
 
@@ -565,8 +591,9 @@ mod tests {
     }
 
     /// Scenario: Arm Codex rollout tailers against files in a temp dir and
-    /// poll them. A usage-limit failure for the armed turn is reported once and
-    /// disarms; a dead owner's tailer is dropped; a FIFO, a wrong file name and
+    /// poll them. A usage-limit failure for the armed turn is reported once as
+    /// a block and disarms, and a non-quota failure is reported once as an
+    /// error; a dead owner's tailer is dropped; a FIFO, a wrong file name and
     /// a `..` path are refused; a tick reads at most 1 MiB, a 300 KiB line is
     /// skipped, and a new arm starts 256 KiB before the end.
     #[spec("status/blocked/013")]
@@ -584,17 +611,47 @@ mod tests {
         let blocks = tailers.tick(live);
         assert_eq!(
             blocks,
-            vec![CodexBlock {
+            vec![CodexTurnFailure {
                 pane_id: "pane-a".into(),
                 agent_id: "a".into(),
                 session_id: "session-a".into(),
-                kind: BlockedKind::CreditsDepleted,
-                resets_at_ms: None,
+                turn_id: TURN.into(),
+                outcome: FailureOutcome::Blocked {
+                    kind: BlockedKind::CreditsDepleted,
+                    resets_at_ms: None,
+                },
                 message: Some("out of credits".into()),
             }]
         );
         assert!(!tailers.is_armed("a"), "a completed turn disarms");
         append(&rollout, failure_lines(TURN).as_bytes());
+        assert!(tailers.tick(live).is_empty(), "reported once");
+
+        // Issue #1359: any other failed turn is reported once, as an error.
+        tailers.apply(arm("a", &rollout, Some("turn-err")));
+        assert!(tailers.tick(live).is_empty());
+        append(
+            &rollout,
+            concat!(
+                r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-err"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-err","error":{"message":"model not supported","codex_error_info":"other"}}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            tailers.tick(live),
+            vec![CodexTurnFailure {
+                pane_id: "pane-a".into(),
+                agent_id: "a".into(),
+                session_id: "session-a".into(),
+                turn_id: "turn-err".into(),
+                outcome: FailureOutcome::Error,
+                message: Some("model not supported".into()),
+            }]
+        );
+        assert!(!tailers.is_armed("a"), "a failed turn disarms");
         assert!(tailers.tick(live).is_empty(), "reported once");
 
         // Another turn's failure is not ours; a Stop for the watched turn

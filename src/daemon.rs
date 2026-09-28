@@ -1539,8 +1539,22 @@ pub async fn ingest_event(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
     registry: &Arc<AgentPtyRegistry>,
-    mut event: AgentEvent,
+    event: AgentEvent,
 ) {
+    ingest_event_unless(state, event_tx, registry, event, || false).await;
+}
+
+/// [`ingest_event`], except that `stale` is asked once the `AppState` write
+/// lock is held, and a `true` drops the event before it is broadcast or
+/// applied. Asked under that lock so nothing the lock orders can slip between
+/// the verdict and the apply. Returns whether the event was ingested.
+async fn ingest_event_unless(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    mut event: AgentEvent,
+    stale: impl FnOnce() -> bool,
+) -> bool {
     // Issue #770: half of the orphan verdict, asked of the registry BEFORE the
     // `AppState` write lock is taken. Sequencing, not style: `has_live_pane`
     // takes the registry's own mutex, and every other path in the daemon that
@@ -1552,6 +1566,9 @@ pub async fn ingest_event(
         .as_deref()
         .is_some_and(|pane_id| registry.has_live_pane(pane_id));
     let mut state = state.write().await;
+    if stale() {
+        return false;
+    }
     // Issue #714: keep the registry's per-agent quota-block latch in step with
     // the card. A `QuotaBlocked` latches a fresh epoch for the pane's live
     // owner — the key the orchestrator notice below is claimed and re-checked
@@ -1588,6 +1605,13 @@ pub async fn ingest_event(
     // registry has never heard of the pane, and a non-`SessionStart` frame is
     // dropped. The card that needs the badge is an attached TUI's.
     state.stamp_orchestration_orphan(&mut event, daemon_owns_pane);
+    // Issue #320: the registry's generation verdict, stamped for the same
+    // reason and at the same point as the orphan marker — an attached TUI has
+    // no registry, and without it ordered a takeover by the frame's type and
+    // producer clock, so a late frame from the OUTGOING generation retired the
+    // live card there while the daemon refused it here. See
+    // `PANE_GENERATION_METADATA_KEY`.
+    state.stamp_pane_generation(&mut event);
     // PRD #1223: the pane-closed marker is the daemon's alone too — it makes an
     // attached TUI drop the pane — so a producer's copy never reaches the
     // fan-out. The daemon's own removal is broadcast directly and never passes
@@ -1605,6 +1629,7 @@ pub async fn ingest_event(
     if let Some((pane_id, agent_id, epoch)) = reported_block {
         notify_orchestrator_of_quota_block(registry, &pane_id, &agent_id, epoch);
     }
+    true
 }
 
 /// Issue #714: the one notice to the orchestrator of a worker whose block
@@ -1813,16 +1838,17 @@ fn queue_codex_rollout_arm(registry: &AgentPtyRegistry, event: &AgentEvent) {
     registry.codex_rollout_arms().push(command);
 }
 
-/// Issue #714: the daemon half of Codex quota detection
+/// Issues #714 and #1359: the daemon half of Codex failed-turn detection
 /// (`crate::codex_rollout_tail`).
 ///
 /// Every [`crate::codex_rollout_tail::POLL_INTERVAL`] it applies the arm
 /// commands the hook loop queued, then polls every armed tailer on a blocking
 /// thread — the file I/O happens there, outside every lock the daemon holds —
-/// and reports each block it finds as ONE `QuotaBlocked` event through
-/// [`ingest_event`], the same path, lock order and orchestrator notice a
-/// producer's report takes. The event is filed under the arming hook's session
-/// id, carries the registry agent, and is marked with
+/// and reports each failed turn it finds as ONE event through [`ingest_event`],
+/// the same path, lock order and orchestrator notice a producer's report takes:
+/// a `QuotaBlocked` for a usage limit, an `Error` for anything else. The event
+/// is filed under the arming hook's session id and carries the registry agent;
+/// a `QuotaBlocked` is also marked with
 /// [`crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY`] as the daemon's own.
 ///
 /// A poll with no armed tailer does no I/O at all. No internal shutdown signal —
@@ -1839,34 +1865,81 @@ async fn run_codex_rollout_monitor(
         for command in registry.codex_rollout_arms().drain() {
             tailers.apply(command);
         }
-        let blocks;
-        (tailers, blocks) = poll_codex_rollouts(&registry, tailers).await;
-        for block in blocks {
-            ingest_event(
-                &state,
-                &event_tx,
-                &registry,
-                codex_rollout_block_event(block),
-            )
-            .await;
+        let failures;
+        (tailers, failures) = poll_codex_rollouts(&registry, tailers).await;
+        for failure in failures {
+            report_codex_rollout_failure(&state, &event_tx, &registry, failure).await;
         }
     }
 }
 
+/// Issue #1359: report one failed turn a poll found — unless Codex has moved
+/// on to another turn since the poll began.
+///
+/// The poll runs on a blocking thread while the hook loop keeps going, so the
+/// agent's next `UserPromptSubmit` can put the card on Thinking before this
+/// failure is ingested, and the older turn's `Error` (or `QuotaBlocked`) would
+/// then repaint the newer turn's card (Qodo and Greptile on PR #1375). The hook
+/// loop queues that prompt's arm before it applies the prompt, and nothing
+/// drains the queue until the next tick, so a newer arm still queued when the
+/// `AppState` write lock is held is the proof: the failure is dropped. A
+/// prompt that has not reached the queue by then has not reached the card
+/// either, and lands after the failure.
+async fn report_codex_rollout_failure(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    failure: crate::codex_rollout_tail::CodexTurnFailure,
+) {
+    use crate::quota_signals::FailureOutcome;
+    let pane_id = failure.pane_id.clone();
+    let agent_id = failure.agent_id.clone();
+    let turn_id = failure.turn_id.clone();
+    let outcome = failure.outcome.clone();
+    let event = codex_rollout_failure_event(failure);
+    let superseded = || {
+        registry
+            .codex_rollout_arms()
+            .supersedes(&agent_id, &turn_id)
+    };
+    if !ingest_event_unless(state, event_tx, registry, event, superseded).await {
+        tracing::debug!(
+            agent_id = %escape_id_for_log(&agent_id),
+            "codex rollout: dropped a failed turn that a newer turn superseded"
+        );
+        return;
+    }
+    // Logged only once the card really changed, so a dropped stale failure
+    // never reads as a status change (Qodo on PR #1375).
+    match outcome {
+        FailureOutcome::Blocked { kind, .. } => warn!(
+            pane_id = %escape_id_for_log(&pane_id),
+            agent_id = %escape_id_for_log(&agent_id),
+            kind = kind.as_wire(),
+            "quota: the Codex session log records a usage-limit failure; marked Blocked"
+        ),
+        FailureOutcome::Error => warn!(
+            pane_id = %escape_id_for_log(&pane_id),
+            agent_id = %escape_id_for_log(&agent_id),
+            "the Codex session log records a failed turn; marked Error"
+        ),
+    }
+}
+
 /// Issue #714: one poll of `tailers` on a blocking thread, handing the set back
-/// with the blocks found. A poll that panicked loses the set rather than the
+/// with the failed turns found. A poll that panicked loses the set rather than the
 /// monitor: every agent's next Codex prompt arms afresh.
 async fn poll_codex_rollouts(
     registry: &Arc<AgentPtyRegistry>,
     mut tailers: crate::codex_rollout_tail::CodexRolloutTailers,
 ) -> (
     crate::codex_rollout_tail::CodexRolloutTailers,
-    Vec<crate::codex_rollout_tail::CodexBlock>,
+    Vec<crate::codex_rollout_tail::CodexTurnFailure>,
 ) {
     let registry = Arc::clone(registry);
     tokio::task::spawn_blocking(move || {
-        let blocks = tailers.tick(|pane_id, agent_id| registry.is_live_owner(pane_id, agent_id));
-        (tailers, blocks)
+        let failures = tailers.tick(|pane_id, agent_id| registry.is_live_owner(pane_id, agent_id));
+        (tailers, failures)
     })
     .await
     .unwrap_or_else(|e| {
@@ -1875,52 +1948,56 @@ async fn poll_codex_rollouts(
     })
 }
 
-/// Issue #714: the `QuotaBlocked` event the daemon reports for a block read
-/// from a Codex rollout.
-fn codex_rollout_block_event(block: crate::codex_rollout_tail::CodexBlock) -> AgentEvent {
+/// Issues #714 and #1359: the event the daemon reports for a failed turn read
+/// from a Codex rollout — `QuotaBlocked` for a usage limit, `Error` for any
+/// other failure. An `Error` carries no provider text, like the Claude Code
+/// `StopFailure` it gives parity with: the card shows the status, and the
+/// message stays in the rollout it came from.
+fn codex_rollout_failure_event(failure: crate::codex_rollout_tail::CodexTurnFailure) -> AgentEvent {
     use crate::quota_block::{
         QUOTA_BLOCKED_DETAIL_METADATA_KEY, QUOTA_BLOCKED_KIND_METADATA_KEY,
         QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, QUOTA_BLOCKED_SOURCE_CODEX_ROLLOUT,
         QUOTA_BLOCKED_SOURCE_METADATA_KEY,
     };
+    use crate::quota_signals::FailureOutcome;
     let now = chrono::Utc::now();
     let mut metadata = std::collections::HashMap::new();
-    metadata.insert(
-        QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
-        block.kind.as_wire().to_string(),
-    );
-    if let Some(at) = block.resets_at_ms {
-        metadata.insert(
-            QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY.to_string(),
-            at.to_string(),
-        );
-    }
-    if let Some(message) = block.message {
-        metadata.insert(QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(), message);
-    }
-    normalize_quota_blocked_metadata(&mut metadata, now.timestamp_millis());
-    metadata.insert(
-        QUOTA_BLOCKED_SOURCE_METADATA_KEY.to_string(),
-        QUOTA_BLOCKED_SOURCE_CODEX_ROLLOUT.to_string(),
-    );
-    warn!(
-        pane_id = %escape_id_for_log(&block.pane_id),
-        agent_id = %escape_id_for_log(&block.agent_id),
-        kind = block.kind.as_wire(),
-        "quota: the Codex session log records a usage-limit failure; marked Blocked"
-    );
+    let event_type = match failure.outcome {
+        FailureOutcome::Blocked { kind, resets_at_ms } => {
+            metadata.insert(
+                QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
+                kind.as_wire().to_string(),
+            );
+            if let Some(at) = resets_at_ms {
+                metadata.insert(
+                    QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY.to_string(),
+                    at.to_string(),
+                );
+            }
+            if let Some(message) = failure.message {
+                metadata.insert(QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(), message);
+            }
+            normalize_quota_blocked_metadata(&mut metadata, now.timestamp_millis());
+            metadata.insert(
+                QUOTA_BLOCKED_SOURCE_METADATA_KEY.to_string(),
+                QUOTA_BLOCKED_SOURCE_CODEX_ROLLOUT.to_string(),
+            );
+            crate::event::EventType::QuotaBlocked
+        }
+        FailureOutcome::Error => crate::event::EventType::Error,
+    };
     AgentEvent {
-        session_id: block.session_id,
+        session_id: failure.session_id,
         agent_type: crate::event::AgentType::Codex,
-        event_type: crate::event::EventType::QuotaBlocked,
+        event_type,
         tool_name: None,
         tool_detail: None,
         cwd: None,
         timestamp: now,
         user_prompt: None,
         metadata,
-        pane_id: Some(block.pane_id),
-        agent_id: Some(block.agent_id),
+        pane_id: Some(failure.pane_id),
+        agent_id: Some(failure.agent_id),
         agent_version: None,
         schema_version: None,
         live_target: None,
@@ -3989,6 +4066,66 @@ mod quota_admission_tests {
         assert_eq!(subagent.metadata.len(), 2, "{:?}", subagent.metadata);
         assert!(subagent.is_from_subagent());
     }
+
+    /// Issue #1359: a failed Codex turn read from the rollout becomes one
+    /// event for the card — `QuotaBlocked`, marked as the daemon's own, for a
+    /// usage limit, and `Error`, with no quota metadata and no provider text,
+    /// for any other failure — and each paints the card it names.
+    #[test]
+    fn codex_rollout_failures_report_blocked_or_error() {
+        use crate::codex_rollout_tail::CodexTurnFailure;
+        use crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY;
+        use crate::quota_signals::FailureOutcome;
+        let failure = |outcome| CodexTurnFailure {
+            pane_id: "pane-1".to_string(),
+            agent_id: "agent-1".to_string(),
+            session_id: "s".to_string(),
+            turn_id: "t1".to_string(),
+            outcome,
+            message: Some("provider text".to_string()),
+        };
+        let mut state = crate::state::AppState::default();
+        state.register_pane("pane-1".to_string());
+        state.apply_event(AgentEvent {
+            agent_type: AgentType::Codex,
+            agent_id: Some("agent-1".to_string()),
+            ..quota_frame(crate::event::EventType::Thinking)
+        });
+        assert_eq!(
+            state.sessions["s"].status,
+            crate::state::SessionStatus::Thinking
+        );
+
+        let error = codex_rollout_failure_event(failure(FailureOutcome::Error));
+        assert_eq!(error.event_type, crate::event::EventType::Error);
+        assert_eq!(error.agent_type, AgentType::Codex);
+        assert_eq!(error.session_id, "s");
+        assert_eq!(error.pane_id.as_deref(), Some("pane-1"));
+        assert_eq!(error.agent_id.as_deref(), Some("agent-1"));
+        assert!(error.metadata.is_empty(), "{:?}", error.metadata);
+        assert!(error.tool_detail.is_none());
+        state.apply_event(error);
+        assert_eq!(
+            state.sessions["s"].status,
+            crate::state::SessionStatus::Error
+        );
+
+        let block = codex_rollout_failure_event(failure(FailureOutcome::Blocked {
+            kind: crate::quota_block::BlockedKind::CreditsDepleted,
+            resets_at_ms: None,
+        }));
+        assert_eq!(block.event_type, crate::event::EventType::QuotaBlocked);
+        assert!(
+            block
+                .metadata
+                .contains_key(QUOTA_BLOCKED_SOURCE_METADATA_KEY)
+        );
+        state.apply_event(block);
+        assert_eq!(
+            state.sessions["s"].status,
+            crate::state::SessionStatus::Blocked
+        );
+    }
 }
 
 // PRD #42 M2/review: these tests bind a real Unix socket, chmod it via
@@ -4059,6 +4196,92 @@ mod hook_ingestion_tests {
                 if req.turn_id.as_deref() == Some("t1") && turn_id == "t1"),
             "{queued:?}"
         );
+        registry.shutdown_all();
+    }
+
+    /// Issue #1359 (Qodo on PR #1375): a poll that found turn `t1`'s failure
+    /// can finish after Codex's next `UserPromptSubmit` has put the card on
+    /// Thinking. That failure is stale and must not repaint the card. The hook
+    /// loop queues a prompt's arm before it applies the prompt, so the newer
+    /// arm is still in the queue when the failure is reported. A re-arm of the
+    /// same turn does not supersede it, and with no newer arm it is an Error.
+    #[tokio::test]
+    async fn a_codex_failure_superseded_by_a_newer_turn_does_not_repaint_the_card() {
+        use crate::codex_rollout_tail::{
+            CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY, CodexTurnFailure,
+        };
+        use crate::quota_signals::FailureOutcome;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let owner = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "codex-race".to_string(),
+                )]),
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane("codex-race".to_string());
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let prompt = |turn: &str| {
+            let mut event =
+                super::quota_admission_tests::quota_frame(crate::event::EventType::Thinking);
+            event.agent_type = AgentType::Codex;
+            event.pane_id = Some("codex-race".to_string());
+            event.agent_id = Some(owner.clone());
+            event.metadata.insert(
+                CODEX_TRANSCRIPT_PATH_METADATA_KEY.to_string(),
+                "/x/rollout-a.jsonl".to_string(),
+            );
+            event
+                .metadata
+                .insert(CODEX_TURN_ID_METADATA_KEY.to_string(), turn.to_string());
+            event
+        };
+        // The hook loop's order for a prompt: queue its arm, then apply it.
+        let submit = |turn: &'static str| {
+            let event = prompt(turn);
+            queue_codex_rollout_arm(&registry, &event);
+            ingest_event(&state, &event_tx, &registry, event)
+        };
+        let failure = || CodexTurnFailure {
+            pane_id: "codex-race".to_string(),
+            agent_id: owner.clone(),
+            session_id: "s".to_string(),
+            turn_id: "t1".to_string(),
+            outcome: FailureOutcome::Error,
+            message: None,
+        };
+        let status = || async { state.read().await.sessions["s"].status.clone() };
+
+        // Turn t1 is armed and the monitor has drained it; a poll finds its
+        // failure while turn t2 is submitted.
+        submit("t1").await;
+        registry.codex_rollout_arms().drain();
+        submit("t2").await;
+        report_codex_rollout_failure(&state, &event_tx, &registry, failure()).await;
+        assert_eq!(
+            status().await,
+            crate::state::SessionStatus::Thinking,
+            "the older turn's failure repainted the newer turn's card"
+        );
+
+        // A re-arm of the same turn does not supersede its own failure.
+        registry.codex_rollout_arms().drain();
+        submit("t1").await;
+        report_codex_rollout_failure(&state, &event_tx, &registry, failure()).await;
+        assert_eq!(status().await, crate::state::SessionStatus::Error);
+
+        // Control: nothing newer queued, so the failure is reported.
+        registry.codex_rollout_arms().drain();
+        submit("t1").await;
+        registry.codex_rollout_arms().drain();
+        report_codex_rollout_failure(&state, &event_tx, &registry, failure()).await;
+        assert_eq!(status().await, crate::state::SessionStatus::Error);
         registry.shutdown_all();
     }
 
@@ -7511,6 +7734,356 @@ mod hook_ingestion_tests {
             state.read().await.sessions.len() == 1,
             "the daemon state itself is unaffected by the registry going away"
         );
+    }
+
+    /// Issue #320: one frame as a generation's hook would post it, naming its
+    /// pane and its registry agent id.
+    fn takeover_frame_320(
+        pane: &str,
+        agent_id: &str,
+        session_id: &str,
+        event_type: crate::event::EventType,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> AgentEvent {
+        AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp,
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(pane.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// Issue #320: a pane that has changed hands, observed from both ends of
+    /// the fan-out — the daemon's own `AppState` (registry oracle installed, as
+    /// `run_daemon_with` installs it) and an attached TUI's (no oracle, fed
+    /// every relayed frame the way `spawn_event_subscriber` feeds it).
+    struct Takeover320 {
+        registry: Arc<AgentPtyRegistry>,
+        _ownership: Arc<dyn crate::state::AgentOwnership>,
+        daemon: SharedState,
+        tui: crate::state::AppState,
+        event_tx: broadcast::Sender<BroadcastMsg>,
+        rx: broadcast::Receiver<BroadcastMsg>,
+        pane: String,
+        old: String,
+        new: String,
+    }
+
+    impl Takeover320 {
+        /// The OUTGOING generation `old` runs on the pane, opens its card and
+        /// exits; the INCOMING generation `new` then claims the pane. Nothing
+        /// from `new` has been ingested yet.
+        async fn new(pane: &str) -> Self {
+            let mut fixture = Self::start(pane, "/usr/bin/true").await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while fixture.registry.live_count() != 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the outgoing generation's child never exited"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            fixture.new = fixture
+                .registry
+                .spawn_agent(Self::spawn_options(pane, "/bin/cat"))
+                .expect("the pane must be reusable once its child is gone");
+            fixture
+        }
+
+        /// The `clear = true` shape instead: `respawn_agent_for_pane` lifts the
+        /// outgoing generation's record out of the registry BEFORE the incoming
+        /// one is published, so there is no record left to carry a handover
+        /// flag when the outgoing agent's late frame is read.
+        async fn by_respawn(pane: &str) -> Self {
+            let mut fixture = Self::start(pane, "/bin/cat").await;
+            fixture.new = fixture
+                .registry
+                .respawn_agent_for_pane(pane, "/bin/cat")
+                .await
+                .expect("respawn the pane's agent in place");
+            fixture
+        }
+
+        fn spawn_options(pane: &str, command: &'static str) -> SpawnOptions<'static> {
+            SpawnOptions {
+                command: Some(command),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )]),
+                ..SpawnOptions::default()
+            }
+        }
+
+        /// The outgoing generation runs `command` on the pane and opens its
+        /// card with a `SessionStart`.
+        async fn start(pane: &str, command: &'static str) -> Self {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let old = registry
+                .spawn_agent(Self::spawn_options(pane, command))
+                .expect("spawn the outgoing generation");
+            let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+            let daemon: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            daemon
+                .write()
+                .await
+                .set_agent_ownership(Arc::downgrade(&ownership));
+            let mut tui = crate::state::AppState::default();
+            // The TUI registers the panes it draws; the daemon never does for
+            // an ordinary spawn — the registry is its answer.
+            tui.register_pane(pane.to_string());
+            let (event_tx, rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let mut fixture = Self {
+                registry,
+                _ownership: ownership,
+                daemon,
+                tui,
+                event_tx,
+                rx,
+                pane: pane.to_string(),
+                old,
+                new: String::new(),
+            };
+            let (old, pane) = (fixture.old.clone(), fixture.pane.clone());
+            fixture
+                .ingest(takeover_frame_320(
+                    &pane,
+                    &old,
+                    "old-session",
+                    crate::event::EventType::SessionStart,
+                    chrono::Utc::now() - chrono::Duration::seconds(60),
+                ))
+                .await;
+            fixture
+        }
+
+        /// Post `event` through the daemon's real ingestion and relay what the
+        /// daemon broadcast into the TUI's state.
+        async fn ingest(&mut self, event: AgentEvent) -> AgentEvent {
+            ingest_event(&self.daemon, &self.event_tx, &self.registry, event).await;
+            let BroadcastMsg::Event(relayed) = self.rx.try_recv().expect("the frame is relayed")
+            else {
+                panic!("expected an event on the fan-out");
+            };
+            self.tui.apply_event(relayed.clone());
+            relayed
+        }
+
+        /// Every card on the pane, by the generation it names, on each side.
+        async fn owners(&self) -> (Vec<Option<String>>, Vec<Option<String>>) {
+            let on_pane = |state: &crate::state::AppState| {
+                let mut owners: Vec<Option<String>> = state
+                    .sessions
+                    .values()
+                    .filter(|s| s.pane_id.as_deref() == Some(self.pane.as_str()))
+                    .map(|s| s.agent_id.clone())
+                    .collect();
+                owners.sort();
+                owners
+            };
+            (on_pane(&*self.daemon.read().await), on_pane(&self.tui))
+        }
+
+        async fn assert_one_live_card(&self, after: &str) {
+            let want = vec![Some(self.new.clone())];
+            let (daemon, tui) = self.owners().await;
+            assert_eq!(
+                daemon, want,
+                "daemon: after {after}, the pane must carry the live generation's card \
+                 and nothing else"
+            );
+            assert_eq!(
+                tui, want,
+                "attached TUI: after {after}, the pane must carry the live generation's \
+                 card and nothing else — a frame was ordered by its type or its \
+                 producer clock instead of by the pane's generation"
+            );
+        }
+
+        /// The incoming generation announces itself with a `SessionStart`
+        /// stamped EARLIER than the outgoing card's last activity — case B's
+        /// shape, where a start's producer clock is not ordering evidence — and
+        /// must still take the pane over on both sides.
+        async fn take_over(&mut self) {
+            let (new, pane) = (self.new.clone(), self.pane.clone());
+            let relayed = self
+                .ingest(takeover_frame_320(
+                    &pane,
+                    &new,
+                    "new-session",
+                    crate::event::EventType::SessionStart,
+                    chrono::Utc::now() - chrono::Duration::seconds(120),
+                ))
+                .await;
+            assert_eq!(
+                relayed.pane_generation_verdict(),
+                Some(crate::event::GenerationVerdict::Current),
+                "the incoming generation's frame is relayed as the pane's current one"
+            );
+            self.assert_one_live_card("the incoming SessionStart").await;
+        }
+    }
+
+    impl Drop for Takeover320 {
+        fn drop(&mut self) {
+            self.registry.shutdown_all();
+        }
+    }
+
+    /// Issue #320: a late `SessionStart` from the OUTGOING generation — the
+    /// frame PRD #92 F9 followup-7 documents a slow-booting old agent firing —
+    /// arrives after the incoming one owns the pane. It announces a generation
+    /// the registry has already seen displaced, so it must neither retire the
+    /// live card nor add one beside it, on either side of the fan-out.
+    #[tokio::test]
+    async fn a_late_outgoing_session_start_cannot_retire_the_live_card() {
+        let mut deck = Takeover320::new("takeover-start-320").await;
+        deck.take_over().await;
+
+        let (old, pane) = (deck.old.clone(), deck.pane.clone());
+        deck.ingest(takeover_frame_320(
+            &pane,
+            &old,
+            "old-session",
+            crate::event::EventType::SessionStart,
+            chrono::Utc::now(),
+        ))
+        .await;
+        deck.assert_one_live_card("the outgoing generation's late SessionStart")
+            .await;
+    }
+
+    /// Issue #320, the sibling class #284 added: an outgoing NON-start frame
+    /// stamped at-or-newer than the live card's high-water mark. The producer
+    /// clock says "newer"; the registry says "displaced", and the registry is
+    /// what decides.
+    #[tokio::test]
+    async fn a_late_outgoing_frame_stamped_newer_cannot_retire_the_live_card() {
+        let mut deck = Takeover320::new("takeover-newer-320").await;
+        deck.take_over().await;
+
+        let (old, pane) = (deck.old.clone(), deck.pane.clone());
+        deck.ingest(takeover_frame_320(
+            &pane,
+            &old,
+            "old-session",
+            crate::event::EventType::Thinking,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        ))
+        .await;
+        deck.assert_one_live_card("the outgoing generation's late, newer-stamped Thinking")
+            .await;
+    }
+
+    /// Issue #320, the other direction of the same discriminator: the incoming
+    /// generation's first frame is an ordinary status report (Pi's shape — it
+    /// sends no `SessionStart`) stamped OLDER than the outgoing card's last
+    /// activity. The registry names it the pane's current generation, so it
+    /// retires the stale card on both sides; the producer clock is not weighed.
+    #[tokio::test]
+    async fn the_current_generation_supersedes_whatever_its_first_frame_is_stamped() {
+        let mut deck = Takeover320::new("takeover-older-320").await;
+
+        let (new, pane) = (deck.new.clone(), deck.pane.clone());
+        deck.ingest(takeover_frame_320(
+            &pane,
+            &new,
+            "new-session",
+            crate::event::EventType::Thinking,
+            chrono::Utc::now() - chrono::Duration::seconds(120),
+        ))
+        .await;
+        deck.assert_one_live_card("the incoming generation's older-stamped first frame")
+            .await;
+    }
+
+    /// Issue #320, on the path PRD #92 F9 followup-7 is actually about: a
+    /// `clear = true` respawn replaces the pane's agent IN PLACE, removing the
+    /// outgoing record before the incoming one is published. The outgoing
+    /// agent's late `SessionStart` must still be recognised as displaced.
+    #[tokio::test]
+    async fn a_late_frame_from_a_generation_replaced_in_place_cannot_retire_the_live_card() {
+        let mut deck = Takeover320::by_respawn("takeover-respawn-320").await;
+        deck.take_over().await;
+
+        let (old, pane) = (deck.old.clone(), deck.pane.clone());
+        let relayed = deck
+            .ingest(takeover_frame_320(
+                &pane,
+                &old,
+                "old-session",
+                crate::event::EventType::SessionStart,
+                chrono::Utc::now(),
+            ))
+            .await;
+        assert_eq!(
+            relayed.pane_generation_verdict(),
+            Some(crate::event::GenerationVerdict::Displaced),
+            "the registry published the outgoing generation on this pane, so it knows \
+             it was replaced even though its record is gone"
+        );
+        deck.assert_one_live_card("the replaced generation's late SessionStart")
+            .await;
+    }
+
+    /// Issue #320: the generation marker is the REGISTRY's answer and nobody
+    /// else's. A producer's own copy is removed before the fan-out, and an agent
+    /// id the registry never published on the pane — an invented one, as a
+    /// stand-in or a forgery would carry — is relayed with no verdict at all,
+    /// so it is ordered exactly as it was before this marker existed.
+    #[tokio::test]
+    async fn the_generation_marker_is_the_registrys_answer_only() {
+        let mut deck = Takeover320::new("takeover-marker-320").await;
+        deck.take_over().await;
+        let pane = deck.pane.clone();
+
+        let mut forged = takeover_frame_320(
+            &pane,
+            "an-id-the-registry-never-minted",
+            "forged-session",
+            crate::event::EventType::Thinking,
+            chrono::Utc::now(),
+        );
+        forged.metadata.insert(
+            crate::event::PANE_GENERATION_METADATA_KEY.to_string(),
+            crate::event::PANE_GENERATION_CURRENT.to_string(),
+        );
+        let relayed = deck.ingest(forged).await;
+        assert_eq!(
+            relayed
+                .metadata
+                .get(crate::event::PANE_GENERATION_METADATA_KEY),
+            None,
+            "a producer-supplied marker must not survive, and an id the registry never \
+             published on the pane gets no verdict of its own"
+        );
+
+        // A pane the registry holds nothing for gets no verdict either, whatever
+        // the producer claimed.
+        let mut elsewhere = takeover_frame_320(
+            "a-pane-the-registry-never-heard-of",
+            &deck.new.clone(),
+            "elsewhere-session",
+            crate::event::EventType::Thinking,
+            chrono::Utc::now(),
+        );
+        elsewhere.metadata.insert(
+            crate::event::PANE_GENERATION_METADATA_KEY.to_string(),
+            crate::event::PANE_GENERATION_DISPLACED.to_string(),
+        );
+        let relayed = deck.ingest(elsewhere).await;
+        assert_eq!(relayed.pane_generation_verdict(), None);
     }
 }
 
