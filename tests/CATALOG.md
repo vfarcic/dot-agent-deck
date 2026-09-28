@@ -4402,6 +4402,24 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** the exact wording of the rejection message (clap's default unknown-argument text or a custom friendly message both satisfy it).
 - **Platform coverage:** mac+linux.
 
+### Shared remote registry (issue #1350)
+
+#### remote/registry
+
+##### remote/registry/001 — A desktop-shaped row appears in the CLI's remote list.
+- **Layer:** L2 (real CLI subprocess with a test-owned `remotes.toml`; no SSH or credential).
+- **Agent:** none.
+- **Asserts:** `remote list` accepts a row with `id`, `user`, `jump_host`, `socket`, the existing required fields, and an unknown future field; the name and host appear in the CLI output.
+- **Does not assert:** desktop rendering or the display of optional fields, which the CLI table does not currently show.
+- **Platform coverage:** mac+linux+windows.
+
+##### remote/registry/002 — A CLI re-save preserves desktop and future fields on an untouched row.
+- **Layer:** L2 (real CLI subprocess with a test-owned `remotes.toml`; no SSH or credential).
+- **Agent:** none.
+- **Asserts:** after `remote remove` removes a second row, the first row still has its `id`, `user`, `jump_host`, `socket`, and unknown `some_future_field` values in valid TOML.
+- **Does not assert:** a real SSH operation, concurrent writers, or byte-for-byte formatting preservation.
+- **Platform coverage:** mac+linux+windows.
+
 ### Remote diagnostics (PRD #345)
 
 #### remote/doctor
