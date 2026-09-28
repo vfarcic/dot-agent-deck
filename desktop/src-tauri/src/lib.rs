@@ -3949,7 +3949,7 @@ async fn start_orchestration_action(
         .client
         .prepare_orchestration(&path, &orchestration, "", config_revision.as_deref())
         .await
-        .map_err(|error| safe_message(error.to_string()))?;
+        .map_err(|error| prepare_refusal_message(&error, &orchestration))?;
     // Both are `#[serde(default)]` on the reply, and neither may be invented
     // here — see `prepare_orchestration_launch`.
     if prepared.path.is_empty() {
@@ -3994,23 +3994,47 @@ fn ambiguous_orchestration_refusal(orchestration: &str) -> String {
     )
 }
 
+/// A refused `PrepareOrchestration`, as the dialog reports it.
+///
+/// Issue #1233: a deck on #1233 or later refuses an ambiguous name itself, with
+/// `ambiguous-orchestration`, which reaches here when the preflight below did
+/// not see the duplicate — the config was edited between the two reads. That
+/// refusal gets the preflight's own sentence, so the user reads one message for
+/// one outcome whichever side caught it. Every other refusal is the deck's text.
+fn prepare_refusal_message(error: &ClientError, orchestration: &str) -> String {
+    match error {
+        ClientError::Server(message)
+            if message.starts_with(&format!(
+                "{}:",
+                dot_agent_deck::daemon_protocol::PROJECT_ERR_AMBIGUOUS_ORCHESTRATION
+            )) =>
+        {
+            ambiguous_orchestration_refusal(orchestration)
+        }
+        other => safe_message(other.to_string()),
+    }
+}
+
 /// PRD #1223 audit V4: refuse a launch whose orchestration name names MORE
 /// than one of the project's orchestrations on that deck.
 ///
-/// `PrepareOrchestration` takes the FIRST role-bearing definition with the name
-/// (`project_resolve.rs`, the same rule the TUI's spawn uses), so launching a
-/// namesake would run the other definition's roles and commands under the name
-/// the user chose. Config validation only warns about the duplicate, and the
-/// name is all the wire carries.
+/// A deck older than issue #1233 prepares the FIRST role-bearing definition
+/// with the name, so launching a namesake there would run the other
+/// definition's roles and commands under the name the user chose. Config
+/// validation only warns about the duplicate, and the name is all the wire
+/// carries.
 ///
 /// The dialog already shows namesakes as disabled chips and never submits one
 /// (audit F2), but that is presentation: this is the boundary every caller
 /// crosses — the main webview's own action, a frontend regression, a fixture
 /// caller — so the invariant is checked where the launch is decided.
 ///
-/// **Desktop-side only, deliberately.** Changing `PrepareOrchestration`'s
-/// first-match rule would change an existing verb that older desktops and the
-/// TUI already call, which is not this PR's to do; see issue #1233.
+/// **Kept now that the deck refuses too (issue #1233).** A #1233 deck refuses
+/// an ambiguous name at the step that publishes, with
+/// `ambiguous-orchestration` ([`prepare_refusal_message`]), and that closes the
+/// window between this read and the preparation. This check is still what
+/// protects a launch against an **older** deck, which takes the first match; it
+/// also answers before anything is prepared at all.
 ///
 /// A name the project defines NO orchestration under is deliberately left to
 /// the deck: its `PrepareOrchestration` refuses that before it composes or publishes

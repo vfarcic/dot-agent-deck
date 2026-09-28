@@ -449,6 +449,12 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// Retiring the mirror is follow-up #1395, and is the point at which that
 /// pairing has to be argued again.
 ///
+/// Its second half, refusing an ambiguous orchestration name with
+/// [`PROJECT_ERR_AMBIGUOUS_ORCHESTRATION`], moves no wire either — a new error
+/// code on an existing refusal channel — but it IS a semantic break, the
+/// #555/#580 shape, and is declared as `1233-prepare-refuses-ambiguous-orchestration`
+/// in [`CONTRACT_BREAKS`] with `changelog.d/1233.breaking.md`.
+///
 /// # Where this constant is enforced
 ///
 /// **Exactly one call site refuses on it: the desktop.**
@@ -915,6 +921,14 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // new build, which is exactly the older-daemon pairing this list exists to
     // name.
     "708-worker-failure-reports-submitted",
+    // Issue #1233, at 10 without moving it -- the #555/#580 shape. A
+    // `PrepareOrchestration` naming an orchestration the project declares more
+    // than once, with roles each time, used to prepare the FIRST declaration; a
+    // newer daemon refuses it with `PROJECT_ERR_AMBIGUOUS_ORCHESTRATION` before
+    // publishing anything or issuing a token. The request and the refusal
+    // channel are unchanged on the wire. What changed is which preparations are
+    // refused, which a version number cannot express.
+    "1233-prepare-refuses-ambiguous-orchestration",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -1050,6 +1064,20 @@ pub const PROJECT_ERR_STALE_REVISION: &str = "stale-revision";
 /// available orchestration: that is config content for a path the caller may
 /// merely have pasted.
 pub const PROJECT_ERR_NO_ORCHESTRATION: &str = "no-such-orchestration";
+
+/// Issue #1233: the project resolved, but defines **more than one**
+/// role-bearing orchestration under the requested name, so there is no single
+/// one to prepare.
+///
+/// A daemon before #1233 prepared the first declaration instead, which is why
+/// this is declared as a contract break (`1233-prepare-refuses-ambiguous-orchestration`
+/// in [`CONTRACT_BREAKS`]): a request an older daemon accepted is now refused.
+/// It is refused before anything is published or any token issued, and a
+/// roleless duplicate does not count
+/// ([`crate::project_resolve::find_orchestration`]). Checked after
+/// [`PROJECT_ERR_STALE_REVISION`], so a caller holding a stale revision is told
+/// to resolve again first.
+pub const PROJECT_ERR_AMBIGUOUS_ORCHESTRATION: &str = "ambiguous-orchestration";
 
 /// PRD #819 M4: the project and the orchestration resolved, but the
 /// orchestrator context could not be published.

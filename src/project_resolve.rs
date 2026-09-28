@@ -1099,22 +1099,26 @@ pub fn prepare_orchestration_for_wire(
     // refusals below carry their own codes and their own sentences rather than
     // the one generic one.
     //
-    // Same selection rule the spawn uses (`crate::spawn::decide_target`):
-    // roleless entries are skipped, because two entries can resolve to the SAME
-    // name and matching the empty one would refuse a target the listing
-    // legitimately offered.
-    let Some(orch) = config
-        .orchestrations
-        .iter()
-        .filter(|o| !o.roles.is_empty())
-        .find(|o| {
-            crate::project_config::resolve_orchestration_name(&o.name, &dir) == orchestration
-        })
-    else {
-        warn!(
-            "prepare-orchestration refused: the project defines no orchestration under the requested name"
-        );
-        return Err(no_such_orchestration_refusal());
+    // Roleless entries are skipped, as `crate::spawn::decide_target` skips
+    // them: two entries can resolve to the SAME name, and matching the empty one
+    // would refuse a target the listing legitimately offered. Issue #1233: two
+    // ROLE-BEARING entries under one name are refused as ambiguous rather than
+    // resolved to the first, before anything is published or issued.
+    let orch = match find_orchestration(&config, orchestration, &dir) {
+        Ok(orch) => orch,
+        Err(OrchestrationLookup::Missing) => {
+            warn!(
+                "prepare-orchestration refused: the project defines no orchestration under the requested name"
+            );
+            return Err(no_such_orchestration_refusal());
+        }
+        Err(OrchestrationLookup::Ambiguous(count)) => {
+            warn!(
+                count,
+                "prepare-orchestration refused: the project defines more than one orchestration with roles under the requested name"
+            );
+            return Err(ambiguous_orchestration_refusal());
+        }
     };
     // The projection caps ARE a resolve failure — `resolve_for_wire` refuses the
     // same config for the same reason — so this one takes the disclosure split
@@ -1204,6 +1208,49 @@ pub fn prepare_orchestration_for_wire(
         // `PreparedOrchestration::prompt`.
         prompt: prepared.prompt,
     })
+}
+
+/// Why [`find_orchestration`] found no single orchestration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestrationLookup {
+    /// No role-bearing orchestration resolves to the name.
+    Missing,
+    /// This many role-bearing orchestrations resolve to it (always two or more).
+    Ambiguous(usize),
+}
+
+/// The one role-bearing orchestration in `config` that resolves to `name`
+/// under `dir` (issue #1233).
+///
+/// **Roleless entries are not counted**, so a name is ambiguous only when two
+/// entries could each hand a caller a set of roles: a roleless duplicate cannot
+/// launch anything, and skipping it is the rule the launch verb already had.
+/// Before #1233 this was a first match, so a project declaring the same name
+/// twice launched the first declaration's roles for a caller that may have meant
+/// the second. The desktop refused that case itself before preparing, but only
+/// when it had resolved the project first — a caller that sends no revision, or
+/// resolves against one config and prepares against an edited one, reached the
+/// first match. This is the check at the one step that publishes.
+///
+/// `crate::spawn::decide_target`, which `dispatch --orchestration` uses, still
+/// takes the first match; that is follow-up #1396.
+pub fn find_orchestration<'a>(
+    config: &'a ProjectConfig,
+    name: &str,
+    dir: &Path,
+) -> Result<&'a crate::project_config::OrchestrationConfig, OrchestrationLookup> {
+    let mut matches = config
+        .orchestrations
+        .iter()
+        .filter(|o| !o.roles.is_empty())
+        .filter(|o| crate::project_config::resolve_orchestration_name(&o.name, dir) == name);
+    let Some(first) = matches.next() else {
+        return Err(OrchestrationLookup::Missing);
+    };
+    match matches.count() {
+        0 => Ok(first),
+        more => Err(OrchestrationLookup::Ambiguous(more + 1)),
+    }
 }
 
 /// Re-validate a preparation at spawn time: is the artifact this token was
@@ -1336,17 +1383,15 @@ fn revalidate_approved_roles(
     }
     // Cheap, and not a tautology given the revision matched: `config_revision`
     // is a change hint rather than a commitment, so this asks the config itself
-    // the question the hint only stands in for.
-    let Some(orch) = config
-        .orchestrations
-        .iter()
-        .filter(|o| !o.roles.is_empty())
-        .find(|o| {
-            crate::project_config::resolve_orchestration_name(&o.name, &dir)
-                == binding.orchestration
-        })
-    else {
-        return Err(PreparationStale::OrchestrationGone);
+    // the question the hint only stands in for — including issue #1233's "is
+    // the name still unambiguous", which the preparation refused to answer with
+    // a first match.
+    let orch = match find_orchestration(&config, &binding.orchestration, &dir) {
+        Ok(orch) => orch,
+        Err(OrchestrationLookup::Missing) => return Err(PreparationStale::OrchestrationGone),
+        Err(OrchestrationLookup::Ambiguous(_)) => {
+            return Err(PreparationStale::OrchestrationAmbiguous);
+        }
     };
     // Captured before the context checks so the returned list is the one the
     // orchestration lookup just matched, rather than a second lookup's.
@@ -1532,6 +1577,9 @@ pub enum PreparationStale {
     ConfigChanged,
     /// The prepared orchestration is no longer defined with roles.
     OrchestrationGone,
+    /// More than one orchestration with roles now resolves to the prepared
+    /// name (issue #1233), so there is no single one to start.
+    OrchestrationAmbiguous,
     /// The published orchestrator context could not be read back.
     ContextUnreadable,
     /// Something other than a regular file now sits at the published path.
@@ -1558,6 +1606,9 @@ impl PreparationStale {
             Self::ConfigUnreadable => "the prepared project's config no longer reads",
             Self::ConfigChanged => "the project config changed after the preparation",
             Self::OrchestrationGone => "the prepared orchestration is no longer defined with roles",
+            Self::OrchestrationAmbiguous => {
+                "more than one orchestration with roles now has the prepared name"
+            }
             Self::ContextUnreadable => "the published orchestrator context could not be read back",
             Self::ContextNotRegularFile => {
                 "the published orchestrator context is no longer a regular file"
@@ -1953,6 +2004,21 @@ pub fn no_such_orchestration_refusal() -> String {
     format!(
         "{}: that project defines no orchestration with roles under that name",
         crate::daemon_protocol::PROJECT_ERR_NO_ORCHESTRATION
+    )
+}
+
+/// The refusal a `PrepareOrchestration` naming an orchestration the project
+/// declares more than once, with roles each time, gets (issue #1233).
+///
+/// Worded like the desktop's own preflight refusal, which it backs up at the
+/// step that publishes. It names no count and no role: the caller already holds
+/// the project's listing if it resolved first, and a caller that did not is
+/// told only what to change.
+pub fn ambiguous_orchestration_refusal() -> String {
+    format!(
+        "{}: that project defines more than one orchestration with roles under that name; \
+         rename one to launch it",
+        crate::daemon_protocol::PROJECT_ERR_AMBIGUOUS_ORCHESTRATION
     )
 }
 
@@ -2772,6 +2838,36 @@ command = "cat"
         assert!(
             !prepared.token.is_empty(),
             "a preparation carries the token the later spawn presents"
+        );
+    }
+
+    /// Issue #1233: the lookup counts role-bearing matches only, and refuses
+    /// two of them rather than taking the first.
+    #[test]
+    fn find_orchestration_refuses_a_duplicated_role_bearing_name() {
+        let dir = Path::new("/p/project");
+        let parse = |toml: &str| -> ProjectConfig { toml::from_str(toml).expect("parse") };
+        let one = parse(SMALL_PROJECT);
+        assert_eq!(
+            find_orchestration(&one, "loop", dir).map(|o| o.roles.len()),
+            Ok(2)
+        );
+        assert_eq!(
+            find_orchestration(&one, "nope", dir).map(|_| ()),
+            Err(OrchestrationLookup::Missing)
+        );
+        let two = parse(&format!("{SMALL_PROJECT}\n{SMALL_PROJECT}"));
+        assert_eq!(
+            find_orchestration(&two, "loop", dir).map(|_| ()),
+            Err(OrchestrationLookup::Ambiguous(2))
+        );
+        let roleless = parse(&format!(
+            "[[orchestrations]]\nname = \"loop\"\n{SMALL_PROJECT}"
+        ));
+        assert_eq!(
+            find_orchestration(&roleless, "loop", dir).map(|o| o.roles.len()),
+            Ok(2),
+            "a roleless duplicate does not make the name ambiguous"
         );
     }
 
