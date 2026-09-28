@@ -2374,6 +2374,16 @@ async fn desktop_get_settings(
 /// does not carry is an unknown section the merge preserved: `DesktopSettings`
 /// has nowhere to put one.
 ///
+/// # A save that half-happened says so (issue #1350's review)
+///
+/// The deck edits go to the shared `remotes.toml` and the rest to
+/// `desktop.toml`, and two files cannot be replaced atomically together. A save
+/// that fails after the deck edits landed rejects with
+/// [`crate::dto::DesktopSettingsSaveError::Partial`]: a message naming which
+/// half was saved, plus the settings re-read from disk, whose deck list is also
+/// put into force here. Every other failure rejects with a plain string, as
+/// before.
+///
 /// # The accepted strings are length-bounded
 ///
 /// A compromised webview could otherwise send an arbitrarily long appearance
@@ -2396,7 +2406,7 @@ async fn desktop_set_settings(
     state: State<'_, DesktopState>,
     settings: DesktopSettings,
     base: Option<DesktopSettings>,
-) -> Result<DesktopSettings, String> {
+) -> Result<DesktopSettings, crate::dto::DesktopSettingsSaveError> {
     ensure_main_webview(&webview)?;
     // On a blocking worker: the save is synchronous filesystem work — a read,
     // an `fsync`, a rename — and since #828 it can also wait up to
@@ -2410,14 +2420,37 @@ async fn desktop_set_settings(
         eprintln!("desktop settings: the save task did not complete: {error}");
         "Saving the desktop settings did not complete. Try again.".to_string()
     })?;
-    let written = saved.map_err(|error| {
-        // The detail names the path and belongs in the app's own log; the
-        // webview gets the sanitized half, the way connection errors already do.
-        eprintln!("{}", error.detail());
-        safe_message(error.public())
-    })?;
-    apply_selection(&app, &state, &written).await;
-    Ok(written)
+    let failure = match saved {
+        Ok(written) => {
+            apply_selection(&app, &state, &written).await;
+            return Ok(written);
+        }
+        Err(failure) => failure,
+    };
+    // The detail names the path and belongs in the app's own log; the webview
+    // gets the sanitized half, the way connection errors already do.
+    eprintln!("{}", failure.detail());
+    let message = safe_message(failure.public());
+    if !failure.decks_saved() {
+        return Err(message.into());
+    }
+    // Issue #1350's review: the deck edits reached `remotes.toml` and
+    // `desktop.toml` did not, so neither the edit nor the old document is what
+    // is on disk. Re-read both, put that deck list into force — so a removed
+    // deck's tunnel closes and an added one is watched — and hand it to the
+    // window with the error, so it shows what was actually saved.
+    let Ok(disk) =
+        tauri::async_runtime::spawn_blocking(|| crate::settings::load_snapshot().settings).await
+    else {
+        return Err(message.into());
+    };
+    apply_selection(&app, &state, &disk).await;
+    Err(crate::dto::DesktopSettingsSaveError::Partial(
+        crate::dto::DesktopPartialSettingsSave {
+            message,
+            written: disk,
+        },
+    ))
 }
 
 /// The three credential commands (PRD #802 M4), and the one that is missing.

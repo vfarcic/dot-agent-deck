@@ -2810,6 +2810,35 @@ describe("desktop settings (PRD 803)", () => {
     await bridge.dispose();
   });
 
+  /**
+   * Issue #1350's review: a save whose deck edits landed and whose
+   * `desktop.toml` write did not rejects with `{ message, written }`. The
+   * bridge turns that into a `PartialSettingsSaveError` carrying the
+   * normalised on-disk settings; a plain string rejection passes untouched.
+   */
+  it("turns a partial settings save into a typed error carrying what is on disk", async () => {
+    const { TauriDeckBridge, DEFAULT_DESKTOP_SETTINGS } = await import("./bridge");
+    const { PartialSettingsSaveError } = await import("./settingsError");
+    const onDisk = { ...DEFAULT_DESKTOP_SETTINGS, appearance: { mode: "light" } };
+    let partial = true;
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_set_settings") {
+        if (partial) throw { message: "The deck list changes were saved, but the other settings were not", written: onDisk };
+        throw "disk full";
+      }
+      return { ok: true };
+    });
+    const bridge = new TauriDeckBridge();
+    const rejection = await bridge.saveSettings(DEFAULT_DESKTOP_SETTINGS).catch((cause: unknown) => cause);
+    expect(rejection).toBeInstanceOf(PartialSettingsSaveError);
+    expect((rejection as InstanceType<typeof PartialSettingsSaveError>).message).toContain("deck list changes were saved");
+    expect((rejection as InstanceType<typeof PartialSettingsSaveError>).written.appearance.mode).toBe("light");
+
+    partial = false;
+    await expect(bridge.saveSettings(DEFAULT_DESKTOP_SETTINGS)).rejects.toBe("disk full");
+    await bridge.dispose();
+  });
+
   it("keeps fixture settings in unscoped localStorage and never invokes Tauri", async () => {
     const { createDeckBridge, DEFAULT_DESKTOP_SETTINGS, FIXTURE_SETTINGS_KEY, modeScopedKey } = await import("./bridge");
     const bridge = createDeckBridge("fixture");

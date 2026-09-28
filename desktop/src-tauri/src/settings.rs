@@ -2313,6 +2313,72 @@ impl std::fmt::Display for SettingsWriteError {
 
 impl std::error::Error for SettingsWriteError {}
 
+/// Why a [`save`] failed, and whether the shared deck list was written before
+/// it did (issue #1350's review).
+///
+/// A desktop save writes two files — the deck edits to `remotes.toml`, then
+/// everything else to `desktop.toml` — and two files cannot be replaced
+/// atomically together. So a failure after the first write is **partial**, and
+/// this says so instead of reporting the whole save as not having happened:
+/// [`Self::decks_saved`] is how the command knows to put the deck list that is
+/// now on disk into force and show it, and [`Self::public`] tells the user
+/// which half landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveFailure {
+    error: SettingsWriteError,
+    decks_saved: bool,
+}
+
+impl SaveFailure {
+    /// The deck edits of this save reached `remotes.toml`; `desktop.toml`
+    /// (appearance, zoom, voice, the selection) did not.
+    pub fn decks_saved(&self) -> bool {
+        self.decks_saved
+    }
+
+    /// The operator-facing message, including the path. Log this.
+    pub fn detail(&self) -> String {
+        if self.decks_saved {
+            format!(
+                "the deck list was saved, but the desktop settings were not: {}",
+                self.error.detail()
+            )
+        } else {
+            self.error.detail().to_string()
+        }
+    }
+
+    /// The webview-facing message. Contains no path.
+    pub fn public(&self) -> String {
+        if self.decks_saved {
+            format!(
+                "The deck list changes were saved, but the other settings were not, so they \
+                 are shown as they are on disk: {}",
+                self.error.public()
+            )
+        } else {
+            self.error.public().to_string()
+        }
+    }
+}
+
+impl From<SettingsWriteError> for SaveFailure {
+    fn from(error: SettingsWriteError) -> Self {
+        Self {
+            error,
+            decks_saved: false,
+        }
+    }
+}
+
+impl std::fmt::Display for SaveFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail())
+    }
+}
+
+impl std::error::Error for SaveFailure {}
+
 fn write_error(what: &str, path: &Path, cause: impl std::fmt::Display) -> SettingsWriteError {
     SettingsWriteError {
         detail: format!("{what} {}: {cause}", path.display()),
@@ -3007,7 +3073,7 @@ fn line_and_column(contents: &str, offset: usize) -> Option<(usize, usize)> {
 pub fn save(
     base: Option<&DesktopSettings>,
     settings: &DesktopSettings,
-) -> Result<DesktopSettings, SettingsWriteError> {
+) -> Result<DesktopSettings, SaveFailure> {
     save_at(
         &settings_path(),
         &crate::decks::remotes_path(),
@@ -3037,19 +3103,45 @@ pub fn save(
 /// reply carries the rows as `remotes.toml` now holds them — another writer's
 /// deck included.
 ///
-/// An unreadable settings document is refused before the deck list is touched,
-/// so a save that is going to fail does not half-happen.
+/// # Two files, so a failure can be partial — and is reported as one
+///
+/// The two files cannot be replaced atomically together, and this does not
+/// pretend otherwise (issue #1350's review). What it does:
+///
+/// - **The failures it can foresee come first.** A settings document this
+///   build cannot read, one at an unusable path, and a parent directory
+///   [`vet_parent_dir`] refuses are all checked before the deck list is
+///   touched, so a save that was always going to fail does not half-happen.
+/// - **`remotes.toml` is written first**, then `desktop.toml`. The deck rows
+///   are the half that is expensive to redo — a host, a login, a key path,
+///   typed by hand — while `desktop.toml` holds a theme, a zoom level and a
+///   selection, one click each. Either order can leave the selection naming a
+///   deck the other half did not write (a removed deck still selected, or a
+///   new deck selected but never added), and that case is the same both ways:
+///   [`EndpointSettings::resolve`] falls back to the local deck and says so.
+///   So the order is decided by which half is worse to lose, and it matches
+///   the migration's (remotes first, [`migrate_legacy_decks_at`]).
+/// - **A failure after the deck edits landed is a [`SaveFailure`] with
+///   [`SaveFailure::decks_saved`] set**, whose message says which half was
+///   saved; the command then re-reads both files and shows and applies what
+///   is on disk. Retrying is safe: re-sending the same deck edits against the
+///   registry changes nothing a second time.
 pub(crate) fn save_at(
     path: &Path,
     remotes: &Path,
     base: Option<&DesktopSettings>,
     settings: &DesktopSettings,
-) -> Result<DesktopSettings, SettingsWriteError> {
+) -> Result<DesktopSettings, SaveFailure> {
     if let Some(contents) = read_document(path, ReadPurpose::Save)?.as_deref()
         && let Err(error) = toml_edit::de::from_str::<DesktopSettings>(contents)
     {
-        return Err(refuse_to_overwrite(path, contents, &error));
+        return Err(refuse_to_overwrite(path, contents, &error).into());
     }
+    vet_parent_dir(match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    })?;
+    let mut decks_saved = false;
     if let Some(next) = &settings.endpoints {
         let base_rows = match base {
             Some(base) => base
@@ -3059,14 +3151,16 @@ pub(crate) fn save_at(
                 .unwrap_or_default(),
             None => crate::decks::load_rows(remotes).map_err(deck_list_error)?,
         };
-        crate::decks::apply(remotes, &crate::decks::edits(&base_rows, &next.remote))
-            .map_err(deck_list_error)?;
+        let edits = crate::decks::edits(&base_rows, &next.remote);
+        crate::decks::apply(remotes, &edits).map_err(deck_list_error)?;
+        decks_saved = !edits.is_empty();
     }
     let mut written = save_to(
         path,
         base.map(without_deck_rows).as_ref(),
         &without_deck_rows(settings),
-    )?;
+    )
+    .map_err(|error| SaveFailure { error, decks_saved })?;
     attach_deck_rows(&mut written, remotes);
     Ok(written)
 }
@@ -9937,6 +10031,78 @@ level = 1.0
             "{document}"
         );
         assert_eq!(load_snapshot_at(&path, &remotes).settings, written);
+    }
+
+    /// Issue #1350's review: the two files cannot be written atomically, so a
+    /// save whose deck edit landed and whose `desktop.toml` write then failed
+    /// says so — and what is on disk afterwards is the new deck with the old
+    /// selection, which is what the command re-reads and shows.
+    ///
+    /// The failure is injected after every foreseeable check passes: the
+    /// `desktop.toml` save lock's name is taken by a directory.
+    #[test]
+    fn a_save_that_fails_after_the_deck_edit_reports_which_half_was_saved() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let remotes = dir.path().join("remotes.toml");
+        std::fs::write(&remotes, CLI_DECK).unwrap();
+        std::fs::write(&path, "version = 1\n\n[appearance]\nmode = \"light\"\n").unwrap();
+        let snapshot = load_snapshot_at(&path, &remotes);
+        std::fs::create_dir(save_lock_path(dir.path(), &path)).unwrap();
+        let document_before = std::fs::read_to_string(&path).unwrap();
+
+        let mut edited = snapshot.settings.clone();
+        edited.appearance.mode = AppearanceMode::Dark;
+        let endpoints = edited.endpoints.as_mut().unwrap();
+        endpoints
+            .remote
+            .push(deck_row("0123456789abcdef", "new.example"));
+        endpoints.selection = Selection::One(EndpointId::parse("0123456789abcdef").unwrap());
+        let failure = save_at(&path, &remotes, Some(&snapshot.settings), &edited).unwrap_err();
+
+        assert!(failure.decks_saved());
+        assert!(
+            failure
+                .public()
+                .starts_with("The deck list changes were saved, but the other settings were not"),
+            "{}",
+            failure.public()
+        );
+        assert!(!failure.public().contains(&dir.path().display().to_string()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), document_before);
+
+        let disk = load_snapshot_at(&path, &remotes).settings;
+        assert_eq!(row_ids(&disk), ["n-prod", "0123456789abcdef"]);
+        assert_eq!(disk.endpoints.unwrap().selection, Selection::Local);
+        assert_eq!(disk.appearance.mode, AppearanceMode::Light);
+
+        // Retrying the same save once the fault is gone lands the rest and
+        // adds the deck no second time.
+        std::fs::remove_dir(save_lock_path(dir.path(), &path)).unwrap();
+        let written = save_at(&path, &remotes, Some(&snapshot.settings), &edited).unwrap();
+        assert_eq!(row_ids(&written), ["n-prod", "0123456789abcdef"]);
+        assert_eq!(written.appearance.mode, AppearanceMode::Dark);
+    }
+
+    /// The same fault in a save that changed no deck is an ordinary failure:
+    /// nothing was written, and the message does not claim otherwise.
+    #[test]
+    fn a_failed_save_that_changed_no_deck_is_not_partial() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let remotes = dir.path().join("remotes.toml");
+        std::fs::write(&remotes, CLI_DECK).unwrap();
+        let snapshot = load_snapshot_at(&path, &remotes);
+        std::fs::create_dir(save_lock_path(dir.path(), &path)).unwrap();
+        let mut edited = snapshot.settings.clone();
+        edited.appearance.mode = AppearanceMode::Dark;
+        let failure = save_at(&path, &remotes, Some(&snapshot.settings), &edited).unwrap_err();
+        assert!(!failure.decks_saved());
+        assert!(
+            !failure.public().contains("deck list"),
+            "{}",
+            failure.public()
+        );
     }
 
     /// A save that changes no deck leaves the shared list byte for byte alone.
