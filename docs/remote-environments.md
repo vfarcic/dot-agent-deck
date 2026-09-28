@@ -23,7 +23,7 @@ dot-agent-deck remote add my-vm user@host
 dot-agent-deck connect my-vm
 ```
 
-`remote add` connects over ssh, installs `dot-agent-deck` to `~/.local/bin/dot-agent-deck` on the host, sets up the agent hooks, and records the remote in `~/.config/dot-agent-deck/remotes.toml`. `connect` then opens an ssh session and runs the deck there. Your local command stays in the foreground for as long as the session lasts and exits with the remote's exit code, so it behaves predictably in a script.
+`remote add` connects over ssh, installs `dot-agent-deck` to `~/.local/bin/dot-agent-deck` on the host, sets up the agent hooks, and adds the remote to your list of remotes. `connect` then opens an ssh session and runs the deck there. Your local command stays in the foreground for as long as the session lasts and exits with the remote's exit code, so it behaves predictably in a script.
 
 Other registry commands:
 
@@ -56,46 +56,29 @@ dot-agent-deck remote add my-vm deck@198.51.100.10 \
 
 ### Remote names
 
-A name is what you type after `connect`, so `remote add` requires a short, shell-safe one: ASCII letters, digits, `.`, `-` and `_`, starting with a letter or digit, at most 64 characters. A name registered before this rule existed keeps working everywhere — the rule applies only when a remote is added.
+A name is what you type after `connect`, so `remote add` requires a short one: letters (`a`–`z`, `A`–`Z`), digits, `.`, `-` and `_`, starting with a letter or digit, at most 64 characters. Names you registered before this rule keep working.
 
-### Remote addresses
+## Shared with the desktop app
 
-The host, login, port, jump host and socket path of a deck are checked the same way by `remote add` and the desktop app before anything is written to the deck list: a value that starts with `-`, or contains whitespace, a control character, a non-ASCII character or a shell metacharacter such as `;`, `$` or `` ` ``, is refused, because ssh could read it as an option or hand it to a shell through a `ProxyCommand` in your `~/.ssh/config`. `user@host`, `user@realm@host`, IPv4 addresses and IPv6 addresses (`::1` or `[::1]`) are accepted, and so is any key path that does not start with `-`. A deck registered before this check keeps loading and connecting; the check applies to values being written.
+The CLI and the desktop app share one list of remote decks. A remote you add with `remote add` shows up in the desktop app, and a deck you add in the desktop app shows up in `remote list` and opens with `connect <name>`. Either one can edit or remove any deck, and neither overwrites the other's changes: a remote you add in a terminal while the desktop app is open is kept when you next save in the app.
 
-## One deck list for the CLI and the desktop app
+The local deck is not part of this list; the desktop app always offers it. Removing a deck in the desktop app does the same as `remote remove`: it forgets the deck and leaves the host untouched.
 
-`~/.config/dot-agent-deck/remotes.toml` is the deck list for both clients. A remote added with `remote add` appears in the desktop app's deck settings, and a deck added in the desktop app appears in `remote list` and can be opened with `connect <name>`. Either client can edit or remove any deck; "added by the CLI" is information, not a lock. `DOT_AGENT_DECK_REMOTES`, when set, moves the file for whichever client sees it. The local deck is not in the file: the desktop app always offers it, and which deck the app has selected stays in the app's own settings.
+### Decks added in the desktop app
 
-Both clients edit the file one change at a time against what it holds at that moment, and take a lock while they do: an empty `.remotes.toml.lock` beside the file, which holds no data and can be deleted when neither client is saving. So saving in the desktop app while `remote add` runs in a terminal keeps both changes. If one client is stuck holding the lock for more than five seconds, the other reports that the deck list could not be saved instead of waiting forever or saving over it. The desktop app keeps its other settings (theme, zoom, the selected deck) in its own file, so one save writes two files; if the second write fails after the deck list was saved, the app says which part was saved and shows both as they are on disk. If a deck the app is changing or removing is no longer the deck it loaded — say `remote remove prod` and `remote add prod` for another host ran in a terminal meanwhile — the app saves nothing, says the deck list changed outside the app, and shows it as it is now, so the change can be made again against the right deck. A file at that path that is not a regular file (a FIFO, a device) or is larger than 1 MiB is reported as unreadable rather than read. A symlink to a regular file (a dotfile manager's) is followed for reads and for edits alike: both clients write the file the link points at, so the link stays a link. A symlink to a file that does not exist reads as an empty list, and adding a deck through it is refused rather than creating the file it points at.
+The desktop app does not ask for a name. It names a deck after its host, such as `build.example.com`, and adds a number if that name is taken. Use that name with `connect`.
 
-Removing a deck in the desktop app forgets the entry and nothing else, exactly like `remote remove`: the binary and hooks the CLI installed on the host are left in place.
+`remote list` shows `unmanaged` as the version of such a deck, because `remote add` never installed `dot-agent-deck` on that host. Run `dot-agent-deck remote upgrade <name>` if you want the CLI to install and manage it.
 
-### Decks the desktop app adds
+**`connect` does not use a jump host set in the desktop app yet.** If a deck is reachable only through a jump host, add a `ProxyJump` line for that host to your `~/.ssh/config`; `connect` runs your system `ssh`, which reads it.
 
-The desktop app does not ask for a name. It names a deck after its host — `build.example.com` — and when that is taken, after the login and host (`dev-build.example.com`) and then with a number (`build.example.com-2`). The name follows the same rule as `remote add`, so `connect` accepts it.
+### Upgrading from an earlier desktop build
 
-Such a deck has no `dot-agent-deck` installed by `remote add`, so its entry records `version = "unmanaged"` instead of a version number, and that is what `remote list` shows in its VERSION column. Nothing reads the value as a version: `connect` and `remote doctor` ask the host's own binary. Running `dot-agent-deck remote upgrade <name>` installs the binary and replaces the placeholder with the real version.
+Decks you added in an earlier desktop build move to the shared list the first time the new build starts. A deck you had also added with `remote add` is not listed twice, and the deck you had selected stays selected.
 
-A desktop deck carries fields a CLI-added one may not:
+### Mixing versions
 
-| Field | Meaning |
-|---|---|
-| `id` | The desktop app's stable identifier for the deck. An entry without one gets one derived from its name. |
-| `jump_host` | A `Host` name from your `~/.ssh/config` to reach the deck through (`ssh -J`). Only the desktop app uses it — see below. |
-| `socket` | The deck's attach socket path on the host, which the desktop's **Test connection** discovers. `connect` does not need it. |
-| `user` | The login, stored separately only when it contains `@` itself (`dev@REALM`). Otherwise the login is written into `host` as `dev@build.example.com`, which is the form every version of `connect` understands. |
-
-**`connect` ignores `jump_host`.** A deck the desktop app reaches through a jump host is listed by `remote list`, but `dot-agent-deck connect <name>` opens a direct SSH connection to the deck's host and does not go through the jump host, so a host reachable only that way fails to connect from the terminal. Until `connect` supports it, add a `ProxyJump` line for that host to `~/.ssh/config`: `connect` runs your system `ssh`, which reads that file.
-
-The file stays hand-editable. Both clients change only the entry being edited and re-read the file at the moment they save, so a remote you add in a terminal while the desktop app is open is not overwritten by the app's next save. Keys neither client knows about, and comments, are kept.
-
-### Moving the desktop app's existing decks
-
-Desktop builds before the shared list kept their decks in the app's own `desktop.toml`, under `[[endpoints.remote]]`. The first time a build with the shared list starts, it moves those decks into `remotes.toml` and removes them from `desktop.toml`; appearance, zoom and the selected deck stay where they are. A deck that is already in `remotes.toml` — the same host, login and port — is not added twice: the existing entry keeps its name and version and gains the desktop's jump host, socket and key if it had none. If the selected deck was one of those, the selection moves with it. The move happens once; starting the app again changes nothing.
-
-### Older versions of the CLI
-
-A `dot-agent-deck` from before the shared list reads a file the desktop app wrote without trouble, because every entry carries the `type`, `version` and `added_at` fields it requires. It does not keep fields it does not know, though: `remote add`, `remote remove` and `remote upgrade` from an older version, and its `connect` when a session ends, rewrite the whole file and drop `id`, `jump_host`, `socket` and `user` from **every** entry. The decks stay listed in the desktop app, but a deck the app had selected falls back to the local deck until you select it again, a jump host has to be entered again, and **Test connection** has to rediscover the socket. Upgrade `dot-agent-deck` on every machine that shares the file to avoid it. The same applies to an older desktop build: it reads decks only from `desktop.toml`, so once a newer build has moved them it shows no remote decks.
+Keep the CLI and the desktop app at the same version on every machine where you use both. An older CLI that changes the list (`remote add`, `remote remove`, `remote upgrade`, or `connect` when a session ends) loses the desktop app's extra details for every deck: a remote deck the app had selected may fall back to the local deck, jump hosts have to be entered again, and **Test connection** has to run again. An older desktop build shows no remote decks at all once a newer one has moved them to the shared list.
 
 ## Lifecycle model
 
@@ -159,7 +142,7 @@ Reconnection is **bounded**, so a genuinely-gone remote surfaces an error instea
 
 The **first** connect gets a retry budget too, of the same size and shape. A probe that cannot reach the host prints `'<name>' not reachable yet — retrying…` to stderr and tries again after a backoff, up to five attempts — so a link that needs a moment to wake (a cold VM, a VPN still coming up, a laptop whose Wi-Fi has just associated) connects on its own instead of failing and leaving you to run the command a second time. The two budgets are **separate**: attempts spent getting connected are not taken out of the reconnects above, so a session that only came up on the last attempt still gets its full four if it later drops. It does not make a first-attempt failure impossible either: when the host really is unreachable, the retries are spent and you get the [Host unreachable](#host-unreachable) error below.
 
-Only a **dropped connection** triggers a reconnect. A clean quit or detach (exit 0), a `Ctrl-C` (exit 130), or a remote-side crash all end the session immediately — `connect` never reconnects into an intentional exit or a crashing TUI, and `last_connected` is recorded only on a clean exit, not on intermediate reconnects.
+Only a **dropped connection** triggers a reconnect. A clean quit or detach (exit 0), a `Ctrl-C` (exit 130), or a remote-side crash all end the session immediately — `connect` never reconnects into an intentional exit or a crashing TUI.
 
 The connection-check timings and the retry budget are sensible fixed defaults today; exposing them as configuration is a future improvement.
 
@@ -296,4 +279,4 @@ It is two steps and a second terminal, which is worse than pasting. It works on 
 
 - [Remote Environment Requirements](remote-requirements.md) — what a host must provide before you can register it.
 - [Remote Recipes](remote-recipes.md) — how to get a Linux or macOS host bootstrapped for `remote add`.
-- [Installation › Recycling the local daemon](installation.md#recycling-the-local-daemon) — `dot-agent-deck daemon stop` is the local counterpart for recycling the daemon on your laptop after a binary upgrade. The remote lifecycle described above (per-attach daemon, ssh session governs cleanup) is independent.
+- [Installation › Recycling the local daemon](installation.md#recycling-the-local-daemon) — `dot-agent-deck daemon stop` is the local counterpart for recycling the daemon on your laptop after a binary upgrade. It does not affect remote hosts, whose daemons are recycled as described in [What `y` actually does to the remote daemon](#what-y-actually-does-to-the-remote-daemon).
