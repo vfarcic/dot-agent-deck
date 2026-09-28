@@ -1009,14 +1009,40 @@ pub struct RemoteEntry {
     /// untouched so the registry only records sessions that actually ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_connected: Option<String>,
+    /// Issue #1350: the fields the desktop app's deck rows carry, optional so
+    /// every row `remote add` wrote before them still loads. See
+    /// [`crate::deck_list`], which is how both clients edit this file.
+    ///
+    /// The desktop's stable id for the row. A row without one has an id
+    /// derived from its `name` ([`crate::deck_list::deck_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The login name, when it cannot be folded into `host` as `user@host`
+    /// (a login containing `@` itself). Wins over a user in `host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// A `Host` name from `~/.ssh/config` to reach the deck through (`ssh -J`).
+    /// Used by the desktop; `connect` does not route through it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump_host: Option<String>,
+    /// The daemon's attach socket path on the remote, as the desktop's `Test
+    /// connection` discovered it. `connect` does not need it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
 }
 
 impl RemoteEntry {
     /// Reconstruct an [`SshTarget`] from this entry's stored host/port/key. The
     /// `host` field carries the original `[user@]host` string the user typed
-    /// at `remote add` time; we re-parse it the same way `add` does.
+    /// at `remote add` time; we re-parse it the same way `add` does. An
+    /// explicit `user` field (issue #1350) wins over the one in `host`.
     pub fn ssh_target(&self) -> SshTarget {
-        SshTarget::parse(&self.host, self.port, self.key.as_ref().map(PathBuf::from))
+        let mut target =
+            SshTarget::parse(&self.host, self.port, self.key.as_ref().map(PathBuf::from));
+        if let Some(user) = &self.user {
+            target.user = Some(user.clone());
+        }
+        target
     }
 }
 
@@ -1042,6 +1068,8 @@ pub enum RemoteConfigError {
     },
     #[error("Failed to serialize remotes file: {0}")]
     Serialize(#[from] toml::ser::Error),
+    #[error("Cannot edit remotes file at {path}: {reason}")]
+    Unwritable { path: String, reason: String },
 }
 
 impl RemotesFile {
@@ -1061,98 +1089,24 @@ impl RemotesFile {
     }
 
     /// Atomically replace the file at `path` with the serialized form of
-    /// `self`. Creates the parent directory if missing. Writes via a sibling
-    /// temp file with mode 0o600, then `rename(2)`s it into place — so a
-    /// partial write or a crash mid-save can never leave a half-written
-    /// `remotes.toml` for the next run to choke on, and the final file is
-    /// owner-only (0o600) regardless of the user's umask.
+    /// `self` — see [`crate::deck_list::write_atomic`].
+    ///
+    /// Rewrites the **whole** file, so it drops any key [`RemoteEntry`] does
+    /// not know. Every production writer edits one row through
+    /// [`crate::deck_list`] instead (issue #1350); this remains for callers
+    /// that build a registry from scratch, such as test fixtures.
     pub fn save(&self, path: &Path) -> Result<(), RemoteConfigError> {
-        use std::io::Write;
-
-        // PRD #163 auditor: create the parent through the fsperm seam, not plain
-        // `create_dir_all`, so the *directory* is owner-only too — the same call
-        // `schedules.toml` already makes. The per-file DACL/mode protects the
-        // contents; this protects the metadata (which remotes exist, by filename)
-        // when `DOT_AGENT_DECK_REMOTES_DIR` points somewhere shared. Create-only,
-        // so an existing directory is never surprise-tightened (PRD #127 S2).
-        let parent = path.parent().unwrap_or(Path::new("."));
-        crate::platform::fsperm::create_owner_only_dir(parent).map_err(|source| {
-            RemoteConfigError::Io {
-                path: parent.display().to_string(),
-                source,
-            }
-        })?;
-
         let contents = toml::to_string_pretty(self)?;
-
-        // Sibling temp file: same directory as the final path so `rename` is
-        // atomic on POSIX filesystems. Pid suffix avoids collisions when
-        // multiple deck processes save concurrently to different registries.
-        let file_name = path
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "remotes.toml".to_string());
-        let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
-
-        // PRD #42 M1: owner-only (0o600) creation mode comes from the platform
-        // seam — `.mode(0o600)` on Unix; on Windows (#163) the DACL cannot be
-        // supplied at create time, so the seam instead puts `WRITE_DAC` on the
-        // handle, which is what lets the `set_file_owner_only` call below apply it.
-        let mut open_opts = std::fs::OpenOptions::new();
-        open_opts.create(true).write(true).truncate(true);
-        crate::platform::fsperm::set_create_mode_owner_only(&mut open_opts);
-        let open_result = open_opts.open(&tmp_path);
-        let mut tmp_file = open_result.map_err(|source| RemoteConfigError::Io {
-            path: tmp_path.display().to_string(),
-            source,
-        })?;
-
-        // Owner-only permissions BEFORE the first content byte (PRD #163 M4).
-        //
-        // Two reasons this runs here rather than after the write. (1) Defense in
-        // depth on Unix, as before: a stale temp file from a crashed previous save
-        // would not have had `OpenOptions::mode()` re-applied, so the bits have to
-        // be set explicitly. (2) On Windows this call is not a re-assert but the
-        // *only* place the protected current-user-only DACL is applied —
-        // `std::fs::OpenOptions` has no `SECURITY_ATTRIBUTES` hook, so
-        // `set_create_mode_owner_only` can only pre-authorize this call by putting
-        // `WRITE_DAC` on the handle. Doing that after `write_all` would leave
-        // the credentials in this file readable under the parent directory's
-        // inherited ACL for the length of the write; doing it now means only an
-        // empty file is ever exposed. The end state on Unix is identical.
-        let perm_result = crate::platform::fsperm::set_file_owner_only(&tmp_file);
-        if let Err(source) = perm_result {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(RemoteConfigError::Io {
-                path: tmp_path.display().to_string(),
-                source,
-            });
-        }
-
-        let write_result = tmp_file.write_all(contents.as_bytes());
-        if let Err(source) = write_result {
-            // Best-effort cleanup; ignore secondary errors.
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(RemoteConfigError::Io {
-                path: tmp_path.display().to_string(),
-                source,
-            });
-        }
-        drop(tmp_file);
-
-        std::fs::rename(&tmp_path, path).map_err(|source| {
-            let _ = std::fs::remove_file(&tmp_path);
-            RemoteConfigError::Io {
-                path: path.display().to_string(),
-                source,
-            }
-        })
+        crate::deck_list::write_atomic(path, &contents)
     }
 }
 
 /// Default location for the registry: `$DOT_AGENT_DECK_REMOTES` if set,
 /// else `~/.config/dot-agent-deck/remotes.toml`. The env var override is
 /// new; tests use it (or pass an explicit path to `add`).
+///
+/// The one resolver for the deck list: the desktop app calls this too
+/// (issue #1350), so the two clients cannot disagree about which file it is.
 pub fn default_remotes_path() -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_REMOTES") {
         return PathBuf::from(p);
@@ -1192,6 +1146,8 @@ pub enum RemoteAddError {
         "A remote named '{name}' already exists. Use `dot-agent-deck remote remove {name}` first or pick a different name."
     )]
     DuplicateName { name: String },
+    #[error("Invalid remote name: {0}.")]
+    InvalidName(crate::deck_list::DeckNameError),
     #[error("Remote type 'kubernetes' is not yet implemented; planned in PRD #81.")]
     KubernetesNotYetImplemented,
     #[error("Unsupported remote type '{kind}'. Supported: ssh.")]
@@ -1396,12 +1352,14 @@ pub fn add(
     //    and the post-install version comparison matches the binary's
     //    unprefixed `--version` output.
     let version = validate_version_string(&opts.version)?;
+    // Issue #1350: the name is a slug, checked before any ssh call too.
+    crate::deck_list::validate_deck_name(&opts.name).map_err(RemoteAddError::InvalidName)?;
 
     // 3. Uniqueness check — done *before* any ssh call so a duplicate name
     //    short-circuits without bothering the remote (and lets the
     //    `duplicate_name_rejected` test assert the fake recorded zero
     //    commands).
-    let mut registry = RemotesFile::load(remotes_path)?;
+    let registry = RemotesFile::load(remotes_path)?;
     if registry.remotes.iter().any(|r| r.name == opts.name) {
         return Err(RemoteAddError::DuplicateName {
             name: opts.name.clone(),
@@ -1466,9 +1424,14 @@ pub fn add(
         added_at: chrono::Utc::now().to_rfc3339(),
         upgraded_at: None,
         last_connected: None,
+        id: None,
+        user: None,
+        jump_host: None,
+        socket: None,
     };
-    registry.remotes.push(entry.clone());
-    registry.save(remotes_path)?;
+    // Against a fresh read (issue #1350): the install above took seconds, and
+    // the desktop may have saved a deck meanwhile.
+    let entry = crate::deck_list::add(remotes_path, entry)?;
 
     // 7. Final success line.
     println!(
@@ -1606,20 +1569,11 @@ pub enum RemoteRemoveError {
 /// can confirm what was deleted. **Does not** touch the remote host — no
 /// hooks uninstall, no binary cleanup, no ssh call.
 pub fn remove(name: &str, remotes_path: &Path) -> Result<RemoteEntry, RemoteRemoveError> {
-    let mut registry = RemotesFile::load(remotes_path)?;
-    let idx = registry
-        .remotes
-        .iter()
-        .position(|r| r.name == name)
-        .ok_or_else(|| RemoteRemoveError::UnknownName {
+    crate::deck_list::remove(remotes_path, crate::deck_list::DeckRef::Name(name))?.ok_or_else(
+        || RemoteRemoveError::UnknownName {
             name: name.to_string(),
-        })?;
-    let removed = registry.remotes.remove(idx);
-    // If this was the last entry, `registry.remotes` is now an empty Vec —
-    // serde will emit `remotes = []` so the file remains valid TOML for
-    // future loads.
-    registry.save(remotes_path)?;
-    Ok(removed)
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1674,23 +1628,15 @@ pub fn upgrade(
     let version = validate_version_string(&opts.version)?;
 
     // 2. Lookup. Unknown name short-circuits before any ssh work.
-    let mut registry = RemotesFile::load(remotes_path)?;
-    let idx = registry
+    let registry = RemotesFile::load(remotes_path)?;
+    let target = registry
         .remotes
         .iter()
-        .position(|r| r.name == opts.name)
+        .find(|r| r.name == opts.name)
         .ok_or_else(|| RemoteUpgradeError::UnknownName {
             name: opts.name.clone(),
-        })?;
-
-    let target = {
-        let entry = &registry.remotes[idx];
-        SshTarget::parse(
-            &entry.host,
-            entry.port,
-            entry.key.as_ref().map(PathBuf::from),
-        )
-    };
+        })?
+        .ssh_target();
 
     // 3. Reachability + arch detect.
     let uname = executor.run(&target, "uname -s -m")?;
@@ -1720,7 +1666,7 @@ pub fn upgrade(
     //    so the upgraded binary must be paired with refreshed hook scripts —
     //    otherwise `remote upgrade` reports success while leaving the remote
     //    on stale hooks. Mirrors the same step in `add()` so both paths stay
-    //    in lockstep. Runs BEFORE `registry.save` so a hook-install failure
+    //    in lockstep. Runs BEFORE the registry update so a hook-install failure
     //    fails loud rather than persisting half-finished state.
     let hooks = executor.run(&target, "~/.local/bin/dot-agent-deck hooks install")?;
     if hooks.status != 0 {
@@ -1741,11 +1687,17 @@ pub fn upgrade(
     //    timestamp; `upgraded_at` records the most recent upgrade so users
     //    can see both moments without losing the registration history.
     let now = chrono::Utc::now().to_rfc3339();
-    let entry = &mut registry.remotes[idx];
-    entry.version = version.clone();
-    entry.upgraded_at = Some(now);
-    let updated = entry.clone();
-    registry.save(remotes_path)?;
+    let updated = crate::deck_list::update(
+        remotes_path,
+        crate::deck_list::DeckRef::Name(&opts.name),
+        |entry| {
+            entry.version = version.clone();
+            entry.upgraded_at = Some(now);
+        },
+    )?
+    .ok_or_else(|| RemoteUpgradeError::UnknownName {
+        name: opts.name.clone(),
+    })?;
 
     println!(
         "Upgraded remote '{}' to version {}.",
