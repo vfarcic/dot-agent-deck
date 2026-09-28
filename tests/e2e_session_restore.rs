@@ -797,7 +797,12 @@ fn restore_021_reattach_seats_the_tab_where_the_daemon_registered_its_orchestrat
          reattach below cannot tell the daemon's seat from the config's; got {records:?}"
     );
 
-    // Detach-quit: the daemon and both role agents survive.
+    // Detach-quit: the daemon and both role agents survive. The restore leaves
+    // the deck in PaneInput, whose footer shows the Ctrl+D hint; wait for it to
+    // be DRAWN before sending Ctrl+D, or its absence below could be observed
+    // before the deck ever entered PaneInput, and Ctrl+C would then go to the
+    // recorder pane instead of opening the quit dialog (Qodo, PR #1388).
+    first.wait_for_string("[Command Mode Ctrl+D]");
     first.send_keys(b"\x04"); // Ctrl+D -> command mode
     first.wait_for_absence("[Command Mode Ctrl+D]");
     first.send_keys(b"\x03"); // Ctrl+C -> quit-confirm modal
