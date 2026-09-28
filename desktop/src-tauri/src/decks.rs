@@ -416,6 +416,52 @@ mod tests {
         assert_eq!(load_rows(&path).unwrap(), [added]);
     }
 
+    /// Issue #1350's review: `remote add dev@REALM@host` stores the UPN login
+    /// folded into `host`, which the CLI's validation accepts (it splits at the
+    /// last `@`, as ssh does). The desktop's conversion used to split at the
+    /// first, read the host as `REALM@host`, refuse it and skip the deck.
+    #[test]
+    fn a_cli_added_deck_with_a_upn_login_is_shown_by_the_desktop() {
+        let (_dir, path) = registry("");
+        deck_list::add(
+            &path,
+            RemoteEntry {
+                name: "upn".to_string(),
+                kind: "ssh".to_string(),
+                host: "dev@REALM@build.example.com".to_string(),
+                port: 22,
+                key: None,
+                version: "0.43.0".to_string(),
+                added_at: "2026-09-01T00:00:00Z".to_string(),
+                upgraded_at: None,
+                last_connected: None,
+                id: None,
+                user: None,
+                jump_host: None,
+                socket: None,
+            },
+        )
+        .unwrap();
+
+        let rows = load_rows(&path).unwrap();
+        assert_eq!(rows.len(), 1, "the deck is not skipped");
+        assert_eq!(rows[0].host.as_str(), "build.example.com");
+        assert_eq!(rows[0].user.as_ref().unwrap().as_str(), "dev@REALM");
+
+        // And an edit of another field from the desktop keeps the login.
+        let mut after = rows[0].clone();
+        after.port = SshPort::parse(2222).unwrap();
+        apply(
+            &path,
+            &[DeckEdit::Update {
+                before: rows[0].clone(),
+                after: after.clone(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(load_rows(&path).unwrap(), [after]);
+    }
+
     /// The #828 stale-copy scenario, moved to the shared file: the app loads
     /// the list, `remote add` appends a deck from a terminal, and the app then
     /// saves an edit made against its old copy. The terminal's deck survives.

@@ -238,27 +238,43 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Split an ssh destination `[user@]host` into its login and its host.
+///
+/// On the **last** `@`, which is where OpenSSH splits a destination, so a UPN
+/// login (`dev@REALM@host`) is the login `dev@REALM` at the host `host`. The
+/// one splitter every reader of a `host` field uses — [`login_and_host`] (and
+/// through it the desktop's row conversion), [`validate_host_field`] and
+/// `SshTarget::parse` — so what one of them accepts, the others read the same
+/// way. Before issue #1350's review the readers split at the first `@` and the
+/// validator at the last, so a deck `remote add` accepted was one the desktop
+/// read as the host `REALM@host` and skipped.
+pub fn split_login(destination: &str) -> (Option<&str>, &str) {
+    match destination.rsplit_once('@') {
+        Some((user, host)) => (Some(user), host),
+        None => (None, destination),
+    }
+}
+
 /// The login name and bare host a row reaches.
 ///
 /// `host` carries `[user@]host`, the way `remote add` stored what the user
-/// typed; an explicit `user` field, when present, wins over the one in `host`.
-/// Split on the first `@`, exactly as `SshTarget::parse` does, so every reader
-/// agrees on which part is the host.
+/// typed, and is split by [`split_login`]; an explicit `user` field, when
+/// present, wins over the one in `host`.
 pub fn login_and_host(entry: &RemoteEntry) -> (Option<&str>, &str) {
-    let (from_host, host) = match entry.host.split_once('@') {
-        Some((user, host)) => (Some(user), host),
-        None => (None, entry.host.as_str()),
-    };
+    let (from_host, host) = split_login(&entry.host);
     (entry.user.as_deref().or(from_host), host)
 }
 
 /// The `host` and `user` fields to store for `host` and `user`.
 ///
-/// The user is folded into `host` as `user@host` whenever that round-trips,
-/// because that is the one spelling an older CLI's `connect` understands — it
-/// has never heard of a `user` field and would log in as the local user. Only a
-/// login containing `@` itself (a Kerberos-style `user@realm`) goes in the
-/// separate `user` field, since folding it would split at the wrong `@`.
+/// The user is folded into `host` as `user@host` whenever an older CLI reads
+/// it back the same way, because that is the one spelling an older CLI's
+/// `connect` understands — it has never heard of a `user` field and would log
+/// in as the local user. Only a login containing `@` itself (a Kerberos-style
+/// `user@realm`) goes in the separate `user` field: this build reads a folded
+/// `user@realm@host` correctly ([`split_login`]), but a build before #1350
+/// split its `SshTarget` at the first `@` and would take `realm@host` as the
+/// host.
 pub fn host_fields(host: &str, user: Option<&str>) -> (String, Option<String>) {
     match user {
         Some(user) if user.contains('@') => (host.to_string(), Some(user.to_string())),
@@ -361,8 +377,8 @@ fn validate_changed_address(
 
 /// The `host` field: `[user@]host`, the spelling `remote add` stores.
 ///
-/// Split on the **last** `@`, which is where OpenSSH splits a destination, so a
-/// UPN login (`user@realm@host`) is checked as the [`SshUser`] it is. The host
+/// Split by [`split_login`], on the **last** `@`, so a UPN login
+/// (`user@realm@host`) is checked as the [`SshUser`] it is. The host
 /// is a [`Hostname`] — or, wider than the desktop, a bare IPv6 literal such as
 /// `::1` or `fe80::1%eth0`: `remote add` has always passed one straight to
 /// `ssh` as a destination, where it works. The desktop requires the bracketed
@@ -371,13 +387,10 @@ fn validate_changed_address(
 /// actually parses as IPv6, so every byte is still a hex digit, `:` or a
 /// zone id the [`Hostname`] charset already allowed.
 pub fn validate_host_field(host: &str) -> Result<(), SshArgumentError> {
-    let bare = match host.rsplit_once('@') {
-        Some((user, bare)) => {
-            SshUser::parse(user)?;
-            bare
-        }
-        None => host,
-    };
+    let (user, bare) = split_login(host);
+    if let Some(user) = user {
+        SshUser::parse(user)?;
+    }
     match Hostname::parse(bare) {
         Err(SshArgumentError::BareIpv6Separator { .. }) if is_bare_ipv6(bare) => Ok(()),
         other => other.map(|_| ()),
@@ -1502,6 +1515,35 @@ added_at = "2026-01-01T00:00:00+00:00"
             address_key(&entry("a", "me@H.Example")),
             ("h.example".to_string(), Some("me".to_string()), 22)
         );
+    }
+
+    /// Issue #1350's review: parsing split a folded login at the first `@` and
+    /// validation at the last, so a `dev@REALM@host` deck `remote add`
+    /// accepted was read as the host `REALM@host`. Every reader now splits
+    /// where ssh does.
+    #[test]
+    fn a_folded_upn_login_is_split_at_the_last_at_sign_everywhere() {
+        assert_eq!(split_login("dev@REALM@host"), (Some("dev@REALM"), "host"));
+        assert_eq!(split_login("me@host"), (Some("me"), "host"));
+        assert_eq!(split_login("host"), (None, "host"));
+        let folded = entry("upn", "dev@REALM@build.example.com");
+        assert_eq!(
+            login_and_host(&folded),
+            (Some("dev@REALM"), "build.example.com")
+        );
+        validate_host_field(&folded.host).unwrap();
+        assert_eq!(
+            address_key(&folded),
+            (
+                "build.example.com".to_string(),
+                Some("dev@REALM".to_string()),
+                22
+            )
+        );
+        let target = crate::remote::SshTarget::parse("dev@REALM@build.example.com", 22, None);
+        assert_eq!(target.user.as_deref(), Some("dev@REALM"));
+        assert_eq!(target.host, "build.example.com");
+        assert_eq!(target.user_host(), "dev@REALM@build.example.com");
     }
 
     /// S1 of #1350's review: the temp name is predictable, so a symlink

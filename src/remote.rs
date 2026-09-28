@@ -48,10 +48,9 @@ pub struct SshTarget {
 impl SshTarget {
     /// Parse `[user@]host` and combine with `--port` / `--key` flags.
     pub fn parse(target: &str, port: u16, key: Option<PathBuf>) -> Self {
-        let (user, host) = match target.split_once('@') {
-            Some((u, h)) => (Some(u.to_string()), h.to_string()),
-            None => (None, target.to_string()),
-        };
+        // The last `@`, as ssh splits a destination (issue #1350's review).
+        let (user, host) = crate::deck_list::split_login(target);
+        let (user, host) = (user.map(str::to_string), host.to_string());
         Self {
             host,
             user,
