@@ -144,7 +144,7 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          {bin} delegate --to <role-name> --task \"Short plain task description.\"\n\
          ```\n\n\
          Why the allowlist is that narrow: everything after `--task` is processed by **your own \
-         shell** before {bin} receives it. Backticks and `$(…)` are executed and \
+         shell** before the deck receives it. Backticks and `$(…)` are executed and \
          replaced by their output — usually empty — `$VAR` becomes its value or nothing, a \
          balanced inner `\"` is removed and changes how the rest of the argument is quoted, a \
          `\\` before `$`, a backtick, `\"` or `\\` removes itself, and a `\\` at the end of a \
@@ -2607,9 +2607,8 @@ mod tests {
 
     /// Scenario: Build the orchestrator context and check that its `delegate`
     /// and `work-done` command examples name what `binary_name()` resolves
-    /// for the running process — under `cargo test` the throwaway test binary
-    /// is never on `$PATH`, so this is its own absolute `current_exe()` path,
-    /// never the crate's baked-in literal name.
+    /// for the running process — its own absolute `current_exe()` path (issue
+    /// #549), never the crate's baked-in literal name.
     #[spec("orchestration/delegate/016")]
     #[test]
     fn delegate_016_orchestrator_context_names_the_running_binary() {

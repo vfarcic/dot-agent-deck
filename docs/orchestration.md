@@ -202,6 +202,8 @@ Task text passed inline goes through the orchestrator's own shell before dot-age
 
 That default assumes the agent is *authorized* to write a file, which is not the same as having a file-writing tool: a role launched with a restricted tool allowlist — `claude --allowedTools Bash Read`, say — hits an interactive approval prompt instead, and an unattended pane parks there forever. The protocol has a fallback for that case, but it cannot grant itself the tool. That part is yours: if a role is expected to take the primary path, add the file-writing tool to its `command`'s allowlist (e.g. `--allowedTools Bash Read Write`) so it never meets the prompt.
 
+The commands the generated protocol tells an agent to run name the deck by the **absolute path** of the binary that wrote them — `/home/you/.local/bin/dot-agent-deck work-done …` rather than `dot-agent-deck work-done …`. They run later, in the agent's own shell, and a bare name would be looked up in that shell's `PATH`, which need not match the deck's: a login shell that puts `~/bin` first can hand the command to a different `dot-agent-deck`, and the signal is then lost without an error anywhere. One consequence to know about: a permission rule that matches the command's text, such as a Claude Code allow rule written as `Bash(dot-agent-deck work-done:*)`, does not match the path form, so write the rule against the path the protocol shows.
+
 ### Use a tracking file
 
 The most effective pattern is to give the orchestrator a spec or task file — a PRD, a checklist, whatever suits your workflow — and tell it to read the file and keep it updated as work progresses. You can do this in the orchestrator's `prompt_template`, in your opening message to it, or both.
