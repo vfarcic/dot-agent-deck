@@ -1611,7 +1611,7 @@ fn prompt_hook_entry(command: &str, enabled: bool) -> Value {
     entry
 }
 
-/// Scenario: Run the real wrapper in a deck-managed pane around a Codex launcher script three times, collecting every event it emits. With a `codex` app-server stand-in on its PATH that lists the deck's prompt hook switched on, trust is recorded and nothing is declared. With no `codex` on its PATH at all — a launcher like `devbox run codex-big` whose `codex` exists only inside it — trust cannot be recorded; and with the stand-in listing another deck hook plus the prompt hook switched OFF in Codex's `/hooks` browser, trust is recorded for hooks that will never report a prompt. In both of those runs every event must declare that no submitted-prompt report will come from this pane.
+/// Scenario: Run the real wrapper in a deck-managed pane around a Codex launcher script three times, collecting every event it emits: with a `codex` app-server stand-in on its PATH that lists the deck's prompt hook switched on, with no `codex` on its PATH at all (a launcher like `devbox run codex-big` whose `codex` exists only inside it), and with the stand-in listing the prompt hook switched OFF in Codex's `/hooks` browser. The first run records trust and must declare nothing. The other two leave no prompt hook that will run, so every event they emit must declare that no submitted-prompt report will come from this pane.
 #[spec("codex/trust/005")]
 #[test]
 fn codex_trust_005_untrusted_hooks_are_declared_on_every_wrapper_event() {
