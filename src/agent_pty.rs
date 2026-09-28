@@ -2652,9 +2652,16 @@ async fn drain_stranded_payload(w: &mut (dyn std::io::Write + Send), landed: &[u
 /// text of the user's. What stays genuinely ambiguous is what the agent's editor
 /// did with the bytes while they were there, which is why the outcome is
 /// unchanged.
+///
+/// Issue #1243: with an `echo` watch the CR is also held until the payload has
+/// rendered on the agent's screen, bounded by
+/// [`crate::submit_echo::SUBMIT_ECHO_BOUND`]; [`SUBMIT_DELAY`] stays the floor.
+/// The watch only times the CR, so every outcome above is classified exactly as
+/// without one.
 async fn deliver_payload_and_submit(
     w: &mut (dyn std::io::Write + Send),
     payload: &[u8],
+    echo: Option<crate::submit_echo::EchoWatch>,
 ) -> PayloadDelivery {
     match write_all_tracked(w, payload) {
         WriteProgress::Complete => {}
@@ -2668,7 +2675,16 @@ async fn deliver_payload_and_submit(
         WriteProgress::NothingWritten(e) => return PayloadDelivery::CleanFailure(e),
     }
     let _ = w.flush();
-    tokio::time::sleep(SUBMIT_DELAY).await;
+    let written_at = tokio::time::Instant::now();
+    if let Some(echo) = echo {
+        let outcome = echo.wait(crate::submit_echo::SUBMIT_ECHO_BOUND).await;
+        tracing::debug!(
+            outcome = ?outcome,
+            waited_ms = written_at.elapsed().as_millis(),
+            "guarded submit: waited for the payload to render before the CR"
+        );
+    }
+    tokio::time::sleep_until(written_at + SUBMIT_DELAY).await;
     // The payload already landed; ANY failure writing the submit CR now leaves
     // the target holding un-submitted payload bytes — ambiguous, not clean.
     match write_all_tracked(w, b"\r") {
@@ -5575,6 +5591,17 @@ pub type DeliveryNoticeSink = Arc<dyn Fn(DeliveryNotice) + Send + Sync>;
 enum SubmitMode {
     Submit,
     Notice,
+}
+
+/// Issue #1243: what holds a submitted write's CR back. Ignored for a notice,
+/// which has no CR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitGate {
+    /// [`SUBMIT_DELAY`] after the payload, as before #1243.
+    Delay,
+    /// Until the payload renders, bounded; see
+    /// [`AgentPtyRegistry::write_and_submit_guarded_after_echo`].
+    Echo,
 }
 
 /// Issue #876 test-only fault seam: a [`std::io::Write`] that accepts `budget`
@@ -8995,6 +9022,7 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
+            SubmitGate::Delay,
             expected_agent_id,
             revalidate,
             FirstWrite::Immediate,
@@ -9079,6 +9107,7 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
+            SubmitGate::Delay,
             expected_agent_id,
             revalidate,
             FirstWrite::Defer {
@@ -9098,6 +9127,12 @@ impl AgentPtyRegistry {
     /// [`PaneDispatchHold`]. It may still be down when this returns a refusal
     /// reached during the wait; call [`PaneDispatchHold::resume`] before
     /// acting on the outcome.
+    ///
+    /// Issue #1243: `gate` decides what holds the CR back once the write goes
+    /// in. The delegate pointer passes [`SubmitGate::Echo`], so it is deferred
+    /// behind the worker's draft FIRST and only then echo-gated: the watch is
+    /// subscribed under the writer on the pass that writes, after the wait.
+    #[allow(clippy::too_many_arguments)]
     pub async fn write_and_submit_guarded_first_write_parking<Fut>(
         &self,
         pane_id: &str,
@@ -9106,6 +9141,7 @@ impl AgentPtyRegistry {
         revalidate: impl FnOnce() -> Fut,
         started: Instant,
         hold: &mut PaneDispatchHold,
+        gate: SubmitGate,
     ) -> Result<FirstWriteSend, AgentPtyError>
     where
         Fut: std::future::Future<Output = bool>,
@@ -9114,6 +9150,7 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
+            gate,
             expected_agent_id,
             revalidate,
             FirstWrite::Defer {
@@ -9151,6 +9188,7 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
+            SubmitGate::Delay,
             expected_agent_id,
             revalidate,
             FirstWrite::Defer {
@@ -9199,6 +9237,7 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
+            SubmitGate::Delay,
             expected_agent_id,
             revalidate,
             FirstWrite::Defer {
@@ -9270,6 +9309,7 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Notice,
+            SubmitGate::Delay,
             expected_agent_id,
             revalidate,
             FirstWrite::Immediate,
@@ -9277,6 +9317,53 @@ impl AgentPtyRegistry {
         )
         .await
         .map(|sent| sent.detail.outcome())
+    }
+
+    /// Issue #1243: [`Self::write_and_submit_guarded_detailed`], with the CR held
+    /// until the payload's last word is on the agent's screen (bounded by
+    /// [`crate::submit_echo::SUBMIT_ECHO_BOUND`], never sooner than
+    /// [`SUBMIT_DELAY`]). A CR written while a starved agent is still inside
+    /// its paste window is taken as a newline, and the text sits unsubmitted.
+    ///
+    /// For the delegate task pointer. A pane that does not echo what is typed
+    /// pays the whole bound with the writer held, which is why this is not the
+    /// default; see [`crate::submit_echo`].
+    pub async fn write_and_submit_guarded_after_echo<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: &str,
+        revalidate: impl FnOnce() -> Fut,
+    ) -> Result<GuardedSendDetail, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        self.write_guarded(
+            pane_id,
+            text,
+            SubmitMode::Submit,
+            SubmitGate::Echo,
+            expected_agent_id,
+            revalidate,
+            FirstWrite::Immediate,
+            None,
+        )
+        .await
+        .map(|sent| sent.detail)
+    }
+
+    /// Issue #1243: subscribe to `agent_id`'s output for an echo-gated submit of
+    /// `payload`. `None` when the payload is not eligible or the agent is gone.
+    /// Must be called before the payload is written.
+    fn echo_watch(&self, agent_id: &str, payload: &[u8]) -> Option<crate::submit_echo::EchoWatch> {
+        crate::submit_echo::echo_token(payload)?;
+        let (bus, rows, cols) = {
+            let inner = self.inner.lock().unwrap();
+            let agent = inner.agents.get(agent_id)?;
+            (Arc::clone(&agent.bus), agent.pty_rows, agent.pty_cols)
+        };
+        let (snapshot, rx) = bus.subscribe();
+        crate::submit_echo::EchoWatch::new(&snapshot, rx, rows, cols, payload)
     }
 
     /// The shared body of [`Self::write_and_submit_guarded`] (payload +
@@ -9291,6 +9378,7 @@ impl AgentPtyRegistry {
         pane_id: &str,
         text: &str,
         mode: SubmitMode,
+        submit_gate: SubmitGate,
         expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
         first_write: FirstWrite,
@@ -9567,8 +9655,15 @@ impl AgentPtyRegistry {
                 detail: crate::draft_deferral::DRAFT_CAP_NOTICE,
             });
         }
+        // Issue #1243: subscribed before the payload is written, so no byte of
+        // its echo is missed. The writer is held, so nothing else is typed
+        // into this pane in between.
+        let echo = match (&mode, submit_gate) {
+            (SubmitMode::Submit, SubmitGate::Echo) => self.echo_watch(&target.agent_id, &payload),
+            _ => None,
+        };
         let delivery = match mode {
-            SubmitMode::Submit => deliver_payload_and_submit(&mut w.daemon(), &payload).await,
+            SubmitMode::Submit => deliver_payload_and_submit(&mut w.daemon(), &payload, echo).await,
             SubmitMode::Notice => deliver_payload_as_notice(&mut w.daemon(), &payload).await,
         };
         match delivery {
@@ -18184,7 +18279,7 @@ mod spawn_tests {
             written: 0,
         };
         assert_eq!(
-            deliver_payload_and_submit(&mut w, b"hello").await,
+            deliver_payload_and_submit(&mut w, b"hello", None).await,
             PayloadDelivery::Applied
         );
 
@@ -18195,7 +18290,7 @@ mod spawn_tests {
             written: 0,
         };
         assert!(matches!(
-            deliver_payload_and_submit(&mut w, b"hello").await,
+            deliver_payload_and_submit(&mut w, b"hello", None).await,
             PayloadDelivery::CleanFailure(_)
         ));
 
@@ -18208,7 +18303,7 @@ mod spawn_tests {
             written: 0,
         };
         assert_eq!(
-            deliver_payload_and_submit(&mut w, b"hello").await,
+            deliver_payload_and_submit(&mut w, b"hello", None).await,
             PayloadDelivery::Ambiguous { stranded: 2 }
         );
 
@@ -18220,7 +18315,7 @@ mod spawn_tests {
             written: 0,
         };
         assert_eq!(
-            deliver_payload_and_submit(&mut w, b"hello").await,
+            deliver_payload_and_submit(&mut w, b"hello", None).await,
             PayloadDelivery::Ambiguous {
                 stranded: b"hello".len()
             }
@@ -18239,7 +18334,7 @@ mod spawn_tests {
         // errored. Exactly two erases must follow them.
         let (mut w, log) = HealingFaultyWriter::healing(2);
         assert_eq!(
-            deliver_payload_and_submit(&mut w, b"hello").await,
+            deliver_payload_and_submit(&mut w, b"hello", None).await,
             PayloadDelivery::Ambiguous { stranded: 0 },
             "the two bytes that landed were erased again, so nothing is left in the box"
         );
@@ -18253,7 +18348,7 @@ mod spawn_tests {
         // box and the whole payload must come back out.
         let (mut w, log) = HealingFaultyWriter::healing(b"hello".len());
         assert_eq!(
-            deliver_payload_and_submit(&mut w, b"hello").await,
+            deliver_payload_and_submit(&mut w, b"hello", None).await,
             PayloadDelivery::Ambiguous { stranded: 0 }
         );
         assert_eq!(
@@ -18277,7 +18372,7 @@ mod spawn_tests {
         let payload = "⚠ went quiet".as_bytes();
         let (mut w, log) = HealingFaultyWriter::healing(payload.len());
         assert_eq!(
-            deliver_payload_and_submit(&mut w, payload).await,
+            deliver_payload_and_submit(&mut w, payload, None).await,
             PayloadDelivery::Ambiguous {
                 stranded: payload.len()
             }
@@ -18294,7 +18389,7 @@ mod spawn_tests {
         let payload = b"\x1b[200~one\ntwo\x1b[201~";
         let (mut w, log) = HealingFaultyWriter::healing(4);
         assert_eq!(
-            deliver_payload_and_submit(&mut w, payload).await,
+            deliver_payload_and_submit(&mut w, payload, None).await,
             PayloadDelivery::Ambiguous { stranded: 4 }
         );
         assert_eq!(log.lock().unwrap().as_slice(), b"\x1b[20");
@@ -18305,7 +18400,7 @@ mod spawn_tests {
         let payload = vec![b'x'; MAX_DRAINABLE_STRANDED_BYTES + 1];
         let (mut w, log) = HealingFaultyWriter::healing(payload.len());
         assert_eq!(
-            deliver_payload_and_submit(&mut w, &payload).await,
+            deliver_payload_and_submit(&mut w, &payload, None).await,
             PayloadDelivery::Ambiguous {
                 stranded: payload.len()
             }
@@ -18320,7 +18415,7 @@ mod spawn_tests {
         let payload = vec![b'x'; MAX_DRAINABLE_STRANDED_BYTES];
         let (mut w, _log) = HealingFaultyWriter::healing(payload.len());
         assert_eq!(
-            deliver_payload_and_submit(&mut w, &payload).await,
+            deliver_payload_and_submit(&mut w, &payload, None).await,
             PayloadDelivery::Ambiguous { stranded: 0 }
         );
     }
@@ -18377,7 +18472,7 @@ mod spawn_tests {
             faulted: false,
         };
         assert_eq!(
-            deliver_payload_and_submit(&mut w, b"hello").await,
+            deliver_payload_and_submit(&mut w, b"hello", None).await,
             PayloadDelivery::Ambiguous { stranded: 2 },
             "three of the five erases landed, so two payload bytes are still in the input box"
         );

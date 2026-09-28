@@ -86,6 +86,7 @@ pub mod schedule_cli;
 pub mod scheduler;
 pub mod spawn;
 pub mod state;
+pub mod submit_echo;
 pub mod tab;
 pub mod tab_layout;
 pub mod terminal_hangup;

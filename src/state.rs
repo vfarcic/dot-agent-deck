@@ -8682,6 +8682,15 @@ async fn dispatch_one_owned(
     // still caught by the post-lock re-validation), defeating the exact
     // guarantee PRD #249 finding B1 built this call to enforce. Treat an
     // unresolved identity as "no verified target" and never attempt the write.
+    //
+    // Issue #1243: and the CR waits for the pointer to render on the worker's
+    // screen. Under load an agent still inside its paste window takes a CR
+    // written a fixed `SUBMIT_DELAY` after the text as a newline in the paste,
+    // and the pointer sits in the composer unsubmitted with the pane healthy
+    // and idle. See `crate::submit_echo` for the measurement. It is
+    // deferred behind the worker's draft first (issue #544), then echo-gated:
+    // the watch is subscribed on the pass that writes, after any wait.
+    //
     // Issue #544 (PR #1398 review): how long the pointer waited for the
     // worker's draft — non-zero means the dispatch lock was set down, so a
     // `pane restart` may have replaced the worker meanwhile.
@@ -8708,6 +8717,7 @@ async fn dispatch_one_owned(
                 },
                 std::time::Instant::now(),
                 &mut dispatch_hold,
+                crate::agent_pty::SubmitGate::Echo,
             )
             .await;
         // PR #1398 review: a refusal reached while waiting for the draft comes
@@ -18105,7 +18115,7 @@ mod tests {
                 redeliveries: None,
                 retry_done: None,
             }),
-            None,
+            PointerQueueClock::new(registry.clone(), WORKER_PANE.to_string(), None),
             None,
             None,
             None,

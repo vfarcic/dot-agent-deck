@@ -21,7 +21,9 @@
 //! Every re-delivery starts with a submit-only probe — a bare Enter — and reads
 //! the worker's screen. When the delivery id is visible there, the pointer is
 //! most likely parked unsubmitted in the agent's composer (issue #1243's shape),
-//! and the Enter is the whole re-delivery. When it is not visible, the screen
+//! and the re-delivery never types it again: after the grace below it presses
+//! Enter once more if the id is still on screen, because an agent that took the
+//! first CR into a paste swallows the next Enter. When it is not visible, the screen
 //! cannot tell an empty composer from one holding the pointer where the screen
 //! does not show it, so the loop waits a short grace ([`probe_grace`]) for the
 //! turn that Enter would start, and types the pointer again, with the same id,
@@ -45,6 +47,7 @@ use tokio::sync::{broadcast, oneshot};
 use tracing::{info, warn};
 
 use crate::agent_pty::{AgentPtyRegistry, GuardedSend, GuardedSendDetail};
+use crate::config_validation::escape_id_for_log;
 use crate::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
 use crate::state::OrchestrationIdentity;
 
@@ -115,7 +118,7 @@ impl RetrySchedule {
         for entry in trimmed.split(',') {
             let Ok(ms) = entry.trim().parse::<u128>() else {
                 warn!(
-                    value = %crate::config_validation::escape_id_for_log(raw),
+                    value = %escape_id_for_log(raw),
                     "{DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS} is not a comma-separated list \
                      of milliseconds; using the default schedule"
                 );
@@ -690,8 +693,8 @@ impl Watch {
                                     .max(crate::prompt_delivery::REARM_READINESS_BUFFER);
                                 due = due.max(tokio::time::Instant::now() + interval);
                                 info!(
-                                    pane_id = %pane_id,
-                                    role = %role,
+                                    pane_id = %escape_id_for_log(pane_id),
+                                    role = %escape_id_for_log(role),
                                     delivery_id = %delivery_id,
                                     interval_ms = interval.as_millis(),
                                     "delegate retry: the worker's agent announced a session \
@@ -805,7 +808,7 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
             // a worker that has not repainted since is one that may well hold
             // the pointer already (`orchestration/delegate/043` attaches the
             // worker pane, which resizes it, after the task was accepted).
-            if matches!(composer, Composer::PointerVisible | Composer::Unreadable) {
+            if composer == Composer::Unreadable {
                 continue;
             }
             // The screen does not show the pointer, which cannot tell an empty
@@ -813,6 +816,14 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
             // Enter just sent submits it in the second case, and the turn it
             // starts is proof; only silence past the grace means there was
             // nothing to submit.
+            //
+            // Issue #1243: a pointer the screen DOES show waits out the same
+            // grace and then gets a second Enter, never a copy. Measured against
+            // Claude Code: once a CR has been taken into a paste, the composer
+            // holds the pointer and an empty line, the next Enter is swallowed
+            // and the one after it submits, in every case observed (3 lost
+            // first writes under load, 2 forced ones). One Enter per re-delivery
+            // recovered it only at the second re-delivery.
             let grace = probe_grace(wait_at(attempt));
             if let Err(end) = watch
                 .until(
@@ -838,8 +849,8 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
     registry.pending_deliveries().finish(&pane_id, seq);
     match end {
         RetryEnd::Exhausted if !silence_report_armed => warn!(
-            pane_id = %pane_id,
-            role = %role,
+            pane_id = %escape_id_for_log(&pane_id),
+            role = %escape_id_for_log(&role),
             delivery_id = %delivery_id,
             redeliveries = redeliveries.load(Ordering::SeqCst),
             last_classification = ?last_classification,
@@ -847,16 +858,16 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
              event and no ack; the task may never have reached it. The worker is not respawned"
         ),
         RetryEnd::Exhausted => info!(
-            pane_id = %pane_id,
-            role = %role,
+            pane_id = %escape_id_for_log(&pane_id),
+            role = %escape_id_for_log(&role),
             delivery_id = %delivery_id,
             redeliveries = redeliveries.load(Ordering::SeqCst),
             last_classification = ?last_classification,
             "delegate retry: schedule exhausted; the silent-worker report covers it"
         ),
         other => info!(
-            pane_id = %pane_id,
-            role = %role,
+            pane_id = %escape_id_for_log(&pane_id),
+            role = %escape_id_for_log(&role),
             delivery_id = %delivery_id,
             redeliveries = redeliveries.load(Ordering::SeqCst),
             end = ?other,
@@ -883,8 +894,9 @@ enum Phase {
     /// submits a pointer still sitting in the composer and is ignored by an
     /// empty one.
     Probe,
-    /// After a probe over a screen that did not show the pointer went
-    /// unanswered: type the pointer again.
+    /// After a probe went unanswered: type the pointer again over a screen that
+    /// does not show it, or press Enter once more over one that does (issue
+    /// #1243).
     Retype,
 }
 
@@ -931,8 +943,8 @@ async fn redeliver(
     // attempt still counts toward the bound.
     if registry.user_typed_since_automatic_write(pane_id) {
         info!(
-            pane_id = %pane_id,
-            role = %role,
+            pane_id = %escape_id_for_log(pane_id),
+            role = %escape_id_for_log(role),
             delivery_id = %delivery_id,
             attempt,
             total_attempts,
@@ -953,23 +965,13 @@ async fn redeliver(
     let text = match (phase, composer) {
         (Phase::Probe, _) => "",
         // The unanswered Enter left it on screen: it is in the composer and a
-        // copy would double it.
-        (Phase::Retype, Composer::PointerVisible) => {
-            info!(
-                pane_id = %pane_id,
-                role = %role,
-                delivery_id = %delivery_id,
-                attempt,
-                total_attempts,
-                "delegate retry: the pointer appeared on the worker's screen after the Enter; not \
-                 retyping it"
-            );
-            return Attempt::Skipped;
-        }
+        // copy would double it. Press Enter once more instead (issue #1243, see
+        // the loop).
+        (Phase::Retype, Composer::PointerVisible) => "",
         (Phase::Retype, Composer::Unreadable) => {
             info!(
-                pane_id = %pane_id,
-                role = %role,
+                pane_id = %escape_id_for_log(pane_id),
+                role = %escape_id_for_log(role),
                 delivery_id = %delivery_id,
                 attempt,
                 total_attempts,
@@ -996,6 +998,15 @@ async fn redeliver(
     // has to be revalidated after it (the closure below already re-checks it
     // under the writer). The probe stays on this entry either way: #1398 exempts
     // empty payloads, and #424's probe guard refuses one after typing.
+    //
+    // Issue #1243: unlike the first write, a retype does NOT hold its CR until
+    // the pointer renders. It is only ever typed over a screen that showed no
+    // pointer, which is most often a pane that does not echo at all, and there
+    // the gate would hold the writer for its whole bound on every attempt. The
+    // loss the gate prevents needs an agent too busy to finish a paste within
+    // `SUBMIT_DELAY`; a worker that has sat idle through a retry wait is not
+    // one (0 of 20 lost against an idle Claude Code composer under the same
+    // load that lost 3 of 30 first writes).
     let outcome = registry
         .write_and_submit_guarded_detailed(pane_id, text, worker_agent_id, || async move {
             if revalidate_registry.is_pane_closing(&revalidate_pane) {
@@ -1033,8 +1044,8 @@ async fn redeliver(
                 *pointer_epoch = registry.geometry_changes_of(worker_agent_id);
             }
             info!(
-                pane_id = %pane_id,
-                role = %role,
+                pane_id = %escape_id_for_log(pane_id),
+                role = %escape_id_for_log(role),
                 delivery_id = %delivery_id,
                 attempt,
                 total_attempts,
@@ -1050,6 +1061,10 @@ async fn redeliver(
                         "the pointer is not on its screen, which cannot tell an empty input box \
                          from one holding it unshown, so pressed Enter first; the pointer is \
                          retyped only if the worker stays silent",
+                    (Phase::Retype, Composer::PointerVisible) =>
+                        "the pointer is still on its screen after the Enter, and an agent that \
+                         took the first CR into a paste swallows the next Enter, so pressed Enter \
+                         once more rather than retyping it",
                     (Phase::Retype, _) =>
                         "the worker stayed silent after the Enter, so re-typed the pointer into \
                          the same process",
@@ -1060,8 +1075,8 @@ async fn redeliver(
         // Removed while the write waited on the writer: nothing was written.
         Ok(_) if !registry.pending_deliveries().is_current(pane_id, seq) => {
             info!(
-                pane_id = %pane_id,
-                role = %role,
+                pane_id = %escape_id_for_log(pane_id),
+                role = %escape_id_for_log(role),
                 delivery_id = %delivery_id,
                 attempt,
                 "delegate retry: the delivery was acknowledged, completed or superseded while the \
@@ -1073,8 +1088,8 @@ async fn redeliver(
         // could submit it. Stop, and leave the payload record standing (#715).
         Ok(GuardedSendDetail::Outcome(GuardedSend::Ambiguous)) => {
             warn!(
-                pane_id = %pane_id,
-                role = %role,
+                pane_id = %escape_id_for_log(pane_id),
+                role = %escape_id_for_log(role),
                 delivery_id = %delivery_id,
                 attempt,
                 "delegate retry: the re-delivery was ambiguous (partial write); no further \
@@ -1084,8 +1099,8 @@ async fn redeliver(
         }
         Ok(other) => {
             info!(
-                pane_id = %pane_id,
-                role = %role,
+                pane_id = %escape_id_for_log(pane_id),
+                role = %escape_id_for_log(role),
                 delivery_id = %delivery_id,
                 attempt,
                 outcome = ?other,
@@ -1096,8 +1111,8 @@ async fn redeliver(
         }
         Err(error) => {
             warn!(
-                pane_id = %pane_id,
-                role = %role,
+                pane_id = %escape_id_for_log(pane_id),
+                role = %escape_id_for_log(role),
                 delivery_id = %delivery_id,
                 attempt,
                 error = %error,
@@ -1671,13 +1686,19 @@ mod loop_tests {
         let (handle, redeliveries) = fx.deliver_and_retry("150,150").await;
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
         assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
-        let lines = fx.received_lines(3).await;
+        let lines = fx.received_lines(5).await;
         assert_eq!(
             lines.iter().filter(|l| l.contains(ID)).count(),
             1,
             "a pointer visible on screen must never be typed a second time: {lines:?}"
         );
-        assert_eq!(lines.len(), 3, "two submit-only probes: {lines:?}");
+        // Issue #1243: per re-delivery, the probe and, with the pointer still
+        // on screen after the grace, one more Enter.
+        assert_eq!(
+            lines,
+            [POINTER, "", "", "", ""],
+            "two re-deliveries of two Enters each: {lines:?}"
+        );
         fx.stop();
     }
 
