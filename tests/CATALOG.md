@@ -5116,6 +5116,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** a real agent's hook (`orchestration/delegate/014` covers a real Claude worker through a `clear = true` respawn); the late non-start frame stamped newer, or the incoming generation's older-stamped first frame, which `daemon::hook_ingestion_tests` pins at the ingestion seam and `status/supersede/019` / `/020` at the card layer.
 - **Platform coverage:** mac+linux (the e2e tier is Unix-only).
 
+##### pane/restart/014 — Restart replies promptly while a delegate waits on a worker's unsent draft (PR #1398 finding #12).
+- **Layer:** L1/fast (in-process real delegate and restart handlers against daemon-owned `cat` panes; no socket or LLM).
+- **Agent:** none (`cat` stand-ins make the draft and task pointer visible in PTY snapshots).
+- **Asserts:** an unsent draft keeps the queued delegate pointer out of the old worker pane; `pane restart --force` succeeds within eight seconds, below the CLI's fourteen-second reply budget; the waiting delegate then reaches the replacement as a submitted line or produces an explicit delivery notice, without the old draft reaching the replacement.
+- **Does not assert:** the CLI/socket encoding of the reply, or a real agent's editor behavior.
+- **Platform coverage:** mac+linux (unix-only).
+
 #### pane/spawn
 
 ##### pane/spawn/001 — Spawning a configured-but-unspawned role succeeds and it becomes reachable (issue #868).
