@@ -333,7 +333,6 @@ pub(crate) struct CastEvent {
 struct ContinueSession {
     pane_name: String,
     command: String,
-    mode: Option<String>,
 }
 
 /// Which agent's credential set the test wants imported from the
@@ -450,23 +449,6 @@ impl TuiDeckBuilder {
         self.continue_session = Some(ContinueSession {
             pane_name: pane_name.into(),
             command: command.into(),
-            mode: None,
-        });
-        self
-    }
-
-    /// Stage a saved pane carrying mode membership so restore exercises the
-    /// mode-tab rebuild path rather than the plain-pane fallback.
-    pub fn with_continue_mode_session(
-        mut self,
-        pane_name: impl Into<String>,
-        command: impl Into<String>,
-        mode: impl Into<String>,
-    ) -> Self {
-        self.continue_session = Some(ContinueSession {
-            pane_name: pane_name.into(),
-            command: command.into(),
-            mode: Some(mode.into()),
         });
         self
     }
@@ -1028,14 +1010,8 @@ impl TuiDeck {
         // skips panes whose `dir` doesn't exist on disk).
         let session_toml_path = work.join("session.toml");
         if let Some(cs) = &builder.continue_session {
-            write_continue_session_file(
-                &session_toml_path,
-                &work,
-                &cs.pane_name,
-                &cs.command,
-                cs.mode.as_deref(),
-            )
-            .expect("write continue session.toml");
+            write_continue_session_file(&session_toml_path, &work, &cs.pane_name, &cs.command)
+                .expect("write continue session.toml");
         }
 
         let hook_socket = work.join("hook.sock");
@@ -7115,7 +7091,6 @@ fn write_continue_session_file(
     work_dir: &Path,
     pane_name: &str,
     command: &str,
-    mode: Option<&str>,
 ) -> std::io::Result<()> {
     // Hand-rolled TOML so we don't need a runtime dep on toml in the
     // harness module. Field names match `dot_agent_deck::config::SavedPane`.
@@ -7127,9 +7102,6 @@ fn write_continue_session_file(
     ));
     s.push_str(&format!("name = \"{}\"\n", toml_escape(pane_name)));
     s.push_str(&format!("command = \"{}\"\n", toml_escape(command)));
-    if let Some(mode) = mode {
-        s.push_str(&format!("mode = \"{}\"\n", toml_escape(mode)));
-    }
     std::fs::write(session_toml_path, s)
 }
 

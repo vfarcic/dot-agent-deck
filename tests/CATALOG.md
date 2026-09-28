@@ -118,7 +118,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** L1 (ratatui `TestBackend` buffer-text assertions).
 - **Agent:** synthetic neutral and ClaudeCode `SessionState` fixtures with a declared Codex identity.
 - **Asserts:** a neutral session plus `Some(Codex)` renders `Codex · reviewer` and no `No agent`; after that session reports `ClaudeCode`, the observed identity renders `ClaudeCode · reviewer` with no stale `Codex` label. A neutral session with no declaration retains the pre-#308 `No agent` baseline.
-- **Does not assert:** declaration propagation through config, spawn, or daemon dispatch; those end-to-end paths are covered by `codex/spawn/009` and `codex/spawn/011`.
+- **Does not assert:** declaration propagation through config, spawn, or daemon dispatch; those end-to-end paths are covered by `codex/spawn/009`.
 - **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/pane/015 — A card title wider in COLUMNS than the title region is ellipsized instead of bare-clipped (issue #357).
@@ -327,18 +327,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the active-selection derive path (covered by `dashboard/pane/005`).
 - **Platform coverage:** mac+linux+windows.
 
-##### dashboard/selection/015 — SC1 against the real binary: the highlight clears on a tab round-trip when the focused pane is a Mode agent pane that is also a dashboard card.
-- **Layer:** L2 (real `dot-agent-deck` binary in a PTY; vt100 grid scraping).
-- **Agent:** a Mode tab agent (fixture shell script) that self-posts `SessionStart` so its agent pane is also a dashboard card; no LLM tokens.
-- **Asserts:** with the highlight armed on the Dashboard (a `▸` marker present), switching away to the Mode tab and back to the Dashboard — where the Mode agent pane stays focused (steady state, no transition) and maps to a card — leaves NO `▸` selection marker on any card. This is the real-binary repro the L1 tests cannot provide (their mocks never restore focus to a Mode agent pane on return); pre-fix the steady-state focus re-armed the highlight.
-- **Does not assert:** the cyan controller focus border (driven separately, unaffected); the keyboard nav/wrap semantics (covered by `dashboard/selection/001`–`002`).
-- **Platform coverage:** mac+linux.
-
 ##### dashboard/selection/016 — The inactive-selection close no-op (012) does NOT suppress closing an active Orchestration tab via Ctrl+W.
 - **Layer:** L1 (in-process `dispatch_action(Action::CloseSelected)` against a recording `PaneController`).
 - **Agent:** none (a real Orchestration tab; no dashboard cards armed).
 - **Asserts:** with an Orchestration tab active and `selected_index == None`, dispatching `Action::CloseSelected` opens confirmation and `ConfirmCloseSelected` closes that tab (tab count drops back to the lone Dashboard). Bounds the `dashboard/selection/012` no-op gate: the inactive-selection guard suppresses an unarmed dashboard CARD, but an active TAB remains a valid confirmation target. Regression for the PR #151 e2e failure `e2e_render_contract::layout_002` (first seen on a workspace-mode tab, removed in #1199).
-- **Does not assert:** the per-pane PTY teardown / role-pane stop (covered by the L2 `tabs/mode/002`, `tabs/orchestration/002`); the dashboard-card close no-op itself (covered by `dashboard/selection/012`).
+- **Does not assert:** per-pane PTY teardown / role-pane stop (covered by `tabs/orchestration/002`); the dashboard-card close no-op itself (covered by `dashboard/selection/012`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/selection/017 — Enter (Action::Focus) paints the highlight on BOTH decks by setting `selected_index` to the restored target (unified deck behavior).
@@ -973,7 +966,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 ##### daemon/status/002 — `dot-agent-deck daemon status --json` pins its schema-versioned public document shape and every supported live-status string.
 - **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status --json` CLI as a subprocess + an in-process daemon attach socket + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
-- **Agent:** none (synthetic — a labeled `cat`-stub mode pane spawned through the TUI's real `StartAgent` attach path, driven first by the REAL `dot-agent-deck agent-event --type running` CLI with the daemon-injected pane and agent ids, then by a raw `ToolStart` on the same production hook wire so the representative row has an active tool).
+- **Agent:** none (synthetic — a labeled `cat`-stub pane spawned through the real `StartAgent` attach path, driven first by the REAL `dot-agent-deck agent-event --type running` CLI, then by a raw `ToolStart` on the same production hook wire).
 - **Asserts:** the subprocess exits successfully; stdout parses as a JSON object; `schema_version` equals the exact current public version; that schema has exactly the top-level fields `schema_version` and `agents`; the fully populated managed-agent row has exactly `agent_id`, `pane_id`, `label`, `cwd`, `role`, `status`, and `active_tool`, with the expected values and nested `{ "name": ... }` tool shape; and all six supported statuses serialize with the exact public strings `Thinking`, `Working`, `Compacting`, `WaitingForInput`, `Idle`, and `Error`.
 - **Does not assert:** the human-readable table (`daemon/status/001`); omission behavior when optional fields are absent; tool-detail privacy (`daemon/status/004`).
 - **Platform coverage:** mac+linux.
@@ -1170,13 +1163,6 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** tab identity binding (covered independently by `mouse/tabstrip/003`).
 - **Platform coverage:** mac+linux.
 
-##### prompt/close-confirm/006 — A dashboard Session target that belongs to a Mode tab uses whole-tab copy and teardown.
-- **Layer:** L2 (real-binary PTY against a protocol-faithful scripted daemon).
-- **Agent:** none (a hydrated Mode agent pane rendered as a dashboard card plus one persistent side pane).
-- **Asserts:** arming Ctrl+W from the selected dashboard card renders `Close this tab and all its panes?`, never the pane sentence; confirming sends stops for both daemon panes and removes the tab only after the registry is empty.
-- **Does not assert:** internal `CloseTarget`/`ClosePlan` variants; the rendered promise and observable blast radius are the contract.
-- **Platform coverage:** mac+linux.
-
 ##### prompt/close-confirm/007 — A close that would LEAVE a dispatched worktree holding uncommitted work says so, with its path, before the user answers (issue #717).
 - **Layer:** L1 (in-process `TestBackend` through `render_close_confirm_to_buffer`).
 - **Agent:** none.
@@ -1203,11 +1189,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 #### prompt/pane-input
 
-##### prompt/pane-input/001 — `Enter` on a focused side pane enters PaneInput mode.
+##### prompt/pane-input/001 — `Enter` on a focused orchestration role pane enters PaneInput mode.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** the mode line / focus indicator updates to indicate PaneInput mode; a subsequent letter keystroke is forwarded to the side pane's PTY.
-- **Does not assert:** the side pane's command output (depends on the fixture shell).
+- **Asserts:** the mode line / focus indicator updates to indicate PaneInput mode; a subsequent letter keystroke is forwarded to the role pane's PTY.
+- **Does not assert:** the role pane's command output (depends on the fixture shell).
 - **Platform coverage:** mac+linux.
 
 ##### prompt/pane-input/002 — `Ctrl+d` from PaneInput returns to Normal mode without writing the keystroke to the PTY.
@@ -1624,24 +1610,24 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the dashboard's selection cursor location on return.
 - **Platform coverage:** mac+linux.
 
-##### prompt/new-pane/007 — The new-deck dialog surfaces a built-in `schedule` authoring option, visually separated from the workload modes (PRD #127 M3.2).
+##### prompt/new-pane/007 — The New Agent dialog surfaces a built-in `schedule` authoring option after orchestrations (PRD #127 M3.2).
 - **Layer:** L2 (re-sequenced from L1: the dialog renderer + `NewPaneFormState` are private and there is no public L1 render seam, so the real dialog is driven via PTY keystrokes and asserted on the rendered vt100 grid).
 - **Agent:** none (drives Ctrl+n → dir-picker → new-pane form, then cycles the Mode field).
-- **Asserts:** after cycling the Mode field to the end, the dialog's authoring-session affordance — the `↳`-marked hint that separates `schedule` from the workload modes — renders its FULL text (normalized for grid padding) as exactly `↳ authoring (one-off)` AND stays fully contained within the new-pane modal border (its tail is followed by padding before the right `│`, not clipped by it).
-- **Does not assert:** the authoring seed-prompt delivery (covered by `tabs/mode/005`); the manager dialog's add/edit path (Phase 3B-ii); the leading-pad width that aligns the hint under the mode chips.
+- **Asserts:** after selecting `schedule`, the `↳`-marked authoring hint renders its full text as exactly `↳ authoring (one-off)` within the modal border.
+- **Does not assert:** seed delivery (covered by the built-in authoring tests); the manager dialog's add/edit path; the hint's leading padding.
 - **Platform coverage:** mac+linux.
 
-##### prompt/new-pane/008 — Submitting the built-in `schedule` authoring option opens a single-agent dashboard card, not a 50/50 mode tab (PRD #127 bug fix).
+##### prompt/new-pane/008 — Submitting the built-in `schedule` authoring option opens a single-agent dashboard card.
 - **Layer:** L2 (no public L1 render seam for the dialog or the post-submit layout — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid).
-- **Agent:** none (the schedule option's Command field is empty, so the spawn falls back to `$SHELL`; the card-vs-mode-tab layout renders independent of the agent).
-- **Asserts:** after cycling the Mode field to the `schedule` option and submitting, the rendered grid shows the dashboard-with-card layout — the dashboard's `dot-agent-deck — N agent(s)` title is present (it renders only on the Dashboard tab) AND no `×` tab-close glyph appears — proving the authoring session stayed a single-agent card rather than opening as a separate 50/50 mode tab.
-- **Does not assert:** the authoring seed-prompt delivery (covered by `tabs/mode/005`); the exact mode-tab split geometry; the spawned agent's command behavior.
+- **Agent:** none (a synthetic command keeps the dashboard card alive without an LLM).
+- **Asserts:** after selecting `schedule` and submitting, the dashboard's `dot-agent-deck — N agent(s)` title is present and no `×` tab-close glyph appears.
+- **Does not assert:** authoring seed delivery or the spawned agent's command behavior.
 - **Platform coverage:** mac+linux.
 
 ##### prompt/new-pane/009 — The built-in `[schedule]` Mode chip stays fully visible inside the modal even when the chip row is wider than the modal (overflow regression guard).
 - **Layer:** L2 (no public L1 render seam for the dialog — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid).
 - **Agent:** none (drives Ctrl+n → dir-picker → new-pane form, then cycles the Mode field to the `schedule` option).
-- **Asserts:** with a fixture defining a workload mode (`build`) plus an orchestration (`ci-deployment`) — so the Mode chip row `  Mode: [No mode] [build] [Orch: ci-deployment] [schedule]` is wider than the capped modal — cycling to and selecting the trailing built-in `[schedule]` option leaves that `[schedule]` chip rendered FULLY between some row's modal borders (`│ … │`), not clipped at the right edge. Approach-agnostic: passes whether the renderer wraps the chip row or windows/scrolls the cycler, as long as the selected chip ends up visible inside the modal.
+- **Asserts:** with two long orchestration chips widening the Mode row beyond the capped modal, selecting the trailing `[schedule]` option leaves that chip fully visible between the modal borders. This passes with wrapping or windowing.
 - **Does not assert:** the exact layout used to keep the chip visible (wrap vs. window/scroll); the visibility of the non-selected chips when the row overflows; the authoring hint text (covered by `prompt/new-pane/007`).
 - **Platform coverage:** mac+linux.
 
@@ -1690,7 +1676,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### prompt/new-pane/016 — Selecting the "dispatcher" option in the new-pane form opens a live dispatcher dashboard card whose real Claude agent, given a goal, invokes `dot-agent-deck dispatch` itself and the daemon creates the promised sibling git worktree (PRD #220). [reel]
 - **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness with imported Claude credentials — records a `full-stream.cast`). The freshly-built binary's dir is prepended to the PATH the deck → daemon → agents inherit, so the agent's `dot-agent-deck dispatch` resolves to the build under test rather than a host-installed binary that predates the verb.
 - **Agent:** Claude Code (interactive `claude`, real Anthropic API — receives the dispatcher seed prompt via gated delivery, acts on the typed goal, and runs the `dispatch` verb itself; no stand-in), pinned to Haiku (`--model claude-haiku-4-5-20251001`) and reached through `common::write_late_announcing_real_agent`: a `claude`-named launcher set as the deck's `default_command`, which declares the agent TYPE at exec with a `wrapper_fork`-origin `SessionStart`, withholds the real agent for 3 s, drains and records whatever the deck typed in the meantime, and only then `exec`s Claude. The dispatched unit inherits the same `default_command` — so the same 3 s, and the same model. Before issue #1013 the launcher `exec`'d a bare `claude`, which ran on whatever the host's managed settings selected (measured on the dev box: Opus 5 at xhigh reasoning effort) — silent, since nothing reports the model it picked.
-- **Asserts,** in the order they can fail: the dispatcher surfaces LIVE as a dashboard CARD within 60s of form submission (`1 agent(s)`, no tab strip — a mode tab would instead route through `render_mode_tab`'s 50/50 split and render the agent at half width beside an empty column, which is the shape this pins against); the pane's input queue was EMPTY when the launcher handed over to Claude (`clean`) — nothing typed into a program that had not started reading; the seed's text reached the pane (a distinctive `DISPATCHER_SEED_PROMPT` phrase, so it cannot pass on an unseeded agent); the seed was ACTED UPON, i.e. some card's `AgentRecord.live.last_user_prompt` carries it, sampled before the goal is typed since that field holds only the newest prompt; then, after a directive one-unit goal is typed into the pane, the sibling worktree `../<repo>-dispatch-probe-unit` appears on disk within 180s — proving agent → `dispatch` CLI → daemon → `git worktree add` end to end, at the sibling (never nested) path. The handover check is deliberately first: it is also chronologically first (3 s in) and it is the only one of the three whose failure message names the ordering.
+- **Asserts,** in the order they can fail: the dispatcher surfaces live as a single dashboard card within 60s of form submission (`1 agent(s)`, no tab strip); the pane's input queue was empty when the launcher handed over to Claude (`clean`); the distinctive dispatcher seed reached the pane and appears in a card's submitted prompt history; then, after a one-unit goal is typed, the sibling worktree `../<repo>-dispatch-probe-unit` appears within 180s, proving agent → `dispatch` CLI → daemon → `git worktree add` end to end.
 - **Also asserts (added after real use found three defects underneath the original green run):** that the unit comes up as a real AGENT — a second live session whose card carries an agent type — because `SpawnRequest.command: None` reads as `$SHELL` in the spawn path, so the previous assertions passed while the unit was a bash prompt with the task text typed into it. Verified to be capable of failing by reintroducing `command: None`. The typed goal also names `--single`, so the shape selector is exercised end to end rather than steering the agent back onto the legacy config-derived path.
 - **Why the launcher, and why the on-screen phrase is not enough (issue #1006).** This test reported GREEN on a broken product, measured by reverting the fix and running it twice, for two independent reasons. It could not reach the failing ORDERING: it exec'd `claude` directly with a pre-seeded HOME and the agent announced fast enough to win the race, while the field environment was `devbox run agent` → devbox init hooks → `claude`, announcing ~4.2 s after spawn. And it asserted the wrong FACT: the deck writes the bytes before a delivery goes wrong and a PTY buffers them, so the seed's text on the grid survives the failure — it is an adjacent artefact. The launcher makes the latency a parameter and consumes what arrived early (`scheduler/dispatch/015`'s discipline, made non-blocking so it does not hang when nothing arrives); the prompt-history assertion is the user-altitude fact. Verified capable of failing: with issue #1005's second conjunct temporarily deleted from `spawn_time_agent_ready`, the `clean` assertion fails on a `premature|` line carrying the seed.
 - **Does not assert:** the dispatched unit's own OUTPUT; an `--orchestration` dispatch (covered deterministically by `dispatch::tests::an_orchestration_dispatch_writes_the_delegation_protocol_and_the_task`, which spawns `cat` roles and asserts the orchestrator-context file — no LLM tokens); the return edge (#220's own deferred Phase 2 — NOT #174, which depends on this PRD rather than tracking it); cleanup on tab close (covered by `src/dispatch.rs` unit tests); the deterministic form of the same ordering, which is lane 1's `prompt/new-pane/017`.
@@ -1699,7 +1685,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 ##### prompt/new-pane/017 — A spawn-time seed is not written into a pane before the agent has announced itself, and is delivered exactly once and acted upon after (issues #1005 / #1006).
 - **Layer:** L2 PTY-attached, **lane 1** (`#![cfg(all(feature = "e2e", unix))]` — no `e2e-live` term, so `e2e-deterministic` runs it on every PR). The real binary is driven through the vt100 `TuiDeck` harness; the seed is enqueued by the production `Ctrl+N` new-pane flow and delivered by `ui::process_pending_seed_prompts`.
-- **Agent:** none — `common::write_late_announcing_agent`, a `claude`-named stand-in whose announcement latency is a PARAMETER. It emits a `wrapper_fork`-origin `SessionStart` at exec (which resolves an agent type for the pane without announcing a conversation — the same standing the daemon's card-surfacing start confers), withholds its genuine `SessionStart` for 3 s, then reads stdin and reports each line back as a `UserPromptSubmit`.
+- **Agent:** none — `common::write_late_announcing_paste_agent`, a `claude`-named stand-in whose announcement latency is a parameter. It emits a `wrapper_fork`-origin `SessionStart` at exec, withholds its genuine `SessionStart` for 3 s, then reports the built-in dispatcher's bracketed-paste seed as one `UserPromptSubmit`.
 - **Asserts:** three things, in the order they can fail. The stand-in's PTY input queue is EMPTY at the instant it announces (`clean`) — nothing was typed into a program that had not started reading. Then the seed arrives and the card's prompt history carries it (`AgentRecord.live.last_user_prompt`), i.e. the agent ACTED on it. Then exactly one copy of the seed was ever typed in, so the single bounded replacement payload (`MAX_PAYLOAD_SUBMISSIONS`) is still available to whatever genuinely needs it.
 - **The ordering is read from the INPUT QUEUE, not from the screen, and that is the whole design.** A PTY buffers a premature write and hands it over the moment the agent starts reading, so the seed's text arrives — and is visible in the pane — whether or not the delivery was sound. The stand-in therefore drains its own tty non-blockingly (`stty -icanon min 0 time 0`, then one `dd`) immediately BEFORE announcing, and labels what it finds `premature|` rather than `received|`. A blocking read cannot tell the two apart at all, which is why no existing test could see this. The probe reports `probe-failed|…` rather than degrading to silence, so the assertion is on `clean` being PRESENT, never on `premature|` being absent.
 - **Why it is lane 1, and why the delay is 3 s.** `prompt/new-pane/016` covers the same user-visible scenario with a real agent, and issue #1006 measured that it passed with the bug present: it is lane 2 (so it runs in no CI anywhere) AND its `claude` booted fast enough to win the race the test exists to exercise. `/016` has since been put behind the same delaying launcher and can now fail, but it stays lane 2 — dropping the `e2e-live` term here is what puts the ordering in front of every PR, with no credential and no token spend. 3 s is comfortably past the 500 ms `SPAWN_TIME_READINESS_BUFFER` the broken gate writes on and comfortably short of the 10 s `timeout_ready` slow path, which would deliver the seed for an unrelated reason and make the test green on a broken product.
@@ -1723,24 +1709,6 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** selection moves; pressing `Enter` does not switch tabs or open any dialog from a selected card.
 - **Does not assert:** the broken `Enter`-to-jump behavior tracked in [#68](https://github.com/vfarcic/dot-agent-deck/issues/68); see deliberate skips.
 - **Platform coverage:** mac+linux.
-
-#### focus/mode-tab
-
-##### focus/mode-tab/001 — `j` / `k` cycle focus through agent → side panes → agent on a mode tab.
-- **Layer:** L2.
-- **Agent:** none (two persistent side panes from a fixture mode).
-- **Asserts:** the cyan focus border moves through panes in order and wraps.
-- **Does not assert:** focus during PaneInput mode (PaneInput pins focus on the active pane).
-- **Platform coverage:** mac+linux.
-
-##### focus/mode-tab/002 — `Esc` from a focused side pane returns focus to the agent pane.
-- **Layer:** L2.
-- **Agent:** none.
-- **Asserts:** focus indicator jumps to the agent pane region.
-- **Does not assert:** focus persistence across tab switches.
-- **Platform coverage:** mac+linux.
-
-#### focus/orchestration
 
 ##### focus/orchestration/001 — `1`–`9` on an orchestration tab jumps to role pane N and focuses it.
 - **Layer:** L2.
@@ -1782,57 +1750,6 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Platform coverage:** mac+linux.
 
 #### tabs/mode
-
-##### tabs/mode/001 — Selecting a mode on the new-pane form opens a mode tab with the agent pane on the left and persistent side panes stacked on the right; both side panes render SIMULTANEOUSLY under the deck's default (Stacked) global `pane_layout` (PRD #311 regression guard).
-- **Layer:** L2 (PTY-attached, `tests/e2e_mode_tab_layout.rs`).
-- **Agent:** none (fixture `tests/fixtures/mode-two-side-panes` with TWO persistent side panes, each printing a unique sentinel and idling).
-- **Asserts:** the new-pane form's Mode selection opens a Mode tab (tab strip appears); with the deck's default `PaneLayout::Stacked` global, BOTH side panes' sentinels are visible in the grid at the same time — proving the Mode tab's side-pane column (hardcoded `PaneLayout::Tiled` in `render_mode_tab`, `src/ui.rs`) does not read the shared global `pane_layout` field (PRD #311's Open Question 2 risk) and so never collapses a side pane to a titled 1-row frame regardless of the global's value.
-- **Does not assert:** the side pane's command output content beyond the sentinel line; the agent pane's exact left-half geometry (covered by `compute_frame_layout_mode_geometry`, a plain unit test in `src/ui.rs`); orchestration/dashboard pane-column geometry (covered by `orchestration/layout/002`).
-- **Platform coverage:** mac+linux.
-
-##### tabs/mode/002 — `Ctrl+w` on a mode tab tears down the entire workspace (agent + all side panes).
-- **Layer:** L2.
-- **Agent:** none.
-- **Asserts:** tab disappears; the daemon's `list_agents` no longer returns the agent that lived in the tab.
-- **Does not assert:** side panes' shells receive SIGTERM vs SIGKILL (an implementation detail).
-- **Platform coverage:** mac+linux.
-
-##### tabs/mode/003 — Reactive rule routes a matching agent bash command to a reactive side pane.
-- **Layer:** L2.
-- **Agent:** none (synthetic `PostToolUse` event for a `Bash` tool whose command matches a rule's pattern).
-- **Asserts:** the reactive side pane is populated; its title reflects the matched command.
-- **Does not assert:** the rule's regex internals (covered by `config_validation` pure-data tests).
-- **Platform coverage:** mac+linux.
-
-##### tabs/mode/004 — Once all reactive slots are full, the next match reuses the oldest slot (circular pool).
-- **Layer:** L2.
-- **Agent:** none.
-- **Asserts:** three distinct matches against a 2-slot pool leave the second and third matches visible; the first is gone.
-- **Does not assert:** slot reuse ordering beyond "oldest first".
-- **Platform coverage:** mac+linux.
-
-##### tabs/mode/005 — A `[[modes]]` mode carrying a `seed_prompt` auto-delivers it to the agent pane once the agent is ready (gated, like orchestrations); a mode without one delivers nothing (PRD #127 M3.1).
-- **Layer:** L2.
-- **Agent:** none — a fixture "recorder" agent that self-posts `SessionStart` (the readiness signal) via the real `dot-agent-deck hook` path, then records every prompt written into its PTY stdin.
-- **Asserts:** spawning the seeded mode via the new-pane dialog delivers the configured `seed_prompt` into the agent pane after the agent signals readiness (the marker is recorded); spawning a mode without a `seed_prompt` starts the agent but records no auto-delivered prompt.
-- **Does not assert:** which gate path fires (SessionStart fast path vs the slow-path fallback) — only that delivery is gated on readiness, not ungated/immediate; the serde round-trip of `seed_prompt` (covered by a coder unit test).
-- **Platform coverage:** mac+linux.
-
-##### tabs/mode/006 — A persistent side pane keeping the default `watch = true` shows its command's output while the command is still running (issue #367).
-- **Layer:** L2.
-- **Agent:** none (fixture whose single mode has one persistent pane running `printf …; sleep 600` under the default watch wrapper).
-- **Asserts:** a sentinel assembled at runtime by the command — so it cannot appear in the command line the pane's shell echoes — is visible in the side pane although the command never exits; the echoed wrapper invocation is gone from the pane, proving the watcher cleared the screen ahead of its first output rather than after process exit.
-- **Does not assert:** the 10s re-run interval; the ordering of interleaved stdout/stderr; the buffer-then-clear internals (covered by `watch::tests` unit tests).
-- **Platform coverage:** mac+linux.
-
-##### tabs/mode/007 — A mode's `seed_prompt` reaches an agent that never signals readiness, through the 10-second fallback and no sooner than its readiness buffer allows (issue #529).
-- **Layer:** L2 (lane 1).
-- **Agent:** none — `tabs/mode/005`'s recorder with its `SessionStart` line removed, so nothing announces a conversation and only the `timeout_ready` fallback in `process_pending_seed_prompts` can open the pane.
-- **Asserts:** spawning the `seeded` mode via the new-pane dialog with that silent recorder still delivers the configured `seed_prompt` into the agent pane (the marker is recorded within 30 s), and it is observed more than 10.5 s after the test began typing the spawn. That instant precedes the seed's `created_at` anchor, so with the buffer in place the bound holds by construction and cannot flake on a slow box.
-- **Does not assert:** the 500 ms boundary itself. Spawn latency and render-frame jitter are the same order as the buffer, so the pre-fix code can also clear 10.5 s here; `prompt/pane-input/040` is the discriminator, at L1 with explicit instants. Also not: the orchestrator remit's fallback (L1 only, same entry), or confirmation and retry after the write.
-- **Platform coverage:** mac+linux.
-
-#### tabs/orchestration
 
 ##### tabs/orchestration/001 — Selecting an orchestration on the new-pane form opens one pane per role with the orchestrator's pane in focus.
 - **Layer:** L2.
@@ -2338,14 +2255,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 ##### lifecycle/stop/017 — A partially failed tab close stays visible and succeeds on retry.
 - **Layer:** L2 (real-binary PTY against a protocol-faithful scripted daemon).
-- **Agent:** none (a hydrated Mode tab with one agent pane and one persistent side pane; the side pane's first StopAgent is denied and its retry succeeds).
+- **Agent:** none (a hydrated two-role orchestration; the worker's first StopAgent is denied and its retry succeeds).
 - **Asserts:** the first confirmed whole-tab close removes the successful pane, retains the failed pane and its tab/`×`, and renders that the tab was kept; after switching into the retained tab, a second confirmed close removes the failed pane, daemon record, and tab.
 - **Does not assert:** an exact count of `close_pane` calls; the observable retry outcome is the contract.
 - **Platform coverage:** mac+linux.
 
 ##### lifecycle/stop/018 — Already-gone and unverified-success panes do not block whole-tab removal.
 - **Layer:** L2 (real-binary PTY against a protocol-faithful scripted daemon).
-- **Agent:** none (two hydrated one-pane Mode tabs: exact id-scoped NotFound with an empty slot, then exact NotFound whose ListAgents verification fails).
+- **Agent:** none (two hydrated orchestration tabs: exact id-scoped NotFound, then NotFound whose ListAgents verification fails).
 - **Asserts:** both outcomes remove the tab; the proven-gone close renders no unattended-agent warning, while DoneUnverified renders exactly one such warning on the live status line.
 - **Does not assert:** warning expiry timing or terminal styling.
 - **Platform coverage:** mac+linux.
@@ -2772,23 +2689,14 @@ note).
 - **M1 status (PRD #84):** **Flag / invariant-check (riskiest entry).** The PRD risk row flags this symptom as possibly a vt100/parser issue below scope. The current code resizes panes on every layout-change path (`Action::ToggleLayout` routes through `resize_*_panes`), so the area/PTY mismatch that would scramble the bottom rows self-heals and is not deterministically observable through the harness. Written as an invariant guard on bottom-row content (PTY size == inner area, observed via rendered content). If it reproduces deterministically after M4+M5, that's follow-up signal — NOT a reason to re-add the clamp.
 - **Post-M5 resolution (PRD #84):** **GREEN.** Stays green after M4+M5 and now runs with the M5 contract `debug_assert!` live in debug builds: a layout toggle that left a pane's PTY out of step with its rect would trip the debug assert instead of self-healing, so the guard exercises the layout-driven resize + 1:1 render contract rather than masking the race. No deterministic bottom-row scramble survived M4+M5 — no below-scope (vt100/parser) follow-up signal, and the clamp stays removed.
 
-##### render/layout/002 — Reactive pane recreation/replace leaves no scrambled fragments — the replacement pane renders cleanly.
+##### render/layout/002 — Closing an orchestration tab leaves no stale rendered fragment.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** after a pane is recreated/replaced in place (open a Mode tab, return to command mode, request its close with Ctrl+W, observe the tab-scoped confirmation, then choose Close with Down+Enter), the rendered grid contains the surviving Dashboard and no leftover fragment of the removed pane at a stale position.
+- **Asserts:** after opening an orchestration tab, returning to command mode and confirming its close, the rendered grid contains the surviving Dashboard and no fragment of the removed tab.
 - **Does not assert:** the exact recreation trigger internals; per-cell colours.
 - **Platform coverage:** mac+linux.
 - **M1 status (PRD #84):** **Flag / invariant-check.** Pane open/close and reactive recreation (`src/ui.rs:1510`, `:2147` areas) currently resize the affected PTYs on the spot, so any scramble is transient. Invariant guard on "no stale fragment after replace". GREEN target at M4/M5.
 - **Post-M5 resolution (PRD #84):** **GREEN.** Stays green after M4+M5 and now exercises the pane open/close replace through layout-driven resize + 1:1 widget render with the M5 contract `debug_assert!` live in debug builds — asserting the replace contract rather than masking a self-healing race.
-
-##### render/layout/003 — A mode switch (the `render_mode_tab` path) leaves no short-lived render artefacts after the transition settles.
-- **Layer:** L2.
-- **Agent:** none.
-- **Asserts:** after switching into a mode tab and quiescence, the rendered grid shows the destination layout cleanly with no leftover fragment from the dashboard/source layout.
-- **Does not assert:** mode-tab content semantics; the transient mid-transition frame.
-- **Platform coverage:** mac+linux.
-- **M1 status (PRD #84):** **Flag / invariant-check.** Mode switch (`src/ui.rs:2828` area) resizes panes through `resize_mode_tab_panes`, so artefacts are transient. Invariant guard on post-transition cleanliness. GREEN target at M4/M5.
-- **Post-M5 resolution (PRD #84):** **GREEN.** Stays green after M4+M5 and now exercises the `render_mode_tab` switch through layout-driven resize + 1:1 widget render with the M5 contract `debug_assert!` live in debug builds — asserting the mode-switch contract rather than masking a self-healing race.
 
 ##### render/layout/004 — A wrapped button bar costs the dashboard exactly one extra row of its height budget (PRD #144).
 - **Layer:** L1 (in-process `TestBackend` via `render_button_bar_with_bindings_to_buffer`; no PTY, no subprocess).
@@ -3512,7 +3420,7 @@ without depending on the config struct API.
 - **Does not assert:** the daemon-side authoritative check, which issue #555 added behind this advisory one (`orchestration/identity/007`–`010`); a real-binary/PTY-attached end-to-end pass; the footer wording on a field where Enter only advances focus, or on the mode-locked schedule form (both covered by the `new_pane_form_footer_hint` unit test beside it).
 - **Platform coverage:** mac+linux+windows.
 
-##### orchestration/identity/006 — Cycling AWAY from the orchestration restores the directory-basename pre-fill, so a plain pane, a workload-mode pane or a `schedule`/`dispatcher` card is never left holding the `<folder>-orchestrator-N` suggestion (issue #638).
+##### orchestration/identity/006 — Cycling away from an orchestration restores the directory-basename pre-fill for a plain pane or built-in authoring card (issue #638).
 - **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests` — the real `handle_new_pane_form_key` arrow-key path against a `NewPaneFormState` built with the bare-basename pre-fill `transition_after_dir_pick` produces; no daemon, no PTY).
 - **Agent:** none.
 - **Asserts:** a form built with Name `"myproj"` and one orchestration, after Right selects the orchestration (control: `form.name == "myproj-orchestrator-1"`, so the failure below is attributable to the leave path and not to the whole suggestion), Left back to "No mode" restores `form.name == "myproj"` and submitting yields `Action::SpawnPane` with `req.name == "myproj"`; separately, two Rights landing on the built-in `schedule` option — the cycler orders orchestrations BEFORE it, so reaching it means passing over one — also leaves `form.name == "myproj"`.
@@ -3785,7 +3693,7 @@ without depending on the config struct API.
 - **Layer:** L1 (in-process `compute_frame_layout` + `render_frame` driven through a real `ratatui::Terminal<TestBackend>`, via `EmbeddedPaneController::for_render_only_tests()`; no PTY, no subprocess). Lives in `src/ui.rs`'s own `#[cfg(test)]` module (same pattern as `tabs/orchestration/003-005`) because the geometry helpers under test (`pane_stack_rects`, `stacked_expanded_index`, `render_terminal_panes`) are module-private and unreachable from `tests/*.rs`.
 - **Agent:** none (7 synthetic role pane ids, no backing PTYs).
 - **Asserts:** with no pane explicitly focused (so `stacked_expanded_index` falls back to the first role, `orchestrator`), the expanded role's OUTER rect height equals the full pane-column height with no rows ceded to collapsed frames; none of the other 6 roles' pane ids appear anywhere in the rendered grid (i.e. no `Borders::TOP` collapsed title block is drawn for a non-focused pane).
-- **Does not assert:** PTY resizing of the reclaimed area (`resize_panes_to_layout`); mode-tab side-pane geometry (covered by `tabs/mode/001`); the sidebar deck-card capacity math (covered by `orchestration/layout/001`).
+- **Does not assert:** PTY resizing of the reclaimed area (`resize_panes_to_layout`); the sidebar deck-card capacity math (covered by `orchestration/layout/001`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/layout/003 — `Ctrl+l` resolves to `Action::ToggleOrchestrationSplit`, and an orchestration tab's frame geometry is the default 34/66 split untoggled and the narrower-sidebar 25/75 split toggled (PRD #336).
@@ -3855,7 +3763,7 @@ without depending on the config struct API.
 - **Layer:** L1 (three `compute_frame_layout` passes over an `ActiveTabView::Dashboard`; no PTY, no TestBackend render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module for the same reason its siblings do — `compute_frame_layout`, `ActiveTabView` and `FrameContent` are module-private.
 - **Agent:** none (two synthetic pane ids; the layout pass is a pure function of its inputs and spawns nothing).
 - **Asserts:** the Dashboard is the SAME SHAPE as an orchestration tab — a card sidebar beside a stack of agent panes, sharing `right_column_pane_dims` — so zoom is worth the same there and resolves the same way. Unzoomed the split is the Dashboard's own **33/67**, not orchestration's 34/66, which is what fails this test if zoom is wired to `orchestration_layout_percents` instead of `dashboard_layout_percents`. Zoomed it is `(0, 100)`: zero-width sidebar, pane column across the whole 100-column frame. Unzooming restores **33/67 exactly** rather than leaving the tab on some third geometry — PRD #313's "the same key restores the previous view exactly", asserted on the Dashboard half. Finally, under `PaneLayout::Tiled` a zoomed Dashboard hands the FOCUSED pane the entire pane column while the non-focused pane collapses to ZERO reserved height, so M1's "other panes are not drawn" half holds here through the same effective-`Stacked` resolution `orchestration/layout/011` pins for the Orchestration arm.
-- **Does not assert:** the key that produces the toggle or its scoping (`orchestration/layout/007`, which covers both card-shaped tab kinds through the `tab_has_card_sidebar` predicate); that the Dashboard's zoom flag is independent of an orchestration tab's (they are separate fields on separate `Tab` variants, so no shared value exists to diverge); the `[Z]` marker on a zoomed Dashboard pane (`render/layout/006` pins the marker on the orchestration path, and the indicator is resolved once in `render_frame` for both); Mode tabs, which are deliberately excluded — two pane regions rather than sidebar-plus-panes, so "hide the sidebar" has no meaning there.
+- **Does not assert:** the key that produces the toggle or its scoping (`orchestration/layout/007`); that the Dashboard's zoom flag is independent of an orchestration tab's; the `[Z]` marker on a zoomed Dashboard pane (`render/layout/006` pins the marker on the orchestration path).
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/dispatch
@@ -4071,20 +3979,6 @@ without depending on the config struct API.
 - **Does not assert:** the agents' inner state (not preserved per docs); the daemon-vs-snapshot precedence (deferred to Phase 2 M2.2).
 - **Platform coverage:** mac+linux.
 
-##### session/restore/002 — A saved mode tab is restored as a full mode tab when the project's `.dot-agent-deck.toml` still has the mode.
-- **Layer:** L2.
-- **Agent:** none.
-- **Asserts:** after `--continue`, a tab with the mode's name appears and contains the persistent side panes.
-- **Does not assert:** any reactive pane content.
-- **Platform coverage:** mac+linux.
-
-##### session/restore/003 — A saved mode whose `.dot-agent-deck.toml` no longer carries the mode falls back to a plain dashboard pane with a stderr warning.
-- **Layer:** L2.
-- **Agent:** none.
-- **Asserts:** the saved pane becomes a dashboard card (not a mode tab); the harness's stderr capture contains a warning that names the missing mode.
-- **Does not assert:** any rendering of the warning inside the TUI.
-- **Platform coverage:** mac+linux.
-
 ##### session/restore/004 — A saved pane whose `dir` no longer exists is skipped with a stderr warning; other saved panes still restore.
 - **Layer:** L2.
 - **Agent:** none.
@@ -4123,7 +4017,7 @@ without depending on the config struct API.
 ##### session/restore/009 — An orchestration snapshot whose config no longer resolves falls back to a plain dashboard pane with a `session_warnings` message naming the missing orchestration (PRD #89 Phase 2b M2b.3 drift).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (the fallback pane runs `sleep 600`; no LLM).
-- **Asserts:** with a hand-staged `session.toml` whose `[panes.orchestration]` block references `config_name = "tdd-cycle"` while the project config at `project_path` defines only a renamed `renamed-orch` (a re-resolution drift), launching against an empty daemon with no flag restores the saved pane as a PLAIN dashboard card (its saved name `orchestrator`, with no `coder`/`reviewer` role panes — never a half-broken tab) AND surfaces a clear `session_warnings` message naming the missing orchestration (`tdd-cycle`), flushed to stderr on detach-quit. Mirrors the mode-tab drift fallback (`session/restore/003`, PRD #69 Path D/E).
+- **Asserts:** with a hand-staged `session.toml` whose `[panes.orchestration]` block references `config_name = "tdd-cycle"` while the project config defines only `renamed-orch`, launching against an empty daemon restores the saved pane as a plain dashboard card and emits a warning naming the missing orchestration.
 - **Does not assert:** the exact warning wording (only that it names the missing orchestration); the successful rebuild path (`session/restore/008`); which other panes survive when multiple are staged (only one is here).
 - **Platform coverage:** mac+linux.
 
@@ -4159,7 +4053,7 @@ without depending on the config struct API.
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (a test-owned executable named `opencode` runs `sleep 600`; no LLM or OpenCode hook event).
 - **Asserts:** restoring a saved plain pane whose command basename is `opencode` immediately renders an `Idle` card and never requires a hook event to replace the `No agent` placeholder identity.
-- **Does not assert:** OpenCode plugin delivery or later working/waiting transitions; restore fallback paths after a mode-tab failure.
+- **Does not assert:** OpenCode plugin delivery or later working/waiting transitions; orchestration restore fallback paths.
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/015 — A `session_warnings` entry flushed after `ratatui::restore()` escapes control characters in the daemon-supplied value it interpolates (issue #576).
@@ -4581,25 +4475,11 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** mode or orchestration paths (002–003).
 - **Platform coverage:** mac+linux.
 
-##### codex/spawn/002 — Mode-pane Codex commands launch through the Wrapper strategy (PRD #20, blocker 3).
-- **Layer:** L2 synthetic PTY-attached new-pane mode flow with PATH recorder stubs.
-- **Agent:** synthetic Codex recorder.
-- **Asserts:** selecting a workload mode while Command is bare `codex` injects the wrapped command into the mode pane, never bare Codex.
-- **Does not assert:** restore or orchestration paths.
-- **Platform coverage:** mac+linux.
-
 ##### codex/spawn/003 — Orchestration role Codex commands launch through the Wrapper strategy (PRD #20, blocker 3).
 - **Layer:** L2 synthetic PTY-attached new-pane orchestration flow with PATH recorder stubs.
 - **Agent:** synthetic Codex recorder as the start role.
 - **Asserts:** selecting an orchestration whose start-role command is bare `codex` launches the role through the wrapper exactly once.
 - **Does not assert:** scheduler role spawning (`scheduler/spawn/006`) or respawn.
-- **Platform coverage:** mac+linux.
-
-##### codex/spawn/004 — Restored mode-pane Codex commands launch through the Wrapper strategy (PRD #20, blocker 3).
-- **Layer:** L2 synthetic PTY-attached saved-session mode restore with PATH recorder stubs.
-- **Agent:** synthetic Codex recorder.
-- **Asserts:** a saved pane carrying `mode = "wrapped-mode"` and bare command `codex` rebuilds the mode tab and injects the wrapper command, never bare Codex.
-- **Does not assert:** fresh mode creation (`codex/spawn/002`) or plain restore (`codex/spawn/001`).
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/005 — Respawning an existing pane as Codex launches through the Wrapper strategy (PRD #20, blocker 3).
@@ -4634,7 +4514,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L2 synthetic PTY-attached new-pane orchestration flow with PATH recorder stubs.
 - **Agent:** synthetic `devbox run codex-big` launcher declared as Codex by the start role.
 - **Asserts:** the role executes exactly once as `dot-agent-deck wrap --agent codex -- devbox run codex-big`, and its visible card reads `Codex` at spawn without any delegated task or synthesized hook event.
-- **Does not assert:** `clear = true` re-create precedence (`codex/spawn/010`), mode panes (`codex/spawn/011`), or a real Codex process (`codex/spawn/012`).
+- **Does not assert:** `clear = true` re-create precedence (`codex/spawn/010`) or a real Codex process (`codex/spawn/012`).
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/010 — A current config declaration outranks command derivation across spawn and missing-record re-create without admitting learned identity into the exec line.
@@ -4642,13 +4522,6 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Agent:** synthetic Codex declaration applied to a command whose basename derives Claude Code.
 - **Asserts:** declared Codex beats the conflicting Claude derivation at initial spawn and on two same-pane missing-record `clear = true` re-creates; a conflicting learned badge observation cannot replace the declared badge or alter the byte-identical Codex wrapper exec record.
 - **Does not assert:** TOML parsing or the visible card (covered by `codex/spawn/009`); ordinary frozen-identity respawn precedence (covered by `codex/spawn/008`); daemon hook-socket ingestion.
-- **Platform coverage:** mac+linux.
-
-##### codex/spawn/011 — A config-declared Codex mode pane wraps and badges a shell-injected non-inferable launcher.
-- **Layer:** L2 synthetic PTY-attached new-pane mode flow with PATH recorder stubs.
-- **Agent:** synthetic `devbox run codex-big` launcher entered for a `[[modes]]` agent pane declared as Codex.
-- **Asserts:** the mode's shell-injection seam executes exactly `dot-agent-deck wrap --agent codex -- devbox run codex-big`, and the mode agent's Dashboard card reads `Codex` without a hook event.
-- **Does not assert:** restored mode panes, persistent side panes, orchestration roles (`codex/spawn/009`), or real Codex behavior.
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/012 — A real script-launched Codex role badges at spawn before its first prompt.
@@ -5128,21 +5001,21 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 
 ##### mouse/tabstrip/001 — Clicking a tab header switches to that tab.
 - **Layer:** L2.
-- **Agent:** none (synthetic Mode tab).
-- **Asserts:** with Dashboard + a Mode tab open, clicking the inactive `Dashboard` header switches to it (the empty-dashboard state returns).
+- **Agent:** none (synthetic orchestration tab).
+- **Asserts:** with Dashboard + an orchestration tab open, clicking the inactive `Dashboard` header switches to it.
 - **Does not assert:** the `[×]` close affordance (covered by `mouse/tabstrip/002`).
 - **Platform coverage:** mac+linux.
 
-##### mouse/tabstrip/002 — Mode/Orchestration tabs carry a clickable `[×]` close affordance (Dashboard has none); clicking it closes the tab.
+##### mouse/tabstrip/002 — Orchestration tabs carry a clickable `[×]` close affordance (Dashboard has none); clicking it closes the tab.
 - **Layer:** L1 (glyph presence/absence) + L2 (click-to-close).
 - **Agent:** none.
-- **Asserts:** the strip renders exactly one `×` per closeable tab and none for the Dashboard; clicking a Mode tab's `[×]` leaves the tab intact behind the tab-scoped `Close this tab and all its panes?` Cancel-default confirmation, and Down+Enter then closes it.
+- **Asserts:** the strip renders one `×` per closeable tab and none for Dashboard; clicking an orchestration tab's `×` leaves it intact behind a Cancel-default confirmation, and Down+Enter closes it.
 - **Does not assert:** which tab gets focus after close.
 - **Platform coverage:** mac+linux (L1 half: +windows).
 
 ##### mouse/tabstrip/003 — An inactive tab's `×` binds confirmation to that stable tab while modal navigation is suppressed.
-- **Layer:** L2 (real-binary PTY with two distinct synthetic Mode tabs and production SGR mouse/key dispatch).
-- **Agent:** none (the `alpha` and `beta` fixture modes run long-lived side panes with unique rendered sentinel text).
+- **Layer:** L2 (real-binary PTY with two distinct synthetic orchestration tabs and production SGR mouse/key dispatch).
+- **Agent:** none (the `alpha` and `beta` orchestration start roles emit unique sentinel text).
 - **Asserts:** with `BETA_TAB_SENTINEL` active, clicking the inactive alpha tab's `×` arms alpha with tab-scoped copy; Ctrl+PageUp and Ctrl+PageDown leave beta rendered; confirmation removes alpha while beta and its single remaining `×` survive.
 - **Does not assert:** dashboard-session identity replacement (covered by `prompt/close-confirm/005`).
 - **Platform coverage:** mac+linux.
@@ -5201,8 +5074,8 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 
 ##### mouse/form/001 — The new-pane form is mouse-operable (field focus, mode chips, Submit/Cancel).
 - **Layer:** L1 (chip + button render) + L2 (click outcomes).
-- **Agent:** none (fixture with two modes).
-- **Asserts:** the form renders one clickable chip per mode option plus `[Submit]`/`[Cancel]`; clicking a field focuses it (typing lands there), clicking a chip selects that mode (title reflects it), `[Submit]` creates the pane, `[Cancel]` discards.
+- **Agent:** none (the `schedule` chip is selected but no authoring agent is submitted).
+- **Asserts:** the form renders clickable choice chips plus `[Submit]`/`[Cancel]`; clicking a field focuses it, clicking `[schedule]` selects it, `[Submit]` creates a plain pane, and `[Cancel]` discards.
 - **Does not assert:** command-field validation.
 - **Platform coverage:** mac+linux (L1 half: +windows).
 
@@ -5212,7 +5085,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Layer:** L2.
 - **Agent:** none (real `--continue` pane).
 - **Asserts:** double-click still focuses a card's pane (PaneInput); a non-button click in the pane region is not swallowed into a button action; a scroll in the pane region reaches the scroll path, not the button hit-test.
-- **Does not assert:** mode-tab click-to-focus, text-selection drag, Ctrl+click hyperlink, child-app forwarding (deferred in the test body with reasons).
+- **Does not assert:** orchestration-tab click-to-focus, text-selection drag, Ctrl+click hyperlink, child-app forwarding (deferred in the test body with reasons).
 - **Platform coverage:** mac+linux.
 
 ##### mouse/preserve/002 — Button clicks short-circuit; misses fall through.
@@ -5455,7 +5328,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Layer:** L1 (in-process production dashboard layout + render seam, whose recorded `focused_pane_rect` and `card_rects` feed the production wheel-routing seam over a real vt100 parser with a recording child-input channel; no PTY subprocess). L1 rather than L2 because every claim is about which in-process function receives which coordinates and which bytes the pane queues for the child — the routing decision, the real dashboard geometry and "the agent received nothing" are all directly observable in process, whereas a PTY-attached deck could only infer routing from rendered output and could not observe a non-forwarded event at all.
 - **Agent:** none (synthetic newline-terminated pane history; one focused pane beside synthetic Idle session cards).
 - **Asserts:** a wheel at an off-centre point inside the focused pane's content area is delivered as exactly that cell in all four mode × child-mouse cells, with the forwarded SGR report carrying the pointer's own 1-based cell and a deck-owned scroll genuinely moving the view; a wheel at the corners and centre of every deck card the production dashboard painted — each one proven disjoint from the pane's content area first, so "over a card" and "over the pane" are genuinely different questions — is dropped entirely, with nothing delivered, no bytes to the child and the deck's view unmoved, in both PaneInput-with-child-mouse and command mode, against a fixture with nonzero retained depth so "unmoved" is not vacuous; a sweep of **every cell of a whole frame** delivers to exactly the content area's cells and to nothing else, and every delivered cell equals the pointer's own offset rather than a saturated one; and a frame that drew no pane at all drops the wheel rather than falling back to raw screen coordinates.
-- **Does not assert:** that a wheel over the deck's card list scrolls the card grid (it is dropped, by decision — `UiState::scroll_offset` is written only in the render pass, so there is no card-grid scroll model to route to); mode-tab side-pane wheel routing, which hit-tests its own rects earlier in the same arm; real terminal mouse-report decoding; which pane the deck considers focused; or real-agent behavior.
+- **Does not assert:** that a wheel over the deck's card list scrolls the card grid (it is dropped, by decision — `UiState::scroll_offset` is written only in the render pass, so there is no card-grid scroll model to route to); real terminal mouse-report decoding; which pane the deck considers focused; or real-agent behavior.
 - **Platform coverage:** mac+linux+windows.
 
 #### mode/live
@@ -5805,7 +5678,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 ##### scheduler/manager/002 — Editing a schedule reuses the Ctrl+n dir-picker + mode-locked Edit Schedule form; submitting spawns the seeded authoring agent running the CONFIGURED command (`default_command`), pre-filled with the row's current values (PRD #127 M3.3; PRD #170 M2.1 + unified Add/Edit flow).
 - **Layer:** L2 (same no-L1-seam reason for the manager dialog; the mode-locked form's render is covered at L1 by `scheduler/form/001`). Two shims are on PATH: a distinctive `default_command` (e.g. `stub-authoring`) shimmed to a recorder that posts SessionStart and records its delivered seed, and `claude` shimmed to a separate neutralizing recorder (so the host's real `claude` is never invoked and so a fall-back-to-`claude` regression is observable).
-- **Agent:** the shimmed authoring agent (records the gated-delivered seed, mirroring how `tabs/mode/005` observes seed delivery).
+- **Agent:** the shimmed authoring agent (records the built-in seed after gated delivery).
 - **Asserts:** with `default_command` set to the distinctive stub, pressing `e` on a row opens the directory picker (` Select Directory `); confirming the dir with Space opens the mode-locked ` Edit Schedule ` form (Command pre-filled from `default_command`); submitting via `[Submit]` spawns the seeded authoring agent running THAT configured command — its recorder receives the authoring seed carrying the row's current prompt value (pre-fill), AND the `claude` recorder receives nothing (the confirmed command came from `default_command`). RED until the unified flow exists: today `e` opens the deleted pick-agent modal, so the dir picker's ` Select Directory ` chrome never renders and the wait times out.
 - **Does not assert:** the full authoring seed-prompt text; that the agent ultimately calls `schedule update` (covered by the CLI + seed-delivery mechanism); the add (blank) path (covered by `scheduler/form/002` / `scheduler/manager/010`); the spawn-in-picked-dir / working_dir pre-seed (covered by `scheduler/form/002` / `scheduler/form/003`); the mode-locked form's render (covered by `scheduler/form/001`).
 - **Platform coverage:** mac+linux.
@@ -5859,10 +5732,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the whitespace-only variant of the fallback (the same code path); the mode-locked form's render (covered by `scheduler/form/001`).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/manager/016 — Wheel input over the Schedules dialog does not scroll a mode-tab side pane behind the modal (issue #142).
-- **Layer:** L2 (real TUI in a PTY; opens a synthetic `scroll` mode tab whose persistent right-hand side pane is filled with deterministic scrollback, then sends precise SGR wheel reports over the overlapping manager dialog).
-- **Agent:** none (the mode side pane runs a synthetic shell command; no LLM is invoked).
-- **Asserts:** after the side pane is scrolled into history and the manager is opened over it, wheel-down must first move the manager selection from `alpha` to `bravo`, then wheel-up must move it back to `alpha`, while the exposed side-pane marker sequence remains unchanged; the modal consumes the wheel events instead of leaking them to the pane behind it.
+##### scheduler/manager/016 — Wheel input over Schedules does not scroll an orchestration role pane behind it (issue #142).
+- **Layer:** L2 (real TUI in a PTY; opens a synthetic `scroll` orchestration whose start role fills its pane with deterministic scrollback, then sends SGR wheel reports over the dialog).
+- **Agent:** none (the role runs a shell command; no LLM is invoked).
+- **Asserts:** after scrolling the role pane into history, wheel-down and wheel-up move the manager selection while the exposed pane markers stay unchanged.
 - **Does not assert:** focused dashboard-pane wheel behavior; child-app mouse forwarding; the manager list viewport behavior (covered by `scheduler/manager/017`).
 - **Platform coverage:** mac+linux.
 

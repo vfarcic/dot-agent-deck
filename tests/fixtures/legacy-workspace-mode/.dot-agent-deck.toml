@@ -8,3 +8,7 @@ name = "keep-orch"
 name = "orchestrator"
 command = "cat"
 start = true
+
+[[orchestrations.roles]]
+name = "worker"
+command = "cat"

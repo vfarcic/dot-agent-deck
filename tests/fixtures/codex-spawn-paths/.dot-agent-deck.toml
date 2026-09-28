@@ -1,8 +1,5 @@
 default_command = "codex"
 
-[[modes]]
-name = "wrapped-mode"
-
 [[orchestrations]]
 name = "wrapped-orchestration"
 
@@ -10,3 +7,7 @@ name = "wrapped-orchestration"
 name = "orchestrator"
 command = "codex"
 start = true
+
+[[orchestrations.roles]]
+name = "worker"
+command = "cat"

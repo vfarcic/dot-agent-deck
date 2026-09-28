@@ -225,7 +225,7 @@ fn preserve_disabled_button_is_inert() {
 
     let grid = deck.snapshot_grid();
     assert!(
-        !grid.contains("No workspace modes config found"),
+        !grid.contains("No orchestration config found"),
         "clicking the disabled Generate button must not open the config-gen prompt:\n{grid}"
     );
     assert!(
