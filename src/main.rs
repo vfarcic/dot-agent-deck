@@ -730,10 +730,12 @@ enum AckStream {
 /// daemon keeps re-sending the pointer in that case, which the task file tells
 /// the worker to expect.
 ///
-/// `NoReply` is reported as acknowledged for the same reason
-/// [`send_signal_and_report_ack`] reports it as success — nothing here is
-/// evidence that it failed — and an older daemon, which does not know `ack`,
-/// answers exactly that way.
+/// Only a recognisable ack from the daemon with `accepted: true` prints
+/// "Acknowledged". `NoReply` — which is how a daemon older than `ack` answers,
+/// because it predates the verb — and a line that is not an ack this build
+/// understands are both reported on stderr as "could not confirm", still with
+/// exit 0: nothing proves the deck saw the ack, so the worker must not be told
+/// it did, and nothing proves it failed either, so the worker carries on.
 fn ack_report(reply: &AckReply) -> (AckStream, String) {
     use dot_agent_deck::hook::SocketReply;
     const CARRY_ON: &str = "this is harmless — carry on with your task.";
@@ -747,22 +749,22 @@ fn ack_report(reply: &AckReply) -> (AckStream, String) {
         AckReply::Malformed => not_confirmed("that is not a delivery id"),
         AckReply::NoPane => not_confirmed("not running inside a dot-agent-deck managed pane"),
         AckReply::Socket(SocketReply::Unreachable) => not_confirmed("the deck is not reachable"),
-        AckReply::Socket(SocketReply::NoReply) => (
-            AckStream::Stdout,
-            "Acknowledged. Carry on with your task.".to_string(),
-        ),
+        AckReply::Socket(SocketReply::NoReply) => {
+            not_confirmed("the deck did not answer; it may predate acknowledgements")
+        }
         AckReply::Socket(SocketReply::Line(line)) => match parse_signal_ack(line) {
-            Some(ack) if !ack.accepted => not_confirmed(&format!(
+            Some(ack) if ack.accepted => (
+                AckStream::Stdout,
+                "Acknowledged. Carry on with your task.".to_string(),
+            ),
+            Some(ack) => not_confirmed(&format!(
                 "the deck refused it{}",
                 ack.reason
                     .as_deref()
                     .map(|r| format!(": {r}"))
                     .unwrap_or_default()
             )),
-            _ => (
-                AckStream::Stdout,
-                "Acknowledged. Carry on with your task.".to_string(),
-            ),
+            None => not_confirmed("the deck's reply was not one this build understands"),
         },
     }
 }
@@ -3999,7 +4001,9 @@ mod tests {
     }
 
     /// Issue #1383: `ack` exits 0 whatever happens, and says on stderr — never
-    /// as a failure — when receipt could not be confirmed.
+    /// as a failure — when receipt could not be confirmed. Only an accepted ack
+    /// from the daemon prints "Acknowledged"; an unanswered one (an older
+    /// daemon) does not.
     #[test]
     fn ack_report_is_never_a_failure_and_says_what_happened() {
         use dot_agent_deck::hook::SocketReply;
@@ -4015,10 +4019,12 @@ mod tests {
                 AckReply::Socket(SocketReply::Line(accepted)),
                 AckStream::Stdout,
             ),
-            (AckReply::Socket(SocketReply::NoReply), AckStream::Stdout),
+            // An older daemon that does not know `ack` answers nothing: that
+            // must not read as "Acknowledged".
+            (AckReply::Socket(SocketReply::NoReply), AckStream::Stderr),
             (
                 AckReply::Socket(SocketReply::Line("not json".to_string())),
-                AckStream::Stdout,
+                AckStream::Stderr,
             ),
             (
                 AckReply::Socket(SocketReply::Line(refused)),

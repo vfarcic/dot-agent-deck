@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Weak};
 
 use chrono::{DateTime, Utc};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, oneshot};
 use tracing::warn;
 
 use crate::agent_pty::{AgentPtyRegistry, GuardedSendDetail};
@@ -4796,6 +4796,36 @@ async fn wait_for_worker_event(
     }
 }
 
+/// Issue #1383: does the way a delivery's in-place retry ended mean the
+/// silent-worker report must stay quiet?
+///
+/// The loop watches the same event stream as the report, with the same proof
+/// predicate ([`crate::delegate_retry::classify_event`] agrees with
+/// [`worker_event_proves_delivery`]), so a turn it saw is a turn the report
+/// would have seen. A lag or a closed bus suppresses, as in
+/// [`wait_for_worker_event`]. Every other end — the schedule ran out, a write
+/// was refused, the pane or agent went away, the loop was cancelled — is left to
+/// the report's own seq-conditional take: an ack, a `work-done` or a supersede
+/// has already removed the watch's record, and exhaustion is the case the report
+/// exists for. A quota block is not proof, exactly as it is not for the watch.
+/// An unknown end (the loop's task dropped its sender without sending) reports.
+fn silence_retry_end_proves_delivery(end: Option<crate::delegate_retry::RetryEnd>) -> bool {
+    use crate::delegate_retry::RetryEnd;
+    match end {
+        Some(RetryEnd::Received | RetryEnd::Lagged | RetryEnd::BusClosed) => true,
+        Some(
+            RetryEnd::Blocked
+            | RetryEnd::Cancelled
+            | RetryEnd::Superseded
+            | RetryEnd::PaneClosed
+            | RetryEnd::AgentExited
+            | RetryEnd::WriteStopped
+            | RetryEnd::Exhausted,
+        )
+        | None => false,
+    }
+}
+
 /// PRD #249 M3: where a silent-worker report is allowed to go — the orchestrator
 /// pane, plus everything needed to prove at write time that the pane is still the
 /// same orchestrator it was when the delegate went out. Captured as one value
@@ -4836,6 +4866,11 @@ struct SilenceWatch {
     /// dispatch when one is armed for this delivery, so the report can say how
     /// many there were. `None` when no retry runs.
     redeliveries: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// Issue #1383: resolves when the in-place retry for this delivery ends.
+    /// Once the window has passed in silence the report waits for it, so it is
+    /// never written while a re-delivery is still pending and the count it
+    /// quotes is final. `None` when no retry runs.
+    retry_done: Option<oneshot::Receiver<crate::delegate_retry::RetryEnd>>,
 }
 
 /// PRD #249 M3: make an undelivered delegate visible instead of silent.
@@ -4896,6 +4931,7 @@ fn arm_delegate_silence_watch(
     let SilenceWatch {
         window,
         redeliveries,
+        retry_done,
         target:
             SilenceReportTarget {
                 pane_id: orchestrator_pane_id,
@@ -4903,13 +4939,14 @@ fn arm_delegate_silence_watch(
                 orchestration,
             },
     } = watch;
-    let crate::agent_pty::ArmedSilenceWatch { seq, cancel } = armed;
+    let crate::agent_pty::ArmedSilenceWatch { seq, mut cancel } = armed;
     tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
         // `biased` polls the cancellation first on every wake, so a completion
         // that lands in the same instant as the window's expiry always wins.
-        let spoke = tokio::select! {
+        let mut spoke = tokio::select! {
             biased;
-            _ = cancel => {
+            _ = &mut cancel => {
                 tracing::debug!(
                     pane_id = %worker_pane_id,
                     role = %role,
@@ -4926,6 +4963,30 @@ fn arm_delegate_silence_watch(
                 window,
             ) => spoke,
         };
+        // Issue #1383: the window passed in silence, but an in-place retry for
+        // this delivery may still have a re-delivery pending — held back by a
+        // `SessionStart`, a probe's grace or a busy dispatch lock. Wait for the
+        // loop to end instead of reporting in the middle of it. The loop sees
+        // every event this watch would, so its end says whether a turn began.
+        if !spoke && let Some(retry_done) = retry_done {
+            spoke = tokio::select! {
+                biased;
+                _ = &mut cancel => {
+                    tracing::debug!(
+                        pane_id = %worker_pane_id,
+                        role = %role,
+                        seq,
+                        "delegate: silent-worker watch cancelled while the in-place retry ran; \
+                         no notice"
+                    );
+                    return;
+                }
+                end = retry_done => silence_retry_end_proves_delivery(end.ok()),
+            };
+        }
+        // What the report quotes: the window, or how long the watch actually
+        // waited when the retry kept it longer.
+        let window = window.max(std::time::Duration::from_secs(started.elapsed().as_secs()));
         // One-shot: consume our own record. A `false` means work-done, a
         // supersede or a pane close resolved this delegation while the window
         // ran and the cancellation had not been observed yet — suppress.
@@ -8526,7 +8587,9 @@ async fn dispatch_one_owned(
     // ever probes.
     let late_readiness_rx = late_readiness_rearm.as_ref().map(|_| event_tx.subscribe());
     // Issue #1383: decide BEFORE the write whether this delivery may be retried in
-    // place, and if so register it and subscribe now. Subscribing first is the
+    // place, and if so register it and subscribe now. The silent-worker watch's
+    // seq is known already and is registered with it, so an ack that lands while
+    // the first write is still in flight cancels that watch too (audit M3). Subscribing first is the
     // silence watch's reason above: a fast agent's first `Thinking` must not land
     // before the loop can see it. Registering first means an `ack` can never
     // arrive for a delivery the daemon does not know about yet.
@@ -8554,10 +8617,12 @@ async fn dispatch_one_owned(
                 && crate::delegate_retry::agent_type_supports_retry(retry_agent_type.as_ref()) =>
         {
             let rx = event_tx.subscribe();
-            let armed =
-                registry
-                    .pending_deliveries()
-                    .arm(&pane_id, &delivery_id, worker_agent_id, None);
+            let armed = registry.pending_deliveries().arm(
+                &pane_id,
+                &delivery_id,
+                worker_agent_id,
+                silence.as_ref().map(|(_, armed, _)| armed.seq),
+            );
             Some((armed, rx))
         }
         _ => None,
@@ -8897,15 +8962,12 @@ async fn dispatch_one_owned(
     // `Ambiguous` write may have left a PREFIX of the pointer in the composer, and
     // a retype would submit that prefix and the pointer as one turn.
     let redeliveries = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let mut retry_armed = false;
+    let mut retry_done = None;
     if let Some((armed_retry, retry_rx)) = pending_retry {
         let retry_seq = armed_retry.seq;
         match (submit_outcome, expected_worker_agent_id.as_deref()) {
             (Some(crate::agent_pty::GuardedSend::Applied), Some(worker_agent_id)) => {
-                let silence_seq = silence.as_ref().map(|(_, armed, _)| armed.seq);
-                registry
-                    .pending_deliveries()
-                    .attach_silence_seq(&pane_id, retry_seq, silence_seq);
+                let (done_tx, done_rx) = oneshot::channel();
                 tracing::info!(
                     pane_id = %pane_id,
                     role = %target_role,
@@ -8931,8 +8993,9 @@ async fn dispatch_one_owned(
                     orchestration: orchestration.clone(),
                     redeliveries: Arc::clone(&redeliveries),
                     silence_report_armed: delivered && silence.is_some(),
+                    done: Some(done_tx),
                 });
-                retry_armed = true;
+                retry_done = Some(done_rx);
             }
             _ => {
                 registry.pending_deliveries().finish(&pane_id, retry_seq);
@@ -8941,14 +9004,16 @@ async fn dispatch_one_owned(
     }
     // Issue #1383: with the retry armed, the silent-worker report is the "not
     // delivered" report for the whole schedule rather than a second one fired in
-    // the middle of it — so its window covers the schedule, plus a second of
-    // slack for the last re-delivery's own write. This exceeds
-    // `MAX_DELEGATE_NO_EVENT_WINDOW` for this delivery only; the clamp still
-    // governs the report whenever the retry is off.
-    if retry_armed && let Some((watch, _, _)) = silence.as_mut() {
-        watch.window = watch
-            .window
-            .max(retry_schedule.total_span() + std::time::Duration::from_secs(1));
+    // the middle of it — so once its window has passed it waits for the retry
+    // loop to END, however long a `SessionStart` postponement or a queued
+    // dispatch lock held the last attempt, rather than for a window computed
+    // from the schedule. This outlasts `MAX_DELEGATE_NO_EVENT_WINDOW` for this
+    // delivery only; the clamp still governs the report whenever the retry is
+    // off.
+    if let Some(done_rx) = retry_done
+        && let Some((watch, _, _)) = silence.as_mut()
+    {
+        watch.retry_done = Some(done_rx);
         watch.redeliveries = Some(Arc::clone(&redeliveries));
     }
     let Some((watch, armed, rx)) = silence else {
@@ -10852,6 +10917,7 @@ impl AppState {
                             orchestration: orchestration.clone(),
                         },
                         redeliveries: None,
+                        retry_done: None,
                     },
                 );
 
@@ -17967,6 +18033,7 @@ mod tests {
                     orchestration: None,
                 },
                 redeliveries: None,
+                retry_done: None,
             }),
             PointerQueueClock::new(registry.clone(), worker_pane.to_string(), None),
             None,
@@ -17983,6 +18050,261 @@ mod tests {
             "an identity-unresolved refusal must cancel the silence watch it armed, not leave a \
              taskless record behind to inflate the next watch's `superseded` counter"
         );
+    }
+
+    /// Issue #1383 audit M3: a worker can read its pointer and run `ack` while
+    /// the dispatch is still finishing the first write. That ack must cancel the
+    /// silent-worker watch as well as the retry, or the orchestrator is later
+    /// told an acknowledged worker never got its task. Park the first write on
+    /// the worker's held writer, ack the delivery the dispatch minted, then let
+    /// the write finish.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_ack_before_the_first_write_completes_cancels_the_silence_watch() {
+        const ORCH_PANE: &str = "early-ack-orch";
+        const WORKER_PANE: &str = "early-ack-worker";
+        const NOTICE: &str = "delegated worker went quiet";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn = |pane: &str, agent_type: crate::event::AgentType| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )]),
+                    agent_type: Some(agent_type),
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn stand-in")
+        };
+        let worker = spawn(WORKER_PANE, crate::event::AgentType::Codex);
+        let orch = spawn(ORCH_PANE, crate::event::AgentType::ClaudeCode);
+        let (event_tx, _event_rx) = broadcast::channel(64);
+
+        let writer = registry.hold_pane_writer_for_test(WORKER_PANE).await;
+        // A clone stays here for the whole test: a bus whose last sender is
+        // gone reads as closed, which suppresses the report by itself.
+        let dispatch = tokio::spawn(dispatch_one_owned(
+            registry.clone(),
+            event_tx.clone(),
+            None,
+            ORCH_PANE.to_string(),
+            "coder".to_string(),
+            WORKER_PANE.to_string(),
+            "do the task".to_string(),
+            None,
+            Some(SilenceWatch {
+                window: std::time::Duration::from_millis(300),
+                target: SilenceReportTarget {
+                    pane_id: ORCH_PANE.to_string(),
+                    agent_id: Some(orch.clone()),
+                    orchestration: None,
+                },
+                redeliveries: None,
+                retry_done: None,
+            }),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let delivery_id = loop {
+            if let Some(id) = registry
+                .pending_deliveries()
+                .pending_id_for_test(WORKER_PANE)
+            {
+                break id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dispatch never registered a pending delivery"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(
+            !dispatch.is_finished(),
+            "precondition: the first write is parked"
+        );
+        crate::daemon::handle_delivery_ack(
+            &registry,
+            &crate::event::AckSignal {
+                pane_id: WORKER_PANE.to_string(),
+                delivery_id,
+                agent_id: Some(worker.clone()),
+                token: None,
+            },
+        );
+        assert!(!registry.pending_deliveries().is_pending(WORKER_PANE));
+        drop(writer);
+        tokio::time::timeout(std::time::Duration::from_secs(30), dispatch)
+            .await
+            .expect("the dispatch finishes once the writer is free")
+            .expect("the dispatch does not panic");
+
+        // Well past the 300 ms window.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let orch_screen =
+            String::from_utf8_lossy(&registry.snapshot(&orch).expect("orchestrator")).into_owned();
+        assert!(
+            !orch_screen.contains(NOTICE),
+            "an acknowledged worker was reported silent: {orch_screen:?}"
+        );
+        assert!(
+            matches!(
+                registry.retire_silence_watch(WORKER_PANE),
+                crate::agent_pty::SilenceWatchRetirement::Nothing
+            ),
+            "the early ack must have cancelled the silent-worker watch"
+        );
+        drop(event_tx);
+        registry.shutdown_all();
+    }
+
+    /// Issue #1383 audit M6: a genuine `SessionStart` after the write holds the
+    /// retry's next attempt for a readiness interval. The silent-worker report
+    /// must wait for the retry loop to end rather than fire at its own window
+    /// while that attempt is still pending, and must then quote the final count.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_silence_report_waits_for_a_postponed_retry_and_quotes_its_final_count() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const ORCH_PANE: &str = "postponed-retry-orch";
+        const WORKER_PANE: &str = "postponed-retry-worker";
+        const ID: &str = "d-1383cafe";
+        const POINTER: &str =
+            "Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-1383cafe]";
+        const NOTICE: &str = "delegated worker went quiet";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn = |pane: &str, command: &str, agent_type: crate::event::AgentType| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some(command),
+                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )]),
+                    agent_type: Some(agent_type),
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn stand-in")
+        };
+        let worker = spawn(
+            WORKER_PANE,
+            "stty -echo && exec cat > /dev/null",
+            crate::event::AgentType::OpenCode,
+        );
+        let orch = spawn(ORCH_PANE, "/bin/cat", crate::event::AgentType::ClaudeCode);
+        let (event_tx, _) = broadcast::channel(64);
+
+        let silence = registry
+            .arm_silence_watch(WORKER_PANE, ORCH_PANE, Some(&worker))
+            .expect("arm the silent-worker watch");
+        let armed = registry
+            .pending_deliveries()
+            .arm(WORKER_PANE, ID, &worker, Some(silence.seq));
+        let retry_rx = event_tx.subscribe();
+        let watch_rx = event_tx.subscribe();
+        let first = registry
+            .write_and_submit_guarded_detailed(WORKER_PANE, POINTER, &worker, || async { true })
+            .await
+            .expect("first write");
+        assert_eq!(
+            first,
+            crate::agent_pty::GuardedSendDetail::Outcome(crate::agent_pty::GuardedSend::Applied)
+        );
+        settle_one_shot_payload_record(
+            &registry,
+            WORKER_PANE,
+            POINTER,
+            Some(crate::agent_pty::GuardedSend::Applied),
+        );
+        let redeliveries = Arc::new(AtomicU32::new(0));
+        let (done_tx, done_rx) = oneshot::channel();
+        let retry = crate::delegate_retry::spawn(crate::delegate_retry::DeliveryRetry {
+            registry: registry.clone(),
+            event_rx: retry_rx,
+            armed,
+            schedule: crate::delegate_retry::RetrySchedule::parse(Some("200")),
+            pane_id: WORKER_PANE.to_string(),
+            worker_agent_id: worker.clone(),
+            role: "coder".to_string(),
+            delivery_id: ID.to_string(),
+            pointer: POINTER.to_string(),
+            orchestration: None,
+            redeliveries: redeliveries.clone(),
+            silence_report_armed: true,
+            done: Some(done_tx),
+        });
+        // The agent announces its session after the pointer went in: the retry
+        // holds its one re-delivery for at least 500 ms, well past the report's
+        // 100 ms window and the schedule's nominal 400 ms span.
+        let session_start: AgentEvent = serde_json::from_value(serde_json::json!({
+            "session_id": "s",
+            "agent_type": "open_code",
+            "event_type": EventType::SessionStart,
+            "timestamp": "2026-09-28T00:00:00Z",
+            "pane_id": WORKER_PANE,
+            "agent_id": worker,
+        }))
+        .unwrap();
+        event_tx.send(BroadcastMsg::Event(session_start)).unwrap();
+        arm_delegate_silence_watch(
+            registry.clone(),
+            watch_rx,
+            SilenceWatch {
+                window: std::time::Duration::from_millis(100),
+                target: SilenceReportTarget {
+                    pane_id: ORCH_PANE.to_string(),
+                    agent_id: Some(orch.clone()),
+                    orchestration: None,
+                },
+                redeliveries: Some(redeliveries.clone()),
+                retry_done: Some(done_rx),
+            },
+            silence,
+            WORKER_PANE.to_string(),
+            worker.clone(),
+            "coder".to_string(),
+        );
+        let orch_screen = || {
+            String::from_utf8_lossy(&registry.snapshot(&orch).expect("orchestrator")).into_owned()
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+        assert_eq!(
+            redeliveries.load(Ordering::SeqCst),
+            0,
+            "precondition: the SessionStart held the re-delivery"
+        );
+        assert!(
+            !orch_screen().contains(NOTICE),
+            "the report fired while a re-delivery was still pending: {:?}",
+            orch_screen()
+        );
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(15), retry)
+                .await
+                .expect("the retry loop ends")
+                .expect("the retry loop does not panic"),
+            crate::delegate_retry::RetryEnd::Exhausted
+        );
+        assert_eq!(redeliveries.load(Ordering::SeqCst), 1);
+        let counted = "re-sent the task pointer into the same process 1 times";
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !orch_screen().contains(counted) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the report never arrived with the final count: {:?}",
+                orch_screen()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        registry.shutdown_all();
     }
 
     /// Mirrors `compose_delegate_silence_notice_carries_no_untrusted_interpolation`

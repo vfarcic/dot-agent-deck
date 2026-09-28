@@ -18,12 +18,20 @@
 //! pointer into the same pane on a bounded schedule while none arrives. It never
 //! respawns anything.
 //!
-//! Each re-delivery first reads the worker's screen. When the delivery id is
-//! visible there, the pointer is most likely parked unsubmitted in the agent's
-//! composer (issue #1243's shape), so the re-delivery is a submit-only probe (a
-//! bare Enter) rather than a second copy of the text. Otherwise the pointer is
-//! typed again with the same id, and the task file tells the worker that a
+//! Every re-delivery starts with a submit-only probe — a bare Enter — and reads
+//! the worker's screen. When the delivery id is visible there, the pointer is
+//! most likely parked unsubmitted in the agent's composer (issue #1243's shape),
+//! and the Enter is the whole re-delivery. When it is not visible, the screen
+//! cannot tell an empty composer from one holding the pointer where the screen
+//! does not show it, so the loop waits a short grace ([`probe_grace`]) for the
+//! turn that Enter would start, and types the pointer again, with the same id,
+//! only if the worker is still silent. A screen blanked by a resize since the
+//! pointer went in gets the Enter alone. The task file tells the worker that a
 //! repeated pointer is the same task.
+//!
+//! That ordering makes a doubled pointer unlikely, not impossible: a composer
+//! that neither shows its text nor submits it on Enter, or an agent that starts
+//! a turn without reporting one within the grace, still gets a second copy.
 //!
 //! What this is not: a receipt for the work. An ack claims only that the worker
 //! read its task file.
@@ -61,12 +69,15 @@ pub const MAX_RETRY_WAIT: Duration = Duration::from_secs(300);
 /// one delegation into an unbounded stream of re-deliveries.
 pub const MAX_RETRY_ENTRIES: usize = 8;
 
-/// When a re-delivery happens, as the silences that precede each one.
+/// When a re-delivery happens, as the waits that precede each one.
 ///
-/// Entry *i* is how long the worker may stay silent after write *i* before
-/// re-delivery *i + 1*. After the last re-delivery the loop waits the last
-/// entry once more before declaring the delivery exhausted, so N entries give N
-/// re-deliveries and a total span of `sum + last`.
+/// Entry *i* is the wait from the first write (for *i* = 0) or from the start of
+/// re-delivery *i* to the start of re-delivery *i + 1*; a probe's grace and its
+/// retype come out of that wait. After the last re-delivery the loop waits the
+/// last entry once more before declaring the delivery exhausted, so N entries
+/// give N re-deliveries and a nominal span of `sum + last`. A `SessionStart`
+/// postponement or a busy dispatch lock can stretch any wait; the silent-worker
+/// report waits for the loop's real end rather than for this span.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetrySchedule {
     waits: Vec<Duration>,
@@ -164,7 +175,8 @@ impl RetrySchedule {
     }
 
     /// From the first write to the moment the loop declares exhaustion, not
-    /// counting any postponement: every wait, plus the last one once more.
+    /// counting any postponement or time spent queued for the pane: every wait,
+    /// plus the last one once more.
     pub fn total_span(&self) -> Duration {
         let sum: Duration = self.waits.iter().sum();
         sum + self.waits.last().copied().unwrap_or_default()
@@ -262,6 +274,15 @@ pub enum EventVerdict {
 ///
 /// An exhaustive `match`, so a new [`EventType`] has to be classified on
 /// purpose.
+///
+/// **Trust bound (audit M5).** These events arrive as raw `AgentEvent`s, which
+/// carry no provenance token for any agent today (`docs/develop/hook-provenance.md`),
+/// so a process running as the same user that knows a worker's pane and agent
+/// ids can forge a `Thinking` and stop that worker's retry. Requiring
+/// attestation here would stop the retry for every real hook too. What a forged
+/// event can cause is bounded at the behaviour before #1383: the pointer is not
+/// re-sent, and the silent-worker report still covers a worker that then says
+/// nothing.
 pub fn classify_event(event: &AgentEvent) -> EventVerdict {
     match event.event_type {
         EventType::Thinking
@@ -295,15 +316,16 @@ pub fn classify_event(event: &AgentEvent) -> EventVerdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Composer {
     /// The delivery id is on screen: the pointer is most likely sitting in the
-    /// composer, unsubmitted. Re-deliver with a submit-only probe.
+    /// composer, unsubmitted. The re-delivery is the submit-only probe alone.
     PointerVisible,
     /// The screen shows nothing at all, and the PTY was resized since the
     /// pointer was typed. A resize drops the scrollback ring the screen is read
     /// from, so a blank screen then says nothing about the composer — an agent
-    /// that has not repainted still holds whatever it held. Treated like
-    /// [`Self::PointerVisible`]: a submit-only probe, never a second copy.
+    /// that has not repainted still holds whatever it held. The re-delivery is
+    /// the submit-only probe alone, never a second copy.
     Unreadable,
-    /// No trace of it: re-type the pointer.
+    /// No trace of it on screen — which is not proof the composer is empty. The
+    /// probe, then a retype only after an unanswered grace.
     Absent,
 }
 
@@ -314,9 +336,9 @@ pub enum Composer {
 /// composer's border glyphs and padding around the split — is still found.
 ///
 /// **Biased toward [`Composer::PointerVisible`] on purpose.** A false positive,
-/// for example a submitted pointer still visible in the transcript, costs one
-/// Enter on an empty composer, which the supported agents' TUIs ignore. A false
-/// negative costs a second copy of the pointer in the composer.
+/// for example a submitted pointer still visible in the transcript, costs a
+/// retype that never happens. A false negative costs a probe's grace and then,
+/// if the worker stays silent through it, a second copy of the pointer.
 ///
 /// `resized_since_write` is whether the PTY geometry moved since the pointer
 /// was last typed; see [`Composer::Unreadable`].
@@ -404,6 +426,10 @@ pub struct PendingDeliveries {
 impl PendingDeliveries {
     /// Register a delivery for `pane_id`, replacing (and so cancelling) any
     /// older one.
+    ///
+    /// `silence_seq` is the silent-worker watch armed for the same delivery,
+    /// given here — before the first write — so an ack that arrives while that
+    /// write is still in flight cancels the watch too (audit M3).
     pub fn arm(
         &self,
         pane_id: &str,
@@ -428,17 +454,6 @@ impl PendingDeliveries {
         ArmedDelivery {
             seq,
             cancel: cancel_rx,
-        }
-    }
-
-    /// Record the silent-worker watch armed for the pane's current delivery, so
-    /// an ack can cancel it too. A no-op unless `seq` is still current.
-    pub fn attach_silence_seq(&self, pane_id: &str, seq: u64, silence_seq: Option<u64>) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(record) = inner.records.get_mut(pane_id)
-            && record.seq == seq
-        {
-            record.silence_seq = silence_seq;
         }
     }
 
@@ -519,6 +534,18 @@ impl PendingDeliveries {
             .is_some_and(|r| r.seq == seq)
     }
 
+    /// The pane's pending delivery id, for tests that must ack a delivery the
+    /// dispatch minted.
+    #[cfg(test)]
+    pub(crate) fn pending_id_for_test(&self, pane_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .records
+            .get(pane_id)
+            .map(|record| record.delivery_id.clone())
+    }
+
     /// Whether anything is pending for `pane_id`.
     pub fn is_pending(&self, pane_id: &str) -> bool {
         self.inner.lock().unwrap().records.contains_key(pane_id)
@@ -591,6 +618,11 @@ pub(crate) struct DeliveryRetry {
     /// Whether a silent-worker report will cover exhaustion. When it will not,
     /// the loop logs exhaustion itself.
     pub silence_report_armed: bool,
+    /// Told how the loop ended, once it has. The silent-worker report waits on
+    /// it, so the report is never written while a re-delivery is still pending
+    /// — however far a `SessionStart` or a busy dispatch lock pushed one — and
+    /// the count it quotes is final.
+    pub done: Option<oneshot::Sender<RetryEnd>>,
 }
 
 /// Spawn the retry loop onto its own task. The dispatch returns as it does
@@ -600,11 +632,97 @@ pub(crate) fn spawn(retry: DeliveryRetry) -> tokio::task::JoinHandle<RetryEnd> {
     tokio::spawn(run(retry))
 }
 
+/// The longest a submit-only probe waits for proof of a turn before the pointer
+/// is typed again. See [`probe_grace`].
+pub const PROBE_GRACE: Duration = Duration::from_secs(5);
+
+/// How long a submit-only probe over a screen that does not show the pointer
+/// waits before the pointer is retyped: [`PROBE_GRACE`], or half the wait before
+/// the next re-delivery when that is shorter, so the retype always lands before
+/// the next attempt is due.
+pub fn probe_grace(next_wait: Duration) -> Duration {
+    PROBE_GRACE.min(next_wait / 2)
+}
+
+/// The signals a retry loop waits on between writes.
+struct Watch {
+    cancel: oneshot::Receiver<()>,
+    closing: oneshot::Receiver<()>,
+    exited: oneshot::Receiver<()>,
+    event_rx: broadcast::Receiver<BroadcastMsg>,
+}
+
+impl Watch {
+    /// Wait until `due` for proof or for anything that ends the loop. `Ok` when
+    /// the time passed with neither.
+    ///
+    /// A genuine `SessionStart` pushes `due` out once per call by a readiness
+    /// interval, so the next write lands after the boot rather than inside it —
+    /// and after issue #1031's own submit probe, when that one is armed too.
+    async fn until(
+        &mut self,
+        mut due: tokio::time::Instant,
+        pane_id: &str,
+        worker_agent_id: &str,
+        role: &str,
+        delivery_id: &str,
+    ) -> Result<(), RetryEnd> {
+        let mut postponed = false;
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut self.cancel => return Err(RetryEnd::Cancelled),
+                _ = &mut self.closing => return Err(RetryEnd::PaneClosed),
+                _ = &mut self.exited => return Err(RetryEnd::AgentExited),
+                msg = self.event_rx.recv() => match msg {
+                    Ok(BroadcastMsg::Event(event)) => {
+                        if event.pane_id.as_deref() != Some(pane_id)
+                            || event.agent_id.as_deref() != Some(worker_agent_id)
+                        {
+                            continue;
+                        }
+                        match classify_event(&event) {
+                            EventVerdict::Received => return Err(RetryEnd::Received),
+                            EventVerdict::Blocked => return Err(RetryEnd::Blocked),
+                            EventVerdict::Postpone if !postponed => {
+                                postponed = true;
+                                let interval = crate::state::delegate_readiness_buffer()
+                                    .max(crate::prompt_delivery::REARM_READINESS_BUFFER);
+                                due = due.max(tokio::time::Instant::now() + interval);
+                                info!(
+                                    pane_id = %pane_id,
+                                    role = %role,
+                                    delivery_id = %delivery_id,
+                                    interval_ms = interval.as_millis(),
+                                    "delegate retry: the worker's agent announced a session \
+                                     after the pointer went in; holding the next re-delivery \
+                                     for a readiness interval"
+                                );
+                            }
+                            EventVerdict::Postpone | EventVerdict::Ignore => {}
+                        }
+                    }
+                    // Not evidence about this pane. Listed rather than
+                    // wildcarded so a future variant is classified on purpose.
+                    Ok(
+                        BroadcastMsg::OrchestrationSurface(_)
+                        | BroadcastMsg::WorktreeKept(_)
+                        | BroadcastMsg::Unknown,
+                    ) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => return Err(RetryEnd::Lagged),
+                    Err(broadcast::error::RecvError::Closed) => return Err(RetryEnd::BusClosed),
+                },
+                _ = tokio::time::sleep_until(due) => return Ok(()),
+            }
+        }
+    }
+}
+
 /// The loop body. See the module docs.
 pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
     let DeliveryRetry {
         registry,
-        mut event_rx,
+        event_rx,
         armed,
         schedule,
         pane_id,
@@ -615,100 +733,101 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
         orchestration,
         redeliveries,
         silence_report_armed,
+        done,
     } = retry;
-    let ArmedDelivery { seq, mut cancel } = armed;
-    let mut closing = registry.pane_close_signal(&pane_id);
-    let mut exited = registry.agent_exit_signal(&worker_agent_id);
+    let ArmedDelivery { seq, cancel } = armed;
+    let mut watch = Watch {
+        cancel,
+        closing: registry.pane_close_signal(&pane_id),
+        exited: registry.agent_exit_signal(&worker_agent_id),
+        event_rx,
+    };
     let waits = schedule.waits().to_vec();
     let total_attempts = waits.len();
+    let wait_at = |index: usize| {
+        waits
+            .get(index)
+            .or(waits.last())
+            .copied()
+            .unwrap_or_default()
+    };
     let mut last_classification: Option<Composer> = None;
     // The PTY geometry epoch the pointer's bytes were last typed at. A resize
     // clears the scrollback the composer is read from (PRD #104 M3), so after one
     // a blank screen is no evidence the pointer is gone.
     let mut pointer_epoch = registry.geometry_changes_of(&worker_agent_id);
+    // When the current wait began: the first write, then the start of each
+    // re-delivery. Each schedule entry is measured from here, so a probe's grace
+    // and its retype come out of the wait rather than stretching the schedule.
+    let mut anchor = tokio::time::Instant::now();
+    let redeliver_ctx = RedeliverCtx {
+        registry: &registry,
+        seq,
+        pane_id: &pane_id,
+        worker_agent_id: &worker_agent_id,
+        role: &role,
+        delivery_id: &delivery_id,
+        pointer: &pointer,
+        orchestration: orchestration.as_ref(),
+        total_attempts,
+    };
 
     let end = 'outer: {
         // One more wait than there are re-deliveries: the last is the silence
         // after the final re-delivery, before exhaustion is declared.
         for index in 0..=total_attempts {
-            let wait = waits
-                .get(index)
-                .or(waits.last())
-                .copied()
-                .unwrap_or_default();
-            let mut due = tokio::time::Instant::now() + wait;
-            let mut postponed = false;
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut cancel => break 'outer RetryEnd::Cancelled,
-                    _ = &mut closing => break 'outer RetryEnd::PaneClosed,
-                    _ = &mut exited => break 'outer RetryEnd::AgentExited,
-                    msg = event_rx.recv() => match msg {
-                        Ok(BroadcastMsg::Event(event)) => {
-                            if event.pane_id.as_deref() != Some(pane_id.as_str())
-                                || event.agent_id.as_deref() != Some(worker_agent_id.as_str())
-                            {
-                                continue;
-                            }
-                            match classify_event(&event) {
-                                EventVerdict::Received => break 'outer RetryEnd::Received,
-                                EventVerdict::Blocked => break 'outer RetryEnd::Blocked,
-                                EventVerdict::Postpone if !postponed => {
-                                    postponed = true;
-                                    let interval = crate::state::delegate_readiness_buffer()
-                                        .max(crate::prompt_delivery::REARM_READINESS_BUFFER);
-                                    due = due.max(tokio::time::Instant::now() + interval);
-                                    info!(
-                                        pane_id = %pane_id,
-                                        role = %role,
-                                        delivery_id = %delivery_id,
-                                        interval_ms = interval.as_millis(),
-                                        "delegate retry: the worker's agent announced a session \
-                                         after the pointer went in; holding the next re-delivery \
-                                         for a readiness interval"
-                                    );
-                                }
-                                EventVerdict::Postpone | EventVerdict::Ignore => {}
-                            }
-                        }
-                        // Not evidence about this pane. Listed rather than
-                        // wildcarded so a future variant is classified on
-                        // purpose.
-                        Ok(
-                            BroadcastMsg::OrchestrationSurface(_)
-                            | BroadcastMsg::WorktreeKept(_)
-                            | BroadcastMsg::Unknown,
-                        ) => {}
-                        Err(broadcast::error::RecvError::Lagged(_)) => break 'outer RetryEnd::Lagged,
-                        Err(broadcast::error::RecvError::Closed) => break 'outer RetryEnd::BusClosed,
-                    },
-                    _ = tokio::time::sleep_until(due) => break,
-                }
+            // Never sooner than the shortest wait from now, however long the
+            // previous write spent queued behind the pane's dispatch lock.
+            let due = (anchor + wait_at(index)).max(tokio::time::Instant::now() + MIN_RETRY_WAIT);
+            if let Err(end) = watch
+                .until(due, &pane_id, &worker_agent_id, &role, &delivery_id)
+                .await
+            {
+                break 'outer end;
             }
             if index == total_attempts {
                 break 'outer RetryEnd::Exhausted;
             }
             let attempt = index + 1;
-            match redeliver(
-                &registry,
-                seq,
-                &pane_id,
-                &worker_agent_id,
-                &role,
-                &delivery_id,
-                &pointer,
-                orchestration.as_ref(),
-                attempt,
-                total_attempts,
-                &mut pointer_epoch,
-            )
-            .await
+            anchor = tokio::time::Instant::now();
+            let composer =
+                match redeliver(&redeliver_ctx, Phase::Probe, attempt, &mut pointer_epoch).await {
+                    Attempt::Written(composer) => {
+                        last_classification = Some(composer);
+                        redeliveries.fetch_add(1, Ordering::SeqCst);
+                        composer
+                    }
+                    Attempt::Skipped => continue,
+                    Attempt::Stop(end) => break 'outer end,
+                };
+            // A resize-blanked screen gets the Enter and nothing more, as
+            // before this audit: the deck knows it cannot read that screen, and
+            // a worker that has not repainted since is one that may well hold
+            // the pointer already (`orchestration/delegate/043` attaches the
+            // worker pane, which resizes it, after the task was accepted).
+            if matches!(composer, Composer::PointerVisible | Composer::Unreadable) {
+                continue;
+            }
+            // The screen does not show the pointer, which cannot tell an empty
+            // composer from one holding the pointer off-screen or unechoed. The
+            // Enter just sent submits it in the second case, and the turn it
+            // starts is proof; only silence past the grace means there was
+            // nothing to submit.
+            let grace = probe_grace(wait_at(attempt));
+            if let Err(end) = watch
+                .until(
+                    anchor + grace,
+                    &pane_id,
+                    &worker_agent_id,
+                    &role,
+                    &delivery_id,
+                )
+                .await
             {
-                Attempt::Written(composer) => {
-                    last_classification = Some(composer);
-                    redeliveries.fetch_add(1, Ordering::SeqCst);
-                }
+                break 'outer end;
+            }
+            match redeliver(&redeliver_ctx, Phase::Retype, attempt, &mut pointer_epoch).await {
+                Attempt::Written(composer) => last_classification = Some(composer),
                 Attempt::Skipped => {}
                 Attempt::Stop(end) => break 'outer end,
             }
@@ -744,6 +863,10 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
             "delegate retry: stopped"
         ),
     }
+    if let Some(done) = done {
+        // The report may already have been cancelled; nobody listening is fine.
+        let _ = done.send(end);
+    }
     end
 }
 
@@ -753,20 +876,49 @@ enum Attempt {
     Stop(RetryEnd),
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn redeliver(
-    registry: &Arc<AgentPtyRegistry>,
+/// Which half of a re-delivery to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Every re-delivery starts with a submit-only probe: a bare Enter, which
+    /// submits a pointer still sitting in the composer and is ignored by an
+    /// empty one.
+    Probe,
+    /// After a probe over a screen that did not show the pointer went
+    /// unanswered: type the pointer again.
+    Retype,
+}
+
+/// The per-loop constants [`redeliver`] reads.
+#[derive(Clone, Copy)]
+struct RedeliverCtx<'a> {
+    registry: &'a Arc<AgentPtyRegistry>,
     seq: u64,
-    pane_id: &str,
-    worker_agent_id: &str,
-    role: &str,
-    delivery_id: &str,
-    pointer: &str,
-    orchestration: Option<&OrchestrationIdentity>,
-    attempt: usize,
+    pane_id: &'a str,
+    worker_agent_id: &'a str,
+    role: &'a str,
+    delivery_id: &'a str,
+    pointer: &'a str,
+    orchestration: Option<&'a OrchestrationIdentity>,
     total_attempts: usize,
+}
+
+async fn redeliver(
+    ctx: &RedeliverCtx<'_>,
+    phase: Phase,
+    attempt: usize,
     pointer_epoch: &mut Option<u64>,
 ) -> Attempt {
+    let RedeliverCtx {
+        registry,
+        seq,
+        pane_id,
+        worker_agent_id,
+        role,
+        delivery_id,
+        pointer,
+        orchestration,
+        total_attempts,
+    } = *ctx;
     // The dispatch lock, then the generation check: a newer delegation that took
     // the lock first has already superseded this record, so an old pointer can
     // never land after a new delegation starts.
@@ -775,8 +927,8 @@ async fn redeliver(
     if !registry.pending_deliveries().is_current(pane_id, seq) {
         return Attempt::Stop(RetryEnd::Superseded);
     }
-    // Never type onto a human's draft. The attempt still counts toward the
-    // bound.
+    // Never type onto a draft someone started since the deck's last write. The
+    // attempt still counts toward the bound.
     if registry.user_typed_since_automatic_write(pane_id) {
         info!(
             pane_id = %pane_id,
@@ -784,8 +936,9 @@ async fn redeliver(
             delivery_id = %delivery_id,
             attempt,
             total_attempts,
-            "delegate retry: someone has typed into the worker pane since the pointer went in; \
-             skipping this re-delivery"
+            phase = ?phase,
+            "delegate retry: someone has typed into the worker pane since the deck last wrote to \
+             it; skipping this re-delivery"
         );
         return Attempt::Skipped;
     }
@@ -797,16 +950,66 @@ async fn redeliver(
         ),
         Err(_) => return Attempt::Stop(RetryEnd::AgentExited),
     };
-    let text = match composer {
-        Composer::PointerVisible | Composer::Unreadable => "",
-        Composer::Absent => pointer,
+    let text = match (phase, composer) {
+        (Phase::Probe, _) => "",
+        // The unanswered Enter left it on screen: it is in the composer and a
+        // copy would double it.
+        (Phase::Retype, Composer::PointerVisible) => {
+            info!(
+                pane_id = %pane_id,
+                role = %role,
+                delivery_id = %delivery_id,
+                attempt,
+                total_attempts,
+                "delegate retry: the pointer appeared on the worker's screen after the Enter; not \
+                 retyping it"
+            );
+            return Attempt::Skipped;
+        }
+        (Phase::Retype, Composer::Unreadable) => {
+            info!(
+                pane_id = %pane_id,
+                role = %role,
+                delivery_id = %delivery_id,
+                attempt,
+                total_attempts,
+                "delegate retry: the worker's screen was cleared by a resize after the Enter; not \
+                 retyping into a composer the deck cannot read"
+            );
+            return Attempt::Skipped;
+        }
+        (Phase::Retype, Composer::Absent) => pointer,
     };
     let revalidate_registry = Arc::clone(registry);
     let revalidate_pane = pane_id.to_string();
     let expected_orchestration = orchestration.cloned();
+    // Issue #544 / PR #1398: this retype goes through the IMMEDIATE guarded
+    // entry, whose only draft check is "has someone typed since the deck's last
+    // automatic write" (the pre-check above and the writer's own). #1398's
+    // deferring first-write entry also defers on a draft that was already
+    // pending, or that the agent itself put in its composer. Switching this call
+    // to it is NOT a one-line swap: it returns `FirstWriteSend { detail,
+    // deferred }` rather than a `GuardedSendDetail`, so the match below changes;
+    // its wait runs while this function holds `pane_dispatch_lock`, so a
+    // superseding delegation queues behind it; and an ack, a `work-done` or a
+    // supersede can land during that wait, so the pending-delivery generation
+    // has to be revalidated after it (the closure below already re-checks it
+    // under the writer). The probe stays on this entry either way: #1398 exempts
+    // empty payloads, and #424's probe guard refuses one after typing.
     let outcome = registry
         .write_and_submit_guarded_detailed(pane_id, text, worker_agent_id, || async move {
             if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                return false;
+            }
+            // Issue #1383 audit (M4): an ack, a `work-done` or a newer
+            // delegation that removed this delivery while the write waited for
+            // the pane's writer must stop it here, under that writer, rather
+            // than type bytes after it. The ack path does not take the dispatch
+            // lock, so the check above cannot cover that wait.
+            if !revalidate_registry
+                .pending_deliveries()
+                .is_current(&revalidate_pane, seq)
+            {
                 return false;
             }
             crate::state::orchestration_still_matches(
@@ -837,16 +1040,34 @@ async fn redeliver(
                 total_attempts,
                 classification = ?composer,
                 "delegate retry: no proof the worker received its task pointer; {}",
-                match composer {
-                    Composer::PointerVisible =>
+                match (phase, composer) {
+                    (Phase::Probe, Composer::PointerVisible) =>
                         "the pointer is visible on its screen, so pressed Enter instead of retyping it",
-                    Composer::Unreadable =>
+                    (Phase::Probe, Composer::Unreadable) =>
                         "its screen was cleared by a resize since the pointer went in, so pressed \
                          Enter rather than risk typing a second copy",
-                    Composer::Absent => "re-typed the pointer into the same process",
+                    (Phase::Probe, Composer::Absent) =>
+                        "the pointer is not on its screen, which cannot tell an empty input box \
+                         from one holding it unshown, so pressed Enter first; the pointer is \
+                         retyped only if the worker stays silent",
+                    (Phase::Retype, _) =>
+                        "the worker stayed silent after the Enter, so re-typed the pointer into \
+                         the same process",
                 }
             );
             Attempt::Written(composer)
+        }
+        // Removed while the write waited on the writer: nothing was written.
+        Ok(_) if !registry.pending_deliveries().is_current(pane_id, seq) => {
+            info!(
+                pane_id = %pane_id,
+                role = %role,
+                delivery_id = %delivery_id,
+                attempt,
+                "delegate retry: the delivery was acknowledged, completed or superseded while the \
+                 re-delivery waited for the worker pane; nothing written"
+            );
+            Attempt::Stop(RetryEnd::Cancelled)
         }
         // A partial write: a prefix may be in the box, and a further attempt
         // could submit it. Stop, and leave the payload record standing (#715).
@@ -1248,12 +1469,12 @@ mod tests {
     }
 
     #[test]
-    fn pending_deliveries_attach_silence_seq_only_to_the_current_record() {
+    fn pending_deliveries_ack_returns_the_silence_seq_registered_at_arm() {
+        // The seq is known before the first write, so an ack that lands before
+        // that write completes still names the watch to cancel (audit M3).
         let store = PendingDeliveries::default();
-        let old = store.arm("p1", "d-11111111", "a1", None);
-        let newer = store.arm("p1", "d-22222222", "a1", None);
-        store.attach_silence_seq("p1", old.seq, Some(3));
-        store.attach_silence_seq("p1", newer.seq, Some(4));
+        let _old = store.arm("p1", "d-11111111", "a1", Some(3));
+        let _newer = store.arm("p1", "d-22222222", "a1", Some(4));
         assert_eq!(
             store.acknowledge("p1", "d-22222222", None),
             AckOutcome::Stopped {
@@ -1300,9 +1521,14 @@ mod loop_tests {
         /// turns the terminal echo off, so a typed pointer never reaches the
         /// screen — the composer then reads as empty.
         async fn start(pane: &str, echo: bool) -> Self {
+            Self::start_with(pane, if echo { "true" } else { "stty -echo" }).await
+        }
+
+        /// A worker whose terminal is set up by `stty` before it copies its
+        /// input into a file.
+        async fn start_with(pane: &str, stty: &str) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let sink = dir.path().join("sink");
-            let stty = if echo { "true" } else { "stty -echo" };
             let command = format!("{stty} && printf READY && exec cat > '{}'", sink.display());
             let registry = Arc::new(AgentPtyRegistry::new());
             let agent = registry
@@ -1372,6 +1598,7 @@ mod loop_tests {
                 orchestration: None,
                 redeliveries: Arc::clone(&redeliveries),
                 silence_report_armed: false,
+                done: None,
             });
             (handle, redeliveries)
         }
@@ -1421,11 +1648,18 @@ mod loop_tests {
         let (handle, redeliveries) = fx.deliver_and_retry("150,150").await;
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
         assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
-        let lines = fx.received_lines(3).await;
+        // The first write, then per re-delivery an unanswered Enter (an empty
+        // line) and the retyped pointer.
+        let lines = fx.received_lines(5).await;
         assert_eq!(
             lines.iter().filter(|l| l.as_str() == POINTER).count(),
             3,
             "the first write plus two re-typed pointers: {lines:?}"
+        );
+        assert_eq!(
+            lines,
+            [POINTER, "", POINTER, "", POINTER],
+            "each retype must follow an Enter that went unanswered: {lines:?}"
         );
         assert!(!fx.registry.pending_deliveries().is_pending(&fx.pane));
         fx.stop();
@@ -1444,6 +1678,78 @@ mod loop_tests {
             "a pointer visible on screen must never be typed a second time: {lines:?}"
         );
         assert_eq!(lines.len(), 3, "two submit-only probes: {lines:?}");
+        fx.stop();
+    }
+
+    /// Audit H1: a composer that holds the pointer while the screen does not
+    /// show its id — no echo, and the first CR not taken as submit. The re-
+    /// delivery must press Enter first, and when that starts a turn it must
+    /// never type a second copy of the pointer behind the first.
+    #[tokio::test]
+    async fn retry_loop_probes_before_retyping_a_pointer_the_screen_does_not_show() {
+        // Raw mode: every byte, CRs included, reaches the sink as typed, and
+        // nothing is echoed to the screen.
+        let fx = Fixture::start_with("retry-hidden", "stty raw -echo").await;
+        let (handle, redeliveries) = fx.deliver_and_retry("1000").await;
+        // Play the agent: its composer ignored the first CR and kept the
+        // pointer; the next Enter submits it, and the turn is reported.
+        let submitted = format!("{POINTER}\r\r");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !std::fs::read_to_string(&fx.sink)
+            .unwrap_or_default()
+            .contains(&submitted)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the retry never pressed Enter on the retained pointer: {:?}",
+                std::fs::read_to_string(&fx.sink).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        fx.tx
+            .send(fx.event(EventType::Thinking, &fx.agent))
+            .unwrap();
+        assert_eq!(end_of(handle).await, RetryEnd::Received);
+        assert_eq!(redeliveries.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let raw = std::fs::read_to_string(&fx.sink).unwrap_or_default();
+        assert_eq!(
+            raw.matches(ID).count(),
+            1,
+            "a pointer held in the composer must not be typed a second time: {raw:?}"
+        );
+        fx.stop();
+    }
+
+    /// Audit M4: an ack that lands while a re-delivery is parked on the pane's
+    /// writer must stop it there. Nothing may be typed after the ack.
+    #[tokio::test]
+    async fn retry_loop_writes_nothing_after_an_ack_that_lands_while_it_waits_on_the_writer() {
+        let fx = Fixture::start("retry-ack-writer", false).await;
+        let (handle, redeliveries) = fx.deliver_and_retry("150").await;
+        let lines = fx.received_lines(1).await;
+        assert_eq!(lines, [POINTER], "precondition: the first write landed");
+        let writer = fx.registry.hold_pane_writer_for_test(&fx.pane).await;
+        // Past the 150 ms wait: the probe is now queued behind the held writer.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            matches!(
+                fx.registry
+                    .pending_deliveries()
+                    .acknowledge(&fx.pane, ID, Some(&fx.agent)),
+                AckOutcome::Stopped { .. }
+            ),
+            "the ack must match the pending delivery"
+        );
+        drop(writer);
+        assert_eq!(end_of(handle).await, RetryEnd::Cancelled);
+        assert_eq!(redeliveries.load(Ordering::SeqCst), 0);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            std::fs::read_to_string(&fx.sink).unwrap_or_default(),
+            format!("{POINTER}\n"),
+            "nothing may reach the worker after its ack"
+        );
         fx.stop();
     }
 

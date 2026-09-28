@@ -7783,6 +7783,21 @@ impl AgentPtyRegistry {
         self.launcher_handoff_agents.lock().unwrap().len()
     }
 
+    /// Issue #1383 test seam: take and hold `pane_id`'s live writer, so a test
+    /// can park a guarded write on it and change state underneath. The writer
+    /// is released when the returned guard drops.
+    #[cfg(test)]
+    pub(crate) async fn hold_pane_writer_for_test(
+        &self,
+        pane_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<PaneWriter> {
+        self.writer_target_for_pane(pane_id)
+            .expect("a live writer for the pane")
+            .writer
+            .lock_owned()
+            .await
+    }
+
     /// Issue #542 test seam: does any pane-keyed clock hold `pane_id_env`?
     #[cfg(test)]
     fn pane_input_tracks(&self, pane_id_env: &str) -> bool {
