@@ -141,7 +141,7 @@ Once you have a config, starting an orchestration is the same as starting any ot
 3. Cycle the **Mode** field (`Left`/`Right` or `h`/`l`) until the orchestration name appears.
 4. Press `Enter` — the deck opens a tab with a pane for every role.
 
-![An orchestration tab on launch: two role cards, planner and builder, stacked in the sidebar, with the orchestrator role, planner, selected and its pane filling the right-hand side](/img/orchestration-tui.png)
+![The demo-loop orchestration tab: two role cards, planner and builder, stacked in the sidebar and both Working, each showing its prompt, its current tool and a Last: age of a few seconds, with the orchestrator role, planner, selected and its pane filling the right-hand side](/img/orchestration-tui.png)
 
 In the desktop app, choose the project directory in **New agent**, pick its `Orch: <name>` chip under **Mode**, and press **Activate orchestration**; the Dashboard then shows the run as one group. Generating the config with `g` is TUI-only.
 

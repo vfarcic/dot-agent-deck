@@ -86,7 +86,7 @@ Opening an orchestration tab uses the same `Ctrl+n` flow as a regular pane, but 
 
 A new tab opens with one pane per role. The role cards appear on the left sidebar; the orchestrator's pane is active on the right. Each pane has the role's `command` running inside it.
 
-![An orchestration tab on launch: the tab bar shows Dashboard and the orchestration's own tab, two role cards, planner and builder, are stacked in the left sidebar, and the orchestrator role, planner, is selected with its pane active on the right](/img/orchestration-tui.png)
+![The demo-loop orchestration tab with both roles at work: the tab bar shows Dashboard and demo-loop, two role cards are stacked in the left sidebar, planner (Claude Code, reading src/checkout/flow.ts, Last: 2s) and builder (Codex, editing src/checkout/RetryPayment.tsx, Last: 3s), both Working, and the orchestrator role, planner, is selected with its pane active on the right](/img/orchestration-tui.png)
 
 </TabItem>
 <TabItem value="desktop" label="Desktop">
