@@ -3537,8 +3537,8 @@ without depending on the config struct API.
 ##### orchestration/delegate/040 — A capped draft wait eventually delivers the real delegate pointer (issue #544).
 - **Layer:** L2, lane 1, PTY-attached (real TUI and delegate CLI).
 - **Agent:** none (`orch-deck` cat roles).
-- **Asserts:** an unsent worker draft delays the pointer, then the configured two-second cap allows delivery without dropping it.
-- **Does not assert:** that the draft remains private after cap expiry, native agent behavior, or the exact card-notice wording.
+- **Asserts:** an unsent worker draft delays the pointer, then the configured two-second cap allows delivery without dropping it; the attached TUI renders a warning on the worker card explaining that the unsent draft was submitted after the draft-deferral cap.
+- **Does not assert:** that the draft remains private after cap expiry, native agent behavior, or the full card-notice wording.
 - **Platform coverage:** mac+linux.
 
 #### orchestration/work-done
@@ -3614,7 +3614,7 @@ without depending on the config struct API.
 ##### orchestration/work-done/010 — A deferred completion leaves the daemon responsive and releases after Ctrl+U (issue #544).
 - **Layer:** L2, lane 1, PTY-attached (real TUI, work-done CLI, agent-event CLI, and daemon status CLI).
 - **Agent:** none (`orch-deck` cat roles).
-- **Asserts:** work-done feedback remains absent while an orchestrator draft is pending; a worker event requiring the daemon's state write lock is broadcast and daemon status completes promptly during the wait; Ctrl+U releases feedback without joining it to the cleared draft.
+- **Asserts:** work-done feedback remains absent while an orchestrator draft is pending; a worker event requiring the daemon's state write lock is broadcast and daemon status completes promptly during the wait; Ctrl+U releases feedback without joining it to the cleared draft. A sibling sends two completions in arrival order during the same draft wait and checks that Ctrl+U releases both as separate, ordered turns.
 - **Does not assert:** the exact feedback prose, real-agent handling, or other hook callers' lock behavior.
 - **Platform coverage:** mac+linux.
 
@@ -5973,6 +5973,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the production sixty-second deadline duration, confirmation retry sequence, or card-notice rendering.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/dispatch/025 — A SessionStart during a deferred spawn-seed wait cannot authorize a duplicate payload (issue #544, PR #1398 review).
+- **Layer:** L1 (production spawn delivery against a real byte-observation PTY, with a synthetic hook event).
+- **Agent:** none (`cat` target stamped with the deck's Claude launch type).
+- **Asserts:** a genuine SessionStart sent after readiness times out but before the draft releases and the seed is written cannot authorize a third seed payload; the draft and seed reach the pane as separate submitted lines. A sibling starts a second hook session while the seed is deferred and checks that releasing the draft does not send the stale seed into that new conversation.
+- **Does not assert:** a real agent's interpretation of the seed or its hook timing.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/pi
 
 ##### scheduler/pi/001 — A SCHEDULED, UNATTENDED real `pi` job (no TUI client attached) boots and its bundled extension reports the Pi pane's status via `agent-event`, re-broadcast on the daemon's event stream (PRD #201 M4.2).
@@ -6326,6 +6333,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** synthetic Codex stand-in that announces its rollout through installed hooks and appends a structured task failure; no provider credential.
 - **Asserts:** one fixed blocked-worker report reaches the orchestrator pane with the worker pane id, no agent-controlled detail, and a second delegate remains busy because work-done is still owed. The report is SUBMITTED, as #708 made its worker-exited sibling: the single byte after its stable final clause (`daemon log names the role.`) is CR, not LF — exact because the orchestrator stand-in runs `cat` under `stty -echo -icanon -icrnl -opost` before its readiness marker. Verified red with the delivery on `write_notice_guarded` (`Some(10)`). The release of its payload record on `Applied`, so a byte-identical report for a later delegation is still submitted after user input, is pinned by the `agent_pty` unit test `worker_blocked_report_is_submitted_and_resubmits_after_user_input`, verified red with that settle call removed.
 - **Does not assert:** eventual worker completion or provider quota reset.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/025 — Response watches start when a deferred delegate pointer reaches the worker (issue #544, PR #1398 review).
+- **Layer:** fast integration (production delegate handler and response watches with real `cat` PTYs and shortened test clocks).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** after a worker's unsent draft holds its pointer longer than both the idle-worker and no-event windows, neither report reaches the orchestrator; Enter delivers the pointer, and only after the configured windows then elapse do both reports arrive.
+- **Does not assert:** real-agent event handling, rendered card state, or the exact wording of either report.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live

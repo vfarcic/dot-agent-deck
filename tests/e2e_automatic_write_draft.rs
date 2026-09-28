@@ -19,6 +19,8 @@ use spec::spec;
 const DRAFT: &str = "draft-544-sentinel";
 const POINTER: &str = "Read .dot-agent-deck/worker-task-worker.md for your task.";
 const FEEDBACK: &str = "work-done-draft-544-feedback";
+const FIRST_REPORT: &str = "work-done-order-544-first";
+const SECOND_REPORT: &str = "work-done-order-544-second";
 
 fn launch_orchestration(cap_ms: &str) -> TuiDeck {
     let deck = TuiDeck::builder()
@@ -287,9 +289,76 @@ fn orchestration_work_done_010_feedback_wait_does_not_stall_daemon() {
     );
 }
 
+/// Scenario: Two worker completions arrive while the orchestrator has an
+/// unsent draft. Clearing the draft must deliver both reports as separate
+/// turns in the order their hook requests arrived.
+#[spec("orchestration/work-done/010")]
+#[test]
+fn orchestration_work_done_010_deferred_reports_keep_arrival_order() {
+    let deck = launch_orchestration("60000");
+    let orchestrator = role(&deck, "orchestrator");
+    let worker = role(&deck, "worker");
+    deck.send_keys(DRAFT.as_bytes());
+    assert!(
+        common::wait_until(Duration::from_secs(5), || pane_text(
+            &deck,
+            &orchestrator.id
+        )
+        .contains(DRAFT)),
+        "draft did not reach the orchestrator PTY"
+    );
+
+    for report in [FIRST_REPORT, SECOND_REPORT] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            .args(["work-done", "--task", report])
+            .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+            .env(
+                "DOT_AGENT_DECK_PANE_ID",
+                worker.pane_id_env.as_deref().expect("worker pane id"),
+            )
+            .env("HOME", deck.home_dir())
+            .current_dir(deck.workdir())
+            .output()
+            .expect("run work-done CLI");
+        assert_cli_success(&output, "work-done");
+    }
+    assert!(
+        !common::wait_until(Duration::from_millis(800), || {
+            let text = pane_text(&deck, &orchestrator.id);
+            text.contains(FIRST_REPORT) || text.contains(SECOND_REPORT)
+        }),
+        "completion reached the orchestrator before the draft was cleared: {:?}",
+        pane_text(&deck, &orchestrator.id)
+    );
+
+    deck.send_keys(b"\x15");
+    assert!(
+        common::wait_until(Duration::from_secs(10), || pane_text(
+            &deck,
+            &orchestrator.id
+        )
+        .contains(SECOND_REPORT)),
+        "second completion never arrived after Ctrl+U: {:?}",
+        pane_text(&deck, &orchestrator.id)
+    );
+    let text = pane_text(&deck, &orchestrator.id);
+    let first = text.find(FIRST_REPORT).expect("first completion was lost");
+    let second = text
+        .find(SECOND_REPORT)
+        .expect("second completion was lost");
+    assert!(
+        first < second && text[first..second].contains("\r\n"),
+        "completion reports were reordered or joined into one turn: {text:?}"
+    );
+    assert!(
+        !text.contains(&format!("{DRAFT}Worker")),
+        "completion report submitted the cleared user draft: {text:?}"
+    );
+}
+
 /// Scenario: Leave a worker draft unsent beyond a short two-second deferral
 /// cap. The real delegate pointer must eventually arrive despite the draft,
-/// showing the cap degrades to the original delivery behavior.
+/// and the worker's card must explain that the draft may have been submitted.
 #[spec("orchestration/delegate/040")]
 #[test]
 fn orchestration_delegate_040_cap_delivers_instead_of_dropping_pointer() {
@@ -321,5 +390,19 @@ fn orchestration_delegate_040_cap_delivers_instead_of_dropping_pointer() {
         start.elapsed() >= Duration::from_millis(1800),
         "pointer arrived before the configured two-second cap: {:?}",
         start.elapsed()
+    );
+    let card_column = || {
+        deck.snapshot_grid()
+            .lines()
+            .map(|line| line.chars().take(40).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            card_column().contains("a deck prompt waited")
+        }),
+        "worker card did not render the capped-draft DeliveryNotice: {}",
+        card_column()
     );
 }

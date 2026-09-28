@@ -5907,6 +5907,150 @@ mod tests {
         registry.shutdown_all();
     }
 
+    /// Scenario: A spawn seed waits behind a draft after its readiness wait
+    /// has ended, and the agent starts its session during that wait. Once the
+    /// draft is submitted, that pre-write start must not authorize a third
+    /// payload copy in the pane.
+    #[spec("scheduler/dispatch/025")]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_025_session_start_during_draft_wait_does_not_duplicate_seed() {
+        const PANE_ID: &str = "spawn-seed-start-during-draft-pane";
+        const DRAFT: &str = "spawn-seed-start-during-draft-544";
+        const SEED: &str = "SPAWN-SEED-START-DURING-DRAFT-544";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_typed_byte_target(&registry, PANE_ID, Some(AgentType::ClaudeCode));
+        type_user_draft(&registry, &agent_id, PANE_ID, DRAFT, 0).await;
+        let (event_tx, event_rx) = broadcast::channel(16);
+
+        let previous_wait = std::env::var("DOT_AGENT_DECK_SESSION_START_WAIT_MS").ok();
+        // SAFETY: nextest runs this test in its own process. The previous value
+        // is restored after the delivery task passes its readiness wait.
+        unsafe { std::env::set_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS", "100") };
+        run_delivery_with_deadline(
+            &registry,
+            PANE_ID.to_string(),
+            agent_id.clone(),
+            Some(event_rx),
+            SEED.to_string(),
+            true,
+            Duration::from_secs(8),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        unsafe {
+            match previous_wait {
+                Some(value) => std::env::set_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS", value),
+                None => std::env::remove_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS"),
+            }
+        }
+        let before_start = registry.snapshot(&agent_id).expect("seed target snapshot");
+        assert_eq!(
+            payload_echoes(&before_start, SEED),
+            0,
+            "seed was not deferred before SessionStart: {:?}",
+            String::from_utf8_lossy(&before_start)
+        );
+        event_tx
+            .send(BroadcastMsg::Event(typed_prompt_watch_event(
+                PANE_ID,
+                &agent_id,
+                "session-that-started-before-the-seed-write",
+                EventType::SessionStart,
+                AgentType::ClaudeCode,
+                false,
+            )))
+            .expect("send SessionStart during the draft wait");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        write_user_bytes(&registry, &agent_id, PANE_ID, b"\r").await;
+        wait_for_echo_bytes(&registry, &agent_id, format!("{SEED}\r\n").as_bytes()).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let delivered = registry.snapshot(&agent_id).expect("seed target snapshot");
+        let copies = payload_echoes(&delivered, SEED);
+        assert!(
+            copies <= 4,
+            "pre-write SessionStart authorized a duplicate seed payload: {copies} echoes, snapshot={:?}",
+            String::from_utf8_lossy(&delivered)
+        );
+        assert!(
+            String::from_utf8_lossy(&delivered).contains(&format!("{DRAFT}\r\n")),
+            "user draft was not submitted separately from the seed"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The pane starts one hook session, then starts a different one
+    /// while its seed is waiting behind a draft. Releasing the draft must not
+    /// submit a seed addressed to the conversation that has already ended.
+    #[spec("scheduler/dispatch/025")]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_025_session_change_during_draft_wait_refuses_stale_seed() {
+        const PANE_ID: &str = "spawn-seed-session-change-draft-pane";
+        const SEED: &str = "SPAWN-SEED-STALE-SESSION-544";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_typed_byte_target(&registry, PANE_ID, Some(AgentType::ClaudeCode));
+        type_user_draft(
+            &registry,
+            &agent_id,
+            PANE_ID,
+            "draft-before-session-change",
+            0,
+        )
+        .await;
+        let (event_tx, event_rx) = broadcast::channel(16);
+        run_delivery(
+            &registry,
+            PANE_ID.to_string(),
+            agent_id.clone(),
+            Some(event_rx),
+            SEED.to_string(),
+            true,
+        )
+        .await;
+        event_tx
+            .send(BroadcastMsg::Event(typed_prompt_watch_event(
+                PANE_ID,
+                &agent_id,
+                "ready-session",
+                EventType::SessionStart,
+                AgentType::ClaudeCode,
+                false,
+            )))
+            .expect("announce the initial ready session");
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let waiting = registry.snapshot(&agent_id).expect("seed target snapshot");
+        assert_eq!(
+            payload_echoes(&waiting, SEED),
+            0,
+            "seed did not remain behind the draft before session change"
+        );
+        event_tx
+            .send(BroadcastMsg::Event(typed_prompt_watch_event(
+                PANE_ID,
+                &agent_id,
+                "new-session-before-seed-write",
+                EventType::SessionStart,
+                AgentType::ClaudeCode,
+                false,
+            )))
+            .expect("announce replacement session during draft wait");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        write_user_bytes(&registry, &agent_id, PANE_ID, b"\r").await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let released = registry.snapshot(&agent_id).expect("seed target snapshot");
+        assert_eq!(
+            payload_echoes(&released, SEED),
+            0,
+            "seed reached a new conversation after SessionStart during draft wait: {:?}",
+            String::from_utf8_lossy(&released)
+        );
+        registry.shutdown_all();
+    }
+
     /// Scenario: Abandon a spawn prompt against its exact pane owner, then replace that owner and exhaust the 256-watch cap for a new delivery. Abandonment must report state without pane bytes, a stale report must not mark the replacement, and the 257th delivery must visibly report that it is unwatched.
     #[serial_test::serial(prompt_confirmation_tasks)]
     #[tokio::test]
