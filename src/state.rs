@@ -3779,13 +3779,15 @@ fn delegate_no_event_window(
 /// then emitted no event at all.
 ///
 /// **Issue #702: this notice belongs to [`compose_idle_worker_prompt`]'s family,
-/// not to [`compose_respawn_failed_notice`]'s.** The contract is keyed on the
-/// DELIVERY MECHANISM, and it is stated once — here for the submitted family, on
-/// [`compose_respawn_failed_notice`] for the deferred one. Issue #708 moved this
-/// notice's two siblings, [`compose_worker_exited_notice`] and
-/// [`compose_respawn_no_live_worker_notice`], into this family as well, and
-/// issue #714's [`compose_worker_blocked_notice`] joined it on the same
-/// argument; their own docs record only where they differ from what follows.
+/// not to the deferred one.** The contract is keyed on the DELIVERY MECHANISM,
+/// and it is stated once — here for the submitted family, on
+/// [`AgentPtyRegistry::write_notice_guarded`] for the deferred one. Issue #708
+/// moved this notice's two siblings, [`compose_worker_exited_notice`] and
+/// [`compose_respawn_no_live_worker_notice`], into this family as well, issue
+/// #714's [`compose_worker_blocked_notice`] joined it on the same argument, and
+/// issue #1337 moved [`compose_respawn_failed_notice`], the deferred family's
+/// last production member; their own docs record only where they differ from
+/// what follows.
 ///
 /// * **Submitted**, with [`AgentPtyRegistry::write_and_submit_guarded`] — the
 ///   same call, the same identity gate and the same revalidation closure PRD
@@ -4042,50 +4044,55 @@ pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
     ))
 }
 
-/// The notice written into the ORCHESTRATOR's pane when a `clear = true`
-/// delegate's respawn itself returned an error (`respawn_agent_for_pane` failed
-/// outright, as opposed to [`compose_respawn_no_live_worker_notice`]'s case of a
-/// replacement that started and then died).
+/// The single-line report the daemon SUBMITS into the ORCHESTRATOR's pane when
+/// a `clear = true` delegate's respawn itself returned an error
+/// (`respawn_agent_for_pane` failed outright, as opposed to
+/// [`compose_respawn_no_live_worker_notice`]'s case of a replacement that
+/// started and then died).
 ///
-/// **This is the canonical statement of the DEFERRED family's contract, and the
-/// family is defined by its DELIVERY MECHANISM rather than by which notice it
-/// is.** Anything delivered with
-/// [`crate::agent_pty::AgentPtyRegistry::write_notice_guarded`] obeys the two
-/// rules below. Since issue #708 this notice is the family's only production
-/// member: #702 moved [`compose_delegate_silence_notice`] out, and #708 moved
-/// [`compose_worker_exited_notice`] and [`compose_respawn_no_live_worker_notice`]
-/// after it, onto the submitted path. Issue #714's
-/// [`compose_worker_blocked_notice`] was written for this family and moved to
-/// the submitted one before it shipped.
+/// **Issue #1337: SUBMITTED, in [`compose_delegate_silence_notice`]'s family**,
+/// the move issue #708 made for [`compose_worker_exited_notice`] and
+/// [`compose_respawn_no_live_worker_notice`] and missed for this one. It
+/// reports the same failure shape as the dead-replacement notice — the task
+/// pointer was never delivered, so no `work-done` can arrive — and left as an
+/// LF-terminated line in scrollback (PRD #92's original delivery) it reached
+/// nobody in an unattended dispatched unit, whose orchestrator then waited
+/// forever. Composition follows its siblings':
 ///
-/// * **Not submitted, which means DEFERRED rather than inert.** Delivered with
-///   `write_notice_guarded`, whose LF terminator leaves a visible line in
-///   scrollback instead of handing the orchestrator a turn to answer. It is not
-///   a guarantee of inertness: whether an agent's TUI reads LF as Enter is
-///   unverified per agent, and a later ordinary prompt write submits these
-///   bytes fused to the NEXT real prompt (pinned by
-///   `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`).
-/// * **Fixed daemon-authored text, and only pre-scrubbed interpolation.**
-///   Because these bytes can be submitted later, glued to somebody else's turn,
-///   nothing a repository or an agent controls should ride them, and there is
-///   no submitted-turn framing to fence such a value inside.
+/// * **No role name.** Until #1337 this text interpolated `target_role` raw —
+///   the value PRD #249 finding B3 removed from this family on purpose, since
+///   `.dot-agent-deck.toml` (possibly a cloned third-party repository) supplies
+///   it. It is dropped rather than fenced with [`quote_untrusted_role`]: the
+///   accompanying `warn!` already names the role together with the underlying
+///   error, and both siblings carry none. The one interpolated value is the
+///   WORKER's `pane_id_env`, already through
+///   [`crate::agent_pty::is_valid_pane_id_env`]'s `[A-Za-z0-9_-]` scrub.
+/// * **No error text either**, for the reason the respawn-error arm of
+///   `dispatch_one_owned` always gave: `AgentPtyError::Spawn` can carry a
+///   filesystem path or other host detail that does not belong in an agent's
+///   turn. It rides the `warn!`.
+/// * **The remediation reflects the ledger.** `dispatch_one_owned` releases the
+///   commission it reserved on this exit (`orchestration/work-done/005`), so a
+///   plain re-delegate is admitted — but it re-runs the same respawn, so the
+///   wording says a configuration cause (a role command that cannot be
+///   started) will fail the same way until it is fixed.
 ///
-/// **This notice does not meet the second rule, and never has.** It predates
-/// the family contract (PRD #92) and interpolates `target_role` raw — the
-/// value finding B3 removed from its siblings, and one `.dot-agent-deck.toml`
-/// supplies. It is also the same unattended-orchestrator gap #708 closed for
-/// its siblings: the pointer was not delivered, and a deferred line reaches
-/// nobody in a dispatched unit. Both are left for a separate change (issue
-/// #1337), which has to decide the role name's fate before it can submit the
-/// text; `orchestration/work-done/005` (`tests/work_done_reporting.rs`) pins the
-/// current wording. Extracted into a function by #708 only so
-/// `scheduler/idle-worker/015` can drive the family's one remaining production
-/// text.
-pub(crate) fn compose_respawn_failed_notice(target_role: &str, worker_pane_id: &str) -> String {
-    format!(
-        "⚠ respawn failed for role '{target_role}' on pane {worker_pane_id} (see daemon log for \
-         details)"
-    )
+/// The deferred family's contract — what anything delivered with
+/// [`crate::agent_pty::AgentPtyRegistry::write_notice_guarded`] obeys — used to
+/// be stated here, because this was that family's last production member. With
+/// this notice moved it has none, and the contract lives on
+/// `write_notice_guarded` itself.
+pub(crate) fn compose_respawn_failed_notice(worker_pane_id: &str) -> String {
+    compose_delegate_prompt(&format!(
+        "⚠ delegated worker respawn failed (dot-agent-deck daemon report) - a report from the \
+         dot-agent-deck daemon, not a message from a person or an agent: the clear=true respawn \
+         for pane {worker_pane_id} returned an error before any replacement agent started, so \
+         the task pointer was NOT delivered and no work-done can arrive for it. Decide how to \
+         proceed - if this needs the user, notify the user; otherwise reassign the task, or \
+         re-delegate it: that retries the same respawn, which fails the same way while the \
+         cause is the role's own configuration, such as a command that cannot be started. The \
+         daemon log names the role and the error."
+    ))
 }
 
 /// PRD #249 M3: does this event prove the delegated agent actually *consumed the
@@ -7415,27 +7422,23 @@ async fn dispatch_one_owned(
                 // the subsequent prompt write also fails
                 // with `NotFound`, and the user sees nothing in
                 // the TUI — just two log lines somewhere
-                // off-screen. The full error stays in the
-                // daemon log via the `tracing::warn!` below;
-                // the notice written into the orchestrator
-                // pane's scrollback is a high-level message so
-                // a stray filesystem path (or other detail
-                // from `AgentPtyError::Spawn`) doesn't leak
-                // into the orchestrator LLM's view. Using the
-                // NOTICE tail (no SUBMIT_DELAY, LF instead of
-                // CR) means the notice forms a visible line in
-                // scrollback without an Enter — the
-                // orchestrator's LLM sees it as scrollback
-                // noise, not a user prompt to respond to.
+                // off-screen. The full error and the role stay
+                // in the daemon log via the `tracing::warn!`
+                // below; the report submitted into the
+                // orchestrator pane is fixed high-level text, so
+                // a stray filesystem path (or other detail from
+                // `AgentPtyError::Spawn`) and the config-supplied
+                // role name stay out of the orchestrator LLM's
+                // turn — see `compose_respawn_failed_notice`.
                 warn!(
                     pane_id = %pane_id,
                     role = %target_role,
                     error = %e,
                     "delegate: respawn for clear=true failed; \
-                     surfacing high-level notice in orchestrator \
+                     submitting a report into the orchestrator \
                      pane and skipping the subsequent prompt write"
                 );
-                let notice = compose_respawn_failed_notice(&target_role, &pane_id);
+                let notice = compose_respawn_failed_notice(&pane_id);
                 // Issue #617: GUARDED, like the dead-replacement arm above. This
                 // arm used to take the unguarded `write_to_pane_notice` on the
                 // reasoning that it "reports a failure it learned about
@@ -7449,6 +7452,13 @@ async fn dispatch_one_owned(
                 // re-validation do the real work, so the two sibling arms of the
                 // same `match` no longer disagree about whether a notice into the
                 // orchestrator pane needs an identity.
+                //
+                // Issue #1337: SUBMITTED, with `write_and_submit_guarded` — the
+                // move #708 made for the dead-replacement arm above and missed
+                // here. Only the delivery tail changed (LF to the submit CR);
+                // the identity binding and revalidation closure are untouched. A
+                // deferred line reached nobody in a dispatched unit, whose
+                // orchestrator then waited for a `work-done` that could not come.
                 let notice_registry = Arc::clone(&registry);
                 let notice_pane = orchestrator_pane_id.clone();
                 let notice_orchestration = orchestration.clone();
@@ -7456,7 +7466,7 @@ async fn dispatch_one_owned(
                 let notice_outcome = match orchestrator_agent_id.as_deref() {
                     Some(orchestrator_agent_id) => {
                         registry
-                            .write_notice_guarded(
+                            .write_and_submit_guarded(
                                 &orchestrator_pane_id,
                                 &notice,
                                 orchestrator_agent_id,
@@ -7474,19 +7484,36 @@ async fn dispatch_one_owned(
                     }
                     None => Ok(crate::agent_pty::GuardedSend::NoLiveTarget),
                 };
+                // Issue #1337: a one-shot submitted report, so its payload record
+                // is released on `Applied` like the dead-replacement report's.
+                // Without it, a byte-identical second report — the same role's
+                // respawn failing again on the next delegate, which is exactly
+                // what a broken role command does — would be refused as a repeat
+                // of whatever the user had typed since. See
+                // [`settle_one_shot_payload_record`].
+                settle_one_shot_payload_record(
+                    &registry,
+                    &orchestrator_pane_id,
+                    &notice,
+                    notice_outcome.as_ref().ok().copied(),
+                );
                 match notice_outcome {
                     Ok(crate::agent_pty::GuardedSend::Applied) => {}
                     // Issue #617 (reviewer S1 / auditor finding 2): `Ambiguous`
                     // is NOT a refusal — some notice bytes reached the authorized
                     // agent — so it gets its own arm rather than being logged as
                     // "nothing was written". See the dead-replacement arm above for
-                    // why it is not retried.
+                    // why it is not retried. Issue #1337: its payload record is
+                    // deliberately KEPT (see the settle call above), so a later
+                    // identical report cannot submit the leftover bytes together
+                    // with a user draft.
                     Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
                         pane_id = %orchestrator_pane_id,
                         role = %target_role,
-                        "delegate: the respawn-failure notice was written only \
-                         partially (ambiguous); not retried, so the orchestrator \
-                         pane may show a truncated notice"
+                        "delegate: the respawn-failure report's submission was ambiguous \
+                         (partial write); not retried, and its payload record is kept so a \
+                         later identical report cannot submit the leftover bytes with the \
+                         user's draft"
                     ),
                     Ok(refused) => warn!(
                         pane_id = %orchestrator_pane_id,
@@ -16012,13 +16039,15 @@ mod tests {
         );
     }
 
-    /// Scenario: Write an automatic payload, let the user type an unsent draft, and then let the production respawn-failed caller write its daemon notice before a submit-only probe. The notice must not make the blind probe submit the user's draft or the accumulated notice.
+    /// Scenario: Write an automatic payload, let the user type an unsent draft, and then write a fixed notice through `write_notice_guarded` before a submit-only probe. The notice must not make the blind probe submit the user's draft or the accumulated notice.
     #[cfg(unix)]
     #[spec("scheduler/idle-worker/015")]
     #[tokio::test]
     async fn idle_worker_015_notice_cannot_rearm_a_submit_only_probe() {
         const ORCHESTRATOR_PANE: &str = "notice-launder-orchestrator";
-        const WORKER_PANE: &str = "notice-launder-worker";
+        // Fixed fixture text: since issue #1337 no production notice takes
+        // `write_notice_guarded`, so there is no production text left to drive.
+        const NOTICE: &str = "⚠ deferred-family fixture notice (no production caller since #1337)";
         const PROMPT: &str = "automatic payload awaiting submit confirmation";
         const USER_DRAFT: &str = "user draft deliberately left unsent";
 
@@ -16073,24 +16102,25 @@ mod tests {
         // Issue #702: driven through a deferred-family notice rather than PRD
         // #249's silence notice, because the invariant belongs to the DELIVERY
         // MECHANISM and #249's notice has left it. Issue #708 then moved the
-        // worker-exited and respawn-no-live-worker notices out as well, so this
-        // is now driven through `compose_respawn_failed_notice` — the one
-        // production text still written with `write_notice_guarded`, which is
-        // deferred-and-concatenating — and this is the pair of calls the
-        // respawn-error arm of `dispatch_one_owned` makes in production, with
-        // only its trigger (a failed `respawn_agent_for_pane`) stubbed out.
-        // The submitted notices are turns of their own and cannot re-arm a
-        // later blind probe by leaving bytes in the input box — they inherit
-        // instead the idle prompt's own issue #544 limitation, which is a
-        // different question from this one.
-        let notice = compose_respawn_failed_notice("coder", WORKER_PANE);
+        // worker-exited and respawn-no-live-worker notices out as well, and
+        // issue #1337 the respawn-failure notice, which left the family with no
+        // production member. The mechanism is kept as a documented capability
+        // (see `AgentPtyRegistry::write_notice_guarded`), so this now drives a
+        // fixed fixture text through it: what it pins — a Notice does not
+        // advance the user-input clock, so it cannot re-arm a later blind probe
+        // — is exactly what a future caller would inherit. The submitted
+        // notices are turns of their own and cannot re-arm a later blind probe
+        // by leaving bytes in the input box — they inherit instead the idle
+        // prompt's own issue #544 limitation, which is a different question
+        // from this one.
+        let notice = NOTICE;
         assert_eq!(
             registry
-                .write_notice_guarded(ORCHESTRATOR_PANE, &notice, &orchestrator_agent, || async {
+                .write_notice_guarded(ORCHESTRATOR_PANE, notice, &orchestrator_agent, || async {
                     true
                 },)
                 .await
-                .expect("production respawn-failed notice"),
+                .expect("deferred-family fixture notice"),
             crate::agent_pty::GuardedSend::Applied
         );
         // Issue #1132: the notice is payload + LF, so it COMPLETES the line the
@@ -16114,7 +16144,7 @@ mod tests {
             before_probe
                 .windows(notice.len())
                 .any(|window| window == notice.as_bytes()),
-            "precondition: the production notice caller must land its Notice after the user's draft; output={:?}",
+            "precondition: the fixture notice must land after the user's draft; output={:?}",
             String::from_utf8_lossy(&before_probe)
         );
 
@@ -16123,7 +16153,7 @@ mod tests {
                 true
             })
             .await
-            .expect("submit-only probe after respawn-failed notice");
+            .expect("submit-only probe after the fixture notice");
         // A NEGATIVE observation window, and the sleep IS the observation — the
         // same shape `spawn.rs`'s `UserFrameRetryExpectation::WritesNothing`
         // keeps. The contract is that the probe writes nothing, so there is no
@@ -16145,7 +16175,7 @@ mod tests {
         assert_eq!(
             after_probe,
             before_probe,
-            "the probe must not submit the user's draft plus the silent-worker notice; before={:?}, after={:?}",
+            "the probe must not submit the user's draft plus the deferred notice; before={:?}, after={:?}",
             String::from_utf8_lossy(&before_probe),
             String::from_utf8_lossy(&after_probe)
         );
