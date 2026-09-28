@@ -225,6 +225,72 @@ while True:
         os.write(sys.stdout.fileno(), bytes([byte]))
 "#;
 
+const READY_COMPOSER_WORKER: &str = r#"import json
+import os
+import subprocess
+import sys
+import time
+import tty
+
+pid = os.getpid()
+with open('worker-launches.log', 'a', encoding='ascii') as log:
+    log.write(f'{pid}\n')
+fd = sys.stdin.fileno()
+tty.setraw(fd)
+hook_agent = 'claude-code' if sys.argv[2] == 'claude' else 'codex'
+hook = subprocess.run([sys.argv[1], 'hook', '--agent', hook_agent],
+    input='{"hook_event_name":"SessionStart","session_id":"ready-composer-%s"}' % pid,
+    text=True, capture_output=True, timeout=5)
+with open('worker-ready.log', 'a', encoding='ascii') as log:
+    log.write(f'{pid} {hook.returncode}\n')
+if hook.returncode:
+    raise SystemExit(hook.stderr)
+os.write(sys.stdout.fileno(), b'\xe2\x9d\xaf ' if sys.argv[2] == 'claude' else b'\xe2\x80\xba ')
+line = bytearray()
+submits = 0
+accepted_at = None
+before_accept = []
+while True:
+    chunk = os.read(fd, 4096)
+    with open('worker-raw.log', 'ab') as log:
+        log.write(chunk)
+    for byte in chunk:
+        received_at = time.monotonic_ns()
+        if accepted_at is None:
+            before_accept.append((received_at, byte))
+        else:
+            with open('worker-input-timeline.log', 'a', encoding='ascii') as log:
+                log.write(f'{(received_at - accepted_at) / 1_000_000:.3f} {byte:02x}\n')
+        if byte in (10, 13):
+            submits += 1
+            with open('worker-submits.log', 'a', encoding='ascii') as log:
+                log.write(f'{pid} {submits} {line.decode("utf-8", "replace")}\n')
+            if submits == 1:
+                continue
+            if b'worker-task-coder.md' in line:
+                accepted_at = time.monotonic_ns()
+                with open('worker-input-timeline.log', 'w', encoding='ascii') as log:
+                    for timestamp, received_byte in before_accept:
+                        log.write(f'{(timestamp - accepted_at) / 1_000_000:.3f} {received_byte:02x}\n')
+                    log.write('ACCEPT 0\n')
+                before_accept.clear()
+                if sys.argv[2] == 'claude':
+                    turn = subprocess.run([sys.argv[1], 'hook', '--agent', hook_agent],
+                        input=json.dumps({'hook_event_name': 'UserPromptSubmit',
+                            'session_id': f'ready-composer-{pid}',
+                            'prompt': line.decode('utf-8', 'replace')}),
+                        text=True, capture_output=True, timeout=5)
+                    if turn.returncode:
+                        raise SystemExit(turn.stderr)
+                with open('worker-accepted-pid.log', 'w', encoding='ascii') as log:
+                    log.write(str(pid))
+                os.write(sys.stdout.fileno(), b'\r\nREADY_COMPOSER_SUBMITTED_1383\r\n')
+                line.clear()
+            continue
+        line.append(byte)
+        os.write(sys.stdout.fileno(), bytes([byte]))
+"#;
+
 const ACK_WORKER: &str = r#"import os
 from pathlib import Path
 import re
@@ -271,6 +337,16 @@ fn launch_retry_fixture(
     schedule: &str,
     silence_window: &str,
 ) -> (TuiDeck, PathBuf, u32) {
+    launch_retry_fixture_for_agent(worker, worker_command, "opencode", schedule, silence_window)
+}
+
+fn launch_retry_fixture_for_agent(
+    worker: &str,
+    worker_command: &str,
+    agent: &str,
+    schedule: &str,
+    silence_window: &str,
+) -> (TuiDeck, PathBuf, u32) {
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
         .with_pty_size(120, 40)
@@ -293,7 +369,7 @@ fn launch_retry_fixture(
              [[orchestrations.roles]]\n\
              name = \"coder\"\n\
              command = \"{worker_command}\"\n\
-             agent = \"opencode\"\n\
+             agent = \"{agent}\"\n\
              clear = true\n"
         ),
     )
@@ -452,6 +528,111 @@ fn delegate_043_visible_composer_retries_submit_only() {
         delivered_pid
     );
     assert_eq!(launch_pids(&work.join("worker-launches.log")).len(), 2);
+}
+
+fn ready_composer_lost_submit(agent: &str) {
+    let command = format!(
+        "python3 -u worker.py {} {agent}",
+        env!("CARGO_BIN_EXE_dot-agent-deck")
+    );
+    let (deck, work, delivered_pid) = launch_retry_fixture_for_agent(
+        READY_COMPOSER_WORKER,
+        &command,
+        agent,
+        "500,1000,1500",
+        "0",
+    );
+    let ready_path = work.join("worker-ready.log");
+    assert!(
+        common::wait_until(Duration::from_secs(8), || {
+            std::fs::read_to_string(&ready_path).is_ok_and(|ready| {
+                ready
+                    .lines()
+                    .any(|line| line == format!("{delivered_pid} 0"))
+            })
+        }),
+        "replacement worker did not announce readiness: {:?}",
+        std::fs::read_to_string(&ready_path).unwrap_or_default()
+    );
+    let ready = std::fs::read_to_string(&ready_path).expect("worker readiness log");
+    assert!(
+        ready
+            .lines()
+            .any(|line| line == format!("{delivered_pid} 0")),
+        "replacement worker did not announce readiness: {ready:?}"
+    );
+    let raw_path = work.join("worker-raw.log");
+    assert!(
+        common::wait_until(Duration::from_secs(8), || std::fs::read(&raw_path)
+            .is_ok_and(|raw| pointer_count(&raw) >= 1)),
+        "pointer never reached the ready worker; grid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(12), || work
+            .join("worker-accepted-pid.log")
+            .exists()),
+        "pointer stayed visibly unsent after the first CR; raw={:?}; submits={:?}; grid:\n{}",
+        String::from_utf8_lossy(&std::fs::read(&raw_path).unwrap_or_default()),
+        std::fs::read_to_string(work.join("worker-submits.log")).unwrap_or_default(),
+        deck.snapshot_grid()
+    );
+    deck.send_bytes(b"\x04");
+    deck.wait_for_string("[New Agent Ctrl+N]");
+    deck.send_bytes(b"2");
+    assert!(
+        deck.wait_for_grid_string_within("READY_COMPOSER_SUBMITTED_1383", Duration::from_secs(5)),
+        "submitted task did not render in the worker pane; grid:\n{}",
+        deck.snapshot_grid()
+    );
+    wait_past_retry_schedule();
+    let raw = std::fs::read(&raw_path).expect("worker raw-byte log");
+    assert_eq!(pointer_count(&raw), 1, "pointer was typed twice: {raw:?}");
+    let timeline = std::fs::read_to_string(work.join("worker-input-timeline.log"))
+        .expect("worker input timeline after acceptance");
+    let (_, after_accept) = timeline
+        .split_once("ACCEPT 0\n")
+        .expect("worker input timeline contains acceptance marker");
+    assert!(
+        after_accept.is_empty(),
+        "worker received input after accepting the task; relative-ms and hex bytes:\n{after_accept}"
+    );
+    let submit_bytes = raw
+        .iter()
+        .filter(|&&byte| byte == b'\r' || byte == b'\n')
+        .count();
+    assert_eq!(
+        submit_bytes, 2,
+        "worker should receive one ignored Enter and one accepting Enter; raw={raw:?}; timeline:\n{timeline}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.join("worker-accepted-pid.log"))
+            .expect("accepted PID")
+            .parse::<u32>()
+            .expect("numeric accepted PID"),
+        delivered_pid
+    );
+    assert_eq!(launch_pids(&work.join("worker-launches.log")).len(), 2);
+}
+
+/// Scenario: A Claude-declared stand-in announces SessionStart, shows the task
+/// pointer in its ❯ composer, and ignores the first Enter. A later Enter makes
+/// it emit UserPromptSubmit and show completion without a second pointer copy
+/// or any input after acceptance.
+#[spec("orchestration/delegate/046")]
+#[test]
+fn delegate_046_ready_claude_composer_recovers_lost_submit() {
+    ready_composer_lost_submit("claude");
+}
+
+/// Scenario: A Codex-declared stand-in announces readiness and shows the task
+/// pointer in its › composer while dropping the first Enter. A submit-only
+/// retry must complete the task in that process without typing again or
+/// sending any input after acceptance.
+#[spec("orchestration/delegate/047")]
+#[test]
+fn delegate_047_ready_codex_composer_recovers_lost_submit() {
+    ready_composer_lost_submit("codex");
 }
 
 /// Scenario: A hookless worker reads the delivery id and acknowledgement

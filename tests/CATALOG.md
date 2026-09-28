@@ -3488,10 +3488,24 @@ without depending on the config struct API.
 ##### orchestration/delegate/045 — A real interactive OpenCode worker completes a delegation whose first pointer is sent during boot (issue #1383).
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_delegate_respawn_readiness.rs`; real TUI, daemon, OpenCode, and `work-done` CLI; developer credentials required).
 - **Agent:** real interactive OpenCode on the configured cheap test model, with `--auto`; the worker has a uniquely named fixture sentinel in its orchestration worktree.
-- **Asserts:** with a zero readiness buffer and a short retry schedule, the replacement worker lists the worktree, reports the exact sentinel filename through `work-done`, and keeps the same daemon agent identity until completion. The daemon log records each in-place re-delivery; when it records none, the test explicitly reports that the first pointer was accepted before recovery was needed.
+- **Asserts:** with a zero readiness buffer and a bounded retry schedule that reaches past observed slow OpenCode startups, the replacement worker lists the fixture worktree by its explicit path, reports the exact sentinel filename through `work-done`, and keeps the same daemon agent identity until completion. The daemon log shows no Enter-only probe or pointer retype after that pane's first `Thinking` or `ToolStart` proof; OpenCode's transcript database contains exactly one user text part for the task pointer. It counts submit-only probes and in-place pointer re-deliveries separately and reports whether a retype was likely the copy that landed; the log cannot identify the consumed copy with certainty. A failure preserves the log beside the harness cast.
 - **Does not assert:** a universal OpenCode boot distribution or that every run loses its first pointer; the zero buffer makes that race likely, while `/041` pins the loss deterministically.
 - **Platform coverage:** mac+linux (Unix PTY; local lane 2 only).
 - **Cost note:** one short real OpenCode worker turn plus the model preflight.
+
+##### orchestration/delegate/046 — A ready Claude composer recovers an unsubmitted pointer (issue #1243).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`).
+- **Agent:** Python stand-in declared as `claude`, emitting `SessionStart` before rendering the `❯` composer and `UserPromptSubmit` through the real hook CLI when a later Enter accepts the pointer.
+- **Asserts:** the pointer reaches the ready worker, the first Enter is dropped, a later Enter submits it in the same process and emits turn evidence, the attached pane shows completion, the pointer was typed exactly once, exactly two Enter bytes reached the worker, and no input byte arrived after acceptance. The stand-in records each raw input byte with a timestamp relative to acceptance.
+- **Does not assert:** a real Claude model turn or the provider's actual composer implementation.
+- **Platform coverage:** mac+linux (Unix PTY and Python 3).
+
+##### orchestration/delegate/047 — A Codex composer recovers an unsubmitted pointer (issue #1243).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`).
+- **Agent:** Python stand-in declared as `codex`, emitting a real `SessionStart` hook and rendering the `›` composer before dropping its first Enter.
+- **Asserts:** the pointer reaches the worker, a later Enter submits it in the same process, the attached pane shows completion, the pointer was typed exactly once, exactly two Enter bytes reached the worker, and no input byte arrived after acceptance. The stand-in records each raw input byte with a timestamp relative to acceptance.
+- **Does not assert:** a real Codex model turn or the provider's actual composer implementation.
+- **Platform coverage:** mac+linux (Unix PTY and Python 3).
 
 #### orchestration/work-done
 

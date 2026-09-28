@@ -527,7 +527,56 @@ fn worker_agent_id(deck: &TuiDeck) -> Option<String> {
         .map(|record| record.id)
 }
 
-/// Scenario: Open a PTY-attached orchestration with a real interactive OpenCode worker, then delegate while its replacement is still booting by removing the readiness buffer. The worker must list a uniquely named fixture file and report its name through `work-done` without another respawn; the daemon log records whether an in-place re-delivery was needed.
+struct PreserveDelegateLogOnFailure(std::path::PathBuf);
+
+impl Drop for PreserveDelegateLogOnFailure {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let target = common::current_test_recordings_dir();
+            if std::fs::create_dir_all(&target).is_ok() {
+                let _ = std::fs::copy(&self.0, target.join("delegate-retry.log"));
+            }
+        }
+    }
+}
+
+fn opencode_user_prompt_count(home: &std::path::Path, pointer: &str) -> Result<usize, String> {
+    let db = home.join(".local/share/opencode/opencode.db");
+    let script = r#"import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+pointer = sys.argv[2]
+count = 0
+for message, part in db.execute('select message.data, part.data from part join message on part.message_id = message.id'):
+    message, part = json.loads(message), json.loads(part)
+    if message.get('role') == 'user' and part.get('type') == 'text' and pointer in part.get('text', ''):
+        count += 1
+print(count)
+"#;
+    let output = std::process::Command::new("python3")
+        .args(["-c", script])
+        .arg(&db)
+        .arg(pointer)
+        .output()
+        .map_err(|error| {
+            format!(
+                "could not read OpenCode transcript {}: {error}",
+                db.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not query OpenCode transcript {}: {}",
+            db.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| format!("OpenCode transcript count was invalid: {error}"))
+}
+
+/// Scenario: Open a PTY-attached orchestration with a real interactive OpenCode worker, then delegate while its replacement is still booting by removing the readiness buffer. The worker must report a uniquely named fixture file through `work-done` in the same process; after its first Thinking or ToolStart proof, the deck must never probe or retype, and the OpenCode transcript must contain exactly one user task prompt.
 #[spec("orchestration/delegate/045")]
 #[test]
 #[cfg(unix)]
@@ -535,16 +584,23 @@ fn delegate_045_real_opencode_recovers_early_pointer_in_place() {
     skip_unless!(common::check_opencode_available());
 
     let worker_command = format!("opencode --model {} --auto", common::opencode_test_model());
+    let log_dir = common::harness_tempdir().expect("delegate retry log directory");
+    let daemon_log_path = log_dir.path().join("delegate-retry.log");
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
         .with_env("PATH", path_with_binary_dir())
+        .with_env(
+            "DOT_AGENT_DECK_LOG",
+            daemon_log_path.to_str().expect("UTF-8 log path"),
+        )
         .with_env(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, "0")
         .with_env(
             "DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS",
-            "5000,10000,20000",
+            "5000,15000,30000",
         )
         .with_imported_opencode_credentials()
         .launch_with_fixture("minimal");
+    let _preserve_log = PreserveDelegateLogOnFailure(daemon_log_path.clone());
     deck.wait_for_string("No active agents");
 
     let work = deck.workdir();
@@ -560,10 +616,13 @@ fn delegate_045_real_opencode_recovers_early_pointer_in_place() {
     .expect("write real OpenCode orchestration config");
     std::fs::write(
         work.join(DELEGATE_TASK_FILE),
-        "Use your shell to list the files in the current working directory. Find the one filename \
-         beginning with delegate-retry-fixture- and ending with .sentinel. Then run \
-         dot-agent-deck work-done --task with a short report containing that exact filename. \
-         Do not guess the filename and do not stop before work-done succeeds.\n",
+        format!(
+            "Use your shell to list the files in {}. Find the one filename beginning with \
+             delegate-retry-fixture- and ending with .sentinel. Then run dot-agent-deck \
+             work-done --task with a short report containing that exact filename. Do not guess \
+             the filename and do not stop before work-done succeeds.\n",
+            work.display()
+        ),
     )
     .expect("write delegated file-list task");
     write_executable(&work.join(ORCHESTRATOR_SCRIPT), ORCHESTRATOR_BODY);
@@ -590,7 +649,19 @@ fn delegate_045_real_opencode_recovers_early_pointer_in_place() {
         std::fs::read_to_string(&delegate_log).unwrap_or_default(),
         deck.snapshot_grid()
     );
-    let replacement_id = worker_agent_id(&deck).expect("replacement worker has a daemon record");
+    assert!(
+        common::wait_until(Duration::from_secs(20), || {
+            worker_agent_id(&deck).is_some_and(|id| id != initial_id)
+        }),
+        "replacement worker never acquired a new daemon record; grid:\n{}",
+        deck.snapshot_grid()
+    );
+    let replacement_id = worker_agent_id(&deck).expect("replacement worker checked above");
+    let replacement_pane = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.id == replacement_id)
+        .and_then(|record| record.pane_id_env)
+        .expect("replacement worker has a pane id");
     assert_ne!(
         initial_id, replacement_id,
         "clear=true must replace the first worker before the task pointer is sent"
@@ -602,18 +673,35 @@ fn delegate_045_real_opencode_recovers_early_pointer_in_place() {
     deck.wait_for_string("[New Agent Ctrl+N]");
     deck.send_bytes(b"2");
     let work_done = work.join(".dot-agent-deck/work-done-coder.md");
-    let completed = common::wait_until(Duration::from_secs(95), || {
+    let completed = common::wait_until(Duration::from_secs(240), || {
         std::fs::read_to_string(&work_done)
             .is_ok_and(|report| report.contains(OPENCODE_RETRY_SENTINEL))
     });
-    let daemon_log = std::fs::read_to_string(work.join("state/daemon.log"))
+    let daemon_log = std::fs::read_to_string(&daemon_log_path)
         .unwrap_or_else(|error| format!("<daemon log unavailable: {error}>"));
     let retry_lines: Vec<&str> = daemon_log
         .lines()
+        .filter(|line| line.contains("re-typed the pointer into the same process"))
+        .collect();
+    let submit_probes = daemon_log
+        .lines()
+        .filter(|line| line.contains("pressed Enter first"))
+        .count();
+    let delivery_evidence: Vec<&str> = daemon_log
+        .lines()
         .filter(|line| {
             line.contains("delegate retry: no proof the worker received its task pointer")
+                || (line.contains("Received event") && line.contains("UserPromptSubmit"))
+                || line.contains("Received ack")
         })
         .collect();
+    let log_lines: Vec<&str> = daemon_log.lines().collect();
+    let proof_index = log_lines.iter().position(|line| {
+        line.contains("Received event")
+            && line.contains(&replacement_pane)
+            && (line.contains("event_type=Thinking") || line.contains("event_type=ToolStart"))
+    });
+    eprintln!("delegate_045 delivery evidence: {delivery_evidence:?}");
     assert!(
         completed,
         "the REAL OpenCode worker did not report the listed sentinel through work-done; \
@@ -629,15 +717,43 @@ fn delegate_045_real_opencode_recovers_early_pointer_in_place() {
         Some(replacement_id.as_str()),
         "the worker must complete inside the same process that received the first pointer"
     );
-    if retry_lines.is_empty() {
-        eprintln!(
-            "delegate_045: OpenCode accepted the first pointer before a scheduled retry; \
-             this run proves completion but did not exercise recovery"
-        );
-    } else {
-        eprintln!(
-            "delegate_045: {} in-place re-delivery attempt(s) occurred before work-done",
-            retry_lines.len()
-        );
-    }
+    let proof_index = proof_index.unwrap_or_else(|| {
+        panic!(
+            "no Thinking or ToolStart proof matched worker pane {replacement_pane}; \
+             delivery_evidence={delivery_evidence:?}; log={daemon_log}"
+        )
+    });
+    let after_proof: Vec<&str> = log_lines[proof_index + 1..]
+        .iter()
+        .copied()
+        .filter(|line| {
+            line.contains("re-typed the pointer into the same process")
+                || line.contains("pressed Enter first")
+        })
+        .collect();
+    assert!(
+        after_proof.is_empty(),
+        "pointer retype or Enter-only probe followed first worker proof \
+         ({:?}); later retries={after_proof:?}; log={daemon_log}",
+        log_lines[proof_index]
+    );
+    let transcript_prompts =
+        opencode_user_prompt_count(deck.home_dir(), "Read .dot-agent-deck/worker-task-coder.md")
+            .expect("OpenCode transcript must be readable for this test");
+    assert_eq!(
+        transcript_prompts, 1,
+        "OpenCode transcript contains {transcript_prompts} user turns for this task pointer"
+    );
+    eprintln!(
+        "delegate_045: {submit_probes} submit-only probe(s) and {} in-place pointer \
+         re-delivery attempt(s) occurred before work-done; first proof={:?}; \
+         a retype {} the likely landing copy",
+        retry_lines.len(),
+        log_lines[proof_index],
+        if retry_lines.is_empty() {
+            "was not"
+        } else {
+            "was"
+        }
+    );
 }
