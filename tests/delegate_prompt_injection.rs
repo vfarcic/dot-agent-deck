@@ -53,6 +53,8 @@ const DELEGATE_READINESS_BUFFER_ENV: &str = "DOT_AGENT_DECK_DELEGATE_READINESS_B
 const DELEGATE_NO_EVENT_WINDOW_ENV: &str = "DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS";
 const SESSION_START_WAIT_ENV: &str = "DOT_AGENT_DECK_SESSION_START_WAIT_MS";
 const WORKER_RESPONSE_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS";
+#[cfg(unix)]
+const DRAFT_DEFER_CAP_ENV: &str = "DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS";
 const DELEGATE_READINESS_BUFFER_MS: u64 = 1000;
 const SLOW_STUB_NOT_READY_MS: u64 = 650;
 
@@ -4015,6 +4017,23 @@ impl SilenceHarness {
         );
     }
 
+    async fn start_draft_delegate(&self, supersede: bool) {
+        self.state
+            .handle_delegate(
+                DelegateSignal {
+                    pane_id: ORCH_PANE.to_string(),
+                    task: "Perform the draft-deferral task.".to_string(),
+                    to: vec![WORKER_ROLE.to_string()],
+                    supersede,
+                    timestamp: chrono::Utc::now(),
+                    token: None,
+                },
+                &self.registry,
+                &self.event_tx,
+            )
+            .await;
+    }
+
     async fn redelegate_and_wait_for_another_pointer(&self) {
         let before = self
             .registry
@@ -4095,6 +4114,18 @@ impl SilenceHarness {
             "unsent worker draft did not physically reach the PTY; snapshot={:?}",
             String::from_utf8_lossy(&observed)
         );
+    }
+
+    async fn send_worker_user_bytes(&self, bytes: &[u8]) {
+        use std::io::Write as _;
+
+        let handle = self
+            .registry
+            .subscribe(&self.worker_agent_id)
+            .expect("attach draft-test worker");
+        let mut writer = handle.writer.lock().await;
+        writer.write_all(bytes).expect("write worker user bytes");
+        writer.flush().expect("flush worker user bytes");
     }
 
     fn orchestrator_snapshot(&self) -> Vec<u8> {
@@ -4284,6 +4315,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
         (SESSION_START_WAIT_ENV, "2000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
         (DELEGATE_NO_EVENT_WINDOW_ENV, "600"),
+        (DRAFT_DEFER_CAP_ENV, "0"),
     ]);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -4348,6 +4380,318 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                 "stale work-done cancelled the newer delegation's no-event watch: {:?}",
                 String::from_utf8_lossy(&notice)
             );
+        });
+}
+
+/// Scenario: Type an unsent draft into a worker's real PTY, then delegate through
+/// the production handler. The pointer must wait until the user presses Enter
+/// and arrive on a separate line from the draft.
+#[spec("scheduler/dispatch/023")]
+#[test]
+#[cfg(unix)]
+fn dispatch_023_delegate_waits_for_unsent_worker_draft() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
+        (DRAFT_DEFER_CAP_ENV, "60000"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build draft-deferral runtime")
+        .block_on(async {
+            const DRAFT: &str = "draft-544-sentinel";
+            let harness = SilenceHarness::new(64).await;
+            harness.type_unsent_worker_draft(DRAFT).await;
+
+            harness.start_draft_delegate(false).await;
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let waiting = harness
+                .registry
+                .snapshot(&harness.worker_agent_id)
+                .expect("worker snapshot during draft wait");
+            assert!(
+                !snapshot_contains(&waiting, POINTER),
+                "automatic pointer reached a worker with an unsent draft: {:?}",
+                String::from_utf8_lossy(&waiting)
+            );
+
+            harness.send_worker_user_bytes(b"-still-typing").await;
+            let typed = wait_for_snapshot_needle(
+                &harness.registry,
+                &harness.worker_agent_id,
+                b"draft-544-sentinel-still-typing",
+                Duration::from_millis(700),
+            )
+            .await;
+            assert!(
+                snapshot_contains(&typed, b"draft-544-sentinel-still-typing")
+                    && !snapshot_contains(&typed, POINTER),
+                "user keystrokes were blocked by the waiting automatic writer: {:?}",
+                String::from_utf8_lossy(&typed)
+            );
+
+            harness.send_worker_user_bytes(b"\r").await;
+            let delivered = wait_for_snapshot_needle(
+                &harness.registry,
+                &harness.worker_agent_id,
+                b"Read .dot-agent-deck/worker-task-coder.md for your task.\r\n",
+                Duration::from_secs(5),
+            )
+            .await;
+            let text = String::from_utf8_lossy(&delivered);
+            assert!(
+                text.contains("draft-544-sentinel-still-typing\r\n")
+                    && text
+                        .contains("Read .dot-agent-deck/worker-task-coder.md for your task.\r\n")
+                    && !text.contains("draft-544-sentinelRead"),
+                "user draft and automatic pointer were not separate submitted lines: {text:?}"
+            );
+        });
+}
+
+/// Scenario: Clear an unsent worker draft with Ctrl+U while a production
+/// delegate waits. The pointer must then arrive without submitting that draft.
+#[test]
+#[cfg(unix)]
+fn dispatch_023_ctrl_u_releases_waiting_delegate() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
+        (DRAFT_DEFER_CAP_ENV, "60000"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build draft-clear runtime")
+        .block_on(async {
+            const DRAFT: &str = "draft-544-ctrl-u";
+            let harness = SilenceHarness::new(64).await;
+            harness.type_unsent_worker_draft(DRAFT).await;
+            harness.start_draft_delegate(false).await;
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let waiting = harness
+                .registry
+                .snapshot(&harness.worker_agent_id)
+                .unwrap_or_default();
+            assert!(
+                !snapshot_contains(&waiting, POINTER),
+                "delegate pointer ignored pending draft before Ctrl+U: {:?}",
+                String::from_utf8_lossy(&waiting)
+            );
+            harness.send_worker_user_bytes(b"\x15").await;
+            let delivered = wait_for_snapshot_needle(
+                &harness.registry,
+                &harness.worker_agent_id,
+                POINTER,
+                Duration::from_secs(5),
+            )
+            .await;
+            let text = String::from_utf8_lossy(&delivered);
+            assert!(
+                snapshot_contains(&delivered, POINTER) && !text.contains("draft-544-ctrl-uRead"),
+                "Ctrl+U did not release a clean delegate pointer: {text:?}"
+            );
+        });
+}
+
+/// Scenario: Forward only terminal mouse and focus reports to a worker before
+/// delegating. These reports must not masquerade as an unsent user draft, so
+/// the pointer should arrive promptly without an Enter.
+#[test]
+#[cfg(unix)]
+fn dispatch_023_terminal_reports_do_not_defer_delegate() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
+        (DRAFT_DEFER_CAP_ENV, "60000"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build terminal-report runtime")
+        .block_on(async {
+            let harness = SilenceHarness::new(64).await;
+            harness
+                .send_worker_user_bytes(
+                    b"\x1b[<64;10;5M\x1b[I\x1b[10;5R\x1b[?1;2c\x1b]10;rgb:ffff/ffff/ffff\x07\x1bP1$r0m\x1b\\",
+                )
+                .await;
+            harness.start_draft_delegate(false).await;
+            let delivered = wait_for_snapshot_needle(
+                &harness.registry,
+                &harness.worker_agent_id,
+                POINTER,
+                Duration::from_secs(3),
+            )
+            .await;
+            assert!(
+                snapshot_contains(&delivered, POINTER),
+                "terminal reports incorrectly held a delegate pointer: {:?}",
+                String::from_utf8_lossy(&delivered)
+            );
+        });
+}
+
+/// Scenario: Leave a draft unsent beyond a short cap and observe the real
+/// delegate arrive anyway. A second first write must then proceed promptly,
+/// because the capped submit consumed and cleared the pending draft.
+#[test]
+#[cfg(unix)]
+fn dispatch_023_cap_expiry_delivers_and_clears_pending_draft() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
+        (DRAFT_DEFER_CAP_ENV, "1500"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build draft-cap runtime")
+        .block_on(async {
+            let harness = SilenceHarness::new(64).await;
+            let notices = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&notices);
+            harness.registry.set_delivery_notice_sink(Arc::new(move |notice| {
+                captured.lock().expect("delivery notices lock").push(notice);
+            }));
+            harness.type_unsent_worker_draft("draft-544-cap").await;
+            let started = Instant::now();
+            harness.start_draft_delegate(false).await;
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let early = harness.registry.snapshot(&harness.worker_agent_id).unwrap_or_default();
+            assert!(
+                !snapshot_contains(&early, POINTER),
+                "delegate pointer arrived before the configured draft cap: {:?}",
+                String::from_utf8_lossy(&early)
+            );
+            let delivered = wait_for_snapshot_needle(
+                &harness.registry,
+                &harness.worker_agent_id,
+                POINTER,
+                Duration::from_secs(4),
+            )
+            .await;
+            assert!(snapshot_contains(&delivered, POINTER), "capped pointer was dropped");
+            assert!(
+                started.elapsed() >= Duration::from_millis(1300),
+                "pointer arrived before the draft cap: {:?}",
+                started.elapsed()
+            );
+            let (notice_count, notice_details) = {
+                let guard = notices.lock().expect("delivery notices lock");
+                let count = guard
+                    .iter()
+                    .filter(|notice| {
+                        notice.pane_id == WORKER_PANE
+                            && notice.agent_id == harness.worker_agent_id
+                            && notice.detail.contains("draft")
+                    })
+                    .count();
+                (count, format!("{guard:?}"))
+            };
+            assert_eq!(
+                notice_count,
+                1,
+                "capped delivery did not publish one draft notice: {notice_details}"
+            );
+            let settled_by = Instant::now() + Duration::from_secs(2);
+            let before = loop {
+                let snapshot = harness.registry.snapshot(&harness.worker_agent_id).unwrap_or_default();
+                let count = snapshot.windows(POINTER.len()).filter(|w| *w == POINTER).count();
+                if count >= 2 || Instant::now() >= settled_by {
+                    break count;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert_eq!(before, 2, "first pointer did not finish round-tripping");
+            let second_started = Instant::now();
+            harness.start_draft_delegate(true).await;
+            let after = loop {
+                let snapshot = harness.registry.snapshot(&harness.worker_agent_id).unwrap_or_default();
+                let count = snapshot.windows(POINTER.len()).filter(|w| *w == POINTER).count();
+                if count > before || second_started.elapsed() >= Duration::from_secs(2) {
+                    break count;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert!(
+                after > before && second_started.elapsed() < Duration::from_millis(1300),
+                "second first write stayed deferred after capped submit; before={before}, after={after}, elapsed={:?}",
+                second_started.elapsed()
+            );
+        });
+}
+
+/// Scenario: Close a worker while its unsent draft is holding a delegate
+/// pointer. The stale delivery must not write pointer bytes before or after
+/// that pane exits.
+#[test]
+#[cfg(unix)]
+fn dispatch_023_worker_exit_cancels_waiting_pointer() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
+        (DRAFT_DEFER_CAP_ENV, "60000"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build exiting-worker runtime")
+        .block_on(async {
+            let harness = SilenceHarness::new(64).await;
+            harness
+                .type_unsent_worker_draft("draft-544-exiting-worker")
+                .await;
+            let mut observer = harness
+                .registry
+                .subscribe(&harness.worker_agent_id)
+                .expect("subscribe to worker output before exit")
+                .rx;
+            harness.start_draft_delegate(false).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let before = harness
+                .registry
+                .snapshot(&harness.worker_agent_id)
+                .unwrap_or_default();
+            assert!(
+                !snapshot_contains(&before, POINTER),
+                "pointer reached drafted worker before exit: {:?}",
+                String::from_utf8_lossy(&before)
+            );
+            harness
+                .registry
+                .close_agent(&harness.worker_agent_id)
+                .expect("close worker during deferral");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            while let Ok(bytes) = observer.try_recv() {
+                assert!(
+                    !snapshot_contains(&bytes, POINTER),
+                    "pointer bytes reached worker around exit: {:?}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
         });
 }
 

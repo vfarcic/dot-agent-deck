@@ -16,6 +16,7 @@ mod common;
 use std::time::Duration;
 
 use common::TuiDeck;
+use dot_agent_deck::daemon_protocol::TabMembership;
 use spec::spec;
 
 const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
@@ -32,6 +33,134 @@ const ERASE_TAIL_WORD: &str = "erase_tail_9e33";
 /// bulk-input heuristic is most likely to misread. `MAX_DRAINABLE_STRANDED_BYTES`
 /// is 1024, so this sits between the real payload and the cap.
 const ERASE_BULK_LEN: usize = 600;
+
+/// Claude's live editor is a single row between two horizontal rules. Scope
+/// the draft to that row so a submitted prompt in transcript history cannot
+/// satisfy the no-submit assertion.
+fn claude_input_contains(grid: &str, text: &str) -> bool {
+    let rows: Vec<&str> = grid.lines().collect();
+    let rule = |row: &str| row.contains("────────────────────");
+    rows.iter().enumerate().any(|(index, row)| {
+        row.contains(text)
+            && index
+                .checked_sub(1)
+                .and_then(|above| rows.get(above))
+                .is_some_and(|r| rule(r))
+            && rows.get(index + 1).is_some_and(|r| rule(r))
+    })
+}
+
+/// Scenario: Type a draft into a genuine interactive Claude Haiku worker,
+/// then delegate a file-creation task through the real CLI. The sentinel must
+/// stay absent until Ctrl+U clears the draft, after which the agent acts on the
+/// separately submitted task pointer.
+#[spec("prompt/pane-input/042")]
+#[test]
+fn prompt_pane_input_042_live_claude_draft_defers_delegate() {
+    skip_unless!(common::check_claude_available());
+
+    const DRAFT: &str = "draft-544-live-sentinel";
+    const SENTINEL: &str = "draft-544-haiku-created-83c7.txt";
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .with_pty_size(160, 45)
+        .with_imported_claude_credentials()
+        .with_claude_trust_workdir()
+        .with_env("DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS", "60000")
+        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
+        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
+        .launch_with_fixture("orch-deck");
+    deck.wait_for_string("No active agents");
+    let config = deck.workdir().join(".dot-agent-deck.toml");
+    let original = std::fs::read_to_string(&config).expect("read orchestration fixture");
+    let updated = original.replace(
+        "name = \"worker\"\ncommand = \"cat\"",
+        "name = \"worker\"\ncommand = \"claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write\"\nclear = false",
+    );
+    assert_ne!(updated, original, "worker command must be replaced");
+    std::fs::write(&config, updated).expect("configure real Claude worker");
+
+    deck.send_keys(b"\x0e");
+    deck.send_keys(b" ");
+    deck.wait_for_string("No mode");
+    deck.send_keys(b"\x1b[C");
+    deck.send_keys(b"\r");
+    deck.send_keys(b"\r");
+    deck.wait_for_string("worker");
+    deck.send_keys(b"\x04");
+    deck.send_keys(b"2");
+    assert!(
+        deck.wait_for_grid_string_within("Claude Code v", Duration::from_secs(45)),
+        "interactive Claude worker never rendered: {}",
+        deck.snapshot_grid()
+    );
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+
+    let records = common::agent_records_on(deck.attach_socket_path());
+    let orchestrator = records
+        .iter()
+        .find(|record| {
+            matches!(
+                &record.tab_membership,
+                Some(TabMembership::Orchestration { role_name, .. }) if role_name == "orchestrator"
+            )
+        })
+        .expect("orchestrator role registered");
+    let sentinel_path = deck.workdir().join(SENTINEL);
+    deck.send_keys(DRAFT.as_bytes());
+    deck.wait_until_grid("draft visible in interactive Claude input", |grid| {
+        claude_input_contains(grid, DRAFT)
+    });
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args([
+            "delegate",
+            "--to",
+            "worker",
+            "--task",
+            &format!(
+                "Read the task file and create {SENTINEL} in this working directory with the exact text done-544. Then report completion."
+            ),
+        ])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env(
+            "DOT_AGENT_DECK_PANE_ID",
+            orchestrator
+                .pane_id_env
+                .as_deref()
+                .expect("orchestrator pane id"),
+        )
+        .env("HOME", deck.home_dir())
+        .current_dir(deck.workdir())
+        .output()
+        .expect("delegate to real Claude worker");
+    assert!(
+        output.status.success(),
+        "delegate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let draft_was_submitted = common::wait_until(Duration::from_secs(3), || {
+        !claude_input_contains(&deck.snapshot_grid(), DRAFT) || sentinel_path.exists()
+    });
+    assert!(
+        !draft_was_submitted
+            && claude_input_contains(&deck.snapshot_grid(), DRAFT)
+            && !sentinel_path.exists(),
+        "automatic pointer submitted the live user's draft before Ctrl+U; grid: {}",
+        deck.snapshot_grid()
+    );
+    deck.send_keys(b"\x15");
+    assert!(
+        common::wait_until(Duration::from_secs(90), || sentinel_path.exists()),
+        "real Claude did not act on the separately submitted delegate pointer; grid: {}",
+        deck.snapshot_grid()
+    );
+    assert_eq!(
+        std::fs::read_to_string(sentinel_path).expect("read Claude-created sentinel"),
+        "done-544"
+    );
+}
 
 /// Scenario: Runtime-skip unless Claude credentials are available, then launch a genuine interactive Claude Haiku pane with project trust and allowed tools configured. Type two sentinel words at the live agent prompt, press Ctrl+W, and verify the second word disappears before returning to command mode; the same Claude pane and daemon agent must still exist.
 #[spec("prompt/pane-input/022")]

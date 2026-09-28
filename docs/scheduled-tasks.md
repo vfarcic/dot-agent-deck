@@ -99,6 +99,8 @@ Tab reuse is tracked only while the daemon keeps running, so a daemon restart cl
 
 If a reuse fire lands while you are actively typing in that tab, the new prompt **waits** and is delivered once you pause (a short debounce, ~5s by default). If you are not typing, it is delivered immediately. The debounce window is tunable via the `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` environment variable (milliseconds).
 
+Pausing is not enough when you have left an unsent draft in the tab: the prompt then also waits until you press Enter, or clear the draft with Ctrl+U or Ctrl+C, so it is not submitted together with your text. That wait and the typing debounce share one cap, 60 seconds by default and set with `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS`, after which the prompt is delivered anyway. The same applies to the first prompt of a newly opened tab if you start typing into it before the prompt arrives. See [A deck prompt waits while you have an unsent draft](orchestration.md#a-deck-prompt-waits-while-you-have-an-unsent-draft) for the details and what this does not cover.
+
 ## Daemon must be running
 
 Scheduling depends on the daemon being up. The behavior on daemon stop / upgrade / restart / reboot is honest and documented:

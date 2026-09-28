@@ -169,10 +169,16 @@ fn reuse_003_deliver_on_idle_debounce() {
     let (work, record, command) = recorder_setup(scratch.path(), "idle");
 
     let toml = task_block("idle", &work.to_string_lossy(), &command, false);
+    // Issue #544: the simulated keystroke is an unsent draft, which the draft
+    // gate would hold the prompt behind until Enter. This test's subject is
+    // the debounce alone, so the gate is off; `scheduler/reuse/005` pins it.
     let daemon = common::spawn_daemon_serve_with_env(
         Some(&toml),
         "0",
-        &[("DOT_AGENT_DECK_REUSE_DEBOUNCE_MS", "2000")],
+        &[
+            ("DOT_AGENT_DECK_REUSE_DEBOUNCE_MS", "2000"),
+            ("DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS", "0"),
+        ],
     );
 
     // First fire opens the reused pane and delivers the prompt once.
@@ -209,5 +215,55 @@ fn reuse_003_deliver_on_idle_debounce() {
     assert!(
         common::wait_for_file_substr_count(&record, PROMPT_MARKER, 3, Duration::from_millis(1800)),
         "with no recent input a reuse fire must deliver immediately"
+    );
+}
+
+/// Scenario: Leave an unsent draft in a reused pane and fire its schedule after
+/// the ordinary idle debounce has passed. The prompt must stay queued until
+/// the user's Enter submits the draft, then arrive as a separate line.
+#[spec("scheduler/reuse/005")]
+#[test]
+fn reuse_005_unsent_draft_outlives_idle_debounce() {
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
+    let (work, record, command) = recorder_setup(scratch.path(), "draft");
+    let toml = task_block("draft", &work.to_string_lossy(), &command, false);
+    let daemon = common::spawn_daemon_serve_with_env(
+        Some(&toml),
+        "0",
+        &[
+            ("DOT_AGENT_DECK_REUSE_DEBOUNCE_MS", "500"),
+            ("DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS", "60000"),
+        ],
+    );
+
+    daemon.run_now("draft").expect("open reused pane");
+    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
+    let pane = records.first().expect("first fire spawned a pane");
+    assert!(
+        common::wait_for_file_substr_count(&record, PROMPT_MARKER, 1, Duration::from_secs(10)),
+        "first scheduled prompt must reach recorder"
+    );
+
+    assert!(
+        daemon.send_pane_input(&pane.id, TYPING_MARKER),
+        "draft bytes must reach reused pane"
+    );
+    daemon.run_now("draft").expect("fire into drafted pane");
+    assert!(
+        !common::wait_for_file_substr_count(&record, PROMPT_MARKER, 2, Duration::from_secs(2)),
+        "reuse prompt reached pane while a user draft was still unsent"
+    );
+
+    assert!(daemon.send_pane_input(&pane.id, "\r"), "submit user draft");
+    assert!(
+        common::wait_for_file_substr_count(&record, PROMPT_MARKER, 2, Duration::from_secs(6)),
+        "reuse prompt did not arrive after the user submitted the draft"
+    );
+    let lines = std::fs::read_to_string(&record).expect("read submitted lines");
+    assert!(
+        lines.lines().any(|line| line == TYPING_MARKER)
+            && lines.lines().any(|line| line == PROMPT_MARKER)
+            && !lines.contains(&format!("{TYPING_MARKER}{PROMPT_MARKER}")),
+        "draft and reuse prompt were not separate submitted lines: {lines:?}"
     );
 }

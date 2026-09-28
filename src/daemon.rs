@@ -2884,7 +2884,13 @@ pub async fn deliver_dispatch_result(
 ) -> crate::agent_pty::GuardedSend {
     use crate::agent_pty::GuardedSend;
     match registry
-        .write_and_submit_guarded(pane_id, message, expected_agent_id, || async { true })
+        .write_and_submit_guarded_first_write(
+            pane_id,
+            message,
+            expected_agent_id,
+            || async { true },
+            std::time::Instant::now(),
+        )
         .await
     {
         Ok(GuardedSend::Applied) => GuardedSend::Applied,
@@ -3598,13 +3604,29 @@ async fn run_hook_loop_with_idle_timeout(
 
                                     // Deliver result to the caller (doesn't need any
                                     // AppState lock — uses the PTY registry).
-                                    deliver_dispatch_result(
-                                        &pty_registry,
-                                        &signal.pane_id,
-                                        &caller_agent_id,
-                                        &result.message,
-                                    )
-                                    .await;
+                                    //
+                                    // Issue #544: DETACHED, because this is a first
+                                    // write that may wait up to the draft cap for the
+                                    // caller's unsent draft, and awaiting it here
+                                    // would hold this connection — one of
+                                    // `MAX_CONCURRENT_HOOK_CONNECTIONS` — for that
+                                    // long. Nothing below depends on it finishing:
+                                    // the caller's CLI was acked at the provenance
+                                    // gate above, the outcome is logged inside
+                                    // `deliver_dispatch_result`, and its return value
+                                    // was never read here.
+                                    let registry = pty_registry.clone();
+                                    let caller_pane_id = signal.pane_id.clone();
+                                    let message = result.message;
+                                    tokio::spawn(async move {
+                                        deliver_dispatch_result(
+                                            &registry,
+                                            &caller_pane_id,
+                                            &caller_agent_id,
+                                            &message,
+                                        )
+                                        .await;
+                                    });
                                 }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(
@@ -3612,7 +3634,32 @@ async fn run_hook_loop_with_idle_timeout(
                                         done = signal.done,
                                         "Received work-done signal"
                                     );
-                                    state.read().await.handle_work_done(signal, &pty_registry).await;
+                                    // Issue #544: the write happens AFTER the read
+                                    // guard is released. It may wait for the
+                                    // orchestrator's unsent draft, and a read guard
+                                    // held across that wait queues every
+                                    // `state.write()` — and every reader behind it —
+                                    // for as long. See `WorkDoneDelivery`.
+                                    //
+                                    // The write is also DETACHED from this
+                                    // connection, for the reason given on the
+                                    // `Dispatch` arm's `deliver_dispatch_result`:
+                                    // awaited inline, a deferred write holds one of
+                                    // the `MAX_CONCURRENT_HOOK_CONNECTIONS` permits
+                                    // for up to the draft cap. The `work-done` CLI
+                                    // was acked at the provenance gate, and
+                                    // `deliver` logs its own outcome. The state
+                                    // changes `prepare_work_done` makes stay inline
+                                    // and in message order; only the PTY write moves.
+                                    let delivery = state
+                                        .read()
+                                        .await
+                                        .prepare_work_done(signal, &pty_registry)
+                                        .await;
+                                    let registry = pty_registry.clone();
+                                    tokio::spawn(async move {
+                                        delivery.deliver(&registry).await;
+                                    });
                                 }
                                 DaemonMessage::GetSeed(req) => {
                                     // PRD #201 native prompt delivery: hand the

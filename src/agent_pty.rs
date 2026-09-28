@@ -182,9 +182,13 @@ pub fn arm_seed_fallback(
                 // Native pull did not happen within the grace window — deliver
                 // via the legacy PTY injection so the pane still works.
                 let outcome = registry
-                    .write_and_submit_guarded(&pane_id, &seed, &expected_agent_id, || async {
-                        true
-                    })
+                    .write_and_submit_guarded_first_write(
+                        &pane_id,
+                        &seed,
+                        &expected_agent_id,
+                        || async { true },
+                        Instant::now(),
+                    )
                     .await;
                 match outcome {
                     Ok(GuardedSend::Applied) => {
@@ -2267,6 +2271,29 @@ pub enum GuardedSendDetail {
     RefusedUserInput,
 }
 
+/// Issue #544: whether a guarded write is a daemon-originated FIRST write that
+/// waits for the user's unsent draft, or writes immediately as every write did
+/// before the gate existed.
+#[derive(Debug, Clone, Copy)]
+enum FirstWrite {
+    Immediate,
+    /// Wait while a draft is pending, within the cap measured from `started`.
+    Defer {
+        started: Instant,
+    },
+}
+
+/// Issue #544: what [`AgentPtyRegistry::write_and_submit_guarded_first_write_detailed`]
+/// reports — the send's outcome, and how long it spent waiting for the user's
+/// draft before it got there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirstWriteSend {
+    pub detail: GuardedSendDetail,
+    /// Time spent asleep waiting for the draft to clear. Zero when nothing was
+    /// pending. Excludes time spent queued behind another writer.
+    pub deferred: Duration,
+}
+
 impl GuardedSendDetail {
     /// Flatten to the vocabulary every existing caller and the wire mapping use.
     pub fn outcome(self) -> GuardedSend {
@@ -3435,6 +3462,12 @@ struct UserInputStream {
     /// from the ESC-prefixed `Alt+Enter`. `None` only at the very start of the
     /// stream, where no prefix can have been sent.
     preceding: Option<u8>,
+    /// Issue #544: whether the user has sent input since their last submit or
+    /// clear — the bit an automatic FIRST write waits on. Fed every byte this
+    /// stream sees, with the submit decision and paste framing above, so the
+    /// two can never disagree about what a byte did. See
+    /// [`crate::draft_deferral::DraftTracker`].
+    draft: crate::draft_deferral::DraftTracker,
 }
 
 impl UserInputStream {
@@ -3452,7 +3485,21 @@ impl UserInputStream {
     }
 
     /// Feed one byte; `true` if it submits, OUTSIDE a bracketed paste.
+    ///
+    /// Issue #544: the same byte also moves the draft bit, with the submit
+    /// decision just made and the paste framing as it stood BEFORE this byte —
+    /// so the closing marker's bytes are paste content and the opening one's are
+    /// not.
     fn feed_byte(&mut self, byte: u8) -> bool {
+        let in_paste = self.in_paste;
+        let submits = self.scan_submit(byte);
+        self.draft.feed_byte(byte, submits, in_paste);
+        submits
+    }
+
+    /// The submit half of [`Self::feed_byte`]: paste framing, then the keypress
+    /// behind the byte.
+    fn scan_submit(&mut self, byte: u8) -> bool {
         // Unconditional, and before the marker matcher's early returns: every
         // byte is somebody's predecessor, including the ones consumed as part
         // of a paste marker.
@@ -3674,6 +3721,24 @@ impl PaneInputState {
         self.user_input_at.get(pane_id_env).copied()
     }
 
+    /// Issue #544: has the user sent input into `pane_id_env` since their last
+    /// submit or clear? See [`crate::draft_deferral::DraftTracker`].
+    fn draft_pending(&self, pane_id_env: &str) -> bool {
+        self.input
+            .get(pane_id_env)
+            .is_some_and(|stream| stream.draft.pending())
+    }
+
+    /// Issue #544: a SUBMIT write of ours reached the PTY in full, so its CR
+    /// submitted whatever was in the box — the user's draft included. Without
+    /// this, every automatic write after a capped one would wait out a whole
+    /// cap again for a draft that is no longer there.
+    fn note_box_submitted(&mut self, pane_id_env: &str) {
+        if let Some(stream) = self.input.get_mut(pane_id_env) {
+            stream.draft.clear();
+        }
+    }
+
     /// Would a blind submit CR into `pane_id_env` submit something other than
     /// the payload we put there? See
     /// [`AgentPtyRegistry::user_typed_since_automatic_write`].
@@ -3808,6 +3873,17 @@ impl PaneWriter {
         }
     }
 
+    /// Issue #544: record that a SUBMIT write of ours just landed in full, as
+    /// the writer that made it — a no-op once this writer's agent has left the
+    /// registry, like [`Self::note_automatic_write`]. See
+    /// [`PaneInputState::note_box_submitted`].
+    fn note_box_submitted(&self, pane_id_env: &str) {
+        let mut state = self.state.lock().unwrap();
+        if !self.retired.load(Ordering::SeqCst) {
+            state.note_box_submitted(pane_id_env);
+        }
+    }
+
     /// Write as the DAEMON: the bytes are ours, so they are not user input and
     /// must not advance the user-input clock. Every daemon-initiated write into
     /// a pane goes through here; everything that reaches the plain
@@ -3902,6 +3978,11 @@ pub struct AgentPtyRegistry {
     /// (H1). See [`PaneInputState`], [`Self::user_typed_since_automatic_write`]
     /// and [`Self::user_typed_since_writing_payload`].
     pane_input: Arc<Mutex<PaneInputState>>,
+    /// Issue #544: how long an automatic first write waits for the user's
+    /// unsent draft ([`crate::draft_deferral::draft_defer_cap_from_env`]),
+    /// captured when the registry is built so the daemon and every in-process
+    /// test resolve it the same way. Zero switches the gate off.
+    draft_defer_cap: Duration,
     /// Issue #424 F4: agents whose pane declared BOOT PROVENANCE before their
     /// spawn-time prompt was written — a `wrapper_fork`-origin `SessionStart`
     /// that the readiness gate skipped
@@ -5214,7 +5295,7 @@ pub type DeliveryNoticeSink = Arc<dyn Fn(DeliveryNotice) + Send + Sync>;
 /// seam — so the modes a production build can reach are exactly the two
 /// [`AgentPtyRegistry::write_and_submit_guarded`] and
 /// [`AgentPtyRegistry::write_notice_guarded`] pass in.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum SubmitMode {
     Submit,
     Notice,
@@ -5343,6 +5424,7 @@ impl AgentPtyRegistry {
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
+            draft_defer_cap: crate::draft_deferral::draft_defer_cap_from_env(),
             launcher_handoff_agents: Mutex::new(HashMap::new()),
             delivery_ledger: Mutex::new(DeliveryLedger::default()),
             hook_socket: Mutex::new(None),
@@ -6908,7 +6990,7 @@ impl AgentPtyRegistry {
         let revalidate_pane = orchestrator_pane_id.clone();
         let revalidate_worker = worker_pane_id.to_string();
         let outcome = self
-            .write_and_submit_guarded(
+            .write_and_submit_guarded_first_write(
                 &orchestrator_pane_id,
                 &notice,
                 &expected_agent_id,
@@ -6928,6 +7010,7 @@ impl AgentPtyRegistry {
                             .as_ref(),
                     )
                 },
+                Instant::now(),
             )
             .await;
         // Issue #708: a one-shot submitted report releases its payload record on
@@ -7017,6 +7100,19 @@ impl AgentPtyRegistry {
             .lock()
             .unwrap()
             .last_user_input_at(pane_id_env)
+    }
+
+    /// Issue #544: has the user sent input into `pane_id_env` since their last
+    /// submit or clear — the draft an automatic first write waits for? See
+    /// [`crate::draft_deferral::DraftTracker`] for what sets and clears it.
+    pub fn draft_pending(&self, pane_id_env: &str) -> bool {
+        self.pane_input.lock().unwrap().draft_pending(pane_id_env)
+    }
+
+    /// Issue #544: the draft-deferral cap this registry was built with. Zero
+    /// means the gate is off.
+    pub fn draft_defer_cap(&self) -> Duration {
+        self.draft_defer_cap
     }
 
     /// Issue #424 F1: has a USER keystroke reached `pane_id_env` since the last
@@ -7125,12 +7221,19 @@ impl AgentPtyRegistry {
     /// direction — refused and reported, never silently submitted on top of what
     /// the user typed.
     ///
-    /// Residual, deliberately out of scope here and tracked as **issue #544**: a
-    /// new, DIFFERENT payload delivered into a pane holding an unsent user draft
-    /// still concatenates with it — the long-documented limitation on
-    /// every automatic payload write — because the alternative is the brick
-    /// above. Both reviewers ruled it a pre-existing limitation of every
-    /// automatic payload rather than a regression introduced here.
+    /// Residual, deliberately out of scope here: a new, DIFFERENT payload
+    /// delivered into a pane holding an unsent user draft is not this
+    /// predicate's question, because refusing it is the brick above. Issue #544
+    /// answers it separately, by DELAYING rather than refusing: the
+    /// daemon-originated first writes take
+    /// [`Self::write_and_submit_guarded_first_write`], which waits while the
+    /// pane's draft bit ([`Self::draft_pending`]) is set, up to
+    /// [`Self::draft_defer_cap`]. What still concatenates with a draft: a first
+    /// write that waited out the cap (reported on the card), one made through
+    /// the immediate entries — the TUI/desktop `WriteAndSubmit` RPC among them —
+    /// and text in the box the daemon never saw typed (agent history recall,
+    /// autocomplete), or a draft the bit reads as cleared when it is not (a
+    /// `Ctrl+U` that killed only one line of several).
     pub fn user_typed_since_writing_payload(&self, pane_id_env: &str, text: &str) -> bool {
         let Ok(payload) = encode_pane_payload(text) else {
             // A payload the encoder rejects is never written, so it can never be
@@ -8357,6 +8460,85 @@ impl AgentPtyRegistry {
             SubmitMode::Submit,
             expected_agent_id,
             revalidate,
+            FirstWrite::Immediate,
+        )
+        .await
+        .map(|sent| sent.detail)
+    }
+
+    /// Issue #544: [`Self::write_and_submit_guarded`] for a daemon-originated
+    /// FIRST write — one that is not a retry of an earlier write of the same
+    /// delivery — which WAITS while the user has an unsent draft in the pane.
+    ///
+    /// The wait ends when the user submits or clears the draft (`Enter`,
+    /// `Ctrl+U`, `Ctrl+C`), or when [`Self::draft_defer_cap`] has passed since
+    /// `started`. At the cap the write goes ahead exactly as the immediate entry
+    /// would, with a `warn!` and one [`DeliveryNotice`] on the pane's card,
+    /// because a prompt that never arrives is the worse outcome (#424). It
+    /// never refuses on account of the draft; every other refusal is the
+    /// immediate entry's, re-checked on each pass so a pane that closes or
+    /// changes hands during the wait is refused exactly as it would be before
+    /// it.
+    ///
+    /// `started` is when this delivery's wait budget began. Pass `Instant::now()`
+    /// unless an earlier wait is sharing the budget — the scheduler's reuse
+    /// fire passes the start of its idle debounce, so the two together stay
+    /// within one cap.
+    ///
+    /// The wait holds NO lock: the user's own `Enter` needs this pane's writer
+    /// to reach the PTY, so waiting while holding it would always run to the
+    /// cap. `revalidate` still runs exactly once, under the writer, on the pass
+    /// that writes.
+    ///
+    /// Only non-empty payloads are gated: an empty one is a submit-only probe,
+    /// which #424 already refuses once the user has typed. The TUI/desktop
+    /// `WriteAndSubmit` RPC deliberately stays on the immediate entry — the TUI
+    /// calls it from its UI thread, and the desktop's `SubmitText` is the user's
+    /// own submit.
+    pub async fn write_and_submit_guarded_first_write<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: &str,
+        revalidate: impl FnOnce() -> Fut,
+        started: Instant,
+    ) -> Result<GuardedSend, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        self.write_and_submit_guarded_first_write_detailed(
+            pane_id,
+            text,
+            expected_agent_id,
+            revalidate,
+            started,
+        )
+        .await
+        .map(|sent| sent.detail.outcome())
+    }
+
+    /// [`Self::write_and_submit_guarded_first_write`], keeping the refusal
+    /// reason and reporting how long the write waited for the draft — the
+    /// spawn seed path needs the latter so the wait does not consume its
+    /// delivery deadline.
+    pub async fn write_and_submit_guarded_first_write_detailed<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: &str,
+        revalidate: impl FnOnce() -> Fut,
+        started: Instant,
+    ) -> Result<FirstWriteSend, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        self.write_guarded(
+            pane_id,
+            text,
+            SubmitMode::Submit,
+            expected_agent_id,
+            revalidate,
+            FirstWrite::Defer { started },
         )
         .await
     }
@@ -8398,9 +8580,10 @@ impl AgentPtyRegistry {
             SubmitMode::Notice,
             expected_agent_id,
             revalidate,
+            FirstWrite::Immediate,
         )
         .await
-        .map(GuardedSendDetail::outcome)
+        .map(|sent| sent.detail.outcome())
     }
 
     /// The shared body of [`Self::write_and_submit_guarded`] (payload +
@@ -8416,22 +8599,33 @@ impl AgentPtyRegistry {
         mode: SubmitMode,
         expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
-    ) -> Result<GuardedSendDetail, AgentPtyError>
+        first_write: FirstWrite,
+    ) -> Result<FirstWriteSend, AgentPtyError>
     where
         Fut: std::future::Future<Output = bool>,
     {
+        // Issue #544: every outcome reports the time this call spent asleep
+        // waiting for the user's draft, including a refusal reached after
+        // sleeping — one closure taking it as an argument rather than one
+        // captured per phase, so no return path can silently report zero.
+        let finish = |outcome, deferred: Duration| {
+            Ok(FirstWriteSend {
+                detail: GuardedSendDetail::Outcome(outcome),
+                deferred,
+            })
+        };
+        let mut deferred = Duration::ZERO;
         let is_paneless = pane_id == "<no-pane>";
-        let target = if is_paneless {
-            // Resolve BY agent identity.
-            match self.writer_target_for_agent(expected_agent_id) {
-                Some(target) => target,
-                None => return Ok(GuardedSendDetail::Outcome(GuardedSend::NoLiveTarget)),
+        let resolve = || {
+            if is_paneless {
+                // Resolve BY agent identity.
+                self.writer_target_for_agent(expected_agent_id)
+            } else {
+                self.writer_target_for_pane(pane_id)
             }
-        } else {
-            let Some(target) = self.writer_target_for_pane(pane_id) else {
-                return Ok(GuardedSendDetail::Outcome(GuardedSend::NoLiveTarget));
-            };
-            target
+        };
+        let Some(mut target) = resolve() else {
+            return finish(GuardedSend::NoLiveTarget, deferred);
         };
         // Pre-lock identity gate: refuse a prompt queued for a different agent
         // than the one that now owns the pane (respawn/rebind before delivery).
@@ -8444,34 +8638,87 @@ impl AgentPtyRegistry {
         // write to the pane's entry-time owner. `expected_agent_id` is a `&str`,
         // so that case no longer exists to be skipped.
         if !is_paneless && expected_agent_id != target.agent_id {
-            return Ok(GuardedSendDetail::Outcome(GuardedSend::WrongSession));
+            return finish(GuardedSend::WrongSession, deferred);
         }
         // Encode before locking so a bad payload doesn't pin the writer.
         let payload = encode_pane_payload(text)?;
-        // Acquire the EXACT target writer, THEN re-validate — this is the
-        // barrier the TOCTOU test holds open by locking the writer externally.
-        let mut w = target.writer.lock().await;
-        // Re-resolve identity: the pane may have rebound to a new agent, or the
-        // target may have exited, while we waited for the writer. A paneless
-        // agent has no pane→agent mapping to rebind, so the meaningful re-check
-        // is that the agent still exists — a removal (`None`) is `Stale`.
-        if is_paneless {
-            if self.writer_target_for_agent(&target.agent_id).is_none() {
-                return Ok(GuardedSendDetail::Outcome(GuardedSend::Stale));
+        // Issue #544: the draft gate, for a first write of a non-empty SUBMIT
+        // payload with the cap switched on. A Notice submits nothing, and an
+        // empty payload is a probe that #424 already governs.
+        let gate = match first_write {
+            FirstWrite::Defer { started }
+                if matches!(mode, SubmitMode::Submit)
+                    && !payload.is_empty()
+                    && !self.draft_defer_cap.is_zero() =>
+            {
+                Some(started)
             }
-        } else {
-            match self.writer_target_for_pane(pane_id) {
-                Some(current) if current.agent_id == target.agent_id => {}
-                Some(_) => return Ok(GuardedSendDetail::Outcome(GuardedSend::WrongSession)),
-                None => return Ok(GuardedSendDetail::Outcome(GuardedSend::Stale)),
+            _ => None,
+        };
+        let decide = |pending: bool| match gate {
+            Some(started) => crate::draft_deferral::decide_first_write(
+                pending,
+                Instant::now(),
+                started,
+                self.draft_defer_cap,
+            ),
+            None => crate::draft_deferral::FirstWriteDecision::Now { capped: false },
+        };
+        let (mut w, capped) = loop {
+            // Issue #544: wait WITHOUT the writer while the draft is pending.
+            // Every pass after a sleep re-resolves the target, so a pane that
+            // closed or changed hands meanwhile is refused exactly as it would
+            // have been had the write arrived then.
+            if let crate::draft_deferral::FirstWriteDecision::Wait { after } =
+                decide(self.draft_pending(pane_id))
+            {
+                let slept = Instant::now();
+                tokio::time::sleep(after).await;
+                deferred += slept.elapsed();
+                let Some(current) = resolve() else {
+                    return finish(GuardedSend::NoLiveTarget, deferred);
+                };
+                if current.agent_id != target.agent_id {
+                    return finish(GuardedSend::WrongSession, deferred);
+                }
+                target = current;
+                continue;
             }
-        }
-        if target.exited.load(Ordering::SeqCst) {
-            return Ok(GuardedSendDetail::Outcome(GuardedSend::Stale));
-        }
+            // Acquire the EXACT target writer, THEN re-validate — this is the
+            // barrier the TOCTOU test holds open by locking the writer externally.
+            let w = target.writer.lock().await;
+            // Re-resolve identity: the pane may have rebound to a new agent, or the
+            // target may have exited, while we waited for the writer. A paneless
+            // agent has no pane→agent mapping to rebind, so the meaningful re-check
+            // is that the agent still exists — a removal (`None`) is `Stale`.
+            if is_paneless {
+                if self.writer_target_for_agent(&target.agent_id).is_none() {
+                    return finish(GuardedSend::Stale, deferred);
+                }
+            } else {
+                match self.writer_target_for_pane(pane_id) {
+                    Some(current) if current.agent_id == target.agent_id => {}
+                    Some(_) => return finish(GuardedSend::WrongSession, deferred),
+                    None => return finish(GuardedSend::Stale, deferred),
+                }
+            }
+            if target.exited.load(Ordering::SeqCst) {
+                return finish(GuardedSend::Stale, deferred);
+            }
+            // Issue #544: the decision again, UNDER the writer. User bytes are
+            // recorded while their writer is held ([`PaneWriter`]), so this read
+            // cannot miss a keystroke already in the PTY. A draft typed between
+            // the check above and this one sends the write back to waiting —
+            // dropping the writer first, and without calling `revalidate`, which
+            // is `FnOnce` and belongs to the pass that writes.
+            match decide(self.draft_pending(pane_id)) {
+                crate::draft_deferral::FirstWriteDecision::Now { capped } => break (w, capped),
+                crate::draft_deferral::FirstWriteDecision::Wait { .. } => drop(w),
+            }
+        };
         // Liveness/session recheck against the authoritative session state.
         if !revalidate().await {
-            return Ok(GuardedSendDetail::Outcome(GuardedSend::Stale));
+            return finish(GuardedSend::Stale, deferred);
         }
         // Issue #424 F1 (auditor HIGH): a SUBMIT-ONLY PROBE — an empty payload
         // whose only effect is the submit CR — must not fire once the user has
@@ -8531,7 +8778,10 @@ impl AgentPtyRegistry {
                 // Issue #424 H5: `Stale` to every existing caller and to the
                 // wire, but the reason survives for the one caller that owes the
                 // user a terminal report — see [`GuardedSendDetail`].
-                return Ok(GuardedSendDetail::RefusedUserInput);
+                return Ok(FirstWriteSend {
+                    detail: GuardedSendDetail::RefusedUserInput,
+                    deferred,
+                });
             }
         }
         // Authorized — write the payload and the mode's configured terminator,
@@ -8562,6 +8812,29 @@ impl AgentPtyRegistry {
         // error; a partial write (payload started, or the tail — submit CR for
         // `Submit`, LF for `Notice` — failed after the payload landed) is
         // AMBIGUOUS and must not be blind-retried.
+        // Issue #544: the wait ran to the cap with the draft still pending, so
+        // this write goes ahead on top of it — today's behaviour, degraded but
+        // not dropped. Reported BEFORE the bytes go in, so the card says so by
+        // the time the prompt is visible in the pane; a write that then fails
+        // cleanly is logged as a failure below, and the card says only that
+        // the draft MAY have been sent.
+        if capped {
+            tracing::warn!(
+                pane_id = %pane_id,
+                agent_id = %target.agent_id,
+                payload_len = payload.len(),
+                deferred_ms = deferred.as_millis(),
+                "automatic first write waited out the draft-deferral cap; submitting it into a \
+                 pane still holding the user's unsent draft"
+            );
+            self.publish_delivery_notice(DeliveryNotice {
+                pane_id: pane_id.to_string(),
+                agent_id: target.agent_id.clone(),
+                delivery_id: crate::prompt_delivery::mint_delivery_id(pane_id),
+                session_id: None,
+                detail: crate::draft_deferral::DRAFT_CAP_NOTICE,
+            });
+        }
         let delivery = match mode {
             SubmitMode::Submit => deliver_payload_and_submit(w.daemon(), &payload).await,
             SubmitMode::Notice => deliver_payload_as_notice(w.daemon(), &payload).await,
@@ -8575,7 +8848,15 @@ impl AgentPtyRegistry {
             // dangerous.
             PayloadDelivery::Applied => {
                 w.note_automatic_write(pane_id, mode, &payload);
-                Ok(GuardedSendDetail::Outcome(GuardedSend::Applied))
+                // Issue #544: our CR submitted the whole box, so nothing the
+                // user typed is waiting in it any more. Only a SUBMIT that
+                // landed in full says so: a Notice leaves its bytes (and the
+                // draft) in the box, and an ambiguous write may not have sent
+                // its CR at all.
+                if matches!(mode, SubmitMode::Submit) {
+                    w.note_box_submitted(pane_id);
+                }
+                finish(GuardedSend::Applied, deferred)
             }
             // Issue #876: an ambiguous write is recorded only while bytes of
             // ours are still sitting in that input box.
@@ -8641,7 +8922,7 @@ impl AgentPtyRegistry {
                          out of the input box, so no payload record is kept"
                     );
                 }
-                Ok(GuardedSendDetail::Outcome(GuardedSend::Ambiguous))
+                finish(GuardedSend::Ambiguous, deferred)
             }
             PayloadDelivery::CleanFailure(e) => Err(AgentPtyError::Writer(e)),
         }
@@ -10535,7 +10816,7 @@ impl AgentPtyRegistry {
         let revalidate_pane = orchestrator_pane_id.clone();
         let (worker_pane, worker_agent) = (worker_pane_id.to_string(), worker_agent_id.to_string());
         let outcome = self
-            .write_and_submit_guarded(
+            .write_and_submit_guarded_first_write(
                 &orchestrator_pane_id,
                 &text,
                 &expected_agent_id,
@@ -10558,6 +10839,7 @@ impl AgentPtyRegistry {
                             .as_ref(),
                     ) && gate.begin_write()
                 },
+                Instant::now(),
             )
             .await;
         // A one-shot submitted report: its payload record goes on `Applied` and
@@ -17911,6 +18193,199 @@ mod spawn_tests {
         retired.store(true, Ordering::SeqCst);
         writer.write_all(b"typed").expect("write to sink");
         assert!(!state.lock().unwrap().tracks_pane(PANE));
+    }
+
+    /// Issue #544: the draft bit rides the same stream state as the submit
+    /// drain, so paste framing and the report classifier cannot confuse each
+    /// other — including when a marker or a report is split across writes.
+    #[test]
+    fn draft_bit_shares_the_stream_with_paste_framing() {
+        let mut stream = UserInputStream::default();
+        assert!(
+            !stream.feed(b"\x1b[<64;10;5M\x1b[I"),
+            "reports submit nothing"
+        );
+        assert!(!stream.draft.pending(), "reports are not a draft");
+
+        // A paste split mid-marker: its newlines neither submit nor clear.
+        assert!(!stream.feed(b"\x1b[20"));
+        assert!(!stream.feed(b"0~line one\r"));
+        assert!(!stream.feed(b"line two\x1b[201~"));
+        assert!(stream.draft.pending(), "pasted text is a draft");
+        // A Ctrl+U INSIDE a paste is content, not a clear.
+        assert!(!stream.feed(b"\x1b[200~\x15\x1b[201~"));
+        assert!(stream.draft.pending());
+
+        // Out of the paste, a report after the draft leaves it pending, and
+        // Enter clears it.
+        assert!(!stream.feed(b"\x1b[10;5R"));
+        assert!(stream.draft.pending());
+        assert!(stream.feed(b"\r"));
+        assert!(!stream.draft.pending());
+    }
+
+    /// Issue #544: a pane that changes hands, or closes, starts with no draft.
+    #[test]
+    fn draft_bit_is_reset_by_forget_pane_and_forget_closed_pane() {
+        const PANE: &str = "issue-544-forget";
+        let mut state = PaneInputState::default();
+        state.note_user_bytes(PANE, b"draft");
+        assert!(state.draft_pending(PANE), "the control");
+        state.forget_pane(PANE);
+        assert!(!state.draft_pending(PANE), "forget_pane");
+
+        state.note_user_bytes(PANE, b"draft");
+        state.forget_closed_pane(PANE);
+        assert!(!state.draft_pending(PANE), "forget_closed_pane");
+
+        // Sentinel ids never hold one.
+        state.note_user_bytes("<no-pane>", b"draft");
+        assert!(!state.draft_pending("<no-pane>"));
+    }
+
+    /// Issue #544: only an `Applied` SUBMIT of ours clears the draft bit — its
+    /// CR submitted the box. A Notice leaves its bytes and the draft in the box,
+    /// and an ambiguous write may never have sent its CR.
+    #[tokio::test]
+    async fn applied_submit_clears_the_draft_bit_but_notice_and_ambiguous_do_not() {
+        use std::io::Write as _;
+        const PANE: &str = "issue-544-clears";
+        const AMBIGUOUS_PANE: &str = "issue-544-ambiguous";
+        const TEXT: &str = "ISSUE-544-CLEAR-PROBE";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn = |pane: &str| {
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn stand-in")
+        };
+        let agent = spawn(PANE);
+        let ambiguous_agent = spawn(AMBIGUOUS_PANE);
+        for id in [&agent, &ambiguous_agent] {
+            let handle = registry.subscribe(id).expect("attach");
+            let mut writer = handle.writer.lock().await;
+            writer.write_all(b"draft").expect("type draft");
+        }
+        assert!(registry.draft_pending(PANE) && registry.draft_pending(AMBIGUOUS_PANE));
+
+        assert_eq!(
+            registry
+                .write_notice_guarded(PANE, TEXT, &agent, || async { true })
+                .await
+                .expect("notice"),
+            GuardedSend::Applied
+        );
+        assert!(
+            registry.draft_pending(PANE),
+            "a notice leaves the draft in the box"
+        );
+
+        let payload_len = crate::pane_input::encode_pane_payload(TEXT)
+            .expect("encode")
+            .len();
+        let (never_healing, _log) = HealingFaultyWriter::never_healing(payload_len);
+        let _displaced = registry
+            .replace_agent_writer_for_test(&ambiguous_agent, Box::new(never_healing))
+            .await;
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(AMBIGUOUS_PANE, TEXT, &ambiguous_agent, || async { true })
+                .await
+                .expect("ambiguous submit"),
+            GuardedSend::Ambiguous
+        );
+        assert!(
+            registry.draft_pending(AMBIGUOUS_PANE),
+            "an ambiguous submit may not have sent its CR"
+        );
+
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(PANE, TEXT, &agent, || async { true })
+                .await
+                .expect("submit"),
+            GuardedSend::Applied
+        );
+        assert!(!registry.draft_pending(PANE), "our CR submitted the box");
+        registry.shutdown_all();
+    }
+
+    /// Issue #544: the IMMEDIATE entries keep their pre-#544 semantics — a
+    /// pending draft does not delay them — while the first-write entry waits
+    /// for the draft to clear and then writes.
+    #[tokio::test]
+    async fn only_the_first_write_entry_waits_for_a_pending_draft() {
+        use std::io::Write as _;
+        const PANE: &str = "issue-544-immediate";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        assert!(!registry.draft_defer_cap().is_zero(), "default cap is on");
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let type_bytes = |bytes: &'static [u8]| {
+            let registry = Arc::clone(&registry);
+            let agent = agent.clone();
+            async move {
+                let handle = registry.subscribe(&agent).expect("attach");
+                let mut writer = handle.writer.lock().await;
+                writer.write_all(bytes).expect("type");
+            }
+        };
+        type_bytes(b"draft").await;
+        let immediate = tokio::time::timeout(
+            Duration::from_secs(2),
+            registry.write_and_submit_guarded(PANE, "IMMEDIATE", &agent, || async { true }),
+        )
+        .await
+        .expect("the immediate entry must not wait for the draft")
+        .expect("immediate write");
+        assert_eq!(immediate, GuardedSend::Applied);
+
+        type_bytes(b"second draft").await;
+        let started = Instant::now();
+        let waiting = {
+            let registry = Arc::clone(&registry);
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                registry
+                    .write_and_submit_guarded_first_write_detailed(
+                        PANE,
+                        "DEFERRED",
+                        &agent,
+                        || async { true },
+                        Instant::now(),
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the first write must wait for the draft"
+        );
+        type_bytes(b"\x15").await;
+        let sent = tokio::time::timeout(Duration::from_secs(3), waiting)
+            .await
+            .expect("released by Ctrl+U")
+            .expect("join")
+            .expect("first write");
+        assert_eq!(
+            sent.detail,
+            GuardedSendDetail::Outcome(GuardedSend::Applied)
+        );
+        assert!(
+            sent.deferred >= Duration::from_millis(400) && sent.deferred <= started.elapsed(),
+            "the reported wait is the time spent waiting: {:?}",
+            sent.deferred
+        );
+        registry.shutdown_all();
     }
 
     /// Issue #542 (PR #1293 review): a spawn that has only RESERVED the pane
