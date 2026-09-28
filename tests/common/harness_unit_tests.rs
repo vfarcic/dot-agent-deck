@@ -5015,3 +5015,261 @@ fn measured_load_still_widens_between_one_and_the_cap() {
         "load_scaled must be exactly load_factor applied to the base"
     );
 }
+
+// -----------------------------------------------------------------------
+// Issue #701 — a load-induced failure labels itself
+// -----------------------------------------------------------------------
+
+mod load_context_tests {
+    use std::time::Duration;
+
+    use crate::common::load_context::*;
+
+    const PSI_CPU: &str = "some avg10=7.21 avg60=19.87 avg300=16.87 total=31056709947\n\
+                           full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+
+    fn reading(cpu: u64, io: u64, mem: u64) -> Reading {
+        Reading {
+            cpu_some_us: Some(cpu),
+            io_full_us: Some(io),
+            memory_full_us: Some(mem),
+            load1: None,
+        }
+    }
+
+    /// Scenario: Parse the `total=` field out of a real `/proc/pressure/cpu`
+    /// capture for both the `some` and the `full` line, and get `None` for a
+    /// line that is absent or malformed rather than a wrong number.
+    #[test]
+    fn psi_total_is_read_from_the_named_line_only() {
+        assert_eq!(parse_psi_total(PSI_CPU, "some"), Some(31_056_709_947));
+        assert_eq!(parse_psi_total(PSI_CPU, "full"), Some(0));
+        assert_eq!(parse_psi_total("some avg10=1.00\n", "some"), None);
+        assert_eq!(parse_psi_total("some total=abc\n", "some"), None);
+        assert_eq!(parse_psi_total("", "full"), None);
+    }
+
+    /// Scenario: Two readings ten seconds apart whose stall counters grew by
+    /// 6 s, 0.5 s and nothing yield 60%, 5% and 0% of the window; a counter
+    /// that went backwards, a missing source and a zero-length window yield
+    /// no share at all rather than a fabricated one.
+    #[test]
+    fn stall_share_is_the_counter_delta_over_the_window() {
+        let start = reading(1_000_000, 2_000_000, 3_000_000);
+        let end = reading(7_000_000, 2_500_000, 3_000_000);
+        let stall = stall_between(&start, &end, Duration::from_secs(10));
+        assert_eq!(stall.cpu_some, Some(0.6));
+        assert_eq!(stall.io_full, Some(0.05));
+        assert_eq!(stall.memory_full, Some(0.0));
+
+        let backwards = stall_between(&end, &start, Duration::from_secs(10));
+        assert_eq!(backwards.cpu_some, None);
+        let zero = stall_between(&start, &end, Duration::ZERO);
+        assert_eq!(zero.cpu_some, None);
+        let absent = Reading {
+            cpu_some_us: None,
+            ..start
+        };
+        assert_eq!(
+            stall_between(&absent, &end, Duration::from_secs(10)).cpu_some,
+            None
+        );
+        // Clamped: a counter that ran ahead of wall time is at most 100%.
+        let over = stall_between(
+            &reading(0, 0, 0),
+            &reading(20_000_000, 0, 0),
+            Duration::from_secs(10),
+        );
+        assert_eq!(over.cpu_some, Some(1.0));
+    }
+
+    /// Scenario: Each PSI source on its own pushes the verdict over its
+    /// STARVED or CONTENDED threshold and the worst one wins; a high load
+    /// average does not override a quiet PSI reading, but decides the verdict
+    /// on a host with no PSI; and a host that measured nothing is UNMEASURED
+    /// rather than QUIET.
+    #[test]
+    fn psi_decides_the_verdict_and_load_is_only_the_fallback() {
+        let quiet = Stall {
+            cpu_some: Some(0.02),
+            io_full: Some(0.0),
+            memory_full: Some(0.0),
+        };
+        let with = |f: fn(&mut Stall)| {
+            let mut s = quiet;
+            f(&mut s);
+            s
+        };
+        assert_eq!(classify(&quiet, Some(0.3)), Verdict::Quiet);
+        assert_eq!(
+            classify(&with(|s| s.cpu_some = Some(STARVED_CPU_SOME)), None),
+            Verdict::Starved
+        );
+        assert_eq!(
+            classify(&with(|s| s.io_full = Some(STARVED_FULL)), None),
+            Verdict::Starved
+        );
+        assert_eq!(
+            classify(&with(|s| s.memory_full = Some(STARVED_FULL)), None),
+            Verdict::Starved
+        );
+        assert_eq!(
+            classify(&with(|s| s.cpu_some = Some(CONTENDED_CPU_SOME)), None),
+            Verdict::Contended
+        );
+        assert_eq!(
+            classify(&with(|s| s.io_full = Some(CONTENDED_FULL)), None),
+            Verdict::Contended
+        );
+        // A quiet CPU does not mask a starved disk.
+        assert_eq!(
+            classify(
+                &with(|s| {
+                    s.cpu_some = Some(CONTENDED_CPU_SOME);
+                    s.io_full = Some(0.5);
+                }),
+                None
+            ),
+            Verdict::Starved
+        );
+        // The calibration case: load 1.5 per CPU with PSI at 12% is not
+        // contention the tests could feel, so the load average does not vote.
+        assert_eq!(
+            classify(&with(|s| s.cpu_some = Some(0.12)), Some(3.0)),
+            Verdict::Quiet
+        );
+        // Without PSI (macOS), the load average is the whole signal.
+        let none = Stall::default();
+        assert_eq!(
+            classify(&none, Some(STARVED_LOAD_PER_CPU)),
+            Verdict::Starved
+        );
+        assert_eq!(
+            classify(&none, Some(CONTENDED_LOAD_PER_CPU)),
+            Verdict::Contended
+        );
+        assert_eq!(classify(&none, Some(0.1)), Verdict::Quiet);
+        assert_eq!(classify(&none, None), Verdict::Unmeasured);
+    }
+
+    /// Scenario: The load factor is the higher of the start and end readings
+    /// divided by the CPU count, and is absent only when neither reading
+    /// exists.
+    #[test]
+    fn peak_load_is_the_worse_of_the_two_readings_per_cpu() {
+        assert_eq!(peak_load_per_cpu(Some(8.0), Some(32.0), 16), Some(2.0));
+        assert_eq!(peak_load_per_cpu(Some(32.0), Some(8.0), 16), Some(2.0));
+        assert_eq!(peak_load_per_cpu(None, Some(16.0), 16), Some(1.0));
+        assert_eq!(peak_load_per_cpu(None, None, 16), None);
+        assert_eq!(peak_load_per_cpu(Some(f64::NAN), None, 16), None);
+    }
+
+    /// Scenario: Render the report for a starved, a quiet and an unmeasured
+    /// window. Each names its verdict first and says what to do about it —
+    /// a starved one points at a solo rerun, a quiet one at the code — and the
+    /// measured numbers and co-tenant counts appear under it.
+    #[test]
+    fn the_report_names_its_verdict_and_what_to_do_next() {
+        let starved = render_report(
+            Some(16),
+            Duration::from_millis(131_154),
+            Stall {
+                cpu_some: Some(0.641),
+                io_full: Some(0.03),
+                memory_full: Some(0.0),
+            },
+            Some(18.39),
+            Some(75.73),
+            &[("claude", 81), ("dot-agent-deck", 161)],
+        );
+        assert!(starved.contains("load context (issue #701)"), "{starved}");
+        assert!(starved.contains("verdict: STARVED"), "{starved}");
+        assert!(
+            starved.contains("NOT evidence of a regression"),
+            "{starved}"
+        );
+        assert!(starved.contains("rule 6"), "{starved}");
+        assert!(starved.contains("131.2s"), "{starved}");
+        assert!(starved.contains("cpu some 64.1%"), "{starved}");
+        assert!(starved.contains("75.73 now, on 16 CPUs"), "{starved}");
+        assert!(
+            starved.contains("81 claude, 161 dot-agent-deck"),
+            "{starved}"
+        );
+
+        let quiet = render_report(
+            Some(16),
+            Duration::from_secs(25),
+            Stall {
+                cpu_some: Some(0.01),
+                io_full: Some(0.0),
+                memory_full: Some(0.0),
+            },
+            Some(1.17),
+            Some(1.4),
+            &[],
+        );
+        assert!(quiet.contains("verdict: QUIET"), "{quiet}");
+        assert!(quiet.contains("real signal"), "{quiet}");
+        assert!(!quiet.contains("alive:"), "{quiet}");
+
+        let unarmed = render_report(None, Duration::ZERO, Stall::default(), None, None, &[]);
+        assert!(unarmed.contains("verdict: UNMEASURED"), "{unarmed}");
+    }
+
+    const LOAD_CHILD_ENV: &str = "DAD_TEST_LOAD_CONTEXT_CHILD";
+    const LOAD_CHILD_MARKER: &str = "load-context child reached its panic";
+
+    /// Scenario: Only when re-run by the test below — allocate a harness temp
+    /// dir, the one step every headless e2e test takes, and then panic, so
+    /// the parent can read what the panic hook printed.
+    #[test]
+    fn a_headless_harness_panic_carries_the_load_report() {
+        if std::env::var_os(LOAD_CHILD_ENV).is_none() {
+            return;
+        }
+        let _dir = crate::common::harness_tempdir().expect("harness tempdir");
+        panic!("{LOAD_CHILD_MARKER}");
+    }
+
+    /// Scenario: Re-run this binary against the child above and read its
+    /// captured stderr. A test that never touched a TUI grid — only a harness
+    /// temp dir — must still have its panic followed by the load report with
+    /// a verdict, which is the path `dispatch_005` and every other headless
+    /// test in #701's table fails through.
+    #[test]
+    fn the_panic_hook_appends_the_load_report_to_a_headless_failure() {
+        let exe = std::env::current_exe().expect("current exe");
+        let module = module_path!()
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| module_path!());
+        let child = format!("{module}::a_headless_harness_panic_carries_the_load_report");
+        let out = std::process::Command::new(&exe)
+            .arg(&child)
+            .args(["--exact", "--test-threads=1", "--nocapture"])
+            .env(LOAD_CHILD_ENV, "1")
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .expect("re-run this test binary");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(LOAD_CHILD_MARKER),
+            "the child never reached its panic, so this proves nothing — did `{child}` match \
+             no test?\n{stderr}"
+        );
+        let report = stderr
+            .split_once("---- load context (issue #701) ----")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| panic!("no load report after the panic message:\n{stderr}"));
+        assert!(
+            ["STARVED", "CONTENDED", "QUIET", "UNMEASURED"]
+                .iter()
+                .any(|v| report.contains(&format!("verdict: {v}"))),
+            "the report carries no verdict:\n{stderr}"
+        );
+        // The baseline was taken, so the report measured a window rather than
+        // falling back to the unarmed wording.
+        assert!(report.contains("window:"), "{stderr}");
+    }
+}
