@@ -3162,7 +3162,7 @@ fn arm_idle_worker_watch_for_delegation(
     // dispatch next, and it may queue behind an earlier dispatch to the pane
     // that is waiting for the worker's draft. Marked before the watch exists,
     // so the watch never sees the delegation as "written with no wait"; the
-    // dispatch's `PointerQueueClock` ends the mark on every path.
+    // `PointerQueueClock` the caller builds next ends the mark on every path.
     registry.queue_delegation_pointer_write(worker_pane_id, seq);
     arm_idle_worker_watch(
         Arc::clone(registry),
@@ -3189,6 +3189,13 @@ fn arm_idle_worker_watch_for_delegation(
 /// to go on and report — including when the record is gone, which the caller's
 /// seq-conditional take then settles — and `false` when the delegation was
 /// cancelled meanwhile.
+///
+/// Those two marks do not cover the whole dispatch. Between the dispatch
+/// taking both locks (the dequeue) and the pointer write beginning, the record
+/// is neither queued nor in progress — for a `clear = true` delegation that is
+/// the respawn and its `SessionStart` wait — so the due time is computed and
+/// may already have passed. That is deliberate: respawn time counts against
+/// the worker, as it did before #544, and the watch may report during it.
 async fn wait_out_pointer_deferral(
     registry: &AgentPtyRegistry,
     worker_pane_id: &str,
@@ -3222,15 +3229,41 @@ async fn wait_out_pointer_deferral(
 /// — explicitly once its dispatch holds the pane's dispatch locks, and on drop
 /// otherwise, so a dispatch that returns early, panics or is dropped while it
 /// waits for a lock never leaves the idle-worker watch holding forever.
+///
+/// Built by `handle_delegate_with_state` right after the mark is set and moved
+/// into the spawned `dispatch_one_owned`, so the mark is never outside a guard:
+/// a panic before the spawn, or a spawned task dropped unpolled, still drops it.
 struct PointerQueueClock {
     registry: Arc<AgentPtyRegistry>,
     worker_pane_id: String,
-    seq: Option<u64>,
+    delegation_seq: Option<u64>,
+    queued: bool,
 }
 
 impl PointerQueueClock {
+    fn new(
+        registry: Arc<AgentPtyRegistry>,
+        worker_pane_id: String,
+        delegation_seq: Option<u64>,
+    ) -> Self {
+        Self {
+            registry,
+            worker_pane_id,
+            delegation_seq,
+            queued: true,
+        }
+    }
+
+    /// The generation of the idle-worker record this dispatch owns, if any.
+    fn delegation_seq(&self) -> Option<u64> {
+        self.delegation_seq
+    }
+
     fn dequeue(&mut self) {
-        if let Some(seq) = self.seq.take() {
+        if !std::mem::take(&mut self.queued) {
+            return;
+        }
+        if let Some(seq) = self.delegation_seq {
             self.registry
                 .dequeue_delegation_pointer_write(&self.worker_pane_id, seq);
         }
@@ -6951,7 +6984,10 @@ async fn dispatch_one_owned(
     task: String,
     cwd: Option<String>,
     silence_watch: Option<SilenceWatch>,
-    delegation_seq: Option<u64>,
+    // Issue #544 (PR #1398 review): carries the generation of the idle-worker
+    // record this dispatch owns and ends its "queued" mark — see
+    // [`PointerQueueClock`].
+    mut pointer_queue: PointerQueueClock,
     // Issue #606: the daemon's own state, when the caller has one, so a worker
     // pane that had to be RE-CREATED can have its orchestration role registered
     // again. `None` for callers with no daemon state (unit fixtures): the
@@ -6978,11 +7014,7 @@ async fn dispatch_one_owned(
     // behind that wait. Dispatches to this pane still run one at a time in the
     // order they queued, because every one of them holds the order lock
     // throughout. See [`crate::agent_pty::PaneDispatchHold`].
-    let mut pointer_queue = PointerQueueClock {
-        registry: Arc::clone(&registry),
-        worker_pane_id: pane_id.clone(),
-        seq: delegation_seq,
-    };
+    let delegation_seq = pointer_queue.delegation_seq();
     let dispatch_order = registry.pane_dispatch_order_lock(&pane_id);
     let _dispatch_order_guard = dispatch_order.lock().await;
     let mut dispatch_hold = registry.hold_pane_dispatch(&pane_id).await;
@@ -10394,6 +10426,11 @@ impl AppState {
                 orchestration_cwd.as_deref(),
                 cwd.as_deref(),
             );
+            // Issue #544 (PR #1398 review): the guard that ends the "queued"
+            // mark the arm just set, built before anything else can fail and
+            // moved into the dispatch, so the mark is never outside it.
+            let pointer_queue =
+                PointerQueueClock::new(Arc::clone(&registry), pane_id.clone(), delegation_seq);
             // Issue #590 review (Qodo, #1285): tell the in-flight guard which idle
             // record this dispatch owns, so a `pane restart` that lands while it
             // is queued keeps that record and cancels only the replaced agent's.
@@ -10434,7 +10471,7 @@ impl AppState {
                     task,
                     cwd,
                     silence_watch,
-                    delegation_seq,
+                    pointer_queue,
                     state_for_dispatch,
                     commission_in_flight,
                     recorded_title,
@@ -17067,7 +17104,7 @@ mod tests {
             "probe task".to_string(),
             None,
             None,
-            None,
+            PointerQueueClock::new(registry.clone(), "worker-pane-no-agent".to_string(), None),
             None,
             None,
             None,
@@ -17159,7 +17196,7 @@ mod tests {
                 "do the task".to_string(),
                 None,
                 None,
-                Some(armed.seq),
+                PointerQueueClock::new(registry.clone(), WORKER_PANE.to_string(), Some(armed.seq)),
                 None,
                 None,
                 None,
@@ -17230,7 +17267,7 @@ mod tests {
                     orchestration: None,
                 },
             }),
-            None,
+            PointerQueueClock::new(registry.clone(), worker_pane.to_string(), None),
             None,
             None,
             None,
