@@ -360,12 +360,23 @@ pub fn xdg_endpoints(uid: u32) -> [PathBuf; 2] {
 pub struct EndpointMatrix {
     /// `[hook, attach]`.
     pub owned: [PathBuf; 2],
+    /// Further addresses the same daemon holds, to exactly the owned standard —
+    /// listening, every inode held by the daemon's pid, an owner-only socket of
+    /// the run's uid. Only the issue #1211 layout has any: the pre-#1121 flat
+    /// pair a post-#1211 daemon binds, best-effort, beside its per-uid pair.
+    #[serde(default)]
+    pub aliases: Vec<PathBuf>,
     pub absent: Vec<PathBuf>,
 }
 
 impl EndpointMatrix {
     pub fn attach(&self) -> &Path {
         &self.owned[1]
+    }
+
+    /// Every address the daemon must hold: the owned pair, then any aliases.
+    pub fn held(&self) -> impl Iterator<Item = &PathBuf> {
+        self.owned.iter().chain(self.aliases.iter())
     }
 
     pub fn for_run(sb: &Sandbox, mode: EndpointMode, keep_xdg: bool, uid: u32) -> Self {
@@ -375,54 +386,122 @@ impl EndpointMatrix {
         match (mode, keep_xdg) {
             (EndpointMode::SandboxSockets, _) => Self {
                 owned: [sb.hook_socket(), sb.attach_socket()],
+                aliases: vec![],
                 absent: vec![flat_h, flat_a, uid_h, uid_a, xdg_h, xdg_a],
             },
             (EndpointMode::Resolved, false) => Self {
                 owned: [flat_h, flat_a],
+                aliases: vec![],
                 absent: vec![uid_h, uid_a, xdg_h, xdg_a],
             },
             (EndpointMode::Resolved, true) => Self {
                 owned: [xdg_h, xdg_a],
+                aliases: vec![],
                 absent: vec![flat_h, flat_a, uid_h, uid_a],
             },
         }
     }
 
     /// Every matrix the run's DAEMON may legitimately bind, one of which the
-    /// inner half selects by reading the kernel's table once the daemon is up.
+    /// inner half selects by reading the kernel's table once the daemon is up
+    /// (see [`Self::select`]).
     ///
-    /// One candidate, except in a reverse `resolved` run with `XDG_RUNTIME_DIR`
-    /// unset. There the daemon is a branch build, and which fallback it binds is
-    /// the branch's own behaviour rather than something this harness can know in
-    /// advance: a post-#1121 build binds the per-uid pair, every build before it
-    /// the flat one. So both are candidates, each with the OTHER pair and the XDG
-    /// pair absent, and the selected one is held to exactly the same assertion a
-    /// predicted one would be — one pair owned by the daemon, every other
-    /// candidate absent. The run records which one it was.
-    pub fn candidates(
-        sb: &Sandbox,
-        mode: EndpointMode,
-        keep_xdg: bool,
-        uid: u32,
-        direction: Direction,
-    ) -> Vec<Self> {
+    /// One candidate, except in a `resolved` run with `XDG_RUNTIME_DIR` unset.
+    /// There which fallback the daemon binds depends on its build rather than on
+    /// anything this harness can know in advance: every build before #1121
+    /// binds the flat pair; a build with #1121 binds the per-uid pair; and a
+    /// build with #1211 as well also holds the flat pair beside it, in the same
+    /// process, as an alias. That holds in both directions — in reverse the
+    /// daemon is a branch build, in forward it is the previous release (v0.41.0
+    /// and older bind the flat pair; #1121 and #1211 landed together in #1179,
+    /// first released in v0.41.1).
+    ///
+    /// #1211's alias is best-effort per address (`bind_legacy_aliases` in
+    /// `src/daemon.rs` skips a hook or attach alias it cannot clear, and both
+    /// when their lock is unavailable or another daemon answers there), so the
+    /// per-uid layout is a candidate with every subset of the flat pair as its
+    /// aliases, the whole pair first. A skipped alias is then held absent like
+    /// any other address outside the layout.
+    ///
+    /// Each candidate splits the six resolved addresses into held and absent,
+    /// and [`Self::select`] needs its absent half unbound, so at most one
+    /// candidate matches any one kernel table. The selected one is held to
+    /// exactly the same assertion a predicted one would be: its addresses held
+    /// by the daemon, every other candidate absent. The run records which one
+    /// it was.
+    pub fn candidates(sb: &Sandbox, mode: EndpointMode, keep_xdg: bool, uid: u32) -> Vec<Self> {
         let predicted = Self::for_run(sb, mode, keep_xdg, uid);
-        if direction == Direction::Forward || mode != EndpointMode::Resolved || keep_xdg {
+        if mode != EndpointMode::Resolved || keep_xdg {
             return vec![predicted];
         }
         let [flat_h, flat_a] = flat_endpoints(uid);
-        let [uid_h, uid_a] = per_uid_endpoints(uid);
-        let [xdg_h, xdg_a] = xdg_endpoints(uid);
+        let per_uid = |aliases: Vec<PathBuf>| {
+            let mut absent: Vec<PathBuf> = [&flat_h, &flat_a]
+                .into_iter()
+                .filter(|p| !aliases.contains(p))
+                .cloned()
+                .collect();
+            absent.extend(xdg_endpoints(uid));
+            Self {
+                owned: per_uid_endpoints(uid),
+                aliases,
+                absent,
+            }
+        };
         vec![
-            Self {
-                owned: [uid_h.clone(), uid_a.clone()],
-                absent: vec![flat_h.clone(), flat_a.clone(), xdg_h.clone(), xdg_a.clone()],
-            },
-            Self {
-                owned: [flat_h, flat_a],
-                absent: vec![uid_h, uid_a, xdg_h, xdg_a],
-            },
+            per_uid(vec![flat_h.clone(), flat_a.clone()]),
+            per_uid(vec![flat_h.clone()]),
+            per_uid(vec![flat_a.clone()]),
+            per_uid(vec![]),
+            predicted,
         ]
+    }
+
+    /// The candidate the daemon has bound, or `None` while it has not bound
+    /// any of them yet. `held_by_daemon(p)` is whether something listens at `p`
+    /// and every listening inode there is the daemon's; `listening(p)` whether
+    /// anything listens at `p` at all.
+    ///
+    /// A candidate is bound when the daemon holds every address in it AND
+    /// nothing listens at any address it requires absent. The second half is
+    /// not redundant with the pre-connect assertion: a post-#1211 daemon binds
+    /// its primary hook endpoint, then the flat aliases, then its primary
+    /// attach endpoint (`src/daemon.rs`), so for a moment mid-startup it holds
+    /// the whole flat pair and only half of the per-uid one. Selecting on the
+    /// held half alone would pick the flat candidate there, and every
+    /// pre-connect after it would then abort on the per-uid pair it requires
+    /// absent. With it that moment matches nothing and the wait goes on — and
+    /// by the time the per-uid attach socket listens, the aliases are settled.
+    pub fn select(
+        candidates: &[Self],
+        held_by_daemon: impl Fn(&Path) -> bool,
+        listening: impl Fn(&Path) -> bool,
+    ) -> Option<&Self> {
+        candidates
+            .iter()
+            .find(|m| m.held().all(|p| held_by_daemon(p)) && !m.absent.iter().any(|p| listening(p)))
+    }
+
+    /// Which layout this is, for the evidence file.
+    pub fn layout(&self, uid: u32) -> &'static str {
+        let flat = flat_endpoints(uid);
+        if self.owns_per_uid(uid) {
+            match self.aliases.len() {
+                2 => {
+                    "the post-#1121 per-uid directory, with the pre-#1121 flat pair held beside \
+                     it as its #1211 alias"
+                }
+                1 => {
+                    "the post-#1121 per-uid directory, with only one of the pre-#1121 flat pair \
+                     aliased beside it — the daemon skipped the other #1211 alias"
+                }
+                _ => "the post-#1121 per-uid directory, with no flat alias",
+            }
+        } else if self.owned == flat {
+            "the pre-#1121 flat fallback"
+        } else {
+            "the predicted pair"
+        }
     }
 
     /// Whether this matrix's owned pair is the post-#1121 per-uid directory.
@@ -733,7 +812,7 @@ pub fn check_env(
 
 /// Refuse a sandbox whose socket paths would not fit in `sun_path`.
 pub fn check_socket_path_lengths(matrix: &EndpointMatrix) -> Result<(), String> {
-    for p in matrix.owned.iter().chain(matrix.absent.iter()) {
+    for p in matrix.held().chain(matrix.absent.iter()) {
         let len = p.as_os_str().len();
         if len + 1 > SUN_PATH_MAX {
             return Err(format!(
@@ -1261,58 +1340,181 @@ mod reverse_tests {
         assert_eq!(sb.stub_claude().file_name().unwrap(), "claude");
     }
 
+    /// Every candidate partitions the six resolved addresses exactly: each is
+    /// held (owned or aliased) or required absent, and none is both or neither.
+    fn assert_partitions_every_resolved_address(m: &EndpointMatrix) {
+        let mut all: Vec<PathBuf> = m.held().cloned().collect();
+        all.extend(m.absent.iter().cloned());
+        all.sort();
+        let mut every: Vec<PathBuf> = flat_endpoints(1000)
+            .into_iter()
+            .chain(per_uid_endpoints(1000))
+            .chain(xdg_endpoints(1000))
+            .collect();
+        every.sort();
+        assert_eq!(all, every, "{m:?}");
+    }
+
     #[test]
     fn a_reverse_resolved_no_xdg_run_learns_which_fallback_the_branch_daemon_binds() {
         let sb = Sandbox::at(PathBuf::from("/srv/runs/r1"));
-        let fwd = EndpointMatrix::candidates(
-            &sb,
-            EndpointMode::Resolved,
-            false,
-            1000,
-            Direction::Forward,
-        );
+        let c = EndpointMatrix::candidates(&sb, EndpointMode::Resolved, false, 1000);
+        let [both, hook, attach, none, flat] = <[EndpointMatrix; 5]>::try_from(c).expect("five");
+        let [flat_h, flat_a] = flat_endpoints(1000);
+        // #1211's layout, whole first, then with each alias the daemon may skip.
+        for (m, aliases) in [
+            (&both, vec![flat_h.clone(), flat_a.clone()]),
+            (&hook, vec![flat_h.clone()]),
+            (&attach, vec![flat_a.clone()]),
+            (&none, vec![]),
+        ] {
+            assert!(m.owns_per_uid(1000), "{m:?}");
+            assert_eq!(m.aliases, aliases);
+        }
         assert_eq!(
-            fwd,
-            vec![EndpointMatrix::for_run(
-                &sb,
-                EndpointMode::Resolved,
-                false,
-                1000
-            )],
-            "forward keeps its one predicted matrix"
+            flat,
+            EndpointMatrix::for_run(&sb, EndpointMode::Resolved, false, 1000)
         );
-        let rev = EndpointMatrix::candidates(
-            &sb,
-            EndpointMode::Resolved,
-            false,
-            1000,
-            Direction::Reverse,
-        );
-        assert_eq!(rev.len(), 2);
-        assert!(rev[0].owns_per_uid(1000) && !rev[1].owns_per_uid(1000));
-        for m in &rev {
-            // Whichever pair the daemon binds, the other pair and XDG must be
+        for m in [&both, &hook, &attach, &none, &flat] {
+            // Whichever layout the daemon binds, everything outside it must be
             // absent — the same strength as a predicted matrix.
-            let mut all: Vec<PathBuf> = m.owned.to_vec();
-            all.extend(m.absent.iter().cloned());
-            all.sort();
-            let mut every: Vec<PathBuf> = flat_endpoints(1000)
-                .into_iter()
-                .chain(per_uid_endpoints(1000))
-                .chain(xdg_endpoints(1000))
-                .collect();
-            every.sort();
-            assert_eq!(all, every, "{m:?}");
+            assert_partitions_every_resolved_address(m);
+            check_socket_path_lengths(m).expect("short paths fit");
         }
         for (mode, keep) in [
             (EndpointMode::SandboxSockets, false),
             (EndpointMode::Resolved, true),
         ] {
             assert_eq!(
-                EndpointMatrix::candidates(&sb, mode, keep, 1000, Direction::Reverse).len(),
-                1,
+                EndpointMatrix::candidates(&sb, mode, keep, 1000),
+                vec![EndpointMatrix::for_run(&sb, mode, keep, 1000)],
                 "{mode:?} keep_xdg={keep}: every build resolves the same address"
             );
+        }
+    }
+
+    /// Issue #1352: a forward run's daemon is the previous release, and every
+    /// release from v0.41.1 on binds #1211's layout — the per-uid pair owned
+    /// and the flat pair aliased — rather than the pre-#1121 flat prediction.
+    /// Forward and reverse share one candidate list, since in both the daemon
+    /// may be either side of #1179.
+    #[test]
+    fn a_forward_resolved_no_xdg_run_accepts_the_1211_aliased_layout() {
+        let sb = Sandbox::at(PathBuf::from("/srv/runs/r1"));
+        let c = EndpointMatrix::candidates(&sb, EndpointMode::Resolved, false, 1000);
+        let aliased = &c[0];
+        assert_eq!(aliased.owned, per_uid_endpoints(1000));
+        assert_eq!(aliased.aliases, flat_endpoints(1000).to_vec());
+        assert_eq!(aliased.absent, xdg_endpoints(1000).to_vec());
+        assert!(
+            c.contains(&EndpointMatrix::for_run(
+                &sb,
+                EndpointMode::Resolved,
+                false,
+                1000
+            )),
+            "a pre-v0.41.1 previous release still gets the flat prediction"
+        );
+    }
+
+    /// Issue #1352's regression: which candidate a daemon's listeners select,
+    /// for every layout a daemon binds — including the moment mid-startup
+    /// where a post-#1211 daemon holds the flat aliases and only its per-uid
+    /// hook, which must match NOTHING rather than the flat candidate.
+    #[test]
+    fn the_bound_layout_is_selected_from_the_daemon_s_listeners() {
+        let sb = Sandbox::at(PathBuf::from("/srv/runs/r1"));
+        let [flat_h, flat_a] = flat_endpoints(1000);
+        let [uid_h, uid_a] = per_uid_endpoints(1000);
+        let [xdg_h, xdg_a] = xdg_endpoints(1000);
+        let c = EndpointMatrix::candidates(&sb, EndpointMode::Resolved, false, 1000);
+        let select = |daemon: &[&PathBuf], stranger: &[&PathBuf]| {
+            EndpointMatrix::select(
+                &c,
+                |p| daemon.iter().any(|d| d.as_path() == p),
+                |p| daemon.iter().chain(stranger).any(|d| d.as_path() == p),
+            )
+            .cloned()
+        };
+        let per_uid_with = |aliases: &[&PathBuf]| {
+            c.iter()
+                .find(|m| {
+                    m.owns_per_uid(1000)
+                        && m.aliases.len() == aliases.len()
+                        && aliases.iter().all(|a| m.aliases.contains(a))
+                })
+                .cloned()
+        };
+        assert_eq!(
+            select(&[&uid_h, &uid_a, &flat_h, &flat_a], &[]),
+            per_uid_with(&[&flat_h, &flat_a]),
+            "a post-#1211 daemon"
+        );
+        assert_eq!(
+            select(&[&flat_h, &flat_a], &[]),
+            c.last().cloned(),
+            "a pre-#1121 daemon"
+        );
+        assert_eq!(
+            select(&[&uid_h, &uid_a], &[]),
+            per_uid_with(&[]),
+            "a per-uid daemon with no flat alias — #1121 alone, or both aliases skipped"
+        );
+        assert_eq!(
+            select(&[&uid_h, &uid_a, &flat_h], &[]),
+            per_uid_with(&[&flat_h]),
+            "the attach alias skipped"
+        );
+        assert_eq!(
+            select(&[&uid_h, &uid_a, &flat_a], &[]),
+            per_uid_with(&[&flat_a]),
+            "the hook alias skipped"
+        );
+        assert_eq!(
+            select(&[&uid_h, &flat_h, &flat_a], &[]),
+            None,
+            "mid-startup, the per-uid attach socket not bound yet"
+        );
+        assert_eq!(select(&[&uid_h], &[]), None, "only the primary hook bound");
+        // A listener the daemon does not hold is not its alias, and it is not
+        // absent either.
+        assert_eq!(
+            select(&[&uid_h, &uid_a], &[&flat_h, &flat_a]),
+            None,
+            "a stranger on the flat pair"
+        );
+        assert_eq!(
+            select(&[&uid_h, &uid_a, &flat_h], &[&flat_a]),
+            None,
+            "a stranger on the flat attach address"
+        );
+        assert_eq!(
+            select(&[&uid_h, &uid_a, &flat_h, &flat_a], &[&xdg_h, &xdg_a]),
+            None,
+            "something on the XDG pair"
+        );
+        // At most one candidate matches any one table, so their order is not
+        // what decides the selection.
+        let tables: [&[&PathBuf]; 5] = [
+            &[&uid_h, &uid_a, &flat_h, &flat_a],
+            &[&uid_h, &uid_a, &flat_h],
+            &[&uid_h, &uid_a, &flat_a],
+            &[&uid_h, &uid_a],
+            &[&flat_h, &flat_a],
+        ];
+        for daemon in tables {
+            let matching = c
+                .iter()
+                .filter(|m| {
+                    EndpointMatrix::select(
+                        std::slice::from_ref(*m),
+                        |p| daemon.iter().any(|d| d.as_path() == p),
+                        |p| daemon.iter().any(|d| d.as_path() == p),
+                    )
+                    .is_some()
+                })
+                .count();
+            assert_eq!(matching, 1, "{daemon:?}");
         }
     }
 
