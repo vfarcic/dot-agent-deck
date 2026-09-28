@@ -3417,26 +3417,36 @@ impl AppState {
         if !from_current_generation {
             return;
         }
+        // Every current report re-keys the record to the pane's live agent, so
+        // `agent_id` always names whose sessions it holds — including the
+        // session the pane was on before this report. When that owner has been
+        // replaced, the record starts over for the successor WITHOUT the
+        // predecessor's session: it is not one the successor moved past, and a
+        // successor that resumes that conversation must still be heard (Qodo,
+        // #1393). The predecessor's own late reports are refused by admission
+        // control before they get here.
+        let superseded = self
+            .waiting_superseded_sessions
+            .entry(pane_id.clone())
+            .or_default();
+        let previous_was_live_agents = superseded.agent_id == live_agent_id;
+        if !previous_was_live_agents {
+            *superseded = SupersededSessions {
+                agent_id: live_agent_id.clone(),
+                ..SupersededSessions::default()
+            };
+        }
         // Remember the session a current report moved the pane off. A stale
         // one that moved it — the old session's delayed start regressing the
         // pane under #424 D2 — records nothing, so the genuine session it
         // displaced is not mistaken for an old one.
-        if let Some((previous, _)) = &generation_before
+        if previous_was_live_agents
+            && let Some((previous, _)) = &generation_before
             && self
                 .pane_hook_session
                 .get(&pane_id)
                 .is_none_or(|(now, _)| now != previous)
         {
-            let superseded = self
-                .waiting_superseded_sessions
-                .entry(pane_id.clone())
-                .or_default();
-            if superseded.agent_id != live_agent_id {
-                *superseded = SupersededSessions {
-                    agent_id: live_agent_id.clone(),
-                    ..SupersededSessions::default()
-                };
-            }
             superseded.insert(previous);
         }
         if self.pane_status(&pane_id) == Some(SessionStatus::WaitingForInput) {
@@ -13684,7 +13694,12 @@ mod tests {
         );
         assert!(record.contains("s9"), "more than eight are kept");
 
-        // A different live agent: the previous agent's sessions are not its.
+        // A different live agent: the record was keyed to one this registry no
+        // longer names as the pane's owner (it knows none here), as after a
+        // replacement. The previous agent's sessions — including the one the
+        // pane is moving off, which the successor never moved past — are not
+        // the successor's (Qodo, #1393). The takeover through a real registry
+        // is `scheduler/idle-worker/025`'s `resumed-worker`.
         state
             .waiting_superseded_sessions
             .get_mut("pane")
@@ -13694,10 +13709,12 @@ mod tests {
         let record = &state.waiting_superseded_sessions["pane"];
         assert_eq!(record.agent_id, None);
         assert!(
-            record.sessions.len() == 1
-                && record.contains(&format!("s{}", WAITING_SUPERSEDED_SESSIONS_KEPT + 1)),
-            "a change of agent must start the record over"
+            record.sessions.is_empty() && record.order.is_empty(),
+            "a change of agent must start the record over, without the predecessor's session"
         );
+        // From there the successor's own moves are recorded as before.
+        state.apply_event_watching_waiting(start("successor-next"), &registry);
+        assert!(state.waiting_superseded_sessions["pane"].contains("after-replacement"));
     }
 
     /// Issue #447 (Qodo, #1347): the waiting watch's record of the hook sessions

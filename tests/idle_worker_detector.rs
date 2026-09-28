@@ -2377,7 +2377,7 @@ fn worker_subagent_event(
     event
 }
 
-/// Scenario: Delegate to four workers and have each report `WaitingForInput` through the daemon's real hook ingestion. `redelegated-worker` waits, is reported, sends work-done while still at its prompt, and is delegated to again without leaving it; `many-times-cleared-worker` has its conversation cleared twelve times, waits in the newest session, and then a delayed report and a delayed `session_start` from its FIRST session arrive; `subagent-worker`'s wait is a subagent's permission request, and that subagent then stops inside the debounce; `other-subagent-worker` is the control, whose waiting subagent stays waiting while a different subagent stops. The orchestrator must be told about the redelegated worker twice (once per delegation), about the cleared worker and the control once each, and never about the subagent whose wait ended.
+/// Scenario: Delegate to four workers and have each report `WaitingForInput` through the daemon's real hook ingestion. `redelegated-worker` waits, is reported, sends work-done while still at its prompt, and is delegated to again without leaving it; `many-times-cleared-worker` has its conversation cleared twelve times, waits in the newest session, and then a delayed report and a delayed `session_start` from its FIRST session arrive; `subagent-worker`'s wait is a subagent's permission request, and that subagent then stops inside the debounce; `other-subagent-worker` is the control, whose waiting subagent stays waiting while a different subagent stops; `resumed-worker`'s agent is replaced, and the successor starts a session of its own, resumes its predecessor's conversation, is delegated to and waits. The orchestrator must be told about the redelegated worker twice (once per delegation), about the cleared worker, the control and the resumed worker once each, and never about the subagent whose wait ended.
 #[spec("scheduler/idle-worker/025")]
 #[test]
 fn idle_worker_025_a_waiting_episode_ends_and_reopens_with_what_it_is_about() {
@@ -2391,6 +2391,7 @@ fn idle_worker_025_a_waiting_episode_ends_and_reopens_with_what_it_is_about() {
             "many-times-cleared-worker",
             "subagent-worker",
             "other-subagent-worker",
+            "resumed-worker",
         ];
         let harness = IdleHarness::new(&roles, None).await;
         for role in roles {
@@ -2436,6 +2437,45 @@ fn idle_worker_025_a_waiting_episode_ends_and_reopens_with_what_it_is_about() {
             delayed.timestamp = before_clears;
             harness.ingest(delayed).await;
         }
+
+        // Qodo on #1393: the worker's agent is replaced, the successor starts a
+        // session of its own, then RESUMES its predecessor's conversation —
+        // same session id, the successor's agent id — is delegated to, and
+        // waits. The predecessor's session is not one the successor has moved
+        // past, so its wait must be reported.
+        let resumed = "resumed-worker";
+        let predecessor = harness.worker_agent_ids[resumed].clone();
+        let resumer = harness
+            .registry
+            .respawn_agent_for_pane(&worker_pane(resumed), WORKER_COMMAND)
+            .await
+            .unwrap_or_else(|error| panic!("replace {resumed}'s agent: {error}"));
+        assert_ne!(
+            resumer, predecessor,
+            "precondition: {resumed} was not replaced"
+        );
+        for session in [
+            format!("session-{resumed}-successor"),
+            format!("session-{resumed}"),
+        ] {
+            harness
+                .ingest(worker_hook_event(
+                    resumed,
+                    &session,
+                    "session_start",
+                    Some(&resumer),
+                ))
+                .await;
+        }
+        harness.delegate(&[resumed]).await;
+        harness
+            .ingest(worker_hook_event(
+                resumed,
+                &format!("session-{resumed}"),
+                "waiting_for_input",
+                Some(&resumer),
+            ))
+            .await;
 
         // #1364: a subagent's permission request, then that subagent ends.
         harness
@@ -2502,6 +2542,7 @@ fn idle_worker_025_a_waiting_episode_ends_and_reopens_with_what_it_is_about() {
                     waiting_notices_for(snapshot, "redelegated-worker") > 1
                         && waiting_notices_for(snapshot, cleared) > 0
                         && waiting_notices_for(snapshot, "other-subagent-worker") > 0
+                        && waiting_notices_for(snapshot, resumed) > 0
                 },
                 common::load_scaled(Duration::from_secs(5)) + debounce * 4,
             )
@@ -2517,6 +2558,13 @@ fn idle_worker_025_a_waiting_episode_ends_and_reopens_with_what_it_is_about() {
             1,
             "a delayed report from a session cleared more than eight rollovers ago closed the \
              newest session's wait (#1365 item 4); snapshot = {snapshot:?}"
+        );
+        assert_eq!(
+            waiting_notices_for(&snapshot, resumed),
+            1,
+            "a replacement agent that resumed its predecessor's conversation was never reported \
+             waiting, its session mistaken for one it had moved past (Qodo, #1393); \
+             snapshot = {snapshot:?}"
         );
         assert_eq!(
             waiting_notices_for(&snapshot, "redelegated-worker"),
@@ -2536,8 +2584,8 @@ fn idle_worker_025_a_waiting_episode_ends_and_reopens_with_what_it_is_about() {
         );
         assert_eq!(
             settled.matches(WAITING_NEEDLE).count(),
-            4,
-            "exactly four waiting notices may reach the orchestrator; snapshot = {settled:?}"
+            5,
+            "exactly five waiting notices may reach the orchestrator; snapshot = {settled:?}"
         );
     });
 }
