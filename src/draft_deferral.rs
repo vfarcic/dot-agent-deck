@@ -326,14 +326,22 @@ impl DraftTracker {
                         paste,
                     }
                 }
-                0x20..=0x2f => Escape::Csi {
-                    private,
-                    params,
-                    dollar: dollar || byte == b'$',
-                    len: len.saturating_add(1),
-                    code: None,
-                    paste,
-                },
+                0x20..=0x2f => {
+                    // Bounded like the parameter bytes above: past the bound
+                    // this is input, not a report the deck knows.
+                    if len >= MAX_CSI_LEN {
+                        self.pending = true;
+                        return Escape::Ground;
+                    }
+                    Escape::Csi {
+                        private,
+                        params,
+                        dollar: dollar || byte == b'$',
+                        len: len + 1,
+                        code: None,
+                        paste,
+                    }
+                }
                 0x40..=0x7e => {
                     // Exactly the bytes `crate::agent_pty`'s paste framing
                     // matches, so the two agree on what a marker is. Inside a
@@ -756,6 +764,18 @@ mod tests {
         feed(&mut tracker, b"draft");
         tracker.clear();
         assert!(!tracker.pending());
+    }
+
+    /// Sweep (PR #1398): CSI intermediate bytes are bounded like parameter
+    /// bytes. Past the bound the sequence is input, whatever its final byte —
+    /// otherwise `Alt+[`, a run of spaces and a report-shaped letter swallow
+    /// the lot without setting the bit.
+    #[test]
+    fn an_overlong_csi_intermediate_run_is_input() {
+        let mut bytes = b"\x1b[".to_vec();
+        bytes.extend(std::iter::repeat_n(b' ', usize::from(MAX_CSI_LEN) + 8));
+        bytes.push(b'n');
+        assert!(pending_after(&bytes));
     }
 
     /// PR #1398 finding #15: a daemon submit resets the escape parser exactly

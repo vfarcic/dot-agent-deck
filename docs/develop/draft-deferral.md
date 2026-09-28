@@ -12,6 +12,8 @@ The daemon cannot see an agent's input box, but it does see every byte a deck cl
 
 - **Sets the bit:** any forwarded byte that is not part of a recognised terminal report — printable text and UTF-8, arrows and other navigation keys (editing a history-recalled prompt is editing a draft), Backspace, Tab, `Ctrl+J`, `Alt+Enter`, `Shift+Enter`, and anything inside a bracketed paste (including a literal `ESC[200~` pasted as text).
 - **Clears the bit:** a byte that submits the input box, and — outside a paste — `Ctrl+U` and `Ctrl+C`.
+- **An open paste counts from its opening marker.** While a bracketed paste is open the pane reads as having a draft, even before any of its content has arrived, so a paste whose marker and content come in separate writes cannot have a first write land between them (PR #1398 finding #14). The marker alone never sets the bit itself, so an empty paste still leaves nothing pending once it closes.
+- **Our own submit.** A SUBMIT write of ours that lands in full clears the bit, because its CR submitted the box. It resets everything the user had half-sent along with the bit — the escape sequence being parsed, a partially matched paste marker, and an `ESC` that would otherwise make the user's next `CR` read as `Alt+Enter` — exactly as the user's own Enter resets the parser, since the agent saw our bytes in their place (PR #1398 finding #15). Inside a paste the user still has open, our CR is paste content and submits nothing, so nothing is reset.
 - **Neither:** terminal reports a client forwards through the same channel as keystrokes (mouse, focus, cursor-position, device-attribute and similar replies, OSC/DCS strings) and the bracketed-paste markers themselves. One ambiguity is accepted: xterm encodes a modified `F3` as `ESC[1;5R`, the shape of a cursor-position report, so that key does not set the bit.
 
 ## What is not detected
@@ -19,7 +21,7 @@ The daemon cannot see an agent's input box, but it does see every byte a deck cl
 The bit is a proxy, and it is wrong in both directions in ways that are bounded:
 
 - **Missed drafts (the old behaviour returns).** Text the agent itself puts into its input box — a prompt recalled from history, an autocompletion, a restored message — is never seen as typed. Neither is anything typed into the agent other than through the deck. A partial clear read as a full one lets a draft through: `Ctrl+U` in a multi-line Claude Code draft kills only the current line, but clears the bit.
-- **False drafts (a delay of at most the cap).** A key that leaves nothing in the box still sets the bit — answering a menu with a number and no Enter, or deleting a draft back to empty with Backspace. The prompt then waits until the user's next Enter or the cap.
+- **False drafts (a delay of at most the cap).** A key that leaves nothing in the box still sets the bit — answering a menu with a number and no Enter, or deleting a draft back to empty with Backspace. The prompt then waits until the user's next Enter or the cap. A paste whose closing marker never arrives — which interleaved input from two attached clients can cause — keeps the pane reading as mid-paste, so each first write into it waits out the cap until a closing marker arrives or the pane changes hands.
 
 An approximation in the clear keys can only let a draft through as before; it can never hold a prompt past the cap.
 

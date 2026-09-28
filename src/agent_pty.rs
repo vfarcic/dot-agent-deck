@@ -3525,6 +3525,27 @@ impl UserInputStream {
         submits
     }
 
+    /// Issue #544: a SUBMIT write of ours landed in full, so its CR reached the
+    /// agent between two of the user's bytes. Outside a paste it submitted the
+    /// box, and it also ends whatever the user had half-sent: the escape
+    /// sequence the draft bit was parsing, a partially matched paste marker, and
+    /// the `ESC` a following `CR` would read as `Alt+Enter` — the agent now sees
+    /// our bytes in their place, so none of them can be completed by the user's
+    /// next write. All of it resets together, exactly as the user's own Enter
+    /// resets the draft bit's parser (PR #1398 finding #15 and its sweep).
+    ///
+    /// INSIDE a paste the user still has open, our CR is paste content and
+    /// submits nothing, so nothing resets: the box still holds the paste, and
+    /// the framing must stay open for the closing marker that is still coming.
+    fn note_daemon_submit(&mut self) {
+        if self.in_paste {
+            return;
+        }
+        self.draft.clear();
+        self.matched = 0;
+        self.preceding = Some(b'\r');
+    }
+
     /// The submit half of [`Self::feed_byte`]: paste framing, then the keypress
     /// behind the byte.
     fn scan_submit(&mut self, byte: u8) -> bool {
@@ -3751,19 +3772,28 @@ impl PaneInputState {
 
     /// Issue #544: has the user sent input into `pane_id_env` since their last
     /// submit or clear? See [`crate::draft_deferral::DraftTracker`].
+    ///
+    /// An open paste counts from its opening marker on, before any of its
+    /// content has arrived: a paste split across writes is still one paste, and
+    /// a first write let through between the marker and the content lands in
+    /// the middle of it (PR #1398 finding #14). The marker alone does not set
+    /// the tracker's bit, so an empty paste still leaves nothing pending once it
+    /// closes.
     fn draft_pending(&self, pane_id_env: &str) -> bool {
         self.input
             .get(pane_id_env)
-            .is_some_and(|stream| stream.draft.pending())
+            .is_some_and(|stream| stream.in_paste || stream.draft.pending())
     }
 
     /// Issue #544: a SUBMIT write of ours reached the PTY in full, so its CR
-    /// submitted whatever was in the box — the user's draft included. Without
-    /// this, every automatic write after a capped one would wait out a whole
-    /// cap again for a draft that is no longer there.
+    /// submitted whatever was in the box — the user's draft included — unless
+    /// the user had a paste open, where it is paste content (see
+    /// [`UserInputStream::note_daemon_submit`]). Without this, every automatic
+    /// write after a capped one would wait out a whole cap again for a draft
+    /// that is no longer there.
     fn note_box_submitted(&mut self, pane_id_env: &str) {
         if let Some(stream) = self.input.get_mut(pane_id_env) {
-            stream.draft.clear();
+            stream.note_daemon_submit();
         }
     }
 
@@ -9348,8 +9378,9 @@ impl AgentPtyRegistry {
             // dangerous.
             PayloadDelivery::Applied => {
                 w.note_automatic_write(pane_id, mode, &payload);
-                // Issue #544: our CR submitted the whole box, so nothing the
-                // user typed is waiting in it any more. Only a SUBMIT that
+                // Issue #544: our CR submitted the whole box (unless the user
+                // has a paste open, where it is content — the stream decides),
+                // so nothing the user typed is waiting in it any more. Only a SUBMIT that
                 // landed in full says so: a Notice leaves its bytes (and the
                 // draft) in the box, and an ambiguous write may not have sent
                 // its CR at all.
@@ -18758,6 +18789,79 @@ mod spawn_tests {
         // Sentinel ids never hold one.
         state.note_user_bytes("<no-pane>", b"draft");
         assert!(!state.draft_pending("<no-pane>"));
+    }
+
+    /// PR #1398 finding #14: a paste whose opening marker and content arrive
+    /// as separate writes is a draft from the marker on. A first write checking
+    /// in between must wait, or it lands in the middle of the paste. An empty
+    /// paste still leaves nothing pending once it closes.
+    #[test]
+    fn an_open_paste_is_a_pending_draft_before_its_content_arrives() {
+        const PANE: &str = "issue-544-split-paste";
+        let mut state = PaneInputState::default();
+        state.note_user_bytes(PANE, b"\x1b[200~");
+        assert!(
+            state.draft_pending(PANE),
+            "an open paste with no content yet is not pending"
+        );
+        state.note_user_bytes(PANE, b"pasted");
+        state.note_user_bytes(PANE, b"\x1b[201~");
+        assert!(state.draft_pending(PANE), "the pasted text");
+
+        let mut state = PaneInputState::default();
+        state.note_user_bytes(PANE, b"\x1b[200~");
+        state.note_user_bytes(PANE, b"\x1b[201~");
+        assert!(!state.draft_pending(PANE), "an empty paste");
+    }
+
+    /// Sweep (PR #1398 #15's class): a CR of ours written into a paste the
+    /// user still has open is paste CONTENT — it submits nothing — so the draft
+    /// the paste already holds is still in the box afterwards.
+    #[test]
+    fn a_daemon_submit_inside_an_open_paste_does_not_clear_the_draft() {
+        const PANE: &str = "issue-544-submit-in-paste";
+        let mut state = PaneInputState::default();
+        state.note_user_bytes(PANE, b"\x1b[200~abc");
+        state.note_box_submitted(PANE);
+        state.note_user_bytes(PANE, b"\x1b[201~");
+        assert!(
+            state.draft_pending(PANE),
+            "a daemon CR inside a paste cleared the pasted draft"
+        );
+    }
+
+    /// Sweep (PR #1398 #15's class): after a daemon submit the byte before the
+    /// user's next one is our CR, not whatever they sent before it. A lone
+    /// `ESC`, then our submit, then the user's Enter is a plain Enter that
+    /// submits — not the `Alt+Enter` the stale predecessor would make it.
+    #[test]
+    fn a_daemon_submit_ends_the_users_esc_prefix_for_the_submit_scan() {
+        const PANE: &str = "issue-544-esc-then-submit";
+        let mut state = PaneInputState::default();
+        state.note_user_bytes(PANE, b"\x1b");
+        state.note_box_submitted(PANE);
+        state.note_user_bytes(PANE, b"\r");
+        assert!(
+            !state.draft_pending(PANE),
+            "the user's Enter after our submit was read as Alt+Enter"
+        );
+    }
+
+    /// Sweep (PR #1398 #15's class): our bytes land in the middle of a
+    /// partially received paste marker, so the agent never sees that marker.
+    /// The scanner must not complete it from the user's later bytes and treat
+    /// their plain Enter as a newline inside a paste.
+    #[test]
+    fn a_daemon_submit_breaks_a_partial_paste_marker() {
+        const PANE: &str = "issue-544-submit-mid-marker";
+        let mut state = PaneInputState::default();
+        state.note_user_bytes(PANE, b"\x1b[20");
+        state.note_box_submitted(PANE);
+        state.note_user_bytes(PANE, b"0~abc\r");
+        assert!(
+            !state.draft_pending(PANE),
+            "the user's Enter was read as a newline inside a paste nobody opened"
+        );
     }
 
     /// Issue #544: only an `Applied` SUBMIT of ours clears the draft bit — its
