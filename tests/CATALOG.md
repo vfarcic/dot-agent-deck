@@ -2581,6 +2581,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** any TUI or desktop surface (PRD #819 leaves the TUI's project-resolution sites out of scope, so the client methods are driven directly rather than through a UI); the daemon-side behaviour of the verbs themselves (`project/resolve/001`, `project/launch/001`–`002`); the fallback for an omitted `running_agents`, which is `lifecycle/handshake/007`'s separate claim.
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/handshake/009 — A daemon on a different attach protocol with a live agent: declining the restart prompt refuses to attach, names both protocol numbers, and leaves the daemon and its agent running (issue #405).
+- **Layer:** L2 (real `dot-agent-deck` binary in a PTY against a real external `daemon serve`).
+- **Agent:** one synthetic `sleep`-style agent with a distinctive display name; the daemon runs with the `e2e`-only `DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE` so its `Hello` reply advertises `PROTOCOL_VERSION + 1`, which is the only way a single compiled binary can stand on both sides of a protocol skew.
+- **Asserts:** the restart prompt appears; after `Esc` the TUI exits non-zero within 15s instead of attaching (pre-fix it attached into a normal-looking dashboard), the screen carries the refusal's own header (`error: daemon speaks attach protocol v<N+1>, but this binary speaks v<N>`) and its keep-the-agents line naming the daemon's build id, the daemon process is still alive, and the live agent is still reachable on it by display name.
+- **Does not assert:** the rest of the refusal's wording (pinned character-for-character by `build_version_handshake::tests::protocol_refusal_*`); the non-TTY arm (`build_version_handshake::tests::protocol_skew_with_agents_on_a_pipe_is_refused_naming_the_protocol`, against a scripted daemon); that a daemon's events would in fact fail to decode across a real skew, which only two builds can show.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/handshake/010 — A daemon whose build id MATCHES but whose attach protocol differs, with no agents, is restarted silently rather than attached to (issue #405).
+- **Layer:** L2 (real `dot-agent-deck` binary in a PTY against a real external `daemon serve`).
+- **Agent:** none; the daemon is pinned to the TUI's own build id and advertises `PROTOCOL_VERSION - 1` through `DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE`.
+- **Asserts:** the empty dashboard (`No active agents`) appears and the original daemon process exits — the build-id match did not wave the skew through (pre-fix it returned `Match` and attached, leaving the daemon alive).
+- **Does not assert:** the fresh daemon's advertised protocol; the agents-present arms (009, and the scripted-daemon unit tests).
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/login-path
 
 ##### lifecycle/login-path/001 — A dashboard new-pane whose command is a bare binary living only in the user's login-shell PATH spawns successfully when the daemon was launched without that dir on PATH (PRD #170 M1.3).

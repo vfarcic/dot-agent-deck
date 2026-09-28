@@ -31,16 +31,18 @@
 //! [`CAP_PREPARE_WORKFLOW`]'s doc says why that is the point they stop being
 //! reachable.
 //!
-//! The handshake itself ([`AttachRequest::Hello`]) is enforced by the
-//! **desktop** client, which refuses to connect unless the daemon reports
-//! exactly this [`PROTOCOL_VERSION`] (`desktop/src-tauri/src/daemon_bridge.rs`,
-//! `classify_handshake`) — that check runs before the build-stamp comparison
-//! and its session-scoped bypass cannot reach it. No other client refuses on a
-//! version *difference*: `72527b9` removed the laptop-side `connect`
-//! comparison this note used to name (issue #491 — it compared two constants
-//! that never shared a wire), leaving only a presence floor there, and the
-//! local TUI attach path never had one (issue #405). Single-binary in-process
-//! call sites match versions by construction.
+//! The handshake itself ([`AttachRequest::Hello`]) is enforced by two
+//! clients, each refusing unless the daemon reports exactly this
+//! [`PROTOCOL_VERSION`]: the **desktop** (`desktop/src-tauri/src/daemon_bridge.rs`,
+//! `classify_handshake` — that check runs before the build-stamp comparison
+//! and its session-scoped bypass cannot reach it), and the **TUI's startup
+//! handshake** against a local daemon
+//! ([`crate::build_version_handshake::ensure_compatible_daemon_or_die`], issue
+//! #405). `72527b9` removed the laptop-side `connect` comparison this note used
+//! to name (issue #491 — it compared two constants that never shared a wire),
+//! leaving only a presence floor there. [`PROTOCOL_VERSION`]'s own doc has what
+//! neither check covers. Single-binary in-process call sites match versions by
+//! construction.
 //!
 //! # Wire format
 //!
@@ -435,45 +437,72 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 ///
 /// # Where this constant is enforced
 ///
-/// **Exactly one call site refuses on it: the desktop.**
-/// `classify_handshake` in `desktop/src-tauri/src/daemon_bridge.rs` requires
-/// `server_version == Some(PROTOCOL_VERSION)`, runs that comparison *before*
-/// the build-stamp one, and is not reachable by the stamp check's
-/// session-scoped bypass — so a desktop and a daemon that disagree here never
-/// exchange a second frame. Inside this crate nothing refuses on a version
-/// *difference* — `probe_remote_protocol`'s surviving check is a presence
-/// floor, described two paragraphs down — and that is issue #405. The bump
-/// rationales above were written while
-/// [`crate::connect::probe_remote_protocol`] compared the remote's
+/// **Two call sites refuse on it, and both require exact equality**
+/// (`server_version == Some(PROTOCOL_VERSION)`):
+///
+/// - **The desktop.** `classify_handshake` in
+///   `desktop/src-tauri/src/daemon_bridge.rs` runs the comparison *before* the
+///   build-stamp one, and the stamp check's session-scoped bypass cannot reach
+///   it — so a desktop and a daemon that disagree here never exchange a second
+///   frame.
+/// - **The TUI's startup handshake against a local daemon** (issue #405).
+///   [`crate::build_version_handshake::ensure_compatible_daemon_or_die`] reads
+///   the daemon's `server_version` before any build-id branching. A skewed
+///   daemon may still be *restarted* by that handshake — silently when no agents
+///   run under it, or on the user's `S` — since the fresh daemon speaks this
+///   build's protocol; what it can no longer be is *attached to*. A build-id
+///   match does not wave the skew through, and declining the restart exits with
+///   a refusal that names both numbers instead of returning `ProceedOnExisting`.
+///
+/// The check is written at each site rather than shared, because it is one
+/// equality; the two are meant to stay the same rule, and a directional one was
+/// rejected for the reason `build_version_handshake`'s `ProtocolCheck` gives.
+/// What it does **not** cover: the one-shot CLI subcommands (`delegate`,
+/// `work-done`, `agent-event`, `daemon status`, …), which send their request
+/// without that handshake, and a TUI whose daemon is replaced mid-session, whose
+/// reconnects do not re-run it.
+///
+/// Before #491, [`crate::connect::probe_remote_protocol`] compared a remote's
 /// `server_version` against the laptop's and hard-failed on a difference, and
-/// each one named that refusal as the payoff.
+/// the bump rationales above each named that refusal as the payoff. #491 removed
+/// the comparison, because it could not fail for a real reason: `connect` is an
+/// `ssh -t` wrapper that runs the *remote* binary's TUI against the *remote*
+/// daemon, so the laptop's constant was never a party to that attach
+/// conversation. The probe still refuses a remote that cannot answer
+/// `daemon hello` at all — an install floor, not a version verdict — and the
+/// remote's own TUI now runs the check above against the remote's own daemon.
 ///
-/// Issue #491 removed the comparison, because it could not fail for a real
-/// reason: `connect` is an `ssh -t` wrapper that runs the *remote* binary's TUI
-/// against the *remote* daemon, so the laptop's constant was never a party to
-/// that attach conversation and the check could only refuse remotes whose two
-/// ends already agreed by construction. The probe still refuses a remote that
-/// cannot answer `daemon hello` at all — an install floor, not a version
-/// verdict.
-///
-/// The local same-machine TUI↔daemon pairing is the place a wire-shape skew
-/// most easily happens (the binary upgraded on disk under a still-running
-/// daemon), and it is guarded by [`crate::build_version_handshake`]'s
-/// `DAD_BUILD_ID` comparison rather than by this constant. Build-id equality is
-/// strictly stronger than protocol equality when it *matches* — same build
-/// implies same protocol — but declining its restart prompt (the right choice
-/// when live agents would die with the daemon) attaches anyway with no version
-/// check of any kind. Issue #405 tracks closing that. The desktop↔daemon
-/// pairing skews the same way and is the one that *does* read this constant,
-/// per the paragraph above.
-///
-/// Keep bumping this on every wire-shape break regardless — "break" in the
-/// sense of this module's bump list at the top, which a capability-gated
-/// variant is deliberately not on. The bump is what makes a skew *nameable* —
-/// it is the number the handshake reports, what `daemon hello` prints, and the
-/// input any future compatibility gate will read; #405 is what will make it
-/// *refused*.
+/// Keep bumping this on every wire-shape break — "break" in the sense of this
+/// module's bump list at the top, which a capability-gated variant is
+/// deliberately not on. The bump is what makes a skew *nameable* — the number
+/// the handshake reports and `daemon hello` prints — and, at the two sites
+/// above, what makes it *refused*.
 pub const PROTOCOL_VERSION: u32 = 10;
+
+/// The attach-protocol version the daemon's `Hello` handler advertises as
+/// [`AttachResponse::server_version`]. [`PROTOCOL_VERSION`] in every shipped
+/// build.
+///
+/// Issue #405 test seam: under the `e2e` feature only,
+/// `DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE` replaces the advertised
+/// number, so an L2 test can start a daemon that *claims* another protocol and
+/// drive the real TUI's refusal against it. The daemon and the TUI there are
+/// one compiled binary sharing one constant, so without this no PTY test can
+/// produce a protocol skew at all. It is gated on `e2e` rather than on
+/// `debug_assertions` for the reason [`crate::platform::paths`]' current-exe
+/// override is: neither a release build nor a `cargo test-fast` run compiles
+/// the branch, so there is no code for production to take. Only the reply's
+/// number moves; the daemon still speaks this build's wire.
+pub fn advertised_protocol_version() -> u32 {
+    #[cfg(feature = "e2e")]
+    if let Some(v) = std::env::var("DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        return v;
+    }
+    PROTOCOL_VERSION
+}
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -956,8 +985,9 @@ pub enum ContractComparison {
 /// is what lets a message say something an operator can act on.
 ///
 /// Lives here rather than in the desktop so the one client that refuses today
-/// and any that refuses later read the same implementation — the shape issue
-/// #405 is open about for [`PROTOCOL_VERSION`], not repeated.
+/// and any that refuses later read the same implementation. A set comparison
+/// is worth sharing where [`PROTOCOL_VERSION`]'s one equality, written at each
+/// of its two refusal sites (issue #405), is not.
 pub fn compare_contract_breaks(peer: Option<&[String]>) -> ContractComparison {
     let Some(peer) = peer else {
         return ContractComparison::Undeclared;
@@ -1526,10 +1556,9 @@ pub enum AttachRequest {
     /// `client_version`. On the client side, the **desktop** rejects on
     /// `server_version` — `classify_handshake` in
     /// `desktop/src-tauri/src/daemon_bridge.rs` requires exact equality and is
-    /// never bypassed. Issue #491 removed `connect`'s comparison and the local
-    /// TUI attach path never had one (issue #405), so the desktop is currently
-    /// the only client that refuses on a version *difference*. See the
-    /// enforcement note on [`PROTOCOL_VERSION`].
+    /// never bypassed — and so does the TUI's startup handshake against a local
+    /// daemon (issue #405). Issue #491 removed `connect`'s comparison. See the
+    /// enforcement note on [`PROTOCOL_VERSION`] for what neither covers.
     ///
     /// PRD #103 M1.2: optional `client_build_version` carries the client's
     /// compiled-in `DAD_BUILD_ID`. The daemon logs it but never rejects on
@@ -4775,7 +4804,7 @@ async fn handle_connection(
             // client asks a stable question ("do you know this op?") instead
             // of string-matching serde's `unknown variant` message. Absence
             // means withhold — see `AttachResponse::capabilities`.
-            let mut resp = AttachResponse::hello(PROTOCOL_VERSION)
+            let mut resp = AttachResponse::hello(advertised_protocol_version())
                 .with_guarded_send()
                 .with_capabilities();
             if !omit_running_agents {

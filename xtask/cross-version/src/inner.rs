@@ -783,6 +783,11 @@ impl Cast {
     }
 }
 
+/// A line only issue #405's protocol refusal prints — not the prompt, which also
+/// names the two protocol numbers — so finding it means the attaching TUI
+/// declined into an exit rather than into the daemon.
+const PROTOCOL_REFUSAL: &str = "Not attaching: across an attach-protocol change";
+
 /// The key that declines the build-version mismatch prompt.
 ///
 /// Established per build rather than assumed symmetric, because the reverse
@@ -1339,9 +1344,22 @@ fn with_attached_tui(
     // DECLINE_KEY). Accepting would SIGTERM the daemon under test and replace
     // it, which destroys the entire point of the run.
     tui.send(DECLINE_KEY);
-    if !tui.wait_for_grid(UI_TIMEOUT, |g| {
-        g.contains("XVER_") || g.contains(ROLE_ORCHESTRATOR)
-    }) {
+    let attached_or_refused = tui.wait_for_grid(UI_TIMEOUT, |g| {
+        g.contains("XVER_") || g.contains(ROLE_ORCHESTRATOR) || g.contains(PROTOCOL_REFUSAL)
+    });
+    if tui.stream_text().contains(PROTOCOL_REFUSAL) {
+        ev.excerpt(
+            format!("{} TUI's protocol refusal", cast.client_side),
+            tail(&tui.stream_text(), 30),
+        );
+        return Err(Abort::Scenario(format!(
+            "{}: declining the prompt was REFUSED, not attached: the two builds speak different              attach protocols, and a TUI carrying issue #405's check will not attach across that              (the daemon and its roles were left running). That is the intended result of a              `PROTOCOL_VERSION` bump rather than a semantic break, and it leaves no attached              session to send a delegate or hooks through, so nothing below was measured.              old={} new={}",
+            tui.label,
+            ev.old_hello.trim(),
+            ev.new_hello.trim()
+        )));
+    }
+    if !attached_or_refused {
         return Err(Abort::Scenario(format!(
             "{}: after declining the prompt it never rendered the orchestration.\n=== grid ===\n{}",
             tui.label,
@@ -2801,9 +2819,12 @@ fn extract_prompt(stream: &str) -> String {
         return String::new();
     };
     let rest = &stream[start..];
-    let end = rest
-        .find("keep current daemon")
-        .map(|i| i + "keep current daemon".len())
+    // The second marker is the decline label a build carrying issue #405 prints
+    // when the two builds' attach protocols differ.
+    let end = ["keep current daemon", "exit, leaving the daemon running"]
+        .iter()
+        .filter_map(|m| rest.find(m).map(|i| i + m.len()))
+        .min()
         .unwrap_or(rest.len().min(600));
     rest[..end].replace('\r', "")
 }
@@ -2860,8 +2881,9 @@ pub fn compare_hellos(old_raw: &str, new_raw: &str) -> Result<Vec<String>, Strin
         )
     } else {
         format!(
-            "PROTOCOL_VERSION DIFFERS (old {:?}, branch {:?}). That is a hard floor, so the two \
-             builds refuse each other at the handshake rather than interoperating; read a failure \
+            "PROTOCOL_VERSION DIFFERS (old {:?}, branch {:?}). A TUI carrying issue #405's check \
+             refuses to attach across that, so the attaching TUI is expected to exit at the \
+             declined prompt rather than interoperate; read a failure \
              below as that refusal rather than as a semantic break",
             op, np
         )
@@ -2909,6 +2931,19 @@ mod tests {
         assert!(got.ends_with("keep current daemon"), "{got}");
         assert!(!got.contains('\r'));
         assert!(got.contains("0.41.0-gc19c7d7") && got.contains("0.41.0-g19385813"));
+    }
+
+    #[test]
+    fn extract_prompt_ends_at_the_protocol_skew_decline_label() {
+        // Issue #405: across a protocol skew the decline key is relabelled, and
+        // the refusal printed after it must not be swallowed into the prompt.
+        let stream = "⚠  Daemon version mismatch  (1 agent(s) running)\r\n\
+             \x20  This binary cannot attach to it: the daemon speaks attach protocol v9, but this binary speaks v10.\r\n\
+             \x20  [S] restart daemon and continue   [any other key] exit, leaving the daemon running\r\n\
+             error: daemon speaks attach protocol v9, but this binary speaks v10";
+        let got = extract_prompt(stream);
+        assert!(got.ends_with("exit, leaving the daemon running"), "{got}");
+        assert!(!got.contains("error:"), "{got}");
     }
 
     #[test]
