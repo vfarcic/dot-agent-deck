@@ -5134,6 +5134,21 @@ fn lookup_orchestration_role_indexed(
     orchestration_name: &str,
     role_name: &str,
 ) -> Option<(usize, OrchestrationRoleConfig)> {
+    lookup_orchestration_role_seated(cwd, orchestration_name, role_name)
+        .map(|(index, role, _)| (index, role))
+}
+
+/// [`lookup_orchestration_role_indexed`], plus whether that role is the
+/// orchestration's orchestrator by
+/// [`crate::project_config::OrchestrationConfig::orchestrator_role_index`] —
+/// the one rule the spawn paths seat by (issue #523). Answered from the same
+/// read of the file, so the role and its seat cannot come from two versions of
+/// it.
+fn lookup_orchestration_role_seated(
+    cwd: &str,
+    orchestration_name: &str,
+    role_name: &str,
+) -> Option<(usize, OrchestrationRoleConfig, bool)> {
     let cfg = load_project_config(std::path::Path::new(cwd))
         .ok()
         .flatten()?;
@@ -5171,11 +5186,13 @@ fn lookup_orchestration_role_indexed(
         );
         return None;
     };
+    let orch_idx = orch.orchestrator_role_index();
     orch.roles
         .iter()
         .cloned()
         .enumerate()
         .find(|(_, r)| r.name == role_name)
+        .map(|(index, role)| (index, role, index == orch_idx))
 }
 
 /// PRD #225 M3: does this `SessionStart` mean "the agent can accept input", or
@@ -8989,11 +9006,19 @@ impl AppState {
     /// `cwd` is the pane's own working directory (`pane_cwd_map`), which may
     /// differ per role; the orchestration IDENTITY passed in is what scopes
     /// routing, and is shared across every role of one orchestration.
+    ///
+    /// `is_orchestrator` is the caller's answer from
+    /// [`crate::project_config::orchestrator_index`], the one rule (issue
+    /// #523): the dispatched spawn passes `idx == orch_idx`, and the
+    /// `AttachRequest::StartAgent` handler passes the membership's
+    /// `is_start_role`, which the `Ctrl+n` tab computes by that same rule. The
+    /// decision cannot move in here: `StartAgent` registers one pane per
+    /// request and carries only that pane's membership, not the role list.
     pub fn register_orchestration_role(
         &mut self,
         pane_id: &str,
         role_name: &str,
-        is_start_role: bool,
+        is_orchestrator: bool,
         identity: OrchestrationIdentity,
         cwd: Option<&str>,
     ) {
@@ -9006,7 +9031,7 @@ impl AppState {
             self.pane_cwd_map
                 .insert(pane_id.to_string(), cwd.to_string());
         }
-        if is_start_role {
+        if is_orchestrator {
             self.orchestrator_pane_ids.insert(pane_id.to_string());
         }
     }
@@ -9970,6 +9995,27 @@ impl AppState {
     /// `verb` names the action in the refusal message (e.g. `"delegate"`,
     /// `"restart a role"`). Returns the error message to embed in the
     /// caller's own response type, or `None` when the caller is authorized.
+    /// Issue #523 review: whether `pane spawn <role>` from `caller_pane_id`
+    /// asks for this orchestration's own orchestrator role. `config_seat` is
+    /// the config's answer for `role`.
+    ///
+    /// Answered from the instance, not the config: the caller has already
+    /// passed [`Self::refuse_unless_orchestrator_caller`], so ITS role is the
+    /// orchestrator this instance registered — which is the config's seat
+    /// except where a restored tab honoured a saved cursor (PRD #89 F3). The
+    /// config's answer is only the fallback for a caller with no role entry.
+    fn spawn_role_is_the_orchestrator(
+        &self,
+        caller_pane_id: &str,
+        role: &str,
+        config_seat: bool,
+    ) -> bool {
+        match self.pane_role_map.get(caller_pane_id) {
+            Some(caller_role) => caller_role == role,
+            None => config_seat,
+        }
+    }
+
     fn refuse_unless_orchestrator_caller(&self, pane_id: &str, verb: &str) -> Option<String> {
         if !self.pane_role_map.contains_key(pane_id) {
             // Issue #1082: the `pane_role_map` lookup just MISSED, so this id
@@ -10393,13 +10439,13 @@ pub async fn handle_spawn_role_with_state(
         let cwd = guard.orchestration_cwd_of(&signal.pane_id, registry);
         let identity = guard.pane_orchestration_map.get(&signal.pane_id).cloned();
 
-        let role_config_indexed = match (cwd.as_deref(), identity.as_ref()) {
+        let role_config_seated = match (cwd.as_deref(), identity.as_ref()) {
             (Some(c), Some(identity)) => {
-                lookup_orchestration_role_indexed(c, identity.name(), &signal.role)
+                lookup_orchestration_role_seated(c, identity.name(), &signal.role)
             }
             _ => None,
         };
-        let Some((role_index, role_config)) = role_config_indexed else {
+        let Some((role_index, role_config, is_orchestrator)) = role_config_seated else {
             return SpawnRoleResponse {
                 error: Some(format!(
                     "could not resolve role `{}` in this project's .dot-agent-deck.toml, so \
@@ -10428,7 +10474,11 @@ pub async fn handle_spawn_role_with_state(
         // orchestrator-command pane registered as a worker. Refuse
         // explicitly instead of relying on a routing helper whose exclusion
         // rule means something else here.
-        if role_config.start {
+        //
+        // Issue #523: the orchestrator by the one rule, not the bare `start`
+        // flag — a role named `orchestrator` in a toml that flags no role is
+        // this orchestration's orchestrator, and is not a spawnable worker.
+        if guard.spawn_role_is_the_orchestrator(&signal.pane_id, &signal.role, is_orchestrator) {
             return SpawnRoleResponse {
                 error: Some(format!(
                     "role `{}` is this orchestration's own start (orchestrator) role — it is \
@@ -14846,12 +14896,68 @@ mod tests {
 
     /// The dispatched spawn path registers its orchestrator by `orch_idx`, not
     /// by the raw `start = true` flag — which is the whole point, because
-    /// `orchestrator_role_index` falls back (role named `orchestrator` → any
-    /// `start = true` → role 0) where the bare flag is false for EVERY role of
-    /// an orchestration whose toml sets no `start`. Registering on the raw flag
+    /// `orchestrator_role_index` falls back (any `start = true` → role named
+    /// `orchestrator` → role 0, issue #523) where the bare flag is false for
+    /// EVERY role of an orchestration whose toml sets no `start`. Registering on the raw flag
     /// would leave such an orchestration with a context-bearing orchestrator
     /// that is still absent from `orchestrator_pane_ids`: the same bug this
     /// change fixes, for a narrower input.
+    /// Issue #523: `pane spawn`'s "that is the orchestrator" refusal reads the
+    /// seat from the one rule, so a role named `orchestrator` in a toml that
+    /// flags no role is refused as the orchestrator (it used to read the bare
+    /// flag and treat it as a spawnable worker), and a flagged role beside a
+    /// role merely named `orchestrator` is the seat while that named role is a
+    /// worker.
+    #[test]
+    fn lookup_orchestration_role_seated_reads_the_one_rule() {
+        let seat = |toml: &str, role: &str| -> Option<(usize, bool)> {
+            let cwd = tempfile::tempdir().expect("tempdir");
+            std::fs::write(cwd.path().join(".dot-agent-deck.toml"), toml).expect("write toml");
+            lookup_orchestration_role_seated(cwd.path().to_str().expect("utf8"), "team", role)
+                .map(|(index, _, is_orchestrator)| (index, is_orchestrator))
+        };
+        let unflagged = "[[orchestrations]]\nname = \"team\"\n\n\
+             [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"cat\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\n";
+        assert_eq!(seat(unflagged, "orchestrator"), Some((1, true)));
+        assert_eq!(seat(unflagged, "coder"), Some((0, false)));
+
+        let flagged = "[[orchestrations]]\nname = \"team\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\n\n\
+             [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"cat\"\nstart = true\n";
+        assert_eq!(seat(flagged, "lead"), Some((1, true)));
+        assert_eq!(seat(flagged, "orchestrator"), Some((0, false)));
+    }
+
+    /// Issue #523 review (Qodo, PR #1388): a restored tab can seat a role other
+    /// than the config's (PRD #89 F3 honours the saved cursor), and the daemon
+    /// registers that seat. `pane spawn <that role>` from its own orchestrator
+    /// must still be refused as the orchestrator — the config-seat check alone
+    /// let it through, and `delegate_targets` excludes orchestrator panes, so
+    /// the duplicate check would not catch it either. The config's seat,
+    /// meanwhile a live worker there, is not "the orchestrator".
+    #[test]
+    fn spawn_role_refuses_the_callers_own_seat_even_when_the_config_seats_another() {
+        let mut state = AppState::default();
+        let identity = instance("orch-restored-0");
+        // Config seats `orchestrator` (index 0); the restore seated `coder`.
+        state.register_orchestration_role("pane-0", "orchestrator", false, identity.clone(), None);
+        state.register_orchestration_role("pane-1", "coder", true, identity, None);
+
+        assert!(
+            state.spawn_role_is_the_orchestrator("pane-1", "coder", false),
+            "`coder` is the seat this instance registered, and it is asking for its own role"
+        );
+        assert!(
+            !state.spawn_role_is_the_orchestrator("pane-1", "orchestrator", true),
+            "the config's seat is a worker in this instance, not its orchestrator"
+        );
+        assert!(
+            !state.spawn_role_is_the_orchestrator("pane-1", "reviewer", false),
+            "an ordinary worker role is spawnable"
+        );
+    }
+
     #[test]
     fn register_orchestration_role_makes_orch_idx_the_orchestrator() {
         let roles: Vec<crate::spawn::RoleSpawn> = ["coder", "orchestrator", "tester"]

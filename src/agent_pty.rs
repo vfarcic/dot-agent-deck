@@ -497,6 +497,17 @@ pub enum TabMembership {
     /// populates [`crate::state::AppState::pane_role_map`] and
     /// `is_start_role` populates
     /// [`crate::state::AppState::orchestrator_pane_ids`].
+    ///
+    /// Issue #523: `is_start_role` names the orchestrator SEAT — the role
+    /// [`crate::project_config::OrchestrationConfig::orchestrator_role_index`]
+    /// picks (`start = true`, else the role named `orchestrator`, else the
+    /// first) — not the bare `start` flag. The two paths that open an
+    /// orchestration from a config, the `Ctrl+n` tab and the daemon's
+    /// dispatched spawn, compute it by that rule, so each stamps it on exactly
+    /// one role. The desktop's prepared launch sends the bare flag, but refuses
+    /// to launch a config without exactly one `start = true` role — and for
+    /// such a config, which is also all `validate` accepts, the two readings
+    /// are the same value.
     Orchestration {
         name: String,
         role_index: usize,
