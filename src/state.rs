@@ -3429,8 +3429,18 @@ impl AppState {
             .waiting_superseded_sessions
             .entry(pane_id.clone())
             .or_default();
-        let previous_was_live_agents = superseded.agent_id == live_agent_id;
-        if !previous_was_live_agents {
+        //
+        // A record with no owner yet is ADOPTED by the first published one, not
+        // replaced: a worker's tagged events are admitted while its spawn is
+        // still pending, before the registry names it as the pane's owner, so
+        // "no owner, then this agent" is that same worker arriving (Qodo,
+        // #1393). A predecessor is always a published owner, so a real
+        // replacement is still `Some(old)` giving way to `Some(new)`.
+        let previous_was_live_agents =
+            superseded.agent_id.is_none() || superseded.agent_id == live_agent_id;
+        if previous_was_live_agents {
+            superseded.agent_id.clone_from(&live_agent_id);
+        } else {
             *superseded = SupersededSessions {
                 agent_id: live_agent_id.clone(),
                 ..SupersededSessions::default()
@@ -13715,6 +13725,76 @@ mod tests {
         // From there the successor's own moves are recorded as before.
         state.apply_event_watching_waiting(start("successor-next"), &registry);
         assert!(state.waiting_superseded_sessions["pane"].contains("after-replacement"));
+    }
+
+    /// Qodo on #1393: a worker's hook events can be admitted while its spawn is
+    /// still pending, before the registry publishes it as the pane's owner. The
+    /// record must read that owner arriving as the SAME worker, not as a
+    /// replacement: the session the worker left after publication is one it
+    /// moved past, and a delayed report from it must not read as current.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_session_reported_before_the_owner_was_published_is_still_superseded() {
+        fn start(session: &str, agent: &str) -> AgentEvent {
+            AgentEvent {
+                session_id: session.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some("pane".into()),
+                agent_id: Some(agent.to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+        // The pending window: the owner read finds no published agent.
+        let pending = Arc::new(AgentPtyRegistry::new());
+        // After publication: the same agent owns the pane.
+        let published = Arc::new(AgentPtyRegistry::new());
+        let agent = published
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane".to_string(),
+                )]),
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        assert_eq!(
+            published.pane_current_agent_id("pane").as_deref(),
+            Some(agent.as_str())
+        );
+
+        let mut state = AppState::default();
+        state.managed_pane_ids.insert("pane".into());
+        state.apply_event_watching_waiting(start("while-pending", &agent), &pending);
+        state.apply_event_watching_waiting(start("after-publication", &agent), &published);
+        let record = &state.waiting_superseded_sessions["pane"];
+        assert_eq!(record.agent_id.as_deref(), Some(agent.as_str()));
+        assert!(
+            record.contains("while-pending"),
+            "the worker's own pre-publication session was dropped as if a predecessor's"
+        );
+
+        // A genuine replacement still starts the record over without the
+        // predecessor's session.
+        let successor = published
+            .respawn_agent_for_pane("pane", "/bin/cat")
+            .await
+            .expect("replace the agent");
+        assert_ne!(successor, agent);
+        state.apply_event_watching_waiting(start("successor", &successor), &published);
+        let record = &state.waiting_superseded_sessions["pane"];
+        assert_eq!(record.agent_id.as_deref(), Some(successor.as_str()));
+        assert!(record.sessions.is_empty());
+        published.shutdown_all();
     }
 
     /// Issue #447 (Qodo, #1347): the waiting watch's record of the hook sessions
