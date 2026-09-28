@@ -822,11 +822,14 @@ struct CodexSpawnPrep {
     /// marked ([`Emitter::prompt_reports_unavailable`]) so the deck stops reading
     /// "this pane is Codex" as "this pane can confirm a delivery".
     ///
-    /// `true` for a Codex identity whenever the trust step did not record at
-    /// least one deck hook: the step was skipped (no pane and a non-`codex`
-    /// program), the install produced nothing to trust, `codex app-server` could
-    /// not be run — the ordinary `devbox run codex-big` host, where `codex`
-    /// exists only inside the launcher — or it recorded nothing.
+    /// `true` for a Codex identity whenever the trust step did not trust the
+    /// deck's own `UserPromptSubmit` hook with the user's toggle on
+    /// ([`crate::codex_hooks_manage::TrustOutcome::reports_prompts`]): the step
+    /// was skipped (no pane and a non-`codex` program), the install produced
+    /// nothing to trust, `codex app-server` could not be run — the ordinary
+    /// `devbox run codex-big` host, where `codex` exists only inside the
+    /// launcher — it recorded nothing, or it recorded only OTHER hooks, or the
+    /// user has switched the prompt hook off in Codex's `/hooks` browser.
     ///
     /// **It reports what THIS spawn could establish, and can be wrong in the
     /// safe direction.** A trust record an earlier `hooks install` wrote from a
@@ -883,7 +886,7 @@ fn codex_spawn_prep(
     // path it installed with, and that value is what reaches the trust write
     // below (issue #730).
     let mut installed_binary = None;
-    let mut deck_hooks_trusted = false;
+    let mut prompt_hook_live = false;
     let pinned_home = if installs_hooks {
         installed_binary = crate::codex_hooks_manage::auto_install();
         crate::codex_hooks_manage::active_codex_home()
@@ -911,9 +914,10 @@ fn codex_spawn_prep(
             // level anyone runs. One line per Codex spawn, on a path that
             // already writes one when it fails.
             Ok(outcome) if outcome.trusted() > 0 => {
-                deck_hooks_trusted = true;
+                prompt_hook_live = outcome.reports_prompts();
                 tracing::info!(
                     count = outcome.trusted(),
+                    prompt_hook_live,
                     "codex: recorded scoped trust for deck hooks"
                 )
             }
@@ -931,7 +935,7 @@ fn codex_spawn_prep(
 
     CodexSpawnPrep {
         pinned_home,
-        prompt_reports_unavailable: codex_identity && !deck_hooks_trusted,
+        prompt_reports_unavailable: codex_identity && !prompt_hook_live,
     }
 }
 

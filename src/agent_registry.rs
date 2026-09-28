@@ -305,7 +305,7 @@ fn codex_install_resolved(binary_path: Result<String, String>) -> Result<(), Str
              to stdout classification. Set DOT_AGENT_DECK_LOG to log the expected command.)",
             if listed == 1 { "entry" } else { "entries" }
         ),
-        Ok(TrustOutcome::Trusted(count)) => println!("Trusted hooks: {count}"),
+        Ok(TrustOutcome::Trusted { count, .. }) => println!("Trusted hooks: {count}"),
         // Say it on stderr as well as in the log. This is the one arm that
         // printed nothing at all, so the user got no trust line whatsoever and
         // exit 0 — and the log half needs `DOT_AGENT_DECK_LOG` to have been set

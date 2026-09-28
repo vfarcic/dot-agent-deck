@@ -4556,6 +4556,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** what the delegate gate then does with the signal (`orchestration/delegate/029`); the fork-time event's own card-surfacing role (`orchestration/delegate/007`); real codex-cli boot output (`codex/live/001`).
 - **Platform coverage:** mac+linux (unix-only — `openpty` and a POSIX shell stand-in).
 
+##### codex/wrap/007 — A wrapped Codex pane whose wrapper could not get Codex's hooks trusted receives its seed prompt exactly once (issue #559).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_codex_seed_delivery.rs`, `#![cfg(all(feature = "e2e", unix))]`): the real deck, daemon and `dot-agent-deck wrap`, a `[[modes]]` entry declaring `agent = "codex"` with a `seed_prompt`, spawned through the new-pane form.
+- **Agent:** a stand-in that paints one composer line (so the wrapper's classifier gives the pane a producer), records every submission, and reports none. Two decks, differing only in `PATH`: one with the `codex-synthetic` app-server stand-in listing the deck's `pre_tool_use` and `user_prompt_submit` hooks, so the wrapper records trust for the prompt hook; one with no `codex` at all (`<deck bin dir>:/usr/bin:/bin`), the `devbox run codex-big` host, so the trust step cannot run. Never the inherited `PATH`, since a host `codex` would decide the trust step.
+- **Asserts:** the seed reaches the pane in both runs; the healthy pane is re-submitted after the 10 s Codex retry floor, so it records the seed twice (the control — the retry that recovers a swallowed seed); the untrusted pane records it exactly once. RED with the wrapper's marker stamping disabled: the untrusted pane recorded it twice.
+- **Does not assert:** the orchestrator or daemon-owned delivery paths (`prompt/pane-input/041`, `scheduler/dispatch/016`); a real Codex (`codex/hooks/001` and `codex/live/001` cover the wrapper under one); which event carried the marker (`codex/trust/005`).
+- **Platform coverage:** mac+linux (unix-only file).
+
 #### codex/trust
 
 ##### codex/trust/001 — No Codex launch form receives an invocation-global hook-trust bypass (PRD #20 Greptile P1 close-by-deletion).
@@ -4586,10 +4593,10 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** that the wrapper actually writes the record (covered by `codex/trust/002`), or `config.toml` byte preservation (covered by `codex/trust/003`).
 - **Platform coverage:** mac+linux (unix-only test file).
 
-##### codex/trust/005 — A wrapper that could not record trust for Codex's hooks declares, on every event it emits, that no submitted-prompt report will come (issue #559).
+##### codex/trust/005 — A wrapper whose Codex prompt hook will not run declares, on every event it emits, that no submitted-prompt report will come (issue #559).
 - **Layer:** L1/fast real-binary subprocess integration: the real `wrap` inside a deck-managed pane (pane id set, so the trust step runs), a pinned Codex home, a seeded durable deck, and a real hook socket collecting every emitted event.
-- **Agent:** a Codex launcher script (a copy of the app-server stand-in that, launched without `app-server`, records its args and exits) — the `devbox run codex-big` shape. Two runs: a `codex` app-server stand-in on the wrapper's `PATH` listing the deck's own hook, and a `PATH` of `/usr/bin:/bin` with no `codex` at all.
-- **Asserts:** the precondition that trust was recorded exactly in the first run (`config.toml` exists) and not in the second; then that no event carries `wrapper_prompt_reports_unavailable` when trust was recorded, and that EVERY event does — the fork-time `SessionStart` included — when it could not be. RED before issue #559's fix: the second run's events carried nothing, so the deck read the pane as able to confirm a delivery.
+- **Agent:** a Codex launcher script (a copy of the app-server stand-in that, launched without `app-server`, records its args and exits) — the `devbox run codex-big` shape. Three runs: a `codex` app-server stand-in on the wrapper's `PATH` listing a deck `pre_tool_use` hook and the deck's `user_prompt_submit` hook switched on; a `PATH` of `/usr/bin:/bin` with no `codex` at all; and the stand-in listing the same two entries with the prompt hook switched OFF (`enabled: false`, the user's `/hooks` toggle), so trust is recorded only for a hook that reports no prompt.
+- **Asserts:** the precondition that trust was recorded in the first and third runs (`config.toml` exists) and not in the second; then that no event carries `wrapper_prompt_reports_unavailable` in the first run, and that EVERY event does — the fork-time `SessionStart` included — in the other two. RED before issue #559's fix for the no-`codex` run, whose events carried nothing; RED on the fix's first revision for the disabled-prompt-hook run, which counted any trusted deck hook as proof (Qodo on PR #1390).
 - **Does not assert:** what the deck does with the marker (`prompt/pane-input/041` for the TUI-owned delivery, `scheduler/dispatch/016` for the daemon-owned one); a trust record left by an earlier `hooks install`, which this spawn cannot see and which the marker therefore misreads in the safe direction; a launcher that re-exports `CODEX_HOME`, which the wrapper cannot detect and which stays a residual.
 - **Platform coverage:** mac+linux (unix-only test file).
 
