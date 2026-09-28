@@ -40,8 +40,8 @@ cat >> /tmp/gen-input.md <<'EOF'
 
 ## NON-INTERACTIVE CAPTURE (overrides the interactive steps above)
 - You ARE allowed to read the repo with your tools — perform step 1's discovery yourself.
-- Do NOT ask the user anything and do NOT wait for confirmation; skip step 5's negotiation.
-- Do NOT write or modify ANY file in the repo. You have write tools but must not use them — skip step 6's file write entirely; only print the config.
+- Do NOT ask the user anything and do NOT wait for confirmation; skip step 4's negotiation.
+- Do NOT write or modify ANY file in the repo. You have write tools but must not use them — skip step 5's file write entirely; only print the config.
 - Output a short (≤1 paragraph) rationale, then the COMPLETE proposed `.dot-agent-deck.toml` (its orchestration) in a single fenced ```toml block, and nothing after it.
 EOF
 

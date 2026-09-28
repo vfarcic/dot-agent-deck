@@ -188,10 +188,10 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     );
     assert!(
         !grid.contains("×"),
-        "the `schedule` authoring session must NOT open as a 50/50 mode tab: a mode tab \
-         creates a second tab whose strip carries a `×` close glyph. A `×` on screen means \
-         the authoring agent was (wrongly) routed through `render_mode_tab` instead of \
-         landing as a dashboard card.\nGrid:\n{grid}"
+        "the `schedule` authoring session must NOT open a tab of its own: any second tab \
+         puts a `×` close glyph on the tab strip. A `×` on screen means the authoring \
+         agent was (wrongly) given its own tab instead of landing as a dashboard \
+         card.\nGrid:\n{grid}"
     );
 }
 

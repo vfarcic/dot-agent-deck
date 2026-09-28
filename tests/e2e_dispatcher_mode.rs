@@ -641,11 +641,11 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
 
     // The dispatcher must surface live as a DASHBOARD CARD, not a mode tab.
     //
-    // This is the PRD #127 card shape (`mode_config: None` + `seed_prompt`), and
-    // asserting it is the point: a mode tab routes through `render_mode_tab`'s
-    // 50/50 split, so the dispatcher — which declares no side panes — rendered at
-    // half width beside an empty column. `1 agent(s)` with no tab strip is what
-    // distinguishes the fixed shape from the broken one.
+    // This is the PRD #127 card shape (a seeded single agent), and asserting it
+    // is the point: before workspace modes were removed (#1199) the dispatcher
+    // once opened as a mode tab, whose 50/50 split rendered it — with no side
+    // panes declared — at half width beside an empty column. `1 agent(s)` with
+    // no tab strip is what distinguishes the card shape from that one.
     // Asserted on the GRID, not the raw stream: this is redrawn dashboard chrome,
     // so the bytes carrying it are interleaved with cursor-positioning escapes and
     // the text never appears contiguously in the stream. The rendered grid is the

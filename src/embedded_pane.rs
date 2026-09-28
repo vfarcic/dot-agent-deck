@@ -1340,9 +1340,8 @@ impl EmbeddedPaneController {
         // Issue #363: through [`new_pane_parser`], never `vt100::Parser::new`
         // raw. The two hydration callers hand over dims the daemon vouched for,
         // but the spawn caller (`create_stream_pane`) forwards viewport-derived
-        // dims straight from `ui.rs`'s layout helpers — `right_column_pane_dims`,
-        // `mode_side_pane_dims` and `mode_agent_pane_dims` all end in a
-        // `saturating_sub(2)` border allowance — so a short or narrow terminal
+        // dims straight from `ui.rs`'s layout helpers — `right_column_pane_dims`
+        // ends in a `saturating_sub(2)` border allowance — so a short or narrow terminal
         // arrives here with a zero axis and no caller in between rejects it, the
         // way `resize_panes_to_layout` does on the resize path.
         //

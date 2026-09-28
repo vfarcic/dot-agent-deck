@@ -2102,9 +2102,8 @@ struct UiState {
     /// (launch), one layer up.
     ///
     /// **Lifecycle.** Entries are removed on exactly the paths that remove
-    /// [`Self::pane_metadata`]: closing a pane (`Action::ClosePane`), closing a
-    /// tab, and the restore-failure / mode-activation-failure arms that retire
-    /// a pane id they just spawned. A stale entry would nonetheless be inert
+    /// [`Self::pane_metadata`]: closing a pane (`Action::ClosePane`) and
+    /// closing a tab. A stale entry would nonetheless be inert
     /// rather than a mislabelled card, because a pane id is never recycled
     /// within a daemon session — `EmbeddedPaneController::allocate_id`
     /// (`src/embedded_pane.rs`) hands out a monotonic counter and never reuses
@@ -2112,12 +2111,8 @@ struct UiState {
     /// rehydrated id before allocating again. So a leftover entry can only be
     /// looked up by the pane that put it there.
     ///
-    /// Only the two surfaces that can carry a declaration are ever inserted:
-    /// orchestration ROLE panes and MODE agent panes. In particular the mode's
-    /// reactive SIDE panes get no entry — `TabManager::route_reactive_commands`
-    /// (`src/tab.rs`) closes and re-creates those panes under fresh ids as
-    /// rules fire, so an entry keyed on one of them would be orphaned on every
-    /// rule that fires rather than on tab close.
+    /// Only orchestration ROLE panes can carry a declaration, so they are the
+    /// only panes ever inserted — at spawn and on session restore.
     pane_declared_agent: HashMap<String, AgentType>,
     /// Maps pane_id → launch metadata for auto-save/restore.
     pane_metadata: HashMap<String, config::SavedPane>,
@@ -2229,7 +2224,8 @@ struct UiState {
     /// otherwise.
     form_field_rects: Vec<(FormField, Rect)>,
     /// PRD #80 M8: new-pane-form mode chips, paired with the mode-option index
-    /// each selects (0 = "No mode", 1.. = modes/orchestrations).
+    /// each selects (0 = "No mode", then the orchestrations, then the built-in
+    /// options — see `NewPaneFormState::mode_option_name`).
     form_chip_rects: Vec<(usize, Rect)>,
     /// PRD #80 M8: new-pane-form `[Submit]`/`[Cancel]` button rects, paired
     /// with the [`Action`] each fires.
@@ -15128,7 +15124,7 @@ fn render_tab_strip(
 /// PRD #84 M3/M4 — the result of the single per-frame layout pass. Holds every
 /// structural rect the render path draws into: the optional tab-bar row, the
 /// hints/button-bar row, and the per-tab-variant content rects. `render_frame`
-/// and `render_mode_tab` read their rects from here instead of splitting layout
+/// reads its rects from here instead of splitting layout
 /// inline (contract invariant 1: one layout pass per frame). M4: it also
 /// carries each terminal pane's OUTER rect so `resize_panes_to_layout` can
 /// derive PTY size from the layout (invariant 2). See
@@ -15254,7 +15250,7 @@ impl FrameLayout {
 /// the active `PaneLayout`, and the controller's focused pane, produce every
 /// structural rect the render path draws into — including each terminal pane's
 /// OUTER rect (M4, used to size PTYs). The split math mirrors
-/// `render_frame` / `render_mode_tab` / `render_terminal_panes` exactly, so the
+/// `render_frame` / `render_terminal_panes` exactly, so the
 /// rendered output and the resize target agree by construction.
 fn compute_frame_layout(
     frame_area: Rect,
@@ -15974,8 +15970,8 @@ fn render_frame(
     // source the deck cards read (`state.sessions[*].status`), so an embedded
     // pane's border encodes its status with the SAME centralized-palette color
     // the deck card uses — closing the deck/pane consistency gap (criterion #2).
-    // Built once and threaded into every `render_terminal_panes` call below (and
-    // into `render_mode_tab`). Extracted into `build_pane_status` so the join can
+    // Built once and threaded into every `render_terminal_panes` call below.
+    // Extracted into `build_pane_status` so the join can
     // be unit-tested without a live daemon.
     let pane_status: HashMap<&str, SessionStatus> = build_pane_status(state);
 
@@ -25431,7 +25427,11 @@ mod tests {
         assert!(status.contains("Workspace modes were removed"));
         assert_eq!(ui.session_warnings.len(), 1);
         let full = &ui.session_warnings[0];
-        assert!(full.contains("/work/legacy/.dot-agent-deck.toml"), "{full}");
+        let expected = dir
+            .join(crate::project_config::CONFIG_FILE_NAME)
+            .display()
+            .to_string();
+        assert!(full.contains(&expected), "{full}");
         assert!(
             full.contains("ignored") && full.contains("deleted"),
             "{full}"

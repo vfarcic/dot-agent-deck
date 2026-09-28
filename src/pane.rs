@@ -320,7 +320,6 @@ pub trait PaneController: Send + Sync {
     /// this method**: every production spawn now goes through
     /// `create_pane_with_options` with real dims computed via the
     /// `*_pane_dims` SSOT helpers in `ui.rs` (`dashboard_pane_dims`,
-    /// `mode_agent_pane_dims`, `mode_side_pane_dims`,
     /// `orchestration_role_pane_dims`). After the M2.15 fixup pass 2,
     /// the legacy `EmbeddedPaneController::create_pane` override was
     /// deleted so no production controller can hit the 24×80 fallback —

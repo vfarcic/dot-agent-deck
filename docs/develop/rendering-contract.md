@@ -28,8 +28,7 @@ compute_frame_layout(frame_area, &TabView, &TabBarInfo, pane_ids) -> FrameLayout
 
 - `compute_frame_layout(...)` (new; in `src/ui.rs` or a new `src/layout.rs`) — the sole producer of `FrameLayout`.
 - `render_frame` (`src/ui.rs`, ~`fn render_frame`) — consumes `FrameLayout` instead of splitting the frame into tab bar + main + hints and computing per-variant dashboard/pane sub-splits inline.
-- `render_mode_tab` (`src/ui.rs`, ~`fn render_mode_tab`) — consumes `FrameLayout` instead of computing its own layout.
-- `ui.side_pane_rects` and `ui.agent_pane_rect` (used for mouse hit-testing) are populated **from** `FrameLayout` after computation, not assembled inline during render. This keeps hit-testing reading the same rects the widgets drew into.
+- `ui.focused_pane_rect` (used for mouse hit-testing) is the rect `render_terminal_panes` drew the focused pane into this frame, so hit-testing reads the same rect the widget drew into. (Workspace-mode tabs had a second renderer, `render_mode_tab`, and their own hit-test rects, `ui.side_pane_rects` and `ui.agent_pane_rect`; all three went with #1199.)
 
 ### 2. PTY size is REQUESTED from the layout rect, not pushed by event handlers
 
@@ -50,7 +49,7 @@ Two consequences follow, and both are load-bearing:
 
 **Enforced by:**
 
-- `resize_panes_to_layout(...)` (new) — the **only** caller of `resize_pane_pty` in the steady-state render loop. Replaces the per-tab-variant helpers `resize_dashboard_panes` / `resize_mode_tab_panes` / `resize_mode_tab_panes_for` (`src/ui.rs`, ~1320–1430), which go away.
+- `resize_panes_to_layout(...)` (new) — the **only** caller of `resize_pane_pty` in the steady-state render loop. It replaced the per-tab-variant helpers `resize_dashboard_panes` / `resize_mode_tab_panes` / `resize_mode_tab_panes_for`, which are gone (the mode-tab ones along with workspace modes in #1199).
 - `resize_pane_pty` (`src/embedded_pane.rs`, ~`fn resize_pane_pty`) — remains the one resize primitive; it is now driven from one place.
 
 **Removed** — every ad hoc `embedded.resize_pane_pty(...)` call that computed its own dimensions from a local view of the layout:
@@ -87,7 +86,7 @@ Within a single frame, the order is always:
 
 1. **Compute layout** — `compute_frame_layout(...)`.
 2. **Commit PTY resizes to match** — `resize_panes_to_layout(...)`, before `terminal.draw`.
-3. **Render** — `render_frame` / `render_mode_tab` read from `FrameLayout`.
+3. **Render** — `render_frame` reads from `FrameLayout`.
 
 There is no path that renders before resizing, or resizes after rendering.
 
