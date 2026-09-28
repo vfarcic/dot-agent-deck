@@ -2521,12 +2521,20 @@ async fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_fli
     // ordinary buffer. `TIMER_TICK_SLACK` as `/011` explains, and every advance
     // below is measured from this instant.
     advance_and_run(Duration::from_secs(30) + TIMER_TICK_SLACK).await;
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(
-        !snapshot_contains(
+    // Both negative checks poll with `poll_until_after_time_advance`, which
+    // yields to this current-thread runtime between real-time sleeps, so a
+    // write the delegate task has pending can still run and be SEEN — a bare
+    // `thread::sleep` here would block the very task under test and could make
+    // an absence vacuous. The paused clock does not move while it polls.
+    let written_at_release = poll_until_after_time_advance(Duration::from_millis(300), || {
+        snapshot_contains(
             &registry.snapshot(&new_agent_id).unwrap_or_default(),
-            POINTER
-        ),
+            POINTER,
+        )
+    })
+    .await;
+    assert!(
+        !written_at_release,
         "control: the pointer was written at the release itself, so no buffer was in flight for \
          the strong fact to re-price"
     );
@@ -2546,10 +2554,17 @@ async fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_fli
         Duration::from_millis(PRODUCTION_READINESS_BUFFER_MS) - strong_at + TIMER_TICK_SLACK * 10,
     )
     .await;
-    std::thread::sleep(Duration::from_millis(300));
+    let written_at_weak_deadline =
+        poll_until_after_time_advance(Duration::from_millis(500), || {
+            snapshot_contains(
+                &registry.snapshot(&new_agent_id).unwrap_or_default(),
+                POINTER,
+            )
+        })
+        .await;
     let at_weak_deadline = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
-        !snapshot_contains(&at_weak_deadline, POINTER),
+        !written_at_weak_deadline,
         "the pointer was written when the weak output-settled fact's {PRODUCTION_READINESS_BUFFER_MS} \
          ms buffer ran out, although the wrapper's STRONG raw-input fact had landed {strong_at:?} \
          into it. A full-screen TUI that has just taken raw mode is still initialising and eats \
