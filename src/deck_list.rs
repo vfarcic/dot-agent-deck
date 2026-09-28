@@ -821,6 +821,11 @@ fn unwritable(path: &str, reason: &str) -> RemoteConfigError {
 /// CLI in a terminal and the desktop — can never both read the same original
 /// and have the later rename silently discard the other's change. The lock's
 /// directory is created (owner-only) if missing, since the sidecar lives in it.
+///
+/// **A symlinked registry is edited at its target** ([`publish_path`]): the
+/// lock, the read, the temp file and the rename all use the file the link
+/// resolves to, so the link survives and a writer that came in through the
+/// link and one that came in through the target take the same lock.
 pub fn edit<T, E>(path: &Path, f: impl FnOnce(&mut DeckDocument) -> Result<T, E>) -> Result<T, E>
 where
     E: From<RemoteConfigError>,
@@ -828,6 +833,7 @@ where
     let _guard = EDIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = &publish_path(path)?;
     let dir = registry_dir(path);
     crate::platform::fsperm::create_owner_only_dir(dir).map_err(|source| {
         RemoteConfigError::Io {
@@ -917,6 +923,56 @@ pub fn remove(path: &Path, which: DeckRef<'_>) -> Result<Option<RemoteEntry>, Re
     })
 }
 
+/// The file an edit of the registry at `path` reads, locks beside and
+/// renames onto: `path` itself, unless `path` is a symlink — then the file the
+/// link finally resolves to.
+///
+/// Reads have always followed a symlink at the registry path, deliberately:
+/// dotfile managers (stow, chezmoi's symlink mode, a hand-made link into a
+/// dotfiles repo) keep `remotes.toml` as a link. A rename onto the link's own
+/// path replaces the **link** with a plain file, which silently detaches the
+/// registry from the managed copy — every later edit lands in the new file and
+/// the dotfiles repo keeps the stale one (issue #1350's review). Publishing at
+/// the target keeps the link and updates what it points at. The lock sidecar
+/// is derived from the same resolved path, so it lives beside the target, and
+/// every writer — through the link or straight at the target — locks the one
+/// `.remotes.toml.lock` there.
+///
+/// An absent path stays as given, so a first `remote add` still creates the
+/// file where the configuration says. A **dangling** symlink is refused rather
+/// than followed to create its target: that target can be anywhere, and the
+/// directories on the way would be created owner-only by [`write_atomic`] — a
+/// link left behind by a half-applied dotfile checkout, or planted, should not
+/// decide where the deck list and its parent directories appear. Reads already
+/// see such a link as an empty registry, so the refusal is on write only and
+/// names the link.
+fn publish_path(path: &Path) -> Result<std::path::PathBuf, RemoteConfigError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::canonicalize(path).map_err(|source| {
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    unwritable(
+                        &path.display().to_string(),
+                        "it is a symlink to a file that does not exist, so nothing was written. \
+                         Create the file it points at, or remove the link",
+                    )
+                } else {
+                    RemoteConfigError::Io {
+                        path: path.display().to_string(),
+                        source,
+                    }
+                }
+            })
+        }
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(source) => Err(RemoteConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        }),
+    }
+}
+
 /// Distinguishes temp files written by one process, which may save more than
 /// once at a time (the desktop, from several windows).
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -932,8 +988,13 @@ const TEMP_NAME_ATTEMPTS: usize = 8;
 /// `rename(2)`s it into place — so a partial write or a crash mid-save can
 /// never leave a half-written `remotes.toml` for the next run to choke on, and
 /// the final file is owner-only (0o600) regardless of the user's umask.
+///
+/// A `path` that is a symlink is written at its target ([`publish_path`]), so
+/// the link is kept rather than replaced by a plain file.
 pub fn write_atomic(path: &Path, contents: &str) -> Result<(), RemoteConfigError> {
     use std::io::Write;
+
+    let path = &publish_path(path)?;
 
     // PRD #163 auditor: create the parent through the fsperm seam, not plain
     // `create_dir_all`, so the *directory* is owner-only too — the same call
@@ -1869,6 +1930,110 @@ added_at = "2026-01-01T00:00:00+00:00"
         let link = dir.path().join("linked.toml");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert_eq!(RemotesFile::load(&link).unwrap().remotes.len(), 1);
+    }
+
+    /// Issue #1350's review: an edit through a symlinked registry lands at the
+    /// link's target and leaves the link a link. The rename used to replace
+    /// the link itself with a plain file, detaching the registry from the
+    /// dotfile manager's copy. The link here sits in another directory than
+    /// its target, so the lock and temp file must follow the target there.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_through_a_symlinked_registry_updates_the_target_and_keeps_the_link() {
+        let dotfiles = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let target = registry(&dotfiles, "");
+        add(&target, entry("a", "a.example")).unwrap();
+        let link = config.path().join("remotes.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        add(&link, entry("b", "b.example")).unwrap();
+        update(&link, DeckRef::Name("a"), |row| row.port = 2200).unwrap();
+        remove(&link, DeckRef::Name("b")).unwrap();
+        RemotesFile::load(&link)
+            .unwrap()
+            .save(&link)
+            .expect("a whole-file save follows the link too");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link was replaced by a plain file"
+        );
+        let rows = RemotesFile::load(&target).unwrap().remotes;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "a");
+        assert_eq!(rows[0].port, 2200, "the edit did not reach the target");
+        let stray: Vec<_> = std::fs::read_dir(config.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "remotes.toml")
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "lock or temp file beside the link: {stray:?}"
+        );
+    }
+
+    /// The lock is one lock whichever path a writer came in by: an edit through
+    /// the link waits while the lock taken through the target is held.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_through_a_link_and_one_at_its_target_share_one_lock() {
+        let dotfiles = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let target = registry(&dotfiles, "");
+        let link = config.path().join("remotes.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let held = acquire_edit_lock(&target)
+            .unwrap()
+            .expect("tempdirs can lock");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let editor = std::thread::spawn(move || {
+            let result = add(&link, entry("through-the-link", "l.example"));
+            let _ = tx.send(());
+            result
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the edit through the link went ahead while the target's lock was held"
+        );
+        drop(held);
+        editor.join().unwrap().unwrap();
+        assert_eq!(RemotesFile::load(&target).unwrap().remotes.len(), 1);
+    }
+
+    /// A dangling symlink at the registry path is refused on write — its
+    /// target, and the directories on the way to it, are not created — and
+    /// still reads as an empty registry.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlinked_registry_is_refused_on_write_and_nothing_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-yet").join("remotes.toml");
+        let link = dir.path().join("remotes.toml");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+
+        assert!(RemotesFile::load(&link).unwrap().remotes.is_empty());
+        assert!(matches!(
+            add(&link, entry("a", "a.example")),
+            Err(AddDeckError::Config(RemoteConfigError::Unwritable { .. }))
+        ));
+        assert!(matches!(
+            write_atomic(&link, "remotes = []\n"),
+            Err(RemoteConfigError::Unwritable { .. })
+        ));
+        assert!(!dir.path().join("not-yet").exists());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     /// Issue #1350's review: parsing split a folded login at the first `@` and
