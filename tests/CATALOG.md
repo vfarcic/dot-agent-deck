@@ -884,6 +884,27 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the daemon's own handling of the same stamp, which its registry-ownership ground (`generation_disowned`, issue #454) bounds and which a client state has no counterpart for; the readout, which is `0s` either way because `format_elapsed` clamps a future delta.
 - **Platform coverage:** mac+linux+windows.
 
+##### status/supersede/019 — A late frame the daemon marked as from a DISPLACED generation neither retires the live card nor adds one beside it (issue #320).
+- **Layer:** L1 (in-process `AppState` with no registry — an attached TUI's shape — fed frames carrying the daemon's `pane_generation` metadata stamp through `apply_event`).
+- **Agent:** none (synthetic Claude Code generations under two registry agent ids).
+- **Asserts:** with the incoming generation's card on the pane, a late `SessionStart` and a late `Thinking` stamped an hour in the future from the outgoing generation, each marked `displaced`, leave that card as the pane's only card. Control: the same frames unmarked — as a daemon predating the stamp relays them — are still ordered by the old type-and-timestamp rule and replace the live card, so the verdict is what decides.
+- **Does not assert:** that the daemon stamps the right verdict — that is its registry's answer, pinned end to end against a real `AgentPtyRegistry` by `daemon::hook_ingestion_tests` (`a_late_outgoing_session_start_cannot_retire_the_live_card`, `a_late_outgoing_frame_stamped_newer_cannot_retire_the_live_card`, `a_late_frame_from_a_generation_replaced_in_place_cannot_retire_the_live_card`, `the_generation_marker_is_the_registrys_answer_only`); an id the registry never published on the pane, which gets no verdict and keeps the old rule, residual included.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/020 — A frame the daemon marked as the pane's CURRENT generation supersedes the previous generation's card however it is stamped (issue #320).
+- **Layer:** L1 (in-process `AppState` with no registry, fed stamped frames through `apply_event`).
+- **Agent:** none (synthetic Pi generations — the agent that sends no `SessionStart`).
+- **Asserts:** an outgoing Pi card, then the incoming generation's first `Thinking` stamped 30 seconds EARLIER than that card's last activity and marked `current`, leaves exactly one card, owned by the incoming agent. Control: the same frame unmarked is held back by the timestamp and the pane keeps both cards, the TUI-side behaviour against a daemon that predates the stamp.
+- **Does not assert:** the daemon's own side, where the registry answers directly (`daemon::hook_ingestion_tests::the_current_generation_supersedes_whatever_its_first_frame_is_stamped`); the scheduler placeholder handoff (`status/supersede/001`, `scheduler/live/004`), which a current-generation `SessionStart` still performs.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/021 — A displaced generation's own `SessionEnd` still ends its card (issue #320, Greptile on PR #1389).
+- **Layer:** L1 (in-process `AppState` with no registry, fed stamped frames through `apply_event`).
+- **Agent:** none (a synthetic Claude Code generation).
+- **Asserts:** with the outgoing generation's card still the pane's card (its successor has only reserved the pane), that generation's `SessionEnd` marked `displaced` removes the card. The displaced mark refuses frames that claim a generation; a `SessionEnd` claims none, so it keeps the path it had before the mark existed — but only while the pane holds a card of the ending agent's own. With the successor's Pi card under the shared `{pane_id}-session` key and no card of the outgoing agent's left, the outgoing agent's displaced `SessionEnd` under that key leaves the successor's card in place, with its own status. Asserted on the card rather than on the pane's owners, because the terminal branch rebuilds a bare placeholder carrying the removed card's `agent_id` (Qodo on PR #1389).
+- **Does not assert:** that a displaced end on a different key cannot erase a successor's card, which that path already guarantees (`status/supersede/003`); the placeholder the `SessionEnd` branch restores (`status/supersede/008`); the daemon's own handling, whose admission refuses a displaced end as it did before #320; an UNMARKED end under a successor's key, from a daemon that predates the mark, which still takes the historical path.
+- **Platform coverage:** mac+linux+windows.
+
 #### status/shell-activity
 
 ##### status/shell-activity/001 — The process-table primitive finds a real, detached grandchild process as a descendant and reports its no-controlling-tty / session-leader / argv / session-id facts correctly (PRD #386 M1).
@@ -5004,6 +5025,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Asserts:** after a delegate whose pointer landed is cancelled with `pane restart --force`, three silent-worker windows pass with no "delegated worker went quiet" notice in the orchestrator pane; a second, uncancelled delegate then produces that notice (the control that makes the negative mean something).
 - **Does not assert:** the idle-worker (`worker_response_timeout_minutes`) report, which the same restart cancels by the same call; the case of a dispatch queued behind the pane lock during the restart (`agent_pty`'s `replaced_agent_watches_are_cancelled_unless_a_dispatch_is_in_flight` owns that).
 - **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/014 — After `pane restart`, a late `SessionStart` from the REPLACED generation cannot take the role's card back in an attached TUI (issue #320).
+- **Layer:** L2 (PTY-attached real binary: real daemon, real TUI, the real `pane restart` CLI; hook frames posted on the real hook socket).
+- **Agent:** none (`cat` stand-ins for both roles; the hook frames stand in for a hook-emitting agent's, naming the daemon's real registry ids for coder's two generations).
+- **Asserts:** with coder restarted so the daemon has published two generations on its pane, the new generation's `SessionStart` draws its prompt on coder's card; a late `SessionStart` from the replaced generation, followed on the same connection by a barrier frame on the orchestrator's pane, leaves the live generation's prompt on screen and never draws the replaced generation's. The barrier is on another pane on purpose: one from coder's live generation would re-retire a wrongly restored card and hide the defect. Verified load-bearing: with the daemon's generation stamp removed the replaced generation's prompt is drawn and the test fails.
+- **Does not assert:** a real agent's hook (`orchestration/delegate/014` covers a real Claude worker through a `clear = true` respawn); the late non-start frame stamped newer, or the incoming generation's older-stamped first frame, which `daemon::hook_ingestion_tests` pins at the ingestion seam and `status/supersede/019` / `/020` at the card layer.
+- **Platform coverage:** mac+linux (the e2e tier is Unix-only).
 
 #### pane/spawn
 

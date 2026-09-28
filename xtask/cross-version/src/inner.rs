@@ -1447,6 +1447,39 @@ fn with_attached_tui(
     // delivery differently and makes a delivered delegate briefly look
     // undelivered.
     focus_role(tui, plan, ROLE_REVIEWER)?;
+    // The delegate names `reviewer` too, and the daemon writes ITS task pointer
+    // only after that worker's own readiness wait — for a stand-in the deck
+    // cannot identify, the full timeout, ending a few seconds after coder's
+    // pointer (tell 3's signal) and so right inside this step. Typing a hook
+    // command into the reviewer's shell before it lands races that write: the
+    // pointer text arrives on the same input line and the shell runs
+    // `agent-event --type running Read .dot-agent-deck/worker-task-reviewer.md
+    // …`, which the CLI rejects as an unexpected argument, so the status half of
+    // tell 4 fails with no event ever reaching the daemon. Measured on `main`
+    // and on three branches alike while running #320's rule-12 check (the
+    // sandbox TUI stream carries that exact line). Wait for the pointer to be
+    // painted in the reviewer's pane first. Bounded, and recorded either way:
+    // the tells, not this wait, decide the verdict, but a run that timed out
+    // here says so, so a tell-4 failure after it reads as the race it may be
+    // rather than as evidence about the contract (Qodo, PR #1389).
+    let reviewer_pointer = format!("worker-task-{ROLE_REVIEWER}.md");
+    if tui.wait_for_grid(UI_TIMEOUT, |g| g.contains(&reviewer_pointer)) {
+        ev.step(format!(
+            "waited for `{reviewer_pointer}` in the `{ROLE_REVIEWER}` pane before typing hook \
+             commands into its shell"
+        ));
+    } else {
+        ev.step(format!(
+            "`{reviewer_pointer}` never appeared in the `{ROLE_REVIEWER}` pane within {}s; the hook \
+             commands below may race the daemon's late write of it, so a tell-4 failure in this \
+             run is not evidence about the contract",
+            UI_TIMEOUT.as_secs()
+        ));
+        ev.excerpt(
+            "`reviewer` role pane when its task pointer had not appeared",
+            tui.grid(),
+        );
+    }
     let work_done_sentinel = format!("XVER-WORKDONE-{nonce}");
     g.preconnect_logged(
         &format!("pane: {} work-done", cast.pane_cli_label),
