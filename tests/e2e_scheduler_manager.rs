@@ -729,7 +729,7 @@ fn visible_side_scroll_markers(grid: &str) -> Vec<String> {
         .collect()
 }
 
-/// Scenario: Open an output-filled orchestration tab, scroll its start-role pane into history, then open Schedules and wheel down and up over the dialog where it overlaps that pane. The visible pane lines must remain unchanged while the dialog handles the wheel events.
+/// Scenario: Open an output-filled orchestration tab, prove its start-role pane scrolls, then open Schedules and wheel down and up where the dialog covers that same pane. The visible pane lines must remain unchanged while the dialog handles the wheel events.
 #[spec("scheduler/manager/016")]
 #[test]
 fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
@@ -781,6 +781,18 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
     deck.wait_until_grid("side pane scrolled into its history", |grid| {
         visible_side_scroll_markers(grid) != bottom_markers
     });
+    let scrollable_rows = deck.capture_screen_when(
+        "the start-role pane's scrollback to finish painting",
+        |screen| {
+            let rows: Vec<_> = screen
+                .contents()
+                .lines()
+                .enumerate()
+                .filter_map(|(row, line)| line.contains("SIDE_SCROLL_LINE_").then_some(row))
+                .collect();
+            (rows.len() >= 34).then_some(rows)
+        },
+    );
 
     deck.send_keys(b"s");
     deck.wait_for_string("NEXT FIRE");
@@ -804,6 +816,10 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
     assert!(
         wheel_col >= 60,
         "precondition: the wheel target must overlap the role pane (col {wheel_col})"
+    );
+    assert!(
+        scrollable_rows.contains(&(dialog_row as usize)),
+        "precondition: the wheel target row must cross the scrollable start-role pane, not the empty worker pane.\nWheel: ({wheel_col}, {dialog_row})\nScrollable rows before dialog: {scrollable_rows:?}"
     );
 
     deck.scroll(wheel_col, dialog_row, true);

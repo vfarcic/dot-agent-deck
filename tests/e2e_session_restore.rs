@@ -256,7 +256,7 @@ fn restore_001_no_flag_startup_restores_panes_from_snapshot() {
             "DOT_AGENT_DECK_SESSION",
             session_file.to_str().expect("session path is UTF-8"),
         )
-        .launch_with_fixture("modes");
+        .launch_with_fixture("plain-project");
 
     // After Phase 2, both saved panes auto-restore as dashboard cards, and both
     // names must be readable on the cards themselves.
@@ -309,7 +309,7 @@ fn restore_006_empty_daemon_and_no_snapshot_lands_on_clean_dashboard() {
             "DOT_AGENT_DECK_SESSION",
             session_file.to_str().expect("session path is UTF-8"),
         )
-        .launch_with_fixture("modes");
+        .launch_with_fixture("plain-project");
 
     // Empty daemon + empty snapshot → the empty-dashboard placeholder.
     deck.wait_for_string("No active agents");

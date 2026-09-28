@@ -10,7 +10,7 @@
 //! exists to exercise. This file carries no `e2e-live` term, so
 //! `e2e-deterministic` runs it on every PR, and it reaches the failing ordering
 //! by construction rather than by luck — the stand-in's announcement latency is
-//! a parameter (`common::write_late_announcing_agent`).
+//! a parameter (`common::write_late_announcing_paste_agent`).
 //!
 //! The assertion is on what the agent ACTED UPON, never on the seed's text being
 //! on screen: the deck writes the bytes BEFORE the delivery goes wrong, so a PTY
@@ -19,7 +19,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::TuiDeck;
 use spec::spec;
@@ -160,4 +160,71 @@ fn new_pane_017_a_spawn_time_seed_waits_for_the_agent_to_announce_itself() {
          has no reason to spend the single bounded replacement payload.\n\
          agent log:\n{log}"
     );
+}
+
+/// Scenario: Spawn the built-in dispatcher with a stand-in that never sends a
+/// `SessionStart`, and watch the first line of its seeded prompt. The pane must
+/// receive one copy only after the 10-second readiness fallback and its buffer.
+#[spec("prompt/new-pane/019")]
+#[test]
+fn new_pane_019_a_silent_agent_receives_one_seed_after_the_readiness_fallback() {
+    let deck = TuiDeck::launch_with_fixture("dispatcher-seed");
+    deck.wait_for_string("No active agents");
+    let script = deck.workdir().join("claude");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         printf 'started\\n' >> silent-seed.log\n\
+         while IFS= read -r line; do\n\
+         \x20 printf 'received|%s\\n' \"$line\" >> silent-seed.log\n\
+         done\n",
+    )
+    .expect("write silent stand-in");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+        .expect("chmod silent stand-in");
+
+    // This starts before submission and therefore before the seed's created_at.
+    let submitted = Instant::now();
+    spawn_seeded_dispatcher(&deck, "./claude");
+    let log_path = deck.workdir().join("silent-seed.log");
+    assert!(
+        common::wait_for_file_substr_count(&log_path, "started", 1, Duration::from_secs(10)),
+        "the silent stand-in must have started before timing seed delivery"
+    );
+
+    // A seed observed before this point escaped through a readiness path other
+    // than the buffered fallback. The stand-in never announces a conversation.
+    const FALLBACK_WITH_BUFFER: Duration = Duration::from_millis(10_500);
+    assert!(
+        common::wait_until(FALLBACK_WITH_BUFFER + Duration::from_secs(1), || {
+            submitted.elapsed() >= FALLBACK_WITH_BUFFER
+        }),
+        "the readiness fallback observation window did not elapse"
+    );
+    let before_fallback = std::fs::read_to_string(&log_path).expect("stand-in log exists");
+    assert!(
+        !before_fallback.contains(SEED_MARKER),
+        "the dispatcher seed arrived before the 10-second fallback plus readiness buffer.\nLog:\n{before_fallback}"
+    );
+
+    assert!(
+        common::wait_for_file_substr_count(&log_path, SEED_MARKER, 1, Duration::from_secs(30)),
+        "the silent stand-in did not receive the dispatcher seed through the readiness fallback.\nLog:\n{}",
+        std::fs::read_to_string(&log_path).unwrap_or_default()
+    );
+    // Give a replacement attempt time to surface before counting copies.
+    let delivered = Instant::now();
+    assert!(
+        common::wait_until(Duration::from_secs(4), || {
+            delivered.elapsed() >= Duration::from_secs(3)
+        }),
+        "the replacement observation window did not elapse"
+    );
+    let log = std::fs::read_to_string(&log_path).expect("read stand-in log");
+    let copies = log
+        .lines()
+        .filter(|line| line.contains(SEED_MARKER))
+        .count();
+    assert_eq!(copies, 1, "the seed must arrive exactly once.\nLog:\n{log}");
 }

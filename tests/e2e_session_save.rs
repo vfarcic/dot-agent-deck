@@ -69,7 +69,7 @@ fn save_001_new_pane_state_change_writes_snapshot() {
             "DOT_AGENT_DECK_SESSION",
             session_file.to_str().expect("session path is UTF-8"),
         )
-        .launch_with_fixture("modes");
+        .launch_with_fixture("plain-project");
     deck.wait_for_string("No active agents");
 
     // Precondition: a fresh launch (no `--continue`, restore not yet wired)
@@ -115,7 +115,7 @@ fn save_002_detach_path_writes_snapshot() {
             "DOT_AGENT_DECK_SESSION",
             session_file.to_str().expect("session path is UTF-8"),
         )
-        .launch_with_fixture("modes");
+        .launch_with_fixture("plain-project");
     deck.wait_for_string("No active agents");
 
     // Two dashboard panes present → a real workspace to detach from.

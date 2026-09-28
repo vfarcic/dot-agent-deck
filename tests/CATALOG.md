@@ -1699,6 +1699,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the warning's exact wording or its stderr copy on exit; spawning an agent or opening a tab.
 - **Platform coverage:** mac+linux.
 
+##### prompt/new-pane/019 — A silent dispatcher stand-in receives its built-in seed once through the buffered readiness fallback.
+- **Layer:** L2 PTY-attached, lane 1 (`#![cfg(all(feature = "e2e", unix))]`).
+- **Agent:** none (`claude`-named shell recorder that sends no `SessionStart`).
+- **Asserts:** the recorder starts, no seed reaches it before 10 seconds plus the 500 ms readiness buffer measured from before form submission, and exactly one seed reaches it through the fallback. Complements `/017`, which pins the earlier announced-agent path.
+- **Does not assert:** genuine agent interaction or the announced-agent readiness gate.
+- **Platform coverage:** mac+linux.
+
 ### Focus / navigation
 
 #### focus/dashboard
@@ -2695,8 +2702,8 @@ note).
 - **Asserts:** after opening an orchestration tab, returning to command mode and confirming its close, the rendered grid contains the surviving Dashboard and no fragment of the removed tab.
 - **Does not assert:** the exact recreation trigger internals; per-cell colours.
 - **Platform coverage:** mac+linux.
-- **M1 status (PRD #84):** **Flag / invariant-check.** Pane open/close and reactive recreation (`src/ui.rs:1510`, `:2147` areas) currently resize the affected PTYs on the spot, so any scramble is transient. Invariant guard on "no stale fragment after replace". GREEN target at M4/M5.
-- **Post-M5 resolution (PRD #84):** **GREEN.** Stays green after M4+M5 and now exercises the pane open/close replace through layout-driven resize + 1:1 widget render with the M5 contract `debug_assert!` live in debug builds — asserting the replace contract rather than masking a self-healing race.
+- **M1 status (PRD #84):** **Flag / invariant-check.** Closing the orchestration tab resizes the affected PTYs on the spot, so any scramble is transient. Invariant guard on "no stale fragment after close". GREEN target at M4/M5.
+- **Post-M5 resolution (PRD #84):** **GREEN.** Stays green after M4+M5 and now exercises the tab close through layout-driven resize + 1:1 widget render with the M5 contract `debug_assert!` live in debug builds.
 
 ##### render/layout/004 — A wrapped button bar costs the dashboard exactly one extra row of its height budget (PRD #144).
 - **Layer:** L1 (in-process `TestBackend` via `render_button_bar_with_bindings_to_buffer`; no PTY, no subprocess).
