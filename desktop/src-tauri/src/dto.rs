@@ -2881,6 +2881,7 @@ mod tests {
             rows: 32,
             cols: 120,
             live: Some(SessionSnapshot {
+                subagent_wait: None,
                 status: SessionStatus::Working,
                 agent_type: Some(AgentType::Codex),
                 active_tool: Some(ActiveTool {

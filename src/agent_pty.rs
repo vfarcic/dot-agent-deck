@@ -15031,6 +15031,7 @@ mod spawn_tests {
             rows: 0,
             cols: 0,
             live: live_type.map(|agent_type| crate::state::SessionSnapshot {
+                subagent_wait: None,
                 status: crate::state::SessionStatus::Working,
                 agent_type,
                 active_tool: None,

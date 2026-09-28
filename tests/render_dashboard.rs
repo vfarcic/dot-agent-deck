@@ -282,6 +282,7 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
     let quiet_for_an_hour = (now - chrono::Duration::hours(1)).timestamp_millis();
     let bottom_border_after_reconnect = |last_activity_ms: Option<i64>| {
         let snapshot = SessionSnapshot {
+            subagent_wait: None,
             status: SessionStatus::Idle,
             agent_type: Some(AgentType::ClaudeCode),
             active_tool: None,

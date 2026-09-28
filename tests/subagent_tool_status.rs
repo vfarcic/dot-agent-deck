@@ -656,3 +656,70 @@ fn subagent_006_a_subagent_that_ends_takes_its_permission_prompt_with_it() {
         }
     }
 }
+
+/// The card a TUI holds for `PANE`, whichever session it is keyed under — a
+/// hydrated card starts under a placeholder id.
+fn pane_status_of(state: &AppState) -> SessionStatus {
+    state
+        .sessions
+        .values()
+        .filter(|session| session.pane_id.as_deref() == Some(PANE))
+        .max_by_key(|session| session.last_activity)
+        .unwrap_or_else(|| panic!("no card for {PANE:?}; sessions: {:?}", state.sessions))
+        .status
+        .clone()
+}
+
+/// Scenario: A background subagent raises a permission request after the turn ended, and only then does a TUI attach, restoring the card from the daemon's live snapshot as it arrives over the wire. When that subagent then stops, the attached TUI's card must leave Needs Input for Idle, as the daemon's does; the control is a snapshot from a daemon that sends no subagent attribution, whose card keeps today's Needs Input.
+#[spec("status/subagent/007")]
+#[test]
+fn subagent_007_a_tui_that_attaches_mid_wait_still_ends_it_with_the_subagent() {
+    let daemon = apply_all(
+        "claude-code",
+        &[
+            (session_start(), EventType::SessionStart),
+            (stop(), EventType::Idle),
+            (
+                subagent_permission_request(SUBAGENT_ID),
+                EventType::PermissionRequest,
+            ),
+        ],
+    );
+    assert_eq!(status_of(&daemon), SessionStatus::WaitingForInput);
+    let wire = serde_json::to_value(daemon.sessions[SESSION].live_snapshot())
+        .expect("serialize the live snapshot");
+    let stop_event = invoke_hook("claude-code", &subagent_end("SubagentStop", SUBAGENT_ID));
+
+    for (case, snapshot, want) in [
+        ("this daemon's snapshot", wire.clone(), SessionStatus::Idle),
+        (
+            "control: a snapshot without the attribution, as an older daemon sends",
+            {
+                let mut older = wire.clone();
+                older
+                    .as_object_mut()
+                    .expect("a snapshot is a JSON object")
+                    .remove("subagent_wait");
+                older
+            },
+            SessionStatus::WaitingForInput,
+        ),
+    ] {
+        let snapshot: dot_agent_deck::state::SessionSnapshot =
+            serde_json::from_value(snapshot).expect("decode the live snapshot");
+        let mut tui = AppState::default();
+        tui.register_pane(PANE.to_string());
+        tui.seed_hydrated_session(PANE.to_string(), None, None, None, Some(&snapshot));
+        assert_eq!(
+            pane_status_of(&tui),
+            SessionStatus::WaitingForInput,
+            "precondition ({case}): the hydrated card reads Needs Input"
+        );
+        tui.apply_event(stop_event.clone());
+        assert_eq!(
+            pane_status_of(&tui),
+            want,
+            "{case}: the subagent that raised the wait stopped (issue #1364)"
+        );
+    }
+}

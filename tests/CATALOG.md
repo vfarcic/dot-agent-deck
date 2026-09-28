@@ -927,6 +927,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** that a real Claude Code or Codex emits these sequences; the waiting-for-input notice (`scheduler/idle-worker/025`); the rendered badge.
 - **Platform coverage:** mac+linux.
 
+##### status/subagent/007 — A TUI that attaches while a subagent's permission request is pending still ends the wait when that subagent stops (issue #1364, Greptile on #1393).
+- **Layer:** L1 (the daemon side through the real `hook --agent claude-code` CLI and `apply_event`; the TUI side through `SessionSnapshot`'s JSON wire form and `AppState::seed_hydrated_session`).
+- **Agent:** none (Claude Code-shaped hook payloads, as `status/subagent/001`).
+- **Asserts:** after `Stop` and a subagent `PermissionRequest`, the daemon's live snapshot, serialized and decoded, hydrates a fresh TUI card that reads Needs Input; the subagent's `SubagentStop` then takes that card to Idle. The control strips `subagent_wait` from the JSON, as an older daemon sends it, and the card keeps Needs Input — the pre-#1364 behaviour, not a failure.
+- **Verified load-bearing:** red with the snapshot overlay of `subagent_wait` disabled.
+- **Does not assert:** the attach protocol carrying the snapshot (`ListAgents` / `AgentRecord.live`, covered by the rehydration tests); the rendered badge.
+- **Platform coverage:** mac+linux.
+
 ### Agent protocol
 
 #### agent/readiness
