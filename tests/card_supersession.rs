@@ -1513,4 +1513,49 @@ fn status_supersede_021_a_displaced_generation_still_ends_its_own_card() {
         "the outgoing agent's own SessionEnd must still end its card; the pane shows {:?}",
         owners_on_pane(&tui)
     );
+
+    // But only its OWN card. Pi reports every generation under the pane-derived
+    // `{pane_id}-session` key, so the successor's card can sit under the very
+    // key the outgoing agent's late end names — and the terminal branch removes
+    // by key. A displaced end that has no card of its own on the pane ends
+    // nothing.
+    let shared_key = format!("{PANE_ID}-session");
+    let mut tui = AppState::default();
+    tui.register_pane(PANE_ID.to_string());
+    tui.apply_event(stamped(
+        event(
+            &shared_key,
+            AgentType::Pi,
+            EventType::Thinking,
+            Some("incoming-agent"),
+            now,
+        ),
+        GenerationVerdict::Current,
+    ));
+    tui.apply_event(stamped(
+        event(
+            &shared_key,
+            AgentType::Pi,
+            EventType::SessionEnd,
+            Some("outgoing-agent"),
+            now + Duration::seconds(1),
+        ),
+        GenerationVerdict::Displaced,
+    ));
+    // Asserted on the card itself, not on the owners: the terminal branch
+    // rebuilds a bare placeholder carrying the removed card's `agent_id`, so a
+    // wiped successor still reads as "incoming-agent" by owner.
+    let successor = tui.sessions.get(&shared_key).unwrap_or_else(|| {
+        panic!(
+            "a displaced SessionEnd under the successor's session key removed the successor's \
+             card; the pane now holds {:?}",
+            tui.sessions.keys().collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(successor.agent_id.as_deref(), Some("incoming-agent"));
+    assert_eq!(
+        successor.status,
+        SessionStatus::Thinking,
+        "the successor's card must keep its own status"
+    );
 }

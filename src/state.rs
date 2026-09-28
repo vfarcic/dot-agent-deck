@@ -8510,6 +8510,20 @@ impl AppState {
             .pane_generation_verdict(pane_id, agent_id)
     }
 
+    /// Issue #320: does `event`'s pane hold a card naming `event`'s own agent?
+    /// What admits a displaced generation's `SessionEnd` — see the admission
+    /// check in [`Self::apply_event`].
+    fn pane_holds_own_card(&self, event: &AgentEvent) -> bool {
+        let (Some(pane_id), Some(agent_id)) = (event.pane_id.as_deref(), event.agent_id.as_deref())
+        else {
+            return false;
+        };
+        self.sessions.values().any(|session| {
+            session.pane_id.as_deref() == Some(pane_id)
+                && session.agent_id.as_deref() == Some(agent_id)
+        })
+    }
+
     /// Issue #320: the generation verdict [`Self::apply_event`] orders a
     /// takeover by. The daemon asks its registry; a process with none — an
     /// attached TUI — reads the verdict the daemon stamped on the frame before
@@ -11169,10 +11183,17 @@ impl AppState {
         // the pane back. Refusing that agent's own end would leave its card
         // showing an agent that has finished (Greptile, PR #1389;
         // `status/supersede/021`). A displaced end keeps the path it had before
-        // this, which cannot erase a successor's card (`status/supersede/003`).
-        // The daemon still refuses it at admission, as it did before #320.
-        if event.event_type != EventType::SessionEnd
-            && self.generation_verdict(&event) == Some(GenerationVerdict::Displaced)
+        // this — but only when the pane still holds a card of the ENDING agent's
+        // own. The terminal branch below removes by session key, and Pi reports
+        // every generation under the pane-derived `{pane_id}-session` key, so a
+        // displaced end with no card of its own would otherwise remove the
+        // successor's card under that shared key and rebuild it as a bare
+        // placeholder (Qodo, PR #1389; `status/supersede/021`). When the agent
+        // does have a card on the pane, the reuse guard below lands the end on
+        // exactly that card. The daemon still refuses a displaced end at
+        // admission, as it did before #320.
+        if self.generation_verdict(&event) == Some(GenerationVerdict::Displaced)
+            && (event.event_type != EventType::SessionEnd || !self.pane_holds_own_card(&event))
         {
             return AppliedEvent::Rejected;
         }
