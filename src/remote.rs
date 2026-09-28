@@ -1078,6 +1078,11 @@ pub enum RemoteConfigError {
         #[source]
         source: crate::remote_tunnel::SshArgumentError,
     },
+    /// Issue #1350: the cross-process edit lock
+    /// ([`crate::deck_list::edit`]) could not be taken, so nothing was read or
+    /// written. `reason` names no path.
+    #[error("Cannot take the edit lock for remotes file at {path}: {reason}")]
+    Locked { path: String, reason: String },
 }
 
 impl RemotesFile {

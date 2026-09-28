@@ -3107,17 +3107,15 @@ pub fn migrate_legacy_decks() {
 /// nothing, because [`crate::decks::migrate`] skips a row whose id the deck
 /// list already holds. The reverse order could lose a deck.
 ///
-/// **Only the `desktop.toml` half is locked across processes.** Removing the
-/// rows holds [`acquire_save_lock`]; the `remotes.toml` half goes through
-/// [`dot_agent_deck::deck_list::edit`], whose lock is in-process only. Two
-/// desktop instances launching together can therefore both run
-/// [`crate::decks::migrate`] against the same file, and that is safe only
-/// because the migration is idempotent — a row whose id the deck list already
-/// holds is skipped — and the write is a temp file plus an atomic rename. An
-/// instance that reads after the other's rename adds nothing; two that read
-/// the same original both write the same decks under the same ids (only the
-/// `added_at` stamps can differ), and the last rename wins whole. Either way
-/// the list ends with each legacy deck once.
+/// **Both halves are locked across processes, separately.** Removing the rows
+/// holds [`acquire_save_lock`] on `desktop.toml`; the `remotes.toml` half is one
+/// [`dot_agent_deck::deck_list::edit`], which holds that file's own
+/// cross-process lock from its read to its rename. Two desktop instances
+/// launching together therefore migrate one after the other: the second reads
+/// the registry the first wrote and, the migration being idempotent, adds
+/// nothing. No lock spans *both* files — the order above is what makes a crash
+/// or a failure between them safe, and the idempotence is what makes the retry
+/// harmless.
 ///
 /// A selection naming a row that merged into an existing deck with an id of its
 /// own is re-pointed at that id in the document, so the selected deck survives.
@@ -3171,6 +3169,11 @@ fn deck_list_error(error: dot_agent_deck::remote::RemoteConfigError) -> Settings
         // it, so it carries neither the value nor the path.
         RemoteConfigError::InvalidAddress { source, .. } => {
             format!("could not save the deck list: {source}")
+        }
+        // The reason is a fixed sentence or an `io::Error`, neither of which
+        // carries the path.
+        RemoteConfigError::Locked { reason, .. } => {
+            format!("could not save the deck list: {reason}")
         }
     };
     SettingsWriteError {

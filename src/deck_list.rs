@@ -15,9 +15,10 @@
 //!    writer — the desktop, which stays open for days while the user runs
 //!    `remote add` in a terminal — therefore never writes back a list it loaded
 //!    earlier, which is the stale-copy clobber #828 fixed inside `desktop.toml`.
-//!    Edits from one process are also serialised by an in-process lock, so two
-//!    desktop windows saving at once cannot interleave their read and write.
-//!    There is no cross-process lock: a user-driven list does not need one.
+//!    And the read, the change and the rename are held under one exclusive
+//!    lock, across processes as well as threads ([`edit`]), so the CLI and the
+//!    desktop saving at the same moment cannot both read the old file and have
+//!    the later rename discard the other's change.
 //! 2. **Keys this build does not know survive a re-save.** The file is edited
 //!    as a [`toml_edit::DocumentMut`], and an entry is updated key by key, so a
 //!    field a newer build added — and every comment — is left where it was. An
@@ -527,8 +528,131 @@ impl From<AddDeckError> for crate::remote::RemoteAddError {
 }
 
 /// Serialises edits within one process, so two desktop windows saving at the
-/// same moment cannot both read before either writes.
+/// same moment cannot both read before either writes. The file lock
+/// ([`acquire_edit_lock`]) serialises processes; this keeps threads of one
+/// process from contending for it in a poll loop.
 static EDIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// How long an edit waits for another process's edit of the same registry to
+/// finish. An edit is a read, a small render and a rename — milliseconds; a
+/// writer still holding the lock after this long is stuck, and failing the
+/// edit visibly beats blocking `remote add` or a desktop save forever. The
+/// desktop's `desktop.toml` save lock waits the same.
+pub const EDIT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often a waiting edit retries the lock.
+const EDIT_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The sidecar [`edit`] locks: `.remotes.toml.lock` beside the registry.
+fn edit_lock_path(path: &Path) -> std::path::PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "remotes.toml".to_string());
+    registry_dir(path).join(format!(".{name}.lock"))
+}
+
+/// The directory the registry, its temp files and its lock live in.
+fn registry_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// Take the exclusive lock that serialises edits of the registry at `path`
+/// across processes (issue #1350's review) — the CLI's `remote add` /
+/// `remove` / `upgrade` / `connect`, and the desktop's saves and its one-time
+/// migration. Released when the returned file is dropped.
+///
+/// The same mechanism as the desktop's `acquire_save_lock` for `desktop.toml`,
+/// for the same reasons: the registry itself cannot carry the lock, because
+/// every edit **replaces** it by rename and a lock on the old inode would not
+/// exclude a process that opened the new one; so a sidecar that is never
+/// replaced and never deleted holds it (deleting a lock file others may be
+/// waiting on is how two processes end up locking different inodes). An empty,
+/// owner-only `.remotes.toml.lock` therefore stays beside the registry; it
+/// holds no data. `File::try_lock` is `flock(2)` on Unix and `LockFileEx` on
+/// Windows, so it is one call on every platform this crate builds for.
+///
+/// Every failure to take it is an error — [`RemoteConfigError::Locked`] — and
+/// the edit neither reads nor writes: the sidecar's name is taken by something
+/// that is not a regular file, it cannot be opened, or another process still
+/// holds it after [`EDIT_LOCK_WAIT`]. Going ahead unlocked is exactly the lost
+/// update the lock exists to stop.
+///
+/// The one exception, again the desktop's: a filesystem that **cannot lock at
+/// all** (the call reports `Unsupported`). Refusing there would make the deck
+/// list uneditable for as long as the config directory lives on it, to close a
+/// window one edit wide; so the edit goes ahead unlocked and says so on stderr.
+/// It is still made against a fresh read, so only an edit racing inside those
+/// milliseconds can be lost.
+fn acquire_edit_lock(path: &Path) -> Result<Option<std::fs::File>, RemoteConfigError> {
+    let lock_path = edit_lock_path(path);
+    let locked = |reason: String| RemoteConfigError::Locked {
+        path: path.display().to_string(),
+        reason,
+    };
+
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(locked(
+                "the lock file's name is taken by something that is not a regular file. \
+                 Remove it and try again"
+                    .to_string(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(locked(format!(
+                "the lock file cannot be inspected: {error}"
+            )));
+        }
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    // Nothing is ever written to it; `write` is what `create` requires, and on
+    // Windows `LockFileEx` needs a handle opened for reading or writing.
+    options.read(true).write(true).create(true).truncate(false);
+    // Owner-only on Unix for tidiness. Not on Windows, where the helper pins
+    // the handle's access mask for the DACL it applies — and an empty file has
+    // nothing a DACL would protect.
+    #[cfg(unix)]
+    crate::platform::fsperm::set_create_mode_owner_only(&mut options);
+    let file = options
+        .open(&lock_path)
+        .map_err(|error| locked(format!("the lock file cannot be opened: {error}")))?;
+
+    let deadline = std::time::Instant::now() + EDIT_LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(EDIT_LOCK_POLL);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(locked(
+                    "another program has been editing the deck list for too long. Try again"
+                        .to_string(),
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error))
+                if error.kind() == std::io::ErrorKind::Unsupported =>
+            {
+                eprintln!(
+                    "Editing {} without the cross-process lock, which this filesystem does not \
+                     support: {error}",
+                    path.display()
+                );
+                return Ok(None);
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(locked(format!("the lock cannot be taken: {error}")));
+            }
+        }
+    }
+}
 
 /// The registry as a format-preserving document, handed to an [`edit`]
 /// closure. Rows are addressed by index into [`Self::entries`].
@@ -686,10 +810,17 @@ fn unwritable(path: &str, reason: &str) -> RemoteConfigError {
 /// atomically — or, if `f` changed nothing, write nothing.
 ///
 /// The building block [`add`], [`update`] and [`remove`] are made of, and what
-/// a caller with a batch uses (the desktop's one-time migration). The result is
-/// checked to parse as a registry before it is published, so an edit can never
-/// leave a file the next load would refuse. A missing file is an empty
-/// registry, and is created only if `f` adds something.
+/// a caller with a batch uses (the desktop's saves and its one-time
+/// migration): everything `f` does is published as one rename or not at all.
+/// The result is checked to parse as a registry before it is published, so an
+/// edit can never leave a file the next load would refuse. A missing file is
+/// an empty registry, and is created only if `f` adds something.
+///
+/// **Held under an exclusive lock from the read to the rename**, across
+/// processes ([`acquire_edit_lock`]) as well as threads, so two writers — the
+/// CLI in a terminal and the desktop — can never both read the same original
+/// and have the later rename silently discard the other's change. The lock's
+/// directory is created (owner-only) if missing, since the sidecar lives in it.
 pub fn edit<T, E>(path: &Path, f: impl FnOnce(&mut DeckDocument) -> Result<T, E>) -> Result<T, E>
 where
     E: From<RemoteConfigError>,
@@ -697,6 +828,15 @@ where
     let _guard = EDIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = registry_dir(path);
+    crate::platform::fsperm::create_owner_only_dir(dir).map_err(|source| {
+        RemoteConfigError::Io {
+            path: dir.display().to_string(),
+            source,
+        }
+    })?;
+    // Held until this function returns, which is after the rename.
+    let _lock = acquire_edit_lock(path)?;
     let original = read_registry(path)?;
     let mut document = DeckDocument::open(path, original.as_deref())?;
     let value = f(&mut document)?;
@@ -1529,6 +1669,124 @@ added_at = "2026-01-01T00:00:00+00:00"
             address_key(&entry("a", "me@H.Example")),
             ("h.example".to_string(), Some("me".to_string()), 22)
         );
+    }
+
+    /// Issue #1350's review: an edit waits for another holder of the lock and
+    /// then lands on the file as that holder left it. The test takes the lock
+    /// on its own handle — a second, independent acquisition, which is what
+    /// another process's is — writes a row while holding it, and only then lets
+    /// the blocked `add` through: the row survives.
+    #[test]
+    fn an_edit_waits_for_the_lock_and_keeps_what_the_holder_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = registry(&dir, "");
+        let held = acquire_edit_lock(&path)
+            .unwrap()
+            .expect("tempdirs can lock");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let editor_path = path.clone();
+        let editor = std::thread::spawn(move || {
+            let result = add(&editor_path, entry("from-the-waiter", "w.example"));
+            let _ = tx.send(());
+            result
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the edit went ahead while another handle held the lock"
+        );
+        // The holder's own edit, published while the waiter is blocked.
+        let holder_row = toml::to_string(&RemotesFile {
+            remotes: vec![entry("from-the-holder", "h.example")],
+        })
+        .unwrap();
+        write_atomic(&path, &holder_row).unwrap();
+        drop(held);
+
+        editor.join().unwrap().unwrap();
+        let names: Vec<_> = RemotesFile::load(&path)
+            .unwrap()
+            .remotes
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(names, ["from-the-holder", "from-the-waiter"]);
+    }
+
+    /// A lock sidecar whose name is taken by something that is not a regular
+    /// file stops the edit before it reads or writes anything.
+    #[test]
+    fn an_unusable_lock_file_refuses_the_edit_and_leaves_the_registry_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = registry(&dir, "");
+        add(&path, entry("a", "a.example")).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let lock = edit_lock_path(&path);
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        assert!(matches!(
+            add(&path, entry("b", "b.example")),
+            Err(AddDeckError::Config(RemoteConfigError::Locked { .. }))
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// Where the concurrent-editors test's child process writes its rows.
+    const CHILD_EDITOR_PATH_ENV: &str = "DAD_DECK_LIST_TEST_CHILD_EDITOR_PATH";
+    const EDITS_PER_WRITER: usize = 40;
+
+    /// The child half of
+    /// [`two_processes_adding_at_once_lose_no_row`]; a no-op unless that test
+    /// re-executed this binary with [`CHILD_EDITOR_PATH_ENV`] set.
+    #[test]
+    fn concurrent_editor_child_process() {
+        let Some(path) = std::env::var_os(CHILD_EDITOR_PATH_ENV) else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        for n in 0..EDITS_PER_WRITER {
+            add(&path, entry(&format!("child-{n}"), "c.example")).unwrap();
+        }
+    }
+
+    /// Issue #1350's review, the reported scenario itself: the CLI and the
+    /// desktop are separate processes, so the in-process mutex never saw one
+    /// another, and two read-modify-writes of the same original let the later
+    /// rename discard the earlier's row. This re-executes the test binary as a
+    /// second writer and races it: every row from both survives.
+    #[test]
+    fn two_processes_adding_at_once_lose_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = registry(&dir, "");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "deck_list::tests::concurrent_editor_child_process",
+                "--nocapture",
+            ])
+            .env(CHILD_EDITOR_PATH_ENV, &path)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        for n in 0..EDITS_PER_WRITER {
+            add(&path, entry(&format!("parent-{n}"), "p.example")).unwrap();
+        }
+        assert!(child.wait().unwrap().success(), "the child writer failed");
+
+        let names: Vec<String> = RemotesFile::load(&path)
+            .unwrap()
+            .remotes
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        let lost: Vec<String> = ["parent", "child"]
+            .into_iter()
+            .flat_map(|writer| (0..EDITS_PER_WRITER).map(move |n| format!("{writer}-{n}")))
+            .filter(|name| !names.contains(name))
+            .collect();
+        assert!(lost.is_empty(), "rows were lost: {lost:?}");
+        assert_eq!(names.len(), 2 * EDITS_PER_WRITER, "{names:?}");
     }
 
     /// Issue #1350's review: the registry is read on the desktop's startup and
