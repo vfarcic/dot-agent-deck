@@ -1080,8 +1080,8 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
 /// stdin a second time — the orchestrator's remit re-asserting itself on
 /// `/clear`, exactly as it already re-asserts on compaction, via the same
 /// reused delivery machinery. It must then re-assert EXACTLY once: a sentinel
-/// comment is stamped into `.dot-agent-deck/orchestrator-context.md` before
-/// the trigger, the re-assertion's own rewrite of that file must destroy it
+/// comment is stamped into the fixed `.dot-agent-deck/orchestrator-context.md`
+/// mirror before the trigger, the re-assertion's refresh of that mirror must destroy it
 /// (proving the sentinel detects a re-arm at all), and a freshly stamped one
 /// must then survive the settle-and-hold window that follows.
 #[spec("orchestration/remit/004")]

@@ -771,12 +771,16 @@ fn the_submitted_command_is_not_part_of_what_a_prepared_start_binds() {
     );
 }
 
+/// Scenario: Rewrite a preparation's context, then submit a request for a
+/// different project. The request reports the identity mismatch first, while
+/// a matching request reports the rewritten context as stale.
+///
 /// Ordering: the identity comparisons run first, so a request that does not
 /// match its own token is refused with the code that is true of it even when the
 /// preparation has ALSO gone stale.
 ///
 /// This matters for diagnosis rather than for safety — both answers refuse — but
-/// "your artifact was replaced" and "you are not asking for what you prepared"
+/// "your artifact was rewritten" and "you are not asking for what you prepared"
 /// send an operator in different directions, which is the same reasoning that
 /// separates `stale-token` from `stale-preparation`.
 #[test]
@@ -784,10 +788,11 @@ fn a_mismatched_request_is_named_as_one_even_when_the_preparation_is_also_stale(
     let (_guard_other, other) = project();
     let (_guard, project) = project();
     let (_token, binding) = prepare(&project, "The first brief.");
-    // A second preparation replaces the context at its fixed path, so the first
-    // binding is now stale as well.
-    let (_token2, _binding2) = prepare(&project, "The second brief.");
-    expect_stale(&binding, PreparationStale::ContextReplaced);
+    // Rewrite this preparation's own unique file in place. Another
+    // preparation in the project would leave this binding valid.
+    std::fs::write(&binding.context_path, "A different brief.")
+        .expect("rewrite the prepared context");
+    expect_stale(&binding, PreparationStale::ContextRewritten);
 
     expect_mismatch(
         &binding,
@@ -798,7 +803,7 @@ fn a_mismatched_request_is_named_as_one_even_when_the_preparation_is_also_stale(
     // And a MATCHING request against that same stale binding still reports the
     // staleness, so the ordering above is not swallowing it.
     match verify_prepared_start(&binding, &matching_request(&project)) {
-        Err(PreparedStartRefusal::Stale(PreparationStale::ContextReplaced)) => {}
+        Err(PreparedStartRefusal::Stale(PreparationStale::ContextRewritten)) => {}
         other => panic!(
             "a matching request against a stale binding must report the staleness, got {other:?}"
         ),

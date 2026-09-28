@@ -1952,6 +1952,10 @@ async fn a_prepared_start_refuses_an_unknown_token_and_spawns_on_a_live_one() {
 /// this daemon issued and is seconds old, so a refusal carrying the wrong code
 /// would say the token was unknown — which would send an operator looking for a
 /// client bug instead of a replaced artifact.
+///
+/// Scenario: Prepare two launches in one project, replace the first launch's
+/// own context file, and start with its still-live token. The daemon refuses
+/// that token as stale while the second launch's token still starts roles.
 #[tokio::test]
 async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() {
     let server = start_server().await;
@@ -1980,10 +1984,15 @@ async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() 
     let first = prepare("Task A: the first client's brief.").await;
     let second = prepare("Task B: the second client's brief.").await;
     assert_ne!(first.token, second.token);
-    assert_eq!(
+    assert_ne!(
         first.context_path, second.context_path,
-        "both preparations name the same fixed path, which is the shape of the defect"
+        "each preparation must keep its own context path"
     );
+    let replacement = std::path::Path::new(&first.context_path).with_extension("replacement");
+    std::fs::write(&replacement, "This is no longer Task A.")
+        .expect("write a replacement context file");
+    std::fs::rename(&replacement, &first.context_path)
+        .expect("replace the first preparation's context file");
 
     let resp = issue_json_request(
         &server,
@@ -2013,7 +2022,7 @@ async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() 
         "a refused prepared start must not have spawned a pane"
     );
 
-    // The second preparation's token still spawns, which is what stops the
+    // The untouched second preparation's token still spawns, which stops the
     // assertions above from passing against a daemon that refuses every token.
     let resp = issue_json_request(
         &server,
