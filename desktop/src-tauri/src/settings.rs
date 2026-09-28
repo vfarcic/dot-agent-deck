@@ -3104,8 +3104,9 @@ pub fn migrate_legacy_decks() {
 /// **Order is the crash-safety argument.** `remotes.toml` is written first,
 /// then the rows are removed from `desktop.toml`. A crash between the two
 /// leaves the rows in both, and the next launch runs this again — which adds
-/// nothing, because [`crate::decks::migrate`] skips a row whose id the deck
-/// list already holds. The reverse order could lose a deck.
+/// nothing, because [`crate::decks::migrate`] recognises a row it already moved
+/// (by id *and* address, never by id alone) and returns the same selection
+/// remap. The reverse order could lose a deck.
 ///
 /// **Both halves are locked across processes, separately.** Removing the rows
 /// holds [`acquire_save_lock`] on `desktop.toml`; the `remotes.toml` half is one
@@ -3118,7 +3119,9 @@ pub fn migrate_legacy_decks() {
 /// harmless.
 ///
 /// A selection naming a row that merged into an existing deck with an id of its
-/// own is re-pointed at that id in the document, so the selected deck survives.
+/// own, or that had to take a fresh id because an unrelated deck already held
+/// its own, is re-pointed at that id in the document, so the selected deck
+/// survives.
 /// A document this build cannot read is left alone, and any failure is logged
 /// and leaves both files as they were for the next launch to retry.
 pub(crate) fn migrate_legacy_decks_at(path: &Path, remotes: &Path) {
@@ -9768,6 +9771,35 @@ level = 1.0
         assert_eq!(load_snapshot_at(&path, &remotes), snapshot);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), document_before);
         assert_eq!(std::fs::read_to_string(&remotes).unwrap(), registry_before);
+    }
+
+    /// Issue #1350's review, end to end: a CLI deck that merely shares the
+    /// selected legacy deck's id is a different deck. Both end up in the list,
+    /// and the selection follows the legacy deck to its fresh id — not to the
+    /// unrelated deck that holds the old one.
+    #[test]
+    fn a_legacy_deck_whose_id_is_taken_survives_migration_and_stays_selected() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let remotes = dir.path().join("remotes.toml");
+        std::fs::write(&remotes, format!("{CLI_DECK}id = \"desk1\"\n")).unwrap();
+        std::fs::write(
+            &path,
+            "version = 1\n\n[endpoints]\nselection = \"desk1\"\n\n\
+             [[endpoints.remote]]\nhost = \"fresh.example\"\nid = \"desk1\"\n",
+        )
+        .unwrap();
+
+        migrate_legacy_decks_at(&path, &remotes);
+        let snapshot = load_snapshot_at(&path, &remotes);
+        assert_eq!(row_ids(&snapshot.settings), ["desk1", "desk1-2"]);
+        let endpoints = snapshot.settings.endpoints.as_ref().unwrap();
+        assert_eq!(
+            endpoints.selection,
+            Selection::One(EndpointId::parse("desk1-2").unwrap())
+        );
+        assert_eq!(endpoints.remote[1].host.as_str(), "fresh.example");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("remote"));
     }
 
     /// B1 of #1350's review: loading a snapshot writes nothing, even against a

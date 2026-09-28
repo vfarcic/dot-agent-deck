@@ -296,10 +296,25 @@ pub fn apply(path: &Path, edits: &[DeckEdit]) -> Result<(), RemoteConfigError> {
 /// caller re-points a selection at it. Every other row is appended with a
 /// derived name and [`deck_list::UNMANAGED_VERSION`].
 ///
-/// **Idempotent**, which is what makes the two-file order crash-safe: a row
-/// whose id is already in the registry is skipped, so running this again after
-/// the registry was written but before `desktop.toml` was — or at all — adds
-/// nothing and yields the same remap.
+/// **An id is not an address.** A registry row carrying the legacy row's id
+/// counts as that row already migrated only when its address matches too.
+/// When it does not — an unrelated deck happens to hold the id (issue #1350's
+/// review: the legacy deck used to be skipped here, then deleted from
+/// `desktop.toml`, and so lost from both) — the legacy deck is migrated as a
+/// distinct deck under a fresh id ([`fresh_id`]), and the remap re-points a
+/// selection of it there rather than at the unrelated deck.
+///
+/// **Idempotent**, which is what makes the two-file order crash-safe: running
+/// this again after the registry was written but before `desktop.toml` was —
+/// or at all — adds nothing, changes nothing and yields the same remap. A row
+/// already migrated is found by id and address, or, after a collision, by its
+/// address alone, where it now has an id of its own.
+///
+/// One residual is accepted: a crash between the two writes *and* an edit of
+/// that deck's address in the registry before the next launch makes the retry
+/// see an id match with a different address, which reads as a collision and
+/// adds the legacy deck a second time. A duplicate the user can remove beats
+/// the loss the id-only rule produced.
 pub fn migrate(
     path: &Path,
     legacy: &[RemoteEndpointSettings],
@@ -308,18 +323,25 @@ pub fn migrate(
         let mut remap = Vec::new();
         for row in legacy {
             let entries = document.entries()?;
-            if entries
+            let mut candidate = new_entry(row, &entries);
+            let address = deck_list::address_key(&candidate);
+            let holder = entries
                 .iter()
-                .any(|entry| deck_list::deck_id(entry) == row.id.as_str())
-            {
+                .find(|entry| deck_list::deck_id(entry) == row.id.as_str());
+            if holder.is_some_and(|entry| deck_list::address_key(entry) == address) {
                 continue;
             }
-            let candidate = new_entry(row, &entries);
-            let address = deck_list::address_key(&candidate);
+            // Another deck holds this id: the legacy deck needs one of its own.
+            let collides = holder.is_some();
             let Some(index) = entries
                 .iter()
                 .position(|entry| deck_list::address_key(entry) == address)
             else {
+                if collides {
+                    let id = fresh_id(&row.id, &entries);
+                    candidate.id = Some(id.as_str().to_string());
+                    remap.push((row.id.clone(), id));
+                }
                 document.push(&candidate)?;
                 continue;
             };
@@ -332,6 +354,10 @@ pub fn migrate(
                 if let Ok(target) = EndpointId::parse(&deck_list::deck_id(&entry)) {
                     remap.push((row.id.clone(), target));
                 }
+            } else if collides {
+                let id = fresh_id(&row.id, &entries);
+                entry.id = Some(id.as_str().to_string());
+                remap.push((row.id.clone(), id));
             } else {
                 entry.id = Some(row.id.as_str().to_string());
             }
@@ -342,6 +368,27 @@ pub fn migrate(
         }
         Ok(remap)
     })
+}
+
+/// An id no row in `entries` holds, derived from `base`: `base-2`, `base-3`, …
+/// shortened to fit [`deck_list::MAX_DECK_ID_BYTES`]. Deterministic, so a test
+/// can name it; uniqueness is what matters, and it is checked.
+fn fresh_id(base: &EndpointId, entries: &[RemoteEntry]) -> EndpointId {
+    (2u64..)
+        .filter_map(|n| {
+            let suffix = format!("-{n}");
+            let stem = base.as_str();
+            let keep = stem.len().min(deck_list::MAX_DECK_ID_BYTES - suffix.len());
+            // An id is ASCII (`EndpointId::parse`), so any byte offset is a
+            // character boundary.
+            EndpointId::parse(&format!("{}{suffix}", &stem[..keep])).ok()
+        })
+        .find(|id| {
+            !entries
+                .iter()
+                .any(|entry| deck_list::deck_id(entry) == id.as_str())
+        })
+        .expect("an unbounded suffix search always finds a free id")
 }
 
 #[cfg(test)]
@@ -723,6 +770,106 @@ mod tests {
         );
         assert_eq!(RemotesFile::load(&path).unwrap().remotes.len(), 1);
         assert_eq!(migrate(&path, &legacy).unwrap(), remap, "idempotent");
+    }
+
+    /// Issue #1350's review: a registry row that merely shares a legacy deck's
+    /// id — a different address — is not that deck. The legacy deck used to be
+    /// skipped, then deleted from `desktop.toml`, so it was in neither list and
+    /// a selection of it pointed at the unrelated deck.
+    #[test]
+    fn migration_keeps_a_legacy_deck_whose_id_an_unrelated_deck_holds() {
+        let (_dir, path) = registry(
+            "[[remotes]]\nname = \"other\"\ntype = \"ssh\"\nhost = \"other.example\"\n\
+             port = 22\nversion = \"0.40.0\"\nadded_at = \"x\"\nid = \"0123456789abcdef\"\n",
+        );
+        let legacy = [full_row("0123456789abcdef", "legacy.example")];
+        let remap = migrate(&path, &legacy).unwrap();
+        let fresh = EndpointId::parse("0123456789abcdef-2").unwrap();
+        assert_eq!(
+            remap,
+            [(
+                EndpointId::parse("0123456789abcdef").unwrap(),
+                fresh.clone()
+            )]
+        );
+
+        let rows = load_rows(&path).unwrap();
+        assert_eq!(rows.len(), 2, "both decks are kept: {rows:?}");
+        assert_eq!(rows[0].host.as_str(), "other.example");
+        assert_eq!(rows[0].id.as_str(), "0123456789abcdef");
+        assert_eq!(rows[1].host.as_str(), "legacy.example");
+        assert_eq!(rows[1].id, fresh);
+        assert_eq!(
+            rows[1].jump.as_ref().map(HostAlias::as_str),
+            Some("bastion")
+        );
+
+        // Idempotent: the retry after a crash before desktop.toml was rewritten
+        // adds nothing, writes nothing, and re-points the selection the same way.
+        let after_first = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(migrate(&path, &legacy).unwrap(), remap);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after_first);
+    }
+
+    /// The same collision, where the legacy deck's address matches a CLI row
+    /// with no id: it takes a fresh id rather than the one the unrelated deck
+    /// holds, so the list never has two rows with one id.
+    #[test]
+    fn migration_merging_into_a_cli_row_does_not_reuse_a_colliding_id() {
+        let (_dir, path) = registry(&format!(
+            "{CLI_ROW}\n[[remotes]]\nname = \"other\"\ntype = \"ssh\"\n\
+             host = \"other.example\"\nport = 22\nversion = \"0.40.0\"\nadded_at = \"x\"\n\
+             id = \"0123456789abcdef\"\n"
+        ));
+        let legacy = [full_row("0123456789abcdef", "build.example.com")];
+        let remap = migrate(&path, &legacy).unwrap();
+        let fresh = EndpointId::parse("0123456789abcdef-2").unwrap();
+        assert_eq!(
+            remap,
+            [(
+                EndpointId::parse("0123456789abcdef").unwrap(),
+                fresh.clone()
+            )]
+        );
+        let ids: Vec<_> = load_rows(&path)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(ids, [fresh, EndpointId::parse("0123456789abcdef").unwrap()]);
+        let after_first = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(migrate(&path, &legacy).unwrap(), remap, "idempotent");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after_first);
+    }
+
+    #[test]
+    fn a_fresh_id_fits_and_is_unused() {
+        let taken = |ids: &[&str]| -> Vec<RemoteEntry> {
+            ids.iter()
+                .map(|id| RemoteEntry {
+                    name: format!("n{id}"),
+                    kind: "ssh".to_string(),
+                    host: "h".to_string(),
+                    port: 22,
+                    key: None,
+                    version: "1".to_string(),
+                    added_at: "x".to_string(),
+                    upgraded_at: None,
+                    last_connected: None,
+                    id: Some(id.to_string()),
+                    user: None,
+                    jump_host: None,
+                    socket: None,
+                })
+                .collect()
+        };
+        let base = EndpointId::parse("abc").unwrap();
+        assert_eq!(fresh_id(&base, &taken(&["abc"])).as_str(), "abc-2");
+        assert_eq!(fresh_id(&base, &taken(&["abc", "abc-2"])).as_str(), "abc-3");
+        let long = EndpointId::parse(&"a".repeat(64)).unwrap();
+        let id = fresh_id(&long, &taken(&[long.as_str()]));
+        assert_eq!(id.as_str().len(), 64);
+        assert!(id.as_str().ends_with("-2"), "{id:?}");
     }
 
     #[test]
