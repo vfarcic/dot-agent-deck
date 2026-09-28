@@ -164,13 +164,11 @@ A worker that never signals completion would otherwise stall the pipeline silent
 
 ### A deck prompt waits while you have an unsent draft
 
-The deck writes into panes on its own: a delegated task into a worker, a worker's completion report into the orchestrator, the reports described in [Idle Workers & Notifications](idle-workers-and-notifications.md), a dispatched unit's result into the pane that dispatched it, and a scheduled prompt into its tab. Each of those ends with an Enter, so if you had typed something into that pane and not sent it yet, the Enter used to submit your text and the deck's as one message.
+The deck sends prompts into panes on its own — a delegated task, a completion report, a scheduled prompt, the worker reports described in [Idle Workers & Notifications](idle-workers-and-notifications.md). Each one ends with Enter, so if you have typed something into that pane and not sent it yet, the deck's prompt **waits** rather than being merged with your text. Press **Enter** to send your draft, or **Ctrl+U** or **Ctrl+C** to clear it, and the waiting prompt follows as a message of its own. Other panes, and the rest of the orchestration, keep running while it waits.
 
-Now the deck's prompt **waits** while that pane holds a draft you typed and have not sent. Press **Enter** to send your draft, or **Ctrl+U** or **Ctrl+C** to clear it, and the waiting prompt follows as a message of its own. Completion reports and dispatched units' results waiting on the same pane arrive in the order the deck received them, each as a message of its own. Other panes, and the rest of the orchestration, keep running while it waits.
+The wait is capped at **60 seconds**, so an unattended run cannot stall on a stray keystroke. At the cap the prompt is delivered anyway — your draft may be sent together with it — and the pane's card shows **Error**. Set `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` (milliseconds) on the process that starts the deck to change the cap, or to `0` to switch the wait off; a running daemon keeps its value until it is restarted.
 
-The wait is capped, 60 seconds by default, because an unattended orchestration must not stall on a stray keystroke. At the cap the prompt is delivered anyway, exactly as it was before this change, so your draft may be sent together with it. The deck then marks the pane's session **Error**: a card showing that session displays the Error status, but not why. The reason is recorded only in the daemon's log, as a warning that the prompt waited out the cap and was submitted into a pane still holding your unsent draft, and only when the daemon was started with `DOT_AGENT_DECK_LOG` set (see [Enabling Debug Logs](troubleshooting.md#enabling-debug-logs)). Set `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` on the process that starts the deck to change the cap, in milliseconds; values above ten minutes are capped, and `0` switches the wait off. The daemon reads it when it starts, so a daemon that is already running keeps its value until it is restarted. A scheduled task's reuse fire is the one exception to a larger value: its wait never runs past that fire's own 60-second limit (see [scheduled tasks](scheduled-tasks.md)).
-
-The deck decides this from the keys it forwards to the pane, not from what the agent shows, so a few cases are not covered. Text the agent itself puts in its input box — a prompt recalled from history, an autocompletion, a restored message — does not count as a draft, and neither does anything typed into the agent other than through the deck. A clear the deck cannot see all of, such as **Ctrl+U** in a multi-line draft, which clears only one line in Claude Code, releases the prompt while the rest is still there. In the other direction, a key that leaves nothing in the box, such as answering a menu with a number, or deleting a draft with Backspace, still counts as a draft, so the prompt waits until your next Enter or the cap. Prompts the TUI or the desktop app sends on your behalf, such as a new orchestration's first prompt to its orchestrator, do not wait.
+Only text you typed **through the deck** counts as a draft. Text the agent puts in its own input box — a prompt recalled from history, an autocompletion — does not, and prompts the TUI or the desktop app send for you, such as a new orchestration's first prompt, do not wait.
 
 ### One task per worker at a time
 
@@ -194,34 +192,15 @@ With `clear = true` — the default — every delegation is a cold start. The de
 
 There does not have to be a worker there to begin with. If the role's pane is empty — you closed it, or its agent died — the delegation creates a fresh one from the role's `command` instead of failing, so a role stays reachable for as long as the orchestration is running. If the replacement cannot be started at all, the deck says so in your orchestrator's pane rather than dropping the task silently; see [A delegated worker never came up](#a-delegated-worker-never-came-up).
 
-The delivery cost of that restart is timing. A freshly launched agent announces that its session has started well **before** its input box is ready to accept a line of text and treat Enter as "submit", so a task written the instant that signal arrives can land in a pane that is not listening yet. Where the write falls on the agent's startup decides what you see: the task text sitting in the worker's input box unsubmitted until a human presses Enter, or nothing at all — no text, no activity, a worker that looks healthy and idle while the orchestrator waits for a `work-done` that will never come.
+The cost of that restart is a short wait. A freshly started agent needs a moment before it can accept input, so the deck holds a `clear = true` task until the replacement is ready. For a plain `claude`, `codex`, `opencode` or `pi` command that is between about one and eight seconds, depending on the agent; for a role launched through a wrapper such as `devbox run …`, declare the [`agent`](#declaring-the-agent-behind-a-launcher-command) or a Codex, Pi or OpenCode worker waits up to 30 seconds on every delegation.
 
-The deck therefore holds a `clear = true` task for a short **readiness buffer** after the replacement signals its session start (and after the fallback wait expires, for agents that never signal at all). The default is 1000 ms: the spawn-time path's 500 ms, which was tuned for a warm pane, doubled because a respawn is a cold start. Nothing about this is configured per role; the only effect you should notice is that a `clear = true` delegation takes about a second longer to appear in the worker's pane than a `clear = false` one. How long the deck actually holds a task depends on what it has been able to establish about the worker it is delivering to:
-
-| what the deck can tell about the worker | how long it holds the task |
-|---|---|
-| it announced that its session is up | 1 second |
-| the deck watched it take over its terminal | 5 seconds |
-| it announces nothing before its first task | 8 seconds |
-| the deck cannot tell which agent it is, and it announced nothing | the 30-second wait, then 1 second |
-
-Which row a worker falls into depends on how its agent integrates with the deck — and on the deck being able to tell which agent the role runs. For a plain `claude`, `codex`, `opencode` or `pi` command it can. For a role launched through something else, such as `devbox run codex-big`, it cannot unless you [declare the agent](#declaring-the-agent-behind-a-launcher-command), and a Codex, Pi or OpenCode worker then lands in the last row on every delegation.
-
-Be clear about what that buys you: a fixed delay makes the race much less likely, but it cannot *prove* that the replacement is listening. The regression test behind it measures a deterministic test fixture — deliberately built to ignore input for 650 ms — and confirms the task is lost with the buffer at `0` and delivered and submitted at `1000`, which pins the mechanism. It does not measure how long any real agent version takes to boot on your machine.
-
-So if tasks still go missing on your machine — a heavily loaded host, or an agent that boots more slowly than the buffer allows for — raise the buffer with the `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` environment variable, in milliseconds, on the process that starts the deck:
+If tasks still go missing on your machine — the task text sits unsubmitted in the worker's input box, or the worker looks idle and never starts — raise the wait with the `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` environment variable, in milliseconds, on the process that starts the deck:
 
 ```bash
 DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=2000 dot-agent-deck
 ```
 
-Values above `30000` are capped, and `0` disables the wait entirely (the pre-fix behaviour — useful only for reproducing the problem). It covers a schedule's first prompt as well as a delegation, and **the value you set replaces every row of the table above** rather than being added to it — so raising it slows every case down equally, and setting it below one of the longer waits shortens that case to your value. That is deliberate: you know something about your machine that watching one worker start does not refute. Please report it as well — a machine that needs more than a second is exactly the evidence needed to size this per agent.
-
-#### If you are on an older release: `clear = false` is the workaround
-
-Before this buffer existed, `clear = true` delegations could be lost outright, and users hit it consistently enough that two of them independently found the same workaround: set `clear = false` on the affected roles. It works because it removes the respawn, and with it the race — the agent is already running and already listening, so there is no startup window to write into. It was confirmed across different agents and different agent versions.
-
-The trade-off is exactly the one the flag exists to express: those workers now carry context between delegations. That is fine for a stateful role like `release` and usually unwanted for a `coder` who should not remember the last three tasks. On a release that includes the readiness buffer you should not need the workaround at all — set `clear` on each role for the context behaviour you want, not to dodge a delivery bug.
+The value replaces the deck's own wait for every agent rather than adding to it, and also applies to a schedule's first prompt. Values above `30000` are capped. Please [report it](https://github.com/vfarcic/dot-agent-deck/issues) if your machine needs more than a second — that is exactly the evidence needed to tune the default.
 
 ### Parallel delegation
 
@@ -272,7 +251,7 @@ The release flow is stateful: open branch → push → create PR → wait for CI
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `name` | string | no | cwd basename | Display name shown in the tab bar. Defaults to the project directory name when empty. |
-| `default` | bool | no | `false` | Marks this as the orchestration to open when nothing named one — in practice a [schedule](scheduled-tasks.md) rooted here, since the New Agent form and a dispatcher agent both ask. Exactly one orchestration may declare it, and it must have roles; with a single orchestration it does nothing. Without any declaration the first orchestration with roles wins, which is what happened before this key existed. See [Which orchestration a schedule opens](#which-orchestration-a-schedule-opens). |
+| `default` | bool | no | `false` | Marks this as the orchestration to open when nothing named one — in practice a [schedule](scheduled-tasks.md) rooted here, since the New Agent form and a dispatcher agent both ask. Exactly one orchestration may declare it, and it must have roles; with a single orchestration it does nothing. Without any declaration the first orchestration with roles wins. See [Which orchestration a schedule opens](#which-orchestration-a-schedule-opens). |
 | `extends` | string | no | — | Inherit another orchestration's roles by its `name`, then override them with this block's own `[[orchestrations.roles]]` entries, matched by role name. Written for the case where several orchestrations run the same team on different providers. See [Sharing a workflow with `extends`](#sharing-a-workflow-with-extends). |
 | `roles` | array | yes¹ | — | Role definitions. Must contain at least one role with `start = true`. ¹Optional in a block that `extends` another, which may restate only the roles it changes. |
 
@@ -292,9 +271,10 @@ The release flow is stateful: open branch → push → create PR → wait for CI
 
 The deck works out which agent a role runs by looking at the first word of its `command`. `claude --model opus`, `/usr/local/bin/codex`, `env FOO=1 codex` and `sh -c 'codex …'` all resolve fine. What cannot resolve is a command whose first word is a **launcher**: `devbox run -- codex`, `mise exec -- codex`, `nix develop -c codex`, `make codex`, or a project script like `./run-codex.sh`. The deck sees `devbox`, or `make`, or `run-codex.sh` — and there is no way to tell from the outside what any of those will end up starting, so it does not guess.
 
-Three things follow from that, and two of them are easy to miss. The obvious one: the role card reads **No agent** and shows no status. The subtler one: identifying the agent is also what lets the deck monitor it, and for **Codex** that monitoring is the only thing that can identify the pane before you give it work — Codex does not announce itself until its first turn begins. So a Codex role behind a launcher stays blank from launch until the moment you delegate the first task to it, and then quietly starts working. Claude, by comparison, announces itself as soon as it starts, which is why the same `devbox run` wrapper looks fine for a Claude role and broken for a Codex one.
+What you see when that happens:
 
-The costliest one is delivery. The quick ways the deck has of knowing that a Codex, Pi or OpenCode `clear = true` replacement is ready for its task each depend on knowing it is that agent: it watches a Codex terminal, hands a Pi worker its task natively, and gives an OpenCode worker a fixed wait sized for OpenCode's start-up. An agent it cannot identify gets none of them, so the deck waits up to 30 seconds for the agent to announce itself before writing the task anyway. Claude announces itself, so a Claude role behind a launcher delivers promptly; a Codex, Pi or OpenCode role behind one pays the full 30 seconds on every delegation. `dot-agent-deck validate` warns about each role in this state, and the daemon log records a warning each time a delegation pays that wait.
+- The role card reads **No agent** and shows no status. A **Codex** role stays blank from launch until you delegate its first task to it, and then quietly starts working; a Claude role behind the same wrapper looks fine, because Claude identifies itself as soon as it starts.
+- A `clear = true` delegation to a Codex, Pi or OpenCode role behind a launcher waits up to **30 seconds** before the task is delivered, on every delegation. `dot-agent-deck validate` warns about each role in this state.
 
 `agent` is how you answer the question the command cannot:
 
@@ -591,7 +571,7 @@ name = "issue"
 
 `default` sits on the block, so it moves with the block. Exactly one orchestration may declare it, and that orchestration must define roles — `dot-agent-deck validate` rejects both mistakes. **With a single orchestration the key does nothing; omit it.**
 
-**If nothing declares it, the first orchestration with roles wins.** That is the historical rule and it still applies, so a config written before this key keeps behaving identically. With several orchestrations it is worth declaring anyway, because reordering the file then changes which team every scheduled run opens, and nothing in that diff says so.
+**If nothing declares it, the first orchestration with roles wins**, so existing configs keep behaving as they did. With several orchestrations it is worth declaring anyway, because reordering the file then changes which team every scheduled run opens, and nothing in that diff says so.
 
 When the choice is left implicit, the deck says so rather than quietly picking. `dot-agent-deck validate` is where **you** see it:
 
@@ -656,7 +636,7 @@ Only the orchestrator — the role with `start = true` — can call `dot-agent-d
 
 ### `pane restart` says "has not crashed; pass --force to restart a healthy pane"
 
-`dot-agent-deck pane restart <role>` refuses a healthy pane unless you pass `--force` — without the flag, restart only succeeds against a pane the daemon has flagged as having exited on its own (which includes, but is not limited to, a genuine crash: a role whose command simply finished, even with a clean exit, is equally restartable without `--force`). This is deliberate: without it, the command could accidentally force-kill a worker mid-task. `--force` is left out of the orchestrator's own composed context on purpose, so an orchestrating agent isn't pre-taught it (see [Restarting and spawning worker panes](#restarting-and-spawning-worker-panes)) — but that only avoids teaching it pre-emptively. This exact refusal message is still printed verbatim to the agent's own stderr the moment a plain restart is genuinely refused, so an orchestrating agent does learn about `--force`, just one step later than the composed context. Reaching for `--force` yourself from a shell instead of instructing an agent to pass it is a preference for keeping that escalation a guaranteed human-only step, not something the system enforces.
+`dot-agent-deck pane restart <role>` refuses a healthy pane unless you pass `--force`, so it cannot accidentally kill a worker mid-task. Without the flag it restarts only a pane whose agent has exited — a crash, or a command that simply finished, even cleanly. The orchestrator's built-in instructions do not mention `--force`, but the orchestrator does see this refusal message when a plain restart is refused, so it can learn the flag from it. If you want force-restarts to stay your decision, say so in the orchestrator's `prompt_template`; the deck does not enforce it.
 
 ### `pane restart` never detects a wedged-but-alive agent
 
@@ -680,11 +660,9 @@ The role's `command` launches the agent through something the deck cannot see pa
 
 ### A delegated worker never came up
 
-A `clear = true` delegation terminates the worker before it has a replacement, so if the replacement never starts, the pane is left with no agent and the task has nowhere to go. When that happens the deck submits `⚠ delegated worker never came up (dot-agent-deck daemon report)` into your orchestrator's pane as a turn of its own and stops: nothing was delivered, and no `work-done` can arrive for that delegation. Because it is submitted rather than just written, an orchestrator running unattended receives it and can act on it — the report asks it to re-delegate, reassign the task, or notify you. The report names the worker's pane; the daemon log names the role and carries the underlying error.
+A `clear = true` delegation stops the worker before starting its replacement, so if the replacement never starts, the task has nowhere to go. The deck then sends `⚠ delegated worker never came up (dot-agent-deck daemon report)` into your orchestrator's pane: nothing was delivered, and no `work-done` will arrive for that delegation. An orchestrator running unattended receives it as a turn and can re-delegate, reassign the task, or notify you. The report names the worker's pane; the daemon log names the role and the underlying error.
 
 The usual cause is the role's `command` — a launcher that fails in that directory, a binary that is not on the daemon's `PATH`, or an agent that exits immediately on start. Jump into the worker's pane and look at its scrollback: whatever the replacement printed before it died is still there. Running the role's `command` by hand in the worker's directory reproduces most of these in one step.
-
-Before this notice existed the deck waited out its full 30-second readiness window, wrote into the empty pane, had the write refused, and dropped the task with only a line in the daemon log — so the orchestrator was told nothing was wrong and waited for a completion that could never arrive.
 
 ### Closing a worker's pane and then delegating to it
 
@@ -702,11 +680,11 @@ The daemon records every delegation it dispatches, and a `work-done` that answer
 
 Nothing is dropped — the report still arrives, framed as information rather than as delivered work — and `.dot-agent-deck/work-done-<role>.md` is deliberately left untouched, so an uncommissioned report cannot overwrite the last one the orchestrator did commission. If you want a completion to be reported as delegated work, delegate it: task the worker through the orchestrator rather than typing into its pane.
 
-Two consequences of "untouched" are worth knowing before you go looking for a file. An **orchestrator** running `dot-agent-deck work-done` on itself without `--done` counts as uncommissioned too — nobody delegates to the orchestrator — so no `work-done-<orchestrator-role>.md` is written for it; use `--done` to close out the orchestration, or delegate the work to a role. And a delegate that never actually **reached** its worker — the identity gate refused the write, a `clear = true` respawn failed and left the notice `⚠ respawn failed for role '<role>'` in your orchestrator pane, or the replacement never came up and left `⚠ delegated worker never came up` there — commissions nothing, so a completion arriving from that worker afterwards is uncommissioned by the same rule. That is deliberate: the alternative is a stale commission that quietly relabels some later, unrelated completion as delegated work. The same rule covers two more cases: a delegation stops counting seven days after it was issued, and `dot-agent-deck pane restart <role>` drops what the replaced worker owed — so a completion from that worker afterwards, for work nobody has delegated since, is labelled uncommissioned too.
+Two consequences of "untouched" are worth knowing before you go looking for a file. An **orchestrator** running `dot-agent-deck work-done` on itself without `--done` counts as uncommissioned too — nobody delegates to the orchestrator — so no `work-done-<orchestrator-role>.md` is written for it; use `--done` to close out the orchestration, or delegate the work to a role. And a completion is also labelled uncommissioned when its delegation never reached the worker (for example, the deck reported `⚠ respawn failed for role '<role>'` or `⚠ delegated worker never came up` in your orchestrator pane), when the delegation is more than seven days old, or when `dot-agent-deck pane restart <role>` dropped what that worker owed.
 
 ### The summary file could not be written
 
-When the daemon cannot write `.dot-agent-deck/work-done-<role>.md` — no working directory recorded for the pane, the `.dot-agent-deck` directory cannot be created, or the write itself fails — it does **not** tell the orchestrator to read that path. It says the file is unavailable and inlines the worker's report into the feedback instead. That matters because the path is keyed by role name and reused for every delegation to that role: pointing at it after a failed write hands the orchestrator the previous delegation's report, which is well-formed, from the right role, and for the wrong task. An inlined report loses its Markdown formatting, because the feedback is collapsed to a single line.
+When the daemon cannot write `.dot-agent-deck/work-done-<role>.md` (for example, the `.dot-agent-deck` directory cannot be created), it tells the orchestrator the file is unavailable and includes the worker's report in the feedback instead, so the orchestrator never reads a previous delegation's report from that path by mistake. The included report loses its Markdown formatting, because the feedback is collapsed to a single line.
 
 ### Prompt template is not being applied
 
@@ -718,7 +696,7 @@ If you run two orchestration tabs from different directories that happen to have
 
 ## See also
 
-- [Idle Workers & Notifications](idle-workers-and-notifications.md) — the timeout that reports a silent worker to the orchestrator, and an example recipe for notifying yourself
+- [Idle Workers & Notifications](idle-workers-and-notifications.md) — the reports the deck sends the orchestrator about stuck workers, and how to get those moments to you
 - [Workspace Modes](workspace-modes.md) — the simpler tab type that pairs an agent with live side panes
 - [Configuration](configuration.md) — global and project-level configuration options
 - [Keyboard Shortcuts](keyboard-shortcuts.md) — all keybindings, including tab navigation

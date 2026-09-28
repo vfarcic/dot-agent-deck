@@ -3602,7 +3602,7 @@ mod tests {
     /// though: the daemon's own refusal — `"has not crashed; pass --force to
     /// restart a healthy pane"` — is still printed verbatim to the agent's
     /// own stderr the moment a plain restart is genuinely refused, and
-    /// `docs/orchestration.md`'s Troubleshooting entry documents it in full.
+    /// `docs/orchestration.md`'s Troubleshooting entry documents it.
     /// This paragraph only avoids teaching `--force` pre-emptively; it does
     /// not, and structurally cannot, withhold it after a refusal.
     #[test]

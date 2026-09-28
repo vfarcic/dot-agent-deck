@@ -76,11 +76,11 @@ When a task fires, the scheduler decides its **shape**. If the task sets `shape`
 - If it defines an **`[[orchestrations]]`** block → an **orchestration tab** is opened rooted at that directory and the prompt is delivered to the `orchestrator` role (the task's `command` is ignored here).
 - Otherwise → a **single agent card** is opened, running `command`, and the prompt is delivered to it.
 
-**This is why `shape` exists.** Without it the shape came from the directory alone, so a schedule pointed at a repo that defines `[[orchestrations]]` fired the whole team and quietly ignored its own `command` — and nothing in the config, `schedule list` or the CLI said so. That is the common case for a schedule that *wants* the repo as its `working_dir` (so the repo's `.claude/skills/` load and `git` commands run in the right place) but wants **one** agent to do the job. `shape = "single"` is that combination.
+**Use `shape = "single"` when you want the repo but not the team.** A schedule often needs a repo as its `working_dir` — so the repo's `.claude/skills/` load and `git` commands run in the right place — while wanting **one** agent to do the job. Without `shape`, a repo that defines `[[orchestrations]]` opens the whole team and ignores the schedule's `command`.
 
-A `shape` naming an orchestration the target directory does not define **abandons the fire**: the failure is surfaced through the daemon's notification seam with a message listing what *is* available, and **nothing is spawned**. It never falls back to another shape — silently spawning something other than what you asked for is the surprise this field removes.
+A `shape` naming an orchestration the target directory does not define **abandons the fire**: you get a notification listing what *is* available, and **nothing is spawned** — it never falls back to another shape.
 
-`schedule list` prints the resolved shape for every task, showing `shape=config-derived` when the field is unset, so the behaviour above is visible without reading source.
+`schedule list` prints the resolved shape for every task, showing `shape=config-derived` when the field is unset.
 
 **The first prompt waits for the agent to be ready.** When a fire spawns a new agent, the deck waits for it to finish starting up before delivering the prompt, so nothing is lost while the agent is still coming up.
 
@@ -99,14 +99,14 @@ Tab reuse is tracked only while the daemon keeps running, so a daemon restart cl
 
 If a reuse fire lands while you are actively typing in that tab, the new prompt **waits** and is delivered once you pause (a short debounce, ~5s by default). If you are not typing, it is delivered immediately. The debounce window is tunable via the `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` environment variable (milliseconds).
 
-Pausing is not enough when you have left an unsent draft in the tab: the prompt then also waits until you press Enter, or clear the draft with Ctrl+U or Ctrl+C, so it is not submitted together with your text. That wait and the typing debounce share one limit, counted from the fire: 60 seconds, after which the prompt is delivered anyway. `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` can shorten it for a reuse fire but not lengthen it. The first prompt of a newly opened tab also waits if you start typing into it before the prompt arrives, for up to the full `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` (60 seconds by default). See [A deck prompt waits while you have an unsent draft](orchestration.md#a-deck-prompt-waits-while-you-have-an-unsent-draft) for the details and what this does not cover.
+If you have left an unsent draft in the tab, the prompt also waits until you press Enter or clear the draft with Ctrl+U or Ctrl+C, so it is not submitted together with your text. The whole wait is capped at 60 seconds from the fire, after which the prompt is delivered anyway. See [A deck prompt waits while you have an unsent draft](orchestration.md#a-deck-prompt-waits-while-you-have-an-unsent-draft).
 
 ## Daemon must be running
 
-Scheduling depends on the daemon being up. The behavior on daemon stop / upgrade / restart / reboot is honest and documented:
+Scheduling depends on the daemon being up. What happens when it stops, upgrades, restarts or the machine reboots:
 
-- Stopping the daemon (`daemon stop`, `daemon restart`, an upgrade, or a crash) **terminates every running agent** and **wipes the in-memory reuse registry**.
-- **There is no catch-up.** Fires that come due while the daemon is down are **not replayed** — an "every 09:00" task that was offline at 09:00 simply misses that day. There is no persistent queue and no last-fire timestamp.
+- Stopping the daemon (`daemon stop`, `daemon restart`, an upgrade, or a crash) **terminates every running agent** and forgets which tab each schedule reuses.
+- **There is no catch-up.** Fires that come due while the daemon is down are **not replayed** — an "every 09:00" task that was offline at 09:00 simply misses that day.
 - Schedule **definitions survive** because they are reloaded from the global `schedules.toml` the next time the daemon starts.
 - The daemon is **lazy-spawned** by the next `dot-agent-deck` invocation and is **not** auto-respawned after it exits.
 
@@ -154,7 +154,7 @@ dot-agent-deck schedule add \
   --label agent-eligible      # optional
 ```
 
-A malformed `--repo` (not an `owner/name` slug) is rejected before anything is written. The CLI validates, writes the global config atomically, and triggers a live daemon reload — exactly as for a plain task.
+A malformed `--repo` (not an `owner/name` slug) is rejected before anything is written. The CLI validates the entry, writes the global config, and reloads the running daemon — exactly as for a plain task.
 
 ### What a fire does, issue by issue
 
@@ -177,14 +177,14 @@ Everything for a task lives under the task's own `working_dir` (the **workspace 
 | `<working_dir>/<name>/.worktrees/issue-<n>` | The **per-issue worktree** for issue `<n>`. |
 | `agent/issue-<n>` | The **branch** each worktree checks out. |
 
-### Idempotency: the worktree is the ledger
+### Re-runs skip issues already in progress
 
-There is no separate state file — the **filesystem itself** records which issues are in flight, so re-running a dispatch (whether the cron fires again or you press **Run now**) does not double-dispatch work already underway. Before dispatching an issue, the task **skips** it when either:
+Re-running a dispatch — the cron firing again, or you pressing **Run now** — does not dispatch the same issue twice. An issue is **skipped** when either:
 
-- its `.worktrees/issue-<n>` worktree **already exists** (the primary signal), or
-- an **open PR** already has head branch `agent/issue-<n>` (the secondary signal — a deterministic check, not fuzzy `Closes #n` body parsing).
+- its `.worktrees/issue-<n>` worktree **already exists**, or
+- an **open PR** already has head branch `agent/issue-<n>`.
 
-A skipped issue is logged/surfaced and left alone. Concurrency falls out of the same mechanism: a fire only fills the slots that earlier dispatches vacated by being closed, up to `max_per_run`.
+A skipped issue is reported and left alone. So each fire only fills the slots that earlier dispatches freed by being closed, up to `max_per_run`.
 
 ### Cleanup: closing a tab removes its worktree
 
@@ -298,9 +298,9 @@ enabled = true
 | `name` | string | yes | Unique id. Also the key that ties a task to its reused tab — see [Tab reuse](#tab-reuse). Renaming is forbidden (it would orphan an open reused tab); treat a rename as remove + add. |
 | `cron` | string | yes | A **5-field POSIX** cron expression (`min hour day-of-month month day-of-week`), e.g. `0 9 * * MON-FRI`. Evaluated in **local time**. 6/7-field forms (with a seconds field) are also accepted. |
 | `working_dir` | string | yes | Directory the fire spawns into. `~` and `$VAR` / `${VAR}` are expanded at load time; a relative path resolves against `$HOME` (never the authoring agent's cwd). Created with `mkdir -p` if missing. |
-| `command` | string | **yes** | The agent command for the **single-agent** card (e.g. `claude`, `opencode`, `pi`, `codex`, or `devin`), mirroring the new-deck dialog's command field. **Required**: `schedule add` errors without it and the loader **rejects (skips) a command-less entry** — there is **no `$SHELL` fallback**. Required **universally**, including orchestration-target schedules: it is still validated at load, but **ignored at fire** whenever the fire resolves to an orchestration — which is the case when the target dir defines an `[[orchestrations]]` block and the task does not set `shape` (the orchestration's role commands win). Set `shape = "single"` to make `command` take effect in such a directory. |
+| `command` | string | **yes** | The agent command for the **single-agent** card (e.g. `claude`, `opencode`, `pi`, `codex`, or `devin`), mirroring the new-deck dialog's command field. **Required on every schedule** — `schedule add` errors without it, a command-less entry is skipped at load, and there is no `$SHELL` fallback. It is **ignored at fire** when the fire opens an orchestration (the orchestration's role commands win); set `shape = "single"` to make it take effect in a directory that defines `[[orchestrations]]`. |
 | `prompt` | string | yes | The prompt delivered into the spawned agent (or the orchestrator role). |
-| `shape` | string | no (default: derived) | Forces the fire's **spawn shape** instead of deriving it from `working_dir`'s config. `"single"` opens **one** agent card running `command`, *even where that directory defines `[[orchestrations]]`*; `"orchestration"` opens that directory's default orchestration; `"orchestration:<name>"` opens the one with that name. **Omit it** and the shape is derived exactly as before. Any other value is a **load error** naming the task (not a surprise on the next fire). Cannot be combined with `issue_dispatch` — that task type resolves a shape per cloned repo — and the combination is rejected rather than ignored. |
+| `shape` | string | no (default: derived) | Forces the fire's **spawn shape** instead of deriving it from `working_dir`'s config. `"single"` opens **one** agent card running `command`, *even where that directory defines `[[orchestrations]]`*; `"orchestration"` opens that directory's default orchestration; `"orchestration:<name>"` opens the one with that name. **Omit it** to derive the shape from the directory. Any other value is a **load error** naming the task. Cannot be combined with `issue_dispatch` — that task type resolves a shape per cloned repo — and the combination is rejected rather than ignored. |
 | `new_tab_per_fire` | bool | no (default `false`) | `false` reuses one tab per task; `true` opens a fresh tab every fire. See [Tab reuse](#tab-reuse). |
 | `enabled` | bool | no (default `true`) | `false` keeps the definition but stops it firing. |
 
