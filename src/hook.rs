@@ -913,6 +913,12 @@ pub fn send_and_await_reply(json: &str) -> SocketReply {
 /// for a restart the daemon is still holding and will carry out (or refuse,
 /// per the post-lock crash recheck) once the lock frees.
 ///
+/// Issue #544 (PR #1398 review): the delegate's own wait for the worker's
+/// unsent draft — up to the draft-deferral cap — is NOT in that list. The
+/// pointer write sets the dispatch lock down while it waits
+/// ([`crate::agent_pty::PaneDispatchHold`]), so a restart landing then
+/// proceeds at once and the parked pointer is refused.
+///
 /// **Sizing the constant to cover that was considered and rejected**, because
 /// no compile-time constant can honestly bound it. The buffer term is not a
 /// fixed 1s: `dispatch_one_owned` pays one of `DELEGATE_READINESS_BUFFER`

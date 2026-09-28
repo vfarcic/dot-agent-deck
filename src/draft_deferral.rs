@@ -75,6 +75,18 @@ pub const DRAFT_CAP_NOTICE: &str = "a deck prompt waited for the unsent draft in
                                     the draft-deferral cap and was then submitted on top of it, so \
                                     your draft may have been sent together with it";
 
+/// Issue #544 (PR #1398 review): the fixed `DeliveryNotice` detail published
+/// when a delegated task pointer waited for the unsent draft in a worker pane
+/// and, by the time it could be written, the worker it was meant for had been
+/// replaced — most often by `pane restart`, which does not wait for a delegate's
+/// draft wait to end. The pointer is not written to the replacement. Reported on
+/// the pane's current occupant, the only one whose card the sink will mark; like
+/// [`DRAFT_CAP_NOTICE`], what a user sees of it is the card turning `Error`.
+pub const DRAFT_WAIT_WORKER_REPLACED_NOTICE: &str = "a delegated task pointer waited for the \
+                                                     unsent draft in this pane, and the worker \
+                                                     it was meant for was replaced before it \
+                                                     could be written, so it was not delivered";
+
 /// Resolve the cap from the environment. See
 /// [`DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS`].
 pub fn draft_defer_cap_from_env() -> Duration {

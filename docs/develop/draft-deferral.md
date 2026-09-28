@@ -37,6 +37,18 @@ Only daemon-originated automatic first writes are gated. The TUI/desktop `WriteA
 
 At the cap the daemon publishes a synthetic `Error` event for the pane, carrying `DRAFT_CAP_NOTICE` as its detail. No client renders that text today: the TUI's session card shows only the Error badge, and the desktop shows the `error` status and a generic error entry. The readable record is the `warn!` logged beside it, which exists only when the daemon was started with `DOT_AGENT_DECK_LOG` set (see [Enabling Debug Logs](../troubleshooting.md#enabling-debug-logs)). `DRAFT_CAP_NOTICE` must contain the word `draft`: `scheduler/dispatch/023` keys on it.
 
+## Delegate pointers, the dispatch lock and `pane restart`
+
+A delegate's task pointer is written by `dispatch_one_owned`, which takes two per-pane locks: the **order lock** (`pane_dispatch_order_lock`), held for the whole dispatch, and the **dispatch lock** (`pane_dispatch_lock`), which it shares with `pane restart`. The draft wait runs with the dispatch lock set down (`PaneDispatchHold`): the write parks it before each draft sleep and picks it up again before it takes the pane's writer, so a `pane restart` of the worker proceeds at once instead of waiting out the cap and reporting `NoReply` past its 14-second reply budget (PR #1398 review).
+
+What the dispatch lock protects still holds across the parked stretch:
+
+- **`clear = true` respawn against a restart.** The respawn runs before the pointer write, under the lock; by the time a dispatch parks, it has none left to do.
+- **Order of dispatches to one pane.** Kept by the order lock, which only dispatches take and none releases early, so two delegates to one worker are written in the order they queued even while the first waits on a draft. (A second delegate to a worker still owing a `work-done` needs `--supersede` anyway.)
+- **Commission accounting.** While parked, the dispatch's commission is counted as in flight again, so the restart's `retire_commissions_of_replaced_agent` leaves it for the dispatch to release itself, and does not undercount a delegate queued behind it.
+
+A restart that lands during the wait replaces the worker, so the write's identity gate refuses the pointer (`WrongSession`, or `NoLiveTarget` while the replacement is still spawning). It is not written to the replacement, where it would otherwise follow nothing the replacement knows about, and the restart has cancelled the task just as it cancels a task already delivered. The refusal publishes `DRAFT_WAIT_WORKER_REPLACED_NOTICE` against the pane's current occupant, so the card turns `Error` rather than the delegate vanishing; `pane/restart/014` pins this.
+
 ## Ordering and the delivery bound
 
 `work-done` hand-offs and dispatch results are delivered from the daemon's hook loop. Awaited inside the hook connection, a draft wait would hold one of the daemon's hook-connection permits for up to the cap, so they are handed off to a per-pane queue instead:

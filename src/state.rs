@@ -6935,8 +6935,15 @@ async fn dispatch_one_owned(
     // callers with no daemon state, and for an orchestration with no title.
     recorded_title: Option<OrchestrationTitle>,
 ) {
-    let dispatch_mutex = registry.pane_dispatch_lock(&pane_id);
-    let _dispatch_guard = dispatch_mutex.lock().await;
+    // Issue #544 (PR #1398 review): the ORDER lock first, held to the end, and
+    // then the dispatch lock — which the pointer write below sets down while it
+    // waits for the worker's unsent draft, so a `pane restart` is not parked
+    // behind that wait. Dispatches to this pane still run one at a time in the
+    // order they queued, because every one of them holds the order lock
+    // throughout. See [`crate::agent_pty::PaneDispatchHold`].
+    let dispatch_order = registry.pane_dispatch_order_lock(&pane_id);
+    let _dispatch_order_guard = dispatch_order.lock().await;
+    let mut dispatch_hold = registry.hold_pane_dispatch(&pane_id).await;
     // Issue #590: from here on this dispatch's commission is "the caller's own"
     // rather than "in flight" to `retire_commissions_of_replaced_agent`, which
     // is why the guard goes now and only whether it existed is kept.
@@ -6947,6 +6954,8 @@ async fn dispatch_one_owned(
         .as_ref()
         .map(crate::agent_pty::CommissionDispatchInFlight::arm_id);
     drop(commission_in_flight);
+    // Counted as in flight again only while the draft wait has the lock down.
+    dispatch_hold.set_commission_arm_id(commission_arm_id);
 
     // Look the role config up by `(worker cwd, orchestration name,
     // target role)` so the per-role `prompt_template` wrapping is
@@ -8204,12 +8213,16 @@ async fn dispatch_one_owned(
     // still caught by the post-lock re-validation), defeating the exact
     // guarantee PRD #249 finding B1 built this call to enforce. Treat an
     // unresolved identity as "no verified target" and never attempt the write.
+    // Issue #544 (PR #1398 review): how long the pointer waited for the
+    // worker's draft — non-zero means the dispatch lock was set down, so a
+    // `pane restart` may have replaced the worker meanwhile.
+    let mut pointer_deferred = std::time::Duration::ZERO;
     let outcome = if let Some(worker_agent_id) = expected_worker_agent_id.as_deref() {
         // Issue #544: the idle-worker watch armed in `handle_delegate` must
         // not count the time this write waits for the worker's draft.
         let mut pointer_clock = PointerWriteClock::begin(&registry, &pane_id, delegation_seq);
         let sent = registry
-            .write_and_submit_guarded_first_write_detailed(
+            .write_and_submit_guarded_first_write_parking(
                 &pane_id,
                 &one_liner,
                 worker_agent_id,
@@ -8225,13 +8238,21 @@ async fn dispatch_one_owned(
                     )
                 },
                 std::time::Instant::now(),
+                &mut dispatch_hold,
             )
             .await;
+        // PR #1398 review: a refusal reached while waiting for the draft comes
+        // back with the dispatch lock still set down. Everything below settles
+        // this dispatch's records under it, as it always has.
+        dispatch_hold.resume().await;
         if let Ok(sent) = &sent {
             pointer_clock.deferred = sent.deferred;
         }
         drop(pointer_clock);
-        sent.map(|sent| sent.detail)
+        sent.map(|sent| {
+            pointer_deferred = sent.deferred;
+            sent.detail
+        })
     } else {
         tracing::debug!(
             pane_id = %pane_id,
@@ -8293,8 +8314,29 @@ async fn dispatch_one_owned(
                 role = %target_role,
                 expected_agent_id = ?expected_worker_agent_id,
                 outcome = ?refused,
+                deferred_ms = pointer_deferred.as_millis(),
                 "delegate: identity gate refused the task pointer; nothing written"
             );
+            // Issue #544 (PR #1398 review): refused AFTER waiting for the
+            // worker's draft means the worker changed while the pointer
+            // waited — most often a `pane restart`, which no longer queues
+            // behind that wait. The pointer is not carried over to the
+            // replacement: the restart cancelled the task it was handed, just
+            // as it cancels one already delivered. But it must not vanish
+            // silently, so the pane's card says so — reported against the
+            // pane's CURRENT occupant, because a report bound to the replaced
+            // one is dropped by the sink.
+            if !pointer_deferred.is_zero()
+                && let Some(agent_id) = registry.pane_current_agent_id(&pane_id)
+            {
+                registry.publish_delivery_notice(crate::agent_pty::DeliveryNotice {
+                    pane_id: pane_id.clone(),
+                    agent_id,
+                    delivery_id: crate::prompt_delivery::mint_delivery_id(&pane_id),
+                    session_id: None,
+                    detail: crate::draft_deferral::DRAFT_WAIT_WORKER_REPLACED_NOTICE,
+                });
+            }
             false
         }
         Err(e) => {
@@ -10599,8 +10641,12 @@ fn restart_refusal_for_crashed_pane(
 /// immediately after `_dispatch_guard` is acquired, below, before
 /// `recreate_identity` is built or `respawn_or_recreate_agent_for_pane` is
 /// called — by the time this second check runs, no concurrent dispatch on
-/// this pane can still be in-flight (this function now holds the same lock
-/// they all serialize on), so its result is authoritative. `--force` skips
+/// this pane can be mid-respawn (this function now holds the same lock
+/// they all serialize on), so its result is authoritative. A dispatch can
+/// still be PARKED here — waiting for the worker's unsent draft with the
+/// lock set down (issue #544, [`crate::agent_pty::PaneDispatchHold`]) — but
+/// it has finished its respawn by then, and this restart's replacement makes
+/// its pointer write refuse rather than land in the new agent. `--force` skips
 /// both checks identically, by design: it means "restart regardless of
 /// crash state."
 pub async fn handle_restart_role_with_state(

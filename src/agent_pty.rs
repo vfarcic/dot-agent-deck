@@ -3971,6 +3971,12 @@ pub struct AgentPtyRegistry {
     /// re-introducing the registry remove+spawn race the lock exists
     /// to prevent.
     dispatch_mutexes: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// Issue #544 (PR #1398 review): per-pane ORDER mutexes, taken by every
+    /// delegate dispatch before its [`AgentPtyRegistry::pane_dispatch_lock`]
+    /// and held for the whole dispatch. See
+    /// [`AgentPtyRegistry::pane_dispatch_order_lock`]. Never pruned, for the
+    /// same reason `dispatch_mutexes` is not.
+    dispatch_order_mutexes: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     /// Total number of explicit `KIND_DETACH` frames the daemon has observed
     /// across all attach-stream connections. Plain socket close (implicit
     /// detach) does *not* increment this — only the M2.5 explicit-detach
@@ -4582,6 +4588,88 @@ impl CommissionDispatchInFlight {
         {
             *slot = Some(seq);
         }
+    }
+}
+
+/// Issue #544 (PR #1398 review): a delegate dispatch's hold on its worker
+/// pane's [`AgentPtyRegistry::pane_dispatch_lock`], which the deferring pointer
+/// write ([`AgentPtyRegistry::write_and_submit_guarded_first_write_parking`])
+/// SETS DOWN for as long as it sleeps waiting for the worker's unsent draft and
+/// picks up again before it takes the pane's writer.
+///
+/// The draft wait can run to the draft-deferral cap (60 s by default, up to
+/// 600 s). Spent holding the dispatch lock, it parked `pane restart` — which
+/// takes the same lock — behind it, far past the CLI's reply budget. What the
+/// lock protects is unaffected by setting it down there, because by the time a
+/// dispatch reaches its pointer write it has finished everything that needs the
+/// lock held:
+///
+/// - its `clear = true` respawn, if any, has already run, so a restart cannot
+///   interleave with the `registry.remove` + `spawn_agent` gap;
+/// - ordering among dispatches to one pane is kept by
+///   [`AgentPtyRegistry::pane_dispatch_order_lock`], which the dispatch holds
+///   throughout, not by this lock;
+/// - its commission is counted as in flight again while the lock is down
+///   (`commission_arm_id`), so a restart's
+///   [`AgentPtyRegistry::retire_commissions_of_replaced_agent`] still reads
+///   every commission it retires as one whose dispatch has delivered or
+///   released it — the parked dispatch releases its own once its write is
+///   refused.
+///
+/// What a restart landing inside the wait does to the write is decided by the
+/// write's own identity gate: the pane now has a different occupant, so the
+/// pointer is refused (`WrongSession`, or `NoLiveTarget` mid-respawn) and never
+/// reaches the replacement concatenated with the old draft.
+pub struct PaneDispatchHold {
+    registry: Arc<AgentPtyRegistry>,
+    pane_id: String,
+    lock: Arc<AsyncMutex<()>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    commission_arm_id: Option<u64>,
+    parked_commission: Option<CommissionDispatchInFlight>,
+}
+
+impl PaneDispatchHold {
+    /// The commission this dispatch armed, counted as in flight while the lock
+    /// is set down. `None` when it armed none.
+    pub fn set_commission_arm_id(&mut self, arm_id: Option<u64>) {
+        self.commission_arm_id = arm_id;
+    }
+
+    /// Set the lock down, re-counting the commission as in flight FIRST so a
+    /// restart that takes the lock next cannot miss it. A no-op when already
+    /// set down.
+    fn park(&mut self) {
+        if self.guard.is_none() {
+            return;
+        }
+        if let Some(arm_id) = self.commission_arm_id {
+            self.parked_commission = Some(
+                self.registry
+                    .reenter_commission_dispatch_in_flight(&self.pane_id, arm_id),
+            );
+        }
+        self.guard = None;
+    }
+
+    /// Pick the lock up again, then stop counting the commission as in flight
+    /// — the same order the dispatch's original in-flight guard is dropped in.
+    /// A no-op when already held.
+    pub async fn resume(&mut self) {
+        if self.guard.is_some() {
+            return;
+        }
+        self.guard = Some(Arc::clone(&self.lock).lock_owned().await);
+        self.parked_commission = None;
+    }
+}
+
+impl std::fmt::Debug for PaneDispatchHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaneDispatchHold")
+            .field("pane_id", &self.pane_id)
+            .field("held", &self.guard.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -5475,6 +5563,7 @@ impl AgentPtyRegistry {
                 exit_waiters: HashMap::new(),
             }),
             dispatch_mutexes: Mutex::new(HashMap::new()),
+            dispatch_order_mutexes: Mutex::new(HashMap::new()),
             detach_count: AtomicU64::new(0),
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
@@ -6224,8 +6313,10 @@ impl AgentPtyRegistry {
     /// - **The silent-worker watch is always cancelled.** Both of its arm sites
     ///   are inside `dispatch_one_owned` with the pane's dispatch lock held, and
     ///   the caller holds that lock now — so a watch present here was armed by a
-    ///   dispatch that has already finished, for the agent being replaced. A
-    ///   dispatch still queued arms its own after it takes the lock.
+    ///   dispatch that has already finished, for the agent being replaced, or by
+    ///   one parked on the worker's draft ([`PaneDispatchHold`]), whose write
+    ///   the replacement will refuse. A dispatch still queued arms its own after
+    ///   it takes the lock.
     /// - **The idle-worker record is cancelled unless a queued dispatch owns it.**
     ///   It is armed in `handle_delegate`'s synchronous fan-out, before the lock,
     ///   and the map holds only the newest record per worker, so a queued,
@@ -6265,7 +6356,11 @@ impl AgentPtyRegistry {
     ///
     /// 1. **In flight** — armed, but their dispatch task has not taken the lock
     ///    yet ([`CommissionDispatchInFlight`]). Their pointer will be written to
-    ///    the replacement, so the replacement owes them. Kept.
+    ///    the replacement, so the replacement owes them. Kept. A dispatch parked
+    ///    on the worker's draft with the lock set down ([`PaneDispatchHold`]) is
+    ///    counted here too: its write will be refused, and it then releases its
+    ///    own commission, so keeping it is what stops that release consuming a
+    ///    queued dispatch's.
     /// 2. **The caller's own**, when the caller is a `clear = true` dispatch
     ///    (`keep_own`): it holds the lock and will deliver to the replacement
     ///    it just spawned. Kept — sweeping it is exactly what the respawn path's
@@ -7675,6 +7770,68 @@ impl AgentPtyRegistry {
             .clone()
     }
 
+    /// Issue #544 (PR #1398 review): borrow (or lazily create) the per-pane
+    /// dispatch ORDER mutex for `pane_id_env`.
+    ///
+    /// A delegate dispatch takes this before [`Self::pane_dispatch_lock`] and
+    /// holds it to the end, so dispatches to one pane still run strictly one
+    /// after another in the order they queued — including across the stretch
+    /// where the dispatch sets the dispatch lock down to wait for the worker's
+    /// unsent draft ([`PaneDispatchHold`]). Nothing else takes it: `pane
+    /// restart` takes only the dispatch lock, which is what lets a restart
+    /// proceed while a delegate waits on a draft instead of queueing behind
+    /// the whole draft-deferral cap.
+    ///
+    /// Lock order is always this one first, then the dispatch lock; nothing
+    /// takes them the other way round.
+    pub fn pane_dispatch_order_lock(&self, pane_id_env: &str) -> Arc<AsyncMutex<()>> {
+        let mut map = self.dispatch_order_mutexes.lock().unwrap();
+        map.entry(pane_id_env.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    /// Issue #544 (PR #1398 review): take `pane_id_env`'s
+    /// [`Self::pane_dispatch_lock`] as a [`PaneDispatchHold`], which the
+    /// deferring pointer write can set down while it waits for a draft.
+    pub async fn hold_pane_dispatch(self: &Arc<Self>, pane_id_env: &str) -> PaneDispatchHold {
+        let lock = self.pane_dispatch_lock(pane_id_env);
+        let guard = Arc::clone(&lock).lock_owned().await;
+        PaneDispatchHold {
+            registry: Arc::clone(self),
+            pane_id: pane_id_env.to_string(),
+            lock,
+            guard: Some(guard),
+            commission_arm_id: None,
+            parked_commission: None,
+        }
+    }
+
+    /// Issue #544 (PR #1398 review): count the commission `arm_id` as in flight
+    /// again — its dispatch has set the pane's dispatch lock down to wait for a
+    /// draft — until the returned guard drops. See [`PaneDispatchHold`].
+    fn reenter_commission_dispatch_in_flight(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        arm_id: u64,
+    ) -> CommissionDispatchInFlight {
+        let mut tracker = self.delegations.lock().unwrap();
+        // `Some(None)`: a parked dispatch owns no idle-worker record a
+        // replacement should keep. If the pane is replaced while it is parked,
+        // its write is refused (the occupant it was bound to is gone), so the
+        // record it armed has nothing left to watch.
+        tracker
+            .commission_dispatches_in_flight
+            .entry(worker_pane_id.to_string())
+            .or_default()
+            .insert(arm_id, Some(None));
+        CommissionDispatchInFlight {
+            registry: Arc::clone(self),
+            worker_pane_id: worker_pane_id.to_string(),
+            id: arm_id,
+        }
+    }
+
     /// PRD #93 round-2 reviewer REV-1: borrow the change-notify the daemon's
     /// idle monitor waits on. Cloned by callers so they can `.notified()`
     /// without owning the registry. Public so `daemon::run_daemon_with` can
@@ -8575,6 +8732,7 @@ impl AgentPtyRegistry {
             expected_agent_id,
             revalidate,
             FirstWrite::Immediate,
+            None,
         )
         .await
         .map(|sent| sent.detail)
@@ -8602,9 +8760,11 @@ impl AgentPtyRegistry {
     /// [`Self::write_and_submit_guarded_first_write_capped`], so the two
     /// together stay within that fire's own hard limit.
     ///
-    /// The wait holds NO lock: the user's own `Enter` needs this pane's writer
-    /// to reach the PTY, so waiting while holding it would always run to the
-    /// cap. `revalidate` still runs exactly once, under the writer, on the pass
+    /// The wait does not hold the pane's writer: the user's own `Enter` needs
+    /// it to reach the PTY, so waiting while holding it would always run to the
+    /// cap. A lock the CALLER holds is the caller's; a delegate dispatch sets
+    /// its dispatch lock down through
+    /// [`Self::write_and_submit_guarded_first_write_parking`]. `revalidate` still runs exactly once, under the writer, on the pass
     /// that writes.
     ///
     /// Only non-empty payloads are gated: an empty one is a submit-only probe,
@@ -8660,6 +8820,42 @@ impl AgentPtyRegistry {
                 deadline: None,
                 cap_ceiling: None,
             },
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::write_and_submit_guarded_first_write_detailed`] for a delegate
+    /// dispatch holding its worker pane's dispatch lock as `hold`: the lock is
+    /// set down for as long as the write sleeps waiting for the draft, and
+    /// picked up again before the write takes the pane's writer — see
+    /// [`PaneDispatchHold`]. It may still be down when this returns a refusal
+    /// reached during the wait; call [`PaneDispatchHold::resume`] before
+    /// acting on the outcome.
+    pub async fn write_and_submit_guarded_first_write_parking<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: &str,
+        revalidate: impl FnOnce() -> Fut,
+        started: Instant,
+        hold: &mut PaneDispatchHold,
+    ) -> Result<FirstWriteSend, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        self.write_guarded(
+            pane_id,
+            text,
+            SubmitMode::Submit,
+            expected_agent_id,
+            revalidate,
+            FirstWrite::Defer {
+                started,
+                deadline: None,
+                cap_ceiling: None,
+            },
+            Some(hold),
         )
         .await
     }
@@ -8696,6 +8892,7 @@ impl AgentPtyRegistry {
                 deadline: None,
                 cap_ceiling: Some(cap_ceiling),
             },
+            None,
         )
         .await
         .map(|sent| sent.detail.outcome())
@@ -8743,6 +8940,7 @@ impl AgentPtyRegistry {
                 deadline: Some(deadline),
                 cap_ceiling: None,
             },
+            None,
         )
         .await
     }
@@ -8785,6 +8983,7 @@ impl AgentPtyRegistry {
             expected_agent_id,
             revalidate,
             FirstWrite::Immediate,
+            None,
         )
         .await
         .map(|sent| sent.detail.outcome())
@@ -8796,6 +8995,7 @@ impl AgentPtyRegistry {
     /// — and the writer-held re-validation barrier that closes the TOCTOU — is
     /// common, so the two entrypoints cannot drift apart on the parts that make
     /// the send safe.
+    #[allow(clippy::too_many_arguments)]
     async fn write_guarded<Fut>(
         &self,
         pane_id: &str,
@@ -8804,6 +9004,7 @@ impl AgentPtyRegistry {
         expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
         first_write: FirstWrite,
+        mut park: Option<&mut PaneDispatchHold>,
     ) -> Result<FirstWriteSend, AgentPtyError>
     where
         Fut: std::future::Future<Output = bool>,
@@ -8885,6 +9086,11 @@ impl AgentPtyRegistry {
             if let crate::draft_deferral::FirstWriteDecision::Wait { after } =
                 decide(self.draft_pending(pane_id))
             {
+                // PR #1398 review: and without the caller's dispatch lock, so
+                // a `pane restart` of this pane is not parked behind the wait.
+                if let Some(hold) = park.as_deref_mut() {
+                    hold.park();
+                }
                 let slept = Instant::now();
                 tokio::time::sleep(after).await;
                 deferred += slept.elapsed();
@@ -8896,6 +9102,15 @@ impl AgentPtyRegistry {
                 }
                 target = current;
                 continue;
+            }
+            // PR #1398 review: the caller's dispatch lock back before the
+            // writer, so the write itself — and whatever the caller does with
+            // its outcome — runs under it exactly as it did before the wait
+            // set it down. A restart that ran meanwhile is caught by the
+            // identity re-check below. Always the dispatch lock, then the
+            // writer: never the other way round.
+            if let Some(hold) = park.as_deref_mut() {
+                before_write_deadline(within(deferred), hold.resume()).await?;
             }
             // Acquire the EXACT target writer, THEN re-validate — this is the
             // barrier the TOCTOU test holds open by locking the writer externally.
@@ -20370,6 +20585,52 @@ mod spawn_tests {
             reg.arm_delegation_commission_at("other", "orch", None, false, t0),
             CommissionArm::Armed { superseded: 0, .. }
         ));
+    }
+
+    /// Issue #544 (PR #1398 review): a dispatch parked on a draft sets the
+    /// pane's dispatch lock down, so a restart can take it, and while parked its
+    /// commission counts as in flight again — the restart's retire leaves it for
+    /// the parked dispatch to release, and a supersede queued behind it keeps
+    /// its own.
+    #[tokio::test]
+    async fn parked_dispatch_frees_the_dispatch_lock_and_keeps_its_commission_in_flight() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let CommissionArm::Armed { in_flight: a, .. } =
+            reg.arm_delegation_commission("worker", "orch", None, false)
+        else {
+            panic!("first delegate must arm");
+        };
+        let mut hold = reg.hold_pane_dispatch("worker").await;
+        hold.set_commission_arm_id(Some(a.arm_id()));
+        drop(a);
+        let CommissionArm::Armed { in_flight: b, .. } =
+            reg.arm_delegation_commission("worker", "orch", None, true)
+        else {
+            panic!("a superseding delegate must arm");
+        };
+
+        hold.park();
+        let restart_lock = reg.pane_dispatch_lock("worker");
+        let restart_guard = restart_lock
+            .try_lock()
+            .expect("a parked dispatch must not hold the pane's dispatch lock");
+        assert_eq!(
+            reg.retire_commissions_of_replaced_agent("worker", false),
+            0,
+            "the parked dispatch and the queued supersede are both in flight"
+        );
+        drop(restart_guard);
+
+        hold.resume().await;
+        assert!(
+            reg.pane_dispatch_lock("worker").try_lock().is_err(),
+            "resume must take the dispatch lock back"
+        );
+        // The parked write was refused: it releases its own commission, and the
+        // queued supersede still owes one.
+        assert!(reg.release_delegation_commission("worker"));
+        assert!(reg.owes_delegation_commission("worker"));
+        drop(b);
     }
 
     /// Issue #580 review (Qodo): the refusal is for the SAME orchestrator asking
