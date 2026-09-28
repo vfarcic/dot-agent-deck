@@ -358,13 +358,39 @@ fn orchestration_work_done_010_deferred_reports_keep_arrival_order() {
 
 /// Scenario: Leave a worker draft unsent beyond a short two-second deferral
 /// cap. The real delegate pointer must eventually arrive despite the draft,
-/// and the worker's card must explain that the draft may have been submitted.
+/// and the worker's card changes to Error when the cap delivers the pointer.
 #[spec("orchestration/delegate/040")]
 #[test]
 fn orchestration_delegate_040_cap_delivers_instead_of_dropping_pointer() {
     let deck = launch_orchestration("2000");
     focus_worker(&deck);
     let worker = role(&deck, "worker");
+    let card_column = || {
+        deck.snapshot_grid()
+            .lines()
+            .map(|line| line.chars().take(40).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let event = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["agent-event", "--type", "running"])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env(
+            "DOT_AGENT_DECK_PANE_ID",
+            worker.pane_id_env.as_deref().expect("worker pane id"),
+        )
+        .env("DOT_AGENT_DECK_AGENT_ID", &worker.id)
+        .env("HOME", deck.home_dir())
+        .current_dir(deck.workdir())
+        .output()
+        .expect("announce worker session through hook socket");
+    assert_cli_success(&event, "worker agent-event");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || card_column()
+            .contains("Pi · worker")),
+        "worker did not acquire a renderable session card: {}",
+        card_column()
+    );
     deck.send_keys(DRAFT.as_bytes());
     assert!(
         common::wait_until(Duration::from_secs(5), || pane_text(&deck, &worker.id)
@@ -381,6 +407,14 @@ fn orchestration_delegate_040_cap_delivers_instead_of_dropping_pointer() {
         pane_text(&deck, &worker.id)
     );
     assert!(
+        card_column()
+            .lines()
+            .find(|line| line.contains("Pi · worker"))
+            .is_some_and(|line| !line.contains("Error")),
+        "worker card showed Error while the pointer was still deferred: {}",
+        card_column()
+    );
+    assert!(
         common::wait_until(Duration::from_secs(8), || pane_text(&deck, &worker.id)
             .contains(POINTER)),
         "pointer was lost after the draft deferral cap: {:?}",
@@ -391,18 +425,13 @@ fn orchestration_delegate_040_cap_delivers_instead_of_dropping_pointer() {
         "pointer arrived before the configured two-second cap: {:?}",
         start.elapsed()
     );
-    let card_column = || {
-        deck.snapshot_grid()
-            .lines()
-            .map(|line| line.chars().take(40).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
     assert!(
         common::wait_until(Duration::from_secs(5), || {
-            card_column().contains("a deck prompt waited")
+            card_column()
+                .lines()
+                .any(|line| line.contains("Pi · worker") && line.contains("Error"))
         }),
-        "worker card did not render the capped-draft DeliveryNotice: {}",
+        "worker card did not show Error after the draft-deferral cap: {}",
         card_column()
     );
 }

@@ -3537,8 +3537,8 @@ without depending on the config struct API.
 ##### orchestration/delegate/040 — A capped draft wait eventually delivers the real delegate pointer (issue #544).
 - **Layer:** L2, lane 1, PTY-attached (real TUI and delegate CLI).
 - **Agent:** none (`orch-deck` cat roles).
-- **Asserts:** an unsent worker draft delays the pointer, then the configured two-second cap allows delivery without dropping it; the attached TUI renders a warning on the worker card explaining that the unsent draft was submitted after the draft-deferral cap.
-- **Does not assert:** that the draft remains private after cap expiry, native agent behavior, or the full card-notice wording.
+- **Asserts:** an unsent worker draft delays the pointer, then the configured two-second cap allows delivery without dropping it; after a synthetic agent event gives the worker a renderable session, its card badge is not Error while the pointer is deferred and becomes Error after cap delivery.
+- **Does not assert:** that the draft remains private after cap expiry, native agent behavior, or that the card renders the notice text (a pre-existing gap for every `DeliveryNotice`). The notice detail is asserted at the sink by `scheduler/dispatch/023`.
 - **Platform coverage:** mac+linux.
 
 #### orchestration/work-done
