@@ -2072,14 +2072,14 @@ struct UiState {
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
     /// Issue #308: maps pane_id → the agent type its config DECLARED
-    /// (`agent = "…"` on the role or mode), for panes that made a declaration.
+    /// (`agent = "…"` on the role), for panes that made a declaration.
     ///
     /// Kept beside `SessionState.agent_type` rather than written into it,
     /// because the two answer different questions and only one of them may
     /// drive timing. `SessionState.agent_type` is the OBSERVED identity: it
     /// stays `AgentType::None` until something running in the pane reports, and
     /// two separate readiness gates read it — `agent_ready` in the
-    /// orchestrator-prompt and mode-seed paths, both of which route through
+    /// orchestrator-prompt and seed-prompt paths, both of which route through
     /// [`spawn_time_agent_ready`]. Seeding a declaration into that field would
     /// move both closer to firing at spawn and typing a prompt into a launcher
     /// that has not started its agent yet — which is precisely the population

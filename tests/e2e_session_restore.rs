@@ -199,8 +199,8 @@ fn write_zero_role_orchestration_config(project_dir: &Path, config_name: &str) {
 /// readiness signal the orchestrator-prompt delivery gate waits on), then
 /// appends every stdin line it receives to an ABSOLUTE `record-<role>.log` under
 /// `project_dir` — so a replayed prompt surfaces as a recorded line, immune to
-/// PTY echo AND independent of the role pane's working directory. Mirrors the
-/// proven recorder pattern in `e2e_mode_seed_prompt.rs`.
+/// PTY echo AND independent of the role pane's working directory. The same
+/// recorder shape as the authoring-agent shims in `e2e_scheduler_manager.rs`.
 fn write_recorder_agent(project_dir: &Path, role: &str) -> String {
     let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
     let script_path = project_dir.join(format!("agent-{role}.sh"));
