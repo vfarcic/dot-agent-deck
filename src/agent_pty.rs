@@ -4940,10 +4940,27 @@ pub struct WorkerBlockedNotice {
 /// Issue #544: the task pointer write of one [`OutstandingDelegation`].
 #[derive(Debug, Default, Clone, Copy)]
 struct PointerWrite {
+    /// PR #1398 review: the delegation's dispatch has not reached its write
+    /// yet — it is queued behind an earlier dispatch to the same pane, which
+    /// may be waiting for the worker's draft. Set by
+    /// [`AgentPtyRegistry::queue_delegation_pointer_write`] and ended by
+    /// [`AgentPtyRegistry::dequeue_delegation_pointer_write`].
+    queued: bool,
+    /// How long the dispatch was queued, from arm time until it dequeued.
+    queued_for: Duration,
     /// The write has begun and not yet returned.
     in_progress: bool,
     /// How long the finished write waited for the worker's unsent draft.
     deferred: Duration,
+}
+
+impl PointerWrite {
+    fn dequeue(&mut self, armed_at: Instant) {
+        if self.queued {
+            self.queued = false;
+            self.queued_for = armed_at.elapsed();
+        }
+    }
 }
 
 /// Issue #544: what the idle-worker watch needs to keep its clock off the time
@@ -4953,6 +4970,12 @@ struct PointerWrite {
 pub struct DelegationIdleClock {
     /// When the delegation was armed — the idle clock's start.
     pub armed_at: Instant,
+    /// PR #1398 review: the dispatch is still queued behind an earlier one to
+    /// the same pane, so its pointer write has not begun.
+    pub pointer_queued: bool,
+    /// How long the dispatch was queued before it went on towards its write.
+    /// The idle clock runs that much later.
+    pub pointer_queued_for: Duration,
     /// The pointer write is still under way, so how long it waited is not
     /// known yet.
     pub pointer_in_progress: bool,
@@ -5738,6 +5761,37 @@ impl AgentPtyRegistry {
         }
     }
 
+    /// Issue #544 (PR #1398 review): the delegation `seq` on `worker_pane_id`
+    /// has a dispatch on its way that has not reached its pointer write — it
+    /// may queue behind an earlier dispatch to the same pane that is waiting
+    /// for the worker's draft. Until
+    /// [`Self::dequeue_delegation_pointer_write`], the idle-worker watch holds
+    /// its report, and that dequeue must follow on every path, written or not.
+    /// A no-op if the record is gone or a newer one replaced it.
+    pub fn queue_delegation_pointer_write(&self, worker_pane_id: &str, seq: u64) {
+        let mut tracker = self.delegations.lock().unwrap();
+        if let Some(record) = tracker.records.get_mut(worker_pane_id)
+            && record.seq == seq
+        {
+            record.pointer.queued = true;
+        }
+    }
+
+    /// Issue #544 (PR #1398 review): the dispatch
+    /// [`Self::queue_delegation_pointer_write`] announced is no longer queued —
+    /// it holds the pane's dispatch locks, or it ended without writing. The
+    /// idle clock then runs as late as the queue held it. Idempotent, and a
+    /// no-op if the record is gone or a newer one replaced it.
+    pub fn dequeue_delegation_pointer_write(&self, worker_pane_id: &str, seq: u64) {
+        let mut tracker = self.delegations.lock().unwrap();
+        if let Some(record) = tracker.records.get_mut(worker_pane_id)
+            && record.seq == seq
+        {
+            let armed_at = record.armed_at;
+            record.pointer.dequeue(armed_at);
+        }
+    }
+
     /// Issue #544: the delegation `seq` on `worker_pane_id` is about to write
     /// its task pointer, which may wait for the worker's unsent draft. Until
     /// [`Self::finish_delegation_pointer_write`], the idle-worker watch holds
@@ -5747,6 +5801,8 @@ impl AgentPtyRegistry {
         if let Some(record) = tracker.records.get_mut(worker_pane_id)
             && record.seq == seq
         {
+            let armed_at = record.armed_at;
+            record.pointer.dequeue(armed_at);
             record.pointer.in_progress = true;
         }
     }
@@ -5763,10 +5819,10 @@ impl AgentPtyRegistry {
         if let Some(record) = tracker.records.get_mut(worker_pane_id)
             && record.seq == seq
         {
-            record.pointer = PointerWrite {
-                in_progress: false,
-                deferred,
-            };
+            let armed_at = record.armed_at;
+            record.pointer.dequeue(armed_at);
+            record.pointer.in_progress = false;
+            record.pointer.deferred = deferred;
         }
     }
 
@@ -5777,8 +5833,8 @@ impl AgentPtyRegistry {
     /// A worker cannot answer a task it has not been given, so the time its
     /// pointer spent waiting for the worker's own unsent draft is not time
     /// the worker failed to respond: the watch reports at
-    /// `armed_at + timeout + pointer_deferred`, and not at all while the write
-    /// is still in progress.
+    /// `armed_at + timeout + pointer_queued_for + pointer_deferred`, and not at
+    /// all while the dispatch is still queued or the write is in progress.
     pub fn delegation_idle_clock(
         &self,
         worker_pane_id: &str,
@@ -5791,6 +5847,8 @@ impl AgentPtyRegistry {
             .filter(|record| record.seq == seq)
             .map(|record| DelegationIdleClock {
                 armed_at: record.armed_at,
+                pointer_queued: record.pointer.queued,
+                pointer_queued_for: record.pointer.queued_for,
                 pointer_in_progress: record.pointer.in_progress,
                 pointer_deferred: record.pointer.deferred,
             })
@@ -19774,6 +19832,58 @@ mod spawn_tests {
             .expect("armed");
         assert!(!clock.pointer_in_progress);
         assert_eq!(clock.pointer_deferred, Duration::ZERO);
+    }
+
+    /// Issue #544 (PR #1398 review): a delegation whose dispatch is queued
+    /// reads as queued, not as "written with no wait"; dequeuing records how
+    /// long it queued, only once and only for the live generation, and a write
+    /// that begins without an explicit dequeue ends the queued mark too.
+    #[test]
+    fn delegation_idle_clock_holds_a_queued_pointer_write_until_it_dequeues() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let first = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+            .expect("arm #1");
+        reg.queue_delegation_pointer_write("worker", first.seq);
+        let clock = reg
+            .delegation_idle_clock("worker", first.seq)
+            .expect("armed");
+        assert!(clock.pointer_queued && !clock.pointer_in_progress);
+
+        std::thread::sleep(Duration::from_millis(30));
+        reg.dequeue_delegation_pointer_write("worker", first.seq);
+        let clock = reg
+            .delegation_idle_clock("worker", first.seq)
+            .expect("armed");
+        assert!(!clock.pointer_queued);
+        let queued_for = clock.pointer_queued_for;
+        assert!(queued_for >= Duration::from_millis(30), "{queued_for:?}");
+        std::thread::sleep(Duration::from_millis(10));
+        reg.dequeue_delegation_pointer_write("worker", first.seq);
+        reg.begin_delegation_pointer_write("worker", first.seq);
+        reg.finish_delegation_pointer_write("worker", first.seq, Duration::from_secs(3));
+        let clock = reg
+            .delegation_idle_clock("worker", first.seq)
+            .expect("armed");
+        assert_eq!(clock.pointer_queued_for, queued_for);
+        assert_eq!(clock.pointer_deferred, Duration::from_secs(3));
+
+        let second = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+            .expect("arm #2 supersedes #1");
+        reg.queue_delegation_pointer_write("worker", second.seq);
+        reg.dequeue_delegation_pointer_write("worker", first.seq);
+        assert!(
+            reg.delegation_idle_clock("worker", second.seq)
+                .expect("armed")
+                .pointer_queued,
+            "a stale dispatch dequeued the delegation that superseded it"
+        );
+        reg.begin_delegation_pointer_write("worker", second.seq);
+        let clock = reg
+            .delegation_idle_clock("worker", second.seq)
+            .expect("armed");
+        assert!(!clock.pointer_queued && clock.pointer_in_progress);
     }
 
     /// Silence-watch analogue of the unbound-delegation case above:

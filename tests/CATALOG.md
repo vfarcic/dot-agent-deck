@@ -6349,6 +6349,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** real-agent event handling, rendered card state, or the exact wording of either report.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/idle-worker/026 — A delegate queued behind a parked pointer is not reported idle before its own pointer is written (issue #544, PR #1398 review).
+- **Layer:** fast integration (production delegate handler and response watches with real `cat` PTYs and shortened test clocks).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** a worker's unsent draft parks a first delegate's pointer, and a `--supersede` delegate dispatched meanwhile queues behind it past both response windows; neither the idle-worker nor the no-event report reaches the orchestrator while it is queued. Enter delivers both pointers, and only after the windows then elapse do both reports arrive. Verified red on the pre-fix code, where the queued delegate's idle-worker report fired one second after it was armed.
+- **Does not assert:** a queued dispatch that ends without writing (the queued mark's seq-guarding and dequeue are pinned by the `agent_pty` unit test `delegation_idle_clock_holds_a_queued_pointer_write_until_it_dequeues`), real-agent event handling, rendered card state, or the exact wording of either report.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/live
 
 ##### scheduler/live/001 — A scheduled fire surfaces its card LIVE to an already-attached TUI, without a disconnect/reconnect (PRD #127 finding #2).

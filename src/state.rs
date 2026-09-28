@@ -3158,6 +3158,12 @@ fn arm_idle_worker_watch_for_delegation(
         return None;
     };
     let seq = armed.seq;
+    // Issue #544 (PR #1398 review): the caller spawns this delegation's
+    // dispatch next, and it may queue behind an earlier dispatch to the pane
+    // that is waiting for the worker's draft. Marked before the watch exists,
+    // so the watch never sees the delegation as "written with no wait"; the
+    // dispatch's `PointerQueueClock` ends the mark on every path.
+    registry.queue_delegation_pointer_write(worker_pane_id, seq);
     arm_idle_worker_watch(
         Arc::clone(registry),
         worker_pane_id.to_string(),
@@ -3173,8 +3179,13 @@ fn arm_idle_worker_watch_for_delegation(
 /// `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS` shorter than that wait the
 /// watch used to report a worker idle whose pointer had not been written yet.
 ///
-/// Called once the plain timeout has run: holds while the pointer write is
-/// still under way, then until `armed_at + timeout + pointer_deferred`. `true`
+/// PR #1398 review: the same holds for the time the delegation's dispatch
+/// spent queued behind an earlier dispatch to the same pane, which is exactly
+/// when that earlier one is waiting for the draft.
+///
+/// Called once the plain timeout has run: holds while the dispatch is queued
+/// or the pointer write is still under way, then until
+/// `armed_at + timeout + pointer_queued_for + pointer_deferred`. `true`
 /// to go on and report — including when the record is gone, which the caller's
 /// seq-conditional take then settles — and `false` when the delegation was
 /// cancelled meanwhile.
@@ -3189,10 +3200,10 @@ async fn wait_out_pointer_deferral(
         let Some(clock) = registry.delegation_idle_clock(worker_pane_id, seq) else {
             return true;
         };
-        let wait = if clock.pointer_in_progress {
+        let wait = if clock.pointer_queued || clock.pointer_in_progress {
             crate::draft_deferral::DRAFT_POLL_INTERVAL
         } else {
-            let due = clock.armed_at + timeout + clock.pointer_deferred;
+            let due = clock.armed_at + timeout + clock.pointer_queued_for + clock.pointer_deferred;
             match due.checked_duration_since(std::time::Instant::now()) {
                 Some(wait) if !wait.is_zero() => wait,
                 _ => return true,
@@ -3203,6 +3214,32 @@ async fn wait_out_pointer_deferral(
             _ = &mut *cancel => return false,
             _ = tokio::time::sleep(wait) => {}
         }
+    }
+}
+
+/// Issue #544 (PR #1398 review): ends the "queued" mark
+/// [`arm_idle_worker_watch_for_delegation`] put on a delegation's pointer write
+/// — explicitly once its dispatch holds the pane's dispatch locks, and on drop
+/// otherwise, so a dispatch that returns early, panics or is dropped while it
+/// waits for a lock never leaves the idle-worker watch holding forever.
+struct PointerQueueClock {
+    registry: Arc<AgentPtyRegistry>,
+    worker_pane_id: String,
+    seq: Option<u64>,
+}
+
+impl PointerQueueClock {
+    fn dequeue(&mut self) {
+        if let Some(seq) = self.seq.take() {
+            self.registry
+                .dequeue_delegation_pointer_write(&self.worker_pane_id, seq);
+        }
+    }
+}
+
+impl Drop for PointerQueueClock {
+    fn drop(&mut self) {
+        self.dequeue();
     }
 }
 
@@ -6941,9 +6978,17 @@ async fn dispatch_one_owned(
     // behind that wait. Dispatches to this pane still run one at a time in the
     // order they queued, because every one of them holds the order lock
     // throughout. See [`crate::agent_pty::PaneDispatchHold`].
+    let mut pointer_queue = PointerQueueClock {
+        registry: Arc::clone(&registry),
+        worker_pane_id: pane_id.clone(),
+        seq: delegation_seq,
+    };
     let dispatch_order = registry.pane_dispatch_order_lock(&pane_id);
     let _dispatch_order_guard = dispatch_order.lock().await;
     let mut dispatch_hold = registry.hold_pane_dispatch(&pane_id).await;
+    // Issue #544 (PR #1398 review): no longer queued behind another dispatch,
+    // so the idle-worker watch's clock may run again.
+    pointer_queue.dequeue();
     // Issue #590: from here on this dispatch's commission is "the caller's own"
     // rather than "in flight" to `retire_commissions_of_replaced_agent`, which
     // is why the guard goes now and only whether it existed is kept.

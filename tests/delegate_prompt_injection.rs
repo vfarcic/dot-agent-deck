@@ -4532,6 +4532,104 @@ fn idle_worker_025_response_clocks_start_after_deferred_pointer() {
         });
 }
 
+/// Scenario: A worker's unsent draft parks one delegate's pointer, and a
+/// superseding delegate queues behind it for longer than its own response
+/// windows. The orchestrator must receive no idle or silence warning for the
+/// queued delegate until its pointer has actually been written.
+#[spec("scheduler/idle-worker/026")]
+#[test]
+#[cfg(unix)]
+fn idle_worker_026_queued_delegate_clocks_start_after_its_pointer() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "1000"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "1000"),
+        (DRAFT_DEFER_CAP_ENV, "60000"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build queued-response-clock runtime")
+        .block_on(async {
+            let harness = SilenceHarness::new(64).await;
+            harness
+                .type_unsent_worker_draft("draft-544-queued-clock")
+                .await;
+            harness.start_draft_delegate(false).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Supersedes the parked delegation, and queues behind its write.
+            harness.start_draft_delegate(true).await;
+
+            tokio::time::sleep(Duration::from_millis(2200)).await;
+            let waiting = harness.orchestrator_snapshot();
+            let text = String::from_utf8_lossy(&waiting);
+            assert!(
+                !text.contains("has not responded with work-done")
+                    && !text.contains("delegated worker went quiet"),
+                "a delegate queued behind a parked pointer was reported before its own pointer \
+                 was written: {text:?}"
+            );
+            assert!(
+                !snapshot_contains(
+                    &harness
+                        .registry
+                        .snapshot(&harness.worker_agent_id)
+                        .unwrap_or_default(),
+                    POINTER,
+                ),
+                "pointers did not remain deferred during the response-window control"
+            );
+
+            harness.send_worker_user_bytes(b"\r").await;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let snapshot = harness
+                    .registry
+                    .snapshot(&harness.worker_agent_id)
+                    .unwrap_or_default();
+                let written = snapshot
+                    .windows(POINTER.len())
+                    .filter(|w| *w == POINTER)
+                    .count();
+                if written >= 2 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "both pointers were not delivered after Enter: {:?}",
+                    String::from_utf8_lossy(&snapshot)
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let early = harness.orchestrator_snapshot();
+            let early_text = String::from_utf8_lossy(&early);
+            assert!(
+                !early_text.contains("has not responded with work-done")
+                    && !early_text.contains("delegated worker went quiet"),
+                "the queued delegate's response clock did not start from its pointer write: \
+                 {early_text:?}"
+            );
+            let deadline = Instant::now() + Duration::from_secs(4);
+            loop {
+                let snapshot = harness.orchestrator_snapshot();
+                let text = String::from_utf8_lossy(&snapshot);
+                if text.contains("has not responded with work-done")
+                    && text.contains("delegated worker went quiet")
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "response watches did not report after the queued pointer write: {text:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+}
+
 /// Scenario: Clear an unsent worker draft with Ctrl+U while a production
 /// delegate waits. The pointer must then arrive without submitting that draft.
 #[test]
