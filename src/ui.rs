@@ -22264,6 +22264,7 @@ pub fn render_orchestration_frame_to_buffer(
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                subagent_wait: None,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -23055,6 +23056,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                subagent_wait: None,
             },
         );
     }
@@ -25012,6 +25014,7 @@ mod tests {
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                subagent_wait: None,
             },
         );
         state
@@ -28387,6 +28390,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            subagent_wait: None,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -31168,6 +31172,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            subagent_wait: None,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -32109,6 +32114,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            subagent_wait: None,
         }
     }
 
@@ -32458,6 +32464,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            subagent_wait: None,
         };
 
         // Spacious: get all 3
@@ -32495,6 +32502,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            subagent_wait: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -32523,6 +32531,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            subagent_wait: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);

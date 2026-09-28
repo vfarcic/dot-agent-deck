@@ -495,3 +495,164 @@ fn subagent_005_subagent_call_does_not_strand_a_synthetic_shell_working() {
         );
     }
 }
+
+/// A permission request raised inside the subagent `subagent_id`.
+fn subagent_permission_request(subagent_id: &str) -> Value {
+    with(
+        base("PermissionRequest"),
+        json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf target"},
+            "agent_id": subagent_id,
+            "agent_type": "general-purpose",
+        }),
+    )
+}
+
+/// `subagent_id`'s terminal event: `SubagentStop`, or — Claude Code only — the
+/// `StopFailure` an API error ends it with (issue #714), which the hook CLI
+/// turns into the `SubagentStop` it stands in for.
+fn subagent_end(terminal: &str, subagent_id: &str) -> Value {
+    let extra = match terminal {
+        "StopFailure" => json!({
+            "error": "rate_limit",
+            "last_assistant_message": "API Error: rate limit",
+            "agent_id": subagent_id,
+            "agent_type": "general-purpose",
+        }),
+        _ => json!({
+            "stop_hook_active": false,
+            "agent_id": subagent_id,
+            "agent_type": "general-purpose",
+            "last_assistant_message": "",
+        }),
+    };
+    with(base(terminal), extra)
+}
+
+/// One hook payload and the event type it must become.
+type Step = (Value, EventType);
+
+/// Scenario: A subagent raises a permission request — the card reads Needs Input — and then ends without the call it asked about ever running: a plain `SubagentStop`, or for Claude Code a `StopFailure`. For a background subagent after the turn ended the card must return to Idle, and inside a live turn to Thinking, never Working, Error or Blocked; the controls keep Needs Input while the prompt is still someone's — a different subagent stopping, a second waiting subagent still running, and a wait the main thread raised.
+#[spec("status/subagent/006")]
+#[test]
+fn subagent_006_a_subagent_that_ends_takes_its_permission_prompt_with_it() {
+    let agent_call = with(
+        base("PreToolUse"),
+        json!({
+            "tool_name": "Agent",
+            "tool_use_id": "toolu_agent_1",
+            "tool_input": {"description": "survey the tests", "prompt": "list them"},
+        }),
+    );
+    let main_permission = with(
+        base("PermissionRequest"),
+        json!({"tool_name": "Bash", "tool_input": {"command": "cargo clean"}}),
+    );
+    for (agent, terminal) in [
+        ("claude-code", "SubagentStop"),
+        ("claude-code", "StopFailure"),
+        ("codex", "SubagentStop"),
+    ] {
+        let end =
+            |subagent_id: &str| (subagent_end(terminal, subagent_id), EventType::SubagentStop);
+        let cases: Vec<(&str, Vec<Step>, SessionStatus)> = vec![
+            (
+                "a background subagent's prompt, after the turn went Idle",
+                vec![
+                    (stop(), EventType::Idle),
+                    (
+                        subagent_permission_request(SUBAGENT_ID),
+                        EventType::PermissionRequest,
+                    ),
+                    end(SUBAGENT_ID),
+                ],
+                SessionStatus::Idle,
+            ),
+            (
+                "a foreground subagent's prompt, inside the main thread's Agent call",
+                vec![
+                    (agent_call.clone(), EventType::ToolStart),
+                    (
+                        subagent_permission_request(SUBAGENT_ID),
+                        EventType::PermissionRequest,
+                    ),
+                    end(SUBAGENT_ID),
+                ],
+                SessionStatus::Thinking,
+            ),
+            (
+                "both waiting subagents ended",
+                vec![
+                    (stop(), EventType::Idle),
+                    (
+                        subagent_permission_request(SUBAGENT_ID),
+                        EventType::PermissionRequest,
+                    ),
+                    (
+                        subagent_permission_request("b9d0"),
+                        EventType::PermissionRequest,
+                    ),
+                    end("b9d0"),
+                    end(SUBAGENT_ID),
+                ],
+                SessionStatus::Idle,
+            ),
+            (
+                "control: a DIFFERENT subagent ended",
+                vec![
+                    (stop(), EventType::Idle),
+                    (
+                        subagent_permission_request(SUBAGENT_ID),
+                        EventType::PermissionRequest,
+                    ),
+                    end("b9d0"),
+                ],
+                SessionStatus::WaitingForInput,
+            ),
+            (
+                "control: one of two waiting subagents ended",
+                vec![
+                    (stop(), EventType::Idle),
+                    (
+                        subagent_permission_request(SUBAGENT_ID),
+                        EventType::PermissionRequest,
+                    ),
+                    (
+                        subagent_permission_request("b9d0"),
+                        EventType::PermissionRequest,
+                    ),
+                    end(SUBAGENT_ID),
+                ],
+                SessionStatus::WaitingForInput,
+            ),
+            (
+                "control: the MAIN thread's prompt, which a subagent then joined and left",
+                vec![
+                    (stop(), EventType::Idle),
+                    (main_permission.clone(), EventType::PermissionRequest),
+                    (
+                        subagent_permission_request(SUBAGENT_ID),
+                        EventType::PermissionRequest,
+                    ),
+                    end(SUBAGENT_ID),
+                ],
+                SessionStatus::WaitingForInput,
+            ),
+        ];
+        for (case, sequence, want) in cases {
+            let mut payloads = vec![(session_start(), EventType::SessionStart)];
+            payloads.extend(sequence);
+            let state = apply_all(agent, &payloads);
+            assert_eq!(
+                status_of(&state),
+                want,
+                "`{agent}`, ended by {terminal}: {case} (issue #1364)"
+            );
+            assert!(
+                state.sessions[SESSION].blocked.is_none(),
+                "`{agent}`, ended by {terminal}: {case} left a quota reason on the parent"
+            );
+        }
+    }
+}

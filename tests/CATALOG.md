@@ -919,6 +919,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the descendant scan that produces `ShellBusy` (`status/shell-activity/*`).
 - **Platform coverage:** mac+linux.
 
+##### status/subagent/006 — A subagent that asked for permission and then ended takes its prompt with it: the card leaves Needs Input, to Idle after the turn ended and to Thinking inside it (issue #1364).
+- **Layer:** L1 (each payload goes through the real `hook --agent <agent>` CLI, then `AppState::apply_event`).
+- **Agent:** none (Claude Code- and Codex-shaped hook payloads, as `status/subagent/001`).
+- **Asserts:** for `claude-code` ended by `SubagentStop`, `claude-code` ended by `StopFailure` (which the CLI turns into `SubagentStop`) and `codex` ended by `SubagentStop`: a background subagent's `PermissionRequest` after `Stop` returns the card to Idle when that subagent ends; a foreground one inside the main thread's `Agent` call returns it to Thinking, never Working; two waiting subagents both ending returns it to Idle. The controls keep Needs Input: a DIFFERENT subagent ending, only one of two waiting subagents ending, and a wait the MAIN thread raised that a subagent then joined and left. No case leaves a quota reason on the card.
+- **Verified load-bearing:** red with the `SubagentStop` arm in `apply_event` disabled (the first case reads WaitingForInput).
+- **Does not assert:** that a real Claude Code or Codex emits these sequences; the waiting-for-input notice (`scheduler/idle-worker/025`); the rendered badge.
+- **Platform coverage:** mac+linux.
+
 ### Agent protocol
 
 #### agent/readiness
@@ -6111,6 +6119,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** synthetic Codex stand-in that announces its rollout through installed hooks and appends a structured task failure; no provider credential.
 - **Asserts:** one fixed blocked-worker report reaches the orchestrator pane with the worker pane id, no agent-controlled detail, and a second delegate remains busy because work-done is still owed. The report is SUBMITTED, as #708 made its worker-exited sibling: the single byte after its stable final clause (`daemon log names the role.`) is CR, not LF — exact because the orchestrator stand-in runs `cat` under `stty -echo -icanon -icrnl -opost` before its readiness marker. Verified red with the delivery on `write_notice_guarded` (`Some(10)`). The release of its payload record on `Applied`, so a byte-identical report for a later delegation is still submitted after user input, is pinned by the `agent_pty` unit test `worker_blocked_report_is_submitted_and_resubmits_after_user_input`, verified red with that settle call removed.
 - **Does not assert:** eventual worker completion or provider quota reset.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/025 — A waiting-for-input episode ends with the subagent that raised it, reopens for a new delegation to a worker still at its prompt, and survives any number of `/clear`s (issues #1364, #1365).
+- **Layer:** fast integration (the daemon's real hook-ingestion step `daemon::ingest_event`, real `handle_delegate` and `handle_work_done` against daemon-owned PTYs; the debounce shortened through `DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS`).
+- **Agent:** none (`cat` stand-ins; the hook events are built in the shape `hook --agent claude-code` posts, the subagent's carrying `SUBAGENT_ID_METADATA_KEY`).
+- **Asserts:** four delegated workers. `redelegated-worker` waits, is reported once, sends `work-done` while still at its prompt and is delegated to again: the orchestrator receives a SECOND notice, after the per-worker spacing (#1365 item 3). `many-times-cleared-worker`'s conversation is cleared twelve times, it waits in the newest session, and a delayed `thinking` and a delayed `session_start` from its FIRST session arrive: its wait is still reported once (#1365 item 4). `subagent-worker`'s wait is a subagent's `permission_request`, and that subagent's `subagent_stop` follows inside the debounce: it is never reported (#1364). `other-subagent-worker` is the control — its waiting subagent keeps waiting while a DIFFERENT subagent stops, and it is reported once. Exactly four notices in all.
+- **Verified load-bearing:** red on the pre-fix code, and red again with each of the three changes reverted alone — the delegate-time path no longer reopening a settled episode (one notice for `redelegated-worker`), the superseded-session memory capped at eight again (none for `many-times-cleared-worker`), and the `SubagentStop` arm disabled (one for `subagent-worker`).
+- **Does not assert:** the card's status after the subagent ends (`status/subagent/006`); a real agent's subagent; the rendering in an attached TUI.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live

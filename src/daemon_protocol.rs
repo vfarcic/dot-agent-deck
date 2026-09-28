@@ -7888,6 +7888,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            subagent_wait: None,
         };
         let snap = session.live_snapshot();
         assert_eq!(
