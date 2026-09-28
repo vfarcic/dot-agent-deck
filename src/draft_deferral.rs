@@ -80,8 +80,10 @@ pub const DRAFT_CAP_NOTICE: &str = "a deck prompt waited for the unsent draft in
 /// and, by the time it could be written, the worker it was meant for had been
 /// replaced — most often by `pane restart`, which does not wait for a delegate's
 /// draft wait to end. The pointer is not written to the replacement. Reported on
-/// the pane's current occupant, the only one whose card the sink will mark; like
-/// [`DRAFT_CAP_NOTICE`], what a user sees of it is the card turning `Error`.
+/// the pane's current occupant when a live one exists by then, the only one
+/// whose card the sink will mark; like [`DRAFT_CAP_NOTICE`], what a user sees of
+/// it is the card turning `Error`. When the refusal lands while the replacement
+/// is not yet live, nothing is published and only the daemon log records it.
 pub const DRAFT_WAIT_WORKER_REPLACED_NOTICE: &str = "a delegated task pointer waited for the \
                                                      unsent draft in this pane, and the worker \
                                                      it was meant for was replaced before it \
