@@ -4,7 +4,7 @@ Analyze this project and create a `.dot-agent-deck.toml` configuration file in t
 
 This file configures **agent orchestrations** for the dot-agent-deck TUI dashboard. An orchestration is a team of agents that opens together in one tab: a designated orchestrator agent receives the user's request and delegates tasks to worker agents with `dot-agent-deck delegate`, and each worker reports back with `dot-agent-deck work-done`. The file's format is in the **Orchestrations** section below.
 
-(The file used to configure "workspace modes" as well. Those were removed; a `[[modes]]` block is now ignored with a warning, so never propose one.)
+A `[[modes]]` block is ignored with a warning, so never propose one.
 
 ## Your Task
 

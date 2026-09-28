@@ -175,7 +175,7 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     // dashboard's session-count title renders only on the Dashboard tab) or a
     // second tab (whose strip carries a `×` close glyph).
     deck.wait_for_absence("[Submit]"); // form closed
-    deck.wait_until_grid("schedule submit settles into a card or a mode tab", |g| {
+    deck.wait_until_grid("schedule submit settles into a card", |g| {
         g.contains("dot-agent-deck \u{2014}") || g.contains("×")
     });
 

@@ -69,7 +69,7 @@ fn tab_label_modifier(buffer: &ratatui::buffer::Buffer, label: &str) -> Modifier
 /// `render_tab_strip` draws no close glyph at all).
 #[spec("mouse/tabstrip/002")]
 #[test]
-fn tabstrip_002_close_glyph_on_mode_orchestration_not_dashboard() {
+fn tabstrip_002_close_glyph_on_orchestration_not_dashboard() {
     // Dashboard alone: never closeable → no close glyph anywhere.
     let dashboard_only = render_tab_bar_to_buffer(&["Dashboard"], &[false], 0, 80, &[None]);
     assert_eq!(
@@ -92,7 +92,7 @@ fn tabstrip_002_close_glyph_on_mode_orchestration_not_dashboard() {
     assert_eq!(
         close_glyph_count(&three_tabs),
         2,
-        "Mode and Orchestration tabs must each render a [×] (and the Dashboard none), got {:?}",
+        "Both closeable tabs must each render a [×] (and the Dashboard none), got {:?}",
         dashboard_only_text(&three_tabs)
     );
 }

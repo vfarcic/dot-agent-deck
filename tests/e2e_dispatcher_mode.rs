@@ -658,8 +658,7 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     assert!(
         common::wait_until(SURFACE_WAIT, || deck.snapshot_grid().contains("1 agent(s)")),
         "the dispatcher never surfaced a LIVE dashboard card within {}s — expected a \
-         single-agent card on the dashboard (NOT a mode tab, which would split the pane \
-         50/50 with an empty side column).\n\
+         single-agent card on the dashboard.\n\
          Final grid:\n{}",
         SURFACE_WAIT.as_secs(),
         deck.snapshot_grid()
