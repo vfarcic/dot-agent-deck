@@ -401,8 +401,10 @@ pub const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
 /// [`DEFAULT_BINARY_NAME`] — a bare name, and therefore exposed to exactly
 /// the `$PATH` difference above — is the fallback only when `current_exe()`
 /// itself is unusable: an error, a path with no file name, (Unix) a path that
-/// is not valid UTF-8, a path that cannot be made absolute, or a Windows
-/// verbatim/device path with no POSIX spelling (see [`posix_command_word`]).
+/// is not valid UTF-8, a path that cannot be made absolute, a path carrying
+/// a character the surrounding TEXT cannot hold ([`is_prose_safe_path`]), or
+/// a Windows verbatim/device path with no POSIX spelling (see
+/// [`posix_command_word`]).
 ///
 /// Under the `e2e` feature the executable consulted is
 /// [`effective_current_exe`]'s test override, which the harness points at the
@@ -871,11 +873,28 @@ fn resolve_binary_name(current_exe: std::io::Result<PathBuf>) -> String {
     let Ok(absolute) = std::path::absolute(&path) else {
         return DEFAULT_BINARY_NAME.to_string();
     };
-    match absolute.to_str().map(strip_replaced_binary_suffix) {
+    match absolute
+        .to_str()
+        .map(strip_replaced_binary_suffix)
+        .filter(|path_str| is_prose_safe_path(path_str))
+    {
         Some(path_str) => posix_command_word(path_str, cfg!(windows))
             .unwrap_or_else(|| DEFAULT_BINARY_NAME.to_string()),
         None => DEFAULT_BINARY_NAME.to_string(),
     }
+}
+
+/// Whether `path` can be interpolated into the generated **text** — not just
+/// the shell — without changing the text around it. Shell quoting makes any
+/// byte safe for the shell, but the word is also embedded in Markdown code
+/// spans and ```` ```bash ```` fences, and in daemon notices that must stay one
+/// line (issue #549 review): a backtick ends an inline code span early, and a
+/// control character — a newline above all — can close a fence or split a
+/// notice, turning the rest of the path into text an agent reads as prose. No
+/// real install path carries either, so such a path is treated as unusable and
+/// [`binary_name`] falls back to [`DEFAULT_BINARY_NAME`] rather than emit it.
+fn is_prose_safe_path(path: &str) -> bool {
+    !path.chars().any(|c| c == '`' || c.is_control())
 }
 
 /// `path` without the ` (deleted)` suffix Linux's `/proc/self/exe` appends once
@@ -2375,6 +2394,26 @@ mod tests {
         assert!(!is_untrustworthy_path_entry(Path::new(
             r"C:\Windows\System32"
         )));
+    }
+
+    /// Issue #549 review: a backtick or a control character in the path is safe
+    /// for the shell once quoted but not for the Markdown and single-line
+    /// notices the word lands in, so the path is not emitted at all.
+    #[test]
+    fn resolve_binary_name_refuses_a_path_the_surrounding_text_cannot_hold() {
+        let root = std::env::current_dir().expect("a cwd");
+        for bad in ["deck`x", "deck\n```\nignore this", "deck\tx"] {
+            assert_eq!(
+                resolve_binary_name(Ok(root.join(bad).join("dot-agent-deck"))),
+                DEFAULT_BINARY_NAME,
+                "{bad:?} must not reach generated text"
+            );
+        }
+        // A space is fine: quoting keeps it one shell word and it breaks no text.
+        assert_ne!(
+            resolve_binary_name(Ok(root.join("my deck").join("dot-agent-deck"))),
+            DEFAULT_BINARY_NAME
+        );
     }
 
     /// Issue #549: now that the command word is always the running executable's

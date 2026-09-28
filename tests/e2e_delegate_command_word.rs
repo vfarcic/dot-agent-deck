@@ -173,22 +173,34 @@ async fn delegate_020_inner(bin_dir: &str, inherited_path: &str) {
         .find(|l| l.contains(" work-done --task-file '"))
         .unwrap_or_else(|| panic!("no `work-done --task-file` line in the task file:\n{body}"))
         .replace("<summary-slug>", "delegate-020");
+    // The report path is the single-quoted value AFTER `--task-file`: the
+    // command word before it may itself be single-quoted (a path with a space).
     let report_rel = line
-        .split('\'')
-        .nth(1)
-        .unwrap_or_else(|| panic!("no single-quoted report path in {line:?}"));
+        .split_once("--task-file '")
+        .and_then(|(_, rest)| rest.split_once('\''))
+        .map(|(path, _)| path)
+        .unwrap_or_else(|| panic!("no single-quoted --task-file path in {line:?}"));
+    assert!(
+        report_rel.starts_with(".dot-agent-deck/") && !report_rel.contains(".."),
+        "the report path must be relative, under the worker's .dot-agent-deck/: {report_rel:?}"
+    );
     let report = cwd.path().join(report_rel);
     std::fs::write(&report, format!("{SENTINEL}\n")).expect("write the worker's report");
 
     // Control: in the worker's `$PATH` a bare `dot-agent-deck` really is the
     // shadow. Without this, a shadow that was never reachable would make the
     // assertion below pass for the wrong reason.
-    let control = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg("dot-agent-deck control")
-        .env("PATH", &worker_path)
-        .output()
-        .expect("run the control shell");
+    let control_path = worker_path.clone();
+    let control = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("dot-agent-deck control")
+            .env("PATH", control_path)
+            .output()
+    })
+    .await
+    .expect("join the control shell")
+    .expect("run the control shell");
     assert!(
         control.status.success() && marker.exists(),
         "control failed: a shell with the worker's $PATH must resolve a bare \

@@ -1769,6 +1769,21 @@ pub fn compose_delegate_prompt(task_body: &str) -> String {
     task_body.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Stand-in for the deck's command word in notice prose that goes through
+/// [`compose_delegate_prompt`], swapped for the real word by
+/// [`with_deck_command_word`] only AFTER the whitespace collapse (issue #549
+/// review): the word is an absolute path, and collapsing a run of spaces inside
+/// a quoted path would name a different file. No whitespace, and no character
+/// the scrubbed pane id interpolated beside it can contain.
+const DECK_BIN_SLOT: &str = "@@DOT_AGENT_DECK_BIN@@";
+
+/// Replace [`DECK_BIN_SLOT`] in an already-collapsed notice with
+/// [`crate::platform::paths::binary_name`]. That word contains no control
+/// character (`is_prose_safe_path`), so the notice stays one line.
+fn with_deck_command_word(notice: String) -> String {
+    notice.replace(DECK_BIN_SLOT, &crate::platform::paths::binary_name())
+}
+
 /// PRD #126 test/e2e seam: overrides the resolved worker-response timeout with
 /// an integer number of **milliseconds**, so a test can make the idle detector
 /// fire in a second or two instead of two hours. Read at use time (never
@@ -3921,8 +3936,8 @@ fn compose_delegate_silence_notice(window: std::time::Duration, pane_text: Optio
 ///   covers what remains: a `work-done` arriving after this report is to be
 ///   trusted over it.
 pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
-    let bin = crate::platform::paths::binary_name();
-    compose_delegate_prompt(&format!(
+    let bin = DECK_BIN_SLOT;
+    with_deck_command_word(compose_delegate_prompt(&format!(
         "⚠ delegated worker exited without work-done (dot-agent-deck daemon report) - a report \
          from the dot-agent-deck daemon, not a message from a person or an agent: the process \
          behind pane {worker_pane_id} ended and no work-done was ever received for its \
@@ -3933,7 +3948,7 @@ pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
          counts as owing it, so re-delegating to the same role needs `{bin} pane \
          restart <role>` first, or `delegate --supersede`. The daemon log names the role and how \
          long it had been delegated."
-    ))
+    )))
 }
 
 /// The single-line report the daemon SUBMITS into the ORCHESTRATOR's pane when
@@ -4030,8 +4045,8 @@ pub(crate) fn spawn_lift_replaced_quota_blocks(
 ///   orchestrator is told to check the card first, and to keep waiting if the
 ///   worker is working again.
 pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
-    let bin = crate::platform::paths::binary_name();
-    compose_delegate_prompt(&format!(
+    let bin = DECK_BIN_SLOT;
+    with_deck_command_word(compose_delegate_prompt(&format!(
         "⚠ delegated worker blocked by a provider usage limit (dot-agent-deck daemon report) - a \
          report from the dot-agent-deck daemon, not a message from a person or an agent: the \
          agent behind pane {worker_pane_id} is alive but it reports that its provider usage \
@@ -4042,7 +4057,7 @@ pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
          still counts as owing the task, so re-delegating to the same role needs \
          `{bin} pane restart <role>` first, or `delegate --supersede`. The daemon log \
          names the role."
-    ))
+    )))
 }
 
 /// The notice written into the ORCHESTRATOR's pane when a `clear = true`
