@@ -42579,6 +42579,337 @@ mod tests {
         assert_eq!(title_text(&cut), " 1 ab…");
         assert!(!title_text(&cut).contains(char::is_control));
     }
+
+    // -----------------------------------------------------------------------
+    // Issue #1369 — the status-line and empty-filter messages the glossary
+    // (#1045, PR #1342) reworded. Each test drives the real branch and then
+    // draws the whole frame into a `TestBackend`, pinning the text the user
+    // actually reads rather than only the `ui.status_message` field — so a
+    // later terminology regression in any of them fails here.
+    // -----------------------------------------------------------------------
+
+    /// Draw one full dashboard frame for `state` / `ui` into a 100x24
+    /// `TestBackend` and return every row, right-trimmed.
+    fn glossary_frame_rows(state: &AppState, ui: &mut UiState) -> Vec<String> {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let filtered = filter_sessions(state, ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                    zoomed: false,
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                    orchestration_statuses: vec![],
+                };
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    state,
+                    ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                    Utc::now(),
+                )
+            })
+            .unwrap();
+        buffer_to_string(terminal.backend().buffer())
+            .lines()
+            .map(|row| row.trim_end().to_string())
+            .collect()
+    }
+
+    /// The bottom (status) row of the frame `glossary_frame_rows` draws.
+    fn glossary_status_row(state: &SharedState, ui: &mut UiState) -> String {
+        let snapshot = state.blocking_read().clone();
+        glossary_frame_rows(&snapshot, ui)
+            .pop()
+            .expect("a 24-row frame has a bottom row")
+    }
+
+    /// The text of `ui.status_message`, for asserting the field and the
+    /// rendered row agree.
+    fn glossary_status_text(ui: &UiState) -> Option<&str> {
+        ui.status_message.as_ref().map(|(msg, _)| msg.as_str())
+    }
+
+    /// Scenario: Put two agents on the dashboard, apply a filter that matches
+    /// neither, and draw the frame. The sidebar must say "No agents match
+    /// filter." under a title counting `0/2 agent(s)` — the glossary's word,
+    /// not the old "sessions".
+    #[spec("dashboard/filter/005")]
+    #[test]
+    fn filter_005_zero_results_says_no_agents_match() {
+        let state = dashboard_snapshot(2);
+        let mut ui = default_ui();
+        ui.filter_text = "zzz-matches-nothing".to_string();
+        assert!(
+            filter_sessions(&state, &ui).is_empty(),
+            "precondition: the filter must hide every card"
+        );
+
+        let rows = glossary_frame_rows(&state, &mut ui);
+        let title = rows
+            .iter()
+            .find(|row| row.contains("dot-agent-deck"))
+            .expect("the dashboard title row is drawn");
+        let message = rows
+            .iter()
+            .find(|row| row.contains("match filter"))
+            .expect("the zero-result message is drawn");
+        insta::assert_snapshot!(
+            format!("{}\n{}", title.trim(), message.trim()),
+            @"
+            dot-agent-deck — 0/2 agent(s)
+            No agents match filter.
+            "
+        );
+    }
+
+    /// A controller whose every `focus_pane` fails with `CommandFailed` and
+    /// whose on-demand attach finds nothing — the genuinely stale card.
+    fn stale_card_pc() -> UnwiredPC {
+        UnwiredPC::new(false)
+    }
+
+    /// Scenario: Jump to a dashboard card (the `Ctrl+d` → digit path) whose
+    /// pane the daemon no longer has. The card is removed and the status line
+    /// reads "Removed stale agent: …" with the controller's reason.
+    #[spec("dashboard/status-message/001")]
+    #[test]
+    fn status_message_001_digit_jump_to_a_stale_card_says_removed_stale_agent() {
+        use tokio::sync::RwLock;
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        let pc = stale_card_pc();
+        let mut ui = default_ui();
+
+        assert!(focus_deck(0, &mut ui, &filtered, &snapshot, &state, &pc));
+
+        assert!(
+            !state.blocking_read().sessions.contains_key("s0"),
+            "precondition: the stale card is removed"
+        );
+        assert_eq!(
+            glossary_status_text(&ui),
+            Some("Removed stale agent: Pane p0 not found")
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  Removed stale agent: Pane p0 not found");
+    }
+
+    /// Scenario: Jump to a dashboard card that has no pane linked to it. The
+    /// deck stays on the dashboard and the status line reads "No pane linked
+    /// to agent <id>".
+    #[spec("dashboard/status-message/002")]
+    #[test]
+    fn status_message_002_digit_jump_to_a_paneless_card_says_no_pane_linked_to_agent() {
+        use tokio::sync::RwLock;
+        let mut snapshot = dashboard_snapshot(1);
+        snapshot.sessions.get_mut("s0").unwrap().pane_id = None;
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        let pc = stale_card_pc();
+        let mut ui = default_ui();
+
+        assert!(focus_deck(0, &mut ui, &filtered, &snapshot, &state, &pc));
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert_eq!(
+            glossary_status_text(&ui),
+            Some("No pane linked to agent s0")
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  No pane linked to agent s0");
+    }
+
+    /// Drive `Action::Focus` (Enter) on the one card of `snapshot` against `pc`.
+    fn glossary_enter_on_card(
+        snapshot: &AppState,
+        state: &SharedState,
+        pc: Arc<UnwiredPC>,
+        ui: &mut UiState,
+    ) {
+        let mut tab_manager = TabManager::new(pc.clone());
+        let filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        ui.selected_index = Some(0);
+        dispatch_action(
+            Action::Focus,
+            ui,
+            &*pc,
+            state,
+            &mut tab_manager,
+            snapshot,
+            &filtered,
+            Some("s0"),
+            Rect::new(0, 0, 100, 24),
+        );
+    }
+
+    /// Scenario: Press Enter on a dashboard card whose pane the daemon no
+    /// longer has. Enter carries its own copy of the stale-card branch, so it
+    /// is pinned separately: the status line reads "Removed stale agent: …".
+    #[spec("dashboard/status-message/003")]
+    #[test]
+    fn status_message_003_enter_on_a_stale_card_says_removed_stale_agent() {
+        use tokio::sync::RwLock;
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut ui = default_ui();
+
+        glossary_enter_on_card(&snapshot, &state, Arc::new(stale_card_pc()), &mut ui);
+
+        assert!(
+            !state.blocking_read().sessions.contains_key("s0"),
+            "precondition: the stale card is removed"
+        );
+        assert_eq!(
+            glossary_status_text(&ui),
+            Some("Removed stale agent: Pane p0 not found")
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  Removed stale agent: Pane p0 not found");
+    }
+
+    /// Scenario: Press Enter on a dashboard card that has no pane linked to
+    /// it. The deck stays on the dashboard and the status line reads "No pane
+    /// linked to agent <id>".
+    #[spec("dashboard/status-message/004")]
+    #[test]
+    fn status_message_004_enter_on_a_paneless_card_says_no_pane_linked_to_agent() {
+        use tokio::sync::RwLock;
+        let mut snapshot = dashboard_snapshot(1);
+        snapshot.sessions.get_mut("s0").unwrap().pane_id = None;
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut ui = default_ui();
+
+        glossary_enter_on_card(&snapshot, &state, Arc::new(stale_card_pc()), &mut ui);
+
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert_eq!(
+            glossary_status_text(&ui),
+            Some("No pane linked to agent s0")
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  No pane linked to agent s0");
+    }
+
+    /// Scenario: Ask for the config-generation prompt with no card selected.
+    /// There is nothing to send it to, so the prompt does not open and the
+    /// status line reads "No active agent to send prompt to."
+    #[spec("dashboard/status-message/005")]
+    #[test]
+    fn status_message_005_config_gen_without_a_target_says_no_active_agent() {
+        use tokio::sync::RwLock;
+        let snapshot = AppState::default();
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+
+        dispatch_action(
+            Action::RequestConfigGen,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 100, 24),
+        );
+
+        assert_ne!(ui.mode, UiMode::ConfigGenPrompt);
+        assert_eq!(
+            glossary_status_text(&ui),
+            Some("No active agent to send prompt to.")
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  No active agent to send prompt to.");
+    }
+
+    /// Scenario: Submit the new-agent form for a plain dashboard card and let
+    /// the controller create it. The deck enters the new pane and the status
+    /// line reads "Created agent <pane> in <dir>".
+    #[spec("dashboard/status-message/006")]
+    #[test]
+    fn status_message_006_successful_spawn_says_created_agent() {
+        use tokio::sync::RwLock;
+        let snapshot = AppState::default();
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+
+        dispatch_action(
+            Action::SpawnPane(Box::new(plain_card_request("/work/card"))),
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 100, 24),
+        );
+
+        assert_eq!(ui.mode, UiMode::PaneInput);
+        assert_eq!(
+            glossary_status_text(&ui),
+            Some("Created agent mock-pane-0 in /work/card")
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" TYPING  Created agent mock-pane-0 in /work/card                               [Command Mode Ctrl+D]");
+    }
+
+    /// Scenario: Submit the new-agent form for a plain dashboard card while
+    /// the controller refuses to create it. The deck stays on the dashboard
+    /// and the status line reads "New agent failed: …" with the reason.
+    #[spec("dashboard/status-message/007")]
+    #[test]
+    fn status_message_007_failed_spawn_says_new_agent_failed() {
+        use tokio::sync::RwLock;
+        let snapshot = AppState::default();
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let pc = Arc::new(RefusingPaneController {
+            error: "daemon refused the start".to_string(),
+            inner: CapturingPaneController::new(),
+        });
+        let mut tab_manager = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+
+        dispatch_action(
+            Action::SpawnPane(Box::new(plain_card_request("/work/card"))),
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 100, 24),
+        );
+
+        assert_ne!(ui.mode, UiMode::PaneInput);
+        assert_eq!(
+            glossary_status_text(&ui),
+            Some("New agent failed: Command failed: daemon refused the start")
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  New agent failed: Command failed: daemon refused the start");
+    }
 }
 
 #[cfg(test)]

@@ -413,6 +413,66 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** accepting or clearing the filter (covered by `dashboard/filter/002` and `dashboard/selection/004`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/filter/005 — A filter that matches no card says "No agents match filter." (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: `render_frame` into a ratatui `TestBackend`, inline `insta` snapshot of the title and message rows).
+- **Agent:** none (two synthetic dashboard cards).
+- **Asserts:** with two cards and a filter matching neither, the sidebar title reads `dot-agent-deck — 0/2 agent(s)` and the message reads `No agents match filter.` — the glossary's word (#1045), so a return to "sessions" fails the snapshot.
+- **Does not assert:** how the filter is typed or applied (covered by `dashboard/filter/001`-`004`); the zero-agent empty state.
+- **Platform coverage:** mac+linux+windows.
+
+#### dashboard/status-message
+
+The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a later terminology regression fails a test (issue #1369).
+
+##### dashboard/status-message/001 — The digit-jump to a stale card reports "Removed stale agent" (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: drives the branch against a mock `PaneController`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** `focus_deck` on a card whose `focus_pane` fails and whose on-demand attach finds nothing removes the card and the status row reads ` COMMAND  Removed stale agent: Pane p0 not found`.
+- **Does not assert:** the attach retry itself (covered by `dashboard/selection/003`, `020` and `021`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/status-message/002 — The digit-jump to a card with no pane reports "No pane linked to agent" (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: drives the branch against a mock `PaneController`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** `focus_deck` on a live card whose `pane_id` is unset stays in command mode and the status row reads ` COMMAND  No pane linked to agent s0`.
+- **Does not assert:** how a card comes to lack a pane.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/status-message/003 — Enter on a stale card reports "Removed stale agent" (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: drives the branch against a mock `PaneController`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** `dispatch_action(Action::Focus, …)` — Enter carries its own copy of the stale-card branch — removes the card and the status row reads ` COMMAND  Removed stale agent: Pane p0 not found`.
+- **Does not assert:** the attach retry itself (covered by `dashboard/selection/020` and `021`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/status-message/004 — Enter on a card with no pane reports "No pane linked to agent" (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: drives the branch against a mock `PaneController`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** `dispatch_action(Action::Focus, …)` on a live card whose `pane_id` is unset stays in command mode and the status row reads ` COMMAND  No pane linked to agent s0`.
+- **Does not assert:** how a card comes to lack a pane.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/status-message/005 — Asking for the config-generation prompt with no card selected reports "No active agent to send prompt to." (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: drives the branch against a mock `PaneController`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** `dispatch_action(Action::RequestConfigGen, …)` with no selected card does not open the prompt and the status row reads ` COMMAND  No active agent to send prompt to.`.
+- **Does not assert:** the prompt itself when a target exists (covered by `dashboard/config-gen`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/status-message/006 — A successful plain-card spawn reports "Created agent … in …" (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: drives the branch against a mock `PaneController`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** `dispatch_action(Action::SpawnPane(…), …)` for a plain dashboard card that the controller creates enters `PaneInput` and the status row reads ` TYPING  Created agent mock-pane-0 in /work/card` with the `[Command Mode Ctrl+D]` button at its right edge.
+- **Does not assert:** which tab the card lands on (covered by `tabs/spawn/001`-`003`); the mode and orchestration spawn paths.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/status-message/007 — A refused plain-card spawn reports "New agent failed" (issue #1369).
+- **Layer:** L1 (in-module `src/ui.rs` test: drives the branch against a mock `PaneController`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** `dispatch_action(Action::SpawnPane(…), …)` for a plain dashboard card that the controller refuses does not enter `PaneInput` and the status row reads ` COMMAND  New agent failed: Command failed: daemon refused the start`, the `Command failed:` prefix being `PaneError::CommandFailed`'s own `Display`.
+- **Does not assert:** the orchestration refusal that reopens the form (covered by `orchestration/identity/009`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/rename
 
 ##### dashboard/rename/001 — `r` on the selected card opens a rename input pre-filled with the current name.
