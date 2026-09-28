@@ -1263,7 +1263,18 @@ pub fn prepare_orchestration_for_wire(
 pub fn revalidate_preparation(
     binding: &crate::prep_token::PrepBinding,
 ) -> Result<(), PreparationStale> {
+    // The held directory is dropped here: this entry point answers a question
+    // and spawns nothing, so there is no later use for the object it verified.
     revalidate_approved_roles(binding).map(|_| ())
+}
+
+/// What [`revalidate_approved_roles`] passed: the roles the approved
+/// orchestration declares, and on Unix the project directory those checks
+/// verified, still open.
+struct ApprovedProject {
+    roles: Vec<ApprovedRole>,
+    #[cfg(unix)]
+    dir: VerifiedProjectDir,
 }
 
 /// [`revalidate_preparation`], plus the role identities the approved
@@ -1277,18 +1288,37 @@ pub fn revalidate_preparation(
 /// exists to close.
 fn revalidate_approved_roles(
     binding: &crate::prep_token::PrepBinding,
-) -> Result<Vec<ApprovedRole>, PreparationStale> {
+) -> Result<ApprovedProject, PreparationStale> {
     let dir = canonicalize_project_dir(&binding.project_dir)
         .map_err(|_| PreparationStale::ProjectUnresolved)?;
     if dir != binding.project_dir {
         return Err(PreparationStale::ProjectMoved);
     }
-    let identity = std::fs::symlink_metadata(&dir)
-        .ok()
-        .as_ref()
-        .and_then(crate::prep_token::inode_identity);
-    if identity != binding.project_identity {
-        return Err(PreparationStale::ProjectReplaced);
+    // Issue #1233 item 2: the identity is read from an open descriptor, not a
+    // second pathname lookup, and the descriptor is KEPT — it is what the spawn
+    // enters (`crate::agent_pty::spawn_in`). Every failure of the open is the
+    // same finding the old `symlink_metadata` comparison reached for it: the
+    // path now names no directory (`ENOENT`), a symlink (`ELOOP` under
+    // `O_NOFOLLOW`) or a non-directory (`ENOTDIR`) — none of which is the
+    // directory this preparation approved.
+    #[cfg(unix)]
+    let verified_dir = {
+        let verified =
+            VerifiedProjectDir::open(&dir).map_err(|_| PreparationStale::ProjectReplaced)?;
+        if Some(verified.identity()) != binding.project_identity {
+            return Err(PreparationStale::ProjectReplaced);
+        }
+        verified
+    };
+    #[cfg(not(unix))]
+    {
+        let identity = std::fs::symlink_metadata(&dir)
+            .ok()
+            .as_ref()
+            .and_then(crate::prep_token::inode_identity);
+        if identity != binding.project_identity {
+            return Err(PreparationStale::ProjectReplaced);
+        }
     }
 
     let (config, revision) =
@@ -1330,7 +1360,11 @@ fn revalidate_approved_roles(
     if context_digest(&content) != binding.context_digest {
         return Err(PreparationStale::ContextRewritten);
     }
-    Ok(approved_roles)
+    Ok(ApprovedProject {
+        roles: approved_roles,
+        #[cfg(unix)]
+        dir: verified_dir,
+    })
 }
 
 /// One role of the orchestration a preparation approved, as the config declares
@@ -1365,6 +1399,105 @@ pub struct PreparedRoleConfig {
     pub start: bool,
     pub command: String,
     pub agent_type: Option<crate::event::AgentType>,
+}
+
+/// What [`verify_prepared_start_role`] answers: the configured role the request
+/// was matched to, and — on Unix — the project directory the staleness checks
+/// verified, **held open** (issue #1233 item 2).
+///
+/// **Daemon-side only**, like [`PreparedRoleConfig`]: nothing here reaches the
+/// wire.
+#[derive(Debug)]
+pub struct VerifiedPreparedStart {
+    pub role: PreparedRoleConfig,
+    /// The directory object whose identity matched the binding. The daemon arm
+    /// holds this until the spawn has returned and hands it to
+    /// [`crate::agent_pty::AgentPtyRegistry::spawn_agent_in`], so the child is
+    /// started in the object that was checked rather than in whatever the
+    /// pathname names by then.
+    #[cfg(unix)]
+    pub project_dir: VerifiedProjectDir,
+}
+
+/// A project directory opened once and identified from the open descriptor
+/// (issue #1233 item 2).
+///
+/// The check it replaces read the identity with `symlink_metadata(path)`, and the
+/// spawn then entered the directory by `cmd.cwd(path)` — two pathname lookups
+/// with the whole config and context re-validation between them, so a directory
+/// renamed away and replaced after the check was the one the agent started in.
+/// Here the identity is the `fstat` of a descriptor opened with
+/// `O_DIRECTORY | O_NOFOLLOW`, so what was checked is an **object**, and the
+/// spawn can enter that object (on Linux, through `/proc/self/fd/N` — see
+/// [`crate::agent_pty::spawn_in`]) or at least re-compare the pathname against it
+/// (every other Unix).
+///
+/// `cfg(unix)` because the verbs that mint a prepared start are refused on every
+/// other platform (`crate::daemon_protocol::PROJECT_ERR_UNSUPPORTED_PLATFORM`),
+/// and there is no inode identity to hold there anyway.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct VerifiedProjectDir {
+    fd: std::os::fd::OwnedFd,
+    identity: crate::prep_token::InodeIdentity,
+}
+
+#[cfg(unix)]
+impl VerifiedProjectDir {
+    /// Open `path` as a directory without following a final symlink, and read
+    /// its identity from the descriptor.
+    ///
+    /// `O_CLOEXEC` so the descriptor never outlives an `execve` — it is only
+    /// ever meant to be visible to a forked child *before* the exec, which is
+    /// where the Linux spawn path's `chdir` runs. `O_NONBLOCK` is not needed:
+    /// `O_DIRECTORY` refuses a FIFO before any blocking open could happen.
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_dir() {
+            // `O_DIRECTORY` already guarantees this; checked from the handle
+            // anyway so the type's invariant does not rest on one flag's
+            // spelling across every Unix.
+            return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+        let identity = crate::prep_token::inode_identity(&metadata)
+            .ok_or_else(|| std::io::Error::other("no inode identity on this platform"))?;
+
+        let mut fd: OwnedFd = file.into();
+        // The Linux spawn path names this descriptor inside the forked child,
+        // AFTER std has `dup2`'d the PTY onto 0, 1 and 2 and BEFORE the `chdir`.
+        // A daemon started with a closed stdio slot would have handed us one of
+        // those numbers, and the child's `/proc/self/fd/N` would then be the
+        // PTY. Moving it above 2 up front makes that impossible by construction.
+        if fd.as_raw_fd() <= libc::STDERR_FILENO {
+            // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` on a descriptor we own; the
+            // result is a fresh descriptor we take sole ownership of.
+            let dup = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if dup < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            fd = unsafe { OwnedFd::from_raw_fd(dup) };
+        }
+        Ok(Self { fd, identity })
+    }
+
+    /// The `(dev, ino)` the descriptor was verified against.
+    pub fn identity(&self) -> crate::prep_token::InodeIdentity {
+        self.identity
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for VerifiedProjectDir {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
 }
 
 /// Why a preparation no longer describes what it approved.
@@ -1656,11 +1789,18 @@ pub fn verify_prepared_start(
 /// property that keeps an opted-in start inside the existing staleness gate: an
 /// edited config refuses with `stale-preparation`, and no command from it runs.
 ///
+/// On Unix it also answers the project directory the identity check verified,
+/// **still open** ([`VerifiedPreparedStart::project_dir`], issue #1233 item 2).
+/// A caller that spawns must hand that to
+/// [`crate::agent_pty::AgentPtyRegistry::spawn_agent_in`] rather than dropping
+/// it and spawning by pathname, or the check proves nothing about the directory
+/// the agent starts in.
+///
 /// **Blocking** — the caller goes through [`run_bounded`].
 pub fn verify_prepared_start_role(
     binding: &crate::prep_token::PrepBinding,
     request: &PreparedStartRequest,
-) -> Result<PreparedRoleConfig, PreparedStartRefusal> {
+) -> Result<VerifiedPreparedStart, PreparedStartRefusal> {
     use PreparedStartRefusal::{Mismatch, Stale};
 
     // The prepared directory as the daemon spelled it. `canonicalize_project_dir`
@@ -1683,8 +1823,9 @@ pub fn verify_prepared_start_role(
         return Err(Mismatch(PreparationMismatch::OrchestrationCwdDiffers));
     }
 
-    let approved_roles = revalidate_approved_roles(binding).map_err(Stale)?;
-    let Some(role) = approved_roles
+    let approved = revalidate_approved_roles(binding).map_err(Stale)?;
+    let Some(role) = approved
+        .roles
         .iter()
         .find(|role| role.name == membership.role)
     else {
@@ -1693,11 +1834,16 @@ pub fn verify_prepared_start_role(
     if role.start != membership.is_start_role {
         return Err(Mismatch(PreparationMismatch::StartMarkerDiffers));
     }
-    Ok(PreparedRoleConfig {
+    let role = PreparedRoleConfig {
         name: role.name.clone(),
         start: role.start,
         command: role.command.clone(),
         agent_type: role.agent_type.clone(),
+    };
+    Ok(VerifiedPreparedStart {
+        role,
+        #[cfg(unix)]
+        project_dir: approved.dir,
     })
 }
 

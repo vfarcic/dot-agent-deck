@@ -3735,6 +3735,12 @@ async fn handle_connection(
             // not the launch it approved (`preparation-mismatch`).
             let mut configured_role: Option<(crate::project_resolve::PreparedRoleConfig, String)> =
                 None;
+            // Issue #1233 item 2: the project directory the check below verified,
+            // HELD OPEN from the verification until `spawn_agent_in` returns, so
+            // the child starts in the object that was checked rather than in
+            // whatever the pathname names by the time the PTY forks.
+            #[cfg(unix)]
+            let mut prepared_dir: Option<crate::project_resolve::VerifiedProjectDir> = None;
             if let Some(token) = prepared_token.as_deref() {
                 let Some(binding) = crate::prep_token::binding(token) else {
                     write_resp(
@@ -3780,8 +3786,12 @@ async fn handle_connection(
                 })
                 .await;
                 let refusal = match outcome {
-                    Ok(Ok(role)) => {
-                        configured_role = Some((role, coordinator_prompt));
+                    Ok(Ok(verified)) => {
+                        #[cfg(unix)]
+                        {
+                            prepared_dir = Some(verified.project_dir);
+                        }
+                        configured_role = Some((verified.role, coordinator_prompt));
                         None
                     }
                     Ok(Err(refusal)) => {
@@ -4008,7 +4018,19 @@ async fn handle_connection(
                 tab_membership,
                 agent_type,
             };
-            match registry.spawn_agent(opts) {
+            #[cfg(unix)]
+            let spawned = match prepared_dir.as_ref() {
+                Some(dir) => registry.spawn_agent_in(opts, dir),
+                None => registry.spawn_agent(opts),
+            };
+            #[cfg(not(unix))]
+            let spawned = registry.spawn_agent(opts);
+            // The child has entered its directory (or the spawn failed), so the
+            // held descriptor has done its job; it is `CLOEXEC` and never reached
+            // the agent.
+            #[cfg(unix)]
+            drop(prepared_dir);
+            match spawned {
                 Ok(id) => {
                     // PRD #1223 M7: deliver the authoring seed through the path
                     // this agent already has, never a new one (#528). A Pi pane
@@ -4186,7 +4208,22 @@ async fn handle_connection(
                             .await
                             .release_orchestration_title_claim(identity);
                     }
-                    write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?
+                    // Issue #1233 item 2: the verified directory moved between the
+                    // check and the fork. That is a staleness finding like every
+                    // other, so it gets the same one wire sentence and its cause
+                    // stays in this log.
+                    let message = match &e {
+                        crate::agent_pty::AgentPtyError::PreparedDirChanged(detail) => {
+                            warn!(
+                                reason = %detail,
+                                "start-prepared-agent refused: the prepared project directory \
+                                 changed before the spawn"
+                            );
+                            crate::project_resolve::stale_preparation_refusal()
+                        }
+                        _ => e.to_string(),
+                    };
+                    write_resp(&mut stream, &AttachResponse::err(message)).await?
                 }
             }
         }

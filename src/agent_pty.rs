@@ -889,6 +889,14 @@ pub enum AgentPtyError {
     /// Reject the spawn loudly instead.
     #[error("Duplicate pane id: {0}")]
     DuplicatePaneId(String),
+    /// A prepared start's verified project directory could not be entered as
+    /// the object that was verified (issue #1233 item 2): the pathname is no
+    /// longer a directory, or — where the spawn has to enter it by pathname —
+    /// it now names a different one. The payload is a daemon-local detail; the
+    /// attach arm answers the wire with the one `stale-preparation` sentence
+    /// every other staleness finding gets.
+    #[error("Prepared project directory changed before the spawn: {0}")]
+    PreparedDirChanged(&'static str),
 }
 
 /// How to spawn an agent.
@@ -1234,8 +1242,125 @@ impl Drop for PtyGuard {
     }
 }
 
+/// The verified directory a spawn may be asked to enter: only a prepared start
+/// has one, and only on Unix, where the prepared verbs exist.
+#[cfg(unix)]
+type SpawnDir<'a> = Option<&'a crate::project_resolve::VerifiedProjectDir>;
+/// Uninhabited off Unix, so every spawn there takes the pathname.
+#[cfg(not(unix))]
+type SpawnDir<'a> = Option<&'a std::convert::Infallible>;
+
 /// Spawn a new PTY-attached child process.
 pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
+    spawn_with_dir(opts, None)
+}
+
+/// [`spawn`], with the child started in `dir` — the project directory a prepared
+/// start's staleness checks verified and held open (issue #1233 item 2).
+///
+/// `opts.cwd` stays what it always was, the pathname: it is the metadata the
+/// registry stores and a respawn replays. It is **not** what the child enters.
+///
+/// * **Linux:** the child's working directory is `/proc/self/fd/N`, where `N`
+///   is `dir`'s descriptor. The parent's `is_dir()` check (portable-pty's) and
+///   the pre-flight `stat` below follow that magic link to the held object; in
+///   the forked child `/proc/self` is the child, whose copied fd table still
+///   holds `N`, so its `chdir` enters **the verified directory object** whatever
+///   the pathname names by then. `O_CLOEXEC` closes `N` at `execve`, and
+///   portable-pty's `close_random_fds` closes it even earlier. If `/proc` does
+///   not answer with the verified identity, this falls back to the other-Unix
+///   path rather than trusting it.
+/// * **Every other Unix:** the pathname is re-`stat`ed immediately before
+///   `spawn_command` and must match `dir`'s identity, or the spawn is refused.
+///   **That narrows the window without closing it**: a rename-and-replace
+///   between that `stat` and the child's `chdir` still lands the agent in the
+///   replacement. Closing it needs control of the exec that portable-pty 0.8.1
+///   does not give (no caller `pre_exec`, and `close_random_fds` closes every
+///   inherited descriptor above 2) — the follow-up options are in issue #1233.
+/// * **Both:** a pathname that is not a directory at spawn time is refused,
+///   never silently replaced by `$HOME` — which is what portable-pty's
+///   `as_command` does with a cwd that fails its `is_dir()` filter.
+///
+/// **The premise the Linux path rests on, read from the toolchain's own std
+/// source (rustc 1.97.1, `library/std/src/sys/process/unix/unix.rs`)** rather
+/// than assumed: `Command::spawn` tries `posix_spawn` first, and `posix_spawn`
+/// returns `Ok(None)` — falling back to `fork` + `do_exec` — whenever
+/// `!self.get_closures().is_empty()`, and portable-pty's
+/// `UnixSlavePty::spawn_command` always installs a `pre_exec`. In `do_exec` the
+/// order is `dup2` of stdio → `setgroups`/`setgid`/`setuid` → `chroot` →
+/// **`chdir(cwd)`** → `setpgid`/`setsid` → signal reset → **the `pre_exec`
+/// closures** (portable-pty's `setsid`, `TIOCSCTTY` and `close_random_fds`) →
+/// `execvp`. So the `chdir` runs while `N` is still open in the child, and after
+/// the `dup2` onto 0–2 — which is why
+/// [`crate::project_resolve::VerifiedProjectDir::open`] keeps `N` above 2. A
+/// `chdir` failure there is returned from `spawn` as an error, not ignored.
+#[cfg(unix)]
+pub fn spawn_in(
+    opts: SpawnOptions<'_>,
+    dir: &crate::project_resolve::VerifiedProjectDir,
+) -> Result<AgentPty, AgentPtyError> {
+    spawn_with_dir(opts, Some(dir))
+}
+
+/// Where a prepared start's child enters — see [`spawn_in`] for the per-platform
+/// rules. Called immediately before `spawn_command`, so the other-Unix
+/// comparison is as late as the parent can make it.
+#[cfg(unix)]
+fn prepared_spawn_cwd(
+    path: Option<&str>,
+    dir: &crate::project_resolve::VerifiedProjectDir,
+) -> Result<std::ffi::OsString, AgentPtyError> {
+    // A prepared start always carries its cwd (the binding check compared it),
+    // so `None` here is a caller that bypassed that check.
+    let Some(path) = path else {
+        return Err(AgentPtyError::PreparedDirChanged(
+            "a prepared start carried no working directory",
+        ));
+    };
+    // `metadata`, not `symlink_metadata`: this asks what a `chdir(path)` would
+    // enter, and `chdir` follows symlinks.
+    let by_path = std::fs::metadata(path);
+    if !by_path.as_ref().is_ok_and(|m| m.is_dir()) {
+        return Err(AgentPtyError::PreparedDirChanged(
+            "the prepared working directory is no longer a directory",
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let via_fd = format!("/proc/self/fd/{}", dir.as_fd().as_raw_fd());
+        let matches = std::fs::metadata(&via_fd)
+            .ok()
+            .filter(|m| m.is_dir())
+            .as_ref()
+            .and_then(crate::prep_token::inode_identity)
+            == Some(dir.identity());
+        if matches {
+            return Ok(via_fd.into());
+        }
+        tracing::warn!(
+            "prepared spawn: /proc/self/fd did not resolve to the verified project directory; \
+             falling back to a pathname re-check"
+        );
+    }
+
+    let identity = by_path
+        .ok()
+        .as_ref()
+        .and_then(crate::prep_token::inode_identity);
+    if identity != Some(dir.identity()) {
+        return Err(AgentPtyError::PreparedDirChanged(
+            "the prepared working directory was replaced after it was verified",
+        ));
+    }
+    Ok(path.into())
+}
+
+fn spawn_with_dir(
+    opts: SpawnOptions<'_>,
+    verified_dir: SpawnDir<'_>,
+) -> Result<AgentPty, AgentPtyError> {
     // Mirror the `resize` bounds at spawn time: reject 0 rows/cols and clamp
     // oversized values down to [`PTY_RESIZE_DIM_MAX`]. Without this, a same-uid
     // attach-socket peer issuing `StartAgent { rows: 0, cols: 0 }` (or
@@ -1316,7 +1441,11 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
         None => CommandBuilder::new(&default_shell),
     };
 
-    if let Some(dir) = opts.cwd {
+    // A prepared start's cwd is decided immediately before `spawn_command`
+    // below, from the verified directory, rather than here.
+    if verified_dir.is_none()
+        && let Some(dir) = opts.cwd
+    {
         cmd.cwd(dir);
     }
 
@@ -1423,6 +1552,16 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
             crate::lifetime_tag::DOT_AGENT_DECK_TEST_LIFETIME_TAG,
             tag.value(),
         );
+    }
+
+    // Issue #1233 item 2: as late as the parent can decide it. See `spawn_in`.
+    #[cfg(unix)]
+    if let Some(dir) = verified_dir {
+        cmd.cwd(prepared_spawn_cwd(opts.cwd, dir)?);
+    }
+    #[cfg(not(unix))]
+    if let Some(never) = verified_dir {
+        match *never {}
     }
 
     let child = pair
@@ -7082,9 +7221,32 @@ impl AgentPtyRegistry {
     }
 
     /// Spawn a new agent and return its registry id.
-    pub fn spawn_agent(
+    pub fn spawn_agent(self: &Arc<Self>, opts: SpawnOptions<'_>) -> Result<String, AgentPtyError> {
+        self.spawn_agent_with_dir(opts, None)
+    }
+
+    /// [`Self::spawn_agent`], with the child started in the prepared start's
+    /// verified project directory rather than by `opts.cwd`'s pathname — see
+    /// [`spawn_in`] (issue #1233 item 2). `opts.cwd` is still what the registry
+    /// stores and a respawn replays.
+    ///
+    /// An entry point rather than a [`SpawnOptions`] field, deliberately: that
+    /// struct is built as a literal at a couple of hundred sites with no
+    /// `..Default::default()`, and a held descriptor is a property of one call,
+    /// not something a respawn could replay.
+    #[cfg(unix)]
+    pub fn spawn_agent_in(
+        self: &Arc<Self>,
+        opts: SpawnOptions<'_>,
+        dir: &crate::project_resolve::VerifiedProjectDir,
+    ) -> Result<String, AgentPtyError> {
+        self.spawn_agent_with_dir(opts, Some(dir))
+    }
+
+    fn spawn_agent_with_dir(
         self: &Arc<Self>,
         mut opts: SpawnOptions<'_>,
+        dir: SpawnDir<'_>,
     ) -> Result<String, AgentPtyError> {
         // CodeRabbit MAJOR (PRD #92 PR #105): Guard A — reject the spawn
         // immediately if the registry has already entered its shutdown
@@ -7389,7 +7551,7 @@ impl AgentPtyRegistry {
         // `agents.insert` below — where lock poisoning on `inner.lock()`
         // would otherwise drop the `AgentPty` without killing the child
         // (`AgentPty` has no `Drop`).
-        let guard = PtyGuard::new(spawn(opts)?);
+        let guard = PtyGuard::new(spawn_with_dir(opts, dir)?);
         // PRD #745 M11: the child exists as of the line above, so this is the
         // instant to record — before the lock acquisition below, which can
         // block behind any other registry operation. An OBSERVATION of when the
@@ -14680,6 +14842,121 @@ mod spawn_tests {
         }
 
         registry.close_agent(&id).unwrap();
+    }
+
+    /// Issue #1233 item 2: open `dir` as a prepared start's verified handle, then
+    /// rename it to `<dir>.old` and put a fresh directory at the old name — the
+    /// rename-and-replace the pathname-based spawn could not see.
+    #[cfg(unix)]
+    fn verify_then_replace(
+        dir: &std::path::Path,
+    ) -> (
+        crate::project_resolve::VerifiedProjectDir,
+        std::path::PathBuf,
+    ) {
+        let verified =
+            crate::project_resolve::VerifiedProjectDir::open(dir).expect("open the project dir");
+        let old = dir.with_extension("old");
+        std::fs::rename(dir, &old).expect("move the verified directory away");
+        std::fs::create_dir(dir).expect("put a replacement at the verified path");
+        (verified, old)
+    }
+
+    /// A child that writes `marker` into its working directory and exits.
+    fn marker_writer(cwd: &str) -> SpawnOptions<'_> {
+        SpawnOptions {
+            command: Some("echo x > marker"),
+            cwd: Some(cwd),
+            env: vec![("SHELL".into(), "/bin/sh".into())],
+            ..SpawnOptions::default()
+        }
+    }
+
+    /// Issue #1233 item 2: the child of a prepared start runs in the directory
+    /// OBJECT the staleness checks verified, not in whatever its pathname names by
+    /// the time the PTY forks. Handing `cmd.cwd` the pathname instead of
+    /// `/proc/self/fd/N` puts the marker in the replacement and fails this.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_in_enters_the_verified_directory_even_after_its_path_is_replaced() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).expect("create the project dir");
+        let (verified, old) = verify_then_replace(&dir);
+
+        let path = dir.to_str().expect("utf-8 tempdir");
+        let pty = spawn_in(marker_writer(path), &verified).expect("spawn should succeed");
+        let mut child = pty.child;
+        let status = child.wait().expect("wait should succeed");
+        assert!(status.success(), "the marker writer failed: {status:?}");
+
+        assert!(
+            old.join("marker").exists(),
+            "the child must have run in the verified directory, now at {}",
+            old.display()
+        );
+        assert!(
+            !dir.join("marker").exists(),
+            "the child ran in the replacement at the verified path"
+        );
+    }
+
+    /// Issue #1233 item 2, every other Unix: the pathname is re-checked against
+    /// the verified identity immediately before the spawn, and a replacement is
+    /// refused rather than entered. (The residual window after that check is
+    /// documented on `spawn_in`.)
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn spawn_in_refuses_a_verified_directory_whose_path_was_replaced() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).expect("create the project dir");
+        let (verified, old) = verify_then_replace(&dir);
+
+        let path = dir.to_str().expect("utf-8 tempdir");
+        let Err(err) = spawn_in(marker_writer(path), &verified) else {
+            panic!("a replaced prepared directory must be refused");
+        };
+        assert!(
+            matches!(err, AgentPtyError::PreparedDirChanged(_)),
+            "expected PreparedDirChanged, got {err:?}"
+        );
+        assert!(!dir.join("marker").exists());
+        assert!(!old.join("marker").exists());
+    }
+
+    /// Issue #1233 item 2: a prepared start whose pathname is no longer a
+    /// directory is refused on every Unix. portable-pty's `as_command` would
+    /// otherwise have replaced the cwd with `$HOME` without a word, so this pins
+    /// that a prepared start never reaches that fallback — no child is spawned
+    /// at all.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_in_refuses_a_prepared_cwd_that_is_not_a_directory() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).expect("create the project dir");
+        let verified =
+            crate::project_resolve::VerifiedProjectDir::open(&dir).expect("open the project dir");
+        std::fs::rename(&dir, dir.with_extension("old")).expect("move it away");
+        std::fs::write(&dir, b"not a directory").expect("put a file at the verified path");
+
+        let path = dir.to_str().expect("utf-8 tempdir");
+        let Err(err) = spawn_in(marker_writer(path), &verified) else {
+            panic!("a prepared cwd that is not a directory must be refused");
+        };
+        assert!(
+            matches!(err, AgentPtyError::PreparedDirChanged(_)),
+            "expected PreparedDirChanged, got {err:?}"
+        );
+
+        // And through the registry entry point the daemon arm uses.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let Err(err) = registry.spawn_agent_in(marker_writer(path), &verified) else {
+            panic!("spawn_agent_in must refuse the same prepared cwd");
+        };
+        assert!(matches!(err, AgentPtyError::PreparedDirChanged(_)));
+        assert!(registry.is_empty(), "a refused spawn must register nothing");
     }
 
     #[test]
