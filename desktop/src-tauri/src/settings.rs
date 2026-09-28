@@ -2231,6 +2231,24 @@ pub fn load_snapshot() -> DesktopSettingsSnapshot {
     load_snapshot_at(&settings_path(), &crate::decks::remotes_path())
 }
 
+/// The settings document alone — appearance, zoom, voice — for a caller that
+/// needs no deck: [`load_snapshot`] without the shared deck list.
+///
+/// Issue #1350's review: voice control polls its speech settings four times a
+/// second while the microphone is open, from async commands, and since the
+/// decks moved to `remotes.toml` every [`load_snapshot`] also reads and parses
+/// that file. None of those callers looks at a deck, so they read through here
+/// and never touch `remotes.toml`. The `endpoints.remote` rows it returns are
+/// whatever `desktop.toml` holds — none, once migrated — so nothing may read
+/// decks off it.
+pub fn load_settings_without_decks() -> DesktopSettings {
+    let (settings, problem) = load_document(&settings_path());
+    if let Some(problem) = &problem {
+        log_document_problem(problem);
+    }
+    settings
+}
+
 /// [`load_snapshot`] against explicit paths for the settings document and the
 /// shared deck list (issue #1350).
 ///
@@ -9800,6 +9818,25 @@ level = 1.0
         );
         assert_eq!(endpoints.remote[1].host.as_str(), "fresh.example");
         assert!(!std::fs::read_to_string(&path).unwrap().contains("remote"));
+    }
+
+    /// Issue #1350's review: the voice poll's settings read skips the shared
+    /// deck list — it returns the document without attaching any deck, where
+    /// the full snapshot attaches the registry's.
+    #[test]
+    fn the_deck_free_load_does_not_read_the_deck_list() {
+        let env = IsolatedSettingsEnv::new();
+        std::fs::write(env._dir.path().join("remotes.toml"), CLI_DECK).unwrap();
+        std::fs::write(
+            env._dir.path().join(SETTINGS_FILE_NAME),
+            "version = 1\n\n[appearance]\nmode = \"dark\"\n",
+        )
+        .unwrap();
+
+        let settings = load_settings_without_decks();
+        assert_eq!(settings.appearance.mode, AppearanceMode::Dark);
+        assert!(settings.endpoints.is_none(), "{:?}", settings.endpoints);
+        assert_eq!(row_ids(&load_snapshot().settings), ["n-prod"]);
     }
 
     /// B1 of #1350's review: loading a snapshot writes nothing, even against a

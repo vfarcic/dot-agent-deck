@@ -2635,15 +2635,18 @@ pub struct VoiceStatus {
 /// everywhere else. At a few tens of microseconds each that is not worth
 /// caching away the freshness above.
 ///
-/// One consequence is worth naming rather than discovering: `load_snapshot`
+/// It reads `desktop.toml` alone, through `load_settings_without_decks`, so the
+/// poll never touches the shared `remotes.toml` a full `load_snapshot` also
+/// parses (issue #1350's review).
+///
+/// One consequence is worth naming rather than discovering: the load
 /// logs a malformed document through `log_document_problem`, which is a bare
 /// `eprintln!` with no rate limit. A `desktop.toml` this build cannot parse
 /// therefore writes four stderr lines a second while voice is on, where it
 /// wrote one. It is a misconfiguration either way, and the fix — if it ever
 /// matters — is a log-once latch in `settings.rs` rather than a cache here.
 fn voice_speech_settings() -> crate::settings::TranscriptionSettings {
-    crate::settings::load_snapshot()
-        .settings
+    crate::settings::load_settings_without_decks()
         .voice
         .unwrap_or_default()
         .transcription
@@ -3023,8 +3026,7 @@ async fn desktop_voice_resolve(
     // Read per call rather than cached, for `voice_speech_settings`'s reason: a
     // user who changes the backend, the endpoint or the model uses it on the
     // next utterance instead of after a restart.
-    let settings = crate::settings::load_snapshot()
-        .settings
+    let settings = crate::settings::load_settings_without_decks()
         .voice
         .unwrap_or_default();
     let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
@@ -3338,8 +3340,7 @@ async fn desktop_voice_commands(
         new_agent.as_ref(),
         // Read per call, for `desktop_voice_resolve`'s reason: the overlay says
         // what the NEXT utterance can do, so it follows the label choice too.
-        crate::settings::load_snapshot()
-            .settings
+        crate::settings::load_settings_without_decks()
             .voice
             .unwrap_or_default()
             .labels,
@@ -5678,9 +5679,9 @@ mod tests {
     /// user could do about it from inside this app.
     #[test]
     fn a_refused_inhibit_does_not_take_voice_with_it() {
-        // `voice_status` reads the speech settings through `load_snapshot`, so
+        // `voice_status` reads the speech settings from `desktop.toml`, so
         // point it at files this test owns rather than the developer's real
-        // `desktop.toml` and `remotes.toml` (issue #1350).
+        // ones (issue #1350).
         let _settings = crate::settings::IsolatedSettingsEnv::new();
         let source =
             voice::StubSource::tone(voice::AudioFormat::new(voice::TARGET_SAMPLE_RATE, 1), 1.0);
