@@ -5987,6 +5987,7 @@ fn surface_one_orchestration(
             // reasoning, including the `None == None` degeneracy in
             // `delegate_targets` that a TUI-side router would silently hit, is
             // on the grow-existing-tab registration earlier in this function.
+            let orch_idx = orch_config.orchestrator_role_index();
             for (i, role) in orch_config.roles.iter().enumerate() {
                 if let Some(Some(pane_id)) = role_pane_ids.get(i)
                     && !is_dead_slot_pane_id(pane_id)
@@ -5994,7 +5995,7 @@ fn surface_one_orchestration(
                     st.register_pane(pane_id.clone());
                     st.pane_role_map.insert(pane_id.clone(), role.name.clone());
                     st.pane_cwd_map.insert(pane_id.clone(), surface.cwd.clone());
-                    if role.start {
+                    if i == orch_idx {
                         st.orchestrator_pane_ids.insert(pane_id.clone());
                     }
                 }
@@ -11114,12 +11115,13 @@ fn dispatch_action(
                                 // TUI-side router would silently hit, is on the
                                 // first of these registrations in
                                 // `surface_one_orchestration`.
+                                let orch_idx = orch_config.orchestrator_role_index();
                                 for (i, role) in orch_config.roles.iter().enumerate() {
                                     st.pane_role_map
                                         .insert(role_pane_ids[i].clone(), role.name.clone());
                                     st.pane_cwd_map
                                         .insert(role_pane_ids[i].clone(), dir_str.clone());
-                                    if role.start {
+                                    if i == orch_idx {
                                         st.orchestrator_pane_ids.insert(role_pane_ids[i].clone());
                                     }
                                 }
@@ -11140,8 +11142,10 @@ fn dispatch_action(
                                         .insert(role_pane_ids[i].clone(), declared);
                                 }
                             }
-                            let start_idx =
-                                orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+                            // Issue #523: the pane the tab seated as the
+                            // orchestrator — its `start_role_index`, by the one
+                            // rule — so the prompt goes where the focus did.
+                            let start_idx = orch_config.orchestrator_role_index();
                             // PRD #20 R20-003 (finding #5): capture the START
                             // role's delivery IDENTITY *now* — immediately after
                             // `open_orchestration_tab` created the role panes —
@@ -13278,7 +13282,7 @@ pub fn run_tui(
             // Now register the orchestrator pane mapping for any live
             // start role so M5 dispatch keeps routing work-done events
             // back to the right place.
-            let start_role_index = orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+            let start_role_index = orch_config.orchestrator_role_index();
             let orchestrator_pane = role_pane_ids.get(start_role_index).and_then(|s| s.clone());
             match tab_manager.open_orchestration_tab_with_existing_role_panes(
                 &orch_config,
@@ -13334,7 +13338,7 @@ pub fn run_tui(
                             }
                             st.pane_role_map.insert(pane_id.clone(), role.name.clone());
                             st.pane_cwd_map.insert(pane_id.clone(), bucket.cwd.clone());
-                            if role.start {
+                            if i == start_role_index {
                                 st.orchestrator_pane_ids.insert(pane_id.clone());
                             }
                         }
@@ -13512,6 +13516,7 @@ pub fn run_tui(
                                     // TUI-side router would silently hit, is on
                                     // the first of these registrations in
                                     // `surface_one_orchestration`.
+                                    let orch_idx = orch_config.orchestrator_role_index();
                                     for (i, role) in orch_config.roles.iter().enumerate() {
                                         st.pane_role_map
                                             .insert(role_pane_ids[i].clone(), role.name.clone());
@@ -13519,7 +13524,7 @@ pub fn run_tui(
                                             role_pane_ids[i].clone(),
                                             saved_pane.dir.clone(),
                                         );
-                                        if role.start {
+                                        if i == orch_idx {
                                             st.orchestrator_pane_ids
                                                 .insert(role_pane_ids[i].clone());
                                         }

@@ -427,7 +427,16 @@ pub fn decide_target_with_override(
 }
 
 /// Flatten one orchestration's configured roles into [`RoleSpawn`]s.
+///
+/// `is_start_role` is the orchestrator SEAT, not the bare `start` flag: it is
+/// computed here, once, by [`OrchestrationConfig::orchestrator_role_index`]
+/// (issue #523), so the membership stamped on each pane, the surface the TUI
+/// builds the tab from and the `orchestrator_pane_ids` registration all name
+/// the same one role — the role a `Ctrl+n` tab of the same config seats.
+///
+/// [`OrchestrationConfig::orchestrator_role_index`]: crate::project_config::OrchestrationConfig::orchestrator_role_index
 fn roles_of(orch: &crate::project_config::OrchestrationConfig) -> Vec<RoleSpawn> {
+    let orch_idx = orch.orchestrator_role_index();
     orch.roles
         .iter()
         .enumerate()
@@ -435,7 +444,7 @@ fn roles_of(orch: &crate::project_config::OrchestrationConfig) -> Vec<RoleSpawn>
             role_index: i,
             role_name: r.name.clone(),
             command: r.command.clone(),
-            is_start_role: r.start,
+            is_start_role: i == orch_idx,
             agent_type: r.resolved_agent_type(),
         })
         .collect()
@@ -470,15 +479,20 @@ pub fn decide_target(
     }
 }
 
-/// Index (into `roles`) of the role the prompt is delivered to: the one named
-/// `orchestrator`, else the start role, else the first. `roles` is assumed
-/// non-empty (callers only build an `Orchestration` target with ≥1 role).
+/// Index (into `roles`) of the orchestrator — the role the prompt is delivered
+/// to and the one registered as able to `delegate`. The one rule every path
+/// reads, [`crate::project_config::orchestrator_index`] (issue #523): the first
+/// `start = true` role, else the role named `orchestrator`, else the first.
+/// `roles` is assumed non-empty (callers only build an `Orchestration` target
+/// with ≥1 role).
+///
+/// Before #523 this tried the NAME first, so a flagged role beside a
+/// differently positioned role named `orchestrator` was a worker here and the
+/// orchestrator on the `Ctrl+n` tab. [`roles_of`] already flags the seat, so
+/// for a target it built this finds that role; the name fallback still covers a
+/// hand-built `RoleSpawn` list.
 pub fn orchestrator_role_index(roles: &[RoleSpawn]) -> usize {
-    roles
-        .iter()
-        .position(|r| r.role_name == "orchestrator")
-        .or_else(|| roles.iter().position(|r| r.is_start_role))
-        .unwrap_or(0)
+    crate::project_config::orchestrator_index(roles, |r| r.role_name.as_str(), |r| r.is_start_role)
 }
 
 /// Open a tab for `req` and deliver its prompt. See the module docs for the
@@ -929,35 +943,13 @@ pub async fn spawn(
                     state.register_orchestration_role(
                         &pane_id,
                         &role.role_name,
-                        // `orch_idx`, NOT `role.is_start_role`. `orch_idx` is
-                        // already this path's authority on which role is the
-                        // orchestrator — it is the pane that receives the
-                        // orchestrator context and the caller's task below — and
-                        // it falls back (role named `orchestrator` → any
-                        // `start = true` → role 0) where `is_start_role` alone
-                        // would be false for EVERY role of an orchestration whose
-                        // toml sets no `start`. Registering on the raw flag would
-                        // leave such an orchestration with a context-bearing
-                        // orchestrator that is still not in
-                        // `orchestrator_pane_ids`, i.e. this same bug for a
-                        // narrower input.
-                        //
-                        // KNOWN, and deliberately not fixed here (PR #466
-                        // review, issue #523): the registrar is shared, but this
-                        // RULE is not. The `AttachRequest::StartAgent` path still
-                        // registers on the raw flag — `tab.rs` sends
-                        // `is_start_role: role.start` in the membership — so for
-                        // a toml whose role is named `orchestrator` but sets no
-                        // `start = true`, a `Ctrl+N` tab still registers no
-                        // orchestrator at all and its delegate is rejected. That
-                        // path is not what this change set out to fix, and
-                        // unifying the rule is not local: `tab.rs` computes a
-                        // THIRD answer of its own (`start_role_index`, the bare
-                        // `position(|r| r.start).unwrap_or(0)`, with no
-                        // name-based fallback) and drives default focus and
-                        // orchestrator-prompt delivery off it, so aligning the
-                        // three is a user-visible TUI change owing its own tests
-                        // — see the issue.
+                        // `orch_idx`: this path's authority on which role is
+                        // the orchestrator — the pane that receives the
+                        // orchestrator context and the caller's task below. It
+                        // is the same rule (`project_config::orchestrator_index`)
+                        // the `Ctrl+n` tab sends in its membership, so both
+                        // `AttachRequest::StartAgent` and this path register the
+                        // same one pane for one config (issue #523).
                         idx == orch_idx,
                         identity.clone(),
                         Some(req.working_dir.as_str()),
@@ -6060,6 +6052,31 @@ mod tests {
                 role_name: "orchestrator".into(),
                 command: "cat".into(),
                 is_start_role: false,
+            },
+        ];
+        assert_eq!(orchestrator_role_index(&roles), 1);
+    }
+
+    /// Issue #523: `start = true` is the declaration and the name only a
+    /// fallback, so a flagged role beside a differently positioned role NAMED
+    /// `orchestrator` is the orchestrator — the answer the `Ctrl+n` tab and
+    /// the desktop give for the same config.
+    #[test]
+    fn orchestrator_role_index_start_flag_outranks_the_name() {
+        let roles = vec![
+            RoleSpawn {
+                agent_type: None,
+                role_index: 0,
+                role_name: "orchestrator".into(),
+                command: "sh".into(),
+                is_start_role: false,
+            },
+            RoleSpawn {
+                agent_type: None,
+                role_index: 1,
+                role_name: "lead".into(),
+                command: "cat".into(),
+                is_start_role: true,
             },
         ];
         assert_eq!(orchestrator_role_index(&roles), 1);

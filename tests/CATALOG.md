@@ -1834,11 +1834,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 #### tabs/orchestration
 
-##### tabs/orchestration/001 — Selecting an orchestration on the new-pane form opens one pane per role with the orchestrator's pane in focus.
-- **Layer:** L2.
-- **Agent:** none (orchestration fixture with three stub-command roles, one with `start = true`).
-- **Asserts:** the new tab contains three panes; the focused pane is the `start = true` role.
-- **Does not assert:** what command is rendered in each pane (the stub fixture is opaque to the harness).
+##### tabs/orchestration/001 — Selecting an orchestration on the new-pane form opens one pane per role and seats exactly one orchestrator: it has focus, receives the orchestrator prompt, and is the one pane that may `delegate` (issue #523).
+- **Layer:** L2 (`tests/e2e_orchestrator_seat.rs`).
+- **Agent:** none (a two-role config written at runtime over the `minimal` fixture; both roles are `cat` stand-ins that print a ready sentinel and echo their PTY input, so "which pane received it" is a substring question. No LLM tokens, so deliberately unmarked for the reel).
+- **Asserts:** for a config whose worker `coder` comes FIRST and whose second role is named `orchestrator` — once with `start = true` on it (the control) and once with no `start` anywhere (issue #523's config) — a keystroke typed on the freshly opened tab reaches `orchestrator`'s pane and not `coder`'s; the orchestrator prompt (the pointer to `orchestrator-context.md`) is delivered into `orchestrator`'s pane and not `coder`'s; the context file carries `orchestrator`'s own `prompt_template` and lists only `coder` under the available agents; `daemon status --json` marks exactly one card `(orchestrator)`, the named one; `coder`'s `delegate` is refused and `orchestrator`'s reaches `coder`'s PTY.
+- **Does not assert:** a real agent reading the prompt (stand-ins only); the dispatched/scheduled spawn path, whose seat is the same `OrchestrationConfig::orchestrator_role_index` rule and is covered at L1 (`spawn::tests::orchestrator_role_index_*`, `state::tests::register_orchestration_role_makes_orch_idx_the_orchestrator`); a config with `start = true` on a role beside a DIFFERENT role named `orchestrator` (L1: `tab::tests::orchestration_tab_seats_the_one_orchestrator_the_rule_names`); the reconnect rebuild of the tab.
 - **Platform coverage:** mac+linux.
 
 ##### tabs/orchestration/002 — `Ctrl+w` on an orchestration tab closes the tab and stops every role pane.

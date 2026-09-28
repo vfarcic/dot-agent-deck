@@ -61,10 +61,13 @@ pub enum Attendance {
 /// delegation protocol instructions.
 pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     let mut content = String::new();
+    // Issue #523: written for the role the one rule seats, not for whichever
+    // role carries the bare flag — the pane this file is delivered into.
+    let orch_idx = config.orchestrator_role_index();
 
     // 1. Orchestrator's own prompt_template.
-    if let Some(start_role) = config.roles.iter().find(|r| r.start)
-        && let Some(ref tpl) = start_role.prompt_template
+    if let Some(orchestrator) = config.orchestrator_role()
+        && let Some(ref tpl) = orchestrator.prompt_template
     {
         content.push_str(tpl);
         content.push_str("\n\n");
@@ -72,8 +75,8 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
 
     // 2. Available agents list.
     content.push_str("## Available agents\n\n");
-    for role in &config.roles {
-        if role.start {
+    for (idx, role) in config.roles.iter().enumerate() {
+        if idx == orch_idx {
             continue;
         }
         let desc = role.description.as_deref().unwrap_or("(no description)");
@@ -2046,6 +2049,50 @@ mod tests {
             !c.contains("**orchestrator**:"),
             "the start role is the reader, not one of its own available agents"
         );
+    }
+
+    /// Issue #523: the context is written FOR the orchestrator the rule seats,
+    /// not for whichever role carries the bare flag — so a role named
+    /// `orchestrator` with no `start = true` anywhere still gets its own
+    /// template and is not offered to itself as a worker, and a flagged role
+    /// beside a role that is merely NAMED `orchestrator` stays the reader.
+    #[test]
+    fn context_is_written_for_the_role_the_rule_seats() {
+        let unflagged = OrchestrationConfig {
+            default: false,
+            name: "digest".to_string(),
+            roles: vec![
+                role("coder", false, None, Some("Implements features")),
+                role("orchestrator", false, Some("You lead the team."), None),
+            ],
+        };
+        let c = build_orchestrator_context(&unflagged);
+        assert!(
+            c.contains("You lead the team."),
+            "the named orchestrator's own template:\n{c}"
+        );
+        assert!(c.contains("**coder**: Implements features"));
+        assert!(
+            !c.contains("**orchestrator**:"),
+            "the orchestrator is the reader, not one of its own agents:\n{c}"
+        );
+
+        let flagged_beside_name = OrchestrationConfig {
+            default: false,
+            name: "digest".to_string(),
+            roles: vec![
+                role(
+                    "orchestrator",
+                    false,
+                    Some("NOT THE READER"),
+                    Some("A worker"),
+                ),
+                role("lead", true, Some("You lead the team."), None),
+            ],
+        };
+        let c = build_orchestrator_context(&flagged_beside_name);
+        assert!(c.contains("You lead the team.") && !c.contains("NOT THE READER"));
+        assert!(c.contains("**orchestrator**: A worker") && !c.contains("**lead**:"));
     }
 
     /// With a caller task (PRD #220 `dispatch --task`, PRD #120 per-issue prompt)

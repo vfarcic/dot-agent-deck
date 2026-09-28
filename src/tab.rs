@@ -1007,10 +1007,17 @@ impl TabManager {
         // (`ui.rs`) skips it — the daemon owns delivery (native pull + its own
         // PTY-injection safety net). A non-Pi start role is unchanged: no seed,
         // and the tab keeps `orchestrator_prompt` for the existing injection.
+        // Issue #523: the ONE answer to "which role is the orchestrator",
+        // by the rule the daemon's dispatched spawn also reads. It decides the
+        // membership flag below (i.e. which pane the daemon lets `delegate`),
+        // the Pi seed, and `start_role_index` (default focus, the all-clear
+        // focus move and where `orchestrator_prompt` is delivered). Before #523
+        // those read the bare `start` flag, with a role-0 fallback and no
+        // name-based one, so a config that named its orchestrator but set no
+        // `start` opened with the prompt on whichever role came first.
+        let orch_idx = config.orchestrator_role_index();
         let start_role_is_pi = config
-            .roles
-            .iter()
-            .find(|r| r.start)
+            .orchestrator_role()
             // Issue #308: the role's RESOLVED type — its `agent = "…"`
             // declaration when it made one, else the type derived from the
             // command — so a Pi orchestrator launched through a wrapper script
@@ -1070,7 +1077,7 @@ impl TabManager {
                     name: resolved_name.clone(),
                     role_index,
                     role_name: role.name.clone(),
-                    is_start_role: role.start,
+                    is_start_role: role_index == orch_idx,
                     // Round-11 auditor #C: carry the orchestration's
                     // cwd (shared across every role pane in this tab)
                     // so the daemon can disambiguate two unnamed
@@ -1098,7 +1105,7 @@ impl TabManager {
                 // reading "No agent" until its first delegated task.
                 agent_type: role.resolved_agent_type(),
                 // PRD #201: seed only the Pi start-role pane for native pull.
-                seed: if role.start && start_role_is_pi {
+                seed: if role_index == orch_idx && start_role_is_pi {
                     orchestrator_prompt.clone()
                 } else {
                     None
@@ -1124,7 +1131,7 @@ impl TabManager {
         let id = self.next_id;
         self.next_id += 1;
 
-        let start_role_index = config.roles.iter().position(|r| r.start).unwrap_or(0);
+        let start_role_index = orch_idx;
 
         self.tabs.push(Tab::Orchestration {
             id,
@@ -1279,7 +1286,9 @@ impl TabManager {
         let id = self.next_id;
         self.next_id += 1;
 
-        let start_role_index = config.roles.iter().position(|r| r.start).unwrap_or(0);
+        // Issue #523: the same rule the tab's own spawn used, so a rebuilt tab
+        // focuses the pane the daemon registered as the orchestrator.
+        let start_role_index = config.orchestrator_role_index();
 
         // Title-only: prefer the user-typed title the daemon round-tripped,
         // falling back to the canonical resolved name when absent/empty.
@@ -1989,6 +1998,9 @@ mod tests {
         next: Mutex<u32>,
         focused: Mutex<Option<String>>,
         focus_calls: Mutex<Vec<String>>,
+        /// The `TabMembership` each `create_pane_with_options` call carried,
+        /// in call order — what the daemon would register the pane as.
+        memberships: Mutex<Vec<Option<crate::agent_pty::TabMembership>>>,
     }
 
     impl MockPaneController {
@@ -1997,6 +2009,7 @@ mod tests {
                 next: Mutex::new(0),
                 focused: Mutex::new(None),
                 focus_calls: Mutex::new(Vec::new()),
+                memberships: Mutex::new(Vec::new()),
             }
         }
 
@@ -2019,6 +2032,19 @@ mod tests {
             let id = format!("pane-{n}");
             *n += 1;
             Ok(id)
+        }
+        fn create_pane_with_options(
+            &self,
+            command: Option<&str>,
+            cwd: Option<&str>,
+            opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            self.memberships
+                .lock()
+                .unwrap()
+                .push(opts.tab_membership.clone());
+            let resolved = crate::agent_pty::resolve_display_name(opts.display_name, command);
+            Ok((self.create_pane(command, cwd)?, resolved))
         }
         fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError> {
             *self.focused.lock().unwrap() = Some(pane_id.to_string());
@@ -2106,6 +2132,93 @@ mod tests {
                     clear: false,
                 },
             ],
+        }
+    }
+
+    /// Issue #523: the `Ctrl+n` tab seats ONE orchestrator, by the same rule
+    /// the daemon's dispatched spawn uses, and uses that one answer for the
+    /// membership it sends the daemon (who may `delegate`), for default focus
+    /// and for the tab's `start_role_index` (where the orchestrator prompt
+    /// goes). The config puts the worker first, so a role-0 fallback is
+    /// visibly wrong.
+    #[test]
+    fn orchestration_tab_seats_the_one_orchestrator_the_rule_names() {
+        let role = |name: &str, start: bool| OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: format!("echo {name}"),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: false,
+        };
+        let cases = [
+            // The goal's config: named `orchestrator`, no `start` anywhere.
+            (
+                "named, unflagged",
+                vec![role("coder", false), role("orchestrator", false)],
+                1,
+            ),
+            // `start = true` is the declaration and outranks the name.
+            (
+                "flagged beside a named role",
+                vec![
+                    role("coder", false),
+                    role("orchestrator", false),
+                    role("lead", true),
+                ],
+                2,
+            ),
+            // Two flags (validation's error): the first, and only the first.
+            (
+                "two flags",
+                vec![role("coder", false), role("a", true), role("b", true)],
+                1,
+            ),
+        ];
+        for (case, roles, want) in cases {
+            let pc = Arc::new(MockPaneController::new());
+            let mut tm = TabManager::new(pc.clone());
+            let config = OrchestrationConfig {
+                default: false,
+                name: "seat".to_string(),
+                roles,
+            };
+            let (idx, role_ids) = tm
+                .open_orchestration_tab(&config, "/work", Some("go".into()), None, (24, 80))
+                .expect("open orchestration tab");
+
+            let flagged: Vec<usize> = pc
+                .memberships
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|m| match m {
+                    Some(TabMembership::Orchestration {
+                        role_index,
+                        is_start_role: true,
+                        ..
+                    }) => Some(*role_index),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                flagged,
+                vec![want],
+                "[{case}] exactly one membership names the orchestrator"
+            );
+            match &tm.tabs[idx] {
+                Tab::Orchestration {
+                    start_role_index, ..
+                } => assert_eq!(*start_role_index, want, "[{case}] start_role_index"),
+                _ => panic!("[{case}] expected an orchestration tab"),
+            }
+            assert!(tm.switch_to(idx));
+            assert_eq!(
+                tm.restore_focus_on_switch_in().as_deref(),
+                Some(role_ids[want].as_str()),
+                "[{case}] default focus lands on the orchestrator"
+            );
         }
     }
 
