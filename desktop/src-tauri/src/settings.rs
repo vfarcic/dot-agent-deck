@@ -3155,6 +3155,11 @@ fn deck_list_error(error: dot_agent_deck::remote::RemoteConfigError) -> Settings
              so nothing was written"
                 .to_string()
         }
+        // The refusal names the field and describes the byte without quoting
+        // it, so it carries neither the value nor the path.
+        RemoteConfigError::InvalidAddress { source, .. } => {
+            format!("could not save the deck list: {source}")
+        }
     };
     SettingsWriteError {
         detail: error.to_string(),

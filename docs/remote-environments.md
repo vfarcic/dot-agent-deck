@@ -58,6 +58,10 @@ dot-agent-deck remote add my-vm deck@198.51.100.10 \
 
 A name is what you type after `connect`, so `remote add` requires a short, shell-safe one: ASCII letters, digits, `.`, `-` and `_`, starting with a letter or digit, at most 64 characters. A name registered before this rule existed keeps working everywhere — the rule applies only when a remote is added.
 
+### Remote addresses
+
+The host, login, port, jump host and socket path of a deck are checked the same way by `remote add` and the desktop app before anything is written to the deck list: a value that starts with `-`, or contains whitespace, a control character, a non-ASCII character or a shell metacharacter such as `;`, `$` or `` ` ``, is refused, because ssh could read it as an option or hand it to a shell through a `ProxyCommand` in your `~/.ssh/config`. `user@host`, `user@realm@host`, IPv4 addresses and IPv6 addresses (`::1` or `[::1]`) are accepted, and so is any key path that does not start with `-`. A deck registered before this check keeps loading and connecting; the check applies to values being written.
+
 ## One deck list for the CLI and the desktop app
 
 `~/.config/dot-agent-deck/remotes.toml` is the deck list for both clients. A remote added with `remote add` appears in the desktop app's deck settings, and a deck added in the desktop app appears in `remote list` and can be opened with `connect <name>`. Either client can edit or remove any deck; "added by the CLI" is information, not a lock. `DOT_AGENT_DECK_REMOTES`, when set, moves the file for whichever client sees it. The local deck is not in the file: the desktop app always offers it, and which deck the app has selected stays in the app's own settings.

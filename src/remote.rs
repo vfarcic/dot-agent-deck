@@ -1070,6 +1070,15 @@ pub enum RemoteConfigError {
     Serialize(#[from] toml::ser::Error),
     #[error("Cannot edit remotes file at {path}: {reason}")]
     Unwritable { path: String, reason: String },
+    /// Issue #1350: an edit would have written an ssh address field that
+    /// [`crate::deck_list::validate_deck_address`] refuses, so nothing was
+    /// written.
+    #[error("Refusing to write remotes file at {path}: {source}")]
+    InvalidAddress {
+        path: String,
+        #[source]
+        source: crate::remote_tunnel::SshArgumentError,
+    },
 }
 
 impl RemotesFile {
@@ -1148,6 +1157,8 @@ pub enum RemoteAddError {
     DuplicateName { name: String },
     #[error("Invalid remote name: {0}.")]
     InvalidName(crate::deck_list::DeckNameError),
+    #[error("Invalid remote address: {0}.")]
+    InvalidAddress(crate::remote_tunnel::SshArgumentError),
     #[error("Remote type 'kubernetes' is not yet implemented; planned in PRD #81.")]
     KubernetesNotYetImplemented,
     #[error("Unsupported remote type '{kind}'. Supported: ssh.")]
@@ -1354,6 +1365,11 @@ pub fn add(
     let version = validate_version_string(&opts.version)?;
     // Issue #1350: the name is a slug, checked before any ssh call too.
     crate::deck_list::validate_deck_name(&opts.name).map_err(RemoteAddError::InvalidName)?;
+    // …and so is the address: the rules `deck_list::add` enforces on the row,
+    // applied here so an unsafe target never reaches ssh.
+    let key = opts.key.as_ref().map(|p| p.to_string_lossy());
+    crate::deck_list::validate_ssh_target(&opts.target, opts.port, key.as_deref())
+        .map_err(RemoteAddError::InvalidAddress)?;
 
     // 3. Uniqueness check — done *before* any ssh call so a duplicate name
     //    short-circuits without bothering the remote (and lets the
@@ -2361,6 +2377,55 @@ mod tests {
             msg.contains(HOSTILE_SCRUBBED),
             "expected the stripped residue in {msg:?}"
         );
+    }
+
+    /// Issue #1350: `remote add` refuses an unsafe address with the rules the
+    /// shared deck list enforces, before any ssh call — an empty script panics
+    /// on the first one — and writes nothing.
+    #[test]
+    fn remote_add_refuses_an_unsafe_address_before_any_ssh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("remotes.toml");
+        let base = AddOptions {
+            name: "prod".to_string(),
+            remote_type: "ssh".to_string(),
+            target: "user@host".to_string(),
+            port: 22,
+            key: None,
+            version: "0.24.5".to_string(),
+            no_install: true,
+            release_base: "https://example.test/releases/download".to_string(),
+        };
+        let cases = [
+            AddOptions {
+                target: "-oProxyCommand=touch /tmp/x".to_string(),
+                ..base.clone()
+            },
+            AddOptions {
+                target: "user@host;id".to_string(),
+                ..base.clone()
+            },
+            AddOptions {
+                target: "-l@host".to_string(),
+                ..base.clone()
+            },
+            AddOptions {
+                port: 0,
+                ..base.clone()
+            },
+            AddOptions {
+                key: Some(PathBuf::from("-oProxyCommand=x")),
+                ..base.clone()
+            },
+        ];
+        for opts in cases {
+            let executor = ScriptedSsh::new([]);
+            match add(&opts, &executor, &path) {
+                Err(RemoteAddError::InvalidAddress(_)) => {}
+                other => panic!("{:?}: expected InvalidAddress, got {other:?}", opts.target),
+            }
+            assert!(!path.exists(), "a refused add wrote the registry");
+        }
     }
 
     #[test]

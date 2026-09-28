@@ -39,6 +39,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 use crate::remote::{RemoteConfigError, RemoteEntry, RemotesFile};
+use crate::remote_tunnel::{
+    HostAlias, Hostname, RemoteSocketPath, SshArgumentError, SshPort, SshUser,
+};
 
 /// The `version` a deck carries when no `dot-agent-deck` binary was installed
 /// on it by `remote add` — today, every deck added from the desktop app.
@@ -277,6 +280,158 @@ pub fn address_key(entry: &RemoteEntry) -> (String, Option<String>, u16) {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Addresses
+// ---------------------------------------------------------------------------
+
+/// Whether the ssh-facing fields of `entry` are safe to write: the host (with
+/// any `user@` it carries), the port, the key path, the `user` field, the jump
+/// host and the remote socket path.
+///
+/// One definition for both clients, and it is the desktop's: every field but
+/// the key goes through the validating newtype in [`crate::remote_tunnel`] that
+/// the desktop's settings rows are made of ([`Hostname`], [`SshUser`],
+/// [`SshPort`], [`HostAlias`], [`RemoteSocketPath`]) — a leading `-`,
+/// whitespace, control bytes, non-ASCII and shell metacharacters are refused,
+/// because OpenSSH interpolates `%h` and `%r` into a user's `ProxyCommand`,
+/// which a local shell then runs. Checked in [`DeckDocument::push`] and
+/// [`DeckDocument::replace`], so no write through this module can put an
+/// unsafe value in the file whatever the caller checked first.
+///
+/// Two places it is wider than the newtypes, both because `remote add` has
+/// always accepted the form and hands it to `ssh` as a destination, where it
+/// works — see [`validate_host_field`] and [`validate_key_field`].
+///
+/// **Applied on write only**, like [`validate_deck_name`]: a row written before
+/// this rule keeps loading, and [`update`] checks only the fields an edit
+/// changes, so `connect` recording `last_connected` on such a row still works.
+pub fn validate_deck_address(entry: &RemoteEntry) -> Result<(), SshArgumentError> {
+    validate_changed_address(None, entry)
+}
+
+/// The fields `remote add` knows before it has reached the host — the
+/// `[user@]host` target, the port and the key path — checked with the rules
+/// [`validate_deck_address`] applies, so a refusal comes before any ssh.
+pub fn validate_ssh_target(
+    host: &str,
+    port: u16,
+    key: Option<&str>,
+) -> Result<(), SshArgumentError> {
+    validate_host_field(host)?;
+    SshPort::parse(port)?;
+    key.map(validate_key_field).transpose()?;
+    Ok(())
+}
+
+/// [`validate_deck_address`] for the fields of `after` that differ from
+/// `before` — every field when there is no `before`.
+fn validate_changed_address(
+    before: Option<&RemoteEntry>,
+    after: &RemoteEntry,
+) -> Result<(), SshArgumentError> {
+    // `after`'s value of one optional field, when it has one `before` did not.
+    fn changed<'a>(
+        before: Option<&RemoteEntry>,
+        after: &'a RemoteEntry,
+        field: fn(&RemoteEntry) -> Option<&str>,
+    ) -> Option<&'a str> {
+        let value = field(after)?;
+        (before.and_then(field) != Some(value)).then_some(value)
+    }
+    if before.map(|row| row.host.as_str()) != Some(after.host.as_str()) {
+        validate_host_field(&after.host)?;
+    }
+    if before.map(|row| row.port) != Some(after.port) {
+        SshPort::parse(after.port)?;
+    }
+    if let Some(key) = changed(before, after, |row| row.key.as_deref()) {
+        validate_key_field(key)?;
+    }
+    if let Some(user) = changed(before, after, |row| row.user.as_deref()) {
+        SshUser::parse(user)?;
+    }
+    if let Some(jump) = changed(before, after, |row| row.jump_host.as_deref()) {
+        HostAlias::parse(jump)?;
+    }
+    if let Some(socket) = changed(before, after, |row| row.socket.as_deref()) {
+        RemoteSocketPath::parse(socket)?;
+    }
+    Ok(())
+}
+
+/// The `host` field: `[user@]host`, the spelling `remote add` stores.
+///
+/// Split on the **last** `@`, which is where OpenSSH splits a destination, so a
+/// UPN login (`user@realm@host`) is checked as the [`SshUser`] it is. The host
+/// is a [`Hostname`] — or, wider than the desktop, a bare IPv6 literal such as
+/// `::1` or `fe80::1%eth0`: `remote add` has always passed one straight to
+/// `ssh` as a destination, where it works. The desktop requires the bracketed
+/// form (a bare `:` is ambiguous inside its `-L` forward spec) and skips such a
+/// row on load rather than refusing the file. Accepted only when the address
+/// actually parses as IPv6, so every byte is still a hex digit, `:` or a
+/// zone id the [`Hostname`] charset already allowed.
+pub fn validate_host_field(host: &str) -> Result<(), SshArgumentError> {
+    let bare = match host.rsplit_once('@') {
+        Some((user, bare)) => {
+            SshUser::parse(user)?;
+            bare
+        }
+        None => host,
+    };
+    match Hostname::parse(bare) {
+        Err(SshArgumentError::BareIpv6Separator { .. }) if is_bare_ipv6(bare) => Ok(()),
+        other => other.map(|_| ()),
+    }
+}
+
+/// `raw` is an unbracketed IPv6 literal, with an optional `%zone` of
+/// hostname-charset bytes.
+fn is_bare_ipv6(raw: &str) -> bool {
+    let (address, zone) = match raw.split_once('%') {
+        Some((address, zone)) => (address, Some(zone)),
+        None => (raw, None),
+    };
+    address.parse::<std::net::Ipv6Addr>().is_ok()
+        && zone.is_none_or(|zone| {
+            !zone.is_empty()
+                && zone
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        })
+}
+
+/// The `key` field: a path to a private key file, for `ssh -i`.
+///
+/// Wider than the desktop's [`KeyPath`](crate::remote_tunnel::KeyPath), which also requires an absolute or
+/// `~/` path of a narrow ASCII charset: `remote add --key` has always taken any
+/// path the shell hands it — `./id_ed25519`, a directory with a space in its
+/// name — and passes it as the argument to `-i`, never through a shell or a
+/// `ProxyCommand`, so refusing those would break working decks without making
+/// one safer. What is refused is what is unsafe anywhere: an empty value, a
+/// leading `-`, and a NUL or control byte. The desktop skips a row whose key
+/// its `KeyPath` refuses, as it does any row it cannot represent.
+pub fn validate_key_field(key: &str) -> Result<(), SshArgumentError> {
+    const FIELD: &str = "the key path";
+    if key.is_empty() {
+        return Err(SshArgumentError::Empty { field: FIELD });
+    }
+    if key.starts_with('-') {
+        return Err(SshArgumentError::LeadingDash { field: FIELD });
+    }
+    if let Some((offset, byte)) = key
+        .bytes()
+        .enumerate()
+        .find(|(_, byte)| byte.is_ascii_control())
+    {
+        return Err(SshArgumentError::ForbiddenByte {
+            field: FIELD,
+            offset,
+            what: crate::remote_tunnel::describe_byte(byte),
+        });
+    }
+    Ok(())
+}
+
 /// Which row an edit is aimed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeckRef<'a> {
@@ -308,6 +463,8 @@ pub enum AddDeckError {
     DuplicateId { id: String },
     #[error("Invalid remote name: {0}.")]
     InvalidName(#[from] DeckNameError),
+    #[error("Invalid remote address: {0}.")]
+    InvalidAddress(#[from] SshArgumentError),
     #[error(transparent)]
     Config(#[from] RemoteConfigError),
 }
@@ -320,6 +477,7 @@ impl From<AddDeckError> for crate::remote::RemoteAddError {
         match error {
             AddDeckError::DuplicateName { name } => RemoteAddError::DuplicateName { name },
             AddDeckError::InvalidName(reason) => RemoteAddError::InvalidName(reason),
+            AddDeckError::InvalidAddress(reason) => RemoteAddError::InvalidAddress(reason),
             AddDeckError::Config(error) => RemoteAddError::Registry(error),
             AddDeckError::DuplicateId { id } => {
                 RemoteAddError::Registry(RemoteConfigError::Unwritable {
@@ -405,8 +563,10 @@ impl DeckDocument {
             })
     }
 
-    /// Append `entry` as a new row.
+    /// Append `entry` as a new row, refusing one whose address
+    /// [`validate_deck_address`] refuses.
     pub fn push(&mut self, entry: &RemoteEntry) -> Result<(), RemoteConfigError> {
+        validate_deck_address(entry).map_err(|source| self.invalid_address(source))?;
         let table = entry_table(entry, &self.path)?;
         self.rows_mut().push(table);
         Ok(())
@@ -420,6 +580,10 @@ impl DeckDocument {
     /// the module docs. Which keys this build knows is read off its own
     /// serialisation of the row rather than listed by hand, so a field added
     /// to [`RemoteEntry`] later is covered without an edit here.
+    ///
+    /// The address fields `entry` changes are checked with
+    /// [`validate_deck_address`]; one it leaves as it was is not, so a row
+    /// written before that rule can still be edited in every other field.
     pub fn replace(&mut self, index: usize, entry: &RemoteEntry) -> Result<(), RemoteConfigError> {
         let path = self.path.clone();
         let before = self
@@ -427,6 +591,8 @@ impl DeckDocument {
             .into_iter()
             .nth(index)
             .ok_or_else(|| unwritable(&path, "no such row"))?;
+        validate_changed_address(Some(&before), entry)
+            .map_err(|source| self.invalid_address(source))?;
         let old = entry_table(&before, &path)?;
         let new = entry_table(entry, &path)?;
         let row = self
@@ -445,6 +611,13 @@ impl DeckDocument {
             }
         }
         Ok(())
+    }
+
+    fn invalid_address(&self, source: SshArgumentError) -> RemoteConfigError {
+        RemoteConfigError::InvalidAddress {
+            path: self.path.clone(),
+            source,
+        }
     }
 
     /// Remove row `index`.
@@ -520,11 +693,13 @@ where
 
 /// Append `entry`, refusing a name or [`deck_id`] already in the file.
 ///
-/// The name is checked with [`validate_deck_name`] — this is the write path, so
-/// this is where the slug rule applies — and the duplicate checks run against
-/// the file as it is **now**, not as the caller last saw it.
+/// The name is checked with [`validate_deck_name`] and the address with
+/// [`validate_deck_address`] — this is the write path, so this is where those
+/// rules apply — and the duplicate checks run against the file as it is
+/// **now**, not as the caller last saw it.
 pub fn add(path: &Path, entry: RemoteEntry) -> Result<RemoteEntry, AddDeckError> {
     validate_deck_name(&entry.name)?;
+    validate_deck_address(&entry)?;
     edit(path, |document| {
         let existing = document.entries()?;
         if existing.iter().any(|row| row.name == entry.name) {
@@ -951,6 +1126,261 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    /// Every address form `remote add` has taken and ssh reaches, and every
+    /// form the desktop writes.
+    #[test]
+    fn deck_addresses_accept_every_form_remote_add_and_the_desktop_write() {
+        for host in [
+            "host",
+            "build-box.example.com",
+            "ssh_alias",
+            "user@host",
+            "ops@prod.example.com",
+            // A UPN login folded into `host`: OpenSSH splits on the last `@`.
+            "dev@REALM@host",
+            "10.0.0.1",
+            "[2001:db8::1]",
+            "[fe80::1%eth0]",
+            // Unbracketed IPv6: `remote add` hands it to ssh as a destination.
+            "::1",
+            "user@2001:db8::1",
+            "fe80::1%eth0",
+        ] {
+            validate_host_field(host).unwrap_or_else(|error| panic!("{host:?}: {error}"));
+            validate_deck_address(&entry("d", host))
+                .unwrap_or_else(|error| panic!("{host:?}: {error}"));
+        }
+        for key in [
+            "/home/me/.ssh/id_ed25519",
+            "~/.ssh/id_ed25519",
+            "./id_ed25519",
+            "keys/id_rsa",
+            "/home/me/my keys/id",
+        ] {
+            let row = RemoteEntry {
+                key: Some(key.to_string()),
+                ..entry("d", "host")
+            };
+            validate_deck_address(&row).unwrap_or_else(|error| panic!("{key:?}: {error}"));
+        }
+        validate_deck_address(&desktop_entry("d")).unwrap();
+        validate_deck_address(&RemoteEntry {
+            port: 65535,
+            ..entry("d", "host")
+        })
+        .unwrap();
+        validate_ssh_target("user@host", 2222, Some("./id")).unwrap();
+    }
+
+    /// What ssh would read as an option, or what a `ProxyCommand` would hand a
+    /// shell, is refused in every field — by `add`, and by a batch edit that
+    /// pushes or replaces a row directly — and the file is left alone.
+    #[test]
+    fn deck_addresses_refuse_what_ssh_or_a_shell_would_misread() {
+        let unsafe_rows: Vec<(&str, RemoteEntry)> = vec![
+            (
+                "leading dash host",
+                entry("d", "-oProxyCommand=touch /tmp/x"),
+            ),
+            ("leading dash login", entry("d", "-oProxyCommand=x@host")),
+            ("space in host", entry("d", "host name")),
+            ("tab in host", entry("d", "host\tname")),
+            ("newline in host", entry("d", "host\n-oX")),
+            ("NUL in host", entry("d", "host\0")),
+            ("semicolon", entry("d", "host;rm")),
+            ("command substitution", entry("d", "$(id)")),
+            ("backtick", entry("d", "user`id`@host")),
+            ("pipe", entry("d", "host|nc")),
+            ("non-ASCII", entry("d", "hóst")),
+            ("empty host", entry("d", "")),
+            ("empty login", entry("d", "@host")),
+            ("empty host after login", entry("d", "user@")),
+            ("not an IPv6 literal", entry("d", "not:ipv6")),
+            ("empty zone", entry("d", "fe80::1%")),
+            (
+                "port zero",
+                RemoteEntry {
+                    port: 0,
+                    ..entry("d", "host")
+                },
+            ),
+            (
+                "leading dash key",
+                RemoteEntry {
+                    key: Some("-oProxyCommand=x".to_string()),
+                    ..entry("d", "host")
+                },
+            ),
+            (
+                "control byte in key",
+                RemoteEntry {
+                    key: Some("/k\u{1b}[2J".to_string()),
+                    ..entry("d", "host")
+                },
+            ),
+            (
+                "empty key",
+                RemoteEntry {
+                    key: Some(String::new()),
+                    ..entry("d", "host")
+                },
+            ),
+            (
+                "shell metacharacter in user",
+                RemoteEntry {
+                    user: Some("dev$(id)".to_string()),
+                    ..entry("d", "host")
+                },
+            ),
+            (
+                "leading dash user",
+                RemoteEntry {
+                    user: Some("-l".to_string()),
+                    ..entry("d", "host")
+                },
+            ),
+            (
+                "space in jump host",
+                RemoteEntry {
+                    jump_host: Some("bastion -oX".to_string()),
+                    ..entry("d", "host")
+                },
+            ),
+            (
+                "leading dash jump host",
+                RemoteEntry {
+                    jump_host: Some("-J".to_string()),
+                    ..entry("d", "host")
+                },
+            ),
+            (
+                "relative socket",
+                RemoteEntry {
+                    socket: Some("run/deck.sock".to_string()),
+                    ..entry("d", "host")
+                },
+            ),
+            (
+                "colon in socket",
+                RemoteEntry {
+                    socket: Some("/run/a:b.sock".to_string()),
+                    ..entry("d", "host")
+                },
+            ),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = registry(&dir, "");
+        add(&path, entry("ok", "host")).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        for (label, row) in unsafe_rows {
+            assert!(validate_deck_address(&row).is_err(), "{label}: accepted");
+            assert!(
+                matches!(
+                    add(&path, row.clone()),
+                    Err(AddDeckError::InvalidAddress(_))
+                ),
+                "{label}: add did not refuse it as an address"
+            );
+            let pushed = edit(&path, |document| document.push(&row));
+            assert!(
+                matches!(pushed, Err(RemoteConfigError::InvalidAddress { .. })),
+                "{label}: a batch push was not refused: {pushed:?}"
+            );
+            let replaced = edit(&path, |document| {
+                let renamed = RemoteEntry {
+                    name: "ok".to_string(),
+                    ..row.clone()
+                };
+                document.replace(0, &renamed)
+            });
+            assert!(
+                matches!(replaced, Err(RemoteConfigError::InvalidAddress { .. })),
+                "{label}: a batch replace was not refused: {replaced:?}"
+            );
+            assert!(
+                update(&path, DeckRef::Name("ok"), |entry| *entry = RemoteEntry {
+                    name: "ok".to_string(),
+                    ..row.clone()
+                })
+                .is_err(),
+                "{label}: update accepted it"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                before,
+                "{label}: a refused write touched the file"
+            );
+        }
+    }
+
+    /// The address rule is a write rule. A row written before it — `remote
+    /// add` stored whatever target it was given — still loads, and an edit
+    /// that leaves its address alone (`connect` recording `last_connected`)
+    /// still lands; an edit that writes a new unsafe value does not.
+    #[test]
+    fn a_row_with_an_unsafe_address_still_loads_and_takes_edits_that_leave_it_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = registry(
+            &dir,
+            r#"
+[[remotes]]
+name = "legacy"
+type = "ssh"
+host = "-oProxyCommand=x"
+port = 22
+key = "-k"
+version = "0.30.0"
+added_at = "2026-01-01T00:00:00+00:00"
+"#,
+        );
+        let loaded = RemotesFile::load(&path).unwrap();
+        assert_eq!(loaded.remotes[0].host, "-oProxyCommand=x");
+
+        let updated = update(&path, DeckRef::Name("legacy"), |entry| {
+            entry.last_connected = Some("2026-09-28T00:00:00+00:00".to_string());
+        })
+        .unwrap()
+        .expect("the row exists");
+        assert_eq!(updated.host, "-oProxyCommand=x");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("last_connected")
+        );
+
+        for (label, change) in [
+            (
+                "another unsafe host",
+                (|entry: &mut RemoteEntry| entry.host = "-oOther".to_string())
+                    as fn(&mut RemoteEntry),
+            ),
+            ("an unsafe jump host", |entry: &mut RemoteEntry| {
+                entry.jump_host = Some("a b".to_string())
+            }),
+            ("another unsafe key", |entry: &mut RemoteEntry| {
+                entry.key = Some("-other".to_string())
+            }),
+        ] {
+            assert!(
+                matches!(
+                    update(&path, DeckRef::Name("legacy"), change),
+                    Err(RemoteConfigError::InvalidAddress { .. })
+                ),
+                "{label}: accepted"
+            );
+        }
+
+        // Fixing the address is an ordinary edit.
+        update(&path, DeckRef::Name("legacy"), |entry| {
+            entry.host = "host".to_string();
+            entry.key = None;
+        })
+        .unwrap();
+        assert_eq!(RemotesFile::load(&path).unwrap().remotes[0].host, "host");
     }
 
     #[test]
