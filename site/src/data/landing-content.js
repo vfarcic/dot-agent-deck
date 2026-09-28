@@ -537,26 +537,27 @@ export const verify = {
 export const screenshots = {
   /*
    * The hero is a PAIR since PRD #1321, one frame per client, shown side by
-   * side at the same height. `aspect` is each frame's width over its height
-   * (1920x630 and 2560x1600); the page sizes the two columns in that ratio,
-   * which is what makes their heights match without cropping either. The
-   * terminal UI frame is a hand capture of a real orchestration; the desktop
-   * frame is `cargo docs-screenshots` output (the `agent-pane` scenario), an
-   * agent's full-window pane over the app's fixture data. They show the same
-   * kind of moment rather than the same agent, and the caption says so.
+   * side at the same height. `aspect` is each frame's width over its height;
+   * the page sizes the two columns in that ratio, which is what makes their
+   * heights match without cropping either. Both frames are the maintainer's
+   * own captures of the SAME orchestration, dot-agent-deck-dispatch-issue-544,
+   * taken for this slot at close to the same shape (1.31 and 1.21), so each
+   * window gets about half the width and stays readable. They replaced a 3:1
+   * terminal UI band (`orchestration-coder.png`) that, beside any desktop
+   * frame at equal height, left the desktop window too narrow to read.
    */
   hero: {
-    src: '/img/orchestration-coder.png',
-    aspect: 1920 / 630,
-    alt: 'Agent Deck’s terminal UI split view — a sidebar of orchestrator, coder and reviewer cards with only the coder marked Working, beside the coder’s own pane running a grep, an edit to src/email/order_confirmation.rs, and cargo test order_confirmation',
+    src: '/img/orchestration-tui-home.png',
+    aspect: 2536 / 1942,
+    alt: 'Agent Deck’s terminal UI on the dot-agent-deck-dispatch-issue-544 orchestration tab — six role cards down the left, orchestrator, coder, reviewer, auditor, tester and release, run by Claude Code, Pi, OpenCode and Codex, with tester Working and the rest Idle, beside the orchestrator’s pane showing its report on the pull request it prepared, over a footer reading 15 active, 4 working, 1 thinking, 10 idle',
   },
   heroDesktop: {
-    src: '/img/agent-pane-desktop.png',
-    aspect: 2560 / 1600,
-    alt: 'The desktop app’s full-window agent pane — a Codex agent marked RUNNING with its assignment, “Add the retry action to the checkout view”, above a terminal showing the files it read, an edit to src/components/RetryPayment.tsx, npm test -- checkout passing, and its summary',
+    src: '/img/orchestration-desktop-home.png',
+    aspect: 2482 / 2044,
+    alt: 'The desktop app’s Agent dashboard across all daemons — 43 agents over 3 daemons — with a remote daemon’s standalone agents above two six-role orchestrations: the first lists 01 orchestrator, marked ORCHESTRATOR, then coder, reviewer, auditor, tester and release, one running and five waiting, each with its uptime',
   },
   heroCaption:
-    'An agent at work, in each client: in the terminal UI, a coder running what its orchestrator just delegated to it, beside the orchestration’s cards; in the desktop app, an agent’s own pane, with its assignment over the files it touched and a passing test run.',
+    'The same six-role orchestration in both clients. In the terminal UI its roles are cards beside the orchestrator’s pane, Claude Code, Pi, OpenCode and Codex side by side; in the desktop app they are a group on a dashboard that spans every daemon, with the orchestrator marked.',
   newPane: {
     src: '/img/orchestration-new-deck.png',
     alt: 'The New Agent form — Dir /tmp/storefront, a Mode row offering No mode, Orch: review-team, schedule and dispatcher, Agent on auto, Name storefront, Command claude, and Submit and Cancel buttons',
