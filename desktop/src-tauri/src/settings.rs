@@ -16,6 +16,19 @@
 //! [`SETTINGS_PATH_ENV`] overrides the whole path, mirroring the
 //! `DOT_AGENT_DECK_CONFIG` convention and giving tests a seam.
 //!
+//! # The remote decks are not in it (issue #1350)
+//!
+//! The deck list is `remotes.toml`, shared with the CLI and edited through
+//! [`crate::decks`] and `dot_agent_deck::deck_list`. [`load_snapshot`] fills
+//! [`EndpointSettings::remote`] from it and [`save`] writes the rows' changes
+//! back to it, so the in-memory document — and the webview's — still carries
+//! the rows, while `desktop.toml` keeps only the selection. A document written
+//! before #1350 still has `[[endpoints.remote]]` rows; the first load moves
+//! them into `remotes.toml` and removes them. [`load_document`] and [`save_to`]
+//! remain the `desktop.toml`-only halves, which is why they (and the three-way
+//! row merge in [`merged_document`]) still understand rows: a document from an
+//! older build may carry them until that first load.
+//!
 //! # Failure behaviour
 //!
 //! **Loading never fails, and since issue #1072 it is not silent either.** A
@@ -1539,8 +1552,15 @@ pub struct UnconfiguredDeck {
     pub label: String,
 }
 
-/// One `[[endpoints.remote]]` row: a remote deck, stored as **references** and
-/// never as a secret.
+/// One remote deck: a row of the shared deck list, stored as **references**
+/// and never as a secret.
+///
+/// Since issue #1350 a row is stored in `remotes.toml` rather than as an
+/// `[[endpoints.remote]]` row of `desktop.toml`; [`crate::decks`] converts
+/// between this and the registry's `RemoteEntry` — including `identity` ↔ the
+/// registry's `key`, so no `key` name reaches this document. The storage notes
+/// below describe the `desktop.toml` shape, which a pre-#1350 document still
+/// has until its first load migrates it.
 ///
 /// Host, optional user, port, optional identity-file *path*, optional
 /// jump-host *name*. `~/.config/dot-agent-deck/remotes.toml` (`src/remote.rs`)
@@ -2208,11 +2228,27 @@ pub struct DesktopSettingsSnapshot {
 /// the **public** half rides to the webview because a user who cannot see why
 /// their settings look reset is the whole of issue #1072.
 pub fn load_snapshot() -> DesktopSettingsSnapshot {
-    let path = settings_path();
-    let (settings, problem) = load_document(&path);
+    load_snapshot_at(&settings_path(), &crate::decks::remotes_path())
+}
+
+/// [`load_snapshot`] against explicit paths for the settings document and the
+/// shared deck list (issue #1350).
+///
+/// The remote decks come from `remotes.toml`, not from `desktop.toml`: the rows
+/// in [`EndpointSettings::remote`] are what [`crate::decks::load_rows`] read
+/// there, and `desktop.toml` supplies the selection. A document a pre-#1350
+/// build wrote still carries its `[[endpoints.remote]]` rows, and this is where
+/// they move — once, see [`migrate_legacy_rows`]. A deck list that cannot be
+/// read is logged and yields no remote decks rather than failing the load;
+/// every edit to it refuses until it is fixed, so nothing is lost.
+pub(crate) fn load_snapshot_at(path: &Path, remotes: &Path) -> DesktopSettingsSnapshot {
+    let (mut settings, problem) = load_document(path);
     if let Some(problem) = &problem {
         log_document_problem(problem);
+    } else {
+        migrate_legacy_rows(path, remotes, &mut settings);
     }
+    attach_deck_rows(&mut settings, remotes);
     DesktopSettingsSnapshot {
         settings,
         path: path.display().to_string(),
@@ -2952,7 +2988,170 @@ pub fn save(
     base: Option<&DesktopSettings>,
     settings: &DesktopSettings,
 ) -> Result<DesktopSettings, SettingsWriteError> {
-    save_to(&settings_path(), base, settings)
+    save_at(
+        &settings_path(),
+        &crate::decks::remotes_path(),
+        base,
+        settings,
+    )
+}
+
+/// [`save`] against explicit paths: the remote decks go to the shared deck list
+/// at `remotes`, everything else to the settings document at `path` (issue
+/// #1350).
+///
+/// # The deck list is edited, never written back
+///
+/// The rows in `settings` are compared with the rows in `base` — what the
+/// window was showing when the user made the change — and only the difference
+/// reaches `remotes.toml`, one row at a time, each against a fresh read of the
+/// file ([`crate::decks::apply`]). So a deck `remote add` wrote from a terminal
+/// while the app was open survives the app's next save, which is #828's
+/// stale-copy clobber closed for the file two clients share. Without a `base`
+/// the list on disk is the base, so `settings` is authoritative — the same
+/// meaning a missing base has for [`save_to`]. `endpoints = None` asserts
+/// nothing about the rows and changes none of them.
+///
+/// The settings document itself then goes through [`save_to`] **without** the
+/// rows, so `desktop.toml` never gains an `[[endpoints.remote]]` again, and the
+/// reply carries the rows as `remotes.toml` now holds them — another writer's
+/// deck included.
+///
+/// An unreadable settings document is refused before the deck list is touched,
+/// so a save that is going to fail does not half-happen.
+pub(crate) fn save_at(
+    path: &Path,
+    remotes: &Path,
+    base: Option<&DesktopSettings>,
+    settings: &DesktopSettings,
+) -> Result<DesktopSettings, SettingsWriteError> {
+    if let Some(contents) = read_document(path, ReadPurpose::Save)?.as_deref()
+        && let Err(error) = toml_edit::de::from_str::<DesktopSettings>(contents)
+    {
+        return Err(refuse_to_overwrite(path, contents, &error));
+    }
+    if let Some(next) = &settings.endpoints {
+        let base_rows = match base {
+            Some(base) => base
+                .endpoints
+                .as_ref()
+                .map(|endpoints| endpoints.remote.clone())
+                .unwrap_or_default(),
+            None => crate::decks::load_rows(remotes).map_err(deck_list_error)?,
+        };
+        crate::decks::apply(remotes, &crate::decks::edits(&base_rows, &next.remote))
+            .map_err(deck_list_error)?;
+    }
+    let mut written = save_to(
+        path,
+        base.map(without_deck_rows).as_ref(),
+        &without_deck_rows(settings),
+    )?;
+    attach_deck_rows(&mut written, remotes);
+    Ok(written)
+}
+
+/// `settings` with no remote rows, which is how it is written to
+/// `desktop.toml` since the rows moved to `remotes.toml` (issue #1350).
+fn without_deck_rows(settings: &DesktopSettings) -> DesktopSettings {
+    let mut settings = settings.clone();
+    if let Some(endpoints) = &mut settings.endpoints {
+        endpoints.remote.clear();
+    }
+    settings
+}
+
+/// Replace the rows `settings` holds with the shared deck list's.
+///
+/// An absent `[endpoints]` section stays absent when there are no remote decks,
+/// so a fresh install's document is unchanged; with decks it gains a section
+/// selecting the local deck, which is what an absent one already meant.
+fn attach_deck_rows(settings: &mut DesktopSettings, remotes: &Path) {
+    let rows = match crate::decks::load_rows(remotes) {
+        Ok(rows) => rows,
+        Err(error) => {
+            eprintln!(
+                "desktop decks: the deck list could not be read, so no remote deck is shown: {error}"
+            );
+            Vec::new()
+        }
+    };
+    match &mut settings.endpoints {
+        Some(endpoints) => endpoints.remote = rows,
+        None if rows.is_empty() => {}
+        None => {
+            settings.endpoints = Some(EndpointSettings {
+                remote: rows,
+                selection: Selection::Local,
+            })
+        }
+    }
+}
+
+/// Move the `[[endpoints.remote]]` rows a pre-#1350 build kept in the settings
+/// document at `path` into the deck list at `remotes`, once (issue #1350).
+///
+/// **Order is the crash-safety argument.** `remotes.toml` is written first,
+/// then the rows are removed from `desktop.toml`. A crash between the two
+/// leaves the rows in both, and the next load runs this again — which adds
+/// nothing, because [`crate::decks::migrate`] skips a row whose id the deck
+/// list already holds. The reverse order could lose a deck.
+///
+/// A selection naming a row that merged into an existing deck with an id of its
+/// own is re-pointed at that id, in the document and in `settings`, so the
+/// selected deck survives. A failure is logged and leaves both files as they
+/// were for the next launch to retry.
+fn migrate_legacy_rows(path: &Path, remotes: &Path, settings: &mut DesktopSettings) {
+    let Some(endpoints) = settings.endpoints.as_mut() else {
+        return;
+    };
+    if endpoints.remote.is_empty() {
+        return;
+    }
+    let remap = match crate::decks::migrate(remotes, &endpoints.remote) {
+        Ok(remap) => remap,
+        Err(error) => {
+            eprintln!(
+                "desktop decks: moving the decks out of the desktop settings failed, will retry next launch: {error}"
+            );
+            return;
+        }
+    };
+    if let Err(error) = remove_legacy_rows(path, &remap) {
+        eprintln!("{}", error.detail());
+        return;
+    }
+    if let Selection::One(id) = &endpoints.selection
+        && let Some((_, to)) = remap.iter().find(|(from, _)| from == id)
+    {
+        endpoints.selection = Selection::One(to.clone());
+    }
+}
+
+/// The public half of a deck-list failure never carries the file's bytes or
+/// its path: [`RemoteConfigError`]'s own `Display` names the path, and a parse
+/// error's quotes the offending line.
+///
+/// [`RemoteConfigError`]: dot_agent_deck::remote::RemoteConfigError
+fn deck_list_error(error: dot_agent_deck::remote::RemoteConfigError) -> SettingsWriteError {
+    use dot_agent_deck::remote::RemoteConfigError;
+    let public = match &error {
+        RemoteConfigError::Io { source, .. } => format!("could not save the deck list: {source}"),
+        RemoteConfigError::Parse { .. } => {
+            "could not save the deck list: remotes.toml cannot be read. \
+             Fix or remove it, then try again — it has been left exactly as it is"
+                .to_string()
+        }
+        RemoteConfigError::Serialize(_) | RemoteConfigError::Unwritable { .. } => {
+            "could not save the deck list: the edit would not produce a readable file, \
+             so nothing was written"
+                .to_string()
+        }
+    };
+    SettingsWriteError {
+        detail: error.to_string(),
+        public,
+    }
 }
 
 /// How many temp names [`save_to`] draws before giving up. A leftover temp file
@@ -3137,6 +3336,13 @@ pub fn save_to(
         )
     })?;
 
+    publish(parent, path, &contents)?;
+    Ok(written)
+}
+
+/// Write `contents` to a fresh temp file beside `path`, `fsync` it and rename
+/// it over `path` — the last step of [`save_to`], and of [`remove_legacy_rows`].
+fn publish(parent: &Path, path: &Path, contents: &str) -> Result<(), SettingsWriteError> {
     let (mut file, tmp) = create_temp(parent, path)?;
     let published = (|| {
         // On Unix `create_new` + the owner-only creation mode already produced
@@ -3153,7 +3359,63 @@ pub fn save_to(
         let _ = std::fs::remove_file(&tmp);
         return Err(write_error("could not write", path, error));
     }
-    Ok(written)
+    Ok(())
+}
+
+/// Remove `[[endpoints.remote]]` from the settings document at `path`, and
+/// re-point `endpoints.selection` through `remap` — the second half of the
+/// issue-#1350 migration ([`migrate_legacy_rows`]).
+///
+/// A targeted edit of the document rather than a [`save_to`]: the rows are
+/// deleted outright instead of being merged down to an empty list, and every
+/// other byte — comments included — stays. Under the same lock and the same
+/// publish as a save, and refused on a document this build cannot read, exactly
+/// as a save is. A document with no rows left to remove is not rewritten.
+pub(crate) fn remove_legacy_rows(
+    path: &Path,
+    remap: &[(EndpointId, EndpointId)],
+) -> Result<(), SettingsWriteError> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    vet_parent_dir(parent)?;
+    let _lock = acquire_save_lock(parent, path)?;
+    let Some(contents) = read_document(path, ReadPurpose::Save)? else {
+        return Ok(());
+    };
+    if let Err(error) = toml_edit::de::from_str::<DesktopSettings>(&contents) {
+        return Err(refuse_to_overwrite(path, &contents, &error));
+    }
+    let mut document = contents
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| refuse_to_overwrite(path, &contents, &error.into()))?;
+    let Some(endpoints) = document
+        .get_mut("endpoints")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    else {
+        return Ok(());
+    };
+    if endpoints.remove("remote").is_none() {
+        return Ok(());
+    }
+    let remapped = endpoints
+        .get("selection")
+        .and_then(toml_edit::Item::as_str)
+        .and_then(|token| remap.iter().find(|(from, _)| from.as_str() == token))
+        .map(|(_, to)| to.as_str().to_string());
+    if let Some(to) = remapped {
+        endpoints.insert("selection", toml_edit::value(to));
+    }
+    let contents = document.to_string();
+    toml_edit::de::from_str::<DesktopSettings>(&contents).map_err(|_| {
+        write_error(
+            "could not move the decks out of",
+            path,
+            "the result would not be readable by this build, so nothing was written",
+        )
+    })?;
+    publish(parent, path, &contents)
 }
 
 /// How long a save waits for another process's save of the same document to
@@ -4088,6 +4350,12 @@ mod tests {
     /// that set [`SETTINGS_PATH_ENV`] — against each other and against
     /// themselves.
     static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The CLI's override for the deck list's path, which
+    /// [`crate::decks::remotes_path`] honours — set beside
+    /// [`SETTINGS_PATH_ENV`] by every test that goes through [`load_snapshot`]
+    /// or [`save`], so none of them reads the developer's real `remotes.toml`.
+    const REMOTES_PATH_ENV: &str = "DOT_AGENT_DECK_REMOTES";
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("settings tempdir")
@@ -6667,12 +6935,15 @@ mod tests {
         std::fs::write(&path, UNREADABLE_DOCUMENTS[1]).unwrap();
         // SAFETY: the lock above serialises every test that touches this var.
         unsafe { std::env::set_var(SETTINGS_PATH_ENV, &path) };
+        // Issue #1350: the deck list too, so this cannot read the real one.
+        unsafe { std::env::set_var(REMOTES_PATH_ENV, dir.path().join("remotes.toml")) };
         let broken = load_snapshot();
 
         save_to(&path, None, &dark()).unwrap_err();
         std::fs::write(&path, "version = 1\n[appearance]\nmode = \"dark\"\n").unwrap();
         let healthy = load_snapshot();
         unsafe { std::env::remove_var(SETTINGS_PATH_ENV) };
+        unsafe { std::env::remove_var(REMOTES_PATH_ENV) };
 
         let reported = broken.problem.expect("the snapshot must carry the reason");
         assert!(reported.contains("cannot be read"), "{reported}");
@@ -6810,8 +7081,11 @@ mod tests {
 
         // SAFETY: the lock above serialises every test that touches this var.
         unsafe { std::env::set_var(SETTINGS_PATH_ENV, &path) };
+        // Issue #1350: the deck list too, so this cannot read the real one.
+        unsafe { std::env::set_var(REMOTES_PATH_ENV, dir.path().join("remotes.toml")) };
         let snapshot = load_snapshot();
         unsafe { std::env::remove_var(SETTINGS_PATH_ENV) };
+        unsafe { std::env::remove_var(REMOTES_PATH_ENV) };
 
         assert_eq!(snapshot.settings, dark());
         assert_eq!(snapshot.path, path.display().to_string());
@@ -8206,6 +8480,8 @@ forms it is.";
 
         // SAFETY: the lock above serialises every test that touches this var.
         unsafe { std::env::set_var(SETTINGS_PATH_ENV, &path) };
+        // Issue #1350: the deck list too, so this cannot read the real one.
+        unsafe { std::env::set_var(REMOTES_PATH_ENV, dir.path().join("remotes.toml")) };
         let snapshot = load_snapshot();
         // What the webview sends when the user picks a theme: the document it
         // was showing as the base, and that document with the one field changed.
@@ -8213,6 +8489,7 @@ forms it is.";
         edited.appearance.mode = AppearanceMode::Dark;
         let saved = save(Some(&snapshot.settings), &edited);
         unsafe { std::env::remove_var(SETTINGS_PATH_ENV) };
+        unsafe { std::env::remove_var(REMOTES_PATH_ENV) };
         let written = saved.unwrap();
 
         // The reply `desktop_get_settings` would send, as JSON, exactly as the
@@ -9315,5 +9592,207 @@ level = 1.0
             "version = 1\n\n[[endpoints.remote]]\nhost = \"h\"\nid = \"d\"\nport = {SENTINEL:?}\n"
         ))
         .is_err());
+    }
+
+    // -- Issue #1350: the remote decks live in the shared `remotes.toml` -----
+
+    const CLI_DECK: &str = "[[remotes]]\nname = \"prod\"\ntype = \"ssh\"\n\
+        host = \"dev@build.example.com\"\nport = 2222\nversion = \"0.40.0\"\n\
+        added_at = \"2026-01-01T00:00:00Z\"\n";
+
+    fn deck_row(id: &str, host: &str) -> RemoteEndpointSettings {
+        RemoteEndpointSettings::new(
+            EndpointId::parse(id).unwrap(),
+            Hostname::parse(host).unwrap(),
+        )
+    }
+
+    fn row_ids(settings: &DesktopSettings) -> Vec<String> {
+        settings
+            .endpoints
+            .as_ref()
+            .map(|endpoints| {
+                endpoints
+                    .remote
+                    .iter()
+                    .map(|row| row.id.as_str().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// D6: a pre-#1350 document's `[[endpoints.remote]]` rows move into the
+    /// shared list on load — merged with a CLI deck at the same address rather
+    /// than duplicated — the rows leave `desktop.toml` and everything else in it
+    /// stays, and the selection follows its deck to the id it now has. Loading
+    /// again changes neither file.
+    #[test]
+    fn legacy_desktop_rows_move_to_the_shared_list_once_and_the_selection_survives() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let remotes = dir.path().join("remotes.toml");
+        std::fs::write(&remotes, format!("{CLI_DECK}id = \"cli-own\"\n")).unwrap();
+        std::fs::write(
+            &path,
+            "version = 1\n\n\
+             # my theme\n\
+             [appearance]\n\
+             mode = \"dark\"\n\n\
+             [endpoints]\n\
+             selection = \"desk1\"\n\n\
+             [[endpoints.remote]]\n\
+             host = \"build.example.com\"\n\
+             id = \"desk1\"\n\
+             port = 2222\n\
+             user = \"dev\"\n\
+             jump = \"bastion\"\n\n\
+             [[endpoints.remote]]\n\
+             host = \"fresh.example\"\n\
+             id = \"desk2\"\n",
+        )
+        .unwrap();
+
+        let snapshot = load_snapshot_at(&path, &remotes);
+        assert_eq!(snapshot.problem, None);
+        let endpoints = snapshot.settings.endpoints.as_ref().unwrap();
+        assert_eq!(
+            endpoints.selection,
+            Selection::One(EndpointId::parse("cli-own").unwrap())
+        );
+        assert_eq!(row_ids(&snapshot.settings), ["cli-own", "desk2"]);
+        assert_eq!(snapshot.settings.appearance.mode, AppearanceMode::Dark);
+
+        let document = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !document.contains("remote"),
+            "rows left behind:\n{document}"
+        );
+        assert!(document.contains("# my theme"), "{document}");
+        assert!(document.contains("selection = \"cli-own\""), "{document}");
+        let registry = dot_agent_deck::remote::RemotesFile::load(&remotes).unwrap();
+        assert_eq!(registry.remotes.len(), 2, "{registry:?}");
+        assert_eq!(registry.remotes[0].jump_host.as_deref(), Some("bastion"));
+
+        let (document_before, registry_before) = (
+            std::fs::read_to_string(&path).unwrap(),
+            std::fs::read_to_string(&remotes).unwrap(),
+        );
+        assert_eq!(load_snapshot_at(&path, &remotes), snapshot);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), document_before);
+        assert_eq!(std::fs::read_to_string(&remotes).unwrap(), registry_before);
+    }
+
+    /// A crash between the two writes leaves the rows in both files; the next
+    /// load must finish the move without adding anything twice.
+    #[test]
+    fn a_migration_interrupted_after_the_shared_list_was_written_completes_cleanly() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let remotes = dir.path().join("remotes.toml");
+        let legacy = "version = 1\n\n[endpoints]\nselection = \"desk1\"\n\n\
+                      [[endpoints.remote]]\nhost = \"fresh.example\"\nid = \"desk1\"\n";
+        std::fs::write(&path, legacy).unwrap();
+        crate::decks::migrate(&remotes, &[deck_row("desk1", "fresh.example")]).unwrap();
+
+        let snapshot = load_snapshot_at(&path, &remotes);
+        assert_eq!(row_ids(&snapshot.settings), ["desk1"]);
+        assert_eq!(
+            snapshot.settings.endpoints.unwrap().selection,
+            Selection::One(EndpointId::parse("desk1").unwrap())
+        );
+        assert_eq!(
+            dot_agent_deck::remote::RemotesFile::load(&remotes)
+                .unwrap()
+                .remotes
+                .len(),
+            1
+        );
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("remote"));
+    }
+
+    /// D5 at the level the webview drives: the app loads, `remote add` appends
+    /// a deck from a terminal, and the app then saves an edit made against its
+    /// old copy. Both decks survive, the new one is in `remotes.toml` and not in
+    /// `desktop.toml`, and the reply shows the terminal's deck.
+    #[test]
+    fn a_save_edits_the_shared_list_against_a_fresh_read_and_keeps_rows_out_of_desktop_toml() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let remotes = dir.path().join("remotes.toml");
+        std::fs::write(&remotes, CLI_DECK).unwrap();
+        let snapshot = load_snapshot_at(&path, &remotes);
+        assert_eq!(row_ids(&snapshot.settings), ["n-prod"]);
+
+        dot_agent_deck::deck_list::add(
+            &remotes,
+            dot_agent_deck::remote::RemoteEntry {
+                name: "late".to_string(),
+                kind: "ssh".to_string(),
+                host: "late.example".to_string(),
+                port: 22,
+                key: None,
+                version: "0.43.0".to_string(),
+                added_at: "2026-09-01T00:00:00Z".to_string(),
+                upgraded_at: None,
+                last_connected: None,
+                id: None,
+                user: None,
+                jump_host: None,
+                socket: None,
+            },
+        )
+        .unwrap();
+
+        let mut edited = snapshot.settings.clone();
+        let endpoints = edited.endpoints.as_mut().unwrap();
+        endpoints
+            .remote
+            .push(deck_row("0123456789abcdef", "new.example"));
+        endpoints.selection = Selection::One(EndpointId::parse("0123456789abcdef").unwrap());
+        let written = save_at(&path, &remotes, Some(&snapshot.settings), &edited).unwrap();
+
+        assert_eq!(row_ids(&written), ["n-prod", "n-late", "0123456789abcdef"]);
+        let document = std::fs::read_to_string(&path).unwrap();
+        assert!(!document.contains("[[endpoints.remote]]"), "{document}");
+        assert!(!document.contains("new.example"), "{document}");
+        assert!(
+            document.contains("selection = \"0123456789abcdef\""),
+            "{document}"
+        );
+        assert_eq!(load_snapshot_at(&path, &remotes).settings, written);
+    }
+
+    /// A save that changes no deck leaves the shared list byte for byte alone.
+    #[test]
+    fn a_theme_change_does_not_rewrite_the_shared_list() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let remotes = dir.path().join("remotes.toml");
+        let registry = format!("# hand-written\n{CLI_DECK}");
+        std::fs::write(&remotes, &registry).unwrap();
+        let snapshot = load_snapshot_at(&path, &remotes);
+        let mut edited = snapshot.settings.clone();
+        edited.appearance.mode = AppearanceMode::Dark;
+        save_at(&path, &remotes, Some(&snapshot.settings), &edited).unwrap();
+        assert_eq!(std::fs::read_to_string(&remotes).unwrap(), registry);
+    }
+
+    /// A settings document this build cannot read refuses the save before the
+    /// deck list is touched, so the save does not half-happen.
+    #[test]
+    fn an_unreadable_settings_document_refuses_before_the_shared_list_is_edited() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let remotes = dir.path().join("remotes.toml");
+        std::fs::write(&path, UNREADABLE_DOCUMENTS[1]).unwrap();
+        let edited = DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![deck_row("abcd", "new.example")],
+                selection: Selection::Local,
+            }),
+            ..DesktopSettings::default()
+        };
+        save_at(&path, &remotes, Some(&DesktopSettings::default()), &edited).unwrap_err();
+        assert!(!remotes.exists());
     }
 }

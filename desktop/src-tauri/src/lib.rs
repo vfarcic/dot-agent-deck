@@ -1,6 +1,7 @@
 mod agent_view;
 mod appearance;
 mod daemon_bridge;
+mod decks;
 mod dto;
 mod endpoint_test;
 // Tests only: the shared endpoint-validation table, read from here and from
