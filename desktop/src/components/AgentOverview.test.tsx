@@ -1746,6 +1746,8 @@ describe("AgentOverview", () => {
     fireEvent.click(screen.getByTestId("overview-connect-anyway"));
     expect(runAction).not.toHaveBeenCalled();
     expect(screen.getByRole("alertdialog")).toHaveTextContent("The wire protocol matched on both sides");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("a declared compatibility break separates the two builds");
+    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("stamp difference");
     fireEvent.click(screen.getAllByRole("button", { name: "Connect anyway" }).at(-1)!);
 
     await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch" }));
