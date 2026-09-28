@@ -291,7 +291,8 @@ pub fn apply(path: &Path, edits: &[DeckEdit]) -> Result<(), RemoteConfigError> {
 /// agree ([`deck_list::address_key`]) — so a deck the user configured in both
 /// clients is not listed twice. Such a row is not re-added: the registry row
 /// gains the desktop's id if it had none, and any desktop-only field it lacks
-/// (jump host, socket, key); a registry row that already has an id of its own
+/// (jump host, socket, key) — also when it already answers to the legacy id,
+/// explicitly or derived from its name; a registry row that already has an id of its own
 /// keeps it, and the returned pair `(desktop id, registry id)` is how the
 /// caller re-points a selection at it. Every other row is appended with a
 /// derived name and [`deck_list::UNMANAGED_VERSION`].
@@ -327,8 +328,21 @@ pub fn migrate(
             let address = deck_list::address_key(&candidate);
             let holder = entries
                 .iter()
-                .find(|entry| deck_list::deck_id(entry) == row.id.as_str());
-            if holder.is_some_and(|entry| deck_list::address_key(entry) == address) {
+                .position(|entry| deck_list::deck_id(entry) == row.id.as_str());
+            if let Some(index) = holder
+                && deck_list::address_key(&entries[index]) == address
+            {
+                // The same deck under the same id — migrated already, or a CLI
+                // row whose derived id happens to be the legacy one. Either
+                // way it still gains what only the legacy row carried (issue
+                // #1350's review: this path used to skip before the fill, and
+                // `desktop.toml` then lost those fields for good). Filling
+                // only what is missing makes a retry write nothing.
+                let mut entry = entries[index].clone();
+                fill_missing(&mut entry, &candidate);
+                if entry != entries[index] {
+                    document.replace(index, &entry)?;
+                }
                 continue;
             }
             // Another deck holds this id: the legacy deck needs one of its own.
@@ -361,13 +375,26 @@ pub fn migrate(
             } else {
                 entry.id = Some(row.id.as_str().to_string());
             }
-            entry.key = entry.key.or(candidate.key);
-            entry.jump_host = entry.jump_host.or(candidate.jump_host);
-            entry.socket = entry.socket.or(candidate.socket);
+            fill_missing(&mut entry, &candidate);
             document.replace(index, &entry)?;
         }
         Ok(remap)
     })
+}
+
+/// Give `entry` each desktop-only connection field it lacks — key, jump host,
+/// socket — from `legacy`. A value `entry` already has is never overwritten:
+/// the registry row is the one both clients now edit.
+fn fill_missing(entry: &mut RemoteEntry, legacy: &RemoteEntry) {
+    if entry.key.is_none() {
+        entry.key.clone_from(&legacy.key);
+    }
+    if entry.jump_host.is_none() {
+        entry.jump_host.clone_from(&legacy.jump_host);
+    }
+    if entry.socket.is_none() {
+        entry.socket.clone_from(&legacy.socket);
+    }
 }
 
 /// An id no row in `entries` holds, derived from `base`: `base-2`, `base-3`, …
@@ -754,6 +781,43 @@ mod tests {
         let after_first = std::fs::read_to_string(&path).unwrap();
         assert_eq!(migrate(&path, &legacy).unwrap(), []);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), after_first);
+    }
+
+    /// Issue #1350's review: a CLI row `prod` with no id answers to the
+    /// derived id `n-prod`, so a legacy row `n-prod` at the same address is
+    /// the same deck — and the fields only the legacy row carried must still
+    /// reach the registry, since `desktop.toml` loses them next. The registry
+    /// row's own values stand, and a retry writes nothing.
+    #[test]
+    fn migration_into_a_row_answering_to_the_legacy_id_keeps_legacy_only_fields() {
+        let (_dir, path) = registry(&format!("{CLI_ROW}key = \"~/.ssh/cli_key\"\n"));
+        let legacy = [RemoteEndpointSettings {
+            identity: Some(KeyPath::parse("~/.ssh/legacy_key").unwrap()),
+            jump: Some(HostAlias::parse("bastion").unwrap()),
+            port: SshPort::parse(2222).unwrap(),
+            user: Some(SshUser::parse("dev").unwrap()),
+            ..row("n-prod", "build.example.com")
+        }];
+        assert_eq!(migrate(&path, &legacy).unwrap(), []);
+
+        let entries = RemotesFile::load(&path).unwrap().remotes;
+        assert_eq!(entries.len(), 1, "no duplicate: {entries:?}");
+        assert_eq!(entries[0].jump_host.as_deref(), Some("bastion"));
+        assert_eq!(
+            entries[0].key.as_deref(),
+            Some("~/.ssh/cli_key"),
+            "the registry row's own value is never overwritten"
+        );
+        assert_eq!(entries[0].socket, None);
+        assert_eq!(deck_list::deck_id(&entries[0]), "n-prod");
+
+        let after_first = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(migrate(&path, &legacy).unwrap(), []);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            after_first,
+            "the retry wrote"
+        );
     }
 
     #[test]
