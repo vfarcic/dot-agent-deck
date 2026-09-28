@@ -318,12 +318,12 @@ pub fn classify_event(event: &AgentEvent) -> EventVerdict {
 /// What the worker's screen shows about this delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Composer {
-    /// The delivery id ends on the cursor's row: the pointer is most likely
+    /// The pointer ends right at the cursor: the pointer is most likely
     /// sitting in the composer, unsubmitted. The re-delivery is the submit-only
     /// probe, and after an unanswered grace one more Enter (issue #1243).
     PointerInComposer,
-    /// The delivery id is on screen, but not on the cursor's row: most likely a
-    /// submitted pointer still in the transcript above an input box that holds
+    /// The delivery id is on screen, but the pointer does not end at the
+    /// cursor: most likely a submitted pointer still in the transcript above an input box that holds
     /// something else, or nothing. The re-delivery is the submit-only probe and
     /// nothing more — no second Enter into that other input, and no second
     /// copy of a pointer that was most likely already submitted.
@@ -340,7 +340,9 @@ pub enum Composer {
 }
 
 /// Classify the worker's screen for `delivery_id`. `screen_rows` is every row
-/// of the screen, blank ones included, and `cursor_row` indexes it.
+/// of the screen, blank ones included, and `cursor_row` indexes it;
+/// `cursor_col` is how many `char`s of that row sit at or before the cursor
+/// (see [`crate::pane_screen_text::visible_rows_and_cursor`]).
 ///
 /// Searches each row, and then every row concatenated with everything but ASCII
 /// letters, digits and `-` stripped out, so an id split by a line wrap — with a
@@ -351,12 +353,16 @@ pub enum Composer {
 /// cursor right after what was typed into it — measured on Claude Code 2.1.284
 /// and Codex 0.156.1, both with a visible cursor on the composer row, directly
 /// after the id, and Claude Code with three non-blank rows (border and footers)
-/// below it. So the id is in the composer when it ENDS on the cursor's row: on
-/// that row whole, or starting on the row above it across a wrap — or when it
-/// ends on the row above and the cursor's row holds nothing but the rest of the
-/// pointer (`after_id`, the pointer's text after the id: its closing `]`, which
-/// wraps alone when the id fills a row). Anywhere else it is transcript. A row-count window from the bottom would not do: Claude
-/// Code's footers put the composer's id three rows up, and a submitted pointer
+/// below it. So the pointer is in the composer when it ENDS AT THE CURSOR: the
+/// id followed by the rest of the pointer (`after_id`, the pointer's text after
+/// the id: its closing `]`) ends at or just before the cursor's column, with
+/// only whitespace between them. The id may sit on the cursor's row whole or
+/// start on the row above it across a wrap, and when the id fills a row the
+/// `]` wraps alone — then the cursor's row holds nothing before the cursor but
+/// the rest of the pointer, and the id must end the row above. Anywhere else it
+/// is transcript, including a copy earlier on the cursor's row with other text
+/// after it. A row-count window from the bottom would not do: Claude Code's
+/// footers put the composer's id three rows up, and a submitted pointer
 /// directly above an empty input box sits only two rows further.
 ///
 /// **Biased away from [`Composer::Absent`] on purpose.** Any sight of the id,
@@ -372,6 +378,7 @@ pub enum Composer {
 pub fn classify_composer(
     screen_rows: &[String],
     cursor_row: usize,
+    cursor_col: usize,
     delivery_id: &str,
     after_id: &str,
     resized_since_write: bool,
@@ -382,19 +389,17 @@ pub fn classify_composer(
     if delivery_id.is_empty() {
         return Composer::Absent;
     }
-    let rest_of_pointer_on_cursor_row = || {
-        let rest = glyphs_only(after_id);
-        let row = screen_rows
-            .get(cursor_row)
-            .map(|row| glyphs_only(row))
-            .unwrap_or_default();
-        !row.is_empty() && rest.ends_with(&row)
-    };
-    if id_ends_on_row(screen_rows, cursor_row, delivery_id)
-        || (cursor_row > 0
-            && id_ends_on_row(screen_rows, cursor_row - 1, delivery_id)
-            && rest_of_pointer_on_cursor_row())
-    {
+    let before_cursor: String = screen_rows
+        .get(cursor_row)
+        .map(|row| row.chars().take(cursor_col).collect())
+        .unwrap_or_default();
+    if pointer_ends_at(
+        screen_rows,
+        cursor_row,
+        before_cursor.trim_end(),
+        delivery_id,
+        after_id,
+    ) {
         return Composer::PointerInComposer;
     }
     let squeezed: String = screen_rows
@@ -423,26 +428,63 @@ fn glyphs_only(text: &str) -> String {
         .collect()
 }
 
-/// Whether `delivery_id` ends on row `row`: whole on it, or wrapped onto it
-/// from the row above.
-fn id_ends_on_row(screen_rows: &[String], row: usize, delivery_id: &str) -> bool {
-    let Some(current) = screen_rows.get(row) else {
-        return false;
-    };
-    if current.contains(delivery_id) {
+/// Whether the pointer — `delivery_id` then `after_id` — ends exactly where
+/// `head`, row `row`'s text up to a point, ends: on that row whole, or with
+/// `after_id` wrapped alone onto it and the id ending the row above.
+fn pointer_ends_at(
+    screen_rows: &[String],
+    row: usize,
+    head: &str,
+    delivery_id: &str,
+    after_id: &str,
+) -> bool {
+    if let Some(before_rest) = head.strip_suffix(after_id)
+        && id_ends_at(screen_rows, row, before_rest, delivery_id)
+    {
         return true;
     }
-    let above = row
-        .checked_sub(1)
-        .and_then(|above| screen_rows.get(above))
-        .map(|above| squeeze_id_chars(above))
-        .unwrap_or_default();
-    let joined = format!("{above}{}", squeeze_id_chars(current));
-    // A match that ends inside `above` is a copy on the row above, not one that
-    // wraps onto this row.
-    joined
-        .match_indices(delivery_id)
-        .any(|(start, _)| start + delivery_id.len() > above.len())
+    // The rest of the pointer wrapped: nothing but (a tail of) it on this row,
+    // behind any border and padding, and the id with whatever of the rest did
+    // not wrap ending the row above.
+    let rest = glyphs_only(after_id);
+    let here = glyphs_only(head);
+    let Some(unwrapped) = rest.strip_suffix(here.as_str()) else {
+        return false;
+    };
+    let Some(above) = row.checked_sub(1).and_then(|above| screen_rows.get(above)) else {
+        return false;
+    };
+    let above = trim_end_glyphs(above);
+    !here.is_empty()
+        && above
+            .strip_suffix(unwrapped)
+            .is_some_and(|before_rest| id_ends_at(screen_rows, row - 1, before_rest, delivery_id))
+}
+
+/// Whether `delivery_id` ends exactly where `head`, row `row`'s text up to a
+/// point, ends: whole on the row, or wrapped onto it from the row above — then
+/// `head` holds nothing but the id's tail behind any border and padding, and
+/// the row above ends with the rest of it.
+fn id_ends_at(screen_rows: &[String], row: usize, head: &str, delivery_id: &str) -> bool {
+    if head.ends_with(delivery_id) {
+        return true;
+    }
+    let tail = glyphs_only(head);
+    let Some(start) = delivery_id.strip_suffix(tail.as_str()) else {
+        return false;
+    };
+    !tail.is_empty()
+        && !start.is_empty()
+        && row
+            .checked_sub(1)
+            .and_then(|above| screen_rows.get(above))
+            .is_some_and(|above| glyphs_only(above).ends_with(start))
+}
+
+/// `text` without trailing whitespace and box-drawing or block glyphs: a
+/// composer row's content with its right border and padding cut away.
+fn trim_end_glyphs(text: &str) -> &str {
+    text.trim_end_matches(|c: char| c.is_whitespace() || ('\u{2500}'..='\u{259F}').contains(&c))
 }
 
 /// Handed back by [`PendingDeliveries::arm`] to the loop that owns the record.
@@ -1032,12 +1074,13 @@ async fn redeliver(
     }
     let composer = match registry.snapshot_with_pty_size(worker_agent_id) {
         Ok((bytes, rows, cols)) => {
-            let (screen_rows, cursor_row) =
+            let (screen_rows, cursor_row, cursor_col) =
                 crate::pane_screen_text::visible_rows_and_cursor(&bytes, rows, cols)
                     .unwrap_or_default();
             classify_composer(
                 &screen_rows,
                 cursor_row,
+                cursor_col,
                 delivery_id,
                 pointer
                     .rsplit_once(delivery_id)
@@ -1467,6 +1510,12 @@ mod tests {
         screen.len().saturating_sub(1)
     }
 
+    /// The cursor column right after row `row`'s text, where an input box
+    /// leaves it after typing.
+    fn end(screen: &[String], row: usize) -> usize {
+        screen.get(row).map_or(0, |row| row.chars().count())
+    }
+
     #[test]
     fn classify_composer_finds_the_id_on_the_cursor_row() {
         let screen = rows(&[
@@ -1474,7 +1523,14 @@ mod tests {
             "> Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-7f3a9c21]",
         ]);
         assert_eq!(
-            classify_composer(&screen, last(&screen), "d-7f3a9c21", "]", false),
+            classify_composer(
+                &screen,
+                last(&screen),
+                end(&screen, last(&screen)),
+                "d-7f3a9c21",
+                "]",
+                false
+            ),
             Composer::PointerInComposer
         );
     }
@@ -1483,11 +1539,20 @@ mod tests {
     fn classify_composer_finds_an_id_split_across_rows() {
         let screen = rows(&["> Read … for your task. [delivery d-7f3a", "9c21]"]);
         assert_eq!(
-            classify_composer(&screen, last(&screen), "d-7f3a9c21", "]", false),
+            classify_composer(
+                &screen,
+                last(&screen),
+                end(&screen, last(&screen)),
+                "d-7f3a9c21",
+                "]",
+                false
+            ),
             Composer::PointerInComposer
         );
     }
 
+    /// The cursor sits right after the typed `]`, inside the box: the right
+    /// border beyond it is not between the pointer and the cursor.
     #[test]
     fn classify_composer_finds_an_id_behind_border_glyphs() {
         let screen = rows(&[
@@ -1495,7 +1560,14 @@ mod tests {
             "┃ 9c21]                                                          ┃",
         ]);
         assert_eq!(
-            classify_composer(&screen, last(&screen), "d-7f3a9c21", "]", false),
+            classify_composer(
+                &screen,
+                last(&screen),
+                "┃ 9c21]".chars().count(),
+                "d-7f3a9c21",
+                "]",
+                false
+            ),
             Composer::PointerInComposer
         );
     }
@@ -1511,7 +1583,7 @@ mod tests {
             "]",
         ]);
         assert_eq!(
-            classify_composer(&bare, 1, "d-7f3a9c21", "]", false),
+            classify_composer(&bare, 1, end(&bare, 1), "d-7f3a9c21", "]", false),
             Composer::PointerInComposer
         );
         let bordered = rows(&[
@@ -1520,7 +1592,7 @@ mod tests {
             "┃  ]",
         ]);
         assert_eq!(
-            classify_composer(&bordered, 2, "d-7f3a9c21", "]", false),
+            classify_composer(&bordered, 2, end(&bordered, 2), "d-7f3a9c21", "]", false),
             Composer::PointerInComposer
         );
         // Anything but the rest of the pointer on the cursor's row is another
@@ -1531,7 +1603,7 @@ mod tests {
                 cursor_row,
             ]);
             assert_eq!(
-                classify_composer(&screen, 1, "d-7f3a9c21", "]", false),
+                classify_composer(&screen, 1, end(&screen, 1), "d-7f3a9c21", "]", false),
                 Composer::PointerInHistory,
                 "cursor row {cursor_row:?}"
             );
@@ -1552,7 +1624,7 @@ mod tests {
             "⏸ manual mode on",
         ]);
         assert_eq!(
-            classify_composer(&screen, 3, "d-7f3a9c21", "]", false),
+            classify_composer(&screen, 3, end(&screen, 3), "d-7f3a9c21", "]", false),
             Composer::PointerInComposer
         );
     }
@@ -1570,7 +1642,7 @@ mod tests {
             "? for shortcuts",
         ]);
         assert_eq!(
-            classify_composer(&bordered, 2, "d-7f3a9c21", "]", false),
+            classify_composer(&bordered, 2, end(&bordered, 2), "d-7f3a9c21", "]", false),
             Composer::PointerInHistory
         );
         let bare = rows(&[
@@ -1578,7 +1650,7 @@ mod tests {
             "> ",
         ]);
         assert_eq!(
-            classify_composer(&bare, 1, "d-7f3a9c21", "]", false),
+            classify_composer(&bare, 1, end(&bare, 1), "d-7f3a9c21", "]", false),
             Composer::PointerInHistory,
             "a whole copy on the row above is not a wrap onto the cursor row"
         );
@@ -1586,7 +1658,47 @@ mod tests {
         // terminal leaves it after a submitted line.
         let submitted = rows(&["READY> [delivery d-7f3a9c21]", ""]);
         assert_eq!(
-            classify_composer(&submitted, 1, "d-7f3a9c21", "]", false),
+            classify_composer(&submitted, 1, end(&submitted, 1), "d-7f3a9c21", "]", false),
+            Composer::PointerInHistory
+        );
+    }
+
+    /// Auditor re-check of c9ad0a10: a copy of the id earlier on the cursor's
+    /// row, with other text after it, is transcript sharing that row — and so
+    /// is a pointer that ends to the RIGHT of the cursor. Only a pointer that
+    /// ends at the cursor, whitespace aside, is in the composer.
+    #[test]
+    fn classify_composer_an_id_earlier_on_the_cursor_row_is_not_in_the_composer() {
+        let followed = rows(&[
+            "welcome",
+            "READY> [delivery d-7f3a9c21] accepted, working on it > next",
+        ]);
+        assert_eq!(
+            classify_composer(&followed, 1, end(&followed, 1), "d-7f3a9c21", "]", false),
+            Composer::PointerInHistory
+        );
+        // Unrelated text straight after the id, before any `]`.
+        let glued = rows(&["> [delivery d-7f3a9c21 !!]"]);
+        assert_eq!(
+            classify_composer(&glued, 0, end(&glued, 0), "d-7f3a9c21", "]", false),
+            Composer::PointerInHistory
+        );
+        // The pointer ends after the cursor, which sits at the prompt.
+        let ahead = rows(&["> [delivery d-7f3a9c21]"]);
+        assert_eq!(
+            classify_composer(&ahead, 0, 2, "d-7f3a9c21", "]", false),
+            Composer::PointerInHistory
+        );
+        // Whitespace between the pointer's end and the cursor is still the end.
+        let padded = rows(&["> [delivery d-7f3a9c21]   "]);
+        assert_eq!(
+            classify_composer(&padded, 0, end(&padded, 0), "d-7f3a9c21", "]", false),
+            Composer::PointerInComposer
+        );
+        // A wrapped id whose tail shares the cursor's row with other text.
+        let wrapped = rows(&["> Read … for your task. [delivery d-7f3a", "9c21] done"]);
+        assert_eq!(
+            classify_composer(&wrapped, 1, end(&wrapped, 1), "d-7f3a9c21", "]", false),
             Composer::PointerInHistory
         );
     }
@@ -1595,15 +1707,15 @@ mod tests {
     fn classify_composer_ignores_another_delivery_and_a_blank_screen() {
         let screen = rows(&["> Read … for your task. [delivery d-00000000]"]);
         assert_eq!(
-            classify_composer(&screen, 0, "d-7f3a9c21", "]", false),
+            classify_composer(&screen, 0, end(&screen, 0), "d-7f3a9c21", "]", false),
             Composer::Absent
         );
         assert_eq!(
-            classify_composer(&[], 0, "d-7f3a9c21", "]", false),
+            classify_composer(&[], 0, 0, "d-7f3a9c21", "]", false),
             Composer::Absent
         );
         assert_eq!(
-            classify_composer(&rows(&["", "   "]), 1, "d-7f3a9c21", "]", false),
+            classify_composer(&rows(&["", "   "]), 1, 3, "d-7f3a9c21", "]", false),
             Composer::Absent
         );
     }
@@ -1611,18 +1723,19 @@ mod tests {
     #[test]
     fn classify_composer_a_screen_blanked_by_a_resize_is_unreadable() {
         assert_eq!(
-            classify_composer(&[], 0, "d-7f3a9c21", "]", true),
+            classify_composer(&[], 0, 0, "d-7f3a9c21", "]", true),
             Composer::Unreadable
         );
         // A screen the agent has repainted since is read as usual.
         assert_eq!(
-            classify_composer(&rows(&["> "]), 0, "d-7f3a9c21", "]", true),
+            classify_composer(&rows(&["> "]), 0, 2, "d-7f3a9c21", "]", true),
             Composer::Absent
         );
         assert_eq!(
             classify_composer(
                 &rows(&["> [delivery d-7f3a9c21]"]),
                 0,
+                23,
                 "d-7f3a9c21",
                 "]",
                 true
@@ -1747,6 +1860,19 @@ mod loop_tests {
         "Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-1383beef]";
     const ID: &str = "d-1383beef";
 
+    /// [`Fixture::start_composer`]'s worker.
+    const COMPOSER: &str = r#"import os
+import sys
+import tty
+
+tty.setraw(0)
+sink = open(sys.argv[1], 'ab', buffering=0)
+os.write(1, b'READY')
+while chunk := os.read(0, 4096):
+    sink.write(chunk)
+    os.write(1, chunk.replace(b'\r', b'').replace(b'\n', b''))
+"#;
+
     struct Fixture {
         registry: Arc<AgentPtyRegistry>,
         agent: String,
@@ -1767,9 +1893,44 @@ mod loop_tests {
         /// A worker whose terminal is set up by `stty` before it copies its
         /// input into a file.
         async fn start_with(pane: &str, stty: &str) -> Self {
+            Self::spawn(pane, |sink| {
+                format!("{stty} && printf READY && exec cat > '{}'", sink.display())
+            })
+            .await
+        }
+
+        /// A worker whose input box shows what is typed into it and keeps the
+        /// cursor right after it, as an agent's composer that ignores Enter
+        /// does: raw, painting every byte but CR and LF, and copying all of
+        /// them into the file. A raw terminal's own echo is no stand-in for it
+        /// — it paints each ignored Enter after the pointer as `^M`. `None`
+        /// where `python3` is not available.
+        async fn start_composer(pane: &str) -> Option<Self> {
+            let available = std::process::Command::new("python3")
+                .arg("--version")
+                .output()
+                .is_ok_and(|out| out.status.success());
+            if !available {
+                return None;
+            }
+            Some(
+                Self::spawn(pane, |sink| {
+                    let script = sink.with_file_name("composer.py");
+                    std::fs::write(&script, COMPOSER).unwrap();
+                    format!(
+                        "exec python3 -u '{}' '{}'",
+                        script.display(),
+                        sink.display()
+                    )
+                })
+                .await,
+            )
+        }
+
+        async fn spawn(pane: &str, command: impl FnOnce(&std::path::Path) -> String) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let sink = dir.path().join("sink");
-            let command = format!("{stty} && printf READY && exec cat > '{}'", sink.display());
+            let command = command(&sink);
             let registry = Arc::new(AgentPtyRegistry::new());
             let agent = registry
                 .spawn_agent(SpawnOptions {
@@ -1911,7 +2072,10 @@ mod loop_tests {
     /// again.
     #[tokio::test]
     async fn retry_loop_presses_enter_twice_on_a_pointer_left_in_the_composer() {
-        let fx = Fixture::start_with("retry-probe", "stty raw").await;
+        let Some(fx) = Fixture::start_composer("retry-probe").await else {
+            eprintln!("SKIP: python3 is not available");
+            return;
+        };
         let (handle, redeliveries) = fx.deliver_and_retry("150,150").await;
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
         assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
