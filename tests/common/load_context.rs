@@ -106,7 +106,14 @@ struct Baseline {
 
 static BASELINE: OnceLock<Baseline> = OnceLock::new();
 
-/// Record the baseline and start the heartbeat. Idempotent and cheap after the
+/// Record the baseline and start the heartbeat.
+///
+/// **One baseline per PROCESS, which is one per test under nextest** — the
+/// runner every alias in `.cargo/config.toml` and every CI job uses, and which
+/// runs each test in a process of its own. Under plain `cargo test` several
+/// tests share a process and a later test's window then starts at the first
+/// one's harness call; the report prints its window length for that reason,
+/// so a window much longer than the failing test ran reads as what it is. Idempotent and cheap after the
 /// first call. Called from the harness's panic-hook installer, which a `TuiDeck`
 /// launch, every harness temp-dir allocation (`harness_temp_root`) and the
 /// agent preflights and importers all reach — so a test that uses none of
@@ -216,38 +223,59 @@ pub(crate) fn stall_between(start: &Reading, end: &Reading, window: Duration) ->
 
 /// The verdict for a window.
 ///
-/// **PSI decides wherever it exists; the load average is only the fallback.**
+/// **PSI decides wherever it is complete; the load average fills gaps.**
 /// Measured while calibrating this on the dev box: with other agents' ordinary
-/// work running, the 1-minute load average sat at 21-25 on 16 CPUs — 1.3-1.6
-/// per CPU — while PSI `cpu some` over the same windows was 6-13%, and the
-/// tests passed at their usual solo times. Linux counts tasks in uninterruptible
-/// sleep into the load average, so a disk-bound box inflates it without
-/// starving anything of CPU. PSI measures the stall itself, so where it is
-/// readable the load average is shown in the report but does not vote.
+/// work running, the 1-minute load average sat at 21-57 on 16 CPUs while PSI
+/// `cpu some` over the same windows was 1.5-13%, and the tests passed at their
+/// usual solo times. Linux counts tasks in uninterruptible sleep into the load
+/// average, so a disk-bound box inflates it without starving anything of CPU.
+/// PSI measures the stall itself, so when all three PSI sources are readable
+/// the load average is shown in the report but does not vote.
 ///
-/// Among the PSI sources the worst one wins: any one over its STARVED threshold
-/// is enough, because each independently means runnable work sat waiting.
+/// When any PSI source is missing — none on macOS, or only some of the three
+/// on a kernel or container that hides the rest — the load average votes
+/// alongside whatever PSI is present, because it is the only remaining signal
+/// for the resource that went unmeasured (it counts both CPU-runnable and
+/// I/O-blocked tasks). The worst vote wins either way: any one signal over its
+/// STARVED threshold is enough, because each independently means runnable work
+/// sat waiting.
 pub(crate) fn classify(stall: &Stall, load_per_cpu: Option<f64>) -> Verdict {
     let over = |v: Option<f64>, t: f64| v.is_some_and(|v| v >= t);
+    let fulls = [stall.io_full, stall.memory_full];
     let psi = [stall.cpu_some, stall.io_full, stall.memory_full];
-    if psi.iter().any(Option::is_some) {
-        let fulls = [stall.io_full, stall.memory_full];
-        if over(stall.cpu_some, STARVED_CPU_SOME) || fulls.iter().any(|&f| over(f, STARVED_FULL)) {
-            return Verdict::Starved;
+    let psi_vote = if !psi.iter().any(Option::is_some) {
+        None
+    } else if over(stall.cpu_some, STARVED_CPU_SOME) || fulls.iter().any(|&f| over(f, STARVED_FULL))
+    {
+        Some(Verdict::Starved)
+    } else if over(stall.cpu_some, CONTENDED_CPU_SOME)
+        || fulls.iter().any(|&f| over(f, CONTENDED_FULL))
+    {
+        Some(Verdict::Contended)
+    } else {
+        Some(Verdict::Quiet)
+    };
+    let load_vote = if psi.iter().all(Option::is_some) {
+        None
+    } else {
+        match load_per_cpu {
+            Some(l) if l >= STARVED_LOAD_PER_CPU => Some(Verdict::Starved),
+            Some(l) if l >= CONTENDED_LOAD_PER_CPU => Some(Verdict::Contended),
+            Some(_) => Some(Verdict::Quiet),
+            None => None,
         }
-        if over(stall.cpu_some, CONTENDED_CPU_SOME)
-            || fulls.iter().any(|&f| over(f, CONTENDED_FULL))
-        {
-            return Verdict::Contended;
-        }
-        return Verdict::Quiet;
-    }
-    match load_per_cpu {
-        Some(l) if l >= STARVED_LOAD_PER_CPU => Verdict::Starved,
-        Some(l) if l >= CONTENDED_LOAD_PER_CPU => Verdict::Contended,
-        Some(_) => Verdict::Quiet,
-        None => Verdict::Unmeasured,
-    }
+    };
+    let severity = |v: Verdict| match v {
+        Verdict::Starved => 3,
+        Verdict::Contended => 2,
+        Verdict::Quiet => 1,
+        Verdict::Unmeasured => 0,
+    };
+    [psi_vote, load_vote]
+        .into_iter()
+        .flatten()
+        .max_by_key(|v| severity(*v))
+        .unwrap_or(Verdict::Unmeasured)
 }
 
 fn verdict_word(v: Verdict) -> &'static str {
@@ -307,7 +335,7 @@ pub(crate) fn render_report(
     ));
     out.push_str(&format!(
         "stall:   cpu some {} / io full {} / memory full {} of the window (PSI; STARVED at \
-         cpu >= {:.0}% or io/memory >= {:.0}%; decides the verdict when present)\n",
+         cpu >= {:.0}% or io/memory >= {:.0}%)\n",
         percent(stall.cpu_some),
         percent(stall.io_full),
         percent(stall.memory_full),
@@ -319,8 +347,8 @@ pub(crate) fn render_report(
             .unwrap_or_else(|| "n/a".to_string())
     };
     out.push_str(&format!(
-        "load:    1-min average {} at start, {} now, on {cpus} CPUs (votes only without PSI; \
-         STARVED at {:.0} per CPU)\n",
+        "load:    1-min average {} at start, {} now, on {cpus} CPUs (votes only where a PSI source \
+         is missing; STARVED at {:.0} per CPU)\n",
         fmt_load(load_start),
         fmt_load(load_now),
         STARVED_LOAD_PER_CPU,

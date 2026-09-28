@@ -106,9 +106,9 @@ pub const WRAP_TEST_MAX_LIFETIME_SECS: &str = "120";
 /// precisely what a 2 s ceiling did on a 16-core box at load average 44.
 pub const CHILD_BOOT_BASE: Duration = Duration::from_secs(8);
 
-/// Issue #701: base ceiling, before [`load_scaled`], on each half of
-/// [`TuiDeck::submit_claude_prompt`] — the typed prompt reaching the screen,
-/// and then Claude Code's `UserPromptSubmit` hook firing. On a healthy run the
+/// Issue #701: base ceiling, before [`load_scaled`], on the whole of
+/// [`TuiDeck::submit_claude_prompt`] — the typed prompt reaching the screen
+/// and then Claude Code's `UserPromptSubmit` hook firing, under one deadline. On a healthy run the
 /// hook lands a few seconds before `ToolStart`, and every wait here returns the
 /// instant it holds, so the ceiling is paid only by a prompt that was lost.
 pub const CLAUDE_PROMPT_SUBMIT_BASE: Duration = Duration::from_secs(20);
@@ -1888,18 +1888,19 @@ impl TuiDeck {
     /// unsubmitted in the input box, nothing but `SessionStart` in the event
     /// stream, and a 120 s `ToolStart` timeout that read as the model declining
     /// to use Bash. So this waits until `probe` — a space-free substring of
-    /// `prompt`, so line wrapping cannot split it — is on screen before the
-    /// first Enter, and the same load then passed 3 of 3 with that first Enter
+    /// `prompt`, so line wrapping cannot split it — is on screen and followed by
+    /// the prompt's last word before the first Enter, and the same load then passed 3 of 3 with that first Enter
     /// submitting every time. Enter is repeated until the hook fires as a
-    /// backstop for a `\r` that still lands inside the burst (`probe` proves
-    /// the text up to it rendered, not the text after it); a repeat on an
+    /// backstop for a `\r` that still lands inside the burst; a repeat on an
     /// input that already submitted lands on an empty prompt.
     /// `e2e_codex_wrapper.rs` retries Codex's Enter on the same outcome-based
     /// reasoning.
     ///
     /// Only a `Thinking` event that arrives AFTER the prompt is typed counts,
-    /// so an earlier turn on the same agent cannot satisfy it. On failure the
-    /// panic starts with `PROMPT NOT DELIVERED` and names which half failed,
+    /// so an earlier turn on the same agent cannot satisfy it, and its reported
+    /// prompt must match what was typed. On failure the panic starts with
+    /// `PROMPT NOT DELIVERED` or `PROMPT PARTIALLY DELIVERED` and names which
+    /// step failed,
     /// so a lost prompt is never read as a regression in what the calling test
     /// asserts about the agent's behaviour.
     #[cfg(unix)]
@@ -1915,22 +1916,44 @@ impl TuiDeck {
             "submit_claude_prompt: the probe {probe:?} must be a non-empty, space-free \
              substring of the prompt"
         );
+        let tail = prompt
+            .split_whitespace()
+            .last()
+            .expect("submit_claude_prompt: an empty prompt");
         let is_submit = |e: &dot_agent_deck::event::AgentEvent| {
             e.agent_id.as_deref() == Some(agent_id)
                 && e.event_type == dot_agent_deck::event::EventType::Thinking
         };
         let before = events.snapshot().iter().filter(|e| is_submit(e)).count();
         self.send_keys(prompt.as_bytes());
+        // ONE deadline for both halves, so the helper reports its own failure
+        // well inside a test's nextest kill window instead of being killed
+        // between two back-to-back ceilings.
         let budget = load_scaled(CLAUDE_PROMPT_SUBMIT_BASE);
-        if !self.wait_for_grid_string_within(probe, budget) {
-            panic!(
-                "PROMPT NOT DELIVERED: the typed prompt never appeared in Claude Code's input \
-                 (no {probe:?} on screen within {budget:?}), so nothing after this point was \
-                 exercised.\nFinal grid:\n{}",
-                self.snapshot_grid()
-            );
-        }
         let deadline = Instant::now() + budget;
+        // The probe proves the text up to it rendered; the prompt's LAST word
+        // appearing after it proves the rest did. Word-wrap moves a whole word
+        // to the next row rather than splitting it, so a space-free token is
+        // matchable on one row.
+        let typed = || {
+            let grid = self.snapshot_grid();
+            let Some(at) = grid.find(probe) else {
+                return false;
+            };
+            let after = &grid[at + probe.len()..];
+            probe.ends_with(tail) || after.contains(tail)
+        };
+        while !typed() {
+            if Instant::now() >= deadline {
+                panic!(
+                    "PROMPT NOT DELIVERED: the typed prompt never finished rendering in Claude \
+                     Code's input — no {probe:?} followed by its last word {tail:?} within \
+                     {budget:?} — so nothing after this point was exercised.\nFinal grid:\n{}",
+                    self.snapshot_grid()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let mut enters = 0_usize;
         loop {
             self.send_keys(b"\r");
@@ -1949,17 +1972,36 @@ impl TuiDeck {
                              only after Enter #{enters}"
                         );
                     }
+                    // The hook reports the submitted text truncated to 200
+                    // bytes, so this catches a prefix submitted short of that
+                    // and a garbled one; a longer prefix is what the tail wait
+                    // above exists to prevent. Trailing whitespace is ignored:
+                    // a `\r` taken as a newline before a later Enter submitted
+                    // is the case the retry exists for.
+                    if let Some(reported) = ev.user_prompt.as_deref() {
+                        assert!(
+                            dot_agent_deck::prompt_delivery::prompt_submission_matches(
+                                prompt,
+                                reported.trim_end()
+                            ),
+                            "PROMPT PARTIALLY DELIVERED: Claude Code submitted {reported:?}, \
+                             which is not the prompt the test typed ({prompt:?}), so what the \
+                             agent does next is not evidence about the calling test's \
+                             assertions.\nFinal grid:\n{}",
+                            self.snapshot_grid()
+                        );
+                    }
                     return ev;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "PROMPT NOT DELIVERED: the prompt is on screen but {enters} Enter(s) over \
-                     {budget:?} produced no UserPromptSubmit (Thinking) event for agent \
-                     {agent_id:?}. The keystrokes never became a submitted prompt, so nothing \
-                     after this point was exercised — this is not a regression in what the \
-                     calling test asserts; the load context below says whether the machine \
+                    "PROMPT NOT DELIVERED: the prompt is on screen but {enters} Enter(s) within \
+                     {budget:?} of typing it produced no UserPromptSubmit (Thinking) event for \
+                     agent {agent_id:?}. The keystrokes never became a submitted prompt, so \
+                     nothing after this point was exercised — this is not a regression in what \
+                     the calling test asserts; the load context below says whether the machine \
                      was starved at the time.\nObserved events: {:#?}\nFinal grid:\n{}",
                     events.snapshot(),
                     self.snapshot_grid()

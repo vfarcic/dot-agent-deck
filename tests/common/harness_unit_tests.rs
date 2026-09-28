@@ -5085,9 +5085,9 @@ mod load_context_tests {
 
     /// Scenario: Each PSI source on its own pushes the verdict over its
     /// STARVED or CONTENDED threshold and the worst one wins; a high load
-    /// average does not override a quiet PSI reading, but decides the verdict
-    /// on a host with no PSI; and a host that measured nothing is UNMEASURED
-    /// rather than QUIET.
+    /// average does not override a complete, quiet PSI reading, but votes
+    /// whenever a PSI source is missing; and a host that measured nothing is
+    /// UNMEASURED rather than QUIET.
     #[test]
     fn psi_decides_the_verdict_and_load_is_only_the_fallback() {
         let quiet = Stall {
@@ -5137,6 +5137,34 @@ mod load_context_tests {
         assert_eq!(
             classify(&with(|s| s.cpu_some = Some(0.12)), Some(3.0)),
             Verdict::Quiet
+        );
+        // A PARTIAL PSI reading lets the load average vote for what went
+        // unmeasured (PR #1408 review): CPU pressure hidden with I/O quiet, and
+        // CPU quiet with I/O and memory hidden, both still read as starved.
+        assert_eq!(
+            classify(&with(|s| s.cpu_some = None), Some(STARVED_LOAD_PER_CPU)),
+            Verdict::Starved
+        );
+        assert_eq!(
+            classify(
+                &with(|s| {
+                    s.io_full = None;
+                    s.memory_full = None;
+                }),
+                Some(STARVED_LOAD_PER_CPU)
+            ),
+            Verdict::Starved
+        );
+        // …and PSI still wins when it is the worse of the two.
+        assert_eq!(
+            classify(
+                &with(|s| {
+                    s.memory_full = None;
+                    s.cpu_some = Some(STARVED_CPU_SOME);
+                }),
+                Some(0.1)
+            ),
+            Verdict::Starved
         );
         // Without PSI (macOS), the load average is the whole signal.
         let none = Stall::default();
