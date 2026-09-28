@@ -1369,6 +1369,25 @@ command = "cat"
 description = "Implements the requested change"
 "#;
 
+fn published_context_files(project: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(project.join(".dot-agent-deck"))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("orchestrator-context"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Scenario: Resolve a project, change its config, and confirm stale preparation
+/// publishes no context; an omitted revision still permits a fresh launch.
+///
 /// PRD #819 M4: `ResolveProject` hands back a revision derived from the config
 /// bytes, `PrepareWorkflow` echoes it, and a revision that no longer matches the
 /// file on disk is refused — **before** anything is published.
@@ -1381,9 +1400,6 @@ description = "Implements the requested change"
 async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
     let server = start_server().await;
     let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
-    let context = project
-        .join(".dot-agent-deck")
-        .join("orchestrator-context.md");
 
     let resp = issue_json_request(
         &server,
@@ -1426,9 +1442,8 @@ async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
         "expected the stable `{PROJECT_ERR_STALE_REVISION}` code, got {error:?}"
     );
     assert!(
-        !context.exists(),
-        "the revision check must run BEFORE the publish, but {} was written",
-        context.display()
+        published_context_files(&project).is_empty(),
+        "the revision check must run BEFORE any context publish"
     );
 
     // An ABSENT revision means "I have no expectation", not "any revision" — the
@@ -1449,9 +1464,15 @@ async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
         "a preparation that names no revision must still succeed: {:?}",
         resp.error
     );
-    assert!(context.is_file(), "and it must publish the context");
+    assert!(
+        !published_context_files(&project).is_empty(),
+        "and it must publish a context"
+    );
 }
 
+/// Scenario: Ask the daemon to prepare an unknown orchestration and confirm it
+/// publishes no context file and starts no role.
+///
 /// PRD #819 M4: a preparation that fails publishes nothing and starts nothing.
 ///
 /// The e2e (`project/launch/001`) pins the same claim through a real
@@ -1463,9 +1484,6 @@ async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
 async fn a_failed_preparation_publishes_nothing_and_starts_no_roles() {
     let server = start_server().await;
     let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
-    let context = project
-        .join(".dot-agent-deck")
-        .join("orchestrator-context.md");
 
     assert!(
         server.registry.agent_records().is_empty(),
@@ -1493,9 +1511,8 @@ async fn a_failed_preparation_publishes_nothing_and_starts_no_roles() {
         "the refusal must not enumerate the orchestrations the config declares: {error:?}"
     );
     assert!(
-        !context.exists(),
-        "a failed preparation must publish nothing, but {} was written",
-        context.display()
+        published_context_files(&project).is_empty(),
+        "a failed preparation must publish no context"
     );
     assert!(
         server.registry.agent_records().is_empty(),
@@ -1503,6 +1520,9 @@ async fn a_failed_preparation_publishes_nothing_and_starts_no_roles() {
     );
 }
 
+/// Scenario: Symlink the project's context directory elsewhere and confirm the
+/// daemon refuses preparation without publishing through the link.
+///
 /// PRD #819 M4: the publish's symlink refusal is reachable **through the verb**,
 /// not only through a direct call to the publish function.
 ///
@@ -1542,9 +1562,15 @@ async fn prepare_workflow_refuses_a_symlinked_context_directory() {
         "expected `{PROJECT_ERR_PUBLISH_FAILED}`, got {error:?}"
     );
     assert!(
-        !elsewhere.join("orchestrator-context.md").exists(),
-        "nothing may be written through the link, but {} exists",
-        elsewhere.join("orchestrator-context.md").display()
+        std::fs::read_dir(&elsewhere)
+            .expect("list the symlink target")
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("orchestrator-context")),
+        "nothing matching orchestrator-context* may be written through the link at {}",
+        elsewhere.display()
     );
     assert!(
         server.registry.agent_records().is_empty(),

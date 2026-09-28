@@ -6,7 +6,7 @@
 //! session length, worst exactly when an orchestration has run long enough to
 //! compact. This file pins the fix: a `Compacting` event, or a
 //! `/clear`-originated `SessionStart`, on the orchestrator start-role pane
-//! re-delivers the `.dot-agent-deck/orchestrator-context.md` pointer, scoped
+//! re-delivers the `.dot-agent-deck/orchestrator-context-*.md` pointer, scoped
 //! to the start role only, through the SAME readiness-gating and delivery-
 //! confirmation discipline the spawn-time seed already uses
 //! (`deliver_orchestrator_prompt`, `src/ui.rs`).
@@ -42,7 +42,7 @@ use dot_agent_deck::event::{
 };
 use spec::spec;
 
-const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
+const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context";
 
 /// How long the spawn-time remit pointer has to reach the start role's pane.
 ///
@@ -1351,10 +1351,19 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
     // (`src/spawn.rs`), without needing a second, separately-launched fixture
     // for the daemon dispatch path.
     const TASK_SENTINEL: &str = "SENTINEL-TASK-remit007: verify PR #500 and report.";
-    let context_path = deck
-        .workdir()
-        .join(".dot-agent-deck")
-        .join("orchestrator-context.md");
+    let context_dir = deck.workdir().join(".dot-agent-deck");
+    let context_path = std::fs::read_dir(&context_dir)
+        .expect("list published contexts")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("orchestrator-context-") && name.ends_with(".md")
+                })
+        })
+        .expect("the opened tab published its own unique context");
     let mut seeded =
         std::fs::read_to_string(&context_path).expect("read the spawn-written context file");
     seeded.push_str("\n## Your task\n\n");
@@ -1385,8 +1394,20 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
         deck.snapshot_grid()
     );
 
-    let after_reassert = std::fs::read_to_string(&context_path)
-        .expect("read the context file after the re-assertion rewrite");
+    let after_reassert = std::fs::read_dir(&context_dir)
+        .expect("list re-armed contexts")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path != &context_path)
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("orchestrator-context-") && name.ends_with(".md")
+                })
+        })
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .expect("re-arm published a new unique context");
     assert!(
         after_reassert.contains(TASK_SENTINEL),
         "the dispatched task must survive a compaction re-assertion rather than being wiped \

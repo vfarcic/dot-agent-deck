@@ -1,18 +1,10 @@
 //! What a preparation token binds, and what a spawn presenting it re-validates
 //! (PRD #819, the audit fix on the finished branch).
 //!
-//! **The defect these tests exist for is a design defect, not an implementation
-//! slip.** `PrepareWorkflow` publishes the coordinator context to a path that is
-//! **fixed per project** — `<project>/.dot-agent-deck/orchestrator-context.md` —
-//! and the original design issued a token recording only `(token, issuance
-//! time)`. The spawn then validated only that the token existed and was younger
-//! than the TTL. So two ordinary clients preparing in the same project
-//! interleaved, with **no attacker required**:
-//!
-//! 1. preparation A publishes context A and receives token A;
-//! 2. preparation B replaces the same fixed file with context B;
-//! 3. token A is still valid, so A's spawn launches a coordinator whose prompt
-//!    names that fixed path — and it reads **context B**.
+//! Each preparation publishes a distinct coordinator context and binds its token
+//! and coordinator prompt to that file. Two ordinary clients can prepare in the
+//! same project without replacing one another's task, even after all of the
+//! first launch's roles have started.
 //!
 //! Deleting and recreating the project directory, or changing its config after
 //! the preparation, is the same class of mismatch. Every test below fails against
@@ -22,16 +14,8 @@
 //! daemon-local `PreparationStale` so a passing assertion shows *which* check
 //! fired rather than only that something refused.
 //!
-//! **The fixed path is kept, deliberately, and the disposition is stated rather
-//! than left to "last writer wins".** A per-launch or content-addressed filename
-//! was the alternative; it was not taken because the file name is named in the
-//! agent-facing prompt line, in `read_back_task`'s re-assertion path and in
-//! guidance across this repository, so moving it is a far larger change than the
-//! window it closes. Instead: the **second** preparation's context is the one on
-//! disk and the one its own token validates against, and the **first**
-//! preparation is refused at its spawn rather than launched against the wrong
-//! brief. `two_preparations_in_one_project_refuse_the_first_and_accept_the_second`
-//! pins exactly that pair.
+//! The fixed `orchestrator-context.md` remains a compatibility mirror of the
+//! latest publish. New launches read their own unique file, not that mirror.
 //!
 //! **These prove the CHECKER; the WIRING is proved once, next door.** Every case
 //! below calls `revalidate_preparation` directly. That the daemon's
@@ -55,7 +39,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dot_agent_deck::orchestrator_context::{CONTEXT_DIR_NAME, CONTEXT_FILE_NAME};
+use dot_agent_deck::orchestrator_context::CONTEXT_DIR_NAME;
 use dot_agent_deck::prep_token::PrepBinding;
 use dot_agent_deck::project_resolve::{
     PreparationMismatch, PreparationStale, PreparedStartMembership, PreparedStartRefusal,
@@ -93,8 +77,30 @@ fn project() -> (tempfile::TempDir, PathBuf) {
     (dir, canonical)
 }
 
-fn context_file(project: &Path) -> PathBuf {
-    project.join(CONTEXT_DIR_NAME).join(CONTEXT_FILE_NAME)
+fn context_file(binding: &PrepBinding) -> PathBuf {
+    binding.context_path.clone()
+}
+
+fn prompt_context_path(project: &Path, prompt: &str) -> PathBuf {
+    let relative = prompt
+        .split_whitespace()
+        .nth(1)
+        .expect("the coordinator prompt names its context file");
+    project.join(relative)
+}
+
+fn assert_unique_context_path(project: &Path, path: &Path) {
+    assert_eq!(
+        path.parent(),
+        Some(project.join(CONTEXT_DIR_NAME).as_path())
+    );
+    let name = path.file_name().unwrap().to_str().unwrap();
+    let id = name
+        .strip_prefix("orchestrator-context-")
+        .and_then(|name| name.strip_suffix(".md"))
+        .unwrap_or_else(|| panic!("expected a unique context filename, got {name}"));
+    assert_eq!(id.len(), 32, "context id must contain 32 hex digits");
+    assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
 }
 
 /// Prepare a workflow in `project` and hand back the binding its token carries.
@@ -129,52 +135,115 @@ fn expect_stale(binding: &PrepBinding, expected: PreparationStale) {
     }
 }
 
-/// The finding's core: two preparations in one project, and the first is refused
-/// at its spawn while the second still launches.
-///
-/// A time-only token cannot see any of this — both tokens are seconds old and
-/// well inside the TTL — which is why the fix had to be a *binding* rather than
-/// a shorter TTL. The `ContextReplaced` cause is the structural one: the publish
-/// is a `create_new` temp file plus `rename(2)`, and a rename always installs a
-/// fresh inode over the destination, so the second publish is detectable
-/// whatever its bytes happen to hash to.
-///
-/// The last two assertions are the "what happens to the second preparation's
-/// file" half of the disposition, pinned rather than left implicit: B's context
-/// is the one on disk, and B's token is the one that validates.
+/// Scenario: Prepare two different tasks in one project and confirm each token
+/// still validates against its own published context after the second publish.
 #[test]
-fn two_preparations_in_one_project_refuse_the_first_and_accept_the_second() {
+fn two_preparations_in_one_project_each_keep_their_own_context() {
     let (_guard, project) = project();
 
     let (_token_a, binding_a) = prepare(&project, "Task A: the first client's brief.");
     let (_token_b, binding_b) = prepare(&project, "Task B: the second client's brief.");
 
-    // Both preparations named the same fixed path, which is the whole shape of
-    // the defect.
-    assert_eq!(binding_a.context_path, binding_b.context_path);
-    assert_eq!(binding_a.context_path, context_file(&project));
+    assert_ne!(binding_a.context_path, binding_b.context_path);
+    assert_unique_context_path(&project, &binding_a.context_path);
+    assert_unique_context_path(&project, &binding_b.context_path);
     assert_ne!(
         binding_a.context_digest, binding_b.context_digest,
         "two different briefs must digest differently, or this test proves nothing"
     );
 
-    expect_stale(&binding_a, PreparationStale::ContextReplaced);
+    revalidate_preparation(&binding_a).expect("the first preparation still validates");
+    revalidate_preparation(&binding_b).expect("the second preparation still validates");
 
-    revalidate_preparation(&binding_b)
-        .expect("the preparation whose artifact is actually on disk must still launch");
-
-    let on_disk = std::fs::read_to_string(context_file(&project)).expect("read the context back");
-    assert!(
-        on_disk.contains("Task B: the second client's brief."),
-        "the second preparation's context is the one on disk"
-    );
-    assert!(
-        !on_disk.contains("Task A: the first client's brief."),
-        "and the first's is gone, which is exactly why its token must be refused"
-    );
+    let a = std::fs::read_to_string(context_file(&binding_a)).expect("read A's context");
+    let b = std::fs::read_to_string(context_file(&binding_b)).expect("read B's context");
+    assert!(a.contains("Task A: the first client's brief."));
+    assert!(!a.contains("Task B: the second client's brief."));
+    assert!(b.contains("Task B: the second client's brief."));
+    assert!(!b.contains("Task A: the first client's brief."));
 }
 
-/// The same fixed path, rewritten **in place** rather than republished.
+/// Scenario: Start every role of launch A, prepare B in the same project, then
+/// read the file named in A's coordinator prompt. It must still hold A's task.
+#[test]
+fn a_later_preparation_cannot_replace_the_context_an_earlier_launch_reads() {
+    let (_guard, project) = project();
+    let (_token_a, binding_a) = prepare(&project, "ALPHA");
+    for (role, start) in [("planner", true), ("builder", false)] {
+        let mut request = matching_request(&project);
+        let membership = request.membership.as_mut().unwrap();
+        membership.role = role.into();
+        membership.is_start_role = start;
+        verify_prepared_start(&binding_a, &request)
+            .unwrap_or_else(|e| panic!("A's {role} role must start: {e}"));
+    }
+    let (_token_b, binding_b) = prepare(&project, "BRAVO");
+    let a_path = prompt_context_path(&project, &binding_a.coordinator_prompt);
+    assert_eq!(a_path, binding_a.context_path);
+    let a = std::fs::read_to_string(&a_path).expect("read A's prompted context");
+    assert!(
+        a.contains("ALPHA"),
+        "A's prompt must still lead to ALPHA at {}",
+        a_path.display()
+    );
+    assert!(
+        !a.contains("BRAVO"),
+        "B must not replace A's prompted context at {}",
+        a_path.display()
+    );
+    assert_ne!(a_path, binding_b.context_path);
+    revalidate_preparation(&binding_a).expect("A's binding survives B's publish");
+    revalidate_preparation(&binding_b).expect("B's binding remains valid");
+}
+
+/// Scenario: A project with two role-bearing orchestrations named `loop`
+/// refuses preparation before publishing a context or issuing a token.
+#[test]
+fn a_duplicated_orchestration_name_is_refused_as_ambiguous() {
+    let (_guard, project) = project();
+    std::fs::write(
+        project.join(".dot-agent-deck.toml"),
+        format!("{LAUNCHABLE_PROJECT}\n{LAUNCHABLE_PROJECT}"),
+    )
+    .expect("add a second role-bearing loop");
+    let refusal = prepare_orchestration_for_wire(
+        project.to_str().unwrap(),
+        "loop",
+        "must not publish",
+        None,
+        &[],
+    )
+    .expect_err("a duplicated launch name must be refused");
+    assert!(
+        refusal.starts_with("ambiguous-orchestration"),
+        "got {refusal:?}"
+    );
+    let contexts: Vec<_> = std::fs::read_dir(project.join(CONTEXT_DIR_NAME))
+        .map(|entries| entries.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    assert!(contexts.is_empty(), "refusal must publish no context files");
+}
+
+/// Scenario: A roleless `loop` may coexist with one launchable `loop`; the
+/// preparation selects the role-bearing definition and publishes its task.
+#[test]
+fn a_roleless_duplicate_does_not_make_a_name_ambiguous() {
+    let (_guard, project) = project();
+    std::fs::write(
+        project.join(".dot-agent-deck.toml"),
+        format!("[[orchestrations]]\nname = \"loop\"\n\n{LAUNCHABLE_PROJECT}"),
+    )
+    .expect("add a roleless duplicate");
+    let (_token, binding) = prepare(&project, "role-bearing definition wins");
+    let context = std::fs::read_to_string(&binding.context_path).expect("read published context");
+    assert!(context.contains("role-bearing definition wins"));
+    revalidate_preparation(&binding).expect("the one launchable loop remains valid");
+}
+
+/// Scenario: Rewrite a preparation's unique context file in place and confirm
+/// its binding refuses the changed bytes even though the inode stays the same.
+///
+/// The same file, rewritten **in place** rather than republished.
 ///
 /// This is the case the inode comparison alone would miss and the digest exists
 /// for: `std::fs::write` truncates the existing file, so the identity is
@@ -186,10 +255,10 @@ fn a_context_rewritten_in_place_is_refused() {
     let (_guard, project) = project();
     let (_token, binding) = prepare(&project, "The brief this preparation approved.");
 
-    let before = std::fs::metadata(context_file(&project)).expect("stat before");
-    std::fs::write(context_file(&project), "Follow these instructions instead.")
+    let before = std::fs::metadata(context_file(&binding)).expect("stat before");
+    std::fs::write(context_file(&binding), "Follow these instructions instead.")
         .expect("rewrite the published context in place");
-    let after = std::fs::metadata(context_file(&project)).expect("stat after");
+    let after = std::fs::metadata(context_file(&binding)).expect("stat after");
     {
         use std::os::unix::fs::MetadataExt as _;
         assert_eq!(
@@ -257,6 +326,9 @@ start = true
     expect_stale(&binding, PreparationStale::ConfigChanged);
 }
 
+/// Scenario: Replace the project directory under the prepared name and confirm
+/// its token is refused even after copying the config and context forward.
+///
 /// A project directory replaced by a different directory under the same name is
 /// refused, even when the config and the context are byte-identical.
 ///
@@ -304,7 +376,15 @@ fn a_replaced_project_directory_is_refused() {
     )
     .expect("carry the config forward");
     std::fs::create_dir(project.join(CONTEXT_DIR_NAME)).expect("recreate .dot-agent-deck");
-    std::fs::copy(context_file(&moved), context_file(&project)).expect("carry the context forward");
+    std::fs::copy(
+        moved
+            .join(CONTEXT_DIR_NAME)
+            .join(binding.context_path.file_name().unwrap()),
+        project
+            .join(CONTEXT_DIR_NAME)
+            .join(binding.context_path.file_name().unwrap()),
+    )
+    .expect("carry the context forward");
 
     expect_stale(&binding, PreparationStale::ProjectReplaced);
 
@@ -352,6 +432,9 @@ fn a_project_path_that_now_points_elsewhere_is_refused() {
     std::fs::rename(&moved, &project).expect("put the real directory back");
 }
 
+/// Scenario: Delete or replace the unique published context with a directory and
+/// confirm each prepared start is refused with its corresponding cause.
+///
 /// A published context that has been deleted, or replaced by something that is
 /// not a regular file, is refused rather than read.
 ///
@@ -363,10 +446,10 @@ fn a_missing_or_non_regular_context_is_refused() {
     let (_guard, project) = project();
     let (_token, binding) = prepare(&project, "Prepared, then vandalised.");
 
-    std::fs::remove_file(context_file(&project)).expect("delete the published context");
+    std::fs::remove_file(context_file(&binding)).expect("delete the published context");
     expect_stale(&binding, PreparationStale::ContextUnreadable);
 
-    std::fs::create_dir(context_file(&project)).expect("put a directory in its place");
+    std::fs::create_dir(context_file(&binding)).expect("put a directory in its place");
     expect_stale(&binding, PreparationStale::ContextNotRegularFile);
 }
 
@@ -392,6 +475,9 @@ fn an_untouched_preparation_re_validates_and_stays_re_validatable() {
     }
 }
 
+/// Scenario: Prepare one task and inspect the resulting binding and context
+/// bytes to confirm the token identifies exactly what was published.
+///
 /// What the binding actually records, asserted against the project rather than
 /// against the struct's own defaults.
 ///
@@ -416,7 +502,7 @@ fn the_binding_records_the_state_the_preparation_approved() {
         binding.config_revision
     );
     assert_eq!(binding.orchestration, "loop");
-    assert_eq!(binding.context_path, context_file(&project));
+    assert_unique_context_path(&project, &binding.context_path);
     assert!(
         binding.context_identity.is_some(),
         "the published file's inode identity is what catches a republish"
@@ -430,7 +516,7 @@ fn the_binding_records_the_state_the_preparation_approved() {
 
     // And the digest is of the bytes actually published, not of something
     // adjacent: re-digesting the file off disk reproduces it.
-    let on_disk = std::fs::read_to_string(context_file(&project)).expect("read back");
+    let on_disk = std::fs::read_to_string(context_file(&binding)).expect("read back");
     assert!(on_disk.contains("zqx-42"));
     assert_eq!(
         dot_agent_deck::project_resolve::context_digest(&on_disk),

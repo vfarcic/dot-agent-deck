@@ -935,10 +935,21 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
         "the dispatched worktree never appeared at {}",
         expected_worktree.display()
     );
-    let context = expected_worktree.join(".dot-agent-deck/orchestrator-context.md");
+    let context = std::fs::read_dir(expected_worktree.join(".dot-agent-deck"))
+        .expect("list dispatched context files")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("orchestrator-context-") && name.ends_with(".md")
+                })
+        })
+        .expect("the dispatched orchestration must publish a unique context file");
     let content = std::fs::read_to_string(&context).unwrap_or_else(|e| {
         panic!(
-            "the dispatched orchestration must get an orchestrator-context.md at {} \
+            "the dispatched orchestration must get a unique context file at {} \
              — without it the orchestrator never learns it is one, and every worker \
              sits idle: {e}",
             context.display()
