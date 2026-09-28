@@ -28,9 +28,10 @@
  * 4. Scheduling -- cron-fired tabs, run by the daemon whether or not the deck
  *    is open (`docs/scheduled-tasks.md`, `schedule`).
  *
- * Remote environments and the desktop app are real but secondary -- they are
- * about WHERE the deck runs, not what it does -- and they keep the bands they
- * already had. Workspace modes are being REMOVED (issue #1199), so they are
+ * Remote environments are real but secondary -- they are about WHERE the deck
+ * runs, not what it does -- and keep the band they already had. The desktop
+ * app is not secondary any more: since PRD #1321 the page presents both
+ * clients from the top, and its install detail sits with the CLI's. Workspace modes are being REMOVED (issue #1199), so they are
  * gone from the marketing surface entirely.
  *
  * The four-step story arc was rebuilt on that basis. The old ending, "walk
@@ -241,14 +242,14 @@ export const clients = {
  *   attaches to one daemon at a time (`Endpoint` in `src/daemon_client.rs` is
  *   a single `Local`/`Remote` choice, not a map), so "one place holds ... a
  *   deck running on another machine" would be true only of the desktop app,
- *   which holds many at once and has its own band further down the page.
+ *   which holds many at once, as the two-clients section says.
  */
 export const why = {
   heading: 'Why Agent Deck',
   paragraphs: [
     "Running one AI agent at a time, you're still a software engineer who happens to use AI. Running many at the same time, you stop being one. You become a project manager supervising a team, a tech lead unblocking them, an architect designing the approach, a product manager deciding what to build.",
     "The agents do the work — writing the code, running the tests, watching the pipelines, answering the review comments. Your job is everything around it — defining the work up front, supervising it in flight, and validating that the right thing got built. None of this is new. It's the same craft people have practiced for decades. The team just looks different.",
-    'Agent Deck is the tool that lets you do that without losing your mind. One place holds all of it — a lone agent, a team working under an orchestrator, a unit off in its own copy of the repo — and every one of them is a card or a tab you can open, watch and type into. Keyboard-driven, in the terminal you already use, with the agent client you already know.',
+    'Agent Deck is the tool that lets you do that without losing your mind. One place holds all of it — a lone agent, a team working under an orchestrator, a unit off in its own copy of the repo — and every one of them is something you can open, watch and type into, in the terminal you already use or in a desktop window beside it, with the agent client you already know.',
   ],
 };
 
@@ -265,9 +266,9 @@ export const why = {
  */
 export const principles = [
   {
-    title: 'Runs in your terminal',
+    title: 'Your terminal, or a window',
     description:
-      'Ghostty, iTerm2, Alacritty, Kitty, WezTerm — whatever you already configured. Agent Deck is a guest in it, not a replacement, and there is no multiplexer to set up underneath.',
+      'The terminal UI runs in Ghostty, iTerm2, Alacritty, Kitty, WezTerm — whatever you already configured — as a guest, not a replacement, with no multiplexer to set up underneath. The desktop app is a native window over the same agents, so you can use either, or both at once.',
   },
   {
     title: 'Uses your agent client',
@@ -277,12 +278,12 @@ export const principles = [
   {
     title: 'Closing the window does not stop the work',
     description:
-      'Detach the deck and the agents carry on without you; open it again and you rejoin the same sessions, mid-run. The same holds over ssh — a deck running on another machine stays running when you disconnect.',
+      'Detach the terminal UI or quit the desktop app, and the agents carry on without you; open either again and you rejoin the same agents, mid-run. The same holds over ssh — agents running on another machine stay running when you disconnect.',
   },
   {
-    title: 'Keyboard first',
+    title: 'Keyboard, pointer or voice',
     description:
-      'Every action is one or two keystrokes away, because managing a team of agents has to fit in muscle memory. The mouse still works when you want it: a button bar along the bottom names each command and the key it answers to.',
+      'In the terminal UI every action is one or two keystrokes away, because managing a team of agents has to fit in muscle memory, and a button bar along the bottom names each command and the key it answers to. The desktop app is built for the pointer, with a few keys of its own, and it can be driven by voice: open screens, start a new agent, and type into one.',
   },
 ];
 
@@ -328,8 +329,9 @@ export const agentsNote =
   'Any other command still runs in a pane — it just gets no live status tracking. Adapters for Gemini CLI and Aider are designed and open, not shipped.';
 
 /**
- * Mirrors the Platform Support table in `docs/installation.md`, with one
- * deliberate divergence: that table links the Windows-native tracking issue
+ * Mirrors the Platform Support table in `docs/installation.md`, including its
+ * Desktop app row (the first three rows are the terminal UI and the daemon,
+ * which the CLI carries on every platform), with one deliberate divergence: that table links the Windows-native tracking issue
  * and this one does not. See correction 3 at the top of this file before
  * "restoring parity" by adding the link back.
  */
@@ -350,6 +352,12 @@ export const platforms = [
     platform: 'Windows via WSL',
     detail: 'runs as Linux',
     status: 'Supported',
+    supported: true,
+  },
+  {
+    platform: 'Desktop app',
+    detail: 'macOS on Apple Silicon and Linux amd64',
+    status: 'Alpha',
     supported: true,
   },
   {
@@ -383,55 +391,37 @@ export const installRoutes = [
     detail: 'Rust 1.85 or newer, edition 2024',
     code: 'cargo build --release',
   },
+  {
+    name: 'Desktop app (alpha)',
+    detail: 'Outside the CLI’s support expectations, from the releases page. Install the CLI as well: the app connects to a daemon that is already running, and starts none of its own. Each release’s notes say whether its .dmg is signed and notarized; the .deb is unsigned, so check it as below before installing it.',
+    code: null,
+    files: [
+      'dot-agent-deck-desktop-alpha-macos-arm64.dmg',
+      'dot-agent-deck-desktop-alpha-linux-amd64.deb',
+    ],
+    link: {label: 'How to install the desktop app →', to: '/docs/installation#desktop-app'},
+  },
 ];
 
 /**
- * The desktop GUI. Every claim here is checked -- see the note at the top of
- * this file. "Alpha" is load-bearing and is not softened. The signing caveat
- * says what v0.42.0 carries -- a signed, notarized `.dmg` and an unsigned
- * `.deb` -- and sends the reader to the release notes for any other release,
- * because the workflow does not guarantee every release is signed (item 1).
- *
- * `intro` and the Windows caveat used to explain themselves in daemon and
- * sidecar terms. Both now say the same thing in what the reader can see: the
- * terminal deck shows one machine's agents at a time and the app shows
- * several, and there is no Windows build of the deck for an app to carry.
+ * The download check, for everything the install section offers (PRD #1321).
+ * It used to live in a separate band that introduced the desktop app late in
+ * the page ("There is a desktop app too. It is an alpha."), which stopped
+ * making sense once the page presented both clients from the top. What that
+ * band carried was install detail -- the two desktop assets, signing, the
+ * missing Windows bundle, and this check -- so the assets and the signing
+ * line moved into the desktop app's install route, the missing Windows build
+ * is the platform list's last row, and the check sits under both columns,
+ * because it covers every asset the release publishes, the CLI's included.
+ * The signing claims follow the note at the top of this file (item 1): each
+ * release's notes say whether its own .dmg is signed.
  */
-export const desktop = {
-  heading: 'There is a desktop app too. It is an alpha.',
-  intro:
-    'The terminal deck shows you one machine’s agents at a time. The desktop app is a native window that holds several at once — the agents on your laptop and the ones on a remote box, side by side. It connects to a daemon that is already running, which the terminal deck starts for you, so install the CLI as well. It rides along with a release rather than gating it, so check the assets on the release you open: the CLI ships even when a desktop bundle does not.',
-  artifacts: [
-    {
-      platform: 'macOS',
-      arch: 'Apple Silicon',
-      file: 'dot-agent-deck-desktop-alpha-macos-arm64.dmg',
-    },
-    {
-      platform: 'Linux',
-      arch: 'x86_64',
-      file: 'dot-agent-deck-desktop-alpha-linux-amd64.deb',
-    },
-  ],
-  caveats: [
-    {
-      title: 'Alpha, and labelled that way',
-      body: 'It ships outside the support expectations of the CLI. The terminal deck does more today; this is an early preview of a second way in to the same agents.',
-    },
-    {
-      title: 'v0.42.0: signed for macOS, not for Linux',
-      body: 'The .dmg on v0.42.0 is signed with the project’s Apple Developer ID and notarized by Apple, so macOS should ask only to confirm opening an app downloaded from the internet. Each release’s notes say whether its own macOS build is signed; if yours is and macOS calls the app damaged or from an unidentified developer, do not override that — report it. The .deb is unsigned, and dpkg -i verifies no package signature, so on Linux the provenance command below is the only check anybody makes. Run it first on either platform.',
-    },
-    {
-      title: 'No Windows bundle',
-      body: 'There is no native Windows build of Agent Deck itself yet, so there is nothing for a desktop bundle to carry. Windows via WSL runs the terminal deck today.',
-    },
-  ],
-  provenanceNote:
-    'Every asset the release workflow uploads — the binaries, the desktop packages, and both checksums manifests — carries build provenance: proof that this exact file came out of this repository’s release workflow, and a record of the commit it was built from. Run it on what you downloaded before you open it.',
-  provenanceCommand:
+export const verify = {
+  heading: 'Check what you downloaded',
+  note: 'Every asset the release workflow uploads — the binaries, the desktop packages, and both checksums manifests — carries build provenance: proof that this exact file came out of this repository’s release workflow, and a record of the commit it was built from. Run it on what you downloaded before you open it.',
+  command:
     'gh attestation verify <file> --repo vfarcic/dot-agent-deck --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml',
-  provenanceScope:
+  scope:
     'The manifests matter most here: the list of hashes you would check everything else against is exactly the file worth swapping, so it is vouched for by the same proof rather than trusted on its own. The one thing not covered is GitHub’s own “Source code” archives — GitHub synthesizes those from the tag rather than the workflow uploading them.',
 };
 
@@ -606,7 +596,7 @@ export const audience = {
   heading: 'Who this is for',
   forYou: [
     'You already run more than one coding agent at a time, and you are losing track of what each one is doing.',
-    'You have a terminal you have spent years configuring, and you are not moving into someone else’s app to get a dashboard.',
+    'You would rather keep your own tools than move into someone else’s IDE to get a dashboard: the terminal you have spent years configuring, or a plain desktop window beside it.',
     'You want one agent to plan the work and hand pieces of it to others, with somewhere to watch that happen.',
   ],
   notYou:
@@ -681,5 +671,4 @@ export const docLinks = {
   keyboard: '/docs/keyboard-shortcuts',
   remote: '/docs/remote-environments',
   desktop: '/docs/desktop',
-  desktopInstall: '/docs/installation#desktop-app',
 };

@@ -6,7 +6,6 @@ import {
   agentsNote,
   audience,
   clients,
-  desktop,
   docLinks,
   installCommand,
   installRoutes,
@@ -14,6 +13,7 @@ import {
   principles,
   product,
   screenshots,
+  verify,
   why,
   workflow,
 } from '@site/src/data/landing-content';
@@ -80,7 +80,7 @@ const doorPages = [
   {
     to: docLinks.keyboard,
     title: 'Keyboard shortcuts',
-    body: 'The full key map, and the TOML that rebinds most of it.',
+    body: 'The terminal UI’s full key map, and the TOML that rebinds most of it.',
   },
   {
     to: docLinks.remote,
@@ -328,37 +328,6 @@ export default function Home() {
             </div>
           </section>
 
-          <section className={styles.desktop}>
-            <div className={styles.desktopInner}>
-              <span className={styles.alphaBadge}>Alpha</span>
-              <h2 className={styles.sectionTitle}>{desktop.heading}</h2>
-              <p className={styles.desktopLede}>{desktop.intro}</p>
-              <div className={styles.desktopGrid}>
-                {desktop.caveats.map((c) => (
-                  <div key={c.title} className={styles.desktopCaveat}>
-                    <h3>{c.title}</h3>
-                    <p>{c.body}</p>
-                  </div>
-                ))}
-              </div>
-              <p className={styles.desktopFiles}>
-                {desktop.artifacts.map((a) => (
-                  <code key={a.file}>{a.file}</code>
-                ))}
-              </p>
-              <p className={styles.desktopProvenance}>{desktop.provenanceNote}</p>
-              <InstallPill command={desktop.provenanceCommand} />
-              <p className={styles.desktopProvenanceScope}>
-                {desktop.provenanceScope}
-              </p>
-              <p className={styles.desktopLink}>
-                <Link to={docLinks.desktopInstall}>How to install it →</Link>
-                {' · '}
-                <Link href={product.releases}>Get it from the latest release →</Link>
-              </p>
-            </div>
-          </section>
-
           <section className={styles.install}>
             <div className={styles.installInner}>
               <h2 className={styles.sectionTitle}>Runs where you work</h2>
@@ -398,6 +367,20 @@ export default function Home() {
                         {r.code ? (
                           <code className={styles.routeCode}>{r.code}</code>
                         ) : null}
+                        {r.files ? (
+                          <span className={styles.routeFiles}>
+                            {r.files.map((f) => (
+                              <code key={f} className={styles.routeCode}>
+                                {f}
+                              </code>
+                            ))}
+                          </span>
+                        ) : null}
+                        {r.link ? (
+                          <span className={styles.routeLink}>
+                            <Link to={r.link.to}>{r.link.label}</Link>
+                          </span>
+                        ) : null}
                       </li>
                     ))}
                   </ul>
@@ -407,6 +390,12 @@ export default function Home() {
                     </Link>
                   </p>
                 </div>
+              </div>
+              <div className={styles.verify}>
+                <h3 className={styles.installHeading}>{verify.heading}</h3>
+                <p className={styles.verifyNote}>{verify.note}</p>
+                <InstallPill command={verify.command} />
+                <p className={styles.verifyScope}>{verify.scope}</p>
               </div>
             </div>
           </section>

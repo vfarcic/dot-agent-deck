@@ -1,12 +1,20 @@
 ---
 name: docs-screenshots-review
-description: 'Decide whether a change to the user-facing docs needs a new or updated screenshot, and produce it or say exactly which one to capture. Use whenever you create, edit, move or delete any file under docs/ that is NOT under docs/develop/ (the pages published to agent-deck.devopstoolkit.ai), in any task, including when the docs edit is a side effect of a code change, a changelog-driven update or a one-line fix. Also use when a user-visible UI change (TUI or desktop app) makes an existing docs screenshot stale. Invoke it before you report the docs change as done.'
+description: 'Check that a change to the user-facing docs covers both clients (the TUI and the desktop app) unless the feature exists in only one, and decide whether it needs a new or updated screenshot, then produce it or say exactly which one to capture. Use whenever you create, edit, move or delete any file under docs/ that is NOT under docs/develop/ (the pages published to agent-deck.devopstoolkit.ai), or the home page (site/src/pages/, site/src/data/landing-content.js), in any task, including when the docs edit is a side effect of a code change, a changelog-driven update or a one-line fix. Also use when a user-visible UI change (TUI or desktop app) makes an existing docs screenshot stale. Invoke it before you report the docs change as done.'
 user-invocable: true
 ---
 
-# Screenshots for docs changes
+# Both clients, and screenshots, for docs changes
 
-The user docs under `docs/` (not `docs/develop/`, which is never published) describe two clients of one daemon, the TUI and the desktop app. Screenshots are part of those docs, they go stale, and they are generated from code by `cargo docs-screenshots` so that fixing a stale one is a command, not a manual session. This skill makes sure every docs change gets a deliberate screenshot decision.
+The user docs under `docs/` (not `docs/develop/`, which is never published) and the site's home page describe two clients of one daemon, the TUI and the desktop app. Screenshots are part of those docs, they go stale, and they are generated from code by `cargo docs-screenshots` so that fixing a stale one is a command, not a manual session. This skill makes sure every docs change covers both clients and gets a deliberate screenshot decision.
+
+## 0. Show and explain both clients, unless only one has the feature
+
+**The rule: every page shows and explains both the TUI and the desktop app, unless the feature works in only one of them.** Most features live in the daemon, so both clients have them; they just present them differently (a card or a row, a tab or a group, `Ctrl+n` or **New agent**). Name both where they differ, in the prose and in the screenshots. Do not write a page, a paragraph or a caption that describes only the TUI and leaves the desktop app implied, or the other way round.
+
+A feature one client lacks is the exception, and it is stated, not left implicit: say which client has it (the Schedules manager and workspace modes are TUI-only; voice control and several daemons on one dashboard are desktop-only), so a reader of the other client knows why they do not see it. Check "both have it" against the code before writing it (CLAUDE.md rule 17) — the desktop feature inventory in `prds/done/1321-user-docs-both-clients.md` is a starting point, not the source of truth.
+
+How to show both depends on the page. In the docs, a screenshot of a feature both clients have is one image per client in **TUI | Desktop tabs** (section 2). On the home page, the reader should not have to choose a client, so both clients' images sit **side by side**, each labelled (the story rows in `site/src/pages/index.js` are the pattern).
 
 ## 1. Decide whether the change warrants a screenshot
 
@@ -14,7 +22,7 @@ Read the diff of the docs pages you touched and answer, for each changed section
 
 - **Does it describe a screen?** A new page, a new section about a surface (a pane, a dialog, a form, a settings panel, a status, a layout), or a changed flow the reader follows with their eyes. Prose about configuration files, CLI output, protocols or concepts usually needs no image.
 - **Does an image already cover it, and is it still accurate?** Look at every image the section and its page embed (`![…](/img/…)` or `./img/…`) and open the image file. If the change you made — or the code change behind it — alters what that screen shows (a label, a column, a button, a status word), the image is stale.
-- **Is it a feature both clients have?** Then a screenshot needs one image **per client**, shown as tabs (below), depicting the same state.
+- **Is it a feature both clients have?** Then a screenshot needs one image **per client**, depicting the same state: tabs in the docs, side by side on the home page (section 0).
 
 Write the decision down in your report either way — "no screenshot needed: this section is about the TOML schema" is a valid outcome. Do not add images for their own sake.
 
@@ -65,4 +73,4 @@ When producing it is out of reach (no display, the desktop app's Playwright depe
 
 ## Why a skill and not a hook
 
-Most tasks never touch `docs/`, so this is a skill rather than a `CLAUDE.md` rule that every session would load. If agents turn out not to invoke it reliably, the fallback is a hook scoped to edits under `docs/**` that prompts for this review. That hook is **not built**; it is the next step only if this skill is observed being skipped (PRD #1321).
+Most tasks never touch `docs/` or the home page, so this is a skill rather than a `CLAUDE.md` rule that every session would load. If agents turn out not to invoke it reliably, the fallback is a hook scoped to edits under `docs/**` that prompts for this review. That hook is **not built**; it is the next step only if this skill is observed being skipped (PRD #1321).

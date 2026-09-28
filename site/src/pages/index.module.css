@@ -144,8 +144,9 @@
  * The pill WRAPS at every width instead of scrolling sideways. It used to wrap
  * only at 560px and below and scroll above it, which was fine for the hero's
  * `brew tap ...` (471px in the box at every desktop width) and wrong for the
- * desktop section's `gh attestation verify ...`: 1105px of content in a 932px
- * box from 1120px up, so it rendered cut at "/.github/wo" and the rest was
+ * download check's `gh attestation verify ...`, which then sat in a separate
+ * desktop-app band: 1105px of content in a 932px box from 1120px up, so it
+ * rendered cut at "/.github/wo" and the rest was
  * reachable only by scrolling inside the pill. That is the command this page
  * gives a reader for checking a download before they open it -- for the
  * unsigned `.deb`, the only check anybody makes -- so the whole of it has to
@@ -161,8 +162,9 @@
  * still breaks inside itself, and `overflow-wrap` stays for exactly that: the
  * 52-character signer-workflow path does it at 300-552px and again at
  * 561-576px, where the alternative is overflow rather than a tidier break.
- * (Those two bands are split by the 560px block below, which trades the
- * section's desktop padding for phone padding and hands the pill 23px back.)
+ * (Those widths were measured in the old desktop-app band, whose own padding
+ * set the pill's width; since PRD #1321 moved the check into the install
+ * section, the exact break points differ, and the reasoning does not.)
  *
  * `align-items: baseline` sits the `$` on the first line's baseline rather
  * than centring it against a two-line block, and the sigil's `line-height: 1`
@@ -609,100 +611,6 @@
   font-size: 0.95rem;
 }
 
-/* ---------- desktop ---------- */
-
-.desktop {
-  padding: 4rem 1rem;
-}
-
-.desktopInner {
-  max-width: 1000px;
-  margin: 0 auto;
-  border: 1px solid var(--c-line);
-  border-radius: 16px;
-  padding: 2.5rem 2rem;
-  background:
-    radial-gradient(circle at 15% 0%, var(--c-amber-soft), transparent 60%),
-    var(--c-bg-alt);
-}
-
-.alphaBadge {
-  display: inline-block;
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--c-amber);
-  border: 1px solid var(--c-amber);
-  border-radius: 999px;
-  padding: 0.15rem 0.7rem;
-  margin-bottom: 1rem;
-}
-
-.desktopLede {
-  color: var(--c-dim);
-  max-width: 60ch;
-  margin: 0 0 2rem;
-}
-
-.desktopGrid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 1.5rem;
-}
-
-.desktopCaveat h3 {
-  font-size: 0.98rem;
-  font-weight: 700;
-  margin: 0 0 0.4rem;
-}
-
-.desktopCaveat p {
-  font-size: 0.88rem;
-  color: var(--c-dim);
-  margin: 0;
-}
-
-.desktopFiles {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  margin: 2rem 0 1.5rem;
-}
-
-.desktopFiles code {
-  font-size: 0.72rem;
-  background: var(--c-bg);
-  border: 1px solid var(--c-line);
-  border-radius: 5px;
-  padding: 0.2rem 0.5rem;
-  word-break: break-all;
-}
-
-.desktopProvenance {
-  font-size: 0.88rem;
-  color: var(--c-dim);
-  max-width: 62ch;
-  margin: 0;
-}
-
-/*
- * The scope caveat sits UNDER the command, not above it: it says what the line
- * the reader just met does not reach (the two checksums manifests), which only
- * means anything once they have seen the command.
- */
-.desktopProvenanceScope {
-  font-size: 0.82rem;
-  color: var(--c-dim);
-  max-width: 62ch;
-  margin: 0.75rem 0 0;
-}
-
-.desktopLink {
-  margin: 1.5rem 0 0;
-  font-weight: 600;
-}
-
 /* ---------- platforms and install routes ---------- */
 
 .install {
@@ -816,6 +724,47 @@
   font-weight: 600;
 }
 
+/*
+ * The desktop app's route lists its two release assets rather than one
+ * command, so each gets its own chip, wrapping as the column narrows, and the
+ * route ends in a link to the install steps instead of a command to copy.
+ */
+.routeFiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.routeLink {
+  display: block;
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+/*
+ * The download check sits under both columns because it covers every asset
+ * a release publishes, the CLI's binaries as well as the desktop app's
+ * packages. The scope note sits UNDER the command: it says what the command
+ * does not reach, which only means anything once the reader has seen it.
+ */
+.verify {
+  margin-top: 2.5rem;
+}
+
+.verifyNote,
+.verifyScope {
+  font-size: 0.88rem;
+  color: var(--c-dim);
+  max-width: 62ch;
+  margin: 0;
+}
+
+.verifyScope {
+  font-size: 0.82rem;
+  margin-top: 0.75rem;
+}
+
 /* ---------- close ---------- */
 
 .close {
@@ -923,14 +872,14 @@
 
 .platformStatus a,
 .installMore a,
-.desktopLink a,
+.routeLink a,
 .clientLink a {
   color: var(--c-teal);
 }
 
 .platformStatus a:hover,
 .installMore a:hover,
-.desktopLink a:hover,
+.routeLink a:hover,
 .clientLink a:hover {
   color: var(--c-teal);
   text-decoration: underline;
@@ -980,7 +929,6 @@
     gap: 1.5rem;
   }
 
-  .desktopGrid,
   .principleGrid,
   .clientGrid,
   .installCols {
@@ -999,10 +947,6 @@
 @media (max-width: 560px) {
   .hero {
     padding-top: 3rem;
-  }
-
-  .desktopInner {
-    padding: 1.75rem 1.25rem;
   }
 
   .ctaPrimary,
