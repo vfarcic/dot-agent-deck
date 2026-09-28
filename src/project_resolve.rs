@@ -737,6 +737,55 @@ where
     .map_err(|_| ProjectResolveError::Internal)
 }
 
+/// How long the daemon gives one `PrepareOrchestration` from the moment it
+/// reads the request (issue #1233 item 4).
+///
+/// **Ten seconds**, below the desktop's 15 s per-call bound, so a deck that
+/// advertises [`crate::daemon_protocol::CAP_PREPARE_DEADLINE`] answers before a
+/// client that bounds the call gives up on it. The bound covers the wait for a
+/// [`MAX_CONCURRENT_PROJECT_READS`] permit ([`run_bounded_until`]) and the work
+/// itself ([`prepare_orchestration_before`]), and an expired preparation is
+/// **withdrawn** rather than merely answered late: no context file stays, no
+/// token is issued and the compatibility mirror is not touched. That is the
+/// property a client-side timeout alone could not give, because dropping the
+/// client's future stops none of the daemon's work.
+///
+/// What it does not bound: a blocking filesystem call that itself never
+/// returns. The daemon answers when the blocking work finishes, and checks the
+/// deadline again then, so such a preparation is still refused and withdrawn —
+/// just not by the deadline — and a client that bounds the call has given up on
+/// it before that.
+pub const PREPARE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`run_bounded`], but waiting for the permit only until `deadline`: `None`
+/// when the deadline passed first, in which case `f` never ran (issue #1233
+/// item 4).
+///
+/// Only the permit wait is bounded here. Once a permit is held the blocking work
+/// runs to completion — a blocking thread cannot be cancelled — which is why the
+/// work checks the same deadline itself ([`prepare_orchestration_before`]).
+pub async fn run_bounded_until<T, F>(
+    deadline: tokio::time::Instant,
+    f: F,
+) -> Result<Option<T>, ProjectResolveError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit =
+        match tokio::time::timeout_at(deadline, project_fs_limit().clone().acquire_owned()).await {
+            Err(_elapsed) => return Ok(None),
+            Ok(permit) => permit.map_err(|_| ProjectResolveError::Internal)?,
+        };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map(Some)
+    .map_err(|_| ProjectResolveError::Internal)
+}
+
 // ---------------------------------------------------------------------------
 // The daemon's own startup cwd
 // ---------------------------------------------------------------------------
@@ -1042,6 +1091,9 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
 /// prepared orchestration or the exact `error` string the refusal carries; the
 /// detail is logged daemon-locally on every failure, whichever refusal goes
 /// back.
+///
+/// Under no deadline; the daemon's verb calls [`prepare_orchestration_before`]
+/// with [`PREPARE_DEADLINE`].
 pub fn prepare_orchestration_for_wire(
     path: &str,
     orchestration: &str,
@@ -1049,6 +1101,44 @@ pub fn prepare_orchestration_for_wire(
     expected_revision: Option<&str>,
     seeds: &[ProjectCandidate],
 ) -> Result<crate::event::PreparedOrchestration, String> {
+    prepare_orchestration_before(
+        path,
+        orchestration,
+        task,
+        expected_revision,
+        seeds,
+        None,
+        &std::time::Instant::now,
+    )
+}
+
+/// [`prepare_orchestration_for_wire`] under a `deadline`, read through `now`
+/// (issue #1233 item 4).
+///
+/// The deadline is checked three times: on entry, immediately before the
+/// publish, and immediately after it. Expired before the publish, nothing is
+/// written. Expired after it, the file just published is removed again
+/// ([`crate::orchestrator_context::withdraw_published_context`]) and no token is
+/// issued. Either way the answer is [`preparation_expired_refusal`], and the
+/// compatibility mirror — written only after the last check passes — is never
+/// touched by an expired preparation. `now` is a parameter so a test can expire
+/// the deadline at exactly one of those points.
+///
+/// **Blocking**, like [`prepare_orchestration_for_wire`].
+pub fn prepare_orchestration_before(
+    path: &str,
+    orchestration: &str,
+    task: &str,
+    expected_revision: Option<&str>,
+    seeds: &[ProjectCandidate],
+    deadline: Option<std::time::Instant>,
+    now: &dyn Fn() -> std::time::Instant,
+) -> Result<crate::event::PreparedOrchestration, String> {
+    let expired = || deadline.is_some_and(|deadline| now() >= deadline);
+    if expired() {
+        warn!("prepare-orchestration refused: its deadline passed before any work began");
+        return Err(preparation_expired_refusal());
+    }
     // --- resolve. Failures here take the disclosure split, exactly as
     // `resolve_for_wire`'s do: a path the daemon already knows gets the detail,
     // and every other path gets one fixed sentence.
@@ -1139,6 +1229,12 @@ pub fn prepare_orchestration_for_wire(
         .as_ref()
         .and_then(crate::prep_token::inode_identity);
 
+    // Issue #1233 item 4: the last point at which refusing costs nothing.
+    if expired() {
+        warn!("prepare-orchestration refused: its deadline passed before the publish");
+        return Err(preparation_expired_refusal());
+    }
+
     // --- compose and publish. Last, and the only step with a side effect.
     // `Attended` (issue #703): every caller of this verb today is a desktop
     // launch — the Runs panel or the New agent dialog — with the person who
@@ -1150,7 +1246,10 @@ pub fn prepare_orchestration_for_wire(
     // here and the attendance has to travel on
     // `AttachRequest::PrepareOrchestration` — a wire change, with CLAUDE.md rule 12's
     // cross-version test attached to it. It is deliberately not pre-built.
-    let prepared = crate::orchestrator_context::prepare_orchestrator_context(
+    //
+    // Unmirrored (issue #1233): the compatibility mirror is refreshed only once
+    // this preparation is certain to be answered, below.
+    let prepared = crate::orchestrator_context::prepare_unmirrored_orchestrator_context(
         orch,
         &dir,
         Some(task),
@@ -1171,6 +1270,23 @@ pub fn prepare_orchestration_for_wire(
         );
         publish_refusal(&err, &dir)
     })?;
+
+    // Issue #1233 item 4: a publish that finished past the deadline is
+    // withdrawn rather than answered, so a client that stopped waiting cannot
+    // leave a context behind it — and no token is issued for one.
+    if expired() {
+        warn!(
+            project = %dir.display(),
+            "prepare-orchestration refused: its deadline passed during the publish; withdrawing it"
+        );
+        crate::orchestrator_context::withdraw_published_context(
+            &crate::orchestrator_context::PublishedContext {
+                path: prepared.context_path.clone(),
+                identity: prepared.context_identity,
+            },
+        );
+        return Err(preparation_expired_refusal());
+    }
 
     // --- bind the record to what was just approved.
     //
@@ -1193,6 +1309,9 @@ pub fn prepare_orchestration_for_wire(
         context_digest: context_digest(&prepared.content),
         coordinator_prompt: prepared.prompt.clone(),
     });
+    // Best effort, after every check that could still withdraw this
+    // preparation (issue #1233). See `CONTEXT_FILE_NAME` for who reads it.
+    crate::orchestrator_context::mirror_orchestrator_context(&dir, &prepared.content);
 
     Ok(crate::event::PreparedOrchestration {
         context_path: prepared.context_path.to_string_lossy().into_owned(),
@@ -2022,6 +2141,21 @@ pub fn ambiguous_orchestration_refusal() -> String {
     )
 }
 
+/// The refusal a `PrepareOrchestration` whose [`PREPARE_DEADLINE`] passed gets
+/// (issue #1233 item 4).
+///
+/// **Retryable**, and about the daemon's load rather than the request, like
+/// [`crate::daemon_protocol::PROJECT_ERR_BUSY`]: nothing was published and no
+/// token issued, so sending the same request again is safe.
+pub fn preparation_expired_refusal() -> String {
+    format!(
+        "{}: the daemon could not prepare the orchestration within {}s, so it prepared nothing; \
+         try again",
+        crate::daemon_protocol::PROJECT_ERR_PREPARATION_EXPIRED,
+        PREPARE_DEADLINE.as_secs()
+    )
+}
+
 /// The refusal a failed publish gets: the stable code plus the publish error's
 /// own client-safe sentence, **for the directory it is about**.
 ///
@@ -2048,6 +2182,7 @@ pub fn publish_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const SMALL_PROJECT: &str = r#"
 [[orchestrations]]
@@ -2839,6 +2974,141 @@ command = "cat"
             !prepared.token.is_empty(),
             "a preparation carries the token the later spawn presents"
         );
+    }
+
+    /// Issue #1233 item 4: a preparation whose deadline has already passed is
+    /// refused before any work, and writes nothing. (No token can have been
+    /// issued either: the refusal carries none, and issuing is the step after
+    /// the last deadline check.)
+    #[test]
+    fn an_expired_preparation_publishes_nothing_and_issues_no_token() {
+        let (_guard, root) = scratch();
+        let project = root.join("expired-project");
+        std::fs::create_dir_all(&project).expect("create the project dir");
+        write_project(&project, SMALL_PROJECT);
+
+        let now = std::time::Instant::now();
+        let refusal = prepare_orchestration_before(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            None,
+            &[],
+            Some(now),
+            &|| now,
+        )
+        .expect_err("an expired deadline must be refused");
+        assert!(
+            refusal.starts_with(crate::daemon_protocol::PROJECT_ERR_PREPARATION_EXPIRED),
+            "got {refusal}"
+        );
+        assert!(published_contexts(&project).is_empty());
+    }
+
+    /// Issue #1233 item 4: a deadline that passes DURING the publish withdraws
+    /// it — the per-publish file is removed, no token is issued, and the
+    /// compatibility mirror is never written.
+    ///
+    /// The clock answers "before the deadline" for the entry and pre-publish
+    /// checks and "after it" from the third reading on, which is the check
+    /// straight after the publish.
+    #[test]
+    fn a_deadline_passing_during_the_publish_withdraws_it() {
+        let (_guard, root) = scratch();
+        let project = root.join("late-project");
+        std::fs::create_dir_all(&project).expect("create the project dir");
+        write_project(&project, SMALL_PROJECT);
+
+        let start = std::time::Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        let readings = std::cell::Cell::new(0u32);
+        let clock = || {
+            readings.set(readings.get() + 1);
+            if readings.get() >= 3 {
+                deadline + Duration::from_secs(1)
+            } else {
+                start
+            }
+        };
+        let refusal = prepare_orchestration_before(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            None,
+            &[],
+            Some(deadline),
+            &clock,
+        )
+        .expect_err("a deadline passing during the publish must be refused");
+        assert!(
+            refusal.starts_with(crate::daemon_protocol::PROJECT_ERR_PREPARATION_EXPIRED),
+            "got {refusal}"
+        );
+        assert_eq!(
+            readings.get(),
+            3,
+            "the refusal came from the post-publish check"
+        );
+        assert!(
+            published_contexts(&project).is_empty(),
+            "the withdrawn file is gone and the mirror was never written: {:?}",
+            published_contexts(&project)
+        );
+
+        // And a clock that never passes the deadline prepares as usual, which is
+        // what makes the refusal above about the deadline.
+        let prepared = prepare_orchestration_before(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            None,
+            &[],
+            Some(deadline),
+            &|| start,
+        )
+        .expect("a preparation inside its deadline succeeds");
+        assert!(Path::new(&prepared.context_path).is_file());
+        assert!(
+            project
+                .join(crate::orchestrator_context::CONTEXT_DIR_NAME)
+                .join(crate::orchestrator_context::CONTEXT_FILE_NAME)
+                .is_file(),
+            "a preparation that is answered refreshes the mirror"
+        );
+    }
+
+    /// Issue #1233 item 4: with every project permit held, the bounded wait
+    /// gives up at its deadline and never runs the work.
+    #[tokio::test]
+    async fn run_bounded_until_gives_up_at_the_deadline_without_running_the_work() {
+        let held = project_fs_limit()
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_PROJECT_READS as u32)
+            .await
+            .expect("saturate the project permits");
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_inner = std::sync::Arc::clone(&ran);
+        let outcome = run_bounded_until(
+            tokio::time::Instant::now() + Duration::from_millis(50),
+            move || ran_inner.store(true, std::sync::atomic::Ordering::SeqCst),
+        )
+        .await
+        .expect("no internal error");
+        assert!(
+            outcome.is_none(),
+            "the deadline passed before a permit freed up"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the work never ran"
+        );
+
+        drop(held);
+        let outcome =
+            run_bounded_until(tokio::time::Instant::now() + Duration::from_secs(10), || 42)
+                .await
+                .expect("no internal error");
+        assert_eq!(outcome, Some(42), "with a permit free the work runs");
     }
 
     /// Issue #1233: the lookup counts role-bearing matches only, and refuses

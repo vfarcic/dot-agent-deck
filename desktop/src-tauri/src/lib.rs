@@ -217,9 +217,18 @@ async fn prepare_orchestration_launch<D: OrchestrationDaemon + Sync>(
             "task prompt must be at most {COMMAND_MAX_BYTES} bytes and contain no NUL"
         ));
     }
-    let prepared = daemon
-        .prepare_orchestration(cwd, name, task_prompt, config_revision)
-        .await?;
+    let prepare = daemon.prepare_orchestration(cwd, name, task_prompt, config_revision);
+    // Issue #1233 item 4: bounded only against a deck that owns a deadline of
+    // its own (`prepare-deadline`). That deck answers first, and a preparation
+    // it did not finish in time is withdrawn rather than published late, so
+    // giving up here cannot leave a context behind that a retry would race.
+    // An older deck gets no such promise, so it is still waited out — see
+    // `start_orchestration_action` for what dropping its future would cost.
+    let prepared = if daemon.bounds_preparation() {
+        crate::daemon_bridge::bounded_reply("PrepareOrchestration", prepare).await?
+    } else {
+        prepare.await?
+    };
     // Both are `#[serde(default)]` response fields, so an absent one decodes to
     // the empty string rather than failing to parse. Empty means "this daemon
     // did not report it", and neither is something this client may invent: the
@@ -364,6 +373,12 @@ trait OrchestrationDaemon {
         config_revision: Option<&str>,
     ) -> Result<PreparedOrchestration, String>;
 
+    /// Issue #1233 item 4: whether this deck bounds a preparation itself and
+    /// withdraws one it could not finish in time
+    /// ([`dot_agent_deck::daemon_protocol::CAP_PREPARE_DEADLINE`]), which is what
+    /// makes a client-side bound on the call safe.
+    fn bounds_preparation(&self) -> bool;
+
     /// `prep_token` is the one the preparation handed back. A token routes the
     /// spawn onto `start-prepared-agent`, where the token is a required field,
     /// so a daemon that does not know that verb refuses the request outright and
@@ -430,6 +445,10 @@ impl OrchestrationDaemon for DaemonClient {
         DaemonClient::prepare_orchestration(self, cwd, orchestration, task, config_revision)
             .await
             .map_err(|error| safe_message(error.to_string()))
+    }
+
+    fn bounds_preparation(&self) -> bool {
+        daemon_bounds_preparation(self)
     }
 
     async fn start_orchestration_agent(
@@ -3928,12 +3947,16 @@ async fn start_orchestration_action(
         return Err(reason.into());
     }
     ensure_one_orchestration_of_that_name(&daemon, &path, &orchestration).await?;
-    // Deliberately NOT under a client-side deadline, unlike every other call
-    // this launch makes (PRD #1223 audit V1). The deck resolves, composes,
-    // issues the token and publishes `orchestrator-context.md` on its blocking
-    // pool, and dropping this future cannot stop that: a preparation reported
-    // here as timed out would still publish afterwards, possibly over a
-    // retry's context once the retry's last prepared-role check has passed.
+    // Against a deck older than issue #1233, deliberately NOT under a
+    // client-side deadline, unlike every other call this launch makes (PRD
+    // #1223 audit V1). Such a deck resolves, composes, issues the token and
+    // publishes the coordinator context on its blocking pool, and dropping this
+    // future cannot stop that: a preparation reported here as timed out would
+    // still publish afterwards, possibly over a retry's context once the
+    // retry's last prepared-role check has passed. A deck that advertises
+    // `prepare-deadline` owns a shorter deadline, withdraws what it could not
+    // finish, and publishes each preparation to a file of its own, so there the
+    // call is bounded like the rest.
     // The role starts and rollback stops below stay bounded, and for two
     // different reasons (audit W6 — this comment used to give the start's
     // reason for both). A start that elapses is reported as INDETERMINATE and
@@ -3945,11 +3968,18 @@ async fn start_orchestration_action(
     // rollback costs and lets it reach the roles behind a wedged stop. A
     // preparation has neither: dropping it neither finds out what happened nor
     // says anything useful, so it is waited out instead.
-    let prepared = daemon
-        .client
-        .prepare_orchestration(&path, &orchestration, "", config_revision.as_deref())
-        .await
-        .map_err(|error| prepare_refusal_message(&error, &orchestration))?;
+    let prepare = async {
+        daemon
+            .client
+            .prepare_orchestration(&path, &orchestration, "", config_revision.as_deref())
+            .await
+            .map_err(|error| prepare_refusal_message(&error, &orchestration))
+    };
+    let prepared = if daemon_bounds_preparation(&daemon.client) {
+        crate::daemon_bridge::bounded_reply("PrepareOrchestration", prepare).await?
+    } else {
+        prepare.await?
+    };
     // Both are `#[serde(default)]` on the reply, and neither may be invented
     // here — see `prepare_orchestration_launch`.
     if prepared.path.is_empty() {
@@ -3992,6 +4022,20 @@ fn ambiguous_orchestration_refusal(orchestration: &str) -> String {
          Nothing was started.",
         safe_message(orchestration)
     )
+}
+
+/// Issue #1233 item 4: whether `client`'s deck advertised
+/// [`dot_agent_deck::daemon_protocol::CAP_PREPARE_DEADLINE`] on the handshake
+/// this client holds.
+///
+/// Read from the cached handshake, so the residual is the usual one: a cached
+/// set that outlived a daemon replaced by an older build bounds a preparation
+/// that deck does not bound itself — the pre-#1233 hazard, for exactly that
+/// pairing, until the next handshake.
+fn daemon_bounds_preparation(client: &DaemonClient) -> bool {
+    client.cached_capabilities().is_some_and(|capabilities| {
+        capabilities.supports(dot_agent_deck::daemon_protocol::CAP_PREPARE_DEADLINE)
+    })
 }
 
 /// A refused `PrepareOrchestration`, as the dialog reports it.
@@ -6596,6 +6640,9 @@ mod tests {
         /// Stops the deck never answers, and stops it refuses, by agent id.
         stop_hangs: Mutex<HashSet<String>>,
         stop_errors: Mutex<HashMap<String, String>>,
+        /// Issue #1233 item 4: whether the deck advertises `prepare-deadline`.
+        /// `false` is a deck older than #1233.
+        bounds_preparation: AtomicBool,
     }
 
     impl FakeOrchestrationDaemon {
@@ -6634,6 +6681,7 @@ mod tests {
                 stop_attempts: Mutex::new(Vec::new()),
                 stop_hangs: Mutex::new(HashSet::new()),
                 stop_errors: Mutex::new(HashMap::new()),
+                bounds_preparation: AtomicBool::new(false),
             }
         }
 
@@ -6670,6 +6718,10 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| Ok(prepared_orchestration()))
+        }
+
+        fn bounds_preparation(&self) -> bool {
+            self.bounds_preparation.load(Ordering::SeqCst)
         }
 
         async fn start_orchestration_agent(
@@ -7337,15 +7389,15 @@ command = "configured-planner"
         assert!(ensure_daemon_can_prepare(Some(&advertising(&["something-else"]))).is_ok());
     }
 
-    /// PRD #1223 audit V1, guarded (audit W6): the preparation is under NO
-    /// client-side deadline, and nothing else in the suite would notice if one
-    /// were put back.
+    /// PRD #1223 audit V1, guarded (audit W6): against a deck older than issue
+    /// #1233 the preparation is under NO client-side deadline, and nothing else
+    /// in the suite would notice if one were put back.
     ///
     /// Every other deck call a launch makes is bounded at
     /// [`ORCHESTRATION_ROLE_START_TIMEOUT`], and the reason this one is not is
-    /// integrity rather than patience: the deck resolves, composes, issues the
-    /// token and publishes `orchestrator-context.md` on its blocking pool, and
-    /// dropping the client's future stops none of that — so a preparation
+    /// integrity rather than patience: such a deck resolves, composes, issues
+    /// the token and publishes the coordinator context on its blocking pool,
+    /// and dropping the client's future stops none of that — so a preparation
     /// reported here as timed out could still publish afterwards, over a
     /// retry's context once the retry's last prepared-role check had passed.
     ///
@@ -7353,7 +7405,7 @@ command = "configured-planner"
     /// bound to answer costs the test nothing and would trip any `timeout`
     /// wrapped around this call.
     #[tokio::test(start_paused = true)]
-    async fn a_slow_preparation_is_waited_out_rather_than_timed_out() {
+    async fn a_slow_preparation_on_an_older_deck_is_waited_out_rather_than_timed_out() {
         let daemon = FakeOrchestrationDaemon::new(
             Ok(Some("unused-session")),
             std::iter::empty(),
@@ -7375,6 +7427,59 @@ command = "configured-planner"
         assert!(!prepared.path.is_empty());
         assert!(!roles.is_empty());
         assert_eq!(daemon.prepare_requests.lock().unwrap().len(), 1);
+    }
+
+    /// Issue #1233 item 4: against a deck that advertises `prepare-deadline`
+    /// the preparation IS bounded, at the same per-call bound as every other
+    /// deck call, and the error names the preparation.
+    ///
+    /// Safe there and only there: that deck answers within its own shorter
+    /// deadline, and withdraws a preparation it could not finish rather than
+    /// publishing it after the client gave up. The clock is paused, so the
+    /// bound elapses without the test waiting on it.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_preparation_on_a_deadline_deck_is_bounded() {
+        let daemon = FakeOrchestrationDaemon::new(
+            Ok(Some("unused-session")),
+            std::iter::empty(),
+            Ok(SendResult::Applied),
+        );
+        daemon.bounds_preparation.store(true, Ordering::SeqCst);
+        *daemon.prepare_delay.lock().unwrap() = Some(crate::daemon_bridge::DECK_REPLY_TIMEOUT * 4);
+
+        let error = prepare_orchestration_launch(
+            &daemon,
+            "loop",
+            "/home/dev/repo",
+            "Build it.",
+            &launch_roles("claude"),
+            None,
+        )
+        .await
+        .expect_err("a deadline deck that never answers must be given up on");
+
+        assert!(
+            error.contains("PrepareOrchestration")
+                && error.contains(&format!(
+                    "{}s",
+                    crate::daemon_bridge::DECK_REPLY_TIMEOUT.as_secs()
+                )),
+            "the error names the call and its bound: {error}"
+        );
+        assert_eq!(daemon.prepare_requests.lock().unwrap().len(), 1);
+
+        // And one that answers inside the bound is accepted as usual.
+        *daemon.prepare_delay.lock().unwrap() = Some(crate::daemon_bridge::DECK_REPLY_TIMEOUT / 2);
+        prepare_orchestration_launch(
+            &daemon,
+            "loop",
+            "/home/dev/repo",
+            "Build it.",
+            &launch_roles("claude"),
+            None,
+        )
+        .await
+        .expect("a deadline deck that answers in time is accepted");
     }
 
     /// A refused preparation starts nothing — not even a subscription. The
