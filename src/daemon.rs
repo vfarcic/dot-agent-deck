@@ -3137,6 +3137,9 @@ async fn run_hook_loop_with_idle_timeout(
     // connections faster than they finished grew the daemon's task set and its
     // per-connection buffers without limit.
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HOOK_CONNECTIONS));
+    // Issue #544: the `work-done` and `dispatch` pane writes handed off by the
+    // connections below — ordered per recipient pane and bounded in number.
+    let deliveries = crate::pane_delivery_queue::PaneDeliveryQueues::new();
     // Whether the cap is currently holding, so the warning below fires on the
     // transition into saturation rather than once per waiting connection.
     let mut at_cap = false;
@@ -3162,6 +3165,7 @@ async fn run_hook_loop_with_idle_timeout(
                 let event_tx = event_tx.clone();
                 let pty_registry = pty_registry.clone();
                 let worktree_registry = worktree_registry.clone();
+                let deliveries = Arc::clone(&deliveries);
                 tokio::spawn(async move {
                     // Issue #319: the permit rides INTO the task and is dropped
                     // when it returns, so "connections being served" is exactly
@@ -3605,28 +3609,36 @@ async fn run_hook_loop_with_idle_timeout(
                                     // Deliver result to the caller (doesn't need any
                                     // AppState lock — uses the PTY registry).
                                     //
-                                    // Issue #544: DETACHED, because this is a first
-                                    // write that may wait up to the draft cap for the
-                                    // caller's unsent draft, and awaiting it here
-                                    // would hold this connection — one of
-                                    // `MAX_CONCURRENT_HOOK_CONNECTIONS` — for that
-                                    // long. Nothing below depends on it finishing:
-                                    // the caller's CLI was acked at the provenance
-                                    // gate above, the outcome is logged inside
-                                    // `deliver_dispatch_result`, and its return value
-                                    // was never read here.
+                                    // Issue #544: QUEUED rather than awaited, because
+                                    // this is a first write that may wait up to the
+                                    // draft cap for the caller's unsent draft, and
+                                    // awaiting it here would hold this connection —
+                                    // one of `MAX_CONCURRENT_HOOK_CONNECTIONS` — for
+                                    // that long. Nothing below depends on it
+                                    // finishing: the caller's CLI was acked at the
+                                    // provenance gate above, the outcome is logged
+                                    // inside `deliver_dispatch_result`, and its
+                                    // return value was never read here. The queue
+                                    // keeps writes to one pane in the order they
+                                    // were queued and bounds how many are pending —
+                                    // see `crate::pane_delivery_queue`.
                                     let registry = pty_registry.clone();
                                     let caller_pane_id = signal.pane_id.clone();
                                     let message = result.message;
-                                    tokio::spawn(async move {
-                                        deliver_dispatch_result(
-                                            &registry,
-                                            &caller_pane_id,
-                                            &caller_agent_id,
-                                            &message,
+                                    deliveries
+                                        .enqueue(
+                                            &signal.pane_id,
+                                            Box::pin(async move {
+                                                deliver_dispatch_result(
+                                                    &registry,
+                                                    &caller_pane_id,
+                                                    &caller_agent_id,
+                                                    &message,
+                                                )
+                                                .await;
+                                            }),
                                         )
                                         .await;
-                                    });
                                 }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(
@@ -3641,25 +3653,36 @@ async fn run_hook_loop_with_idle_timeout(
                                     // `state.write()` — and every reader behind it —
                                     // for as long. See `WorkDoneDelivery`.
                                     //
-                                    // The write is also DETACHED from this
-                                    // connection, for the reason given on the
-                                    // `Dispatch` arm's `deliver_dispatch_result`:
+                                    // The write is also QUEUED rather than awaited
+                                    // on this connection, for the reason given on
+                                    // the `Dispatch` arm's `deliver_dispatch_result`:
                                     // awaited inline, a deferred write holds one of
                                     // the `MAX_CONCURRENT_HOOK_CONNECTIONS` permits
                                     // for up to the draft cap. The `work-done` CLI
                                     // was acked at the provenance gate, and
                                     // `deliver` logs its own outcome. The state
-                                    // changes `prepare_work_done` makes stay inline
-                                    // and in message order; only the PTY write moves.
+                                    // changes `prepare_work_done` makes stay inline;
+                                    // only the PTY write moves, into the recipient
+                                    // pane's queue, behind every report already
+                                    // queued for that pane.
                                     let delivery = state
                                         .read()
                                         .await
                                         .prepare_work_done(signal, &pty_registry)
                                         .await;
-                                    let registry = pty_registry.clone();
-                                    tokio::spawn(async move {
-                                        delivery.deliver(&registry).await;
-                                    });
+                                    if let Some(target) =
+                                        delivery.target_pane_id().map(str::to_string)
+                                    {
+                                        let registry = pty_registry.clone();
+                                        deliveries
+                                            .enqueue(
+                                                &target,
+                                                Box::pin(async move {
+                                                    delivery.deliver(&registry).await;
+                                                }),
+                                            )
+                                            .await;
+                                    }
                                 }
                                 DaemonMessage::GetSeed(req) => {
                                     // PRD #201 native prompt delivery: hand the

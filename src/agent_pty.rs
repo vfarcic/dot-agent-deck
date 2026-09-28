@@ -912,6 +912,13 @@ pub enum AgentPtyError {
     /// every other staleness finding gets.
     #[error("Prepared project directory changed before the spawn: {0}")]
     PreparedDirChanged(&'static str),
+    /// Issue #544: a first write given a deadline by
+    /// [`AgentPtyRegistry::write_and_submit_guarded_first_write_within`] ran
+    /// out of it doing something OTHER than waiting for the user's draft —
+    /// queued on the writer, or writing. Whatever it had written so far stays
+    /// written, exactly as when a caller's own timeout cancelled the send.
+    #[error("deadline elapsed while writing")]
+    DeadlineElapsed,
 }
 
 /// How to spawn an agent.
@@ -2280,7 +2287,27 @@ enum FirstWrite {
     /// Wait while a draft is pending, within the cap measured from `started`.
     Defer {
         started: Instant,
+        /// The bound on everything the write does OTHER than wait for the
+        /// draft, moved later by exactly the time it spent waiting. `None` is
+        /// no bound.
+        deadline: Option<Instant>,
+        /// A ceiling on the registry's cap for this write, for a caller whose
+        /// own hard limit is shorter. `None` is the registry's cap.
+        cap_ceiling: Option<Duration>,
     },
+}
+
+/// Issue #544: `fut`, unless `at` passes first.
+async fn before_write_deadline<F: std::future::Future>(
+    at: Option<Instant>,
+    fut: F,
+) -> Result<F::Output, AgentPtyError> {
+    match at {
+        None => Ok(fut.await),
+        Some(at) => tokio::time::timeout_at(at.into(), fut)
+            .await
+            .map_err(|_| AgentPtyError::DeadlineElapsed),
+    }
 }
 
 /// Issue #544: what [`AgentPtyRegistry::write_and_submit_guarded_first_write_detailed`]
@@ -4691,6 +4718,9 @@ pub struct OutstandingDelegation {
     /// this way, an unbound record simply falls through to its own timer
     /// instead of being drained by a stranger's death.
     worker_agent_id: Option<String>,
+    /// Issue #544: where this delegation's task pointer write is — see
+    /// [`AgentPtyRegistry::delegation_idle_clock`].
+    pointer: PointerWrite,
     /// Issue #714: whether this delegation's worker has already been reported
     /// to the orchestrator as blocked by a provider usage limit
     /// ([`AgentPtyRegistry::claim_worker_blocked_notice`]). Once per record, so a
@@ -4816,6 +4846,30 @@ pub struct WorkerBlockedNotice {
     pub orchestrator_pane_id: String,
     pub orchestrator_agent_id: String,
     pub orchestration: Option<crate::state::OrchestrationIdentity>,
+}
+
+/// Issue #544: the task pointer write of one [`OutstandingDelegation`].
+#[derive(Debug, Default, Clone, Copy)]
+struct PointerWrite {
+    /// The write has begun and not yet returned.
+    in_progress: bool,
+    /// How long the finished write waited for the worker's unsent draft.
+    deferred: Duration,
+}
+
+/// Issue #544: what the idle-worker watch needs to keep its clock off the time
+/// a delegation's task pointer spent waiting for the worker's unsent draft.
+/// See [`AgentPtyRegistry::delegation_idle_clock`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelegationIdleClock {
+    /// When the delegation was armed — the idle clock's start.
+    pub armed_at: Instant,
+    /// The pointer write is still under way, so how long it waited is not
+    /// known yet.
+    pub pointer_in_progress: bool,
+    /// How long the finished pointer write waited for the draft. The idle
+    /// clock runs that much later.
+    pub pointer_deferred: Duration,
 }
 
 /// PRD #126: handed back by [`AgentPtyRegistry::arm_outstanding_delegation`] to
@@ -5559,6 +5613,7 @@ impl AgentPtyRegistry {
                 armed_at: Instant::now(),
                 superseded,
                 worker_agent_id: None,
+                pointer: PointerWrite::default(),
                 blocked_reported: false,
                 blocked_notice_waiter: None,
                 _watch_cancel: cancel_tx,
@@ -5591,6 +5646,64 @@ impl AgentPtyRegistry {
         {
             record.worker_agent_id = Some(worker_agent_id.to_string());
         }
+    }
+
+    /// Issue #544: the delegation `seq` on `worker_pane_id` is about to write
+    /// its task pointer, which may wait for the worker's unsent draft. Until
+    /// [`Self::finish_delegation_pointer_write`], the idle-worker watch holds
+    /// its report. A no-op if the record is gone or a newer one replaced it.
+    pub fn begin_delegation_pointer_write(&self, worker_pane_id: &str, seq: u64) {
+        let mut tracker = self.delegations.lock().unwrap();
+        if let Some(record) = tracker.records.get_mut(worker_pane_id)
+            && record.seq == seq
+        {
+            record.pointer.in_progress = true;
+        }
+    }
+
+    /// Issue #544: the pointer write [`Self::begin_delegation_pointer_write`]
+    /// announced has returned, after waiting `deferred` for the draft.
+    pub fn finish_delegation_pointer_write(
+        &self,
+        worker_pane_id: &str,
+        seq: u64,
+        deferred: Duration,
+    ) {
+        let mut tracker = self.delegations.lock().unwrap();
+        if let Some(record) = tracker.records.get_mut(worker_pane_id)
+            && record.seq == seq
+        {
+            record.pointer = PointerWrite {
+                in_progress: false,
+                deferred,
+            };
+        }
+    }
+
+    /// Issue #544: the idle-worker watch's clock for delegation `seq`, or
+    /// `None` when the record is gone or superseded — the watch's own
+    /// seq-conditional take then finds nothing either.
+    ///
+    /// A worker cannot answer a task it has not been given, so the time its
+    /// pointer spent waiting for the worker's own unsent draft is not time
+    /// the worker failed to respond: the watch reports at
+    /// `armed_at + timeout + pointer_deferred`, and not at all while the write
+    /// is still in progress.
+    pub fn delegation_idle_clock(
+        &self,
+        worker_pane_id: &str,
+        seq: u64,
+    ) -> Option<DelegationIdleClock> {
+        let tracker = self.delegations.lock().unwrap();
+        tracker
+            .records
+            .get(worker_pane_id)
+            .filter(|record| record.seq == seq)
+            .map(|record| DelegationIdleClock {
+                armed_at: record.armed_at,
+                pointer_in_progress: record.pointer.in_progress,
+                pointer_deferred: record.pointer.deferred,
+            })
     }
 
     /// PRD #249 M3 review (finding B4/S4): register the silent-worker watch for
@@ -8482,8 +8595,9 @@ impl AgentPtyRegistry {
     ///
     /// `started` is when this delivery's wait budget began. Pass `Instant::now()`
     /// unless an earlier wait is sharing the budget — the scheduler's reuse
-    /// fire passes the start of its idle debounce, so the two together stay
-    /// within one cap.
+    /// fire passes the start of its idle debounce, through
+    /// [`Self::write_and_submit_guarded_first_write_capped`], so the two
+    /// together stay within that fire's own hard limit.
     ///
     /// The wait holds NO lock: the user's own `Enter` needs this pane's writer
     /// to reach the PTY, so waiting while holding it would always run to the
@@ -8538,7 +8652,89 @@ impl AgentPtyRegistry {
             SubmitMode::Submit,
             expected_agent_id,
             revalidate,
-            FirstWrite::Defer { started },
+            FirstWrite::Defer {
+                started,
+                deadline: None,
+                cap_ceiling: None,
+            },
+        )
+        .await
+    }
+
+    /// [`Self::write_and_submit_guarded_first_write`] with the cap lowered to
+    /// `cap_ceiling` when that is shorter than [`Self::draft_defer_cap`].
+    ///
+    /// Issue #544, PR #1398 review: for a caller whose wait has a hard limit
+    /// of its own that the draft wait shares — the scheduler's reuse fire,
+    /// whose `started` is its idle debounce's start, so the two together must
+    /// stay within `REUSE_DELIVERY_HARD_TIMEOUT` whatever
+    /// `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` says. A cap switched off (`0`) stays
+    /// off.
+    pub async fn write_and_submit_guarded_first_write_capped<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: &str,
+        revalidate: impl FnOnce() -> Fut,
+        started: Instant,
+        cap_ceiling: Duration,
+    ) -> Result<GuardedSend, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        self.write_guarded(
+            pane_id,
+            text,
+            SubmitMode::Submit,
+            expected_agent_id,
+            revalidate,
+            FirstWrite::Defer {
+                started,
+                deadline: None,
+                cap_ceiling: Some(cap_ceiling),
+            },
+        )
+        .await
+        .map(|sent| sent.detail.outcome())
+    }
+
+    /// [`Self::write_and_submit_guarded_first_write_detailed`] with a deadline
+    /// on everything the write does OTHER than wait for the draft: queueing on
+    /// the writer, `revalidate`, and the write itself. Time spent waiting for
+    /// the draft moves `deadline` later by exactly that much, so a write that
+    /// never waited is bounded by `deadline` itself — what a caller's own
+    /// `timeout` around the immediate entry gave it — and one that did is not
+    /// dropped for having waited. Past the (moved) deadline the call returns
+    /// [`AgentPtyError::DeadlineElapsed`].
+    ///
+    /// Issue #544, PR #1398 review: the spawn seed used to wrap the deferring
+    /// entry in its own timeout widened by the whole cap, which let time that
+    /// was not a draft wait — a writer held by someone else — run up to a cap
+    /// past the delivery's deadline. The bound has to live here, because only
+    /// this call knows which of its time was the draft's.
+    pub async fn write_and_submit_guarded_first_write_within<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: &str,
+        revalidate: impl FnOnce() -> Fut,
+        started: Instant,
+        deadline: Instant,
+    ) -> Result<FirstWriteSend, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        self.write_guarded(
+            pane_id,
+            text,
+            SubmitMode::Submit,
+            expected_agent_id,
+            revalidate,
+            FirstWrite::Defer {
+                started,
+                deadline: Some(deadline),
+                cap_ceiling: None,
+            },
         )
         .await
     }
@@ -8645,23 +8841,32 @@ impl AgentPtyRegistry {
         // Issue #544: the draft gate, for a first write of a non-empty SUBMIT
         // payload with the cap switched on. A Notice submits nothing, and an
         // empty payload is a probe that #424 already governs.
+        // Issue #544: see [`Self::write_and_submit_guarded_first_write_within`].
+        let write_deadline = match first_write {
+            FirstWrite::Defer { deadline, .. } => deadline,
+            FirstWrite::Immediate => None,
+        };
+        let within = |deferred: Duration| write_deadline.map(|at| at + deferred);
         let gate = match first_write {
-            FirstWrite::Defer { started }
-                if matches!(mode, SubmitMode::Submit)
-                    && !payload.is_empty()
-                    && !self.draft_defer_cap.is_zero() =>
+            FirstWrite::Defer {
+                started,
+                cap_ceiling,
+                ..
+            } if matches!(mode, SubmitMode::Submit)
+                && !payload.is_empty()
+                && !self.draft_defer_cap.is_zero() =>
             {
-                Some(started)
+                let cap = cap_ceiling.map_or(self.draft_defer_cap, |ceiling| {
+                    self.draft_defer_cap.min(ceiling)
+                });
+                Some((started, cap))
             }
             _ => None,
         };
         let decide = |pending: bool| match gate {
-            Some(started) => crate::draft_deferral::decide_first_write(
-                pending,
-                Instant::now(),
-                started,
-                self.draft_defer_cap,
-            ),
+            Some((started, cap)) => {
+                crate::draft_deferral::decide_first_write(pending, Instant::now(), started, cap)
+            }
             None => crate::draft_deferral::FirstWriteDecision::Now { capped: false },
         };
         let (mut w, capped) = loop {
@@ -8686,7 +8891,7 @@ impl AgentPtyRegistry {
             }
             // Acquire the EXACT target writer, THEN re-validate — this is the
             // barrier the TOCTOU test holds open by locking the writer externally.
-            let w = target.writer.lock().await;
+            let w = before_write_deadline(within(deferred), target.writer.lock()).await?;
             // Re-resolve identity: the pane may have rebound to a new agent, or the
             // target may have exited, while we waited for the writer. A paneless
             // agent has no pane→agent mapping to rebind, so the meaningful re-check
@@ -8717,7 +8922,7 @@ impl AgentPtyRegistry {
             }
         };
         // Liveness/session recheck against the authoritative session state.
-        if !revalidate().await {
+        if !before_write_deadline(within(deferred), revalidate()).await? {
             return finish(GuardedSend::Stale, deferred);
         }
         // Issue #424 F1 (auditor HIGH): a SUBMIT-ONLY PROBE — an empty payload
@@ -8835,10 +9040,13 @@ impl AgentPtyRegistry {
                 detail: crate::draft_deferral::DRAFT_CAP_NOTICE,
             });
         }
-        let delivery = match mode {
-            SubmitMode::Submit => deliver_payload_and_submit(w.daemon(), &payload).await,
-            SubmitMode::Notice => deliver_payload_as_notice(w.daemon(), &payload).await,
-        };
+        let delivery = before_write_deadline(within(deferred), async {
+            match mode {
+                SubmitMode::Submit => deliver_payload_and_submit(w.daemon(), &payload).await,
+                SubmitMode::Notice => deliver_payload_as_notice(w.daemon(), &payload).await,
+            }
+        })
+        .await?;
         match delivery {
             // Issue #424 F1: bytes of OURS are now in this pane, which is what
             // makes a later submit-only probe meaningful and a later repeat of
@@ -18388,6 +18596,145 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
+    /// Issue #544 (PR #1398 review): a first write given a deadline is bounded
+    /// by it for everything that is NOT the draft wait. Queued behind a writer
+    /// someone else holds, with no draft pending, it gives up at the deadline
+    /// rather than a whole draft cap later; waiting for a draft, it is not
+    /// dropped for having waited past the deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn first_write_within_bounds_only_the_time_not_spent_on_the_draft() {
+        use std::io::Write as _;
+        const PANE: &str = "issue-544-within";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        assert!(registry.draft_defer_cap() >= Duration::from_secs(10));
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+
+        let target = registry.writer_target_for_pane(PANE).expect("target");
+        let held = target.writer.lock().await;
+        let began = Instant::now();
+        let queued = tokio::time::timeout(
+            Duration::from_secs(5),
+            registry.write_and_submit_guarded_first_write_within(
+                PANE,
+                "QUEUED",
+                &agent,
+                || async { true },
+                Instant::now(),
+                Instant::now() + Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("a write that never waited for a draft must not outlive its deadline by a cap");
+        assert!(
+            matches!(queued, Err(AgentPtyError::DeadlineElapsed)),
+            "queued on a held writer past the deadline: {queued:?}"
+        );
+        assert!(began.elapsed() < Duration::from_secs(2));
+        drop(held);
+
+        let type_bytes = |bytes: &'static [u8]| {
+            let registry = Arc::clone(&registry);
+            let agent = agent.clone();
+            async move {
+                let handle = registry.subscribe(&agent).expect("attach");
+                let mut writer = handle.writer.lock().await;
+                writer.write_all(bytes).expect("type");
+            }
+        };
+        type_bytes(b"draft").await;
+        let waiting = {
+            let registry = Arc::clone(&registry);
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                registry
+                    .write_and_submit_guarded_first_write_within(
+                        PANE,
+                        "DEFERRED",
+                        &agent,
+                        || async { true },
+                        Instant::now(),
+                        Instant::now() + Duration::from_millis(300),
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the first write waits for the draft"
+        );
+        type_bytes(b"\x15").await;
+        let sent = tokio::time::timeout(Duration::from_secs(3), waiting)
+            .await
+            .expect("released by Ctrl+U")
+            .expect("join")
+            .expect("a wait past the deadline must not drop the write");
+        assert_eq!(
+            sent.detail,
+            GuardedSendDetail::Outcome(GuardedSend::Applied)
+        );
+        assert!(
+            sent.deferred >= Duration::from_millis(700),
+            "{:?}",
+            sent.deferred
+        );
+        registry.shutdown_all();
+    }
+
+    /// Issue #544 (PR #1398 review): the scheduler's reuse fire lowers the cap
+    /// to its own hard limit, so a draft nobody finishes holds the fire only
+    /// that long — however long the registry's cap is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_capped_first_write_never_waits_past_its_ceiling() {
+        use std::io::Write as _;
+        const PANE: &str = "issue-544-ceiling";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        assert!(registry.draft_defer_cap() >= Duration::from_secs(10));
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        {
+            let handle = registry.subscribe(&agent).expect("attach");
+            let mut writer = handle.writer.lock().await;
+            writer.write_all(b"unfinished draft").expect("type");
+        }
+        assert!(registry.draft_pending(PANE));
+        let began = Instant::now();
+        let sent = tokio::time::timeout(
+            Duration::from_secs(5),
+            registry.write_and_submit_guarded_first_write_capped(
+                PANE,
+                "REUSE-FIRE",
+                &agent,
+                || async { true },
+                Instant::now(),
+                Duration::from_millis(500),
+            ),
+        )
+        .await
+        .expect("the ceiling, not the registry cap, bounds the wait")
+        .expect("capped write");
+        assert_eq!(sent, GuardedSend::Applied);
+        assert!(
+            began.elapsed() >= Duration::from_millis(400),
+            "it still waited for the draft first: {:?}",
+            began.elapsed()
+        );
+        registry.shutdown_all();
+    }
+
     /// Issue #542 (PR #1293 review): a spawn that has only RESERVED the pane
     /// does not keep a closed pane's clocks. Were they kept and that spawn then
     /// failed, nothing would be left to prune them, and a later occupant would
@@ -19068,6 +19415,48 @@ mod spawn_tests {
         );
     }
 
+    /// Issue #544 (PR #1398 review): the idle-worker watch's clock reports a
+    /// pointer write in progress, then how long it waited for the draft — for
+    /// the live generation only, so a stale dispatch cannot move a newer
+    /// delegation's clock.
+    #[test]
+    fn delegation_idle_clock_tracks_the_pointer_write_of_the_live_generation() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let first = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+            .expect("arm #1");
+        let clock = reg
+            .delegation_idle_clock("worker", first.seq)
+            .expect("armed");
+        assert!(!clock.pointer_in_progress);
+        assert_eq!(clock.pointer_deferred, Duration::ZERO);
+
+        reg.begin_delegation_pointer_write("worker", first.seq);
+        assert!(
+            reg.delegation_idle_clock("worker", first.seq)
+                .expect("armed")
+                .pointer_in_progress
+        );
+        reg.finish_delegation_pointer_write("worker", first.seq, Duration::from_secs(7));
+        let clock = reg
+            .delegation_idle_clock("worker", first.seq)
+            .expect("armed");
+        assert!(!clock.pointer_in_progress);
+        assert_eq!(clock.pointer_deferred, Duration::from_secs(7));
+
+        let second = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+            .expect("arm #2 supersedes #1");
+        assert_eq!(reg.delegation_idle_clock("worker", first.seq), None);
+        reg.begin_delegation_pointer_write("worker", first.seq);
+        reg.finish_delegation_pointer_write("worker", first.seq, Duration::from_secs(9));
+        let clock = reg
+            .delegation_idle_clock("worker", second.seq)
+            .expect("armed");
+        assert!(!clock.pointer_in_progress);
+        assert_eq!(clock.pointer_deferred, Duration::ZERO);
+    }
+
     /// Silence-watch analogue of the unbound-delegation case above:
     /// `arm_silence_watch` takes the worker identity directly (no separate
     /// bind step), but an unbound (`None`) watch must still survive a
@@ -19194,6 +19583,7 @@ mod spawn_tests {
             armed_at: Instant::now(),
             superseded: 0,
             worker_agent_id: None,
+            pointer: PointerWrite::default(),
             blocked_reported: false,
             blocked_notice_waiter: None,
             _watch_cancel: oneshot::channel().0,

@@ -313,8 +313,7 @@ impl DraftTracker {
                 0x40..=0x7e => {
                     // Exactly the bytes `crate::agent_pty`'s paste framing
                     // matches, so the two agree on what a marker is.
-                    let paste_marker =
-                        byte == b'~' && len == 3 && matches!(code, Some(200 | 201));
+                    let paste_marker = byte == b'~' && len == 3 && matches!(code, Some(200 | 201));
                     if paste_marker {
                         return Escape::Ground;
                     }

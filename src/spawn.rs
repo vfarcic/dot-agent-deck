@@ -1583,7 +1583,43 @@ async fn deliver(
     // agent frees for the next spawn — so after a multi-second readiness wait
     // it could type this dispatch prompt into a replacement. (Issue #917
     // deleted that primitive, so the contrast is history, not a choice.)
-    match guarded_first_submit(registry, pane_id, agent_id, prompt, &mut deadline).await {
+    //
+    // Issue #544, PR #1398 review: the pre-write drain runs AGAIN under the
+    // writer, immediately before the bytes, because this write may first wait
+    // out the user's draft for up to the cap. Drained only above, every event
+    // that arrived during that wait — the agent's own `SessionStart` among
+    // them — would reach the confirmation loop as post-write, which is the
+    // window #666's drain exists to close. The drain above stays: it stops a
+    // delivery whose target already changed before it starts waiting.
+    let pre_write = || {
+        event_rx.as_mut().and_then(|rx| {
+            drain_pre_write_events(
+                rx,
+                pane_id,
+                agent_id,
+                &mut generation,
+                &mut drained_capability,
+                &mut pre_write_agent_start,
+            )
+        })
+    };
+    let first = guarded_first_submit(
+        registry,
+        pane_id,
+        agent_id,
+        prompt,
+        &mut deadline,
+        pre_write,
+    )
+    .await;
+    let first = match first {
+        Ok(outcome) => outcome,
+        Err(reason) => {
+            log_prompt_stopped(DELIVERY_LOG_PATH, pane_id, &delivery_id, reason);
+            return;
+        }
+    };
+    match first {
         GuardedOutcome::Written => {}
         // Issue #424 H3/H5: the FIRST write of this delivery was refused because
         // the pane's input box already holds bytes of ours that the user has
@@ -1797,37 +1833,61 @@ async fn guarded_submit(
 /// turn into "deadline elapsed while writing", which would DROP the prompt, the
 /// outcome #424 exists to prevent.
 ///
-/// So the timeout is widened by the draft cap: the deferral itself is bounded
-/// by that cap, so whatever it spends, the rest of the write keeps at least the
-/// budget it had before the gate existed. And `deadline` is moved later by the
-/// time actually spent waiting for the draft, so the confirmation chain after
-/// the write still gets the same span it did before — which is also what keeps
+/// So the deadline is enforced INSIDE the write
+/// ([`AgentPtyRegistry::write_and_submit_guarded_first_write_within`]), which
+/// moves it later by exactly the time spent waiting for the draft and by
+/// nothing else: a write that never waited is bounded by `deadline` as it was
+/// before the gate existed, and time queued behind another writer cannot
+/// borrow the draft's allowance (PR #1398 review). `deadline` is then moved
+/// by the same wait, so the confirmation chain after the write still gets the
+/// same span it did before — which is also what keeps
 /// [`crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`] a bound on how long a
 /// payload record can be guarding a live delivery.
+///
+/// `pre_write` runs under the pane's writer on the pass that writes, just
+/// before the bytes go in; a `Some(reason)` stops the delivery with nothing
+/// written, returned as `Err(reason)`. It exists for the pre-write drain (issue #666): run once before
+/// this call as well, it would leave every event that arrives during a draft
+/// wait to be read as post-write evidence — a `SessionStart` among them.
 async fn guarded_first_submit(
     registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
     agent_id: &str,
     prompt: &str,
     deadline: &mut Instant,
-) -> GuardedOutcome {
+    pre_write: impl FnOnce() -> Option<&'static str>,
+) -> Result<GuardedOutcome, &'static str> {
     let closing = Arc::clone(registry);
-    let send = registry.write_and_submit_guarded_first_write_detailed(
+    let mut stopped = None;
+    let send = registry.write_and_submit_guarded_first_write_within(
         pane_id,
         prompt,
         agent_id,
-        || async move { !closing.is_pane_closing(pane_id) },
+        || {
+            let live = !closing.is_pane_closing(pane_id);
+            if live {
+                stopped = pre_write();
+            }
+            let proceed = live && stopped.is_none();
+            async move { proceed }
+        },
         Instant::now(),
+        *deadline,
     );
-    let budget = remaining_before(*deadline) + registry.draft_defer_cap();
-    match tokio::time::timeout(budget, send).await {
-        Err(_) => GuardedOutcome::Refused("deadline elapsed while writing"),
-        Ok(Err(e)) => GuardedOutcome::Failed(e),
-        Ok(Ok(sent)) => {
+    let sent = send.await;
+    if let Some(reason) = stopped {
+        return Err(reason);
+    }
+    Ok(match sent {
+        Err(AgentPtyError::DeadlineElapsed) => {
+            GuardedOutcome::Refused("deadline elapsed while writing")
+        }
+        Err(e) => GuardedOutcome::Failed(e),
+        Ok(sent) => {
             *deadline += sent.deferred;
             classify_guarded_detail(sent.detail)
         }
-    }
+    })
 }
 
 fn classify_guarded_detail(detail: GuardedSendDetail) -> GuardedOutcome {
@@ -3468,15 +3528,18 @@ async fn deliver_on_idle(
     // Issue #544: a FIRST write, so it also waits while the user has an unsent
     // draft in the pane — which the debounce above does not cover, because a
     // draft left idle for longer than the debounce reads as "not typing". It
-    // shares this fire's budget: `started` is the debounce's own start, so the
-    // two waits together stay within one draft cap rather than stacking.
+    // shares this fire's budget: `started` is the debounce's own start, and the
+    // draft cap is clamped to `REUSE_DELIVERY_HARD_TIMEOUT`, so the two waits
+    // together stay within this path's own one-minute limit rather than
+    // stacking — whatever `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` is set to.
     match registry
-        .write_and_submit_guarded_first_write(
+        .write_and_submit_guarded_first_write_capped(
             pane_id,
             prompt,
             expected_agent_id,
             || async { true },
             started,
+            REUSE_DELIVERY_HARD_TIMEOUT,
         )
         .await
     {

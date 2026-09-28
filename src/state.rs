@@ -2622,6 +2622,15 @@ enum WorkDoneWrite {
 }
 
 impl WorkDoneDelivery {
+    /// The pane the write goes to, or `None` when there is nothing to write.
+    pub fn target_pane_id(&self) -> Option<&str> {
+        match &self.0 {
+            WorkDoneWrite::Nothing => None,
+            WorkDoneWrite::DispatchReturn(pending) => Some(&pending.pane_id),
+            WorkDoneWrite::Feedback { orch_pane_id, .. } => Some(orch_pane_id),
+        }
+    }
+
     /// Perform the write, if there is one. Needs no `AppState`.
     pub async fn deliver(self, registry: &AgentPtyRegistry) {
         let (
@@ -3158,6 +3167,78 @@ fn arm_idle_worker_watch_for_delegation(
     Some(seq)
 }
 
+/// Issue #544 (PR #1398 review): keep the idle-worker watch's clock off the
+/// time the delegation's task pointer spent waiting for the worker's own
+/// unsent draft. A worker cannot answer a task it has not been given, so with
+/// `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS` shorter than that wait the
+/// watch used to report a worker idle whose pointer had not been written yet.
+///
+/// Called once the plain timeout has run: holds while the pointer write is
+/// still under way, then until `armed_at + timeout + pointer_deferred`. `true`
+/// to go on and report — including when the record is gone, which the caller's
+/// seq-conditional take then settles — and `false` when the delegation was
+/// cancelled meanwhile.
+async fn wait_out_pointer_deferral(
+    registry: &AgentPtyRegistry,
+    worker_pane_id: &str,
+    seq: u64,
+    timeout: std::time::Duration,
+    cancel: &mut tokio::sync::oneshot::Receiver<()>,
+) -> bool {
+    loop {
+        let Some(clock) = registry.delegation_idle_clock(worker_pane_id, seq) else {
+            return true;
+        };
+        let wait = if clock.pointer_in_progress {
+            crate::draft_deferral::DRAFT_POLL_INTERVAL
+        } else {
+            let due = clock.armed_at + timeout + clock.pointer_deferred;
+            match due.checked_duration_since(std::time::Instant::now()) {
+                Some(wait) if !wait.is_zero() => wait,
+                _ => return true,
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = &mut *cancel => return false,
+            _ = tokio::time::sleep(wait) => {}
+        }
+    }
+}
+
+/// Issue #544: announces a delegation's task pointer write to its idle-worker
+/// watch, and on drop — whichever way the write ends — reports how long it
+/// waited for the worker's draft. See [`wait_out_pointer_deferral`].
+struct PointerWriteClock<'a> {
+    registry: &'a AgentPtyRegistry,
+    worker_pane_id: &'a str,
+    seq: Option<u64>,
+    deferred: std::time::Duration,
+}
+
+impl<'a> PointerWriteClock<'a> {
+    fn begin(registry: &'a AgentPtyRegistry, worker_pane_id: &'a str, seq: Option<u64>) -> Self {
+        if let Some(seq) = seq {
+            registry.begin_delegation_pointer_write(worker_pane_id, seq);
+        }
+        Self {
+            registry,
+            worker_pane_id,
+            seq,
+            deferred: std::time::Duration::ZERO,
+        }
+    }
+}
+
+impl Drop for PointerWriteClock<'_> {
+    fn drop(&mut self) {
+        if let Some(seq) = self.seq {
+            self.registry
+                .finish_delegation_pointer_write(self.worker_pane_id, seq, self.deferred);
+        }
+    }
+}
+
 /// PRD #126: arm the idle watch for one just-armed delegation. Spawns a task
 /// that races the resolved timeout against the record's cancellation channel:
 ///
@@ -3195,11 +3276,11 @@ fn arm_idle_worker_watch(
     armed: crate::agent_pty::ArmedDelegation,
     timeout: std::time::Duration,
 ) {
-    let crate::agent_pty::ArmedDelegation { seq, cancel } = armed;
+    let crate::agent_pty::ArmedDelegation { seq, mut cancel } = armed;
     tokio::spawn(async move {
         tokio::select! {
             _ = tokio::time::sleep(timeout) => {}
-            _ = cancel => {
+            _ = &mut cancel => {
                 tracing::debug!(
                     pane_id = %worker_pane_id,
                     seq,
@@ -3207,6 +3288,15 @@ fn arm_idle_worker_watch(
                 );
                 return;
             }
+        }
+        if !wait_out_pointer_deferral(&registry, &worker_pane_id, seq, timeout, &mut cancel).await {
+            tracing::debug!(
+                pane_id = %worker_pane_id,
+                seq,
+                "idle-worker watch: cancelled while the task pointer's draft wait was being \
+                 added to the timeout"
+            );
+            return;
         }
         let Some(delegation) = registry.take_outstanding_delegation_if(&worker_pane_id, seq) else {
             tracing::debug!(
@@ -8115,7 +8205,10 @@ async fn dispatch_one_owned(
     // guarantee PRD #249 finding B1 built this call to enforce. Treat an
     // unresolved identity as "no verified target" and never attempt the write.
     let outcome = if let Some(worker_agent_id) = expected_worker_agent_id.as_deref() {
-        registry
+        // Issue #544: the idle-worker watch armed in `handle_delegate` must
+        // not count the time this write waits for the worker's draft.
+        let mut pointer_clock = PointerWriteClock::begin(&registry, &pane_id, delegation_seq);
+        let sent = registry
             .write_and_submit_guarded_first_write_detailed(
                 &pane_id,
                 &one_liner,
@@ -8133,8 +8226,12 @@ async fn dispatch_one_owned(
                 },
                 std::time::Instant::now(),
             )
-            .await
-            .map(|sent| sent.detail)
+            .await;
+        if let Ok(sent) = &sent {
+            pointer_clock.deferred = sent.deferred;
+        }
+        drop(pointer_clock);
+        sent.map(|sent| sent.detail)
     } else {
         tracing::debug!(
             pane_id = %pane_id,

@@ -62,6 +62,7 @@ pub mod orchestrator_context;
 pub mod orchestrator_ext;
 pub mod palette;
 pub mod pane;
+pub mod pane_delivery_queue;
 pub mod pane_input;
 pub mod pane_screen_text;
 pub mod platform;
