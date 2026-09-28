@@ -58,23 +58,6 @@
 # `0` disables the detector; accepted range is 1..=10080 minutes.
 worker_response_timeout_minutes = 120
 
-[[modes]]
-name = "dev"
-init_command = "devbox shell"
-reactive_panes = 2
-
-[[modes.panes]]
-command = "git status -s"
-name = "Git Status"
-
-[[modes.rules]]
-pattern = "cargo (test|clippy|check|fmt --check|build|audit)"
-watch = false
-
-[[modes.rules]]
-pattern = "git (log|status|show|diff)"
-watch = false
-
 # THREE orchestrations, one workflow (issue #705). They exist so a contributor
 # who has credentials for only one provider can still run the team, and so work
 # survives one provider's credits drying up mid-PRD:

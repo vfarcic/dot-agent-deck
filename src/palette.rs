@@ -37,7 +37,7 @@
 //! return you to, but it accepts no keys. The Cyan accent originally rendered
 //! in both cases, which made the loudest border signal on screen claim "type
 //! here" while the keyboard was driving the deck — the mode was invisible on a
-//! full-screen mode tab, where nothing else in the frame changes.
+//! full-screen pane, where nothing else in the frame changes.
 //!
 //! So for panes, (2) applies only in `UiMode::PaneInput`
 //! (`TerminalWidget::with_input_active`). In command mode the focused pane

@@ -574,7 +574,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         );
     }
 
-    // Store full bash command for reactive pane routing (tool_detail truncates).
+    // Store the full bash command (tool_detail truncates).
     if matches!(event_type, EventType::ToolStart)
         && tool_name.as_deref() == Some("Bash")
         && let Some(ref input) = tool_input
@@ -780,7 +780,7 @@ pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEven
         );
     }
 
-    // Store full bash command for reactive pane routing (tool_detail truncates).
+    // Store the full bash command (tool_detail truncates).
     if matches!(event_type, EventType::ToolStart)
         && input.tool_name.as_deref() == Some("Bash")
         && let Some(ref tool_input) = input.tool_input

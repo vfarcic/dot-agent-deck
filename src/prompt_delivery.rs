@@ -31,8 +31,9 @@
 //!
 //! 1. [`crate::ui::deliver_orchestrator_prompt`] — an orchestration tab's
 //!    spawn-time role prompt (TUI-owned).
-//! 2. `crate::ui::process_pending_seed_prompts` — a `[[modes]]` `seed_prompt`
-//!    (TUI-owned, PRD #127).
+//! 2. `crate::ui::process_pending_seed_prompts` — the seed of a built-in
+//!    New Agent option: schedule, issue-dispatch or dispatcher (TUI-owned,
+//!    PRD #127).
 //! 3. [`crate::spawn::spawn`]'s delivery — `dispatch`, the scheduler and
 //!    issue-dispatch (daemon-owned).
 //!

@@ -33,14 +33,13 @@ pub struct PaneInfo {
     pub command: Option<String>,
 }
 
-/// PRD #92 F4: per-pane result of a multi-pane close operation (a mode
-/// tab teardown via [`crate::tab::TabManager::close_tab`], or a mode
-/// deactivation via [`crate::mode_manager::ModeManager::deactivate_mode`]).
+/// PRD #92 F4: per-pane result of a multi-pane close operation (a tab
+/// teardown via [`crate::tab::TabManager::close_tab`]).
 ///
 /// Pre-F4 the same operations returned `Result<Vec<String>, _>` and
 /// silently dropped any [`PaneController::close_pane`] errors. That
 /// produced the user-visible bug where pressing `Ctrl+W` on an
-/// unhealthy mode-tab destroyed the dashboard cards while the underlying
+/// unhealthy tab destroyed the dashboard cards while the underlying
 /// agent processes survived in the daemon registry — the TUI thought
 /// they were gone.
 ///

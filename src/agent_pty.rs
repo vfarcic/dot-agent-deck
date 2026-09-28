@@ -468,7 +468,7 @@ pub fn is_valid_cwd(value: &str) -> bool {
 ///
 /// Wire shape (serde):
 /// ```json
-/// { "kind": "mode", "name": "k8s-ops" }
+/// { "kind": "mode", "name": "k8s-ops" }            // deprecated (#1199)
 /// { "kind": "orchestration", "name": "tdd-cycle", "role_index": 2 }
 /// ```
 ///
@@ -480,9 +480,14 @@ pub fn is_valid_cwd(value: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TabMembership {
-    /// Agent pane of a Mode tab. Side panes (the cards on the left) are
-    /// NOT daemon-tracked — they respawn fresh from `ModeConfig.panes` on
-    /// reconnect, see PRD #76 M2.12 design decision 2.
+    /// **Deprecated by issue #1199 (workspace modes were removed).** Was the
+    /// agent pane of a workspace-mode tab. Kept so an older TUI's `StartAgent`
+    /// and an older daemon's `list_agents` reply still decode — dropping the
+    /// variant would make either fail to parse, which is a wire break with no
+    /// `PROTOCOL_VERSION` bump to announce it. The TUI never constructs it
+    /// again: a hydrated record carrying it lands on the dashboard as a plain
+    /// card (with a session warning), and the daemon keeps handling it as the
+    /// opaque label it always was.
     Mode { name: String },
     /// One role slot of an orchestration tab. `role_index` is the position
     /// of this role in `OrchestrationConfig.roles`; on reconnect a dead

@@ -38,7 +38,7 @@ pub struct HydratedPane {
     pub cwd: Option<String>,
     /// Which tab the agent belonged to at spawn time (PRD #76 M2.12).
     /// Drives the hydration partition in `ui.rs`: `None` → dashboard,
-    /// `Some(Mode { ... })` → mode tab rebuild, `Some(Orchestration {
+    /// `Some(Mode { ... })` → dashboard (deprecated, issue #1199), `Some(Orchestration {
     /// ... })` → orchestration tab rebuild. `None` is also the
     /// older-daemon fallback (the field is omitted from the wire shape
     /// via `skip_serializing_if`), which keeps every legacy agent on
@@ -707,7 +707,7 @@ impl EmbeddedPaneController {
     /// with **no panes at all**, so [`Self::focused_pane_id`] answers `None`.
     ///
     /// That is the state the finding is about — `UiMode::PaneInput` with nothing
-    /// focused, which a vanished reactive pane with no successor really does
+    /// focused, which a vanished pane with no successor really does
     /// produce — and it cannot be posed against either
     /// [`Self::for_render_seam_with_focused_pane`] or
     /// [`Self::for_scroll_seam_with_focused_pane`], both of which focus their pane

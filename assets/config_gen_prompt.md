@@ -2,98 +2,30 @@ Analyze this project and create a `.dot-agent-deck.toml` configuration file in t
 
 ## What is .dot-agent-deck.toml?
 
-This file configures "workspace modes" for the dot-agent-deck TUI dashboard. Each mode defines a tab-based workspace that pairs you (the AI agent) with live command output in side panes. When a user activates a mode, a new tab opens with the agent on the left and side panes stacked on the right.
+This file configures **agent orchestrations** for the dot-agent-deck TUI dashboard. An orchestration is a team of agents that opens together in one tab: a designated orchestrator agent receives the user's request and delegates tasks to worker agents with `dot-agent-deck delegate`, and each worker reports back with `dot-agent-deck work-done`. The file's format is in the **Orchestrations** section below.
 
-## Config Format
-
-The file is TOML. You can define one or more modes. Each mode has a name, optional persistent panes, and optional reactive rules.
-
-```toml
-[[modes]]
-name = "mode-name"   # Display name shown in the tab bar
-init_command = "devbox shell"  # Optional: runs once in every pane before its command
-reactive_panes = 2             # Optional: number of reactive pane slots (default: 2)
-
-# Persistent panes: run when the mode activates, stay alive for the tab lifetime.
-# By default, commands are re-executed every 10 seconds automatically (watch = true).
-# Set watch = false for commands that stream/follow on their own (e.g., --watch, -f, tail -f).
-[[modes.panes]]
-command = "some-command"           # Shell command to run (plain, no watch/follow flags needed)
-name = "Display Name"              # Optional label (defaults to command)
-# watch = true                     # Default: system re-runs command every 10s automatically
-                                   # Set to false for commands with built-in streaming
-
-# Reactive rules: regex patterns matched against your bash commands.
-# When you execute a command that matches, THE EXACT SAME COMMAND is re-executed
-# in a side pane. With watch = true, it is re-executed repeatedly on an interval.
-# This means the matched command itself must be safe to re-run!
-[[modes.rules]]
-pattern = "regex\\s+pattern"   # Regex matched against your bash commands
-watch = false                   # false (default): run the matched command once
-                                # true: re-run the matched command on interval
-interval = 5                   # Seconds between re-runs (only when watch = true)
-```
-
-## Guidelines
-
-**`init_command`** (optional): A setup command that runs once in every pane before its own command starts. If the project ships a reproducible-environment manifest you discovered (e.g. `devbox.json`, `flake.nix`, `.nvmrc`, `pyproject.toml` poetry env, `environment.yml` conda, `.tool-versions` asdf, `.envrc` direnv, a project `Makefile` `shell` target), default `init_command` to that activation command — projects that ship one expect commands to run inside it. Skip `init_command` only when the project has no such manifest.
-
-**Persistent panes** run automatically on a 10-second refresh cycle (`watch = true` by default). Write the plain command without any watch/follow/polling flags — the system handles refresh internally. Examples:
-- `command = "kubectl get pods -o wide"` — refreshes every 10s automatically
-- `command = "helm list -A"` — refreshes every 10s automatically
-
-Set `watch = false` ONLY for commands that have their own built-in streaming (e.g., `kubectl get pods -w`, `tail -f /var/log/app.log`, `cargo watch -x test`). These run directly without the system refresh wrapper.
-
-Do NOT use the `watch` binary, `while true` loops, or any other external polling mechanism — the system handles this.
-
-**Reactive rules** capture commands the agent runs. **The matched command itself is what gets re-executed in the side pane.** This is critical to understand:
-- `watch = false`: the matched command runs once in the side pane and the output stays visible.
-- `watch = true`: the matched command is re-executed repeatedly on the interval timer.
-- Regex patterns use Rust regex syntax (escape backslashes: `\\s`, `\\d`, etc.).
-- **Prefer consolidated alternations** like `cargo (test|clippy|check)` or `git (log|status|show|diff)` over many narrow rules — this keeps `reactive_panes` count low and panes from fragmenting.
-
-**Rule safety: NEVER match a command that mutates files, state, or remote systems.** The matched command itself is what gets re-executed (sometimes on a timer), so any side effect would be duplicated. Concrete exclusions:
-- Formatters/codegen run without `--check`/`--dry-run`: `cargo fmt`, `gofmt -w`, `prettier --write`, `black`, `rustfmt`, code generators that write files.
-- Package operations: `npm install`, `pip install`, `cargo add`, `go get`, `bundle install`.
-- Anything that creates, deletes, or modifies state: `apply`, `deploy`, `merge`, `push`, `commit`, `helm install`, `helm upgrade`, `terraform apply`, `kubectl apply`, `kubectl delete`, `make install`, `cargo publish`.
-
-Whitelist (safe to mirror): read-only inspection — `status`, `log`, `diff`, `show`, `list`, `get`, `describe`, `top`, `tree`, `cat`, `head`, `tail` (without `-f`), `tests`, `check`, `clippy`, `lint`, `--check`/`--dry-run` variants of formatters and applies.
-
-**CRITICAL: Every command in the config MUST come from the project's own toolchain.** If the project uses Helm and kubectl, propose Helm and kubectl commands. If it uses Go, propose Go commands. NEVER propose commands from ecosystems the project does not use — e.g., do not propose `cargo` commands for a Python project, or `npm` commands for a Kubernetes infra project.
-
-**Cover the project's tooling.** Create rules for all the read-only commands the agent is likely to use during development. If you have more reactive rules than the default 2 reactive pane slots, increase `reactive_panes` accordingly (e.g., `reactive_panes = 3` for 3 rules). Keep persistent panes to 1-2 to avoid crowding the screen.
-
-**Compact output is essential.** Side panes are small — roughly 80 columns wide and 15-20 rows tall. Commands must produce concise output that fits this space. Avoid `-o wide`, verbose flags, or commands that produce wide tables. Prefer narrow output formats: use `-o name`, column selection, `--no-headers`, or pipe through `awk`/`cut` to trim columns. If a command naturally produces many lines, add `| head -20` or similar limits.
-
-**Watch intervals**: when using `watch = true`, prefer longer intervals (10-30 seconds) unless the user needs near-real-time updates. Fast refresh (2-5 seconds) creates visual noise and unnecessary load.
+(The file used to configure "workspace modes" as well. Those were removed; a `[[modes]]` block is now ignored with a warning, so never propose one.)
 
 ## Your Task
 
 1. **Discover the project at `{dir}`.** Read its build/package files, task runners, scripts, and CI/CD configs to identify the real toolchain. Do NOT assume — derive everything from what's actually in the repo. Probe for:
    - **Build/package manifests**: `package.json`, `go.mod`, `pyproject.toml`, `Cargo.toml`, `pom.xml`, `Gemfile`, `build.gradle`, `Makefile`, etc.
    - **Task runners**: `Taskfile.yml`, `justfile`, `Makefile`, `package.json#scripts`, `pyproject.toml#tool.poe`, etc.
-   - **Reproducible-environment manifests**: `devbox.json`, `flake.nix`, `shell.nix`, `.nvmrc`, `pyproject.toml` (poetry), `environment.yml` (conda), `.tool-versions` (asdf), `.envrc` (direnv), etc. — these drive `init_command`.
+   - **Reproducible-environment manifests**: `devbox.json`, `flake.nix`, `shell.nix`, `.nvmrc`, `pyproject.toml` (poetry), `environment.yml` (conda), `.tool-versions` (asdf), `.envrc` (direnv), etc. — these often wrap how an agent CLI is launched (e.g. `devbox run …`), which matters for each role's `command`.
    - **Project-defined agent launchers**: any script, alias, or documented instruction in the repo that says how to launch an agent CLI (`claude`, `opencode`, `cursor-agent`, etc.). Look in script directories (`scripts/`), task runners (`package.json#scripts`, `Taskfile.yml`, `justfile`, `Makefile`), reproducible-env manifests' script sections, agent-specific configs (`.claude/`, `opencode.json`, `AGENTS.md`, `CLAUDE.md`), and `README`/`CONTRIBUTING`. **Record the full invocation form**, not the bare script name — these are not binaries on PATH, so the role's `command` must include the runner: `devbox run <script>`, `npm run <script>`, `task <recipe>`, `make <target>`, `just <recipe>`, etc. When present, every orchestration role's `command` should use one of these invocations.
    - **Project-defined slash commands the orchestrator can invoke**: agent CLIs like `claude` and `opencode` support custom slash commands and skills, typically kept in CLI-specific paths inside the repo (e.g. `.claude/skills/`, `.claude/commands/`, or the project's opencode config/skills location) or in the user's home (e.g. `~/.claude/skills/`). Discover the relevant paths for whichever CLI the orchestrator will invoke. Anything that looks like *coordination* — progress tracking, status reporting, release/PR automation, navigation between tasks — is a candidate the orchestrator can run *itself* between worker delegations rather than delegating. Reference relevant ones in the orchestrator's `prompt_template`. Skip if the orchestrator's CLI has no such concept or no relevant commands exist.
    - **Spec directories**: any directory the project uses to drive work (e.g. `specs/`, `prds/`, `rfcs/`, `proposals/`, `docs/adr/`). Reference these in worker `prompt_template`s — they're a common context source for delegations.
    - **CI/CD configs**: `.github/workflows/`, `.gitlab-ci.yml`, `Jenkinsfile`, `.circleci/`, etc. — show what gets validated on PRs.
    - **Infrastructure**: `Dockerfile`, `docker-compose.yml`, Helm charts, Terraform, etc.
 
-2. **Validate every command exists.** For every binary that appears in pane commands, rule patterns, or orchestration role `command`s, run `which <binary>` to confirm it is installed. Exclude any command whose binary is not on the PATH. If a useful tool is missing, mention it as a suggestion but do not include it in the config.
+2. **Validate every command exists.** For every binary that appears in an orchestration role's `command`, run `which <binary>` to confirm it is installed. Exclude any command whose binary is not on the PATH. If a useful tool is missing, mention it as a suggestion but do not include it in the config.
 
-3. **Propose** a `.dot-agent-deck.toml` with a **single mode** tailored to this project:
-   - Pick the most useful workflow for AI-assisted development.
-   - Choose persistent panes for commands developers run continuously (a `git diff --stat HEAD` or `git status -s` is often the right default for AI-paired work — surfaces in-flight changes).
-   - Choose reactive rules for read-only commands you'll likely execute during AI-assisted work.
-   - Use meaningful mode and pane names.
-   - Aim for about 3 side panes total (persistent + reactive combined).
-
-4. **Always propose an orchestration alongside the modes**, composed from the **Role Library** at the bottom of this prompt. Process:
+3. **Propose an orchestration**, composed from the **Role Library** at the bottom of this prompt. Process:
    - **Pick worker roles** from the library that fit this project's workflow. Common picks: `coder` + `reviewer` + `auditor`. **Include `auditor` by default** for any project with a code surface; drop it only when there is genuinely nothing to audit (a pure-docs or infra-manifest repo). **Include a `tester` role** when the project's contributor or agent-instruction files (`CONTRIBUTING.md`, `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, etc.) or test setup make tests mandatory or describe a test-first/TDD flow — and when you do, wire a tester→coder→tester RED/GREEN chain into the orchestrator's `prompt_template`: tester writes/extends a failing test and confirms RED; coder makes it pass with production code only (never editing the tester's tests); tester re-runs the same scoped test to confirm GREEN. Add `documenter` if the project has substantial docs, `researcher` for context-heavy codebases. Propose `release` by default whenever the project has release-flow signals: a release CI workflow, a release/PR slash command (e.g. a `/release`-style command), a `release` task in the task runner, or any push/merge/tag/publish automation. The user can drop it at the proposal step if they'd rather have the orchestrator handle release directly.
    - **Fill in each role's `command`** with the full invocation form of a project launcher (from step 1), matched by *semantic intent*, not just name. Example: a project that defines devbox scripts `agent-strong` (a stronger model), `agent-light` (a cheaper model), and `code-agent`/`review-agent`/`audit-agent` would yield `command = "devbox run agent-strong"` for the orchestrator (benefits from a stronger model), `command = "devbox run agent-light"` for the `release` worker (lighter, mostly runs commands), `command = "devbox run code-agent"` for `coder`, and so on — the runner (`devbox run`, `npm run`, `task`, etc.) is part of `command`, never stripped. **Do not mix**: if any project launcher is used for one role, every role should use one — extend the project's convention if a perfect match doesn't exist (reuse the closest fit) rather than falling back to a bare CLI for some roles. If the project has no launcher convention at all, fall back to a bare CLI that's on PATH (verify with `which claude`, `which opencode`, etc.). If multiple agent CLIs are present on PATH and there's no project signal pointing to one, ask the user during the proposal step rather than guessing.
    - **Tune each role's `prompt_template`**: start from the library's suggestion, then fill in project-specific details — the actual test command, the spec directory path, the release command name. Keep tuning minimal; the library text is already good for most cases. **Don't leave test/lint instructions vague:** the `coder`/`tester` templates should point the worker at the project's actual test/lint commands and any output-redirect or log-handling convention its contributor/agent-instruction files (`CONTRIBUTING.md`, `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, etc.) define. The worker runs in-repo with full tools and its own instruction files, so it can discover and confirm the current commands itself — name them if you already know them, as a starting hint rather than a frozen literal that goes stale if the project changes them.
    - **Compose the orchestrator's `prompt_template`** from the selected workers. Cover three things:
-     - **Workflow shape**: who runs first, what runs in parallel (e.g. reviewer + auditor in parallel after coder), where the user-validation gate sits. **Default to a pre-release human gate**: before delegating to `release`, the orchestrator summarizes what to validate end-to-end and STOPs for explicit user confirmation. This is the safe default for most projects — but it is a default, not a law: if the project's context or the user's stated workflow calls for autonomous release (e.g. trunk-based auto-merge, a solo maintainer who wants hands-off shipping), propose relaxing or dropping it at the proposal step (step 5). Reference any spec directory you discovered.
+     - **Workflow shape**: who runs first, what runs in parallel (e.g. reviewer + auditor in parallel after coder), where the user-validation gate sits. **Default to a pre-release human gate**: before delegating to `release`, the orchestrator summarizes what to validate end-to-end and STOPs for explicit user confirmation. This is the safe default for most projects — but it is a default, not a law: if the project's context or the user's stated workflow calls for autonomous release (e.g. trunk-based auto-merge, a solo maintainer who wants hands-off shipping), propose relaxing or dropping it at the proposal step (step 4). Reference any spec directory you discovered.
      - **Role boundary**: the orchestrator NEVER does *implementation, review, or audit* work — that's worker territory. It MAY run lightweight *coordination* slash commands the project provides (progress tracking, task navigation, status reporting) directly between delegations, without delegating, when those exist. Actions with side effects on shared state — push, merge, tag, publish — are better handled by a dedicated worker (typically `release`): `clear = false` lets it resume after a CI flake without restarting the whole flow, and a restricted-scope prompt prevents the agent from sliding into source edits when something goes wrong.
      - **Context-handoff rule** (see mandatory callout below).
    - Always include an orchestrator role with `start = true`. Validate: exactly one `start = true`, at least 2 roles, all role names unique and non-empty (no `..`, `/`, `\`), all commands non-empty.
@@ -112,15 +44,15 @@ Whitelist (safe to mirror): read-only inspection — `status`, `log`, `diff`, `s
 
    Lead the proposal with project-specific signals you discovered ("the repo defines an `<alias>` script, so I wired it into the `coder` role") rather than generic boilerplate. If genuinely no orchestration fits the project, say so explicitly — but the default is to propose one.
 
-5. **Present the full proposed config (modes + orchestration) to the user before writing it, with every pane, rule, and role numbered.** Numbering lets the user reference items concisely ("drop rule 2", "rename pane 1", "drop the auditor role"). Briefly explain why you chose each item. Make clear the orchestration is optional and can be dropped entirely while keeping the modes. Close with negative confirmation — e.g., "Tell me what to drop or change, otherwise I'll write the whole thing." Do NOT ask multiple-choice questions like "(a) modes-only or (b) include orchestration?" — those force an extra round-trip when the user could just say what to remove. Only write the file after the user confirms.
+4. **Present the full proposed config to the user before writing it, with every orchestration and role numbered.** Numbering lets the user reference items concisely ("drop role 3", "rename orchestration 1", "drop the auditor role"). Briefly explain why you chose each item. Close with negative confirmation — e.g., "Tell me what to drop or change, otherwise I'll write the whole thing." Do NOT ask multiple-choice questions like "(a) coder only or (b) coder plus reviewer?" — those force an extra round-trip when the user could just say what to remove. Only write the file after the user confirms.
 
-6. Write the approved config to `{dir}/.dot-agent-deck.toml`. If an orchestration was kept, include `[[orchestrations]]` alongside `[[modes]]` in the same file.
+5. Write the approved config to `{dir}/.dot-agent-deck.toml`.
 
-7. **After writing the file, tell the user the next steps:** "Config created! To use it, press Ctrl+d to leave this pane, then Ctrl+w and choose **Close** to close it, then Ctrl+n to create a new one. Select the same directory and choose your mode from the Mode field." (`Ctrl+w` only closes from command mode — while you are typing in the pane it is the ordinary delete-previous-word.)
+6. **After writing the file, tell the user the next steps:** "Config created! To use it, press Ctrl+d to leave this pane, then Ctrl+w and choose **Close** to close it, then Ctrl+n to create a new one. Select the same directory and choose your orchestration (`Orch: <name>`) from the Mode field." (`Ctrl+w` only closes from command mode — while you are typing in the pane it is the ordinary delete-previous-word.)
 
 ## Orchestrations
 
-Reference material for step 4. **Agent orchestrations** are multi-agent workflows where a designated orchestrator agent delegates tasks to worker agents.
+Reference material for step 3. **Agent orchestrations** are multi-agent workflows where a designated orchestrator agent delegates tasks to worker agents.
 
 ### Orchestration Config Format
 
@@ -135,7 +67,7 @@ name = "orchestration-name"   # e.g., "code-review", "tdd-cycle"
 name = "orchestrator"         # The orchestrator role — delegates work, never does it
 command = "claude"            # CLI command to launch the agent
 start = true                  # Exactly one role MUST have start = true
-prompt_template = """         # Composed from selected workers (see step 4)
+prompt_template = """         # Composed from selected workers (see step 3)
 You coordinate the team. You NEVER do work yourself — only delegate.
 [workflow shape: who runs first, what runs in parallel, gates]
 """
@@ -166,7 +98,7 @@ description = "Reviews code changes for correctness, style, and edge cases"
 - **`command`**: Use the full invocation form of a project launcher (discovered in step 1), matched by semantic intent — e.g. `command = "devbox run agent-strong"`, never just `"agent-strong"`, because devbox/npm/task scripts are not binaries on PATH. If the project has no launcher convention, fall back to a bare CLI that is on PATH; if multiple agent CLIs are available with no project signal, ask the user. Verify availability with `which <runner-or-binary>` before including it.
 - **One orchestration is the right answer for most projects.** Combine all relevant workers into it — the orchestrator routes each task to the right worker. Do NOT split a team across several orchestrations just because it has several kinds of worker.
 - **Propose more than one only when the project has genuinely different WORKFLOWS**, not different workers: a PRD/feature flow that needs a test-plan gate and a release step, versus a quick bug-fix flow that does not; or the same team wired to a second set of agent CLIs so contributors who only have one provider's credentials can still run it. If you propose several, name them for the workflow (`prd`, `issue`, `review`) or the provider (`anthropic`, `GPT`) — never `orchestration-1`.
-- **Never present orchestrations as an either/or menu.** Propose the whole set you think the project wants and let the user drop from it, the same way you present modes. A multiple-choice question costs a round-trip the user did not need.
+- **Never present orchestrations as an either/or menu.** Propose the whole set you think the project wants and let the user drop from it. A multiple-choice question costs a round-trip the user did not need.
 - **When you propose more than one, use `extends` rather than copying.** A block with `extends = "<other-name>"` inherits that orchestration's roles; its own `[[orchestrations.roles]]` entries then override them by role name, and anything they leave out keeps the parent's value. Provider variants are usually six `command` lines and nothing else. Copying the whole block instead guarantees the copies drift.
 - **When you propose more than one, put `default = true` on exactly one of them.** That is the one a SCHEDULED task opens, and a scheduled run has nobody to ask. It is not used by the `Ctrl+n` form or by a dispatcher agent, both of which list every orchestration and ask the user — so with a single orchestration the key is unnecessary; omit it.
 
@@ -219,7 +151,7 @@ description = "Audits code for security vulnerabilities and unsafe patterns"
 prompt_template = "Audit the change for security vulnerabilities. Report findings only."
 ```
 
-When proposing a `release` role, set `clear = false` on it so it can resume after a CI failure. The orchestrator's **pre-release human gate — the default specified in step 4** (summarize what to validate end-to-end and STOP for explicit user confirmation before delegating to `release`) — put it in the orchestrator's `prompt_template` once; do not also restate it inside `release`. What `release` itself adds is its two-phase shape: Phase 1 opens the PR via the project's release flow, then waits for CI and any automated PR review to settle, reports a findings summary (PR URL, per-check CI conclusions, review findings), and STOPS without merging; Phase 2 merges and closes the issue only when re-delegated with an explicit go-ahead. `release` never merges on its own initiative.
+When proposing a `release` role, set `clear = false` on it so it can resume after a CI failure. The orchestrator's **pre-release human gate — the default specified in step 3** (summarize what to validate end-to-end and STOP for explicit user confirmation before delegating to `release`) — put it in the orchestrator's `prompt_template` once; do not also restate it inside `release`. What `release` itself adds is its two-phase shape: Phase 1 opens the PR via the project's release flow, then waits for CI and any automated PR review to settle, reports a findings summary (PR URL, per-check CI conclusions, review findings), and STOPS without merging; Phase 2 merges and closes the issue only when re-delegated with an explicit go-ahead. `release` never merges on its own initiative.
 
 ## Role Library
 
@@ -230,7 +162,6 @@ The following generic roles are pre-defined. Pick from these when composing an o
 ## Quality Guidelines
 
 - **Discover, don't assume.** Only propose commands for tools the project actually uses.
-- **Focused output over broad output.** Persistent panes should show actionable, scoped information.
 - **Only use installed tools.** Every command in the config must work on this system right now.
-- **Fewer is better.** The user can always add more panes or roles later.
+- **Fewer is better.** The user can always add more roles later.
 - **Always propose an orchestration.** Drop only if no role from the library plausibly applies.

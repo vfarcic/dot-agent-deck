@@ -6,36 +6,30 @@ use std::process::ExitCode;
 use crate::project_config::CONFIG_FILE_NAME;
 
 const TEMPLATE: &str = r#"# dot-agent-deck project configuration
-# Defines workspace modes for the dot-agent-deck dashboard.
-# Each [[modes]] block creates a named layout with persistent panes
-# and reactive command-routing rules.
+# Defines an orchestration: a team of agents in one tab, where the start role
+# (the orchestrator) delegates work to the others with `dot-agent-deck delegate`.
+# Open it from the New Agent form (Ctrl+N) by picking "Orch: team" on the Mode
+# row. Run `dot-agent-deck validate` after editing.
 
-[[modes]]
-name = "dev"
+[[orchestrations]]
+name = "team"
+# default = true    # the orchestration a bare `dispatch` / scheduled run opens
 
-# Persistent panes run continuously alongside your agent session.
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude"
+start = true
+# agent = "claude"  # declare the agent when `command` is a launcher script
+prompt_template = """
+You coordinate the team. Break the user's request into tasks and delegate each
+one to the worker with `dot-agent-deck delegate`; do not implement it yourself.
+"""
 
-[[modes.panes]]
-command = "git log --oneline -20"
-name = "Recent Commits"
-
-# [[modes.panes]]
-# command = "cargo watch -x check"
-# name = "Compiler"
-
-# Rules route agent commands matching a regex to reactive side panes.
-#   pattern  — regex matched against commands the agent executes
-#   watch    — if true, re-run the command on an interval (default: false)
-#   interval — refresh interval in seconds (only when watch = true)
-
-[[modes.rules]]
-pattern = "cargo\\s+(build|test|check)"
-watch = false
-
-# [[modes.rules]]
-# pattern = "kubectl\\s+get"
-# watch = true
-# interval = 5
+[[orchestrations.roles]]
+name = "worker"
+command = "claude"
+description = "Implements the task it is given and reports back when done"
+# clear = true      # start each delegated task from a fresh session (default)
 "#;
 
 pub fn run_init(path: &Path) -> ExitCode {
@@ -73,4 +67,26 @@ pub fn run_init(path: &Path) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config_validation::validate_config;
+    use crate::project_config::ProjectConfig;
+
+    /// Issue #1199: the starter `init` writes is an orchestration (workspace
+    /// modes were removed), and it is a config `dot-agent-deck validate` has
+    /// nothing to say about — not even a warning.
+    #[test]
+    fn template_parses_and_validates_cleanly() {
+        let config: ProjectConfig = toml::from_str(TEMPLATE).expect("the init template parses");
+        assert!(!config.legacy_modes_declared);
+        assert_eq!(config.orchestrations.len(), 1);
+        let issues = validate_config(&config);
+        assert!(
+            issues.is_empty(),
+            "the init template must validate with no issues; got {issues:?}"
+        );
+    }
 }

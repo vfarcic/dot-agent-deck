@@ -95,7 +95,19 @@ impl std::error::Error for ProjectConfigError {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "RawProjectConfig")]
 pub struct ProjectConfig {
-    pub modes: Vec<ModeConfig>,
+    /// Issue #1199: the file declared a `[[modes]]` block. Workspace modes were
+    /// removed, and the block is now ignored rather than rejected — a hard error
+    /// would break every config written before the removal, and ignoring it
+    /// silently would leave the user wondering where their mode went. So the
+    /// parse layer accepts ANY `[[modes]]` shape (invalid regexes, zero reactive
+    /// panes, unknown keys) and records only that one was there; the surfaces a
+    /// user looks at — the New Agent form's status line and `dot-agent-deck
+    /// validate` — turn this into a warning.
+    ///
+    /// Deliberately not warned about inside [`load_project_config`]: the daemon
+    /// re-reads this file on every delegate and every scheduled spawn, so a
+    /// warning there would repeat for as long as the block stays in the file.
+    pub legacy_modes_declared: bool,
     pub orchestrations: Vec<OrchestrationConfig>,
     /// PRD #126: how long the daemon waits for a delegated worker to send
     /// `work-done` before injecting an idle prompt into the orchestrator's
@@ -120,7 +132,7 @@ pub struct ProjectConfig {
     ///   task, so it is treated as a misconfiguration rather than honored.
     ///
     /// ⚠️ TOML placement: this is a **top-level scalar**, so it must appear
-    /// *before* the first table header (`[[modes]]` / `[[orchestrations]]`).
+    /// *before* the first table header (`[[orchestrations]]`).
     /// Appended at the end of the file it would silently become a key of the
     /// last table and be ignored.
     pub worker_response_timeout_minutes: u64,
@@ -133,73 +145,6 @@ pub const DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES: u64 = 120;
 
 fn default_worker_response_timeout_minutes() -> u64 {
     DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ModeConfig {
-    pub name: String,
-    /// Issue #308: what agent this mode's **agent pane** runs, when the command
-    /// entered for it cannot reveal that by itself.
-    ///
-    /// The agent pane's command is typed in the new-pane form rather than
-    /// written here, so this key does not name a command — it answers the one
-    /// question the command may be unable to: `devbox run codex-big`,
-    /// `mise exec -- codex` or a bespoke `run-codex.sh` all resolve to a
-    /// *launcher* basename, and [`crate::event::AgentType::from_command`]
-    /// correctly refuses to guess what is behind it.
-    ///
-    /// Resolved by [`Self::declared_agent_type`] through
-    /// [`crate::agent_registry::resolve_declared_agent`] — the same rule
-    /// `wrap --agent` applies, so an unrecognized name yields the neutral
-    /// [`crate::event::AgentType::None`] rather than a guess. Absent (the
-    /// default, and every config written before this key existed) means "infer
-    /// from the command", i.e. exactly the previous behavior.
-    ///
-    /// Deliberately on `[[modes]]` and NOT on `[[modes.panes]]`: the persistent
-    /// side panes run tools, not agents, and never pass through the seam this
-    /// declaration steers.
-    #[serde(default)]
-    pub agent: Option<String>,
-    #[serde(default)]
-    pub init_command: Option<String>,
-    /// PRD #127 M3.1: a prompt auto-delivered to the mode's **agent** pane
-    /// once the agent signals readiness (gated like orchestrations), as
-    /// opposed to `init_command` which targets the side panes. Optional;
-    /// `None` (the default, and existing configs without it) delivers nothing.
-    /// This is the generic primitive the Phase-3 "schedule" creation mode
-    /// builds on — a `[[modes]]` entry that carries a `seed_prompt`.
-    #[serde(default)]
-    pub seed_prompt: Option<String>,
-    #[serde(default)]
-    pub panes: Vec<ModePersistentPane>,
-    #[serde(default)]
-    pub rules: Vec<ModeRule>,
-    #[serde(default = "default_reactive_panes")]
-    pub reactive_panes: usize,
-}
-
-fn default_reactive_panes() -> usize {
-    2
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ModePersistentPane {
-    pub command: String,
-    pub name: Option<String>,
-    #[serde(default = "default_pane_watch")]
-    pub watch: bool,
-}
-
-fn default_pane_watch() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ModeRule {
-    pub pattern: String,
-    #[serde(default)]
-    pub watch: bool,
-    pub interval: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,8 +326,12 @@ fn default_clear() -> bool {
 
 #[derive(Debug, Deserialize)]
 struct RawProjectConfig {
+    /// Issue #1199: kept only so a leftover `[[modes]]` block can be detected
+    /// and reported. `toml::Value` accepts any shape, so a block that the old
+    /// `ModeConfig` would have rejected still parses — the point is that the
+    /// removal never turns a config that loaded yesterday into a parse error.
     #[serde(default)]
-    modes: Vec<ModeConfig>,
+    modes: Option<toml::Value>,
     #[serde(default)]
     orchestrations: Vec<RawOrchestration>,
     #[serde(default = "default_worker_response_timeout_minutes")]
@@ -449,7 +398,7 @@ impl TryFrom<RawProjectConfig> for ProjectConfig {
 
     fn try_from(raw: RawProjectConfig) -> Result<Self, Self::Error> {
         Ok(ProjectConfig {
-            modes: raw.modes,
+            legacy_modes_declared: raw.modes.is_some(),
             orchestrations: resolve_orchestrations(&raw.orchestrations)?,
             worker_response_timeout_minutes: raw.worker_response_timeout_minutes,
         })
@@ -639,9 +588,8 @@ fn apply_role_patches(
 
 /// Issue #308: resolve a config-declared agent name to an [`AgentType`].
 ///
-/// The shared body behind [`OrchestrationRoleConfig::declared_agent_type`] and
-/// [`ModeConfig::declared_agent_type`], so both surfaces answer a given name
-/// identically — and, through
+/// The body behind [`OrchestrationRoleConfig::declared_agent_type`], which
+/// answers a given name identically — through
 /// [`crate::agent_registry::resolve_declared_agent`], identically to
 /// `wrap --agent <name>`.
 ///
@@ -697,27 +645,6 @@ impl OrchestrationRoleConfig {
     pub fn resolved_agent_type(&self) -> Option<AgentType> {
         self.declared_agent_type()
             .or_else(|| AgentType::from_command(Some(&self.command)))
-    }
-}
-
-impl ModeConfig {
-    /// This mode's DECLARED agent-pane type — see [`declared_agent_type`] for
-    /// what each of the three answers means. `None` when the mode declares
-    /// nothing.
-    pub fn declared_agent_type(&self) -> Option<AgentType> {
-        declared_agent_type(self.agent.as_deref())
-    }
-
-    /// What agent this mode's agent pane runs, given the `command` the user
-    /// entered for it: the declaration if the mode made one, otherwise the type
-    /// derived from that command.
-    ///
-    /// A mode's agent command is typed in the new-pane form rather than stored
-    /// in the config, so unlike [`OrchestrationRoleConfig::resolved_agent_type`]
-    /// this takes the command as an argument.
-    pub fn resolved_agent_type(&self, command: &str) -> Option<AgentType> {
-        self.declared_agent_type()
-            .or_else(|| AgentType::from_command(Some(command)))
     }
 }
 
@@ -1449,172 +1376,6 @@ agent = \"claude\"
     }
 
     #[test]
-    fn parse_valid_full_config() {
-        let toml = r#"
-[[modes]]
-name = "kubernetes-operations"
-shell_init = "devbox shell"
-
-[[modes.panes]]
-command = "kubectl get applications -n argocd -w"
-name = "ArgoCD Apps"
-
-[[modes.panes]]
-command = "kubectl get events -A -w"
-name = "Events"
-
-[[modes.rules]]
-pattern = "kubectl\\s+.*(describe|explain)"
-watch = false
-
-[[modes.rules]]
-pattern = "kubectl\\s+.*(get|top|logs)"
-watch = true
-interval = 2
-
-[[modes.rules]]
-pattern = "helm\\s+.*(status|list)"
-watch = false
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.modes.len(), 1);
-
-        let mode = &config.modes[0];
-        assert_eq!(mode.name, "kubernetes-operations");
-        assert_eq!(mode.panes.len(), 2);
-        assert_eq!(
-            mode.panes[0].command,
-            "kubectl get applications -n argocd -w"
-        );
-        assert_eq!(mode.panes[0].name.as_deref(), Some("ArgoCD Apps"));
-        assert_eq!(mode.panes[1].command, "kubectl get events -A -w");
-        assert_eq!(mode.panes[1].name.as_deref(), Some("Events"));
-        assert_eq!(mode.rules.len(), 3);
-        assert_eq!(mode.rules[0].pattern, "kubectl\\s+.*(describe|explain)");
-        assert!(!mode.rules[0].watch);
-        assert!(mode.rules[0].interval.is_none());
-        assert_eq!(mode.rules[1].pattern, "kubectl\\s+.*(get|top|logs)");
-        assert!(mode.rules[1].watch);
-        assert_eq!(mode.rules[1].interval, Some(2));
-        assert!(!mode.rules[2].watch);
-    }
-
-    #[test]
-    fn parse_minimal_config() {
-        let toml = r#"
-[[modes]]
-name = "minimal"
-
-[[modes.panes]]
-command = "echo hello"
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        let mode = &config.modes[0];
-        assert_eq!(mode.name, "minimal");
-        assert_eq!(mode.panes.len(), 1);
-        assert!(mode.rules.is_empty());
-    }
-
-    // PRD #127 M3.1 — `seed_prompt` is an optional mode field: present →
-    // parsed, absent → None (existing configs without it keep parsing).
-    #[test]
-    fn seed_prompt_parses_when_present() {
-        let toml = r#"
-[[modes]]
-name = "seeded"
-seed_prompt = "do the thing"
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.modes[0].seed_prompt.as_deref(), Some("do the thing"));
-    }
-
-    #[test]
-    fn seed_prompt_defaults_to_none_when_absent() {
-        let toml = r#"
-[[modes]]
-name = "plain"
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert!(config.modes[0].seed_prompt.is_none());
-    }
-
-    #[test]
-    fn watch_defaults_to_false() {
-        let toml = r#"
-[[modes]]
-name = "test"
-
-[[modes.rules]]
-pattern = "some pattern"
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        let rule = &config.modes[0].rules[0];
-        assert!(!rule.watch);
-        assert!(rule.interval.is_none());
-    }
-
-    #[test]
-    fn pane_watch_defaults_to_true() {
-        let toml = r#"
-[[modes]]
-name = "test"
-
-[[modes.panes]]
-command = "kubectl get pods"
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert!(config.modes[0].panes[0].watch);
-    }
-
-    #[test]
-    fn pane_watch_can_be_set_to_false() {
-        let toml = r#"
-[[modes]]
-name = "test"
-
-[[modes.panes]]
-command = "kubectl get pods -w"
-watch = false
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert!(!config.modes[0].panes[0].watch);
-    }
-
-    #[test]
-    fn pane_name_defaults_to_none() {
-        let toml = r#"
-[[modes]]
-name = "test"
-
-[[modes.panes]]
-command = "cargo test"
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert!(config.modes[0].panes[0].name.is_none());
-    }
-
-    #[test]
-    fn reactive_panes_defaults_to_two() {
-        let toml = r#"
-[[modes]]
-name = "test"
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.modes[0].reactive_panes, 2);
-    }
-
-    #[test]
-    fn reactive_panes_configurable() {
-        let toml = r#"
-[[modes]]
-name = "test"
-reactive_panes = 4
-"#;
-        let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.modes[0].reactive_panes, 4);
-    }
-
-    #[test]
     fn parse_full_orchestration_config() {
         let toml = r#"
 [[orchestrations]]
@@ -1657,7 +1418,7 @@ clear = false
     }
 
     #[test]
-    fn parse_orchestration_alongside_modes() {
+    fn legacy_modes_block_is_ignored_alongside_orchestrations() {
         let toml = r#"
 [[modes]]
 name = "dev"
@@ -1678,8 +1439,16 @@ name = "reviewer"
 command = "claude"
 "#;
         let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.modes.len(), 1);
-        assert_eq!(config.orchestrations.len(), 1);
+        assert!(
+            config.legacy_modes_declared,
+            "a leftover [[modes]] block must be recorded so the TUI and validate can warn"
+        );
+        assert_eq!(
+            config.orchestrations.len(),
+            1,
+            "issue #1199: the ignored [[modes]] block must not cost the file its orchestrations"
+        );
+        assert_eq!(config.orchestrations[0].name, "review");
     }
 
     #[test]
@@ -1892,8 +1661,10 @@ command = "claude"
         assert!(!config.orchestrations[0].roles[0].start);
     }
 
+    /// Issue #1199: a config that declares only workspace modes still loads —
+    /// warn and continue, never a parse error — and simply has nothing to open.
     #[test]
-    fn modes_only_config_still_works() {
+    fn legacy_modes_only_config_still_parses() {
         let toml = r#"
 [[modes]]
 name = "dev"
@@ -1902,8 +1673,41 @@ name = "dev"
 command = "echo hi"
 "#;
         let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.modes.len(), 1);
+        assert!(config.legacy_modes_declared);
         assert!(config.orchestrations.is_empty());
+    }
+
+    /// Issue #1199: the tolerance is for ANY `[[modes]]` shape, including ones the
+    /// removed `ModeConfig` would have rejected — an invalid rule regex, a rule
+    /// missing its required `pattern`, zero reactive panes, unknown keys. A block
+    /// that used to be a validate error must not become a parse error now.
+    #[test]
+    fn legacy_modes_block_of_any_shape_is_tolerated() {
+        let toml = r#"
+[[modes]]
+name = "broken"
+reactive_panes = 0
+not_a_real_key = [1, 2, 3]
+
+[[modes.rules]]
+pattern = 'kubectl\s+(unclosed'
+
+[[modes.rules]]
+watch = true
+
+[[orchestrations]]
+name = "kept"
+
+[[orchestrations.roles]]
+name = "a"
+command = "claude"
+start = true
+"#;
+        let config: ProjectConfig =
+            toml::from_str(toml).expect("a legacy [[modes]] block must parse");
+        assert!(config.legacy_modes_declared);
+        assert_eq!(config.orchestrations.len(), 1);
+        assert_eq!(config.orchestrations[0].name, "kept");
     }
 
     #[test]
@@ -1922,21 +1726,8 @@ name = "b"
 command = "claude"
 "#;
         let config: ProjectConfig = toml::from_str(toml).unwrap();
-        assert!(config.modes.is_empty());
+        assert!(!config.legacy_modes_declared);
         assert_eq!(config.orchestrations.len(), 1);
-    }
-
-    #[test]
-    fn missing_required_pattern_is_error() {
-        let toml = r#"
-[[modes]]
-name = "test"
-
-[[modes.rules]]
-watch = true
-"#;
-        let result: Result<ProjectConfig, _> = toml::from_str(toml);
-        assert!(result.is_err());
     }
 
     // ---- Issue #308: the config-declared agent type -------------------------
@@ -1957,11 +1748,6 @@ watch = true
             .into_iter()
             .next()
             .expect("one role")
-    }
-
-    fn mode_of(toml_src: &str) -> ModeConfig {
-        let config: ProjectConfig = toml::from_str(toml_src).expect("mode config parses");
-        config.modes.into_iter().next().expect("one mode")
     }
 
     fn role_with(agent_line: &str) -> OrchestrationRoleConfig {
@@ -2090,46 +1876,6 @@ agent = "codx"
                 "`agent = \"{name}\"` must resolve identically to `wrap --agent {name}`"
             );
         }
-    }
-
-    /// The mode surface carries the same key with the same rules — but on
-    /// `[[modes]]`, whose agent pane command is typed in the new-pane form, so
-    /// the resolution takes that command as an argument.
-    #[test]
-    fn declared_mode_agent_applies_to_the_typed_agent_pane_command() {
-        let declared = mode_of(
-            r#"
-[[modes]]
-name = "declared-codex-mode"
-agent = "codex"
-reactive_panes = 0
-"#,
-        );
-        assert_eq!(declared.declared_agent_type(), Some(AgentType::Codex));
-        assert_eq!(
-            declared.resolved_agent_type("devbox run codex-big"),
-            Some(AgentType::Codex),
-            "the declaration is what identifies a launcher the form typed in"
-        );
-
-        let plain = mode_of(
-            r#"
-[[modes]]
-name = "plain"
-reactive_panes = 0
-"#,
-        );
-        assert_eq!(plain.declared_agent_type(), None);
-        assert_eq!(
-            plain.resolved_agent_type("devbox run codex-big"),
-            None,
-            "an undeclared mode is unchanged: a launcher still resolves to nothing"
-        );
-        assert_eq!(
-            plain.resolved_agent_type("codex"),
-            Some(AgentType::Codex),
-            "…and an inferable command still derives"
-        );
     }
 
     /// Issue #308 follow-up: a `.dot-agent-deck.toml` that merely FAILS TO
