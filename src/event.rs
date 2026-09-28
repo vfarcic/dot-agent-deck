@@ -728,7 +728,8 @@ pub const WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE: &str = "1";
 /// The wrapper never reports a submitted prompt itself: its emitter hardcodes
 /// `user_prompt: None`. A wrapped Codex pane's prompt reports come from Codex's
 /// NATIVE `UserPromptSubmit` hook, which runs only once the wrapper has recorded
-/// trust for it (`crate::wrap`'s `codex_spawn_prep`). That step is best-effort,
+/// trust for it and while the user has not switched it off in Codex's `/hooks`
+/// browser (`crate::wrap`'s `codex_spawn_prep`). That step is best-effort,
 /// and it fails on an ordinary launcher configuration — `codex` reachable only
 /// inside `devbox run codex-big`, so the wrapper's own `codex app-server` is
 /// `NotFound`. The pane's only producer is then the wrapper, whose events still
