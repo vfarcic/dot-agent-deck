@@ -2323,10 +2323,16 @@ impl std::error::Error for SettingsWriteError {}
 /// [`Self::decks_saved`] is how the command knows to put the deck list that is
 /// now on disk into force and show it, and [`Self::public`] tells the user
 /// which half landed.
+///
+/// The other failure the window must answer by showing the disk is a
+/// **conflict** ([`Self::deck_list_conflict`]): a deck this save updates or
+/// removes is no longer the deck the window's list was loaded with, so nothing
+/// was written and the window's list is stale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaveFailure {
     error: SettingsWriteError,
     decks_saved: bool,
+    conflict: bool,
 }
 
 impl SaveFailure {
@@ -2334,6 +2340,31 @@ impl SaveFailure {
     /// (appearance, zoom, voice, the selection) did not.
     pub fn decks_saved(&self) -> bool {
         self.decks_saved
+    }
+
+    /// The deck list changed outside the app in a way this save's deck edits
+    /// cannot be applied to ([`crate::decks::ApplyError::Conflict`]), so
+    /// nothing was written — neither file.
+    pub fn deck_list_conflict(&self) -> bool {
+        self.conflict
+    }
+
+    fn conflict(remotes: &Path) -> Self {
+        Self {
+            error: SettingsWriteError {
+                detail: format!(
+                    "the deck list {} changed outside the app since the window loaded it: a deck \
+                     this save updates or removes is now a different deck, so nothing was saved",
+                    remotes.display()
+                ),
+                public: "The deck list changed outside the app, so nothing from this save was \
+                         applied. The settings are shown as they are on disk now; make the \
+                         change again."
+                    .to_string(),
+            },
+            decks_saved: false,
+            conflict: true,
+        }
     }
 
     /// The operator-facing message, including the path. Log this.
@@ -2367,6 +2398,7 @@ impl From<SettingsWriteError> for SaveFailure {
         Self {
             error,
             decks_saved: false,
+            conflict: false,
         }
     }
 }
@@ -3126,6 +3158,11 @@ pub fn save(
 ///   saved; the command then re-reads both files and shows and applies what
 ///   is on disk. Retrying is safe: re-sending the same deck edits against the
 ///   registry changes nothing a second time.
+/// - **A deck edit aimed at a row that is now a different deck** — a CLI
+///   `remote remove` and `remote add` under the same name, since the window
+///   loaded its list — is a [`SaveFailure::deck_list_conflict`]: nothing is
+///   written to either file, and the command shows what is on disk the same
+///   way ([`crate::decks::apply`] has the rule).
 pub(crate) fn save_at(
     path: &Path,
     remotes: &Path,
@@ -3152,7 +3189,10 @@ pub(crate) fn save_at(
             None => crate::decks::load_rows(remotes).map_err(deck_list_error)?,
         };
         let edits = crate::decks::edits(&base_rows, &next.remote);
-        crate::decks::apply(remotes, &edits).map_err(deck_list_error)?;
+        crate::decks::apply(remotes, &edits).map_err(|error| match error {
+            crate::decks::ApplyError::Config(error) => SaveFailure::from(deck_list_error(error)),
+            crate::decks::ApplyError::Conflict => SaveFailure::conflict(remotes),
+        })?;
         decks_saved = !edits.is_empty();
     }
     let mut written = save_to(
@@ -3160,7 +3200,11 @@ pub(crate) fn save_at(
         base.map(without_deck_rows).as_ref(),
         &without_deck_rows(settings),
     )
-    .map_err(|error| SaveFailure { error, decks_saved })?;
+    .map_err(|error| SaveFailure {
+        error,
+        decks_saved,
+        conflict: false,
+    })?;
     attach_deck_rows(&mut written, remotes);
     Ok(written)
 }
@@ -10084,6 +10128,45 @@ level = 1.0
         assert_eq!(written.appearance.mode, AppearanceMode::Dark);
     }
 
+    /// Issue #1350's review: the window loaded a CLI deck with no `id`; in a
+    /// terminal it was removed and a different deck added under the same name,
+    /// which answers to the same derived id. The window's stale removal of the
+    /// old deck is a conflict: neither file is written, the new deck stands,
+    /// and the failure asks the command to show what is on disk.
+    #[test]
+    fn a_stale_save_aimed_at_a_deck_re_added_under_its_name_is_a_conflict() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let remotes = dir.path().join("remotes.toml");
+        std::fs::write(&remotes, CLI_DECK).unwrap();
+        std::fs::write(&path, "version = 1\n\n[appearance]\nmode = \"light\"\n").unwrap();
+        let snapshot = load_snapshot_at(&path, &remotes);
+        assert_eq!(row_ids(&snapshot.settings), ["n-prod"]);
+
+        let replacement = CLI_DECK.replace("build.example.com", "replacement.example");
+        assert_ne!(replacement, CLI_DECK);
+        std::fs::write(&remotes, &replacement).unwrap();
+        let document_before = std::fs::read_to_string(&path).unwrap();
+
+        let mut edited = snapshot.settings.clone();
+        edited.appearance.mode = AppearanceMode::Dark;
+        edited.endpoints.as_mut().unwrap().remote.clear();
+        let failure = save_at(&path, &remotes, Some(&snapshot.settings), &edited).unwrap_err();
+
+        assert!(failure.deck_list_conflict());
+        assert!(!failure.decks_saved());
+        assert!(
+            failure
+                .public()
+                .starts_with("The deck list changed outside the app"),
+            "{}",
+            failure.public()
+        );
+        assert!(!failure.public().contains(&dir.path().display().to_string()));
+        assert_eq!(std::fs::read_to_string(&remotes).unwrap(), replacement);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), document_before);
+    }
+
     /// The same fault in a save that changed no deck is an ordinary failure:
     /// nothing was written, and the message does not claim otherwise.
     #[test]
@@ -10098,6 +10181,7 @@ level = 1.0
         edited.appearance.mode = AppearanceMode::Dark;
         let failure = save_at(&path, &remotes, Some(&snapshot.settings), &edited).unwrap_err();
         assert!(!failure.decks_saved());
+        assert!(!failure.deck_list_conflict());
         assert!(
             !failure.public().contains("deck list"),
             "{}",

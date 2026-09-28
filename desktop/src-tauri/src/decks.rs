@@ -193,6 +193,10 @@ fn apply_fields(
 }
 
 /// One change the user made to the deck list, as the registry receives it.
+///
+/// An update and a removal carry the row **as the base held it**, not just its
+/// id: the id alone does not say the row on disk is still that deck (see
+/// [`apply`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeckEdit {
     Add(RemoteEndpointSettings),
@@ -200,7 +204,47 @@ pub enum DeckEdit {
         before: RemoteEndpointSettings,
         after: RemoteEndpointSettings,
     },
-    Remove(EndpointId),
+    Remove(RemoteEndpointSettings),
+}
+
+/// Why [`apply`] published nothing.
+#[derive(Debug)]
+pub enum ApplyError {
+    /// The registry could not be read, locked, or written.
+    Config(RemoteConfigError),
+    /// A row an update or a removal was aimed at is, on disk, no longer the
+    /// deck the edit was made against — see [`apply`].
+    Conflict,
+}
+
+impl From<RemoteConfigError> for ApplyError {
+    fn from(error: RemoteConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(error) => error.fmt(f),
+            Self::Conflict => f.write_str(
+                "a deck this save changes or removes is no longer the deck it was made against",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ApplyError {}
+
+/// What an update or a removal checks the row on disk against: the address
+/// the base row reached — the same key [`deck_list::address_key`] computes for
+/// a registry row, so a row loaded by [`row_from_entry`] matches its entry.
+fn base_address(row: &RemoteEndpointSettings) -> (String, Option<String>, u16) {
+    (
+        row.host.as_str().to_ascii_lowercase(),
+        row.user.as_ref().map(|user| user.as_str().to_string()),
+        row.port.get(),
+    )
 }
 
 /// What changed between the rows an edit was made against (`base`) and the
@@ -220,7 +264,7 @@ pub fn edits(base: &[RemoteEndpointSettings], next: &[RemoteEndpointSettings]) -
     }
     for old in base {
         if !next.iter().any(|row| row.id == old.id) {
-            out.push(DeckEdit::Remove(old.id.clone()));
+            out.push(DeckEdit::Remove(old.clone()));
         }
     }
     out
@@ -241,9 +285,25 @@ pub fn edits(base: &[RemoteEndpointSettings], next: &[RemoteEndpointSettings]) -
 ///   remove`'s cleanup of a binary the CLI installed on the host; that is a
 ///   follow-up, and dropping the row is what `remote remove` itself does.
 ///
+/// # An id is not proof the row is still that deck
+///
+/// An update or a removal finds its row by id, then applies only if that row
+/// still reaches the address the **base** row did (host, login, port —
+/// [`base_address`]; for an update that is `before`'s, not the new values).
+/// A row without an `id` answers to one derived from its name, so a `remote
+/// remove prod` and `remote add prod <other host>` in a terminal hands the
+/// old deck's id to an unrelated one (issue #1350's review); a save made
+/// against the window's older list used to rewrite or delete that new deck.
+/// Now any mismatch is [`ApplyError::Conflict`] and **nothing** from the save
+/// is published — the batch is one transaction already — so the caller can
+/// show the list as it is and let the user make the change again. A row
+/// whose address was edited elsewhere (a hand edit, another window) reads the
+/// same way; refusing that too is the price of not guessing which deck the
+/// user meant.
+///
 /// No edits touch nothing — not even the lock — so a save that changed only
 /// the theme never waits on a `remote add` in a terminal.
-pub fn apply(path: &Path, edits: &[DeckEdit]) -> Result<(), RemoteConfigError> {
+pub fn apply(path: &Path, edits: &[DeckEdit]) -> Result<(), ApplyError> {
     if edits.is_empty() {
         return Ok(());
     }
@@ -255,6 +315,14 @@ pub fn apply(path: &Path, edits: &[DeckEdit]) -> Result<(), RemoteConfigError> {
                     .iter()
                     .position(|entry| DeckRef::Id(id.as_str()).matches(entry))
             };
+            // The row `base` was made against, if it is still there — and a
+            // conflict if its id now names a different deck.
+            let target = |base: &RemoteEndpointSettings| match position(&base.id) {
+                Some(index) if deck_list::address_key(&entries[index]) != base_address(base) => {
+                    Err(ApplyError::Conflict)
+                }
+                found => Ok(found),
+            };
             match edit {
                 DeckEdit::Add(row) => match position(&row.id) {
                     Some(index) => {
@@ -265,7 +333,7 @@ pub fn apply(path: &Path, edits: &[DeckEdit]) -> Result<(), RemoteConfigError> {
                     None => document.push(&new_entry(row, &entries))?,
                 },
                 DeckEdit::Update { before, after } => {
-                    if let Some(index) = position(&after.id) {
+                    if let Some(index) = target(before)? {
                         let mut entry = entries[index].clone();
                         apply_fields(&mut entry, Some(before), after);
                         if entry != entries[index] {
@@ -273,8 +341,8 @@ pub fn apply(path: &Path, edits: &[DeckEdit]) -> Result<(), RemoteConfigError> {
                         }
                     }
                 }
-                DeckEdit::Remove(id) => {
-                    if let Some(index) = position(id) {
+                DeckEdit::Remove(base) => {
+                    if let Some(index) = target(base)? {
                         document.remove(index);
                     }
                 }
@@ -631,10 +699,10 @@ mod tests {
     fn an_update_writes_only_the_fields_the_user_changed() {
         let (_dir, path) = registry(CLI_ROW);
         let before = load_rows(&path).unwrap().remove(0);
-        // Another writer upgrades the deck and moves its port.
+        // Another writer upgrades the deck and sets its socket.
         deck_list::update(&path, DeckRef::Name("prod"), |entry| {
             entry.version = "0.43.0".to_string();
-            entry.port = 2200;
+            entry.socket = Some("/run/user/1000/other.sock".to_string());
         })
         .unwrap();
 
@@ -650,16 +718,120 @@ mod tests {
         .unwrap();
 
         let entry = &RemotesFile::load(&path).unwrap().remotes[0];
-        assert_eq!(entry.port, 2200, "the other writer's port stands");
+        assert_eq!(
+            entry.socket.as_deref(),
+            Some("/run/user/1000/other.sock"),
+            "the other writer's socket stands"
+        );
         assert_eq!(entry.version, "0.43.0");
         assert_eq!(entry.jump_host.as_deref(), Some("bastion"));
         assert_eq!(entry.host, "dev@build.example.com");
     }
 
+    /// Issue #1350's review: a CLI deck with no `id` answers to one derived
+    /// from its name, so `remote remove prod` then `remote add prod` for a
+    /// different host hands the old deck's id to the new one. A save made
+    /// against the window's older list — an update, a removal, or both next to
+    /// an unrelated add — must leave the new deck alone and publish nothing.
+    #[test]
+    fn a_stale_save_leaves_a_deck_re_added_under_the_same_name_alone() {
+        let (_dir, path) = registry(CLI_ROW);
+        let loaded = load_rows(&path).unwrap();
+        let old = loaded[0].clone();
+        assert_eq!(old.id.as_str(), "n-prod");
+
+        deck_list::remove(&path, DeckRef::Name("prod")).unwrap();
+        deck_list::add(
+            &path,
+            RemoteEntry {
+                name: "prod".to_string(),
+                kind: "ssh".to_string(),
+                host: "ops@replacement.example".to_string(),
+                port: 22,
+                key: None,
+                version: "0.43.0".to_string(),
+                added_at: "2026-09-02T00:00:00Z".to_string(),
+                upgraded_at: None,
+                last_connected: None,
+                id: None,
+                user: None,
+                jump_host: None,
+                socket: None,
+            },
+        )
+        .unwrap();
+        let replaced = std::fs::read_to_string(&path).unwrap();
+
+        let mut moved = old.clone();
+        moved.jump = Some(HostAlias::parse("bastion").unwrap());
+        moved.port = SshPort::parse(2200).unwrap();
+        for stale in [
+            vec![DeckEdit::Update {
+                before: old.clone(),
+                after: moved,
+            }],
+            vec![DeckEdit::Remove(old.clone())],
+            vec![
+                DeckEdit::Add(row("fedcba9876543210", "new.example")),
+                DeckEdit::Remove(old.clone()),
+            ],
+        ] {
+            let result = apply(&path, &stale);
+            assert!(matches!(result, Err(ApplyError::Conflict)), "{result:?}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                replaced,
+                "the stale save changed the file: {stale:?}"
+            );
+        }
+        let rows = load_rows(&path).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].host.as_str(), "replacement.example");
+    }
+
+    /// The same check reads a deck whose address another writer moved as a
+    /// conflict: an edit of it made against the old address is not applied.
+    #[test]
+    fn an_update_against_an_address_moved_elsewhere_is_a_conflict() {
+        let (_dir, path) = registry(CLI_ROW);
+        let before = load_rows(&path).unwrap().remove(0);
+        deck_list::update(&path, DeckRef::Name("prod"), |entry| entry.port = 2200).unwrap();
+        let moved = std::fs::read_to_string(&path).unwrap();
+        let mut after = before.clone();
+        after.jump = Some(HostAlias::parse("bastion").unwrap());
+        assert!(matches!(
+            apply(&path, &[DeckEdit::Update { before, after }]),
+            Err(ApplyError::Conflict)
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), moved);
+    }
+
+    /// An update that itself changes the address is matched on the address it
+    /// was made against, and lands.
+    #[test]
+    fn an_address_edit_matches_on_the_base_address() {
+        let (_dir, path) = registry(CLI_ROW);
+        let before = load_rows(&path).unwrap().remove(0);
+        let mut after = before.clone();
+        after.host = Hostname::parse("Moved.Example").unwrap();
+        after.user = Some(SshUser::parse("ops").unwrap());
+        after.port = SshPort::DEFAULT;
+        apply(
+            &path,
+            &[DeckEdit::Update {
+                before,
+                after: after.clone(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(load_rows(&path).unwrap(), [after]);
+    }
+
     /// Issue #1350's review: one save's deck edits are one transaction. The
     /// second edit here is refused — another writer hand-edited the deck's host
-    /// into one ssh would misread, and changing its login rewrites that host —
-    /// so the first edit, an add, must not be published either.
+    /// (into one ssh would misread), so the row is no longer at the address the
+    /// update was made against — and the first edit, an add, must not be
+    /// published either.
     #[test]
     fn a_batch_whose_later_edit_fails_publishes_none_of_it() {
         let (_dir, path) = registry(CLI_ROW);
@@ -678,10 +850,7 @@ mod tests {
                 DeckEdit::Update { before, after },
             ],
         );
-        assert!(
-            matches!(result, Err(RemoteConfigError::InvalidAddress { .. })),
-            "{result:?}"
-        );
+        assert!(matches!(result, Err(ApplyError::Conflict)), "{result:?}");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             hand_edited,
@@ -704,7 +873,7 @@ mod tests {
                     before: prod,
                     after: moved,
                 },
-                DeckEdit::Remove(EndpointId::parse("aaaa").unwrap()),
+                DeckEdit::Remove(row("aaaa", "a.example")),
             ],
         )
         .unwrap();
@@ -730,7 +899,7 @@ mod tests {
                     after: b2
                 },
                 DeckEdit::Add(c),
-                DeckEdit::Remove(a.id),
+                DeckEdit::Remove(a),
             ]
         );
     }
@@ -739,11 +908,8 @@ mod tests {
     fn removing_a_deck_drops_only_that_row() {
         let (_dir, path) = registry(CLI_ROW);
         apply(&path, &[DeckEdit::Add(row("abcd", "other.example"))]).unwrap();
-        apply(
-            &path,
-            &[DeckEdit::Remove(EndpointId::parse("n-prod").unwrap())],
-        )
-        .unwrap();
+        let prod = load_rows(&path).unwrap().remove(0);
+        apply(&path, &[DeckEdit::Remove(prod)]).unwrap();
         let ids: Vec<_> = load_rows(&path)
             .unwrap()
             .into_iter()

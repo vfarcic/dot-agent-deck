@@ -11,6 +11,11 @@ import type { DesktopSettingsDto } from "./bridge";
  * `src-tauri/src/dto.rs`): `message` says which half was saved, and `written`
  * is the settings re-read from disk, so the window can show what is actually
  * there rather than either the edit it asked for or the document it had.
+ *
+ * A save refused because the deck list changed outside the app — a deck it
+ * updates or removes is now a different deck, e.g. a CLI `remote remove` and
+ * `remote add` under the same name — wrote nothing and rejects the same way,
+ * since the window's list is just as stale.
  */
 export class PartialSettingsSaveError extends Error {
   /** The settings as both files hold them after the failure, normalised. */

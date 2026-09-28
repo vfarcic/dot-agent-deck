@@ -740,7 +740,10 @@ pub enum DesktopActionError {
 /// `remotes.toml`: that rejects with `{ message, written }`, where `written` is
 /// the settings as both files now hold them, so the webview can show what is
 /// actually on disk instead of either the edit it asked for or the document it
-/// had before. `desktop/src/lib/settingsError.ts` is the webview's half.
+/// had before. A save refused because the deck list changed outside the app
+/// (`SaveFailure::deck_list_conflict`) wrote nothing and rejects the same way,
+/// for the same reason: the window's copy is stale.
+/// `desktop/src/lib/settingsError.ts` is the webview's half.
 ///
 /// Serialize-only, like [`DesktopActionError`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -750,8 +753,8 @@ pub enum DesktopSettingsSaveError {
     Partial(DesktopPartialSettingsSave),
 }
 
-/// A save whose deck edits landed and whose `desktop.toml` write did not — see
-/// [`DesktopSettingsSaveError`].
+/// A save whose deck edits landed and whose `desktop.toml` write did not, or
+/// one refused as a deck-list conflict — see [`DesktopSettingsSaveError`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopPartialSettingsSave {

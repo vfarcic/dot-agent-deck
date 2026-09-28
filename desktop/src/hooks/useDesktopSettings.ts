@@ -233,7 +233,9 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
         })
         .catch((cause: unknown) => {
           // Issue #1350's review: the deck edits reached the shared deck list
-          // and `desktop.toml` did not. Unlike a failure that wrote nothing,
+          // and `desktop.toml` did not — or the deck list changed outside the
+          // app, so nothing was written and this window's list is stale.
+          // Unlike a failure that leaves the screen's copy valid,
           // the screen is replaced with what is now on disk — the saved decks
           // and the unsaved rest as it was — so it shows reality rather than a
           // mix no file holds. That document is the base from here on, so the

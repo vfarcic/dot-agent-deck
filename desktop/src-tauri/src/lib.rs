@@ -2381,8 +2381,11 @@ async fn desktop_get_settings(
 /// that fails after the deck edits landed rejects with
 /// [`crate::dto::DesktopSettingsSaveError::Partial`]: a message naming which
 /// half was saved, plus the settings re-read from disk, whose deck list is also
-/// put into force here. Every other failure rejects with a plain string, as
-/// before.
+/// put into force here. A save whose deck edits were aimed at a deck that
+/// changed outside the app (a CLI remove and re-add under the same name) wrote
+/// nothing, and rejects the same way — the window's list is stale, so it is
+/// replaced with the one on disk. Every other failure rejects with a plain
+/// string, as before.
 ///
 /// # The accepted strings are length-bounded
 ///
@@ -2431,14 +2434,15 @@ async fn desktop_set_settings(
     // gets the sanitized half, the way connection errors already do.
     eprintln!("{}", failure.detail());
     let message = safe_message(failure.public());
-    if !failure.decks_saved() {
+    if !failure.decks_saved() && !failure.deck_list_conflict() {
         return Err(message.into());
     }
     // Issue #1350's review: the deck edits reached `remotes.toml` and
-    // `desktop.toml` did not, so neither the edit nor the old document is what
-    // is on disk. Re-read both, put that deck list into force — so a removed
-    // deck's tunnel closes and an added one is watched — and hand it to the
-    // window with the error, so it shows what was actually saved.
+    // `desktop.toml` did not — or the deck list changed outside the app so the
+    // edits could not be applied — so neither the edit nor the window's copy
+    // is what is on disk. Re-read both, put that deck list into force — so a
+    // removed deck's tunnel closes and an added one is watched — and hand it to
+    // the window with the error, so it shows what is actually there.
     let Ok(disk) =
         tauri::async_runtime::spawn_blocking(|| crate::settings::load_snapshot().settings).await
     else {
