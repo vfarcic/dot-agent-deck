@@ -212,7 +212,7 @@ The reports above cover a worker that *might* be in trouble. Four more cover a d
 | `⚠ delegated worker respawn failed` | A `clear = true` delegation could not start a replacement worker at all — usually because the role's `command` cannot be started. The task was not delivered. | Notify you, reassign, or re-delegate — noting that re-delegating to that role fails the same way until its configuration is fixed. |
 | `⚠ delegated worker blocked by a provider usage limit` | A worker that owes a `work-done` reports that its provider's usage limit or credit pool ran out. Sent once per delegation. | Check the worker's card: reassign or notify you if it still shows Blocked, keep waiting if it is working again. See [Session management](session-management.md) for which agents report Blocked. |
 
-Each names only the worker's pane, never the role or any other value from your project; the daemon log line next to it names the role and, where there is one, the underlying error. What to do when you see one yourself is under [A delegated worker never came up](orchestration.md#a-delegated-worker-never-came-up).
+Each names the worker by its pane, never by its role. The pane id can include the orchestration's name from your project configuration, in a sanitised form ([#1380](https://github.com/vfarcic/dot-agent-deck/issues/1380) tracks that). The daemon log line next to it names the role and, where there is one, the underlying error. What to do when you see one yourself is under [A delegated worker never came up](orchestration.md#a-delegated-worker-never-came-up).
 
 ## Part 2 — An example recipe: turning those moments into messages
 
