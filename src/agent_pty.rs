@@ -4618,8 +4618,8 @@ struct RegistryInner {
     /// which is bounded by the panes a person or a schedule actually opens, and
     /// pruning it is exactly the operation that would re-open the window.
     hook_token_panes: HashSet<String>,
-    /// Issue #320 — per pane id, the agent ids of the generations this registry
-    /// has PUBLISHED on it, oldest first, at most [`PANE_GENERATIONS_KEPT`].
+    /// Issue #320 — per pane id, the agent ids of every generation this
+    /// registry has PUBLISHED on it.
     ///
     /// [`AgentPtyRegistry::pane_generation_verdict`] reads it to tell a frame
     /// from a generation that has been REPLACED on its pane — which must
@@ -4633,13 +4633,17 @@ struct RegistryInner {
     ///
     /// Appended under the same lock acquisition as the `agents.insert` that
     /// publishes the generation, so no frame can observe a published generation
-    /// the history does not yet name. Never pruned by pane — like
-    /// `hook_token_panes` it grows with the distinct pane ids a daemon spawns —
-    /// but capped per pane, so a pane respawned without end costs a bounded
-    /// amount. A generation evicted by the cap is merely forgotten: its frames
-    /// get no verdict and fall back to the rule they were ordered by before
-    /// this existed.
-    pane_generations: HashMap<String, VecDeque<String>>,
+    /// this does not yet name.
+    ///
+    /// Never pruned, for the reason `hook_token_panes` is not: forgetting an id
+    /// is exactly what would let that generation's late frame fall back to the
+    /// type-and-timestamp rule this replaces, and nothing bounds how late a
+    /// frame can be (a per-pane cap did exactly that; Qodo on PR #1389). It
+    /// grows by one registry-minted id per published spawn that names a pane —
+    /// a short decimal string, since `next_id` only ever increments — for the
+    /// life of the daemon, which is the same growth class as
+    /// `AppState::agent_generation_closures`.
+    pane_generations: HashMap<String, HashSet<String>>,
     /// Issue #454: spawns that have been ADMITTED but whose `RunningAgent` is
     /// not in `agents` yet — keyed by the pre-allocated agent id, valued by the
     /// spawn's validated `pane_id_env` (`None` for a paneless agent).
@@ -4953,13 +4957,6 @@ impl crate::state::AgentOwnership for AgentPtyRegistry {
         AgentPtyRegistry::pane_generation_verdict(self, pane_id, agent_id)
     }
 }
-
-/// Issue #320: how many published generations
-/// `RegistryInner::pane_generations` remembers per pane. A generation this
-/// many respawns in the past whose frame is only now arriving has been late
-/// for far longer than any hook delivery takes; evicting it costs only its
-/// verdict, never a card.
-const PANE_GENERATIONS_KEPT: usize = 32;
 
 impl AgentPtyRegistry {
     pub fn new() -> Self {
@@ -7636,11 +7633,11 @@ impl AgentPtyRegistry {
         // under the same lock acquisition that publishes it. See
         // `RegistryInner::pane_generations`.
         if let Some(pane) = pane_for_history {
-            let history = inner.pane_generations.entry(pane).or_default();
-            history.push_back(id.clone());
-            while history.len() > PANE_GENERATIONS_KEPT {
-                history.pop_front();
-            }
+            inner
+                .pane_generations
+                .entry(pane)
+                .or_default()
+                .insert(id.clone());
         }
         inner.agents.insert(id.clone(), agent);
         // Signal *after* releasing the lock would be cleaner, but we still
@@ -10468,7 +10465,7 @@ impl AgentPtyRegistry {
         } else if inner
             .pane_generations
             .get(pane_id)
-            .is_some_and(|history| history.iter().any(|id| id == agent_id))
+            .is_some_and(|history| history.contains(agent_id))
         {
             Some(GenerationVerdict::Displaced)
         } else {
@@ -13260,6 +13257,51 @@ mod spawn_tests {
         registry.generation_ownership(pane_id, agent_id) == Ownership::Owned
     }
 
+    /// Issue #320 (Qodo, PR #1389): the registry never forgets a generation it
+    /// published on a pane, however many have followed it. A history capped
+    /// per pane let a late frame from a generation evicted by the cap fall back
+    /// to the type-and-timestamp rule it exists to replace.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pane_remembers_every_generation_it_published() {
+        use crate::event::GenerationVerdict;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let pane = "many-generations-pane-320";
+        let mut published = Vec::new();
+        for _ in 0..34 {
+            let id = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/usr/bin/true"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn a short-lived generation onto the pane");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while registry.live_count() != 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "generation {id} never exited"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            published.push(id);
+        }
+        let (current, earlier) = published.split_last().expect("published generations");
+        assert_eq!(
+            registry.pane_generation_verdict(pane, current),
+            Some(GenerationVerdict::Current)
+        );
+        for id in earlier {
+            assert_eq!(
+                registry.pane_generation_verdict(pane, id),
+                Some(GenerationVerdict::Displaced),
+                "generation {id}, published on this pane before {current}, must still be \
+                 known as displaced"
+            );
+        }
+        registry.shutdown_all();
+    }
+
     /// Issue #320: a spawn reserving the pane is its CURRENT generation, a
     /// generation published there earlier is displaced by it, and only an id
     /// the registry published on the pane is ever called displaced. Planted
@@ -13276,7 +13318,7 @@ mod spawn_tests {
                 .pane_generations
                 .entry(pane.to_string())
                 .or_default()
-                .push_back("11".to_string());
+                .insert("11".to_string());
             inner
                 .pending_spawns
                 .insert("12".to_string(), Some(pane.to_string()));
