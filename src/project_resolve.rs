@@ -743,33 +743,93 @@ where
 /// **Ten seconds**, below the desktop's 15 s per-call bound, so a deck that
 /// advertises [`crate::daemon_protocol::CAP_PREPARE_DEADLINE`] answers before a
 /// client that bounds the call gives up on it. The bound covers the wait for a
-/// [`MAX_CONCURRENT_PROJECT_READS`] permit ([`run_bounded_until`]) and the work
+/// [`MAX_CONCURRENT_PROJECT_READS`] permit ([`run_bounded_answer`]) and the work
 /// itself ([`prepare_orchestration_before`]), and an expired preparation is
 /// **withdrawn** rather than merely answered late: no context file stays, no
-/// token is issued and the compatibility mirror is not touched. That is the
+/// token stays live and the compatibility mirror is not touched. That is the
 /// property a client-side timeout alone could not give, because dropping the
 /// client's future stops none of the daemon's work.
 ///
-/// What it does not bound: a blocking filesystem call that itself never
-/// returns. The daemon answers when the blocking work finishes, and checks the
-/// deadline again then, so such a preparation is still refused and withdrawn —
-/// just not by the deadline — and a client that bounds the call has given up on
-/// it before that.
+/// **The reply is bounded too, including when a blocking call stalls**
+/// (issue #1233 audit). [`run_bounded_answer`] answers "expired" at the
+/// deadline whether or not the blocking work has returned, and the
+/// [`ReplyLatch`] makes that answer binding on the work: a preparation that
+/// finishes afterwards finds the latch abandoned at its last gate, revokes its
+/// token and withdraws its file. A blocking call that never returns is still
+/// not *interrupted* — a blocking thread cannot be cancelled — so it holds its
+/// permit and thread until it does; it just can no longer delay the answer or
+/// leave anything usable behind when it finishes.
 pub const PREPARE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// [`run_bounded`], but waiting for the permit only until `deadline`: `None`
-/// when the deadline passed first, in which case `f` never ran (issue #1233
-/// item 4).
+/// Who decides whether a preparation is answered — the blocking work or the
+/// reply that gave up waiting for it — so that exactly one of them does
+/// (issue #1233 audit).
 ///
-/// Only the permit wait is bounded here. Once a permit is held the blocking work
-/// runs to completion — a blocking thread cannot be cancelled — which is why the
-/// work checks the same deadline itself ([`prepare_orchestration_before`]).
-pub async fn run_bounded_until<T, F>(
+/// The work calls [`ReplyLatch::commit`] at its last gate, after every side
+/// effect but the post-reply mirror; the reply calls [`ReplyLatch::abandon`]
+/// when its deadline fires first. Whichever gets there first wins, and the
+/// other learns it: a work that cannot commit withdraws everything it did, and
+/// a reply that cannot abandon waits for the answer the work is about to send
+/// (nothing blocking stands between a commit and that send).
+#[derive(Debug, Default)]
+pub struct ReplyLatch(std::sync::Mutex<LatchState>);
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum LatchState {
+    #[default]
+    Open,
+    Committed,
+    Abandoned,
+}
+
+impl ReplyLatch {
+    /// Claim the answer for the work: `false` once the reply has abandoned it.
+    pub fn commit(&self) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match *state {
+            LatchState::Open | LatchState::Committed => {
+                *state = LatchState::Committed;
+                true
+            }
+            LatchState::Abandoned => false,
+        }
+    }
+
+    /// Give up on the work: `false` once it has committed.
+    pub fn abandon(&self) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match *state {
+            LatchState::Open | LatchState::Abandoned => {
+                *state = LatchState::Abandoned;
+                true
+            }
+            LatchState::Committed => false,
+        }
+    }
+}
+
+/// Work to run after the answer has been handed over, on the same blocking
+/// thread and under the same permit — issue #1233's compatibility mirror.
+pub type AfterReply = Box<dyn FnOnce() + Send>;
+
+/// [`run_bounded`] under a `deadline` that bounds the **answer**, not only the
+/// permit wait (issue #1233 item 4 and its audit).
+///
+/// * `None` when the deadline passed before an answer: either no permit freed
+///   up (`f` never ran), or `f` had not answered and the [`ReplyLatch`] was
+///   abandoned — so `f`'s own last gate refuses and withdraws.
+/// * `f` returns its answer and, optionally, work to run **after** the answer
+///   has gone: that work cannot delay the reply, and it only exists for an
+///   answer `f` committed.
+///
+/// A blocking thread cannot be cancelled, so a stalled `f` keeps its thread and
+/// permit until it returns; what it cannot do is hold the reply.
+pub async fn run_bounded_answer<T, F>(
     deadline: tokio::time::Instant,
     f: F,
 ) -> Result<Option<T>, ProjectResolveError>
 where
-    F: FnOnce() -> T + Send + 'static,
+    F: FnOnce(&ReplyLatch) -> (T, Option<AfterReply>) + Send + 'static,
     T: Send + 'static,
 {
     let permit =
@@ -777,13 +837,29 @@ where
             Err(_elapsed) => return Ok(None),
             Ok(permit) => permit.map_err(|_| ProjectResolveError::Internal)?,
         };
-    tokio::task::spawn_blocking(move || {
+    let latch = Arc::new(ReplyLatch::default());
+    let work_latch = Arc::clone(&latch);
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    // Detached: the answer arrives over `rx`, and what runs after it is not
+    // this reply's business.
+    drop(tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        f()
-    })
-    .await
-    .map(Some)
-    .map_err(|_| ProjectResolveError::Internal)
+        let (answer, after) = f(&work_latch);
+        let _ = tx.send(answer);
+        if let Some(after) = after {
+            after();
+        }
+    }));
+    match tokio::time::timeout_at(deadline, &mut rx).await {
+        Ok(answer) => answer.map(Some).map_err(|_| ProjectResolveError::Internal),
+        Err(_elapsed) if latch.abandon() => Ok(None),
+        // The work committed just before the deadline fired; its answer is
+        // already on its way.
+        Err(_elapsed) => rx
+            .await
+            .map(Some)
+            .map_err(|_| ProjectResolveError::Internal),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,8 +1168,9 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
 /// detail is logged daemon-locally on every failure, whichever refusal goes
 /// back.
 ///
-/// Under no deadline; the daemon's verb calls [`prepare_orchestration_before`]
-/// with [`PREPARE_DEADLINE`].
+/// Under no deadline, and with the compatibility mirror written before this
+/// returns; the daemon's verb calls [`prepare_orchestration_before`] with
+/// [`PREPARE_DEADLINE`] and writes the mirror after its reply.
 pub fn prepare_orchestration_for_wire(
     path: &str,
     orchestration: &str,
@@ -1101,7 +1178,7 @@ pub fn prepare_orchestration_for_wire(
     expected_revision: Option<&str>,
     seeds: &[ProjectCandidate],
 ) -> Result<crate::event::PreparedOrchestration, String> {
-    prepare_orchestration_before(
+    let prepared = prepare_orchestration_before(
         path,
         orchestration,
         task,
@@ -1109,22 +1186,56 @@ pub fn prepare_orchestration_for_wire(
         seeds,
         None,
         &std::time::Instant::now,
-    )
+        None,
+    )?;
+    let (answer, mirror) = prepared.into_parts();
+    mirror.write();
+    Ok(answer)
 }
 
-/// [`prepare_orchestration_for_wire`] under a `deadline`, read through `now`
-/// (issue #1233 item 4).
+/// A preparation that passed every gate: the answer, and the compatibility
+/// mirror write still owed for it (issue #1233 audit).
 ///
-/// The deadline is checked three times: on entry, immediately before the
-/// publish, and immediately after it. Expired before the publish, nothing is
+/// The mirror is handed back rather than written so the caller can answer
+/// first — see [`crate::orchestrator_context::PendingMirror`]. Only a
+/// preparation that will be answered ever produces one.
+#[derive(Debug)]
+pub struct Prepared {
+    answer: crate::event::PreparedOrchestration,
+    mirror: crate::orchestrator_context::PendingMirror,
+}
+
+impl Prepared {
+    /// The answer, and the mirror to write once it has gone.
+    pub fn into_parts(
+        self,
+    ) -> (
+        crate::event::PreparedOrchestration,
+        crate::orchestrator_context::PendingMirror,
+    ) {
+        (self.answer, self.mirror)
+    }
+}
+
+/// [`prepare_orchestration_for_wire`] under a `deadline`, read through `now`,
+/// and answerable only while `latch` lets it commit (issue #1233 item 4 and its
+/// audit).
+///
+/// The deadline is checked on entry, immediately before the publish,
+/// immediately after it, and — the **last gate** — after the token is issued,
+/// together with [`ReplyLatch::commit`]. Expired before the publish, nothing is
 /// written. Expired after it, the file just published is removed again
 /// ([`crate::orchestrator_context::withdraw_published_context`]) and no token is
-/// issued. Either way the answer is [`preparation_expired_refusal`], and the
-/// compatibility mirror — written only after the last check passes — is never
-/// touched by an expired preparation. `now` is a parameter so a test can expire
+/// issued. Expired at the last gate, or with a `latch` the reply already
+/// abandoned, the token is revoked ([`crate::prep_token::revoke`]) and the file
+/// withdrawn. Every one of those answers [`preparation_expired_refusal`], and
+/// none of them writes the compatibility mirror: it is returned un-written in
+/// [`Prepared`], only for a preparation that passed the last gate, so the
+/// caller writes it after answering. `now` is a parameter so a test can expire
 /// the deadline at exactly one of those points.
 ///
 /// **Blocking**, like [`prepare_orchestration_for_wire`].
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_orchestration_before(
     path: &str,
     orchestration: &str,
@@ -1133,7 +1244,8 @@ pub fn prepare_orchestration_before(
     seeds: &[ProjectCandidate],
     deadline: Option<std::time::Instant>,
     now: &dyn Fn() -> std::time::Instant,
-) -> Result<crate::event::PreparedOrchestration, String> {
+    latch: Option<&ReplyLatch>,
+) -> Result<Prepared, String> {
     let expired = || deadline.is_some_and(|deadline| now() >= deadline);
     if expired() {
         warn!("prepare-orchestration refused: its deadline passed before any work began");
@@ -1279,12 +1391,7 @@ pub fn prepare_orchestration_before(
             project = %dir.display(),
             "prepare-orchestration refused: its deadline passed during the publish; withdrawing it"
         );
-        crate::orchestrator_context::withdraw_published_context(
-            &crate::orchestrator_context::PublishedContext {
-                path: prepared.context_path.clone(),
-                identity: prepared.context_identity,
-            },
-        );
+        crate::orchestrator_context::withdraw_published_context(&prepared.published());
         return Err(preparation_expired_refusal());
     }
 
@@ -1309,11 +1416,29 @@ pub fn prepare_orchestration_before(
         context_digest: context_digest(&prepared.content),
         coordinator_prompt: prepared.prompt.clone(),
     });
-    // Best effort, after every check that could still withdraw this
-    // preparation (issue #1233). See `CONTEXT_FILE_NAME` for who reads it.
-    crate::orchestrator_context::mirror_orchestrator_context(&dir, &prepared.content);
 
-    Ok(crate::event::PreparedOrchestration {
+    // Issue #1233 audit: the LAST gate, after every side effect this function
+    // performs. Checking before the issue — as this did until the audit — left
+    // the issue itself, and everything after it, outside the deadline. From here
+    // to the return nothing touches a filesystem, so a preparation that passes
+    // is answered, and one that fails leaves no live token and no file behind.
+    if expired() || !latch.is_none_or(ReplyLatch::commit) {
+        warn!(
+            project = %dir.display(),
+            "prepare-orchestration refused: its deadline passed before it could be answered; \
+             revoking its token and withdrawing its context"
+        );
+        crate::prep_token::revoke(&token);
+        crate::orchestrator_context::withdraw_published_context(&prepared.published());
+        return Err(preparation_expired_refusal());
+    }
+
+    // Not written here: the caller answers first and writes it afterwards
+    // (issue #1233 audit). See `CONTEXT_FILE_NAME` for who reads it.
+    let mirror =
+        crate::orchestrator_context::PendingMirror::new(prepared.dir.clone(), prepared.content);
+
+    let answer = crate::event::PreparedOrchestration {
         context_path: prepared.context_path.to_string_lossy().into_owned(),
         // The canonical directory this preparation actually resolved to, so the
         // spawn does not have to trust the caller's spelling — see
@@ -1326,7 +1451,8 @@ pub fn prepare_orchestration_before(
         // party that delivers it, and it may not compose its own copy — see
         // `PreparedOrchestration::prompt`.
         prompt: prepared.prompt,
-    })
+    };
+    Ok(Prepared { answer, mirror })
 }
 
 /// Why [`find_orchestration`] found no single orchestration.
@@ -2976,10 +3102,44 @@ command = "cat"
         );
     }
 
+    /// Where the compatibility mirror of `project` lives.
+    fn mirror_of(project: &Path) -> PathBuf {
+        project
+            .join(crate::orchestrator_context::CONTEXT_DIR_NAME)
+            .join(crate::orchestrator_context::CONTEXT_FILE_NAME)
+    }
+
+    /// Whether the daemon-wide token store still holds a live token for
+    /// `project` (canonicalised, as the binding records it).
+    fn token_live_for(project: &Path) -> bool {
+        crate::prep_token::any_live_for(&std::fs::canonicalize(project).expect("canonicalize"))
+    }
+
+    /// A clock that answers "before the deadline" for its first `good`
+    /// readings and "after it" from then on, counting its readings.
+    fn clock_expiring_after(
+        good: u32,
+        start: std::time::Instant,
+        deadline: std::time::Instant,
+    ) -> (
+        std::rc::Rc<std::cell::Cell<u32>>,
+        impl Fn() -> std::time::Instant,
+    ) {
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let counted = std::rc::Rc::clone(&readings);
+        let clock = move || {
+            counted.set(counted.get() + 1);
+            if counted.get() > good {
+                deadline + Duration::from_secs(1)
+            } else {
+                start
+            }
+        };
+        (readings, clock)
+    }
+
     /// Issue #1233 item 4: a preparation whose deadline has already passed is
-    /// refused before any work, and writes nothing. (No token can have been
-    /// issued either: the refusal carries none, and issuing is the step after
-    /// the last deadline check.)
+    /// refused before any work, and writes nothing and issues nothing.
     #[test]
     fn an_expired_preparation_publishes_nothing_and_issues_no_token() {
         let (_guard, root) = scratch();
@@ -2996,6 +3156,7 @@ command = "cat"
             &[],
             Some(now),
             &|| now,
+            None,
         )
         .expect_err("an expired deadline must be refused");
         assert!(
@@ -3003,6 +3164,7 @@ command = "cat"
             "got {refusal}"
         );
         assert!(published_contexts(&project).is_empty());
+        assert!(!token_live_for(&project));
     }
 
     /// Issue #1233 item 4: a deadline that passes DURING the publish withdraws
@@ -3021,15 +3183,7 @@ command = "cat"
 
         let start = std::time::Instant::now();
         let deadline = start + Duration::from_secs(10);
-        let readings = std::cell::Cell::new(0u32);
-        let clock = || {
-            readings.set(readings.get() + 1);
-            if readings.get() >= 3 {
-                deadline + Duration::from_secs(1)
-            } else {
-                start
-            }
-        };
+        let (readings, clock) = clock_expiring_after(2, start, deadline);
         let refusal = prepare_orchestration_before(
             project.to_str().expect("utf-8 scratch path"),
             "loop",
@@ -3038,6 +3192,7 @@ command = "cat"
             &[],
             Some(deadline),
             &clock,
+            None,
         )
         .expect_err("a deadline passing during the publish must be refused");
         assert!(
@@ -3054,9 +3209,11 @@ command = "cat"
             "the withdrawn file is gone and the mirror was never written: {:?}",
             published_contexts(&project)
         );
+        assert!(!token_live_for(&project));
 
         // And a clock that never passes the deadline prepares as usual, which is
-        // what makes the refusal above about the deadline.
+        // what makes the refusal above about the deadline. The mirror is handed
+        // back un-written, for the caller to write after answering.
         let prepared = prepare_orchestration_before(
             project.to_str().expect("utf-8 scratch path"),
             "loop",
@@ -3065,22 +3222,118 @@ command = "cat"
             &[],
             Some(deadline),
             &|| start,
+            None,
         )
         .expect("a preparation inside its deadline succeeds");
-        assert!(Path::new(&prepared.context_path).is_file());
+        let (answer, mirror) = prepared.into_parts();
+        assert!(Path::new(&answer.context_path).is_file());
         assert!(
-            project
-                .join(crate::orchestrator_context::CONTEXT_DIR_NAME)
-                .join(crate::orchestrator_context::CONTEXT_FILE_NAME)
-                .is_file(),
-            "a preparation that is answered refreshes the mirror"
+            !mirror_of(&project).exists(),
+            "the preparation itself does not write the mirror"
+        );
+        mirror.write();
+        assert!(
+            mirror_of(&project).is_file(),
+            "the caller writes it once the preparation is answered"
+        );
+    }
+
+    /// Issue #1233 audit: a deadline that passes DURING the token issue — the
+    /// last side effect — is caught by the gate after it: the token is revoked,
+    /// the per-publish file withdrawn, and no mirror is handed back to write.
+    #[test]
+    fn a_deadline_passing_during_the_token_issue_revokes_and_withdraws() {
+        let (_guard, root) = scratch();
+        let project = root.join("issue-late-project");
+        std::fs::create_dir_all(&project).expect("create the project dir");
+        write_project(&project, SMALL_PROJECT);
+
+        let start = std::time::Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        let (readings, clock) = clock_expiring_after(3, start, deadline);
+        let refusal = prepare_orchestration_before(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            None,
+            &[],
+            Some(deadline),
+            &clock,
+            None,
+        )
+        .expect_err("a deadline passing during the issue must be refused");
+        assert!(
+            refusal.starts_with(crate::daemon_protocol::PROJECT_ERR_PREPARATION_EXPIRED),
+            "got {refusal}"
+        );
+        assert_eq!(readings.get(), 4, "the refusal came from the last gate");
+        assert!(
+            !token_live_for(&project),
+            "the token issued before the last gate was revoked"
+        );
+        assert!(
+            published_contexts(&project).is_empty(),
+            "the file is withdrawn and no mirror written: {:?}",
+            published_contexts(&project)
+        );
+    }
+
+    /// Issue #1233 audit: a preparation whose reply already gave up on it — the
+    /// latch abandoned, as `run_bounded_answer` does at the deadline — is
+    /// withdrawn at its last gate even when its own clock reads in time, so a
+    /// work that finishes after the client was told "expired" leaves nothing
+    /// usable behind.
+    #[test]
+    fn an_abandoned_reply_revokes_the_token_and_withdraws_the_context() {
+        let (_guard, root) = scratch();
+        let project = root.join("abandoned-project");
+        std::fs::create_dir_all(&project).expect("create the project dir");
+        write_project(&project, SMALL_PROJECT);
+
+        let start = std::time::Instant::now();
+        let latch = ReplyLatch::default();
+        assert!(latch.abandon());
+        let refusal = prepare_orchestration_before(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            None,
+            &[],
+            Some(start + Duration::from_secs(10)),
+            &|| start,
+            Some(&latch),
+        )
+        .expect_err("an abandoned reply must not be answered");
+        assert!(
+            refusal.starts_with(crate::daemon_protocol::PROJECT_ERR_PREPARATION_EXPIRED),
+            "got {refusal}"
+        );
+        assert!(!token_live_for(&project));
+        assert!(published_contexts(&project).is_empty());
+
+        // A latch nobody abandoned lets the same preparation commit.
+        let latch = ReplyLatch::default();
+        prepare_orchestration_before(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            None,
+            &[],
+            Some(start + Duration::from_secs(10)),
+            &|| start,
+            Some(&latch),
+        )
+        .expect("an open latch commits");
+        assert!(
+            !latch.abandon(),
+            "the work committed, so the reply cannot abandon"
         );
     }
 
     /// Issue #1233 item 4: with every project permit held, the bounded wait
     /// gives up at its deadline and never runs the work.
     #[tokio::test]
-    async fn run_bounded_until_gives_up_at_the_deadline_without_running_the_work() {
+    async fn run_bounded_answer_gives_up_at_the_deadline_without_running_the_work() {
         let held = project_fs_limit()
             .clone()
             .acquire_many_owned(MAX_CONCURRENT_PROJECT_READS as u32)
@@ -3088,9 +3341,12 @@ command = "cat"
             .expect("saturate the project permits");
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran_inner = std::sync::Arc::clone(&ran);
-        let outcome = run_bounded_until(
+        let outcome = run_bounded_answer(
             tokio::time::Instant::now() + Duration::from_millis(50),
-            move || ran_inner.store(true, std::sync::atomic::Ordering::SeqCst),
+            move |_| {
+                ran_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                ((), None)
+            },
         )
         .await
         .expect("no internal error");
@@ -3104,11 +3360,88 @@ command = "cat"
         );
 
         drop(held);
-        let outcome =
-            run_bounded_until(tokio::time::Instant::now() + Duration::from_secs(10), || 42)
-                .await
-                .expect("no internal error");
-        assert_eq!(outcome, Some(42), "with a permit free the work runs");
+        let outcome = run_bounded_answer(
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            |latch| (latch.commit().then_some(42), None),
+        )
+        .await
+        .expect("no internal error");
+        assert_eq!(outcome, Some(Some(42)), "with a permit free the work runs");
+    }
+
+    /// Issue #1233 audit: a work that is still running at the deadline does not
+    /// hold the reply — it is answered `None` (expired) on time — and when it
+    /// does finish, its commit is refused, which is what makes it withdraw.
+    #[tokio::test]
+    async fn run_bounded_answer_answers_on_time_and_abandons_a_stalled_work() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel::<bool>();
+        let started = tokio::time::Instant::now();
+        let outcome = run_bounded_answer(started + Duration::from_millis(100), move |latch| {
+            // Stands in for a filesystem call that stalls past the deadline.
+            let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            let committed = latch.commit();
+            let _ = committed_tx.send(committed);
+            (committed, None)
+        })
+        .await
+        .expect("no internal error");
+        assert!(outcome.is_none(), "answered as expired, got {outcome:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the answer did not wait for the stalled work ({:?})",
+            started.elapsed()
+        );
+
+        release_tx.send(()).expect("release the stalled work");
+        let committed = tokio::task::spawn_blocking(move || {
+            committed_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the work finished")
+        })
+        .await
+        .expect("join");
+        assert!(
+            !committed,
+            "a work that finishes after an expired answer cannot commit"
+        );
+    }
+
+    /// Issue #1233 audit: the post-reply work — the compatibility mirror — runs
+    /// only after the answer has been handed over, so a mirror write that
+    /// stalls past the deadline neither delays nor changes the answer.
+    #[tokio::test]
+    async fn run_bounded_answer_answers_before_a_stalled_after_reply() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel::<()>();
+        let started = tokio::time::Instant::now();
+        let outcome = run_bounded_answer(started + Duration::from_millis(100), move |latch| {
+            let after: AfterReply = Box::new(move || {
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                let _ = ran_tx.send(());
+            });
+            (latch.commit(), Some(after))
+        })
+        .await
+        .expect("no internal error");
+        assert_eq!(outcome, Some(true), "the committed answer is delivered");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the answer did not wait for the after-reply work ({:?})",
+            started.elapsed()
+        );
+        assert!(
+            ran_rx.try_recv().is_err(),
+            "the after-reply work had not run when the answer arrived"
+        );
+        release_tx.send(()).expect("release the after-reply work");
+        tokio::task::spawn_blocking(move || {
+            ran_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the after-reply work ran after the answer")
+        })
+        .await
+        .expect("join");
     }
 
     /// Issue #1233: the lookup counts role-bearing matches only, and refuses

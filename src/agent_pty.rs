@@ -1268,8 +1268,9 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
 ///   holds `N`, so its `chdir` enters **the verified directory object** whatever
 ///   the pathname names by then. `O_CLOEXEC` closes `N` at `execve`, and
 ///   portable-pty's `close_random_fds` closes it even earlier. If `/proc` does
-///   not answer with the verified identity, this falls back to the other-Unix
-///   path rather than trusting it.
+///   not answer with the verified identity the start is **refused**, never
+///   sent down the other-Unix pathname path, which would reopen the window the
+///   descriptor closes ([`linux_fd_cwd`]).
 /// * **Every other Unix:** the pathname is re-`stat`ed immediately before
 ///   `spawn_command` and must match `dir`'s identity, or the spawn is refused.
 ///   **That narrows the window without closing it**: a rename-and-replace
@@ -1329,32 +1330,66 @@ fn prepared_spawn_cwd(
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::{AsFd as _, AsRawFd as _};
-        let via_fd = format!("/proc/self/fd/{}", dir.as_fd().as_raw_fd());
-        let matches = std::fs::metadata(&via_fd)
-            .ok()
-            .filter(|m| m.is_dir())
-            .as_ref()
-            .and_then(crate::prep_token::inode_identity)
-            == Some(dir.identity());
-        if matches {
-            return Ok(via_fd.into());
-        }
-        tracing::warn!(
-            "prepared spawn: /proc/self/fd did not resolve to the verified project directory; \
-             falling back to a pathname re-check"
-        );
+        linux_fd_cwd(dir.as_fd().as_raw_fd(), dir.identity(), &|via_fd| {
+            std::fs::metadata(via_fd)
+                .ok()
+                .filter(|m| m.is_dir())
+                .as_ref()
+                .and_then(crate::prep_token::inode_identity)
+        })
     }
 
-    let identity = by_path
-        .ok()
-        .as_ref()
-        .and_then(crate::prep_token::inode_identity);
-    if identity != Some(dir.identity()) {
-        return Err(AgentPtyError::PreparedDirChanged(
-            "the prepared working directory was replaced after it was verified",
-        ));
+    #[cfg(not(target_os = "linux"))]
+    {
+        let identity = by_path
+            .ok()
+            .as_ref()
+            .and_then(crate::prep_token::inode_identity);
+        if identity != Some(dir.identity()) {
+            return Err(AgentPtyError::PreparedDirChanged(
+                "the prepared working directory was replaced after it was verified",
+            ));
+        }
+        Ok(path.into())
     }
-    Ok(path.into())
+}
+
+/// The Linux half of [`prepared_spawn_cwd`]: `/proc/self/fd/<fd>` when it
+/// stats — through `stat_dir`, which answers the identity of a directory at a
+/// path or `None` — to `expected`, and a refusal otherwise.
+///
+/// **Fail closed, never a pathname fallback** (issue #1233 audit). Until the
+/// audit a `/proc` that did not answer fell back to the other-Unix pathname
+/// re-`stat`, which reopens exactly the rename-and-replace window the
+/// descriptor exists to close: a `/proc` that is absent, mounted `hidepid`, or
+/// restricted by a sandbox would silently downgrade every prepared start to it.
+/// A refusal here is the stale-preparation refusal on the wire
+/// (`crate::daemon_protocol`'s `StartPreparedAgent` arm) and this `warn!` in the
+/// daemon log, so an operator can tell a missing `/proc` from a moved project.
+/// `stat_dir` is a parameter so a test can make `/proc` fail without unmounting
+/// it.
+#[cfg(target_os = "linux")]
+fn linux_fd_cwd(
+    fd: std::os::fd::RawFd,
+    expected: crate::prep_token::InodeIdentity,
+    stat_dir: &dyn Fn(&str) -> Option<crate::prep_token::InodeIdentity>,
+) -> Result<std::ffi::OsString, AgentPtyError> {
+    let via_fd = format!("/proc/self/fd/{fd}");
+    match stat_dir(&via_fd) {
+        Some(identity) if identity == expected => Ok(via_fd.into()),
+        found => {
+            tracing::warn!(
+                via_fd = %via_fd,
+                resolved = found.is_some(),
+                "prepared spawn refused: /proc/self/fd did not resolve to the verified \
+                 project directory, and a prepared start on Linux does not fall back to \
+                 the pathname"
+            );
+            Err(AgentPtyError::PreparedDirChanged(
+                "the verified project directory could not be entered through its descriptor",
+            ))
+        }
+    }
 }
 
 fn spawn_with_dir(
@@ -14899,6 +14934,42 @@ mod spawn_tests {
             !dir.join("marker").exists(),
             "the child ran in the replacement at the verified path"
         );
+    }
+
+    /// Issue #1233 audit: on Linux a `/proc/self/fd` that does not answer, or
+    /// answers with another directory, refuses the prepared start — it never
+    /// falls back to the pathname, which is what reopened the rename-and-replace
+    /// window. `/proc` is made to fail through the stat seam rather than by
+    /// unmounting it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_proc_fd_that_does_not_resolve_to_the_verified_directory_is_refused() {
+        let expected = crate::prep_token::InodeIdentity { dev: 1, ino: 2 };
+
+        for (what, answer) in [
+            ("an unreadable /proc", None),
+            (
+                "another directory",
+                Some(crate::prep_token::InodeIdentity { dev: 1, ino: 3 }),
+            ),
+        ] {
+            let Err(err) = linux_fd_cwd(7, expected, &|_| answer) else {
+                panic!("{what} must refuse the prepared start");
+            };
+            assert!(
+                matches!(err, AgentPtyError::PreparedDirChanged(_)),
+                "{what}: expected PreparedDirChanged, got {err:?}"
+            );
+        }
+
+        let asked = std::cell::RefCell::new(Vec::new());
+        let cwd = linux_fd_cwd(7, expected, &|path| {
+            asked.borrow_mut().push(path.to_owned());
+            Some(expected)
+        })
+        .expect("a /proc answer naming the verified directory is entered");
+        assert_eq!(cwd, std::ffi::OsString::from("/proc/self/fd/7"));
+        assert_eq!(*asked.borrow(), ["/proc/self/fd/7"]);
     }
 
     /// Issue #1233 item 2, every other Unix: the pathname is re-checked against

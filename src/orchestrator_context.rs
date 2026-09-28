@@ -464,6 +464,20 @@ pub struct PreparedContext {
     /// preparation published" checkable
     /// ([`crate::prep_token::PrepBinding::context_identity`]).
     pub context_identity: Option<crate::prep_token::InodeIdentity>,
+    /// The directory the file was published into, held open
+    /// ([`PublishedContext::dir`]).
+    pub dir: ContextDir,
+}
+
+impl PreparedContext {
+    /// The published half, for [`withdraw_published_context`].
+    pub fn published(&self) -> PublishedContext {
+        PublishedContext {
+            path: self.context_path.clone(),
+            identity: self.context_identity,
+            dir: self.dir.clone(),
+        }
+    }
 }
 
 /// Compose the orchestrator context and publish it, reporting **why** on
@@ -494,7 +508,7 @@ pub fn prepare_orchestrator_context(
     attendance: Attendance,
 ) -> Result<PreparedContext, ContextPublishError> {
     let prepared = prepare_unmirrored_orchestrator_context(config, cwd, task, attendance)?;
-    mirror_orchestrator_context(cwd, &prepared.content);
+    mirror_into(&prepared.dir, &prepared.content);
     Ok(prepared)
 }
 
@@ -524,6 +538,7 @@ pub fn prepare_unmirrored_orchestrator_context(
         prompt: orchestrator_prompt_line(task.is_some(), &published.path),
         context_path: published.path,
         context_identity: published.identity,
+        dir: published.dir,
         content,
     })
 }
@@ -539,6 +554,10 @@ pub struct PublishedPrompt {
     /// keeps it so its compaction or `/clear` re-arm reads the task back from
     /// its own file rather than from the shared mirror.
     pub context_path: std::path::PathBuf,
+    /// The directory it was published into, held open, so the tab's removal of
+    /// the file this one replaces is anchored on it
+    /// ([`remove_replaced_context`]).
+    pub dir: ContextDir,
 }
 
 /// Write the orchestrator context to a file and return a one-liner to inject.
@@ -569,6 +588,7 @@ pub fn prepare_orchestrator_prompt(
         Ok(prepared) => Some(PublishedPrompt {
             prompt: prepared.prompt,
             context_path: prepared.context_path,
+            dir: prepared.dir,
         }),
         Err(e) => {
             tracing::warn!(reason = %e, "could not publish the orchestrator context");
@@ -756,6 +776,10 @@ pub struct PublishedContext {
     /// The published file's inode identity, or `None` where the platform has
     /// none. See [`crate::prep_token::InodeIdentity`].
     pub identity: Option<crate::prep_token::InodeIdentity>,
+    /// The directory it was published into, held open, so a withdrawal or a
+    /// mirror write reaches that directory rather than whatever the path names
+    /// later (issue #1233 audit).
+    pub dir: ContextDir,
 }
 
 /// Why an orchestrator context was not published.
@@ -1097,13 +1121,12 @@ fn open_context_dir(dir: &std::path::Path) -> Result<ContextDirGuard, ContextPub
 ///
 /// Compares device + inode from the **open handle's** `fstat` against a
 /// `symlink_metadata` of the path. This **detects** a `.dot-agent-deck`
-/// swapped between [`open_context_dir`] and the temp-file create; it does not
-/// **prevent** one. Preventing it needs `openat(2)` from the held descriptor,
-/// which `std` does not expose and which is not worth hand-rolling here: the
-/// swap requires write permission on the project directory, and anyone holding
-/// that can rewrite `.dot-agent-deck.toml` — whose `command` strings the daemon
-/// executes — which is strictly more authority than redirecting one markdown
-/// file. The check is cheap, so it is here; the claim is exactly that.
+/// swapped between [`open_context_dir`] and the write. Since the issue #1233
+/// audit the writes themselves no longer depend on it — every create, rename
+/// and removal goes through the held descriptor ([`ContextDir`]), so a swap
+/// cannot redirect one — and what this check still guards is the *announced*
+/// path: a publish whose directory no longer sits at the path the prompt names
+/// is refused rather than announced.
 #[cfg(unix)]
 fn context_dir_unchanged(guard: &ContextDirGuard, dir: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
@@ -1117,6 +1140,192 @@ fn context_dir_unchanged(guard: &ContextDirGuard, dir: &std::path::Path) -> bool
 fn context_dir_unchanged(_guard: &ContextDirGuard, _dir: &std::path::Path) -> bool {
     // No handle to compare against; see `open_context_dir`'s narrower guarantee.
     true
+}
+
+/// The `.dot-agent-deck` directory a publish checked, **held open**, and the
+/// one handle every later write, rename and removal in it goes through (issue
+/// #1233 audit).
+///
+/// On Unix every operation is `*at(2)` relative to the descriptor
+/// [`open_context_dir`] opened with `O_NOFOLLOW | O_DIRECTORY` — `openat` with
+/// `O_CREAT | O_EXCL | O_NOFOLLOW`, `renameat`, `unlinkat`, `fstatat` with
+/// `AT_SYMLINK_NOFOLLOW` — and each takes a **single name**, never a path. So
+/// once the checks have passed, no operation re-traverses the project pathname:
+/// a project renamed and replaced under a shared parent afterwards cannot
+/// redirect a create, the mirror's rename, a failure's cleanup, a withdrawal or
+/// the TUI's removal of a replaced file into another directory. Before the
+/// audit each of those joined a name onto the path again, after the identity
+/// check, which is exactly the window it named.
+///
+/// **What it does not anchor.** The descriptor itself is opened by pathname,
+/// so which `.dot-agent-deck` it is still depends on the project path at that
+/// moment; [`context_dir_unchanged`] then *detects* (does not prevent) the path
+/// moving before the write, and refuses rather than announcing a path that
+/// names another directory. The retention sweep ([`sweep_coordination_files`])
+/// still works by path. Off Unix the handle is the path and every operation is
+/// a path operation — the narrower guarantee [`open_context_dir`] states, and
+/// the reason the daemon verb is refused there.
+#[derive(Clone)]
+pub struct ContextDir {
+    path: std::path::PathBuf,
+    guard: std::sync::Arc<ContextDirGuard>,
+}
+
+impl std::fmt::Debug for ContextDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextDir")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Equal when they name the same directory path. The descriptors are not
+/// compared: this exists so the value types carrying a handle can stay
+/// comparable, not as an identity check.
+impl PartialEq for ContextDir {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+impl Eq for ContextDir {}
+
+/// `name` as one path component, or `InvalidInput`: every `*at` call below is
+/// meant to act on an entry of the held directory and nothing else.
+#[cfg(unix)]
+fn single_component(name: &str) -> std::io::Result<std::ffi::CString> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    std::ffi::CString::new(name).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+}
+
+impl ContextDir {
+    /// The directory's pathname — what a published file's path is built from
+    /// and what the prompt names. Not what any operation below resolves.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Whether the pathname still names the held directory
+    /// ([`context_dir_unchanged`]).
+    fn unchanged(&self) -> bool {
+        context_dir_unchanged(&self.guard, &self.path)
+    }
+
+    /// Create `name` in the held directory owner-only, refusing an existing
+    /// entry and never following a symlink. The mode is an argument to
+    /// `openat(2)`, so the file is `0o600` from the instant it exists.
+    #[cfg(unix)]
+    fn create_new(&self, name: &str) -> std::io::Result<std::fs::File> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let name = single_component(name)?;
+        // SAFETY: `guard` is an open directory descriptor for the duration of
+        // the call and `name` is a NUL-terminated single component. The mode is
+        // passed as the promoted `c_uint` the variadic `openat` reads.
+        let fd = unsafe {
+            libc::openat(
+                self.guard.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `openat` just returned this descriptor and nothing else owns it.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    #[cfg(not(unix))]
+    fn create_new(&self, name: &str) -> std::io::Result<std::fs::File> {
+        create_owner_only_file(&self.path.join(name))
+    }
+
+    /// Rename `from` over `to`, both entries of the held directory.
+    #[cfg(unix)]
+    fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let (from, to) = (single_component(from)?, single_component(to)?);
+        let fd = self.guard.as_raw_fd();
+        // SAFETY: one open directory descriptor, two NUL-terminated components.
+        if unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        std::fs::rename(self.path.join(from), self.path.join(to))
+    }
+
+    /// Remove the entry `name` of the held directory. Not a directory: without
+    /// `AT_REMOVEDIR`, `unlinkat` refuses one. A symlink is removed, never
+    /// followed.
+    #[cfg(unix)]
+    fn unlink(&self, name: &str) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let name = single_component(name)?;
+        // SAFETY: an open directory descriptor and a NUL-terminated component.
+        if unsafe { libc::unlinkat(self.guard.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn unlink(&self, name: &str) -> std::io::Result<()> {
+        std::fs::remove_file(self.path.join(name))
+    }
+
+    /// The inode identity of the entry `name` itself (a symlink is not
+    /// followed), or `None` when there is none.
+    #[cfg(unix)]
+    fn identity_of(&self, name: &str) -> Option<crate::prep_token::InodeIdentity> {
+        use std::os::fd::AsRawFd as _;
+        let name = single_component(name).ok()?;
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `st` is written by a successful `fstatat` and read only then.
+        let rc = unsafe {
+            libc::fstatat(
+                self.guard.as_raw_fd(),
+                name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        // SAFETY: `fstatat` returned 0, so it filled `st`.
+        let st = unsafe { st.assume_init() };
+        // The same widening `MetadataExt::{dev, ino}` apply, so this compares
+        // equal to `prep_token::inode_identity` of the same file.
+        #[allow(clippy::unnecessary_cast)]
+        Some(crate::prep_token::InodeIdentity {
+            dev: st.st_dev as u64,
+            ino: st.st_ino as u64,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn identity_of(&self, name: &str) -> Option<crate::prep_token::InodeIdentity> {
+        std::fs::symlink_metadata(self.path.join(name))
+            .ok()
+            .as_ref()
+            .and_then(crate::prep_token::inode_identity)
+    }
+}
+
+/// Whether `name` is a per-publish context file name:
+/// [`CONTEXT_FILE_PREFIX`], 32 hex digits, `.md` (issue #1233).
+fn is_per_publish_context_name(name: &str) -> bool {
+    name.strip_prefix(CONTEXT_FILE_PREFIX)
+        .and_then(|rest| rest.strip_suffix(".md"))
+        .is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Do not publish into a `.dot-agent-deck` that grants **write** to group or
@@ -1333,30 +1542,26 @@ fn unique_context_file_name() -> String {
     )
 }
 
-/// Open `options` at `path` owner-only and without following a symlink.
-///
-/// The mode is an argument to `open(2)`, so the file is 0600 from the instant
-/// it exists. `O_NOFOLLOW` costs nothing next to `create_new` and states the
-/// intent at the same seam the directory open states it.
+/// Create `path`, refusing an existing entry — the non-Unix arm of
+/// [`ContextDir::create_new`], which on Unix creates the file `0o600` with
+/// `O_NOFOLLOW` relative to the held directory instead. No mode or DACL is
+/// applied here; see [`open_context_dir`]'s narrower guarantee.
+#[cfg(not(unix))]
 fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    options.open(path)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 /// Every check a write into `.dot-agent-deck` makes before it creates anything:
 /// the size bound, the owner-only directory creation, the symlink-refusing open
-/// and the group/other-write repair. Answers the directory and the guard the
-/// write compares against afterwards.
+/// and the group/other-write repair. Answers the directory, held open, that
+/// every later operation goes through ([`ContextDir`]).
 fn open_publish_dir(
     project_dir: &std::path::Path,
     content: &str,
-) -> Result<(std::path::PathBuf, ContextDirGuard), ContextPublishError> {
+) -> Result<ContextDir, ContextPublishError> {
     if content.len() > MAX_CONTEXT_BYTES {
         return Err(ContextPublishError::ContextTooLarge(content.len()));
     }
@@ -1368,19 +1573,26 @@ fn open_publish_dir(
     // refused only if that fails — because a 0600 file's directory entry is only
     // as protected as the directory holding it.
     ensure_context_dir_owner_writable_only(&guard)?;
-    Ok((dir, guard))
+    Ok(ContextDir {
+        path: dir,
+        guard: std::sync::Arc::new(guard),
+    })
 }
 
 /// Write `content` into the freshly created `file`, after confirming the
-/// directory it sits in is still the one `guard` checked, and answer the file's
+/// directory's pathname still names the held directory, and answer the file's
 /// identity taken from the open handle.
+///
+/// The file itself was created relative to the held descriptor, so the check is
+/// not what keeps the bytes in the right directory — it is what keeps this from
+/// announcing a path (the prompt names `.dot-agent-deck/<name>` under the
+/// project) that by now names a different one.
 fn write_context_file(
     mut file: std::fs::File,
-    guard: &ContextDirGuard,
-    dir: &std::path::Path,
+    dir: &ContextDir,
     content: &str,
 ) -> Result<Option<crate::prep_token::InodeIdentity>, ContextPublishError> {
-    if !context_dir_unchanged(guard, dir) {
+    if !dir.unchanged() {
         return Err(ContextPublishError::ContextDirReplaced);
     }
     use std::io::Write as _;
@@ -1456,31 +1668,36 @@ pub fn publish_orchestrator_context(
     project_dir: &std::path::Path,
     content: &str,
 ) -> Result<PublishedContext, ContextPublishError> {
-    let (dir, guard) = open_publish_dir(project_dir, content)?;
-    let final_path = dir.join(unique_context_file_name());
+    let dir = open_publish_dir(project_dir, content)?;
+    let name = unique_context_file_name();
+    let final_path = dir.path().join(&name);
 
     let mut created = false;
     let outcome = (|| {
-        let file = create_owner_only_file(&final_path).map_err(ContextPublishError::TempCreate)?;
+        let file = dir
+            .create_new(&name)
+            .map_err(ContextPublishError::TempCreate)?;
         created = true;
-        write_context_file(file, &guard, &dir, content)
+        write_context_file(file, &dir, content)
     })();
 
     match outcome {
         Ok(identity) => {
-            tidy_context_dir(project_dir, &dir);
+            tidy_context_dir(project_dir, dir.path());
             Ok(PublishedContext {
                 path: final_path,
                 identity,
+                dir,
             })
         }
         Err(e) => {
             // Best effort, and deliberately not reported: the publish already
             // failed for a reason the caller is about to be told. Only a file
             // this call created is removed — the name is fresh, so that is the
-            // only thing it can name.
+            // only thing it can name — and it is removed from the held
+            // directory, not from whatever the path names by now.
             if created {
-                let _ = std::fs::remove_file(&final_path);
+                let _ = dir.unlink(&name);
             }
             Err(e)
         }
@@ -1490,23 +1707,27 @@ pub fn publish_orchestrator_context(
 /// Withdraw a context [`publish_orchestrator_context`] published but whose
 /// preparation will not be answered (issue #1233 item 4's expired deadline).
 ///
-/// Removes `published.path`, and skips it when the name no longer holds the
-/// inode the publish created — a file some other party put there since is left
-/// alone. (The check and the removal are two lookups, so this narrows rather
+/// Removes the published file from the directory it was published into —
+/// through the held [`ContextDir`], not by re-resolving `published.path` — and
+/// skips it when that entry no longer holds the inode the publish created: a
+/// file some other party put there since is left alone. (The check and the
+/// removal are two operations on one held directory, so this narrows rather
 /// than closes that case; the name is fresh and unannounced, so nothing but a
 /// guess can have put anything there.)
 /// Best effort: a failure is logged, and the file is then an ordinary leftover
 /// that [`sweep_coordination_files`] removes once it ages out of the window.
 pub fn withdraw_published_context(published: &PublishedContext) {
-    let still_ours = std::fs::symlink_metadata(&published.path)
-        .ok()
-        .as_ref()
-        .and_then(crate::prep_token::inode_identity)
+    let Some(name) = published.path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let still_ours = published
+        .dir
+        .identity_of(name)
         .is_some_and(|now| Some(now) == published.identity);
     if !still_ours && published.identity.is_some() {
         return;
     }
-    if let Err(e) = std::fs::remove_file(&published.path)
+    if let Err(e) = published.dir.unlink(name)
         && e.kind() != std::io::ErrorKind::NotFound
     {
         tracing::warn!(
@@ -1527,13 +1748,73 @@ pub fn withdraw_published_context(published: &PublishedContext) {
 ///
 /// **Blocking.** Async callers go through [`crate::project_resolve::run_bounded`].
 pub fn mirror_orchestrator_context(project_dir: &std::path::Path, content: &str) {
-    if let Err(e) = write_mirror(project_dir, content) {
-        tracing::warn!(
+    match open_publish_dir(project_dir, content) {
+        Ok(dir) => mirror_into(&dir, content),
+        Err(e) => tracing::warn!(
             project = %project_dir.display(),
+            reason = %e,
+            "could not refresh the {CONTEXT_FILE_NAME} compatibility mirror"
+        ),
+    }
+}
+
+/// [`mirror_orchestrator_context`] into a directory a publish already holds
+/// open — the one its own per-publish file went into — rather than resolving
+/// the project path again (issue #1233 audit).
+pub fn mirror_into(dir: &ContextDir, content: &str) {
+    if let Err(e) = write_mirror(dir, content) {
+        tracing::warn!(
+            dir = %dir.path().display(),
             reason = %e,
             "could not refresh the {CONTEXT_FILE_NAME} compatibility mirror"
         );
     }
+}
+
+/// A preparation's compatibility-mirror write, held back until the
+/// preparation is certain to be answered (issue #1233 audit).
+///
+/// The daemon verb answers its client first and runs this afterwards on the
+/// same blocking thread, so a slow or stalled mirror write can neither delay
+/// the reply past the deadline nor happen for a preparation that was answered
+/// as expired — one that is withdrawn never produces a `PendingMirror`.
+#[derive(Debug)]
+pub struct PendingMirror {
+    dir: ContextDir,
+    content: String,
+}
+
+impl PendingMirror {
+    /// Hold `content` back for `dir`.
+    pub fn new(dir: ContextDir, content: String) -> Self {
+        Self { dir, content }
+    }
+
+    /// Write it, best effort ([`mirror_into`]).
+    pub fn write(self) {
+        mirror_into(&self.dir, &self.content);
+    }
+}
+
+/// Remove `old`, the per-publish context a re-arm just replaced, from the
+/// directory `dir` — the one the re-arm's own publish holds open (issue #1233
+/// audit, the TUI's `replace_orchestration_context_path`).
+///
+/// The caller only has `old` as a path, so the removal is anchored rather
+/// than revalidated: it happens only when `old`'s parent is `dir`'s own path
+/// and its name is a per-publish context name, and then through `unlinkat` on
+/// the held descriptor — so a project renamed and replaced since cannot turn it
+/// into a removal in another directory. Anything else is left in place for the
+/// retention sweep rather than removed by pathname. Best effort; `true` when a
+/// file was removed.
+pub fn remove_replaced_context(dir: &ContextDir, old: &std::path::Path) -> bool {
+    if old.parent() != Some(dir.path()) {
+        return false;
+    }
+    let Some(name) = old.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    is_per_publish_context_name(name) && dir.unlink(name).is_ok()
 }
 
 /// The mirror write itself: the fixed-name publish every deck performed before
@@ -1552,20 +1833,28 @@ pub fn mirror_orchestrator_context(project_dir: &std::path::Path, content: &str)
 ///
 /// A failure leaves the previous mirror — if any — exactly as it was, and
 /// removes the temp file.
-fn write_mirror(project_dir: &std::path::Path, content: &str) -> Result<(), ContextPublishError> {
-    let (dir, guard) = open_publish_dir(project_dir, content)?;
-    let final_path = dir.join(CONTEXT_FILE_NAME);
-    let temp_path = dir.join(temp_context_file_name());
+fn write_mirror(dir: &ContextDir, content: &str) -> Result<(), ContextPublishError> {
+    // Re-applied rather than inherited from the publish that opened `dir`: the
+    // mirror may run after the reply, and the directory's mode can have been
+    // widened since.
+    if content.len() > MAX_CONTEXT_BYTES {
+        return Err(ContextPublishError::ContextTooLarge(content.len()));
+    }
+    ensure_context_dir_owner_writable_only(&dir.guard)?;
+    let temp_name = temp_context_file_name();
 
     let outcome = (|| {
-        let file = create_owner_only_file(&temp_path).map_err(ContextPublishError::TempCreate)?;
-        write_context_file(file, &guard, &dir, content)?;
-        std::fs::rename(&temp_path, &final_path).map_err(ContextPublishError::Publish)
+        let file = dir
+            .create_new(&temp_name)
+            .map_err(ContextPublishError::TempCreate)?;
+        write_context_file(file, dir, content)?;
+        dir.rename(&temp_name, CONTEXT_FILE_NAME)
+            .map_err(ContextPublishError::Publish)
     })();
     if outcome.is_err() {
         // `TempCreate` is the one case where there is nothing to remove, and
-        // removing a path that is not there is a no-op.
-        let _ = std::fs::remove_file(&temp_path);
+        // removing a name that is not there is a no-op.
+        let _ = dir.unlink(&temp_name);
     }
     outcome
 }
@@ -2535,6 +2824,93 @@ mod tests {
             "someone else's",
             "a different inode at the name is not ours to remove"
         );
+    }
+
+    /// Issue #1233 audit: every operation after the publish's checks goes
+    /// through the held `.dot-agent-deck` descriptor, so a project renamed and
+    /// replaced afterwards cannot redirect it. The withdrawal removes the file
+    /// from the directory it was published into — now under the moved name —
+    /// and leaves a same-named file in the replacement alone; the mirror is not
+    /// written into the replacement; and the TUI's removal of a replaced file is
+    /// anchored the same way.
+    #[cfg(unix)]
+    #[test]
+    fn publish_follow_ups_act_on_the_held_directory_not_the_replaced_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("p");
+        std::fs::create_dir(&project).unwrap();
+        let published = publish_orchestrator_context(&project, "mine").expect("published");
+        let name = published.path.file_name().unwrap().to_owned();
+
+        // Rename the project away and put a replacement at its path holding a
+        // file of the same name.
+        let moved = tmp.path().join("p.moved");
+        std::fs::rename(&project, &moved).unwrap();
+        let replacement_dir = context_dir_of(&project);
+        std::fs::create_dir_all(&replacement_dir).unwrap();
+        std::fs::write(replacement_dir.join(&name), "the replacement's").unwrap();
+
+        withdraw_published_context(&published);
+        assert!(
+            !context_dir_of(&moved).join(&name).exists(),
+            "the withdrawal reached the directory the file was published into"
+        );
+        assert_eq!(
+            std::fs::read_to_string(replacement_dir.join(&name)).unwrap(),
+            "the replacement's",
+            "and did not touch the directory now at the old path"
+        );
+
+        mirror_into(&published.dir, "mine");
+        assert!(
+            !replacement_dir.join(CONTEXT_FILE_NAME).exists(),
+            "the mirror is not written into the replacement"
+        );
+
+        // The TUI's removal: a replaced per-publish file under the held
+        // directory's path is removed from the HELD directory.
+        let second = publish_orchestrator_context(&moved, "second").expect("published");
+        let third = publish_orchestrator_context(&moved, "third").expect("published");
+        let second_name = second.path.file_name().unwrap().to_owned();
+        let moved_again = tmp.path().join("p.moved.again");
+        std::fs::rename(&moved, &moved_again).unwrap();
+        std::fs::create_dir_all(context_dir_of(&moved)).unwrap();
+        std::fs::write(context_dir_of(&moved).join(&second_name), "decoy").unwrap();
+        assert!(remove_replaced_context(&third.dir, &second.path));
+        assert!(!context_dir_of(&moved_again).join(&second_name).exists());
+        assert_eq!(
+            std::fs::read_to_string(context_dir_of(&moved).join(&second_name)).unwrap(),
+            "decoy"
+        );
+    }
+
+    /// Issue #1233 audit: the TUI's removal only ever removes a per-publish
+    /// context file in the held directory — a file in another directory, or one
+    /// whose name is not a per-publish name, is left for the sweep.
+    #[test]
+    fn remove_replaced_context_refuses_anything_but_a_sibling_per_publish_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let published = publish_orchestrator_context(tmp.path(), "ctx").expect("published");
+        let dir = &published.dir;
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let foreign = elsewhere.path().join(published.path.file_name().unwrap());
+        std::fs::write(&foreign, "foreign").unwrap();
+        assert!(!remove_replaced_context(dir, &foreign));
+        assert!(foreign.exists());
+
+        let not_ours = dir.path().join("worker-task-coder.md");
+        std::fs::write(&not_ours, "task").unwrap();
+        assert!(!remove_replaced_context(dir, &not_ours));
+        assert!(not_ours.exists());
+
+        let mirror = dir.path().join(CONTEXT_FILE_NAME);
+        std::fs::write(&mirror, "mirror").unwrap();
+        assert!(!remove_replaced_context(dir, &mirror));
+        assert!(mirror.exists());
+
+        assert!(remove_replaced_context(dir, &published.path));
+        assert!(!published.path.exists());
     }
 
     // -----------------------------------------------------------------------

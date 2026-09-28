@@ -4213,14 +4213,22 @@ fn schedule_send_retry(
 /// deliver. The removal is best effort; a file it misses is swept once it ages
 /// past the coordination retention window
 /// (`orchestrator_context::is_sweepable_coordination_name`).
+///
+/// **Anchored on the new publish's held directory, not on `old` as a path**
+/// (issue #1233 audit): the tab only has the old file's pathname, and removing
+/// by pathname would re-resolve a project that may have been renamed and
+/// replaced since. `remove_replaced_context` removes it through `unlinkat` on
+/// `dir`, and only when `old` sits in that same directory — anything else is
+/// left for the sweep.
 fn replace_orchestration_context_path(
     slot: &mut Option<std::path::PathBuf>,
     new: std::path::PathBuf,
+    dir: &crate::orchestrator_context::ContextDir,
 ) {
     if let Some(old) = slot.replace(new)
         && slot.as_deref() != Some(old.as_path())
     {
-        let _ = std::fs::remove_file(&old);
+        crate::orchestrator_context::remove_replaced_context(dir, &old);
     }
 }
 
@@ -14703,7 +14711,11 @@ pub fn run_tui(
                         ui.orchestration_ready_since.remove(id);
 
                         *orchestrator_prompt = Some(published.prompt);
-                        replace_orchestration_context_path(context_path, published.context_path);
+                        replace_orchestration_context_path(
+                            context_path,
+                            published.context_path,
+                            &published.dir,
+                        );
                         ui.orchestration_prompted.remove(id);
                         // Re-anchor the delivery deadline to NOW:
                         // `deliver_orchestrator_prompt` abandons once
@@ -14848,6 +14860,7 @@ pub fn run_tui(
                             replace_orchestration_context_path(
                                 context_path,
                                 published.context_path,
+                                &published.dir,
                             );
                             ui.orchestration_prompted.remove(id);
                             ui.orchestration_prompt_anchor_at.insert(*id, orch_now);

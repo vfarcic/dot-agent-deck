@@ -276,6 +276,16 @@ impl PrepTokens {
             .map(|r| r.binding.clone())
     }
 
+    /// Forget `token`, so it no longer identifies a preparation — for a
+    /// preparation withdrawn after its token was minted (issue #1233: its
+    /// deadline passed, or the reply had already gone out as expired). `true`
+    /// when this store held it.
+    pub fn revoke(&mut self, token: &str) -> bool {
+        let before = self.live.len();
+        self.live.retain(|r| r.token != token);
+        self.live.len() != before
+    }
+
     /// How many unexpired tokens the store holds. Test-facing.
     pub fn len(&self) -> usize {
         self.live.len()
@@ -318,6 +328,26 @@ pub fn issue(binding: PrepBinding) -> String {
 pub fn binding(token: &str) -> Option<PrepBinding> {
     let mut guard = store().lock().unwrap_or_else(|p| p.into_inner());
     guard.binding(token, Instant::now())
+}
+
+/// Revoke `token` in the daemon-wide store ([`PrepTokens::revoke`]).
+pub fn revoke(token: &str) -> bool {
+    let mut guard = store().lock().unwrap_or_else(|p| p.into_inner());
+    guard.revoke(token)
+}
+
+/// Whether the daemon-wide store holds a live token whose binding names
+/// `project_dir`. Test-facing: a withdrawn preparation's token is not visible
+/// to the test that provoked the withdrawal, so this is how it proves none
+/// stayed live.
+#[cfg(test)]
+pub(crate) fn any_live_for(project_dir: &std::path::Path) -> bool {
+    let mut guard = store().lock().unwrap_or_else(|p| p.into_inner());
+    guard.prune(Instant::now());
+    guard
+        .live
+        .iter()
+        .any(|r| r.binding.project_dir == project_dir)
 }
 
 /// Mint 128 bits of token value.
@@ -406,6 +436,20 @@ mod tests {
                 .is_none()
         );
         assert!(tokens.is_empty(), "an expired token is dropped, not kept");
+    }
+
+    /// Issue #1233: a revoked token is refused exactly like one never issued,
+    /// and revoking leaves every other token live.
+    #[test]
+    fn a_revoked_token_is_refused_and_the_others_stay_live() {
+        let mut tokens = PrepTokens::new();
+        let now = Instant::now();
+        let kept = tokens.issue(now, binding_for("/p"));
+        let revoked = tokens.issue(now, binding_for("/q"));
+        assert!(tokens.revoke(&revoked));
+        assert!(tokens.binding(&revoked, now).is_none());
+        assert!(tokens.binding(&kept, now).is_some());
+        assert!(!tokens.revoke(&revoked), "a second revoke finds nothing");
     }
 
     #[test]

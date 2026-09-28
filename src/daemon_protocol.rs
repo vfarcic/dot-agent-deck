@@ -565,10 +565,12 @@ pub const CAP_PREPARE_WORKFLOW: &str = "prepare-workflow";
 /// [`crate::project_resolve::PREPARE_DEADLINE`].
 ///
 /// Names a BEHAVIOUR rather than a verb or a field, and what it promises is
-/// exactly three things: the preparation is answered within that deadline
-/// unless a blocking filesystem call itself never returns; a preparation that
-/// expires is refused with [`PROJECT_ERR_PREPARATION_EXPIRED`] and leaves no
-/// context file, no token and no mirror write behind; and every preparation
+/// exactly three things: the preparation is answered within that deadline,
+/// including when a blocking filesystem call behind it stalls (the call keeps
+/// its thread; the answer does not wait for it); a preparation that expires is
+/// refused with [`PROJECT_ERR_PREPARATION_EXPIRED`] and leaves no context file,
+/// no live token and no mirror write behind — one still running at the
+/// deadline withdraws itself when it finishes; and every preparation
 /// publishes a file of its own, so even one answered late cannot replace a
 /// retry's. Together those are what make a CLIENT-side bound on the call safe:
 /// the desktop wraps its preparation in its per-call timeout only against a
@@ -1113,7 +1115,8 @@ pub const PROJECT_ERR_AMBIGUOUS_ORCHESTRATION: &str = "ambiguous-orchestration";
 /// Issue #1233 item 4: the daemon did not finish a
 /// [`AttachRequest::PrepareOrchestration`] within
 /// [`crate::project_resolve::PREPARE_DEADLINE`], so it prepared nothing — no
-/// context file stays published and no token was issued.
+/// context file stays published and no token stays live (one minted before
+/// the last deadline check is revoked).
 ///
 /// **Retryable**, and about the daemon's load rather than the request, the
 /// [`PROJECT_ERR_BUSY`] class: the same request sent again is answered normally
@@ -5088,11 +5091,18 @@ async fn handle_connection(
                     // (`CAP_PREPARE_DEADLINE`), taken HERE so the permit wait
                     // counts against it, and handed to the work so a publish
                     // that finishes late is withdrawn rather than answered.
+                    //
+                    // Its audit: the ANSWER is bounded, not only the permit
+                    // wait — a work still running at the deadline is answered
+                    // as expired and the shared latch makes it withdraw itself
+                    // when it finishes — and the compatibility mirror runs
+                    // after the answer has gone, only for a preparation that
+                    // committed to one.
                     let deadline =
                         tokio::time::Instant::now() + crate::project_resolve::PREPARE_DEADLINE;
                     let work_deadline = deadline.into_std();
-                    match crate::project_resolve::run_bounded_until(deadline, move || {
-                        crate::project_resolve::prepare_orchestration_before(
+                    match crate::project_resolve::run_bounded_answer(deadline, move |latch| {
+                        match crate::project_resolve::prepare_orchestration_before(
                             &path,
                             &orchestration,
                             &task,
@@ -5100,7 +5110,16 @@ async fn handle_connection(
                             &seeds,
                             Some(work_deadline),
                             &std::time::Instant::now,
-                        )
+                            Some(latch),
+                        ) {
+                            Ok(prepared) => {
+                                let (answer, mirror) = prepared.into_parts();
+                                let after: crate::project_resolve::AfterReply =
+                                    Box::new(move || mirror.write());
+                                (Ok(answer), Some(after))
+                            }
+                            Err(refusal) => (Err(refusal), None),
+                        }
                     })
                     .await
                     {
