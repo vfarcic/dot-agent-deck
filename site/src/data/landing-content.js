@@ -535,12 +535,28 @@ export const verify = {
  * `grep -rn 'orchestration-config' docs/ site/` returns nothing.
  */
 export const screenshots = {
+  /*
+   * The hero is a PAIR since PRD #1321, one frame per client, shown side by
+   * side at the same height. `aspect` is each frame's width over its height
+   * (1920x630 and 2560x1600); the page sizes the two columns in that ratio,
+   * which is what makes their heights match without cropping either. The
+   * terminal UI frame is a hand capture of a real orchestration; the desktop
+   * frame is `cargo docs-screenshots` output (the `agent-pane` scenario), an
+   * agent's full-window pane over the app's fixture data. They show the same
+   * kind of moment rather than the same agent, and the caption says so.
+   */
   hero: {
     src: '/img/orchestration-coder.png',
-    alt: 'Agent Deck’s split view — a sidebar of orchestrator, coder and reviewer cards with only the coder marked Working, beside the coder’s own pane running a grep, an edit to src/email/order_confirmation.rs, and cargo test order_confirmation',
-    caption:
-      'A coder pane working on what the orchestrator just delegated to it.',
+    aspect: 1920 / 630,
+    alt: 'Agent Deck’s terminal UI split view — a sidebar of orchestrator, coder and reviewer cards with only the coder marked Working, beside the coder’s own pane running a grep, an edit to src/email/order_confirmation.rs, and cargo test order_confirmation',
   },
+  heroDesktop: {
+    src: '/img/agent-pane-desktop.png',
+    aspect: 2560 / 1600,
+    alt: 'The desktop app’s full-window agent pane — a Codex agent marked RUNNING with its assignment, “Add the retry action to the checkout view”, above a terminal showing the files it read, an edit to src/components/RetryPayment.tsx, npm test -- checkout passing, and its summary',
+  },
+  heroCaption:
+    'An agent at work, in each client: in the terminal UI, a coder running what its orchestrator just delegated to it, beside the orchestration’s cards; in the desktop app, an agent’s own pane, with its assignment over the files it touched and a passing test run.',
   newPane: {
     src: '/img/orchestration-new-deck.png',
     alt: 'The New Agent form — Dir /tmp/storefront, a Mode row offering No mode, Orch: review-team, schedule and dispatcher, Agent on auto, Name storefront, Command claude, and Submit and Cancel buttons',

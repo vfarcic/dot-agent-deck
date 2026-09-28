@@ -126,6 +126,16 @@ function storyFrames(step) {
   }));
 }
 
+/**
+ * The hero's two windows, terminal UI first. The title in each window bar is
+ * what that client's own window is called: the binary for the terminal UI,
+ * the app's product name for the desktop app.
+ */
+const HERO_FRAMES = [
+  {label: 'Terminal UI', title: product.binary, shot: screenshots.hero},
+  {label: 'Desktop app', title: product.name, shot: screenshots.heroDesktop},
+];
+
 /*
  * The command is emitted one word per inline-block rather than as one string,
  * so that a wrapped command can only ever break at a space. `index.module.css`
@@ -184,20 +194,36 @@ export default function Home() {
 
         <main>
           <section className={styles.showcase}>
-            <figure className={styles.device}>
-              <div className={styles.deviceBar} aria-hidden="true">
-                <span className={styles.light} />
-                <span className={styles.light} />
-                <span className={styles.light} />
-                <span className={styles.deviceTitle}>{product.binary}</span>
-              </div>
-              <img
-                className={styles.deviceImage}
-                src={screenshots.hero.src}
-                alt={screenshots.hero.alt}
-              />
-            </figure>
-            <p className={styles.showcaseCaption}>{screenshots.hero.caption}</p>
+            {/*
+              * Both clients, side by side (PRD #1321): each column's width is
+              * its frame's aspect ratio, so the two windows stand the same
+              * height. They stack on narrow screens.
+              */}
+            <div
+              className={styles.showcasePair}
+              style={{
+                '--hero-columns': HERO_FRAMES.map(
+                  (f) => `minmax(0, ${f.shot.aspect}fr)`,
+                ).join(' '),
+              }}>
+              {HERO_FRAMES.map((f) => (
+                <figure key={f.label} className={styles.device}>
+                  <div className={styles.deviceBar} aria-hidden="true">
+                    <span className={styles.light} />
+                    <span className={styles.light} />
+                    <span className={styles.light} />
+                    <span className={styles.deviceTitle}>{f.title}</span>
+                    <span className={styles.deviceLabel}>{f.label}</span>
+                  </div>
+                  <img
+                    className={styles.deviceImage}
+                    src={f.shot.src}
+                    alt={f.shot.alt}
+                  />
+                </figure>
+              ))}
+            </div>
+            <p className={styles.showcaseCaption}>{screenshots.heroCaption}</p>
           </section>
 
           <section className={styles.agentStrip}>

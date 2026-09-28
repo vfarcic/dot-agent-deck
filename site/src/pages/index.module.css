@@ -210,9 +210,32 @@
   padding: 1rem 1rem 3.5rem;
 }
 
-.device {
+/*
+ * The hero is one window per client, side by side (PRD #1321). The column
+ * widths come from `index.js` as `--hero-columns`, each in proportion to its
+ * frame's aspect ratio, so the two windows stand the same height without
+ * cropping either. A custom property rather than an inline
+ * `grid-template-columns`, so the narrow-screen rule below can still
+ * override it and stack them.
+ */
+.showcasePair {
   max-width: 1180px;
   margin: 0 auto;
+  display: grid;
+  grid-template-columns: var(--hero-columns, repeat(2, minmax(0, 1fr)));
+  gap: 1.25rem;
+  align-items: start;
+}
+
+@media (max-width: 996px) {
+  .showcasePair {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.device {
+  min-width: 0;
+  margin: 0;
   border: 1px solid var(--c-line);
   border-radius: 12px;
   overflow: hidden;
@@ -239,6 +262,15 @@
   margin-left: 0.75rem;
   font-size: 0.75rem;
   color: var(--c-dim);
+}
+
+.deviceLabel {
+  margin-left: auto;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--c-teal);
 }
 
 .deviceImage {
