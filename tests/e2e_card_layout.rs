@@ -280,16 +280,8 @@ fn card_stats_005_real_agent_card_narrows_without_restructuring() {
     let prompt = format!(
         "Use Bash exactly once to run sleep 4; ls -1. Then respond with only the exact complete filename beginning with {SENTINEL_PREFIX} that the listing revealed. Do not use any other tool."
     );
-    control.send_keys(prompt.as_bytes());
-    control.send_keys(b"\r");
-    events.wait_for(
-        |event| {
-            event.agent_id.as_deref() == Some(agent_id.as_str())
-                && event.agent_type == AgentType::ClaudeCode
-                && event.event_type == EventType::Thinking
-        },
-        Duration::from_secs(120),
-    );
+    let submitted = control.submit_claude_prompt(&events, &agent_id, &prompt, SENTINEL_PREFIX);
+    assert_eq!(submitted.agent_type, AgentType::ClaudeCode);
 
     control.send_keys(b"\x04");
     control.wait_for_string("Dir:");
