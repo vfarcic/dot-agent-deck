@@ -12,20 +12,23 @@ The **Daemon** selector under the Dashboard's title chooses what the Dashboard s
 
 - **All daemons** — every daemon at once, one section each. The **DAEMONS** counter then says how many of them answered.
 - **This machine** — the daemon on this computer. The app finds it at the same default address the TUI uses; if you point the TUI at another socket with `DOT_AGENT_DECK_ATTACH_SOCKET`, launch the app with the same variable.
-- One entry per remote daemon added in Settings, named after its user, host and port.
+- One entry per remote daemon added in Settings, called by its name — the same name `dot-agent-deck connect <name>` takes. A daemon with no usable name is called by its user, host and port.
 
 The selector's menu only chooses. Daemons are added and removed in **Settings → Daemons**.
 
 ## Settings → Daemons
 
-Open **Settings** in the rail and choose **Daemons**. The **Daemon** row lists the same choices as the selector; choose one to see or change its settings, or press **Add a daemon** to add a remote one. The trash icon beside a remote daemon removes it from the app; it does nothing on the host.
+Open **Settings** in the rail and choose **Daemons**. The **Daemon** row lists the same choices as the selector, with each remote daemon's address beside its name; choose one to see or change its settings, or press **Add a daemon** to add a remote one. The trash icon beside a remote daemon removes it from the app; it does nothing on the host.
 
-![Settings → Daemons with a remote daemon, build-box, chosen in the Daemon row beside All daemons and This machine, its Host filled in, the other fields showing their placeholders, and Test connection below, not yet pressed](/img/settings-daemons-desktop.png)
+To add a remote daemon, fill in its **Host** (and any other fields you need), check the **Deck name** the app suggests or type your own, and press **Add this daemon**. The daemon is added and chosen. To rename a daemon you already added, choose it, change **Deck name**, and press **Rename**. A name the app cannot use, such as one another daemon already has, is refused with the reason under the field.
+
+![Settings → Daemons with a remote daemon named build, its address build-box beside the name, chosen in the Daemon row beside All daemons and This machine; below it the Deck name field reads build with a Rename button, Host is filled in, the other fields show their placeholders, and Test connection is not yet pressed](/img/settings-daemons-desktop.png)
 
 A remote daemon has these fields:
 
 | Field | What it is |
 | --- | --- |
+| **Deck name** | What the app calls the daemon, and the name `dot-agent-deck connect <name>` takes. Suggested from the host and user when you add one. |
 | **Host** | The host name or address to ssh to. |
 | **User** | The ssh user. Leave it empty to take it from your ssh config. |
 | **Port** | The ssh port, `22` by default. |

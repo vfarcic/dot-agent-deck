@@ -377,6 +377,11 @@ export function useDeckRuntime(): DeckRuntimeState {
   const secretStatus = useCallback((id: VoiceSecretId) => bridge.secretStatus(id), [bridge]);
   const storeSecret = useCallback((id: VoiceSecretId, secret: string) => bridge.storeSecret(id, secret), [bridge]);
   const forgetSecret = useCallback((id: VoiceSecretId) => bridge.forgetSecret(id), [bridge]);
+  // Issue #1426. Not wrapped in `setError` either: a refused name is a sentence
+  // the Daemons panel shows beside the field.
+  const renameDeck = useCallback((id: string, name: string) => bridge.renameDeck(id, name), [bridge]);
+  const defaultDeckName = useCallback((host: string, user?: string) => bridge.defaultDeckName(host, user), [bridge]);
+  const checkDeckName = useCallback((name: string, id?: string) => bridge.checkDeckName(name, id), [bridge]);
 
   /*
    * PRD #802 M6: the voice seam. Every one is wrapped so its identity is stable
@@ -486,6 +491,9 @@ export function useDeckRuntime(): DeckRuntimeState {
     secretStatus,
     storeSecret,
     forgetSecret,
+    renameDeck,
+    defaultDeckName,
+    checkDeckName,
     declareVoiceScreen,
     resolveVoice,
     voiceCommands,

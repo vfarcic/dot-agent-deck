@@ -501,7 +501,7 @@ const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
 /// name scan on this side would repeat the mistake #827 is about: `endpoint:
 /// string` passes any name check and is a free-text field. A diff here is the
 /// review prompt.
-const PINNED_TS_FIELDS: [(&str, &str, &str); 25] = [
+const PINNED_TS_FIELDS: [(&str, &str, &str); 26] = [
     ("DesktopSettingsDto", "version", "number"),
     (
         "DesktopSettingsDto",
@@ -533,6 +533,10 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 25] = [
     ("RemoteEndpointDto", "id", "string"),
     ("RemoteEndpointDto", "identity?", "string"),
     ("RemoteEndpointDto", "jump?", "string"),
+    // Issue #1426: the deck's name in the shared deck list, a validated slug
+    // (`DeckName`) on the Rust side. `null` is a row whose stored name is not
+    // a usable deck name.
+    ("RemoteEndpointDto", "name?", "string | null"),
     ("RemoteEndpointDto", "port", "number"),
     ("RemoteEndpointDto", "socket?", "string"),
     ("RemoteEndpointDto", "user?", "string"),

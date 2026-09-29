@@ -81,6 +81,18 @@ export interface DesktopSettingsState {
    * which is right for any handler reacting to the render it was given.
    */
   save: (next: DesktopSettingsDto, from?: DesktopSettingsDto) => void;
+  /**
+   * Run a write that is NOT a save and adopt the document it resolves with
+   * (issue #1426's rename, which the shared library performs and which a save
+   * must never do).
+   *
+   * Queued behind any save still in flight, so the document it answers with is
+   * the newest and a slower save cannot overwrite it on screen. Resolves with
+   * that document; a rejection is handed back unchanged, for the caller to
+   * show where the user asked, and leaves the document on screen as it was.
+   * Optional so a hand-built state in a test need not restate it.
+   */
+  apply?: (write: () => Promise<DesktopSettingsDto>) => Promise<DesktopSettingsDto>;
 }
 
 export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsState {
@@ -268,9 +280,25 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
     });
   }, [saveSettings]);
 
+  const apply = useCallback((write: () => Promise<DesktopSettingsDto>) => {
+    const ticket = newest.current + 1;
+    newest.current = ticket;
+    const done = queue.current.then(write).then((written) => {
+      edited.current = true;
+      accepted.current += 1;
+      setDocumentProblem(undefined);
+      setSaveFailure(undefined);
+      if (newest.current === ticket) setSettings(written);
+      return written;
+    });
+    // The queue carries on whatever this write did; the caller hears about it.
+    queue.current = done.then(() => undefined, () => undefined);
+    return done;
+  }, []);
+
   // `edited` is a ref, and this reads it during render — safe here, and only
   // here, because it is monotonic (false to true, never back) and every write
   // to it is paired with a `setSettings` in the same call, so the render that
   // observes the new value is one React was already going to perform.
-  return { settings, path, loaded, chosen: read || edited.current, saveError: saveFailure ?? documentProblem, problem: documentProblem, save };
+  return { settings, path, loaded, chosen: read || edited.current, saveError: saveFailure ?? documentProblem, problem: documentProblem, save, apply };
 }

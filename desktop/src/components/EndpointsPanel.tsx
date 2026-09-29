@@ -35,15 +35,21 @@
  * direction: it spreads `settings` and replaces only `endpoints`, so a section
  * some future build adds survives a save made from here.
  *
- * # There is no display name
+ * # A deck's name is the shared deck list's (issue #1426)
  *
- * M6 decided that deliberately: a user-chosen label is exactly the arbitrary
- * `String` the settings field-type guard refuses, and it would need its own bidi
- * and control-character handling before anything rendered it. `describeEndpoint`
- * derives the label from the address, and every byte of that came through a
- * validated ASCII charset. `sanitizeText` is still applied at this seam, because
- * the line that names the deck is the one place a reordering character has a
- * direct consequence — not because the value is expected to carry one.
+ * A deck is called by its name in the shared deck list — the one `dot-agent-deck
+ * connect` takes — with its address beside it, so a name never hides which
+ * machine it points at. The name is not free text: it is a validated slug
+ * (`DeckName`) and the shared library is the only authority on the rule, so this
+ * panel holds no copy of it. It asks the bridge for the name an added deck would
+ * get (`defaultDeckName`), whether a typed name is acceptable
+ * (`checkDeckName`), and to rename a stored deck (`renameDeck`).
+ *
+ * Adding a deck therefore takes an explicit confirmation (`save-new-deck`):
+ * the name is pre-filled with the derived one and the user may change it
+ * before anything is stored. A rename is not a save — a save never renames a
+ * deck — so it does not go through `onSave`; whoever provides `renameDeck`
+ * applies the document it answers with.
  *
  * # Layout
  *
@@ -59,7 +65,7 @@
  * is built this way is in `docs/` and in the PRD, per that document's text rule.
  */
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, Check, Plug, Plus, Trash2 } from "lucide-react";
+import { AlertTriangle, Check, Pencil, Plug, Plus, Trash2 } from "lucide-react";
 import type {
   DesktopSettingsDto,
   EndpointSettingsDto,
@@ -72,6 +78,7 @@ import {
   ALL_ENDPOINT_SELECTION,
   blankEndpoint,
   deckChoices,
+  endpointAddress,
   endpointSectionToSave,
   FIELD_PLACEHOLDERS,
   hostProblem,
@@ -100,11 +107,21 @@ function sectionOf(settings: DesktopSettingsDto): EndpointSettingsDto {
   return settings.endpoints ?? { remote: [], selection: LOCAL_ENDPOINT_SELECTION };
 }
 
+/** A rejection as the sentence to show: the bridge rejects with a plain string. */
+function refusalText(cause: unknown): string {
+  if (typeof cause === "string") return cause;
+  return cause instanceof Error ? cause.message : String(cause);
+}
+
 export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPanelProps) {
   // `undefined` wherever no provider is mounted — a panel rendered standalone,
   // or a surface with no bridge. The Test connection button is then absent
   // rather than present and broken; see `lib/settingsBridge.tsx`.
-  const onTest = useSettingsBridge()?.testEndpoint;
+  const bridge = useSettingsBridge();
+  const onTest = bridge?.testEndpoint;
+  const defaultDeckName = bridge?.defaultDeckName;
+  const checkDeckName = bridge?.checkDeckName;
+  const renameDeck = bridge?.renameDeck;
   const section = sectionOf(settings);
   const selection = section.selection;
   const [reports, setReports] = useState<Record<string, EndpointTestReportDto>>({});
@@ -125,6 +142,33 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
    * instead, and the stored selection only moves when the row commits.
    */
   const [draft, setDraft] = useState<RemoteEndpointDto>();
+  /**
+   * The name the draft will be stored under (issue #1426), held beside it
+   * rather than in it so a pre-fill can arrive without the draft's fields
+   * moving. Empty means "the one the library derives", which is what a save
+   * without a name gets.
+   */
+  const [draftName, setDraftName] = useState("");
+  /** Once the user types a name, a later pre-fill must not overwrite it. */
+  const draftNameTouched = useRef(false);
+  /** The draft as of the latest edit, for the confirmation that resolves after an `await`. */
+  const latestDraft = useRef(draft);
+  latestDraft.current = draft;
+  /**
+   * What the library said about the last name checked, keyed by the row it was
+   * checked for and the exact text. A verdict for any other text is stale and
+   * is neither shown nor acted on.
+   */
+  const [nameCheck, setNameCheck] = useState<{ id: string; name: string; refusal: string | null }>();
+  /**
+   * A stored deck's name while it is being edited, and the name it was
+   * edited FROM: a rename that lands, or one made elsewhere, moves the row's
+   * name and so retires the edit rather than leaving a stale value on screen.
+   */
+  const [renameEdit, setRenameEdit] = useState<{ id: string; from: string; value: string }>();
+  const [renameRefusal, setRenameRefusal] = useState<{ id: string; message: string }>();
+  const [renaming, setRenaming] = useState(false);
+  const [confirming, setConfirming] = useState(false);
 
   /**
    * The document as of the latest render, for a write-back that happens after
@@ -172,6 +216,56 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
    */
   const fleetSelected = shown === ALL_ENDPOINT_SELECTION;
 
+  const storedName = selected && !draft ? selected.name ?? "" : "";
+  const renameValue = selected && !draft && renameEdit?.id === selected.id && renameEdit.from === storedName
+    ? renameEdit.value
+    : storedName;
+  /** The name field's text for the row on screen: the draft's, or the stored row's edit. */
+  const nameValue = draft ? draftName : renameValue;
+  const verdict = selected && nameCheck?.id === selected.id && nameCheck.name === nameValue ? nameCheck.refusal : undefined;
+  const nameRefusal = (selected && renameRefusal?.id === selected.id ? renameRefusal.message : undefined) ?? verdict ?? undefined;
+
+  /*
+    Issue #1426: pre-fill a draft's name with the one the library would derive
+    for it, as soon as it has an address to derive from — and only until the
+    user types one of their own. A stale answer (the host changed again while
+    it was in flight) is dropped.
+  */
+  const draftId = draft?.id;
+  const draftHost = draft?.host ?? "";
+  const draftUser = draft?.user;
+  useEffect(() => {
+    if (!draftId || !defaultDeckName || draftNameTouched.current) return;
+    if (hostProblem(draftHost) || userProblem(draftUser ?? "")) return;
+    let current = true;
+    defaultDeckName(draftHost, draftUser || undefined)
+      .then((name) => {
+        if (current && !draftNameTouched.current) setDraftName(name);
+      })
+      .catch(() => undefined);
+    return () => { current = false; };
+  }, [draftId, draftHost, draftUser, defaultDeckName]);
+
+  /*
+    Check the name on screen with the library as it is typed, so a refused one
+    is said beside the field and cannot be confirmed. The stored row's own
+    current name is not checked: it is the name it already has.
+  */
+  const checkedId = selected?.id;
+  const isDraft = draft !== undefined;
+  const checkWanted = Boolean(checkedId && nameValue && (isDraft || nameValue !== storedName));
+  useEffect(() => {
+    if (!checkWanted || !checkedId || !checkDeckName) return;
+    let current = true;
+    const name = nameValue;
+    checkDeckName(name, isDraft ? undefined : checkedId)
+      .then((refusal) => {
+        if (current) setNameCheck({ id: checkedId, name, refusal: refusal || null });
+      })
+      .catch(() => undefined);
+    return () => { current = false; };
+  }, [checkWanted, checkedId, nameValue, isDraft, checkDeckName]);
+
   /**
    * Write a new endpoint section back into `document`. The whole document goes,
    * with it spread — see the round-trip note at the top of this file.
@@ -209,6 +303,62 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
     // user then has to select is two steps for one intent, and a deck with no
     // host is not one the app can be pointed at yet.
     setDraft(blankEndpoint());
+    setDraftName("");
+    draftNameTouched.current = false;
+  };
+
+  /**
+   * Store the draft and select it (issue #1426) — the confirmation that used to
+   * happen on its own the moment the row was valid, and is now the user's, so
+   * the pre-filled name can be changed first.
+   *
+   * The name is checked once more at the moment of confirming, because the
+   * verdict on screen may still be in flight; a refusal is shown and nothing is
+   * stored. An empty name stores none, and the library derives one.
+   */
+  const confirmDraft = async () => {
+    const pending = latestDraft.current;
+    if (!pending || rowProblems(pending).length > 0) return;
+    const name = draftName;
+    if (name && checkDeckName) {
+      setConfirming(true);
+      let refusal: string | null;
+      try {
+        refusal = await checkDeckName(name, undefined);
+      } catch (cause) {
+        refusal = refusalText(cause);
+      } finally {
+        setConfirming(false);
+      }
+      if (refusal) {
+        setNameCheck({ id: pending.id, name, refusal });
+        return;
+      }
+    }
+    // The draft as it is NOW, which the user may have edited while the check
+    // ran; abandoned meanwhile means there is nothing to store.
+    const now = latestDraft.current;
+    if (!now || now.id !== pending.id || rowProblems(now).length > 0) return;
+    const document = latest.current;
+    const current = sectionOf(document);
+    const row: RemoteEndpointDto = name ? { ...now, name } : now;
+    setDraft(undefined);
+    saveSectionOf(document, { remote: [...current.remote, row], selection: row.id });
+  };
+
+  /** Rename the stored deck on screen (issue #1426); never through `onSave`. */
+  const rename = async (id: string, name: string) => {
+    if (!renameDeck) return;
+    setRenaming(true);
+    setRenameRefusal(undefined);
+    try {
+      await renameDeck(id, name);
+      setRenameEdit(undefined);
+    } catch (cause) {
+      setRenameRefusal({ id, message: refusalText(cause) });
+    } finally {
+      setRenaming(false);
+    }
   };
 
   /**
@@ -243,6 +393,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
   const removeDeck = (id: string) => {
     if (draft?.id === id) {
       setDraft(undefined);
+      setDraftName("");
       forgetReport(id);
       return;
     }
@@ -256,16 +407,10 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
 
   const editDeck = (id: string, change: Partial<RemoteEndpointDto>) => {
     if (draft?.id === id) {
-      const next = { ...draft, ...change };
-      // The moment it is storable it stops being a draft: it goes into the
-      // document and becomes the selection, which is what clicking "Add a deck"
-      // was always asking for. Until then nothing is written, so no save fails.
-      if (rowProblems(next).length === 0) {
-        setDraft(undefined);
-        saveSection({ remote: [...section.remote, next], selection: next.id });
-      } else {
-        setDraft(next);
-      }
+      // Held until the user confirms it (`confirmDraft`), which is when it goes
+      // into the document and becomes the selection. Until then nothing is
+      // written, so no save fails.
+      setDraft({ ...draft, ...change });
       return;
     }
     saveSection({
@@ -369,6 +514,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
               key={choice.token}
               id={choice.token}
               label={displayText(choice.label, DISPLAY_LIMITS.name)}
+              address={choice.address ? displayText(choice.address, DISPLAY_LIMITS.name) : undefined}
               selected={shown === choice.token}
               onSelect={() => chooseDeck(choice.token)}
               onRemove={removable.has(choice.token) ? () => removeDeck(choice.token) : undefined}
@@ -389,6 +535,46 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
 
       {selected && (
         <div className="deck-detail" data-testid="deck-detail">
+          {draft && (defaultDeckName || checkDeckName) && (
+            <TextRow
+              id={`deck-name-${selected.id}`}
+              label="Deck name"
+              value={draftName}
+              placeholder="derived from the address"
+              problem={nameRefusal}
+              onChange={(name) => {
+                draftNameTouched.current = true;
+                setDraftName(name);
+              }}
+            />
+          )}
+          {!draft && renameDeck && (
+            <>
+              <TextRow
+                id={`deck-name-${selected.id}`}
+                label="Deck name"
+                value={renameValue}
+                placeholder={endpointAddress(selected)}
+                problem={nameRefusal}
+                onChange={(value) => {
+                  setRenameRefusal(undefined);
+                  setRenameEdit({ id: selected.id, from: storedName, value });
+                }}
+              />
+              {/* Under the field rather than beside it, so the row keeps the
+                  house shape: a label and one input. */}
+              <div className="deck-row-actions">
+                <button
+                  className="button secondary compact"
+                  data-testid="rename-deck"
+                  disabled={renaming || !renameValue || renameValue === storedName || Boolean(verdict)}
+                  onClick={() => void rename(selected.id, renameValue)}
+                >
+                  <Pencil size={13} /> {renaming ? "Renaming…" : "Rename"}
+                </button>
+              </div>
+            </>
+          )}
           <TextRow
             id={`deck-host-${selected.id}`}
             label="Host"
@@ -442,6 +628,18 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
             problem={socketProblem(selected.socket ?? "")}
             onChange={(socket) => editDeck(selected.id, { socket: socket || undefined })}
           />
+          {draft && (
+            <div className="deck-row-actions">
+              <button
+                className="button primary compact"
+                data-testid="save-new-deck"
+                disabled={confirming || rowProblems(draft).length > 0 || Boolean(verdict)}
+                onClick={() => void confirmDraft()}
+              >
+                <Check size={13} /> Add this daemon
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -477,10 +675,14 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
   );
 }
 
-/** One deck in the chooser: a radio, plus a remove button for a stored one. */
-function DeckChoice({ id, label, selected, onSelect, onRemove }: {
+/**
+ * One deck in the chooser: a radio, plus a remove button for a stored one.
+ * A named deck shows its address beside the name (issue #1426).
+ */
+function DeckChoice({ id, label, address, selected, onSelect, onRemove }: {
   id: string;
   label: string;
+  address?: string;
   selected: boolean;
   onSelect: () => void;
   onRemove?: () => void;
@@ -490,6 +692,7 @@ function DeckChoice({ id, label, selected, onSelect, onRemove }: {
       <label>
         <input type="radio" name="deck" value={id} checked={selected} onChange={onSelect} />
         <span>{label}</span>
+        {address && <small className="deck-choice-address">{address}</small>}
       </label>
       {onRemove && (
         <button className="icon-button" aria-label={`Remove ${label}`} data-testid={`remove-deck-${id}`} onClick={onRemove}>

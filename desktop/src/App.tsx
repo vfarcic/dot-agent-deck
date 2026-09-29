@@ -1962,14 +1962,29 @@ function Toast({ message, onDismiss, warnings, onDismissWarning }: { message?: s
 function ShellSettings({ runtime, settings, open, onClose }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; open: boolean; onClose: () => void }) {
   // Memoised so the context value is stable across renders; `runtime.testEndpoint`
   // is itself stable for the lifetime of the bridge.
+  //
+  // Issue #1426: the rename is applied HERE, through `settings.apply`, because a
+  // rename is not a save — the panel never hands it to `onSave` — and the
+  // document it answers with is what every surface reading settings must see.
+  const { renameDeck: runtimeRename, defaultDeckName, checkDeckName } = runtime;
+  const apply = settings.apply;
+  const renameDeck = useMemo(
+    () => runtimeRename && apply
+      ? (id: string, name: string) => apply(() => runtimeRename(id, name))
+      : runtimeRename,
+    [runtimeRename, apply],
+  );
   const settingsBridge = useMemo(
     () => ({
       testEndpoint: runtime.testEndpoint,
       secretStatus: runtime.secretStatus,
       storeSecret: runtime.storeSecret,
       forgetSecret: runtime.forgetSecret,
+      renameDeck,
+      defaultDeckName,
+      checkDeckName,
     }),
-    [runtime.testEndpoint, runtime.secretStatus, runtime.storeSecret, runtime.forgetSecret],
+    [runtime.testEndpoint, runtime.secretStatus, runtime.storeSecret, runtime.forgetSecret, renameDeck, defaultDeckName, checkDeckName],
   );
   return (
     <SettingsBridgeProvider value={settingsBridge}>
