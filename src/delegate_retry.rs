@@ -848,6 +848,15 @@ pub(crate) struct DeliveryRetry {
     pub delivery_id: String,
     /// The exact pointer the first write typed.
     pub pointer: String,
+    /// The worker's PTY geometry epoch
+    /// ([`AgentPtyRegistry::geometry_changes_of`]), sampled BEFORE the first
+    /// write began (Qodo, PR #1414). Sampling it when the loop starts would miss
+    /// a resize during that write — which holds its CR for up to the echo bound
+    /// plus `SUBMIT_DELAY` — and read the blank screen it leaves as a pointer
+    /// that never went in, retyping a duplicate. Sampled early, a resize at any
+    /// point after the write started counts; one before it only makes the
+    /// first reading more cautious.
+    pub pointer_epoch: Option<u64>,
     pub orchestration: Option<OrchestrationIdentity>,
     /// What the re-deliveries wrote, shared with the silent-worker report so
     /// it can say what was tried.
@@ -1008,6 +1017,7 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
         role,
         delivery_id,
         pointer,
+        pointer_epoch,
         orchestration,
         redeliveries,
         silence_report_armed,
@@ -1038,10 +1048,11 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
     // (`Composer::PointerInHistory`). From then on this delivery is never
     // retyped, whatever a later screen shows.
     let mut seen_submitted = false;
-    // The PTY geometry epoch the pointer's bytes were last typed at. A resize
-    // clears the scrollback the composer is read from (PRD #104 M3), so after one
-    // a blank screen is no evidence the pointer is gone.
-    let mut pointer_epoch = registry.geometry_changes_of(&worker_agent_id);
+    // The PTY geometry epoch from before the pointer's bytes were last typed. A
+    // resize clears the scrollback the composer is read from (PRD #104 M3), so
+    // after one a blank screen is no evidence the pointer is gone. The first
+    // write's comes from the dispatch, sampled before that write began.
+    let mut pointer_epoch = pointer_epoch;
     // When the current wait began: the first write, then the start of each
     // re-delivery. Each schedule entry is measured from here, so a probe's grace
     // and its retype come out of the wait rather than stretching the schedule.
@@ -1474,6 +1485,10 @@ async fn redeliver(
     // `SUBMIT_DELAY`; a worker that has sat idle through a retry wait is not
     // one (0 of 20 lost against an idle Claude Code composer under the same
     // load that lost 3 of 30 first writes).
+    //
+    // The geometry epoch is read BEFORE the write, as the dispatch reads the
+    // first write's: a resize during this write's `SUBMIT_DELAY` then counts.
+    let epoch_before_write = registry.geometry_changes_of(worker_agent_id);
     let outcome = registry
         .write_and_submit_guarded_detailed(pane_id, text, worker_agent_id, || async move {
             if revalidate_registry.is_pane_closing(&revalidate_pane) {
@@ -1521,8 +1536,9 @@ async fn redeliver(
                     text,
                     Some(GuardedSend::Applied),
                 );
-                // The pointer's bytes are on screen at the current geometry now.
-                *pointer_epoch = registry.geometry_changes_of(worker_agent_id);
+                // The pointer's bytes went in at this epoch, or before a resize
+                // a later reading will see.
+                *pointer_epoch = epoch_before_write;
             }
             info!(
                 pane_id = %escape_id_for_log(pane_id),
@@ -2316,6 +2332,25 @@ while chunk := os.read(0, 4096):
     os.write(1, chunk.replace(b'\r', b'').replace(b'\n', b''))
 "#;
 
+    /// A worker that does not echo and, on every resize, clears its screen the
+    /// way an agent's repaint does: after a resize its screen holds bytes, all
+    /// of them blank. An empty snapshot is unreadable on its own, so a blank
+    /// screen needs this to depend on whether the resize was seen at all.
+    const CLEARS_ON_RESIZE: &str = r#"import os
+import signal
+import sys
+import termios
+
+attrs = termios.tcgetattr(0)
+attrs[3] &= ~termios.ECHO
+termios.tcsetattr(0, termios.TCSANOW, attrs)
+signal.signal(signal.SIGWINCH, lambda *_: os.write(1, b'\x1b[2J\x1b[H'))
+sink = open(sys.argv[1], 'ab', buffering=0)
+os.write(1, b'READY')
+while chunk := os.read(0, 4096):
+    sink.write(chunk)
+"#;
+
     /// Whether `python3` can be spawned. Through Tokio's process API so the
     /// check does not block a runtime worker.
     async fn python3_available() -> bool {
@@ -2363,6 +2398,15 @@ while chunk := os.read(0, 4096):
                 return None;
             }
             Some(Self::spawn_python(pane, COMPOSER).await)
+        }
+
+        /// A worker running [`CLEARS_ON_RESIZE`]. `None` where `python3` is
+        /// not available.
+        async fn start_clearing_on_resize(pane: &str) -> Option<Self> {
+            if !python3_available().await {
+                return None;
+            }
+            Some(Self::spawn_python(pane, CLEARS_ON_RESIZE).await)
         }
 
         /// A worker running the Python `source`, which is handed the sink's path
@@ -2437,11 +2481,24 @@ while chunk := os.read(0, 4096):
             schedule: &str,
             retype: RetypePolicy,
         ) -> (tokio::task::JoinHandle<RetryEnd>, Arc<RedeliveryCounts>) {
+            self.deliver_then_retry(schedule, retype, |_| {}).await
+        }
+
+        /// [`Self::deliver_and_retry_with`], running `between` after the first
+        /// write and before the loop is spawned.
+        async fn deliver_then_retry(
+            &self,
+            schedule: &str,
+            retype: RetypePolicy,
+            between: impl FnOnce(&Self),
+        ) -> (tokio::task::JoinHandle<RetryEnd>, Arc<RedeliveryCounts>) {
             let event_rx = self.tx.subscribe();
             let armed =
                 self.registry
                     .pending_deliveries()
                     .arm(&self.pane, ID, &self.agent, None, retype);
+            // Before the write, as the dispatch samples it.
+            let pointer_epoch = self.registry.geometry_changes_of(&self.agent);
             let first = self
                 .registry
                 .write_and_submit_guarded_detailed(&self.pane, POINTER, &self.agent, || async {
@@ -2456,6 +2513,7 @@ while chunk := os.read(0, 4096):
                 POINTER,
                 Some(GuardedSend::Applied),
             );
+            between(self);
             let redeliveries = Arc::new(RedeliveryCounts::default());
             let handle = spawn(DeliveryRetry {
                 registry: Arc::clone(&self.registry),
@@ -2467,6 +2525,7 @@ while chunk := os.read(0, 4096):
                 role: "coder".to_string(),
                 delivery_id: ID.to_string(),
                 pointer: POINTER.to_string(),
+                pointer_epoch,
                 orchestration: None,
                 redeliveries: Arc::clone(&redeliveries),
                 silence_report_armed: false,
@@ -2550,6 +2609,47 @@ while chunk := os.read(0, 4096):
             "each retype must follow an Enter that went unanswered: {lines:?}"
         );
         assert!(!fx.registry.pending_deliveries().is_pending(&fx.pane));
+        fx.stop();
+    }
+
+    /// Qodo, PR #1414: a resize that lands after the first write began but
+    /// before the loop starts still counts. The worker does not echo, so the
+    /// pointer never reaches its screen, and on the resize it clears what the
+    /// screen did hold: every reading is blank. Blank after a resize is no
+    /// evidence the pointer is gone, so every re-delivery is the probe Enter
+    /// and the pointer is never typed again. Seen from an epoch sampled after
+    /// the resize, the same screen reads as a composer with nothing in it, and
+    /// the pointer is retyped.
+    #[tokio::test]
+    async fn retry_loop_counts_a_resize_between_the_first_write_and_its_start() {
+        let Some(fx) = Fixture::start_clearing_on_resize("retry-resize-before-loop").await else {
+            eprintln!("SKIP: python3 is not available");
+            return;
+        };
+        let (handle, redeliveries) = fx
+            .deliver_then_retry("150,150", RetypePolicy::Allowed, |fx| {
+                let (rows, cols) = fx.registry.pty_size_for_pane(&fx.pane).expect("worker");
+                fx.registry
+                    .resize(&fx.agent, rows + 1, cols + 1)
+                    .expect("resize the worker");
+            })
+            .await;
+        assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
+        assert_eq!(
+            redeliveries.tally(),
+            RedeliveryTally {
+                attempts: 2,
+                enters: 2,
+                retypes: 0
+            },
+            "a screen blanked by a resize after the write began must never be retyped into"
+        );
+        let lines = fx.received_lines(3).await;
+        assert_eq!(
+            lines,
+            [POINTER, "", ""],
+            "the first write, then only the probe Enters: {lines:?}"
+        );
         fx.stop();
     }
 

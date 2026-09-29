@@ -4811,19 +4811,32 @@ async fn wait_for_worker_event(
 /// predicate ([`crate::delegate_retry::classify_event`] agrees with
 /// [`worker_event_proves_delivery`]), so a turn it saw is a turn the report
 /// would have seen. A lag or a closed bus suppresses, as in
-/// [`wait_for_worker_event`]. Every other end — the schedule ran out, a write
-/// was refused, the pane or agent went away, the loop was cancelled — is left to
-/// the report's own seq-conditional take: an ack, a `work-done` or a supersede
-/// has already removed the watch's record, and exhaustion is the case the report
-/// exists for. A quota block is not proof, exactly as it is not for the watch.
-/// An unknown end (the loop's task dropped its sender without sending) reports.
-fn silence_retry_end_proves_delivery(end: Option<crate::delegate_retry::RetryEnd>) -> bool {
+/// [`wait_for_worker_event`].
+///
+/// A quota block suppresses too (Qodo, PR #1414), though it proves nothing
+/// about the pointer: the report would say no event arrived, when one did, and
+/// send the orchestrator after a delivery fault that is really the provider's
+/// limit. That event is already reported, accurately: the daemon latches it for
+/// the pane's live owner and claims issue #714's blocked-worker notice for this
+/// same delegation record (`notify_orchestrator_of_quota_block` in
+/// `src/daemon.rs`), which is bound to the worker before the pointer is written
+/// — and a block published before the bind is reported to the delegation by
+/// [`crate::agent_pty::AgentPtyRegistry::report_published_block_to_new_delegation`].
+///
+/// Every other end — the schedule ran out, a write was refused, the pane or
+/// agent went away, the loop was cancelled — is left to the report's own
+/// seq-conditional take: an ack, a `work-done` or a supersede has already
+/// removed the watch's record, and exhaustion is the case the report exists
+/// for. An unknown end (the loop's task dropped its sender without sending)
+/// reports.
+fn silence_retry_end_settles_report(end: Option<crate::delegate_retry::RetryEnd>) -> bool {
     use crate::delegate_retry::RetryEnd;
     match end {
-        Some(RetryEnd::Received | RetryEnd::Lagged | RetryEnd::BusClosed) => true,
+        Some(RetryEnd::Received | RetryEnd::Blocked | RetryEnd::Lagged | RetryEnd::BusClosed) => {
+            true
+        }
         Some(
-            RetryEnd::Blocked
-            | RetryEnd::Cancelled
+            RetryEnd::Cancelled
             | RetryEnd::Superseded
             | RetryEnd::PaneClosed
             | RetryEnd::AgentExited
@@ -4989,7 +5002,7 @@ fn arm_delegate_silence_watch(
                     );
                     return;
                 }
-                end = retry_done => silence_retry_end_proves_delivery(end.ok()),
+                end = retry_done => silence_retry_end_settles_report(end.ok()),
             };
         }
         // What the report quotes: the window, or how long the watch actually
@@ -8718,6 +8731,18 @@ async fn dispatch_one_owned(
     // worker's draft — non-zero means the dispatch lock was set down, so a
     // `pane restart` may have replaced the worker meanwhile.
     let mut pointer_deferred = std::time::Duration::ZERO;
+    //
+    // Issue #1383 (Qodo, PR #1414): the geometry epoch the retry loop compares
+    // against is read before the payload goes in, not when the loop starts.
+    // This write can hold its CR for the echo bound plus `SUBMIT_DELAY`, and a
+    // resize inside that time blanks the screen; read afterwards, the epoch
+    // would hide it and the loop would retype a pointer that went in. And it
+    // is read AFTER any wait for the worker's draft (issue #544): a resize
+    // during that wait is not one the pointer's bytes were typed across, and
+    // counting it would withhold every retype for a pointer that did not
+    // render. So `revalidate` samples it — that closure runs once, under the
+    // worker's writer, on the pass that writes, immediately before the payload.
+    let epoch_at_write = Arc::new(std::sync::Mutex::new(None::<u64>));
     let outcome = if let Some(worker_agent_id) = expected_worker_agent_id.as_deref() {
         // Issue #544: the idle-worker watch armed in `handle_delegate` must
         // not count the time this write waits for the worker's draft.
@@ -8727,16 +8752,22 @@ async fn dispatch_one_owned(
                 &pane_id,
                 &one_liner,
                 worker_agent_id,
-                || async move {
-                    if revalidate_registry.is_pane_closing(&revalidate_pane) {
-                        return false;
+                {
+                    let epoch_at_write = Arc::clone(&epoch_at_write);
+                    let epoch_agent = worker_agent_id.to_string();
+                    || async move {
+                        if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                            return false;
+                        }
+                        *epoch_at_write.lock().unwrap() =
+                            revalidate_registry.geometry_changes_of(&epoch_agent);
+                        orchestration_still_matches(
+                            expected_orchestration.as_ref(),
+                            revalidate_registry
+                                .pane_orchestration(&revalidate_pane)
+                                .as_ref(),
+                        )
                     }
-                    orchestration_still_matches(
-                        expected_orchestration.as_ref(),
-                        revalidate_registry
-                            .pane_orchestration(&revalidate_pane)
-                            .as_ref(),
-                    )
                 },
                 std::time::Instant::now(),
                 &mut dispatch_hold,
@@ -9023,6 +9054,7 @@ async fn dispatch_one_owned(
                     role: target_role.clone(),
                     delivery_id: delivery_id.clone(),
                     pointer: one_liner.clone(),
+                    pointer_epoch: *epoch_at_write.lock().unwrap(),
                     orchestration: orchestration.clone(),
                     redeliveries: Arc::clone(&redeliveries),
                     silence_report_armed: delivered && silence.is_some(),
@@ -18292,6 +18324,7 @@ mod tests {
         );
         let retry_rx = event_tx.subscribe();
         let watch_rx = event_tx.subscribe();
+        let pointer_epoch = registry.geometry_changes_of(&worker);
         let first = registry
             .write_and_submit_guarded_detailed(WORKER_PANE, POINTER, &worker, || async { true })
             .await
@@ -18318,6 +18351,7 @@ mod tests {
             role: "coder".to_string(),
             delivery_id: ID.to_string(),
             pointer: POINTER.to_string(),
+            pointer_epoch,
             orchestration: None,
             redeliveries: redeliveries.clone(),
             silence_report_armed: true,
@@ -18388,6 +18422,163 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        registry.shutdown_all();
+    }
+
+    /// Qodo, PR #1414: a retry that ended because the worker reported a quota
+    /// block settles the silent-worker report. Issue #714's blocked-worker
+    /// notice already tells the orchestrator about that block, and the
+    /// went-quiet report would claim no event arrived when one did.
+    #[test]
+    fn silence_retry_end_settles_report_on_a_quota_block() {
+        use crate::delegate_retry::RetryEnd;
+        assert!(silence_retry_end_settles_report(Some(RetryEnd::Blocked)));
+        assert!(silence_retry_end_settles_report(Some(RetryEnd::Received)));
+        assert!(!silence_retry_end_settles_report(Some(RetryEnd::Exhausted)));
+        assert!(!silence_retry_end_settles_report(None));
+    }
+
+    /// Qodo, PR #1414: the worker reports a quota block after its pointer went
+    /// in, which ends the in-place retry. The silent-worker window passes with
+    /// no proof of a turn, and the orchestrator must still get no went-quiet
+    /// report: the block is issue #714's to report, and "no event" is false.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_silence_report_stays_quiet_when_the_retry_ends_on_a_quota_block() {
+        const ORCH_PANE: &str = "blocked-retry-orch";
+        const WORKER_PANE: &str = "blocked-retry-worker";
+        const ID: &str = "d-1383b10c";
+        const POINTER: &str =
+            "Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-1383b10c]";
+        const NOTICE: &str = "delegated worker went quiet";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn = |pane: &str, command: &str, agent_type: crate::event::AgentType| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some(command),
+                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )]),
+                    agent_type: Some(agent_type),
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn stand-in")
+        };
+        let worker = spawn(
+            WORKER_PANE,
+            "stty -echo && exec cat > /dev/null",
+            crate::event::AgentType::OpenCode,
+        );
+        let orch = spawn(ORCH_PANE, "/bin/cat", crate::event::AgentType::ClaudeCode);
+        let (event_tx, _) = broadcast::channel(64);
+
+        let silence = registry
+            .arm_silence_watch(WORKER_PANE, ORCH_PANE, Some(&worker))
+            .expect("arm the silent-worker watch");
+        let armed = registry.pending_deliveries().arm(
+            WORKER_PANE,
+            ID,
+            &worker,
+            Some(silence.seq),
+            crate::delegate_retry::RetypePolicy::Allowed,
+        );
+        let retry_rx = event_tx.subscribe();
+        let watch_rx = event_tx.subscribe();
+        let pointer_epoch = registry.geometry_changes_of(&worker);
+        let first = registry
+            .write_and_submit_guarded_detailed(WORKER_PANE, POINTER, &worker, || async { true })
+            .await
+            .expect("first write");
+        assert_eq!(
+            first,
+            crate::agent_pty::GuardedSendDetail::Outcome(crate::agent_pty::GuardedSend::Applied)
+        );
+        settle_one_shot_payload_record(
+            &registry,
+            WORKER_PANE,
+            POINTER,
+            Some(crate::agent_pty::GuardedSend::Applied),
+        );
+        let redeliveries = Arc::new(crate::delegate_retry::RedeliveryCounts::default());
+        let (done_tx, done_rx) = oneshot::channel();
+        let retry = crate::delegate_retry::spawn(crate::delegate_retry::DeliveryRetry {
+            registry: registry.clone(),
+            event_rx: retry_rx,
+            armed,
+            schedule: crate::delegate_retry::RetrySchedule::parse(Some("200")),
+            pane_id: WORKER_PANE.to_string(),
+            worker_agent_id: worker.clone(),
+            role: "coder".to_string(),
+            delivery_id: ID.to_string(),
+            pointer: POINTER.to_string(),
+            pointer_epoch,
+            orchestration: None,
+            redeliveries: redeliveries.clone(),
+            silence_report_armed: true,
+            done: Some(done_tx),
+        });
+        let blocked: AgentEvent = serde_json::from_value(serde_json::json!({
+            "session_id": "s",
+            "agent_type": "open_code",
+            "event_type": EventType::QuotaBlocked,
+            "timestamp": "2026-09-28T00:00:00Z",
+            "pane_id": WORKER_PANE,
+            "agent_id": worker,
+        }))
+        .unwrap();
+        event_tx.send(BroadcastMsg::Event(blocked)).unwrap();
+        arm_delegate_silence_watch(
+            registry.clone(),
+            watch_rx,
+            SilenceWatch {
+                window: std::time::Duration::from_millis(100),
+                target: SilenceReportTarget {
+                    pane_id: ORCH_PANE.to_string(),
+                    agent_id: Some(orch.clone()),
+                    orchestration: None,
+                },
+                redeliveries: Some(redeliveries.clone()),
+                retry_done: Some(done_rx),
+            },
+            silence,
+            WORKER_PANE.to_string(),
+            worker.clone(),
+            "coder".to_string(),
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(15), retry)
+                .await
+                .expect("the retry loop ends")
+                .expect("the retry loop does not panic"),
+            crate::delegate_retry::RetryEnd::Blocked
+        );
+        assert_eq!(
+            redeliveries.attempts(),
+            0,
+            "a blocked worker is not re-sent"
+        );
+        // Well past the 100 ms window, polled so a report written late still
+        // fails the test rather than slipping past a single look.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while std::time::Instant::now() < deadline {
+            let orch_screen =
+                String::from_utf8_lossy(&registry.snapshot(&orch).expect("orch")).into_owned();
+            assert!(
+                !orch_screen.contains(NOTICE),
+                "a quota-blocked worker was reported as having gone quiet: {orch_screen:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            matches!(
+                registry.retire_silence_watch(WORKER_PANE),
+                crate::agent_pty::SilenceWatchRetirement::Nothing
+            ),
+            "the watch must have settled its own record rather than still be waiting"
+        );
+        drop(event_tx);
         registry.shutdown_all();
     }
 
