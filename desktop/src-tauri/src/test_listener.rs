@@ -28,5 +28,7 @@ use dot_agent_deck::platform::ipc::IpcListener;
 pub(crate) fn bind_owner_only(socket: &Path) -> std::io::Result<IpcListener> {
     let listener = tokio::net::UnixListener::bind(socket)?;
     dot_agent_deck::platform::fsperm::set_endpoint_mode_owner_only(socket)?;
-    Ok(IpcListener::from_tokio_listener(listener))
+    // Checked, not trusted: `adopt_owner_only` refuses anything but this user's
+    // socket at exactly `0o600`.
+    IpcListener::adopt_owner_only(listener)
 }

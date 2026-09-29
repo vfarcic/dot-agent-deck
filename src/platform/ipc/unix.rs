@@ -165,6 +165,38 @@ impl IpcListener {
         Ok(IpcStream(stream))
     }
 
+    /// Adopt an already-bound [`tokio::net::UnixListener`], refusing it unless
+    /// the inode at its own address is this user's socket at exactly `0o600` —
+    /// the same predicate a client's `verify_endpoint_trusted` applies before it
+    /// connects.
+    ///
+    /// For a caller that cannot use [`bind`], whose owner-only guarantee comes
+    /// from flipping the **process** umask around `bind(2)`: under a plain
+    /// `cargo test` that flip is visible to every sibling test, and the desktop
+    /// crate's lib tests, which run the production attach server in-process,
+    /// raced on it (issue #1078). Such a caller binds plainly and restates the
+    /// mode itself; this checks that it did rather than trusting it. Unlike
+    /// [`bind`] there is no window this closes: a listener is owner-only by the
+    /// time it is adopted, or it is refused.
+    ///
+    /// [`bind`]: Self::bind
+    pub fn adopt_owner_only(listener: UnixListener) -> io::Result<Self> {
+        let address = listener.local_addr()?;
+        let Some(endpoint) = address.as_pathname() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an unnamed or abstract socket has no inode to check",
+            ));
+        };
+        crate::platform::fsperm::verify_endpoint_trusted(endpoint).map_err(|reason| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("refusing to adopt {}: {reason}", endpoint.display()),
+            )
+        })?;
+        Ok(Self(listener))
+    }
+
     /// Test-only: adopt an already-bound [`tokio::net::UnixListener`] as an
     /// `IpcListener` **without** the umask/permission dance [`bind`] performs.
     /// The daemon hook-ingestion tests bind their socket with a plain
@@ -172,16 +204,9 @@ impl IpcListener {
     /// races sibling tests under single-process `cargo test` — yet still need to
     /// hand the listener to `run_hook_loop`, which takes an `IpcListener`.
     ///
-    /// `pub` rather than `#[cfg(test)]` because the desktop crate's lib tests
-    /// need it for the same reason and cannot see this crate's `cfg(test)`
-    /// items (issue #1078): they run the production attach server in-process,
-    /// and `serve_attach` takes an `IpcListener`. Hidden from the docs because
-    /// nothing outside a test has any business skipping the owner-only mode
-    /// [`bind`] guarantees.
-    ///
     /// [`bind`]: Self::bind
-    #[doc(hidden)]
-    pub fn from_tokio_listener(listener: UnixListener) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_tokio_listener(listener: UnixListener) -> Self {
         Self(listener)
     }
 }
@@ -840,6 +865,40 @@ mod tests {
         assert!(
             elapsed < CONNECT_BUDGET,
             "a healthy connect must be fast, took {elapsed:?}"
+        );
+    }
+
+    /// Scenario: a listener is bound plainly in a temp dir and its socket set to
+    /// `0o600`; adopting it succeeds. Another is left group- and
+    /// world-accessible (`0o666`); adopting it is refused as a permission
+    /// error naming the socket, so the owner-only guarantee [`IpcListener::bind`]
+    /// gives cannot be skipped by adopting instead (issue #1078).
+    #[tokio::test]
+    async fn adopting_a_listener_requires_an_owner_only_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let owner_only = dir.path().join("owner-only.sock");
+        let listener = tokio::net::UnixListener::bind(&owner_only).expect("bind");
+        std::fs::set_permissions(&owner_only, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0o600");
+        assert!(
+            IpcListener::adopt_owner_only(listener).is_ok(),
+            "this user's socket at exactly 0o600 is what a client trusts, so it is adopted"
+        );
+
+        let open = dir.path().join("open.sock");
+        let listener = tokio::net::UnixListener::bind(&open).expect("bind");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o666))
+            .expect("chmod 0o666");
+        let refused = match IpcListener::adopt_owner_only(listener) {
+            Ok(_) => panic!("a socket other local users can reach must not be adopted"),
+            Err(err) => err,
+        };
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            refused.to_string().contains("open.sock"),
+            "the refusal names the socket: {refused}"
         );
     }
 }
