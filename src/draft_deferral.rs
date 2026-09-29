@@ -343,12 +343,14 @@ impl DraftTracker {
                 b']' => Escape::Osc { len: 0, esc: false },
                 b'P' => Escape::Dcs { len: 0, esc: false },
                 b'O' => Escape::Ss3,
-                // The first ESC was a key of its own; this one starts afresh.
-                // Counted only when the user is the one who went on typing:
-                // a lone Escape keypress followed by a deck write edits
-                // nothing of theirs.
+                // The first ESC was a key of its own; this one starts afresh,
+                // attributed to its own sender by `ground`. The first is
+                // counted only when the user sent it (`seq_user`, not this
+                // byte's origin) AND is the one who went on typing: a deck
+                // ESC is never theirs, and a lone Escape keypress followed by
+                // a deck write edits nothing of theirs.
                 ESC => {
-                    self.input_byte();
+                    self.pending |= self.seq_user && self.by_user;
                     self.ground(byte, in_paste)
                 }
                 // `Alt+<key>`, `Alt+Enter`, `Alt+Backspace`: an edit, and the
@@ -882,6 +884,36 @@ mod tests {
         feed(&mut tracker, b"draft");
         feed_as(&mut tracker, b"\x15", ByteOrigin::Deck);
         assert!(tracker.pending());
+    }
+
+    /// Issue #544 (review of finding #16, observation 1): in `ESC ESC` the
+    /// first `ESC` is a key of its own, and it is credited to whoever sent
+    /// THAT byte — not to the sender of the second, which starts a fresh
+    /// sequence of its own. A deck `ESC` (a partial write) and then the
+    /// user's is therefore not a draft, two user `ESC`s still are, and the
+    /// user's lone Escape before our paste framing stays one that edits
+    /// nothing, as it does before our text.
+    #[test]
+    fn a_double_escape_credits_the_first_escape_to_its_own_sender() {
+        let mut tracker = DraftTracker::default();
+        feed_as(&mut tracker, b"\x1b", ByteOrigin::Deck);
+        feed(&mut tracker, b"\x1b");
+        assert!(
+            !tracker.pending(),
+            "the deck's ESC was credited to the user"
+        );
+
+        let mut tracker = DraftTracker::default();
+        feed(&mut tracker, b"\x1b\x1b");
+        assert!(
+            tracker.pending(),
+            "the user's double Escape stopped counting"
+        );
+
+        let mut tracker = DraftTracker::default();
+        feed(&mut tracker, b"\x1b");
+        feed_as(&mut tracker, b"\x1b[200~NOTICE\x1b[201~", ByteOrigin::Deck);
+        assert!(!tracker.pending(), "a lone Escape before our paste");
     }
 
     /// Sweep (PR #1398): CSI intermediate bytes are bounded like parameter
