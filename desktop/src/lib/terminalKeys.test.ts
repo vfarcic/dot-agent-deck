@@ -31,6 +31,14 @@ describe("agentKeySequence (issue #1422)", () => {
     expect(agentKeySequence(key({ key: "/", ctrlKey: true, altKey: true }))).toBeUndefined();
   });
 
+  it("leaves AltGr, which Windows reports as Ctrl+Alt, to xterm", () => {
+    const altGraph = (name: string) => name === "AltGraph";
+    expect(agentKeySequence(key({ key: "Enter", ctrlKey: true, altKey: true, getModifierState: altGraph }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Enter", ctrlKey: true, altKey: true, shiftKey: true, getModifierState: altGraph }))).toBeUndefined();
+    // A genuine Ctrl+Alt+Enter, with no AltGr reported, is still translated.
+    expect(agentKeySequence(key({ key: "Enter", ctrlKey: true, altKey: true, getModifierState: () => false }))).toBe("\x1b[13;7u");
+  });
+
   it("accepts Ctrl+/ where the layout puts / on a shifted key", () => {
     expect(agentKeySequence(key({ key: "/", ctrlKey: true, shiftKey: true }))).toBe("\x1f");
   });

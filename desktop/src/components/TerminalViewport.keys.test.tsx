@@ -156,6 +156,17 @@ describe("TerminalViewport keystrokes reach the agent as the TUI sends them (iss
   });
 
   /**
+   * Scenario: on a Windows keyboard layout, hold AltGr (reported as Ctrl+Alt)
+   * and press Enter. The key is not mistaken for Ctrl+Alt+Enter: it reaches
+   * the agent as xterm encodes it on its own.
+   */
+  it("does not read AltGr+Enter as Ctrl+Alt+Enter", () => {
+    const { sent, textarea } = mountTerminal();
+    fireEvent.keyDown(textarea, { ...enter({ ctrlKey: true, altKey: true }), modifierAltGraph: true });
+    expect(sent).toEqual([`${ESC}\r`]);
+  });
+
+  /**
    * Scenario: open a terminal whose input is disabled (another client holds
    * the write lease) and press Ctrl+Enter. Nothing reaches the agent: the
    * translated key goes through the same input gate as every other keystroke.

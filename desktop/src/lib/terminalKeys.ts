@@ -20,6 +20,8 @@ export interface TerminalKey {
   altKey: boolean;
   metaKey: boolean;
   isComposing?: boolean;
+  /** `KeyboardEvent.getModifierState`, for AltGr, which Windows also reports as Ctrl+Alt. */
+  getModifierState?(key: string): boolean;
 }
 
 const ESC = "\x1b";
@@ -47,10 +49,11 @@ function modifierParam(key: TerminalKey): number {
  *
  * Never claims a Cmd/Super chord: those belong to the app and the OS. Never
  * claims a key while an input method is composing: Enter there commits the
- * composition.
+ * composition. Never claims a key pressed with AltGr: Windows reports AltGr as
+ * Ctrl+Alt, so AltGr+Enter would otherwise be sent as Ctrl+Alt+Enter.
  */
 export function agentKeySequence(key: TerminalKey): string | undefined {
-  if (key.metaKey || key.isComposing) return undefined;
+  if (key.metaKey || key.isComposing || key.getModifierState?.("AltGraph")) return undefined;
   if (key.key === "Enter" && (key.shiftKey || key.ctrlKey)) {
     return `${ESC}[13;${modifierParam(key)}u`;
   }
