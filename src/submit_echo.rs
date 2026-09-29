@@ -30,8 +30,10 @@
 //! behind the output bus (a busy agent outruns its receiver's queue) or whose
 //! parser fails can no longer tell whether the payload rendered, and that
 //! happens under exactly the load #1243 is about, so it holds the CR to the
-//! bound rather than dropping to the floor. Only a closed bus — the agent is
-//! gone, and nothing will ever paint — returns at once.
+//! bound rather than dropping to the floor. That includes a screen that could
+//! not be parsed before the payload was written: the watch still exists, it has
+//! only lost the thread from the start. Only a closed bus — the agent is gone,
+//! and nothing will ever paint — returns at once.
 //!
 //! **Opt-in, not the default for every guarded submit.** A pane that does not
 //! echo its input (a raw-mode stand-in, a program that hides what is typed)
@@ -130,12 +132,30 @@ pub fn echo_token(payload: &[u8]) -> Option<String> {
     (token.len() >= MIN_TOKEN_CHARS).then_some(token)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: make every [`EchoWatch::feed`] on this thread panic inside
+    /// the parser's `catch_unwind`, as a vt100 failure would. vt100 has no
+    /// known panicking input at a geometry the watch accepts.
+    static FAIL_FEED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test seam: make [`EchoWatch`]'s parser fail on this thread while `fail`.
+#[cfg(test)]
+pub(crate) fn fail_parse_for_test(fail: bool) {
+    FAIL_FEED.with(|cell| cell.set(fail));
+}
+
 /// Follows one agent's output and reports when a payload's last word renders.
 pub struct EchoWatch {
     parser: vt100::Parser,
     rx: broadcast::Receiver<Arc<Vec<u8>>>,
     token: String,
     baseline: usize,
+    /// The snapshot the watch started from could not be parsed, so its screen
+    /// is missing output and a count over it means nothing. [`Self::wait`]
+    /// holds to the bound.
+    lost: bool,
 }
 
 impl std::fmt::Debug for EchoWatch {
@@ -143,6 +163,7 @@ impl std::fmt::Debug for EchoWatch {
         f.debug_struct("EchoWatch")
             .field("token", &self.token)
             .field("baseline", &self.baseline)
+            .field("lost", &self.lost)
             .finish_non_exhaustive()
     }
 }
@@ -151,8 +172,11 @@ impl EchoWatch {
     /// Start watching for `payload`. `snapshot` and `rx` must come from one
     /// atomic subscription taken BEFORE the payload is written, so no byte of
     /// the echo is missed; `rows`/`cols` are the geometry that output is drawn
-    /// at. `None` when the payload is not eligible or the screen cannot be
-    /// parsed.
+    /// at. `None` when the payload is not eligible or the pane's geometry gets
+    /// no gate; the caller then keeps the fixed `SUBMIT_DELAY`. A snapshot that
+    /// cannot be parsed is neither: the payload is still one the gate is for, so
+    /// the watch is returned lost and holds the CR to the bound (Qodo round 7,
+    /// PR #1414), as a parse failure later in [`Self::wait`] does.
     pub fn new(
         snapshot: &[u8],
         rx: broadcast::Receiver<Arc<Vec<u8>>>,
@@ -174,18 +198,27 @@ impl EchoWatch {
             rx,
             token,
             baseline: 0,
+            lost: false,
         };
-        if !watch.feed(snapshot) {
-            return None;
+        if watch.feed(snapshot) {
+            watch.baseline = watch.occurrences();
+        } else {
+            watch.lost = true;
         }
-        watch.baseline = watch.occurrences();
         Some(watch)
     }
 
     /// Process output; `false` if the parser panicked.
     fn feed(&mut self, bytes: &[u8]) -> bool {
         let parser = &mut self.parser;
-        std::panic::catch_unwind(AssertUnwindSafe(|| parser.process(bytes))).is_ok()
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if FAIL_FEED.with(std::cell::Cell::get) {
+                panic!("injected vt100 parse failure");
+            }
+            parser.process(bytes)
+        }))
+        .is_ok()
     }
 
     fn occurrences(&self) -> usize {
@@ -199,6 +232,9 @@ impl EchoWatch {
     /// [`EchoOutcome`].
     pub async fn wait(mut self, bound: Duration) -> EchoOutcome {
         let deadline = tokio::time::Instant::now() + bound;
+        if self.lost {
+            return Self::hold_to(deadline).await;
+        }
         loop {
             if self.occurrences() > self.baseline {
                 return EchoOutcome::Rendered;
@@ -444,6 +480,27 @@ mod tests {
             Ok(())
         );
         assert_eq!(watch.occurrences(), watch.baseline + 1);
+    }
+
+    /// Qodo round 7 on PR #1414: an eligible payload over a snapshot the parser
+    /// fails on still gets a watch, and that watch holds to the bound rather
+    /// than letting the caller fall back to the `SUBMIT_DELAY` floor — the
+    /// same as a parse failure partway through the wait.
+    #[tokio::test(start_paused = true)]
+    async fn new_over_an_unparseable_snapshot_holds_to_the_bound() {
+        let (tx, rx) = channel();
+        fail_parse_for_test(true);
+        let watch = EchoWatch::new(b"> ", rx, 24, 80, POINTER);
+        fail_parse_for_test(false);
+        let watch = watch.expect("an eligible payload gets a watch even when the parse fails");
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(watch.wait(SUBMIT_ECHO_BOUND));
+        // Even the payload painting cannot release it: the screen it would be
+        // counted on is missing output.
+        tx.send(Arc::new(b"[delivery d-7f3a9c21]".to_vec()))
+            .unwrap();
+        assert_eq!(task.await.unwrap(), EchoOutcome::Lost);
+        assert_eq!(started.elapsed(), SUBMIT_ECHO_BOUND);
     }
 
     #[test]

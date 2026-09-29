@@ -1018,9 +1018,12 @@ pub(crate) fn spawn(retry: DeliveryRetry) -> tokio::task::JoinHandle<RetryEnd> {
 pub const PROBE_GRACE: Duration = Duration::from_secs(5);
 
 /// How long a submit-only probe over a screen that does not show the pointer
-/// waits before the pointer is retyped: [`PROBE_GRACE`], or half the wait before
-/// the next re-delivery when that is shorter, so the retype always lands before
-/// the next attempt is due.
+/// waits, from the moment its Enter went out, before the pointer is retyped:
+/// [`PROBE_GRACE`], or half the wait before the next re-delivery when that is
+/// shorter, so a probe written on time has its retype land before the next
+/// attempt is due. A probe held up past that point still gets the whole grace;
+/// the next attempt stays anchored where its wait began, never sooner than
+/// [`MIN_RETRY_WAIT`] after the retype.
 pub fn probe_grace(next_wait: Duration) -> Duration {
     PROBE_GRACE.min(next_wait / 2)
 }
@@ -1189,8 +1192,9 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
     // write's comes from the dispatch, sampled before that write began.
     let mut pointer_epoch = pointer_epoch;
     // When the current wait began: the first write, then the start of each
-    // re-delivery. Each schedule entry is measured from here, so a probe's grace
-    // and its retype come out of the wait rather than stretching the schedule.
+    // re-delivery. Each schedule entry is measured from here, so the retype
+    // comes out of the wait rather than stretching the schedule. A probe's
+    // grace is not: it runs from the probe's own write (below).
     let mut anchor = tokio::time::Instant::now();
     let redeliver_ctx = RedeliverCtx {
         registry: &registry,
@@ -1224,17 +1228,26 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
             }
             let attempt = index + 1;
             anchor = tokio::time::Instant::now();
-            let probe =
-                match redeliver(&redeliver_ctx, Phase::Probe, attempt, &mut pointer_epoch).await {
-                    Attempt::Written(composer) => {
-                        last_classification = Some(composer);
-                        redeliveries.attempts.fetch_add(1, Ordering::SeqCst);
-                        composer
-                    }
-                    // The probe never declines: it writes its Enter whatever the screen shows.
-                    Attempt::Skipped | Attempt::Declined(_) => continue,
-                    Attempt::Stop(end) => break 'outer end,
-                };
+            let probe_attempt =
+                redeliver(&redeliver_ctx, Phase::Probe, attempt, &mut pointer_epoch).await;
+            // Qodo round 7 on PR #1414: the grace runs from the moment the
+            // probe's Enter went out, not from `anchor`. The probe queues on the
+            // pane's dispatch lock and writer, reads the screen off the executor
+            // and holds its CR to the `SUBMIT_DELAY` floor, so under a short
+            // schedule a grace measured from `anchor` can have run out before
+            // the Enter lands, and the retype would follow it with no time for
+            // the turn it starts to show.
+            let probe_written = tokio::time::Instant::now();
+            let probe = match probe_attempt {
+                Attempt::Written(composer) => {
+                    last_classification = Some(composer);
+                    redeliveries.attempts.fetch_add(1, Ordering::SeqCst);
+                    composer
+                }
+                // The probe never declines: it writes its Enter whatever the screen shows.
+                Attempt::Skipped | Attempt::Declined(_) => continue,
+                Attempt::Stop(end) => break 'outer end,
+            };
             match probe {
                 // A screen the deck cannot read gets the Enter and nothing
                 // more, as before this audit: a resize-blanked one belongs to a
@@ -1271,7 +1284,7 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
             let grace = probe_grace(wait_at(attempt));
             if let Err(end) = watch
                 .until(
-                    anchor + grace,
+                    probe_written + grace,
                     &pane_id,
                     &worker_agent_id,
                     &role,
@@ -3183,6 +3196,63 @@ while chunk := os.read(0, 4096):
             1,
             "a pointer held in the composer must not be typed a second time: {raw:?}"
         );
+        fx.stop();
+    }
+
+    /// Qodo round 7 on PR #1414: a probe held up on the pane's writer past its
+    /// grace must still give the worker the whole grace after its Enter before
+    /// the pointer is retyped. Measured from the start of the attempt, the grace
+    /// had already run out when the Enter went out, and the retype followed it
+    /// at once.
+    #[tokio::test]
+    async fn retry_loop_gives_the_whole_grace_after_a_delayed_probe_before_retyping() {
+        // Raw mode: every byte, CRs included, reaches the sink as typed, and
+        // nothing is echoed, so the screen never shows the pointer.
+        let fx = Fixture::start_with("retry-grace", "stty raw -echo").await;
+        let (handle, redeliveries) = fx.deliver_and_retry("400,400").await;
+        let grace = probe_grace(Duration::from_millis(400));
+        let first = format!("{POINTER}\r");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !fx.sink_text().await.contains(&first) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "precondition: the first write never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Past the 400 ms wait and past the grace: the probe is queued behind
+        // the held writer.
+        let writer = fx.registry.hold_pane_writer_for_test(&fx.pane).await;
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        drop(writer);
+        let probed = format!("{POINTER}\r\r");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut enter_seen = None;
+        let retyped_at = loop {
+            let raw = fx.sink_text().await;
+            let now = tokio::time::Instant::now();
+            if raw.matches(ID).count() >= 2 {
+                break now;
+            }
+            if enter_seen.is_none() && raw.contains(&probed) {
+                enter_seen = Some(now);
+            }
+            assert!(now < deadline, "the pointer was never retyped: {raw:?}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let enter_seen = enter_seen.expect("the probe's Enter was seen before the retype");
+        // The poll sees each write at most one poll late; the slack covers the
+        // Enter being seen late, which is the only way it shrinks this gap.
+        assert!(
+            retyped_at - enter_seen >= grace - Duration::from_millis(50),
+            "the pointer was retyped {:?} after the probe's Enter, inside the {grace:?} grace",
+            retyped_at - enter_seen
+        );
+        fx.tx
+            .send(fx.event(EventType::Thinking, &fx.agent))
+            .unwrap();
+        assert_eq!(end_of(handle).await, RetryEnd::Received);
+        assert_eq!(redeliveries.attempts(), 1);
         fx.stop();
     }
 

@@ -2656,7 +2656,8 @@ async fn drain_stranded_payload(w: &mut (dyn std::io::Write + Send), landed: &[u
 /// Issue #1243: with an `echo` watch the CR is also held until the payload has
 /// rendered on the agent's screen, bounded by
 /// [`crate::submit_echo::SUBMIT_ECHO_BOUND`]; [`SUBMIT_DELAY`] stays the floor.
-/// A watch that lags behind the output or cannot parse it holds the CR to the
+/// A watch that lags behind the output or cannot parse it — including a
+/// snapshot it could not parse before the payload went in — holds the CR to the
 /// bound; only a closed output bus drops it to the floor
 /// ([`crate::submit_echo::EchoOutcome`]). The watch only times the CR, so every
 /// outcome above is classified exactly as without one.
@@ -9355,8 +9356,10 @@ impl AgentPtyRegistry {
     }
 
     /// Issue #1243: subscribe to `agent_id`'s output for an echo-gated submit of
-    /// `payload`. `None` when the payload is not eligible or the agent is gone.
-    /// Must be awaited before the payload is written.
+    /// `payload`. `None` when the payload is not eligible, the pane's geometry
+    /// gets no gate, or the agent is gone; a snapshot the watch cannot parse
+    /// still returns one, which holds the CR to the bound. Must be awaited
+    /// before the payload is written.
     ///
     /// The subscription copies up to [`SCROLLBACK_CAP_BYTES`] under the bus's
     /// synchronous mutex and the watch parses all of it, so both run on the
@@ -18333,7 +18336,8 @@ mod spawn_tests {
     /// Qodo round 4 on PR #1414: an echo watch that lags behind a busy agent's
     /// output must not let the CR go at the `SUBMIT_DELAY` floor — that is the
     /// CR #1243 saw taken into a starved agent's paste. It holds to the bound.
-    /// A closed output bus, where nothing will ever paint, keeps the floor.
+    /// A closed output bus, where nothing will ever paint, keeps the floor; a
+    /// snapshot the watch could not parse before the write holds to the bound.
     #[tokio::test(start_paused = true)]
     async fn deliver_payload_holds_the_cr_to_the_echo_bound_when_the_watch_lags() {
         use crate::submit_echo::{EchoWatch, SUBMIT_ECHO_BOUND};
@@ -18370,6 +18374,26 @@ mod spawn_tests {
             w.cr_at() - started,
             SUBMIT_DELAY,
             "a closed bus keeps the floor"
+        );
+
+        // Qodo round 7: a snapshot the watch could not parse before the write
+        // holds the CR to the bound as well, not to the floor.
+        let (_tx, rx) = tokio::sync::broadcast::channel(2);
+        crate::submit_echo::fail_parse_for_test(true);
+        let echo = EchoWatch::new(b"> ", rx, 24, 80, payload);
+        crate::submit_echo::fail_parse_for_test(false);
+        let echo = echo.expect("an eligible payload keeps its watch over a failed parse");
+        let mut w = TimedWriter::default();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, payload, Some(echo)).await,
+            PayloadDelivery::Applied
+        );
+        assert!(
+            w.cr_at() - started >= SUBMIT_ECHO_BOUND,
+            "the CR went {:?} after the payload over an unparseable snapshot, before the \
+             {SUBMIT_ECHO_BOUND:?} bound",
+            w.cr_at() - started
         );
     }
 
