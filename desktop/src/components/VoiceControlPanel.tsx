@@ -45,7 +45,10 @@
  * structurally cannot know about; the rest are about the surface's own state
  * — a release it cannot vouch for, a microphone it has nothing to open, a row
  * with nothing in it yet — rather than about an utterance. See their own
- * notes.
+ * notes. The numbered choice (PRD #1261) adds its own `VOICE_CHOICE_*`
+ * sentences, for the same reason as the first three: whether a choice was
+ * closed, cancelled, expired or outlived by the screen is the panel's state,
+ * which Rust never sees.
  *
  * The overlay `list_commands` opens writes no sentence of its own: it prints
  * the table's own `description` column, which is the point of generating it
@@ -213,6 +216,17 @@ export const VOICE_CHOICE_CLOSED = "Choice closed.";
 export const VOICE_CHOICE_CANCELLED = "Choice cancelled — nothing ran.";
 export const VOICE_CHOICE_EXPIRED = "The choice expired, so nothing ran.";
 export const VOICE_CHOICE_REFUSED = "That is not one of the entries on offer, or it is no longer there, so nothing ran. Say the command again.";
+
+/**
+ * PRD #1261 — {@link SCREEN_MOVED_ON} and {@link DIALOG_MOVED_ON} for an
+ * answer to a numbered choice. The check is the same one, comparing the screen
+ * and the New agent dialog declared with the FIRST utterance against the ones
+ * standing when the answer arrives; only the words differ, because an answer
+ * can be a click, and "while that was being worked out" describes a round trip
+ * a click never made. What moved is the time since the list was offered.
+ */
+export const VOICE_CHOICE_SCREEN_MOVED_ON = "You moved to another screen after the choice was offered, so nothing ran. Say the command again here.";
+export const VOICE_CHOICE_DIALOG_MOVED_ON = "The New agent dialog changed after the choice was offered, so nothing ran. Say the command again.";
 
 /**
  * What a press gets when there is no transcription backend to listen with.
@@ -1107,11 +1121,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     setPanelState(IDLE);
     forget();
     if (screenRef.current !== offer.screen) {
-      setProblem(SCREEN_MOVED_ON);
+      setProblem(VOICE_CHOICE_SCREEN_MOVED_ON);
       return;
     }
     if (!sameNewAgentDeclaration(offer.newAgent, newAgentRef.current?.()) || offer.instance !== newAgentInstanceRef.current?.()) {
-      setProblem(DIALOG_MOVED_ON);
+      setProblem(VOICE_CHOICE_DIALOG_MOVED_ON);
       return;
     }
     const at = offer.outcome.candidates.findIndex((entry) => entry.value === candidate.value);

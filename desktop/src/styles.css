@@ -1568,8 +1568,14 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    grew would overlap the surfaces that reserved it. Nine entries at most, and
    each label elided, so the Cancel button and the countdown are never pushed
    out. The countdown is amber for the dictation countdown's reason — it is the
-   one thing here that says something is about to END. */
-.voice-choice { flex: 0 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px; }
+   one thing here that says something is about to END.
+   The group does not shrink: the sentence beside it only repeats the labels,
+   so it is the sentence that is elided first. Before this, a long "matches
+   more than one" sentence squeezed the list until the second entry was cut
+   mid-word (found in the docs screenshot, PRD #1261 M3). `max-width` caps the
+   group instead, so a nine-entry list scrolls inside it rather than taking the
+   whole row. */
+.voice-choice { flex: 0 0 auto; max-width: 60%; min-width: 0; display: flex; align-items: center; gap: 6px; }
 .voice-choice-list { flex: 0 1 auto; min-width: 0; margin: 0; padding: 0; list-style: none; display: flex; gap: 4px; overflow-x: auto; }
 .voice-choice-list li { flex: 0 0 auto; }
 .voice-choice-list button { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

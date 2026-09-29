@@ -37,6 +37,8 @@ import { COMMAND_HIDDEN_BY_ORCHESTRATION, DECK_CANNOT_TAKE_AGENT, DECK_NOT_LISTE
 import { CONFIRMATION_ALREADY_OPEN, STOP_BEHIND_NEW_AGENT, STOP_TARGET_GONE } from "./AgentOverview";
 import {
   DIALOG_MOVED_ON,
+  VOICE_CHOICE_DIALOG_MOVED_ON,
+  VOICE_CHOICE_SCREEN_MOVED_ON,
   NOTHING_DISPATCHED,
   VOICE_DICTATION_SEND_MS,
   VOICE_NOTHING_TO_CLOSE,
@@ -445,6 +447,22 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
     expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
     if (route === "voice") expect(resolveVoice).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: the list is offered on the overview, then the user walks to the
+   * deck and clicks an entry. Nothing opens, and the report says the screen
+   * changed after the choice was offered — not that it changed mid-resolve. */
+  it("refuses a clicked entry after the user moved to another screen", async () => {
+    const voice = microphone(["open the agent"]);
+    setup(voice);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(2, second.label)).toBeVisible();
+    fireEvent.click(screen.getByTestId("open-deck"));
+    await act(async () => { fireEvent.click(entry(2, second.label)); await Promise.resolve(); });
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(VOICE_CHOICE_SCREEN_MOVED_ON);
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(DIALOG_MOVED_ON);
   });
 
   /** Scenario: after twenty seconds the offered entries expire; clicking an old
@@ -3125,7 +3143,7 @@ describe("the New agent deck field and Discard, by voice (issues 1263 and 1247)"
     await flush();
 
     expect(chosenDeck()).toBeUndefined();
-    expect(screen.getByTestId("voice-report")).toHaveTextContent(DIALOG_MOVED_ON);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(VOICE_CHOICE_DIALOG_MOVED_ON);
     expect(screen.getByTestId("voice-report")).not.toHaveTextContent(`Daemon: ${offered[1].label}.`);
   });
 

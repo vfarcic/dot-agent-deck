@@ -18,6 +18,26 @@ What the app did with each thing you said appears beside the button and stays un
 
 To type into an agent, open its [pane](dashboard.md#the-agent-pane) and start with "type", for example "type run the tests". The words after "type" are typed into the agent's prompt, taken from what the Speech service heard rather than from the Commands model's answer, and sent after a short countdown.
 
+## When a command matches several things
+
+If what you said names more than one thing on screen, for example "open the agent" with several agents on the dashboard, the app does not guess. It lists the matches as numbered buttons beside the Voice button, with a **Cancel** button and a countdown, and waits for you to choose:
+
+![The agent dashboard with voice on and "open the agent" heard: beside the Voice button, the sentence saying "agent" matches more than one agent, then the numbered buttons 1. Plan / architecture and 2. Desktop implementation, a Cancel button and a 20 s countdown](/img/voice-choice-desktop.png)
+
+- **Say the number**: "two", "2", "number two", "option two", "the second one" or "the last one", on its own.
+- **Say the name** of one of the listed entries, such as "Desktop implementation".
+- **Click** an entry, or reach it with Tab and press Enter.
+
+The command you first gave then runs with the entry you chose; what you said is not sent to the Commands service again. Choosing does not skip a confirmation: if the command stops an agent or closes an orchestration, the confirmation still opens, and you answer it by hand.
+
+To choose nothing, say "cancel", "never mind", "none", "none of them", "neither" or "no", press **Cancel**, or press Escape while an entry has focus. The list also closes on its own after 20 seconds, and when you turn voice off; nothing runs.
+
+If you say something else while the list is open, the list closes and what you said is treated as a new command. A number that is not on the list, a name that matches more than one entry, or on its own the name of something on screen that is not on the list, closes the list without running anything; say the command again, more specifically.
+
+Nothing runs, and the app says why, if what the list was about changed after it appeared: you moved to another screen, the New agent dialog opened, closed or changed, the directory it showed moved, a daemon's address changed, or the agent, daemon or orchestration you chose is no longer there.
+
+A list is not offered while a confirmation is open, or when more than nine things match; the app then says what matched, and you say the command again, more specifically. Some refusals are never turned into a list, for example "switch to build, not staging", where choosing between the two would let you pick the daemon you just ruled out.
+
 ## Typing mode
 
 When you want to dictate a longer prompt, you do not have to start every sentence with "type". Open the agent's pane and say "type on" (or "typing on", "start typing", "dictation on", "start dictation", "keep typing"). From then on, everything you say is typed into that agent's prompt, word for word, until you stop.
@@ -62,7 +82,7 @@ Keys are stored in your operating system's keychain, not in the settings file: o
 ## What is sent where
 
 - **To the Speech service:** your audio. With the default local container, it stays on this machine.
-- **To the Commands service, on every command:** the words it heard, the app's fixed instructions and answer format, the model name and token limit, and the app's list of commands. When the endpoint is not on this machine, the request also carries your Commands API key. Some utterances are decided on this machine and send nothing: one that starts with "type", "write", "say" or "dictate" followed by words to type; one that is, in its entirety, "end", "send", "send it", "submit", "enter" or "press enter" (case, punctuation and a word such as "okay" or "please" before or after it ignored); and, while the New agent dialog is open, one that is in its entirety a way of closing it, such as "close", "cancel" or "close new agent". Everything else goes to the Commands service, including other ways of saying submit such as "go ahead". While [typing mode](#typing-mode) is on, nothing you say is sent to the Commands service at all: it is typed into the agent or, for the few phrases that still work, handled on this machine. "type on" and "type off" themselves are also decided on this machine.
+- **To the Commands service, on every command:** the words it heard, the app's fixed instructions and answer format, the model name and token limit, and the app's list of commands. When the endpoint is not on this machine, the request also carries your Commands API key. Some utterances are decided on this machine and send nothing: one that starts with "type", "write", "say" or "dictate" followed by words to type; one that is, in its entirety, "end", "send", "send it", "submit", "enter" or "press enter" (case, punctuation and a word such as "okay" or "please" before or after it ignored); while the New agent dialog is open, one that is in its entirety a way of closing it, such as "close", "cancel" or "close new agent"; and, while a [numbered list](#when-a-command-matches-several-things) is open, a number, a listed name or a way of cancelling it. Everything else goes to the Commands service, including other ways of saying submit such as "go ahead". While [typing mode](#typing-mode) is on, nothing you say is sent to the Commands service at all: it is typed into the agent or, for the few phrases that still work, handled on this machine. "type on" and "type off" themselves are also decided on this machine.
 - **With Names shared**, each command also sends the names on screen: each agent on the selected daemon with its role, CLI name, status and running tool; each daemon's label, which for a remote daemon is its ssh user, host and any non-default port; while the New agent dialog shows a directory, up to 200 directory names from it; the dialog's Mode chips and agent entries; and each orchestration's title and roles. The app adds no filesystem path, id, prompt text or tool argument of its own, but a name is whatever it was set to, and can itself be a path.
 - **With Names withheld**, none of those names is sent, so the commands that name an agent, daemon, directory, mode, agent type or orchestration are unavailable. Your words are still sent as heard.
 

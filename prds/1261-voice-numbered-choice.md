@@ -1,6 +1,6 @@
 # PRD #1261: Offer a numbered choice when a voice command names several things
 
-**Status**: In progress — M1 and M2 implemented; M3 (fixtures, docs, changelog) next. Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1260](1260-voice-sticky-dictation-mode.md) and [PRD #1184](1184-voice-command-chains.md).
+**Status**: M1, M2 and M3 implemented; D1 (action ambiguity) deferred and **not done** — this PRD delivers value ambiguity only. Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1260](1260-voice-sticky-dictation-mode.md) and [PRD #1184](1184-voice-command-chains.md).
 **Priority**: Medium
 **Created**: 2026-09-29
 **Issue**: [#1261](https://github.com/vfarcic/dot-agent-deck/issues/1261)
@@ -147,11 +147,25 @@ Answers are local, so the fixtures cover only the first utterance (reaching `par
 
 - [x] **M1 — Candidates carry values.** Resolver arms, `Unmet`, `ParamAmbiguous.candidates`, the cause-keyed eligibility; no UI change. Rust tests.
 - [x] **M2 — The chooser.** `voice::choice::answer`, the panel state, rendering, click/ordinal/name answers, staleness through the existing layers, expiry, cancel, the non-answer rule, the D5 hand-off, `refusedRef` coverage. Rust, vitest and Playwright tests.
-- [ ] **M3 — Fixtures, docs, changelog.** Fixture run (local, credentialed); `docs/desktop/voice.md` (what the user sees and says — rule 21), `docs/develop/voice-first-design.md` (the offered-list check as distinct from grounding; the "genuine ties" note; the list of refusals that never become a choice), `docs/develop/desktop-gui.md`; `changelog.d/1261.feature.md`. Run `docs-screenshots-review`.
+- [x] **M3 — Fixtures, docs, changelog.** Fixture run (local, credentialed); `docs/desktop/voice.md` (what the user sees and says — rule 21), `docs/develop/voice-first-design.md` (the offered-list check as distinct from grounding; the "genuine ties" note; the list of refusals that never become a choice), `docs/develop/desktop-gui.md`; `changelog.d/1261.feature.md`. Run `docs-screenshots-review`.
 
 **Deferred.**
 
+D1 below is deferred, not done: "close the agent" and every other reading the Commands backend settles into ONE action still never offers a choice, because the backend's answer cannot carry a second action until PRD #1184's schema lands.
+
 - [ ] **D1 — Action ambiguity.** After PRD #1184's response schema can carry more than one action. Non-destructive reading as option 1; a destructive option still ends at D5.
+
+## Deviations from the design above, as built
+
+Recorded here so the sections above can be read as the design and this as what shipped.
+
+- **Two copies of the answer rule.** `voice::choice::answer` (Rust, behind the `desktop_voice_choice` Tauri command) is the one production answers with. `answerChoiceLocally` (`desktop/src/lib/voiceChoice.ts`) answers for a runtime with no such command — the browser preview and vitest — because those runtimes have no bridge into Rust, and the chooser's panel behaviour would otherwise be untestable above Rust unit tests. It keeps the order and the closed lists but matches names against labels only, does not refuse a whole-utterance name of something unlisted, and does no liveness check. So vitest and Playwright prove the panel with the fallback, and the Rust path is covered by `voice/choice.rs`'s unit tests and by the manual walk (`desktop-gui.md` step 12c). Both copies are named in `voice-first-design.md` section 8 so a change to one is not mistaken for a change to both.
+- **A refused answer closes the choice.** The design said an answer is "refused"; as built, an out-of-range ordinal, a name matching several offered entries, or an entry that has gone closes the choice with the refusal rather than keeping it open for another try. One more utterance ("say the command again") is the cost; a list that stays open after a wrong answer invites a second guess against the same, possibly stale, list.
+- **A name is refused only as a whole utterance.** A name that resolves to nothing offered is refused only when the whole utterance is, word for word, the name of something on screen or of an offered entry that has gone. A sentence merely containing a name ("open the tester") is a non-answer and goes on to be resolved as a command, per the non-answer rule.
+- **A tie is offered only on the row's LAST param.** Every shipped row has one param, so this changes nothing today; a tie on an earlier param would dispatch the chosen entry without the params after it, so it keeps its sentence and offers no choice.
+- **The 20 s window shipped as written** (`VOICE_CHOICE_WINDOW_MS`), still a starting value (Open Question 2).
+- **The chooser has its own staleness sentences.** The design reused `SCREEN_MOVED_ON` / `DIALOG_MOVED_ON`, whose "while that was being worked out" describes a round trip — wrong for a click, which makes none. The same checks now refuse with `VOICE_CHOICE_SCREEN_MOVED_ON` / `VOICE_CHOICE_DIALOG_MOVED_ON` ("…after the choice was offered…").
+- **The list is never squeezed by the sentence beside it.** The docs screenshot showed the second entry cut mid-word by a long "matches more than one" sentence; the choice group no longer shrinks and is capped at 60% of the row instead, so the sentence is elided first and a long list scrolls inside its cap.
 
 ## Risks
 
@@ -180,4 +194,11 @@ Written from issue #1261 by a dispatched unit, alongside PRDs #1260 and #1184, a
 - **The answer.** `voice::choice::answer` (cancel phrase → whole-utterance ordinal → a name resolved among the offered, still-live candidates with the kind's own resolver), reached through a new `desktop_voice_choice` Tauri command that reads the agents and decks as `desktop_voice_resolve` does. A name that resolves to nothing offered is **refused** only when the whole utterance is, word for word, the name of something on screen or of an offered entry that has gone; a sentence merely containing a name ("open the tester") is a non-answer and goes on to the endpoint. A runtime with no Rust behind it (the browser preview, vitest) answers with `answerChoiceLocally` in `desktop/src/lib/voiceChoice.ts`, the same order and closed lists matched against labels and with no liveness check — a second copy of the rule, kept deliberately small, because the tests' runtimes have no bridge to reach Rust through.
 - **Refused answers close the choice.** An out-of-range ordinal or a name matching several entries closes the choice with a refusal rather than keeping it open for another try; the user says the command again.
 - **The browser preview** answers "open the agent" on the Daemons screen or the dashboard with a canned tie between the `connected` state's two agents (`?fixture=1&state=connected&voice=open%20the%20agent`, then e.g. `&voice=two`), so the browser tier can drive the chooser.
+
+### 2026-09-29 — M3: fixtures, docs, changelog
+
+- **Fixtures.** `phrase_fixtures.toml` gained a `candidates` column, required on (and only on) a `param_ambiguous` fixture and compared as a set: `switch-deck-ambiguous-box` must offer `deck-build-box` and `deck-stale-box`, and `open-agent-ambiguous-name` the two **Atlas** agents. So a tie that stops being offerable goes red rather than passing on its kind. No dispatching fixture became a choice. The harness also gained `DOT_AGENT_DECK_VOICE_FIXTURE` (run only fixtures whose name contains it — rule 6) and prints the model's own value (`model_value`) on a red fixture.
+- **Two reds met on the way, both pre-existing model variance rather than this PRD, fixed at the layer that owned them** (CLAUDE.md rule 6). `switch-deck-build-box` failed 3 of 5 alone: the model answered "switch deck to the build box" with the full label `deploy@build-box`, and `switch_target`'s rule 3 (`said`) refused it because "deploy" was not spoken. A value that resolves to exactly the one deck the transcript names alone is now accepted — it adds no deck rule 4 would not dispatch — pinned by `voice_outcome_switch_deck_accepts_the_full_label_of_the_one_deck_named`. `dictate-stop-typing-in-passing` failed 2 of 5: the model marked the whole utterance as the introducing words, so nothing was typed; `dictate_to_agent`'s description now says the prefix is never the whole sentence, with this phrasing as its example, and all ten `dictate*` fixtures then passed 12 runs of 12.
+- **Docs.** `docs/desktop/voice.md` has "When a command matches several things" with a generated screenshot (`voice-choice` scenario, `cargo docs-screenshots --scenario voice-choice`), and the "decided on this machine" list names the choice's answers. `voice-first-design.md` section 8 has the numbered choice (the offered-list check as distinct from grounding, the refusals that never become a choice, the genuine-ties note, the non-answer rule, staleness, the two copies) and checklist item 11; `desktop-gui.md` has the surface note and manual walk step 12c for the Rust path.
+- **Changelog.** `changelog.d/1261.feature.md`, and `1261.bugfix.md` for the two fixture fixes, which a user can observe.
 

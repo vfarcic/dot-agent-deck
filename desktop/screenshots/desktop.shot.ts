@@ -121,3 +121,27 @@ desktopScenario("voice-typing-mode", async (page) => {
   await expect(page.getByTestId("voice-dictating")).toBeVisible();
   await expect(page.getByTestId("voice-stop-typing")).toBeVisible();
 });
+
+// PRD #1261 — the numbered choice, desktop-only (the TUI has no voice). The
+// fixture's scripted microphone says "open the agent" once the Voice button is
+// pressed on the dashboard, which the preview answers with a canned tie between
+// the two agents labelled Plan / architecture and Desktop implementation; the
+// image shows the numbered entries, Cancel and the countdown in the voice row.
+desktopScenario("voice-choice", async (page) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("dot-agent-deck.desktop-settings", JSON.stringify({
+      version: 1,
+      appearance: { mode: "system" },
+      voice: { activation: "toggle", intent: "claude", transcription: "remote" },
+      zoom: { level: 1 },
+    }));
+  });
+  await page.goto("/?fixture=1&state=docs&voice=open%20the%20agent");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await expect(page.locator(".overview-row")).toHaveCount(4);
+  await page.getByTestId("voice-trigger").click();
+  const choice = page.getByTestId("voice-choice");
+  await expect(choice.getByRole("button", { name: "1. Plan / architecture" })).toBeVisible();
+  await expect(choice.getByRole("button", { name: "2. Desktop implementation" })).toBeVisible();
+});
