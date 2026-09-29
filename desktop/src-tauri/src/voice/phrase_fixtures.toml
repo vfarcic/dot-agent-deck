@@ -36,6 +36,7 @@ utterance = "switch deck to the box"
 screen = "overview"
 action = "switch_deck"
 outcome = "param_ambiguous"
+candidates = ["deck-build-box", "deck-stale-box"]
 
 [[fixtures]]
 name = "switch-deck-unknown"
@@ -75,6 +76,7 @@ utterance = "zoom coder"
 screen = "deck"
 action = "open_agent"
 outcome = "param_ambiguous"
+candidates = ["agent-atlas-one", "agent-atlas-two"]
 
 [[fixtures]]
 name = "open-agent-unavailable"

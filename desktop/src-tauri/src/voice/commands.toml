@@ -541,7 +541,8 @@ NOTHING else: the words BEFORE what the user wants written, copied from their ow
 the prefix at the last word that leads UP TO the request — for "let's write a prompt run the
 login tests" it is "let's write a prompt", and for "ask it to summarise what it just did" it is
 "ask it to" and NOT "ask it to summarise", because the thing the agent is being asked to do is
-part of the text. Never answer with the text itself — the app takes that from the transcript. Do NOT use this for a request to
+part of the text. The prefix is NEVER the whole sentence — something always follows it: for "tell
+it we should stop typing the logs to a file" it is "tell it". Never answer with the text itself — the app takes that from the transcript. Do NOT use this for a request to
 LOOK at an agent or open its pane, which is `open_agent`, and do NOT use it to send what is
 already in the prompt, which is `submit_prompt`."""
 invoke      = "dictateToAgent"

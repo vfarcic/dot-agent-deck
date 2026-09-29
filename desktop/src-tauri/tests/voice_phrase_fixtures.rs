@@ -67,6 +67,10 @@ use serde::Deserialize;
 
 const FIXTURES: &str = include_str!("../src/voice/phrase_fixtures.toml");
 const REQUIRE_REAL_E2E_ENV: &str = "DOT_AGENT_DECK_REQUIRE_REAL_E2E";
+/// Run only the fixtures whose name contains this text — rule 6's "rerun only
+/// the failing test", for a manifest that is one test function. The manifest
+/// is still pre-validated in full; only the model calls are narrowed.
+const FIXTURE_FILTER_ENV: &str = "DOT_AGENT_DECK_VOICE_FIXTURE";
 /// The credential the keyed backend authenticates with, as the developer's own
 /// shell already spells it. Rule 5's lane 2: a developer's key on a developer's
 /// machine, and nothing registered on the repository.
@@ -164,6 +168,15 @@ struct PhraseFixture {
     dictate_prefix: Option<String>,
     #[serde(default)]
     pending_action: bool,
+    /// The candidate values a `param_ambiguous` fixture must offer as a
+    /// numbered choice (PRD #1261), compared as a set: the order is the
+    /// resolver's and is pinned by the unit tests, while what a fixture can
+    /// prove is that the real model's answer lands on a tie the chooser can
+    /// offer — neither a lost candidate nor an extra one. Required on every
+    /// `param_ambiguous` fixture, so a tie that reached the user as a bare
+    /// sentence (no candidates) goes red instead of passing on the kind.
+    #[serde(default)]
+    candidates: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -320,6 +333,31 @@ fn marked_prefix(outcome: &VoiceOutcome) -> Option<&str> {
             .iter()
             .find(|param| param.kind == ParamKind::SpokenPrefix)
             .map(|param| param.spoken.as_str()),
+        _ => None,
+    }
+}
+
+/// The model's own value for the param a refusal or a tie is about — what the
+/// sentence cannot always show, since a refusal such as "I did not catch which
+/// daemon" deliberately does not quote it. Without it a red fixture cannot say
+/// whether the model or the app's check moved.
+fn model_value(outcome: &VoiceOutcome) -> Option<&str> {
+    match outcome {
+        VoiceOutcome::ParamUnresolved { spoken, .. }
+        | VoiceOutcome::ParamAmbiguous { spoken, .. } => Some(spoken),
+        _ => None,
+    }
+}
+
+/// The values a tie offers as a numbered choice (PRD #1261), if it offers one.
+fn offered_values(outcome: &VoiceOutcome) -> Option<Vec<String>> {
+    match outcome {
+        VoiceOutcome::ParamAmbiguous { candidates, .. } => Some(
+            candidates
+                .iter()
+                .map(|candidate| candidate.value.clone())
+                .collect(),
+        ),
         _ => None,
     }
 }
@@ -512,6 +550,12 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 fixture.action
             );
         }
+        assert_eq!(
+            fixture.candidates.is_some(),
+            fixture.outcome == OutcomeKind::ParamAmbiguous,
+            "{}: `candidates` is required on, and only on, a `param_ambiguous` fixture",
+            fixture.name
+        );
         if let Some(expected) = fixture.resolved_agent.as_deref() {
             let planted = if fixture.generated_run {
                 &generated_run_agents
@@ -578,7 +622,16 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
     let suite_started = Instant::now();
     let mut failures = Vec::new();
 
+    let filter = std::env::var(FIXTURE_FILTER_ENV)
+        .ok()
+        .filter(|filter| !filter.trim().is_empty());
     for fixture in fixtures.fixtures {
+        if filter
+            .as_deref()
+            .is_some_and(|filter| !fixture.name.contains(filter))
+        {
+            continue;
+        }
         let Some(screen) = Screen::parse(&fixture.screen) else {
             failures.push(format!(
                 "{}: fixture names unknown screen `{}`",
@@ -664,6 +717,15 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     }
                     None => true,
                 };
+                let candidates_match = match fixture.candidates.as_deref() {
+                    Some(expected) => offered_values(&answer.outcome).is_some_and(|mut offered| {
+                        let mut expected = expected.to_vec();
+                        offered.sort();
+                        expected.sort();
+                        offered == expected
+                    }),
+                    None => true,
+                };
                 let prefix_matches = match fixture.dictate_prefix.as_deref() {
                     Some(expected) => marked_prefix(&answer.outcome)
                         .is_some_and(|marked| normalise(marked) == normalise(expected)),
@@ -730,6 +792,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     && agent_type_matches
                     && orchestration_matches
                     && prefix_matches
+                    && candidates_match
                     && deck_named
                     && deck_eligible
                     && unavailable_named
@@ -740,12 +803,14 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     Err(format!(
                         "{}expected action={} outcome={} resolved_agent={:?} resolved_deck={:?} \
                          resolved_dir={:?} resolved_mode={:?} resolved_agent_type={:?} \
-                         resolved_orchestration={:?} dictate_prefix={:?}, got action={:?} \
-                         outcome={actual_outcome} resolved_agent={actual_agent:?} \
+                         resolved_orchestration={:?} dictate_prefix={:?} candidates={:?}, \
+                         got action={:?} outcome={actual_outcome} resolved_agent={actual_agent:?} \
                          resolved_deck={:?} resolved_dir={:?} resolved_mode={:?} \
                          resolved_agent_type={:?} resolved_orchestration={:?} dictate_prefix={:?} \
-                         sentence={:?}",
-                        if !deck_named {
+                         candidates={:?} model_value={:?} sentence={:?}",
+                        if !candidates_match {
+                            "the tie does not offer the expected candidates; "
+                        } else if !deck_named {
                             "the report does not name the preselected deck; "
                         } else if !deck_eligible {
                             "a deck the dialog disables was preselected; "
@@ -765,6 +830,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                         fixture.resolved_agent_type,
                         fixture.resolved_orchestration,
                         fixture.dictate_prefix,
+                        fixture.candidates,
                         actual_action,
                         resolved_deck(&answer.outcome),
                         resolved_dir(&answer.outcome),
@@ -772,6 +838,8 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                         resolved_of(&answer.outcome, ParamKind::AgentTypeRef),
                         resolved_label(&answer.outcome, ParamKind::OrchestrationRef),
                         marked_prefix(&answer.outcome),
+                        offered_values(&answer.outcome),
+                        model_value(&answer.outcome),
                         // The app's own sentence, which says WHY a refusal
                         // refused — the kinds alone cannot tell a model's
                         // substitution from a grounding refusal.

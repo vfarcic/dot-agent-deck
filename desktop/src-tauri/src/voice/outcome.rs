@@ -1297,7 +1297,11 @@ fn said(spoken: &str, transcript: &str) -> bool {
 ///    for a transcript that excludes something rule 1 cannot see as a deck:
 ///    "switch to the build box, not staging" with no staging deck configured,
 ///    or "switch away from the build box".
-/// 3. **The model's value is not [`said`]** → [`Unmet::NotSaid`].
+/// 3. **The model's value is not [`said`]** → [`Unmet::NotSaid`] — unless it
+///    resolves to exactly the one deck rule 1 found named, which is the model
+///    quoting that deck's full label rather than the user's words for it
+///    (`deploy@build-box` for "the build box"). That adds no deck rule 4 would
+///    not dispatch anyway.
 /// 4. **The model's value resolves to one deck** → dispatched only when the
 ///    transcript named exactly that deck; [`Unmet::NamedOther`] when it named
 ///    a different one; [`Unmet::NotSaid`] when it named none.
@@ -1334,8 +1338,8 @@ fn said(spoken: &str, transcript: &str) -> bool {
 ///
 /// What this guarantees: a voice switch goes only to a deck that the user's
 /// own words, read with the resolver's matching, named and named alone — and
-/// only when the model's value is words the user said that resolve to that
-/// same deck. So neither the model nor text injected into what it reads can
+/// only when the model's value resolves to that same deck (words the user
+/// said, or that deck's own label). So neither the model nor text injected into what it reads can
 /// choose a deck the user did not name.
 ///
 /// What remains, deliberately: the user names one deck while EXCLUDING it in
@@ -1363,10 +1367,23 @@ fn switch_target(
     if let Some(marker) = contrast_marker(transcript.text(), decks, &named) {
         return Err(Unmet::Contrast(marker));
     }
-    if !said(spoken, transcript.text()) && !said_as_a_name(spoken, transcript.text(), decks) {
+    let resolved = resolve_deck_ref(spoken, decks);
+    // Rule 3's one exception: a value the user did not say word for word that
+    // resolves to exactly the one deck their own words named — the model
+    // quoting that deck's full label ("deploy@build-box") for "the build box".
+    // It adds no deck: rule 4 would dispatch the same one had the model echoed
+    // the user's words instead.
+    let names_the_named = matches!(
+        (&resolved, named.as_slice()),
+        (DeckRefMatch::One { id, .. }, [deck]) if deck.id == *id
+    );
+    if !names_the_named
+        && !said(spoken, transcript.text())
+        && !said_as_a_name(spoken, transcript.text(), decks)
+    {
         return Err(Unmet::NotSaid);
     }
-    match resolve_deck_ref(spoken, decks) {
+    match resolved {
         DeckRefMatch::One { id, label } => match named.first() {
             Some(deck) if deck.id == id => Ok((id, label)),
             Some(deck) => Err(Unmet::NamedOther(deck.label.clone())),
@@ -8584,6 +8601,47 @@ mod tests {
                 matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
                     if params[0].value == expected),
                 "{said}: {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: "switch deck to the build box" answered with the deck's full
+    /// label, `deploy@build-box.example.com:2222`, rather than the words said —
+    /// what the shipping model returns about half the time (the
+    /// `switch-deck-build-box` phrase fixture, 2026-09-29). The user's own
+    /// words named exactly that deck, so it switches. A full label for a deck
+    /// the transcript did NOT name is still refused, whether the transcript
+    /// named another deck or none.
+    #[tokio::test]
+    async fn voice_outcome_switch_deck_accepts_the_full_label_of_the_one_deck_named() {
+        let staged = [
+            deck("deck-local", "Local deck", true),
+            deck("deck-build", "deploy@build-box.example.com:2222", false),
+            deck("deck-staging", "deploy@staging-box.example.com", false),
+        ];
+        let labelled = switched_over(
+            &staged,
+            "switch deck to the build box",
+            "deploy@build-box.example.com:2222",
+        )
+        .await;
+        assert!(
+            matches!(&labelled, VoiceOutcome::Dispatch { params, .. }
+                if params[0].value == "deck-build"),
+            "{labelled:?}"
+        );
+
+        for (said, spoken) in [
+            (
+                "switch deck to the build box",
+                "deploy@staging-box.example.com",
+            ),
+            ("switch deck", "deploy@build-box.example.com:2222"),
+        ] {
+            let refused = switched_over(&staged, said, spoken).await;
+            assert!(
+                matches!(&refused, VoiceOutcome::ParamUnresolved { .. }),
+                "{said} / {spoken}: {refused:?}"
             );
         }
     }
