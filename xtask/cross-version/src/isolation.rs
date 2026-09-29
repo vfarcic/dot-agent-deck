@@ -105,6 +105,9 @@ pub struct Plan {
     /// The operator's real home, masked by an empty tmpfs; `None` when it does
     /// not exist on this host.
     pub masked_home: Option<PathBuf>,
+    /// Host paths replaced by a small empty tmpfs ([`host_only_dirs_to_mask`]).
+    #[serde(default)]
+    pub tmpfs: Vec<PathBuf>,
     /// The outer half's mount namespace, which the inner half must differ from.
     pub outer_mnt_ns: String,
 }
@@ -184,6 +187,14 @@ pub fn bwrap_args(plan: &Plan) -> Vec<String> {
             "1048576".into(),
             "--tmpfs".into(),
             home.display().to_string(),
+        ]);
+    }
+    for p in &plan.tmpfs {
+        a.extend([
+            "--size".into(),
+            "1048576".into(),
+            "--tmpfs".into(),
+            p.display().to_string(),
         ]);
     }
     let root = plan.root.display().to_string();
@@ -332,9 +343,26 @@ pub fn check_namespace(plan: &Plan, recorded_mnt: &str) -> Result<Vec<String>, S
                 .to_string(),
         );
     }
+    for p in &plan.tmpfs {
+        let n = std::fs::read_dir(p)
+            .map_err(|e| format!("read masked {}: {e}", p.display()))?
+            .count();
+        if n != 0 {
+            return Err(format!(
+                "{} is not masked: {n} entr{} visible inside the namespace",
+                p.display(),
+                if n == 1 { "y" } else { "ies" }
+            ));
+        }
+        notes.push(format!(
+            "`{}` is an empty tmpfs inside the namespace",
+            p.display()
+        ));
+    }
     match std::fs::read_to_string("/proc/self/mountinfo") {
         Ok(info) => {
-            let residual = residual_rw_mounts(&info, plan);
+            let RwMounts { residual, covered } = residual_rw_mounts(&info, plan);
+            notes.extend(describe_covered(&covered));
             notes.push(if residual.is_empty() {
                 "no residual `rw` submount: every mount point outside the run's own is read-only"
                     .to_string()
@@ -388,38 +416,155 @@ fn unescape_mount_path(field: &str) -> String {
     out
 }
 
-/// The mount points in `mountinfo` still mounted `rw` that are not the run's
-/// own: `$S` and what is under it, the masks, the masked home's tmpfs, the
-/// private `/proc` and the `/dev` bwrap builds. What remains is what the
-/// read-only `/` did not reach — reported, not proven unwritable.
-pub fn residual_rw_mounts(mountinfo: &str, plan: &Plan) -> Vec<String> {
-    residual_rw_mounts_where(mountinfo, |mp: &Path| {
-        mp.starts_with(&plan.root)
-            || plan.masks.iter().any(|m| mp == m.target)
-            || plan.masked_home.as_deref() == Some(mp)
-            || mp == Path::new("/proc")
-            || mp.starts_with("/dev")
+/// The runtime namespace's `rw` mounts that are not its own: `$S` and what is
+/// under it, the masks, the masked home's tmpfs, the tmpfs masks, the private
+/// `/proc` and the `/dev` bwrap builds. What remains is what the read-only `/`
+/// did not reach — the residual ones reported, not proven unwritable.
+pub fn residual_rw_mounts(mountinfo: &str, plan: &Plan) -> RwMounts {
+    let mut masks: Vec<&Path> = plan.masks.iter().map(|m| m.target.as_path()).collect();
+    masks.extend(plan.masked_home.as_deref());
+    masks.extend(plan.tmpfs.iter().map(PathBuf::as_path));
+    masks.extend([Path::new("/proc"), Path::new("/dev")]);
+    classify_rw_mounts(
+        mountinfo,
+        |mp: &Path| mp.starts_with(&plan.root) || masks.contains(&mp) || mp.starts_with("/dev"),
+        &masks,
+    )
+}
+
+/// The `rw` mounts in a mountinfo table that are not a namespace's own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RwMounts {
+    /// Reachable: nothing the namespace mounted lies over them.
+    pub residual: Vec<String>,
+    /// `(mount point, mask)`: still listed in mountinfo, but beneath a mask the
+    /// namespace mounted over them, so no path inside reaches them.
+    pub covered: Vec<(String, String)>,
+}
+
+/// One `/proc/self/mountinfo` line, as far as reachability needs it.
+struct MountEntry {
+    id: u64,
+    parent: u64,
+    mount_point: PathBuf,
+    rw: bool,
+}
+
+fn parse_mountinfo(mountinfo: &str) -> Vec<MountEntry> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            Some(MountEntry {
+                id: f.first()?.parse().ok()?,
+                parent: f.get(1)?.parse().ok()?,
+                mount_point: PathBuf::from(unescape_mount_path(f.get(4)?)),
+                rw: f.get(5)?.split(',').any(|o| o == "rw"),
+            })
+        })
+        .collect()
+}
+
+/// The mask in `masks` that hides `entry` from every path inside the
+/// namespace, if one does.
+///
+/// A mount is hidden when some mount on its way to the root — itself or an
+/// ancestor, `below` here — sits in a parent mount `Q` beneath the mount point
+/// of a mask that is ALSO a child of `Q`: path resolution crossing that point
+/// in `Q` enters the mask, never `Q`, so nothing mounted in `Q` under it is
+/// reached. That is what bwrap's own layering produces: `--ro-bind / /` copies
+/// the host's submounts, and a `--tmpfs /run` mounted afterwards becomes a
+/// child of the copied `/run`, alongside the copied `/run/docker/netns/*`.
+///
+/// Decided from the parent ids, not from the order of the mount ids: those are
+/// the lowest free number, reused after an unmount, so a mask can carry a
+/// lower id than a mount it was layered over (measured: a `/run` mask at 499
+/// over a copied netns mount at 528). The mask's mount point must be a STRICT
+/// prefix of `below`'s — two children of one parent at the same point is not a
+/// layering this reads, so it counts as reachable. A mount made AFTER the mask
+/// on a path beneath it is a child of the mask (or of something on it), not of
+/// `Q`, so its chain meets no such sibling and it stays reachable; so does
+/// anything a later bind copies back out from under a mask.
+fn covering_mask(entries: &[MountEntry], entry: &MountEntry, masks: &[&Path]) -> Option<PathBuf> {
+    let mut below = entry;
+    let mut seen = std::collections::BTreeSet::new();
+    while seen.insert(below.id) {
+        let q = entries
+            .iter()
+            .find(|m| m.id == below.parent && m.id != below.id)?;
+        if let Some(mask) = entries.iter().find(|d| {
+            d.parent == q.id
+                && d.id != below.id
+                && masks.contains(&d.mount_point.as_path())
+                && below.mount_point.starts_with(&d.mount_point)
+                && below.mount_point != d.mount_point
+        }) {
+            return Some(mask.mount_point.clone());
+        }
+        below = q;
+    }
+    None
+}
+
+/// Every `rw` mount in `mountinfo` for which `own` is false, split into the
+/// residual — reachable from inside — and those a mask in `masks`, mounted by
+/// the namespace itself, hides ([`covering_mask`]). Shared by the runtime
+/// namespace ([`residual_rw_mounts`]) and the build namespace (`buildns.rs`),
+/// each with its own idea of which mounts are its own and which are masks.
+pub fn classify_rw_mounts(
+    mountinfo: &str,
+    own: impl Fn(&Path) -> bool,
+    masks: &[&Path],
+) -> RwMounts {
+    let entries = parse_mountinfo(mountinfo);
+    let mut out = RwMounts::default();
+    for e in entries.iter().filter(|e| e.rw && !own(&e.mount_point)) {
+        let mp = e.mount_point.display().to_string();
+        match covering_mask(&entries, e, masks) {
+            Some(mask) => out.covered.push((mp, mask.display().to_string())),
+            None => out.residual.push(mp),
+        }
+    }
+    out.residual.sort();
+    out.residual.dedup();
+    out.covered.sort();
+    out.covered.dedup();
+    out
+}
+
+/// A note naming the `rw` mounts a mask hides, for the evidence file.
+pub fn describe_covered(covered: &[(String, String)]) -> Option<String> {
+    (!covered.is_empty()).then(|| {
+        format!(
+            "{} `rw` mount(s) the read-only root did not remount, each hidden beneath a mask this \
+             namespace mounted over it (so no path inside reaches it): {}",
+            covered.len(),
+            covered
+                .iter()
+                .map(|(m, by)| format!("`{m}` under `{by}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     })
 }
 
-/// The mount points in `mountinfo` still mounted `rw` for which `own` is false.
-/// Shared by the runtime namespace ([`residual_rw_mounts`]) and the build
-/// namespace (`buildns.rs`), each with its own idea of which mounts are its own.
-pub fn residual_rw_mounts_where(mountinfo: &str, own: impl Fn(&Path) -> bool) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in mountinfo.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let (Some(mp), Some(opts)) = (fields.get(4), fields.get(5)) else {
-            continue;
-        };
-        if !opts.split(',').any(|o| o == "rw") {
-            continue;
-        }
-        let mp = unescape_mount_path(mp);
-        if !own(Path::new(&mp)) {
-            out.push(mp);
-        }
-    }
+/// Host paths the build and runtime namespaces replace with a small empty
+/// tmpfs when they exist, because nothing a run does needs them and a running
+/// container leaves `rw` mounts there that a read-only root cannot remount
+/// (issue #1413). bwrap cannot create a missing mount point under the
+/// read-only root, so a host without one is simply not masked there.
+pub const HOST_ONLY_DIRS: &[&str] = &["/var/lib/docker"];
+
+/// The [`HOST_ONLY_DIRS`] present on this host, resolved — the kernel mounts on
+/// the resolved path, and that is what mountinfo lists — and without any that
+/// lie under one of `already`, which masks them anyway.
+pub fn host_only_dirs_to_mask(already: &[&Path]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = HOST_ONLY_DIRS
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .filter(|p| p.is_dir() && p != Path::new("/"))
+        .filter(|p| !already.iter().any(|m| p.starts_with(m)))
+        .collect();
     out.sort();
     out.dedup();
     out
@@ -775,36 +920,180 @@ mod tests {
                 },
             ],
             masked_home: Some("/home/op".into()),
+            tmpfs: vec!["/var/lib/docker".into()],
             outer_mnt_ns: "mnt:[1]".into(),
         }
     }
 
     #[test]
     fn residual_rw_mounts_are_what_the_read_only_root_did_not_reach() {
+        // Laid out the way bwrap lays it out: `--ro-bind / /` copies the host's
+        // submounts (ids 14-17 under the copied root 1), and each mask is then
+        // mounted as a child of whatever copy it lands on.
         let info = "\
 1 0 252:0 / / ro,relatime - ext4 /dev/root rw
 2 1 0:30 / /home/op rw,nosuid,nodev - tmpfs tmpfs rw
 3 2 252:0 /home/op/code/runs/r1 /home/op/code/runs/r1 rw,relatime - ext4 /dev/root rw
 4 1 252:0 /home/op/code/runs/r1/fallback-tmp /tmp rw,relatime - ext4 /dev/root rw
-5 1 252:0 /home/op/code/runs/r1/run-user /run/user/1000 rw,relatime - ext4 /dev/root rw
-6 1 0:5 / /proc rw,nosuid,nodev,noexec - proc proc rw
+5 16 252:0 /home/op/code/runs/r1/run-user /run/user/1000 rw,relatime - ext4 /dev/root rw
+14 1 0:22 / /proc ro,nosuid,nodev,noexec - proc proc rw
+6 14 0:5 / /proc rw,nosuid,nodev,noexec - proc proc rw
 7 1 0:6 / /dev rw,nosuid - tmpfs tmpfs rw
 8 7 0:7 / /dev/pts rw,nosuid,noexec - devpts devpts rw
-9 1 0:40 / /run/docker/netns/abc rw - nsfs nsfs rw
-10 6 0:41 / /proc/sys/fs/binfmt_misc rw,relatime - autofs systemd-1 rw
+16 1 0:28 / /run ro,nosuid,nodev - tmpfs tmpfs rw
+9 16 0:40 / /run/docker/netns/abc rw - nsfs nsfs rw
+10 14 0:41 / /proc/sys/fs/binfmt_misc rw,relatime - autofs systemd-1 rw
 11 1 0:42 / /var/lib/docker/rootfs/overlayfs/x rw,relatime - overlay overlay rw
+15 1 0:45 / /var/lib/docker rw,nosuid,nodev - tmpfs tmpfs rw
 12 1 0:43 / /mnt/with\\040space rw - ext4 /dev/sdb rw
 13 1 0:44 / /srv/ro ro,relatime - ext4 /dev/sdc rw
 ";
+        let got = residual_rw_mounts(info, &plan());
         assert_eq!(
-            residual_rw_mounts(info, &plan()),
+            got.residual,
+            vec!["/mnt/with space", "/run/docker/netns/abc"],
+            "the runtime namespace does not mask `/run`, so Docker's netns mounts stay exposure"
+        );
+        assert_eq!(
+            got.covered,
             vec![
-                "/mnt/with space",
-                "/proc/sys/fs/binfmt_misc",
-                "/run/docker/netns/abc",
-                "/var/lib/docker/rootfs/overlayfs/x",
+                ("/proc/sys/fs/binfmt_misc".into(), "/proc".into()),
+                (
+                    "/var/lib/docker/rootfs/overlayfs/x".into(),
+                    "/var/lib/docker".into()
+                ),
             ]
         );
+    }
+
+    #[test]
+    fn the_runtime_namespace_masks_var_lib_docker_before_the_sandbox_is_bound() {
+        let args = bwrap_args(&plan());
+        let docker = pos(&args, &["--tmpfs", "/var/lib/docker"]);
+        assert_eq!(args[docker - 2], "--size");
+        let back = pos(
+            &args,
+            &["--bind", "/home/op/code/runs/r1", "/home/op/code/runs/r1"],
+        );
+        assert!(pos(&args, &["--ro-bind", "/", "/"]) < docker && docker < back);
+    }
+
+    /// `/proc/self/mountinfo` from a real `bwrap --ro-bind / / --tmpfs /run
+    /// --tmpfs /var/lib/docker` on a host running one container (issue #1413),
+    /// trimmed to the lines that matter. The `/run` mask (499) carries a LOWER
+    /// id than the netns mount it covers (528): ids are reused, not ordered.
+    const MEASURED: &str = "\
+503 232 253:1 / / ro,nosuid,nodev,relatime master:1 - ext4 /dev/vda1 rw
+521 503 0:28 / /run ro,nosuid,nodev master:12 - tmpfs tmpfs rw
+528 521 0:5 net:[4026532620] /run/docker/netns/2b3b370f1677 rw master:181 - nsfs nsfs rw
+533 503 0:50 / /var/lib/docker/rootfs/overlayfs/814c7cd18fc9 rw,relatime master:172 - overlay overlay rw
+499 521 0:59 / /run rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=980k
+534 503 0:62 / /var/lib/docker rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=980k
+";
+
+    const NETNS: &str = "/run/docker/netns/2b3b370f1677";
+    const OVERLAY: &str = "/var/lib/docker/rootfs/overlayfs/814c7cd18fc9";
+
+    fn classify(info: &str, masks: &[&str]) -> RwMounts {
+        let masks: Vec<&Path> = masks.iter().map(Path::new).collect();
+        classify_rw_mounts(info, |mp| masks.contains(&mp), &masks)
+    }
+
+    fn without(info: &str, id: &str) -> String {
+        info.lines()
+            .filter(|l| !l.starts_with(&format!("{id} ")))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+
+    #[test]
+    fn a_rw_mount_beneath_a_mask_mounted_over_it_is_covered_not_residual() {
+        let got = classify(MEASURED, &["/run", "/var/lib/docker"]);
+        assert_eq!(got.residual, Vec::<String>::new());
+        assert_eq!(
+            got.covered,
+            vec![
+                (NETNS.into(), "/run".into()),
+                (OVERLAY.into(), "/var/lib/docker".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn with_no_covering_mask_the_same_mounts_are_residual() {
+        // The mask absent from mountinfo, and a mask the namespace did not
+        // mount (the path is not one of its masks) both leave them reachable.
+        let got = classify(&without(MEASURED, "534"), &["/run", "/var/lib/docker"]);
+        assert_eq!(got.residual, vec![OVERLAY]);
+        let got = classify(MEASURED, &["/run"]);
+        assert_eq!(got.residual, vec!["/var/lib/docker", OVERLAY]);
+        assert_eq!(got.covered, vec![(NETNS.into(), "/run".into())]);
+    }
+
+    #[test]
+    fn a_rw_mount_layered_above_the_mask_is_residual() {
+        // 540 was mounted on the mask itself; 541 is what a later bind of a
+        // host directory into the mask copies along with it.
+        let info = format!(
+            "{MEASURED}\
+540 499 0:70 / /run/later rw - tmpfs tmpfs rw
+539 499 253:1 /srv/data /run/data ro - ext4 /dev/vda1 rw
+541 539 0:71 / /run/data/sub rw - ext4 /dev/vdb rw
+"
+        );
+        let got = classify(&info, &["/run", "/var/lib/docker"]);
+        assert_eq!(got.residual, vec!["/run/data/sub", "/run/later"]);
+        assert_eq!(got.covered.len(), 2, "{got:?}");
+    }
+
+    #[test]
+    fn a_mount_nested_under_a_covered_one_is_covered_too() {
+        let info = format!(
+            "{MEASURED}\
+550 528 0:72 / {NETNS}/inner rw - tmpfs tmpfs rw
+"
+        );
+        let got = classify(&info, &["/run", "/var/lib/docker"]);
+        assert!(got.residual.is_empty(), "{got:?}");
+        assert!(
+            got.covered
+                .contains(&(format!("{NETNS}/inner"), "/run".into()))
+        );
+    }
+
+    #[test]
+    fn a_mask_that_is_not_a_strict_prefix_does_not_cover() {
+        // A sibling mask elsewhere in the same parent, and a sibling at the
+        // very same mount point, which is not a layering this reads.
+        let info = "\
+1 0 253:1 / / ro - ext4 /dev/vda1 rw
+2 1 0:28 / /run ro - tmpfs tmpfs rw
+3 2 0:5 / /run/docker/netns/a rw - nsfs nsfs rw
+4 2 0:59 / /run/user rw - tmpfs tmpfs rw
+5 2 0:60 / /run/docker/netns/a rw - tmpfs tmpfs rw
+";
+        let got = classify(info, &["/run/user", "/run/docker/netns/a"]);
+        assert_eq!(got.residual, Vec::<String>::new());
+        let got = classify_rw_mounts(
+            info,
+            |mp| mp == Path::new("/run/user"),
+            &[Path::new("/run/user"), Path::new("/run/docker/netns/a")],
+        );
+        assert_eq!(got.residual, vec!["/run/docker/netns/a"]);
+        assert!(got.covered.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn a_parent_cycle_or_a_parent_outside_the_table_is_not_covered() {
+        let info = "\
+7 8 0:5 / /run/a rw - nsfs nsfs rw
+8 7 0:6 / /run rw - tmpfs tmpfs rw
+9 7 0:7 / /run rw - tmpfs tmpfs rw
+10 99 0:8 / /x/y rw - ext4 /dev/vdb rw
+";
+        let got = classify_rw_mounts(info, |_| false, &[Path::new("/x")]);
+        assert!(got.residual.contains(&"/x/y".to_string()), "{got:?}");
+        assert!(got.residual.contains(&"/run/a".to_string()), "{got:?}");
     }
 
     fn pos(args: &[String], needle: &[&str]) -> usize {
