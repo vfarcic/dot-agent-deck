@@ -2014,6 +2014,17 @@ impl std::fmt::Display for ContextRemovalError {
 /// following and must be a regular file, and the unlink is an `unlinkat` of that
 /// single name. Nothing is created and no mode is repaired.
 ///
+/// **Why deleting without a repair is safe enough.** The `fstatat` and the
+/// `unlinkat` are two calls, so the entry can be replaced between them — but
+/// only by an account that can write `.dot-agent-deck`. On Unix the publish
+/// that wrote this file ran [`ensure_context_dir_owner_writable_only`] on the
+/// same directory first, so as of that publish group and other could not write
+/// it; this function neither re-checks nor repairs that, so a mode widened
+/// since the last publish widens the window with it. A replacement cannot turn
+/// the removal into anything but the removal of one name in that directory:
+/// `unlinkat` with no flags removes a symlink itself rather than its target and
+/// fails on a directory. Off Unix there is no mode model and no such bound.
+///
 /// A missing file is success: the 14-day sweep, or the user, got there first.
 /// Whether another live orchestration still references the file is the
 /// caller's question to answer, under the state lock, before calling this —
@@ -2999,18 +3010,22 @@ pub(crate) fn git_common_dir(project_dir: &std::path::Path) -> Option<std::path:
 }
 
 /// Read the whole of `file`, refusing one longer than `max` bytes.
+///
+/// The length is checked on the raw bytes before they are decoded, so an
+/// over-cap file reports as over-cap even when the `max + 1`-th byte splits a
+/// UTF-8 sequence; only a file within the cap can fail as invalid UTF-8.
 #[cfg(unix)]
-fn read_bounded(file: std::fs::File, max: u64) -> std::io::Result<String> {
+fn read_bounded(file: impl std::io::Read, max: u64) -> std::io::Result<String> {
     use std::io::Read as _;
-    let mut raw = String::new();
-    file.take(max + 1).read_to_string(&mut raw)?;
+    let mut raw = Vec::new();
+    file.take(max + 1).read_to_end(&mut raw)?;
     if raw.len() as u64 > max {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("longer than {max} bytes"),
         ));
     }
-    Ok(raw)
+    String::from_utf8(raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Open the directory a git pointer file names, as git resolves it: an
@@ -5381,5 +5396,29 @@ mod hygiene_tests {
             0,
             "nothing is created through the link"
         );
+    }
+
+    /// A file over the cap whose `max + 1`-th byte splits a UTF-8 sequence
+    /// reports as over-cap, not as invalid UTF-8 (issue #1395 review).
+    #[cfg(unix)]
+    #[test]
+    fn read_bounded_over_cap_split_utf8_reports_over_cap() {
+        // "é" is two bytes; with max = 3 the take(4) cut lands inside it.
+        let raw = "abcé".as_bytes();
+        let err = read_bounded(raw, 3).expect_err("over the cap");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "longer than 3 bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_bounded_at_cap_reads_and_invalid_utf8_within_cap_is_invalid_data() {
+        assert_eq!(
+            read_bounded("abé".as_bytes(), 4).expect("at the cap"),
+            "abé"
+        );
+        let err = read_bounded(&b"ab\xff"[..], 4).expect_err("invalid UTF-8");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!err.to_string().starts_with("longer than"), "{err}");
     }
 }
