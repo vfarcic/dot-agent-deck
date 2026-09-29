@@ -854,8 +854,12 @@ describe("sticky dictation in the open agent pane", () => {
   beforeEach(() => { window.localStorage.clear(); vi.useFakeTimers(); });
   afterEach(() => vi.useRealTimers());
 
-  const deckId = createFixtureSnapshot("crowded").connection.deckId ?? "";
-  const coderId = createFixtureSnapshot("crowded").agents.find((agent) => agent.displayName === "Coder")?.id ?? "";
+  const fixture = createFixtureSnapshot("crowded");
+  const deckId = fixture.connection.deckId;
+  if (!deckId) throw new Error("crowded fixture must include a deck id");
+  const coder = fixture.agents.find((agent) => agent.role === "Coder");
+  if (!coder) throw new Error("crowded fixture must include the Coder agent");
+  const coderId = coder.id;
   const modeOn = dispatch("dictation_on", "startDictation", "Typing to Coder.", "type on");
   const modeOff = dispatch("dictation_off", "stopDictation", "Stopped typing to Coder.", "type off");
   const inModeText = (said: string) => dispatch("dictate_to_agent", "dictateToAgent", `Typed: “${said}”.`, said, [
@@ -964,6 +968,7 @@ describe("sticky dictation in the open agent pane", () => {
     expect(screen.queryByText(/sending in \d+ s/i)).toBeNull();
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "first sentence ");
   });
 
   /** Scenario: each whole-utterance voice exit ends dictation without pressing
@@ -982,6 +987,7 @@ describe("sticky dictation in the open agent pane", () => {
     expect(screen.queryAllByText(/typing to coder/i)).toHaveLength(0);
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "unsent words ");
   });
 
   /** Scenario: the mode has a visible exit even when speech is misheard. Its
@@ -996,6 +1002,7 @@ describe("sticky dictation in the open agent pane", () => {
     expect(voiceButton()).toHaveAttribute("aria-pressed", "true");
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "unsent words ");
   });
 
   /** Scenario: pressing Voice or closing the pane ends an active mode, leaving
@@ -1011,6 +1018,7 @@ describe("sticky dictation in the open agent pane", () => {
     expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "unsent words ");
   });
 
   /** Scenario: the agent whose pane owns dictation exits. The panel drops the
@@ -1029,6 +1037,7 @@ describe("sticky dictation in the open agent pane", () => {
     expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "unsent words ");
   });
 
   /** Scenario: selected deck identity changes while coder's pane is open.
@@ -1048,6 +1057,7 @@ describe("sticky dictation in the open agent pane", () => {
     expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "unsent words ");
     expect(deck.sendTerminalInput).not.toHaveBeenCalledWith({ deckId: "deck-second", agentId: coderId }, expect.anything());
   });
 
@@ -1061,6 +1071,7 @@ describe("sticky dictation in the open agent pane", () => {
     unmount();
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "unsent words ");
     render(<DeckShell runtime={deck} />);
     expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
   });
@@ -1078,6 +1089,7 @@ describe("sticky dictation in the open agent pane", () => {
     expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "unsent words ");
   });
 
   /** Scenario: a stop confirmation opens in the overview behind an open agent
