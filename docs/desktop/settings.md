@@ -1,7 +1,3 @@
----
-title: Settings
----
-
 # Settings
 
 **Settings**, in the rail on the left, opens the app's settings. It has four sections: **Appearance**, **Daemons**, **Voice** and **Zoom**. Press `Escape` to close it. Changes are saved as you make them.

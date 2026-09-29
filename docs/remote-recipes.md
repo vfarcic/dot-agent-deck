@@ -1,8 +1,3 @@
----
-sidebar_position: 7.6
-title: Remote Recipes
----
-
 # Remote Recipes
 
 Getting a host into a state where `dot-agent-deck remote add` will succeed. The deck ships no provisioner and has no opinion about where the machine comes from — these are starting points you adapt to your environment.

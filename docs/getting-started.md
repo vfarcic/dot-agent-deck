@@ -1,11 +1,3 @@
----
-sidebar_position: 2
-title: Getting Started
----
-
-import Tabs from '@theme/Tabs';
-import TabItem from '@theme/TabItem';
-
 # Getting Started
 
 Agent Deck has two clients: a terminal UI (the TUI, `dot-agent-deck`) and a desktop app. Both are clients of the same background daemon, which owns the agents, so an agent started from one shows up in the other. The desktop app is an alpha; it covers the Dashboard, New agent, several daemons at once, Settings and voice control (see [Desktop app](desktop/index.md)). The desktop app needs a running daemon, and the simplest way to get one is to install and run the TUI, so this page starts there.
@@ -95,8 +87,7 @@ Once the dashboard is running, press `?` inside the app to see all shortcuts. Th
 
 ## Launching
 
-<Tabs groupId="client">
-<TabItem value="tui" label="TUI">
+**TUI:**
 
 Running `dot-agent-deck` opens a two-column layout with native embedded terminal panes:
 
@@ -109,8 +100,7 @@ On a first run there are no agents yet, and the dashboard says so:
 
 ![The TUI with no agents: “No active sessions. Press Ctrl+n to create a pane.” above the command bar](/img/dashboard-empty-tui.png)
 
-</TabItem>
-<TabItem value="desktop" label="Desktop">
+**Desktop:**
 
 Opening the desktop app shows the **Agent dashboard**: every agent as a row, with its status, grouped by daemon and by orchestration. It connects to the daemon on this machine and does not start one; if none is running, the Dashboard says **Daemon disconnected** (see [Installation → How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)).
 
@@ -121,9 +111,6 @@ On a first run the daemon is healthy and owns no agents, and the Dashboard says 
 ![The desktop app's dashboard with no agents: “No agents are running yet” and a New agent button](/img/dashboard-empty-desktop.png)
 
 Clicking a row opens that agent's terminal in a full-window pane; see [Desktop app → Dashboard](desktop/dashboard.md).
-
-</TabItem>
-</Tabs>
 
 ## How it runs
 
@@ -137,8 +124,7 @@ About 30 seconds after every client (the TUI, the desktop app) has disconnected 
 
 ## Basic Workflow
 
-<Tabs groupId="client">
-<TabItem value="tui" label="TUI">
+**TUI:**
 
 1. Launch the dashboard with `dot-agent-deck`
 2. Press `Ctrl+n` to open the **New Agent** form — pick a directory, give the agent a name, and enter the command to run (typically `claude`, `opencode`, `pi`, `codex`, or `devin`)
@@ -152,8 +138,7 @@ About 30 seconds after every client (the TUI, the desktop app) has disconnected 
 
 ![The TUI's New Agent form over the dashboard: the chosen directory at the top, a Mode row with No mode selected and an orchestration, schedule and dispatcher as the other choices, then the Name field pre-filled from the directory, an empty Command field, and Submit and Cancel](/img/new-agent-tui.png)
 
-</TabItem>
-<TabItem value="desktop" label="Desktop">
+**Desktop:**
 
 1. Open the app. The **Agent dashboard** lists the agents of the daemon it is connected to.
 2. Click **New agent** (or press `Ctrl+N` / `⌘N` on the Dashboard). Choose a daemon, browse to a directory and press **Use this directory**, leave **Mode** on **No mode**, then give the agent a **Name** and a **Command** (typically `claude`, `opencode`, `pi`, `codex`, or `devin`; it is pre-filled from your `default_command` or last command) and press **Create agent**. See [Desktop app → New agent](desktop/new-agent.md).
@@ -162,9 +147,6 @@ About 30 seconds after every client (the TUI, the desktop app) has disconnected 
 5. To close an agent, use the stop control on its row (`Close <name> agent`) and confirm with **Close agent**.
 
 ![The desktop app's New agent dialog over the Dashboard: the Local daemon chosen under Daemon, a directory chosen in the browser, the Mode chips with No mode selected, the Name pre-filled from the directory, an empty Command field, and Discard and Create agent](/img/new-agent-desktop.png)
-
-</TabItem>
-</Tabs>
 
 ## Orchestration
 

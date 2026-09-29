@@ -1,8 +1,3 @@
----
-sidebar_position: 7.5
-title: Remote Environment Requirements
----
-
 # Remote Environment Requirements
 
 What a host must provide for a `dot-agent-deck` **remote environment** — a per-project, long-running host that runs the deck daemon and owns the project's agents. This is not a provisioning guide and not a daily-use guide; it lists the prerequisites a host must satisfy before the deck can register it as a remote. Throughout, the **host** is that machine and **your laptop** is whatever machine you connect *from* — a split of roles rather than of hardware, since a host may itself be a laptop. Everything below is written for Linux, which is the only host validated end to end; `remote add` also installs onto macOS, and [macOS as a remote host](#macos-as-a-remote-host) sets out what is and is not known about that.

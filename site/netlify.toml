@@ -1,22 +1,19 @@
 # Netlify configuration for the docs site (agent-deck.devopstoolkit.ai).
 #
-# The site is built in GitHub Actions and uploaded with
-# `netlify deploy --no-build --dir=build` run from this directory, so Netlify
-# never runs a build itself. `publish` only documents where that output lives.
+# The site is generated in GitHub Actions by `cargo xtask site
+# site/build/public ...` and uploaded with `netlify deploy --no-build
+# --dir=build/public` run from this directory, so Netlify never runs a build
+# itself. `publish` only documents where that output lives.
 #
-# Ported from the nginx config the container image served with
-# (`try_files $uri $uri/ =404`): no SPA fallback, so an unknown path is a real
-# 404. Netlify serves Docusaurus's own build/404.html for it, where nginx
-# showed its stock error page. `/docs/x` -> `/docs/x/` redirects come from
-# Netlify's pretty-URL handling, matching nginx's directory redirect.
+# The redirects and the content types live in the output, not here: `cargo
+# xtask site` writes `_redirects` (every URL the Docusaurus site served, to its
+# Markdown successor) and `_headers` (`text/markdown; charset=utf-8` for each
+# published `.md` page, `text/plain; charset=utf-8` for llms.txt and
+# llms-full.txt), both generated from docs/published.toml so the page list is
+# never restated by hand. site/nginx-default.conf does the same for the image.
+#
+# No SPA fallback, as with nginx (`try_files $uri $uri/ =404`), so an unknown
+# path is a real 404.
 
 [build]
-  publish = "build"
-
-# Docusaurus emits content-hashed bundles under /assets/, safe to cache forever.
-# Everything else keeps Netlify's default (max-age=0, must-revalidate), so HTML,
-# sitemap.xml and img/ are revalidated on every request.
-[[headers]]
-  for = "/assets/*"
-  [headers.values]
-    Cache-Control = "public, max-age=31536000, immutable"
+  publish = "build/public"

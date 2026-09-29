@@ -1,7 +1,3 @@
----
-title: New Agent
----
-
 # New Agent
 
 **New agent** starts an agent on a daemon. Open it with the **New agent** button at the top of the [Dashboard](dashboard.md), with a daemon section's own **New agent** button (which picks that daemon for you), or with `Ctrl+N` / `⌘N` on the Dashboard (not while an agent pane is open). It is the desktop counterpart of the TUI's `Ctrl+n` form, and it offers the same kinds of start except workspace modes.

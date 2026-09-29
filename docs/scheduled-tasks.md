@@ -1,8 +1,3 @@
----
-sidebar_position: 5.7
-title: Schedules
----
-
 # Schedules
 
 Schedules let you say *"every weekday at 09:00, run this prompt in this directory"* and have the result land in the deck where you can read it after a notification — no opening a terminal at the right time, `cd`-ing to the right place, and pasting the prompt by hand.

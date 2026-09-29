@@ -418,3 +418,384 @@ fn every_legacy_docusaurus_page_url_has_a_manifest_page() {
         assert!(found, "legacy URL {url} has no manifest page");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Redirects and content types
+// ---------------------------------------------------------------------------
+
+fn fixture_urls() -> Vec<String> {
+    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/docusaurus-urls.txt"))
+        .unwrap()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn redirects_cover_every_route_form_of_every_page() {
+    let fx = Fixture::new();
+    let pages = published_docs::read(fx.docs()).unwrap();
+    let table = redirects(&pages);
+    let get = |from: &str| {
+        table
+            .iter()
+            .find(|r| r.from == from)
+            .map(|r| r.to.as_str())
+            .unwrap_or_else(|| panic!("no redirect from {from}"))
+    };
+    for from in ["/docs/start", "/docs/start/", "/docs/start/index.html"] {
+        assert_eq!(get(from), "/docs/start.md");
+    }
+    // `desktop/index.md` was the category index at /docs/desktop/.
+    for from in [
+        "/docs/desktop",
+        "/docs/desktop/",
+        "/docs/desktop/index.html",
+    ] {
+        assert_eq!(get(from), "/docs/desktop/index.md");
+    }
+    assert_eq!(get("/docs"), DOCS_INDEX);
+    assert_eq!(get("/docs/"), DOCS_INDEX);
+    // The fixture has no `configuration` page, so the retired page's
+    // successor is absent and it gets no redirect rather than a broken one.
+    assert!(table.iter().all(|r| !r.from.contains("workspace-modes")));
+    let froms: BTreeSet<&str> = table.iter().map(|r| r.from.as_str()).collect();
+    assert_eq!(froms.len(), table.len(), "duplicate redirect source");
+}
+
+#[test]
+fn both_deploy_targets_carry_the_same_redirect_table() {
+    let fx = Fixture::new();
+    let site = build(&fx.config).unwrap();
+    let pages = published_docs::read(fx.docs()).unwrap();
+    let table = redirects(&pages);
+    let netlify = site.text("_redirects").unwrap();
+    for r in &table {
+        assert!(
+            netlify
+                .lines()
+                .any(|l| l == format!("{} {} 301!", r.from, r.to)),
+            "_redirects lacks {r:?}:\n{netlify}"
+        );
+        assert!(
+            site.nginx_redirects
+                .lines()
+                .any(|l| l == format!("location = {} {{ return 301 {}; }}", r.from, r.to)),
+            "nginx include lacks {r:?}:\n{}",
+            site.nginx_redirects
+        );
+    }
+    assert!(!site.files.keys().any(|k| k.contains("nginx")));
+}
+
+#[test]
+fn netlify_headers_serve_markdown_and_llms_files_readable() {
+    let fx = Fixture::new();
+    let site = build(&fx.config).unwrap();
+    let headers = site.text("_headers").unwrap();
+    for path in ["/docs/start.md", "/docs/desktop/index.md"] {
+        assert!(
+            headers.contains(&format!(
+                "{path}\n  Content-Type: {MARKDOWN_CONTENT_TYPE}\n"
+            )),
+            "{headers}"
+        );
+    }
+    for path in ["/llms.txt", "/llms-full.txt"] {
+        assert!(
+            headers.contains(&format!("{path}\n  Content-Type: {LLMS_CONTENT_TYPE}\n")),
+            "{headers}"
+        );
+    }
+}
+
+/// The redirect table, checked against the two lists PRD #1419 names: the URLs
+/// the last Docusaurus build served, and every `agent-deck.devopstoolkit.ai/docs/…`
+/// URL in the repository. Each must redirect to a page the site publishes, or
+/// already be a file it publishes.
+#[test]
+fn the_real_redirects_cover_the_legacy_urls_and_every_url_in_the_repository() {
+    let root = workspace_root();
+    let config = SiteConfig::from_workspace(&root);
+    let site = build(&config).unwrap();
+    let pages = published_docs::read(&config.docs_dir).unwrap();
+    let table = redirects(&pages);
+    let resolves = |path: &str| -> Result<(), String> {
+        if let Some(r) = table.iter().find(|r| r.from == path) {
+            let target = r.to.trim_start_matches('/');
+            return if site.files.contains_key(target) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{path} redirects to {}, which is not published",
+                    r.to
+                ))
+            };
+        }
+        if site.files.contains_key(path.trim_start_matches('/')) {
+            Ok(())
+        } else {
+            Err(format!("{path} neither redirects nor is published"))
+        }
+    };
+
+    let mut errors = Vec::new();
+    let legacy = fixture_urls();
+    assert!(legacy.len() > 40, "fixture looks truncated");
+    for url in &legacy {
+        if let Err(e) = resolves(url) {
+            errors.push(format!("fixture: {e}"));
+        }
+    }
+    // `/docs/workspace-modes` was already a 404 before Docusaurus went, and is
+    // redirected to its successor rather than left dead.
+    assert_eq!(
+        table
+            .iter()
+            .find(|r| r.from == "/docs/workspace-modes")
+            .map(|r| r.to.as_str()),
+        Some("/docs/configuration.md")
+    );
+
+    let repo_urls = repository_site_doc_urls(&root);
+    assert!(
+        repo_urls.iter().any(|(_, u)| u == "/docs/workspace-modes"),
+        "the CHANGELOG links to /docs/workspace-modes; the scan found none, so it is broken"
+    );
+    for (file, url) in &repo_urls {
+        if let Err(e) = resolves(url) {
+            errors.push(format!("{file}: {e}"));
+        }
+    }
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+/// Every `agent-deck.devopstoolkit.ai/docs…` URL path in the repository's
+/// tracked files, with the file it was found in. Tracked files, because that
+/// is the list the PRD asks for and it keeps build output and local scratch
+/// out; `git ls-files` is the one reliable way to name them, so this is a
+/// read-only git call with git's location discovery pinned to the checkout.
+fn repository_site_doc_urls(root: &Path) -> Vec<(String, String)> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("run git ls-files");
+    assert!(output.status.success(), "git ls-files failed");
+    let host = "agent-deck.devopstoolkit.ai";
+    let mut found = Vec::new();
+    for name in output.stdout.split(|b| *b == 0) {
+        let Ok(name) = std::str::from_utf8(name) else {
+            continue;
+        };
+        if name.is_empty() || name == "xtask/site/fixtures/docusaurus-urls.txt" {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(root.join(name)) else {
+            continue; // binary, or deleted in the working tree
+        };
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find(host) {
+            let after = &rest[at + host.len()..];
+            rest = after;
+            if !after.starts_with("/docs") {
+                continue;
+            }
+            let end = after
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || matches!(
+                            c,
+                            ')' | '('
+                                | '"'
+                                | '\''
+                                | '`'
+                                | '>'
+                                | '<'
+                                | ']'
+                                | '#'
+                                | '?'
+                                | ','
+                                | '*'
+                                | '…'
+                        )
+                })
+                .unwrap_or(after.len());
+            let mut path = after[..end].trim_end_matches(['.', ';', ':']);
+            if path.len() > 5 && !path[5..].starts_with('/') {
+                continue; // `/docsfoo`, not the docs tree
+            }
+            if path.is_empty() {
+                path = "/docs";
+            }
+            found.push((name.to_string(), path.to_string()));
+        }
+    }
+    found
+}
+
+// ---------------------------------------------------------------------------
+// The link check
+// ---------------------------------------------------------------------------
+
+#[test]
+fn link_check_rejects_a_broken_relative_link_or_image() {
+    let fx = Fixture::new();
+    fs::write(
+        fx.docs().join("start.md"),
+        "# Start\n\nSee [gone](gone.md) and [ok](desktop/index.md#desktop).\n",
+    )
+    .unwrap();
+    let err = build(&fx.config).unwrap_err();
+    assert!(
+        err.contains("docs/start.md: `gone.md` resolves to `/docs/gone.md`"),
+        "{err}"
+    );
+    assert!(!err.contains("desktop/index.md"), "{err}");
+
+    // A raw <img> the image collector does not publish is still checked.
+    fs::write(
+        fx.docs().join("start.md"),
+        "# Start\n\n<img src=\"img/nope.png\" alt=\"\">\n",
+    )
+    .unwrap();
+    let err = build(&fx.config).unwrap_err();
+    assert!(err.contains("`img/nope.png`"), "{err}");
+}
+
+#[test]
+fn link_check_rejects_links_into_develop() {
+    let fx = Fixture::new();
+    fs::write(
+        fx.docs().join("start.md"),
+        "# Start\n\n[secret](develop/secret.md)\n",
+    )
+    .unwrap();
+    let err = build(&fx.config).unwrap_err();
+    assert!(err.contains("links into docs/develop/"), "{err}");
+
+    fs::write(
+        fx.docs().join("start.md"),
+        "# Start\n\n[secret](https://github.com/vfarcic/dot-agent-deck/blob/main/docs/develop/secret.md)\n",
+    )
+    .unwrap();
+    let err = build(&fx.config).unwrap_err();
+    assert!(err.contains("links into docs/develop/"), "{err}");
+}
+
+#[test]
+fn link_check_ignores_code_fences_and_external_links() {
+    let fx = Fixture::new();
+    fs::write(
+        fx.docs().join("start.md"),
+        "# Start\n\n[web](https://example.com/x) [mail](mailto:a@b.c) [here](#start)\n\
+         ```md\n[not a link](gone.md)\n```\n",
+    )
+    .unwrap();
+    build(&fx.config).unwrap();
+}
+
+fn with_landing(fx: &Fixture, html: &str) {
+    let dir = fx.config.landing_dir();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("index.html"), html).unwrap();
+    fs::write(dir.join("landing.css"), "body{}").unwrap();
+}
+
+#[test]
+fn landing_page_links_come_from_the_manifest() {
+    let fx = Fixture::new();
+    with_landing(
+        &fx,
+        "<link href=\"/landing.css\"><a href=\"{{doc:start}}\">s</a>\
+         <a href=\"{{doc:desktop/index#desktop}}\">d</a><a href=\"#top\" id=\"top\">t</a>\
+         <a href=\"/llms.txt\">l</a>\n<ul>\n{{docs-index}}\n</ul>\n",
+    );
+    let site = build(&fx.config).unwrap();
+    let html = site.text("index.html").unwrap();
+    assert!(html.contains("<a href=\"/docs/start.md\">s</a>"), "{html}");
+    assert!(
+        html.contains("<a href=\"/docs/desktop/index.md#desktop\">d</a>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<li><a href=\"/docs/start.md\">Start</a><span>Begin here.</span></li>"),
+        "{html}"
+    );
+    assert!(!html.contains("{{"), "{html}");
+    assert_eq!(site.text("landing.css"), Some("body{}"));
+}
+
+#[test]
+fn landing_page_rejects_an_unpublished_page_a_missing_anchor_or_a_dead_link() {
+    let cases = [
+        (
+            "<a href=\"{{doc:develop/secret}}\">x</a>",
+            "not in docs/published.toml",
+        ),
+        (
+            "<a href=\"{{doc:start#nowhere}}\">x</a>",
+            "has no heading with that anchor",
+        ),
+        ("<a href=\"{{nope}}\">x</a>", "unknown placeholder"),
+        (
+            "<a href=\"/docs/start\">x</a>",
+            "which the site does not publish",
+        ),
+        (
+            "<img src=\"/img/gone.png\">",
+            "which the site does not publish",
+        ),
+        ("<a href=\"#missing\">x</a>", "names no element on the page"),
+    ];
+    for (html, expected) in cases {
+        let fx = Fixture::new();
+        with_landing(&fx, html);
+        let err = build(&fx.config).unwrap_err();
+        assert!(err.contains(expected), "{html}: {err}");
+    }
+}
+
+#[test]
+fn heading_anchors_follow_the_github_convention() {
+    let anchors = heading_anchors(
+        "# Desktop App\n## How it runs\n## How it runs\n### `docs` & more!\n```\n# fenced\n```\n#not\n",
+    );
+    let expected: BTreeSet<String> = ["desktop-app", "how-it-runs", "how-it-runs-1", "docs--more"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(anchors, expected);
+}
+
+#[test]
+fn the_real_landing_page_hands_off_to_the_docs_in_plain_html() {
+    let config = SiteConfig::from_workspace(&workspace_root());
+    let site = build(&config).unwrap();
+    let html = site.text("index.html").unwrap();
+    // The agent prompt, and the visible pointer to /llms.txt.
+    assert!(
+        html.contains("Read https://agent-deck.devopstoolkit.ai/llms.txt, then help me install and set up dot-agent-deck"),
+        "landing page lost the agent prompt"
+    );
+    assert!(html.contains("dot-agent-deck docs"));
+    assert!(html.contains("An AI agent should start at <a href=\"/llms.txt\">/llms.txt</a>"));
+    // Every published page is linked with a plain <a href> in the served HTML.
+    let pages = published_docs::read(&config.docs_dir).unwrap();
+    for page in &pages {
+        assert!(
+            html.contains(&format!("<a href=\"/docs/{}\">", page.file_name())),
+            "no plain link to {}",
+            page.slug
+        );
+    }
+    assert!(!html.contains("{{"));
+    assert!(!html.contains("docs/develop"));
+    assert!(site.files.contains_key("landing.css"));
+}

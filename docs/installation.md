@@ -1,8 +1,3 @@
----
-sidebar_position: 3
-title: Installation
----
-
 # Installation
 
 Agent Deck has two clients of one daemon: the terminal UI (the `dot-agent-deck` binary, which also contains the daemon and the CLI) and the [desktop app](desktop/index.md). Most of this page is the binary. The desktop app is a separate download, covered in [Desktop app](#desktop-app) below; on its own it does not start a daemon, so read [How the desktop app gets a daemon](#how-the-desktop-app-gets-a-daemon) before installing it.

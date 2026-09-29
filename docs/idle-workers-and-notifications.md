@@ -1,7 +1,3 @@
----
-title: Idle Workers & Notifications
----
-
 # Idle Workers & Notifications
 
 If a worker in an [orchestration](orchestration.md) gets stuck — it stops responding, sits at a prompt, or exits without finishing its task — the deck tells the orchestrator, so the orchestrator can chase the worker, hand the task to another role, or let you know. What it does with that news is up to the instructions you give it.

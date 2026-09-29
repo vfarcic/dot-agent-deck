@@ -1,8 +1,3 @@
----
-sidebar_position: 8
-title: Troubleshooting
----
-
 # Troubleshooting
 
 Most of this page applies to both clients, the TUI and the [desktop app](desktop/index.md), because the problems live in the daemon or the agents they share. A section that applies to only one client says so under its heading. For a desktop app that shows **Daemon disconnected**, see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon).

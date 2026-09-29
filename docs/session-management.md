@@ -1,29 +1,16 @@
----
-sidebar_position: 4
-title: Session Management
----
-
-import Tabs from '@theme/Tabs';
-import TabItem from '@theme/TabItem';
-
 # Session Management
 
 ## Session Statuses
 
 The daemon tracks each agent's state from the events its hooks report, and both clients show it: the TUI on each agent's card, the desktop app in the **Status** column of the [Dashboard](desktop/dashboard.md).
 
-<Tabs groupId="client">
-<TabItem value="tui" label="TUI">
+**TUI:**
 
 ![The TUI with four agent cards, each with its status in the card's title row: Idle, Working, Working and Needs Input](/img/dashboard-tui.png)
 
-</TabItem>
-<TabItem value="desktop" label="Desktop">
+**Desktop:**
 
 ![The desktop app's dashboard with four agents, each row starting with its status: waiting or running](/img/dashboard-desktop.png)
-
-</TabItem>
-</Tabs>
 
 The TUI shows seven statuses. The desktop app folds them into four, shown in the last column:
 

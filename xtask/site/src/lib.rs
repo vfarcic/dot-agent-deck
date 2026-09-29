@@ -16,8 +16,22 @@
 //! - `docs/<path>` for each image a page references by a RELATIVE path, so
 //!   `img/x.png` in a top-level page (or `../img/x.png` in a desktop page)
 //!   resolves on the site exactly as it does on disk.
-//! - the landing page, from [`landing_page`] — the hook the "Site replaced"
-//!   milestone fills in.
+//! - the landing page, from [`landing_page`]: `index.html` rendered from the
+//!   `site/landing/` template, whose docs links come from the manifest, and
+//!   its stylesheet.
+//! - `_redirects` and `_headers`, which Netlify reads from the published
+//!   directory: every URL the Docusaurus site served redirects to its Markdown
+//!   successor ([`redirects`]), and `.md` / `llms` files get a readable
+//!   `Content-Type`.
+//! - separately from the published tree, the same redirects as an nginx
+//!   `include` ([`nginx_redirects`]), written only when `--nginx-redirects` asks
+//!   for it, because a file nginx serves from its root would publish its own
+//!   config.
+//!
+//! [`build`] finishes with a link check ([`check_links`]), the replacement for
+//! Docusaurus's `onBrokenLinks: 'throw'`: every relative or root-absolute link
+//! and image in the published Markdown, the landing page and `llms.txt` must
+//! resolve to a file in the output, and nothing may link into `docs/develop/`.
 //!
 //! Nothing under `docs/develop/` can reach the output: the parser rejects a
 //! `develop/` slug, image references are confined to the docs tree outside
@@ -26,7 +40,7 @@
 #[path = "../../../src/published_docs.rs"]
 pub mod published_docs;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
@@ -40,6 +54,24 @@ pub const DEFAULT_BASE_URL: &str = "https://agent-deck.devopstoolkit.ai";
 const SUMMARY: &str = "dot-agent-deck is a dashboard for running several AI coding agents in \
 parallel, in a terminal UI (the `dot-agent-deck` binary) or a desktop app. A background daemon \
 owns the agents, so both clients show and control the same ones.";
+
+/// The page the legacy `/docs` and `/docs/` URLs redirect to: the index an
+/// agent starts from. Docusaurus served nothing there.
+pub const DOCS_INDEX: &str = "/llms.txt";
+
+/// Legacy `/docs/<route>` URLs whose page is gone, with the manifest slug of
+/// its closest successor.
+///
+/// `workspace-modes`: the page was deleted with the feature (#1199, #1412)
+/// while `CHANGELOG.md` still links it. Workspace modes were a `[[modes]]`
+/// block in `.dot-agent-deck.toml`; a leftover block is now ignored with a
+/// warning, and `configuration` is the reference for that file.
+pub const RETIRED_PAGES: &[(&str, &str)] = &[("workspace-modes", "configuration")];
+
+/// The `Content-Type` a published `.md` page is served with, on both targets.
+pub const MARKDOWN_CONTENT_TYPE: &str = "text/markdown; charset=utf-8";
+/// The `Content-Type` of `llms.txt` and `llms-full.txt`, on both targets.
+pub const LLMS_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 
 /// Inputs to [`build`].
 #[derive(Debug, Clone)]
@@ -58,6 +90,17 @@ impl SiteConfig {
         }
     }
 
+    /// The landing-page template directory: `site/landing/` beside `docs/`.
+    /// A docs tree with no such sibling (a test fixture) builds without a
+    /// landing page; `run` refuses that for a real build.
+    pub fn landing_dir(&self) -> PathBuf {
+        self.docs_dir
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join("site")
+            .join("landing")
+    }
+
     fn page_url(&self, page: &Page) -> String {
         format!("{}/docs/{}", self.base_url, page.file_name())
     }
@@ -67,6 +110,9 @@ impl SiteConfig {
 #[derive(Debug, Default)]
 pub struct Site {
     pub files: BTreeMap<String, Vec<u8>>,
+    /// The redirects as an nginx `include`, kept out of `files` so it is never
+    /// published (see the module docs).
+    pub nginx_redirects: String,
 }
 
 impl Site {
@@ -149,24 +195,432 @@ pub fn build(config: &SiteConfig) -> Result<Site, String> {
         "llms-full.txt".to_string(),
         llms_full_txt(config, &pages, &bodies).into_bytes(),
     )?;
-    for (path, bytes) in landing_page(config, &pages)? {
+    let table = redirects(&pages);
+    site.insert(
+        "_redirects".to_string(),
+        netlify_redirects(&table).into_bytes(),
+    )?;
+    site.insert("_headers".to_string(), netlify_headers(&pages).into_bytes())?;
+    site.nginx_redirects = nginx_redirects(&table);
+    let anchors: BTreeMap<&str, BTreeSet<String>> = pages
+        .iter()
+        .zip(&bodies)
+        .map(|(page, body)| (page.slug.as_str(), heading_anchors(body)))
+        .collect();
+    for (path, bytes) in landing_page(config, &pages, &anchors)? {
         site.insert(path, bytes)?;
     }
+    check_links(&site, &config.base_url)?;
     Ok(site)
 }
 
-/// The landing page and its assets (PRD #1419, "Site replaced" milestone).
+/// The landing page and its stylesheet (PRD #1419, Decisions 1 and 2).
 ///
-/// HOOK: this returns nothing until the static landing page exists. The
-/// milestone that ports the #1155 page to static HTML/CSS makes this return
-/// `index.html` and its stylesheet/script, generated from the same `pages` so
-/// the page's plain `<a href>` docs links come from the manifest. Everything it
-/// returns goes through [`Site::insert`], so the `docs/develop/` guard applies.
+/// `index.html` is rendered from `<landing_dir>/index.html`, a template with
+/// two placeholders: `{{doc:<slug>}}` (optionally `{{doc:<slug>#<anchor>}}`)
+/// becomes that page's URL, and fails the build unless `<slug>` is in the
+/// manifest and `<anchor>` names one of its headings; `{{docs-index}}` becomes
+/// one `<li>` per published page, in manifest order. So every docs link on the
+/// page is a plain `<a href>` in the served HTML, and cannot point at a page
+/// that is not published. `landing.css` is copied as is. Everything returned
+/// goes through [`Site::insert`], so the `docs/develop/` guard applies.
 pub fn landing_page(
-    _config: &SiteConfig,
-    _pages: &[Page],
+    config: &SiteConfig,
+    pages: &[Page],
+    anchors: &BTreeMap<&str, BTreeSet<String>>,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
-    Ok(Vec::new())
+    let dir = config.landing_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let read = |name: &str| {
+        std::fs::read_to_string(dir.join(name))
+            .map_err(|e| format!("cannot read {}: {e}", dir.join(name).display()))
+    };
+    let html = render_landing(&read("index.html")?, pages, anchors)?;
+    Ok(vec![
+        ("index.html".to_string(), html.into_bytes()),
+        ("landing.css".to_string(), read("landing.css")?.into_bytes()),
+    ])
+}
+
+/// Replace the landing template's placeholders (see [`landing_page`]).
+pub fn render_landing(
+    template: &str,
+    pages: &[Page],
+    anchors: &BTreeMap<&str, BTreeSet<String>>,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find("}}")
+            .ok_or_else(|| "landing page: unterminated `{{` placeholder".to_string())?;
+        let placeholder = &after[..end];
+        if placeholder == "docs-index" {
+            for page in pages {
+                out.push_str(&format!(
+                    "          <li><a href=\"{}\">{}</a><span>{}</span></li>\n",
+                    page_path(page),
+                    html_escape(&page.title),
+                    html_escape(&page.description)
+                ));
+            }
+            // The template puts the placeholder on a line of its own; the
+            // generated lines already end in newlines.
+            rest = after[end + 2..]
+                .strip_prefix('\n')
+                .unwrap_or(&after[end + 2..]);
+            continue;
+        }
+        let Some(target) = placeholder.strip_prefix("doc:") else {
+            return Err(format!(
+                "landing page: unknown placeholder `{{{{{placeholder}}}}}`"
+            ));
+        };
+        let (slug, anchor) = match target.split_once('#') {
+            Some((slug, anchor)) => (slug, Some(anchor)),
+            None => (target, None),
+        };
+        let page = pages.iter().find(|p| p.slug == slug).ok_or_else(|| {
+            format!("landing page links `{slug}`, which is not in docs/published.toml")
+        })?;
+        out.push_str(&page_path(page));
+        if let Some(anchor) = anchor {
+            if !anchors.get(slug).is_some_and(|a| a.contains(anchor)) {
+                return Err(format!(
+                    "landing page links `{slug}#{anchor}`, but `{slug}` has no heading with that anchor"
+                ));
+            }
+            out.push('#');
+            out.push_str(anchor);
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// A published page's root-absolute URL path.
+fn page_path(page: &Page) -> String {
+    format!("/docs/{}", page.file_name())
+}
+
+fn html_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// One redirect: a legacy URL path and the path it moves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redirect {
+    pub from: String,
+    pub to: String,
+}
+
+/// Every URL form the Docusaurus site served, redirected to its successor.
+///
+/// Generated from the manifest, not written by hand: each page's route is its
+/// slug, or the directory for an `<dir>/index` page (Docusaurus served
+/// `desktop/index.md` at `/docs/desktop/`), and each route is redirected in its
+/// slashless, trailing-slash and `/index.html` forms. [`RETIRED_PAGES`] adds
+/// the same three forms for a page that no longer exists, and `/docs` plus
+/// `/docs/` go to [`DOCS_INDEX`].
+pub fn redirects(pages: &[Page]) -> Vec<Redirect> {
+    let mut out = Vec::new();
+    let mut push_route = |route: &str, to: String| {
+        for from in [
+            format!("/docs/{route}"),
+            format!("/docs/{route}/"),
+            format!("/docs/{route}/index.html"),
+        ] {
+            out.push(Redirect {
+                from,
+                to: to.clone(),
+            });
+        }
+    };
+    for page in pages {
+        let route = page.slug.strip_suffix("/index").unwrap_or(&page.slug);
+        push_route(route, page_path(page));
+    }
+    for (route, successor) in RETIRED_PAGES {
+        if let Some(page) = pages.iter().find(|p| p.slug == *successor) {
+            push_route(route, page_path(page));
+        }
+    }
+    for from in ["/docs", "/docs/"] {
+        out.push(Redirect {
+            from: from.to_string(),
+            to: DOCS_INDEX.to_string(),
+        });
+    }
+    out
+}
+
+/// The redirects in Netlify's `_redirects` format. `301!` forces each one, so
+/// a file Netlify might otherwise find at the old path never shadows it.
+pub fn netlify_redirects(table: &[Redirect]) -> String {
+    let mut out =
+        String::from("# Generated by `cargo xtask site` from docs/published.toml. Do not edit.\n");
+    for r in table {
+        out.push_str(&format!("{} {} 301!\n", r.from, r.to));
+    }
+    out
+}
+
+/// The redirects as nginx exact-match locations, for an `include` inside the
+/// `server` block of `site/nginx-default.conf`. An exact match outranks the
+/// config's prefix and regex locations.
+pub fn nginx_redirects(table: &[Redirect]) -> String {
+    let mut out =
+        String::from("# Generated by `cargo xtask site` from docs/published.toml. Do not edit.\n");
+    for r in table {
+        out.push_str(&format!(
+            "location = {} {{ return 301 {}; }}\n",
+            r.from, r.to
+        ));
+    }
+    out
+}
+
+/// Netlify's `_headers`: the readable content types, path by path, since
+/// Netlify's header paths match by prefix and splat rather than by extension.
+pub fn netlify_headers(pages: &[Page]) -> String {
+    let mut out =
+        String::from("# Generated by `cargo xtask site` from docs/published.toml. Do not edit.\n");
+    for page in pages {
+        out.push_str(&format!(
+            "{}\n  Content-Type: {MARKDOWN_CONTENT_TYPE}\n",
+            page_path(page)
+        ));
+    }
+    for path in ["/llms.txt", "/llms-full.txt"] {
+        out.push_str(&format!("{path}\n  Content-Type: {LLMS_CONTENT_TYPE}\n"));
+    }
+    out
+}
+
+/// The link check that replaced Docusaurus's `onBrokenLinks: 'throw'`.
+///
+/// Every link and image target in the published Markdown, in each HTML page
+/// and in `llms.txt` is resolved against the output: a relative target against
+/// the linking file's directory, a root-absolute one against the site root,
+/// and an absolute URL on `base_url` by its path. Each must name a file the
+/// site publishes (an `#id` on an HTML page must name an element on it), and
+/// no target may reach `docs/develop/`, relatively or through an absolute URL.
+/// Heading anchors between Markdown pages are checked by the `docs`
+/// subcommand's tests (`cli/docs/005`), which read the same files, so this does
+/// not repeat that.
+pub fn check_links(site: &Site, base_url: &str) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (path, bytes) in &site.files {
+        let kind = if path.ends_with(".md") {
+            LinkSource::Markdown
+        } else if path.ends_with(".html") {
+            LinkSource::Html
+        } else if path == "llms.txt" {
+            LinkSource::Markdown
+        } else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            errors.push(format!("{path}: not UTF-8"));
+            continue;
+        };
+        let targets = match kind {
+            LinkSource::Markdown => {
+                let mut t = markdown_link_targets(text);
+                t.extend(html_attr_targets(text));
+                t
+            }
+            LinkSource::Html => html_attr_targets(text),
+        };
+        let dir = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
+        for target in targets {
+            if let Err(e) = check_target(site, base_url, path, dir, kind, text, target) {
+                errors.push(e);
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("broken links:\n  {}", errors.join("\n  ")))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkSource {
+    Markdown,
+    Html,
+}
+
+fn check_target(
+    site: &Site,
+    base_url: &str,
+    source: &str,
+    dir: &Path,
+    kind: LinkSource,
+    text: &str,
+    target: &str,
+) -> Result<(), String> {
+    let develop = format!("docs/{UNPUBLISHED_DIR}/");
+    let local = match target.strip_prefix(base_url) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') || rest.starts_with('#') => {
+            if rest.is_empty() { "/" } else { rest }
+        }
+        _ => target,
+    };
+    if local.contains("://") || local.starts_with("mailto:") || local.starts_with("data:") {
+        if local.contains(&format!("/{develop}")) {
+            return Err(format!(
+                "{source}: `{target}` links into docs/{UNPUBLISHED_DIR}/"
+            ));
+        }
+        return Ok(());
+    }
+    let (path, fragment) = match local.split_once('#') {
+        Some((p, f)) => (p, Some(f)),
+        None => (local, None),
+    };
+    let path = path.split('?').next().unwrap_or(path);
+    if path.is_empty() {
+        // An in-page anchor. Markdown heading anchors are `cli/docs/005`'s; an
+        // HTML page's must name an element on it.
+        if kind == LinkSource::Html {
+            let id = fragment.unwrap_or("");
+            if !id.is_empty() && !text.contains(&format!("id=\"{id}\"")) {
+                return Err(format!("{source}: `{target}` names no element on the page"));
+            }
+        }
+        return Ok(());
+    }
+    let resolved = if let Some(rooted) = path.strip_prefix('/') {
+        if rooted.is_empty() || rooted.ends_with('/') {
+            format!("{rooted}index.html")
+        } else {
+            rooted.to_string()
+        }
+    } else {
+        normalize(dir, path)
+            .ok_or_else(|| format!("{source}: `{target}` points outside the site"))?
+    };
+    if resolved.starts_with(&develop) || resolved == format!("docs/{UNPUBLISHED_DIR}") {
+        return Err(format!(
+            "{source}: `{target}` links into docs/{UNPUBLISHED_DIR}/"
+        ));
+    }
+    if !site.files.contains_key(&resolved) {
+        return Err(format!(
+            "{source}: `{target}` resolves to `/{resolved}`, which the site does not publish"
+        ));
+    }
+    Ok(())
+}
+
+/// Every `](target)` in Markdown outside code fences — links and images alike.
+fn markdown_link_targets(body: &str) -> Vec<&str> {
+    let mut targets = Vec::new();
+    for line in unfenced_lines(body) {
+        let mut rest = line;
+        while let Some(start) = rest.find("](") {
+            let target_start = &rest[start + 2..];
+            let Some(end) = target_start.find(')') else {
+                break;
+            };
+            let target = target_start[..end]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_start_matches('<')
+                .trim_end_matches('>');
+            if !target.is_empty() {
+                targets.push(target);
+            }
+            rest = &target_start[end + 1..];
+        }
+    }
+    targets
+}
+
+/// Every `href="…"` and `src="…"` attribute value, for HTML and for raw HTML
+/// inside Markdown. Only double-quoted values, which is all the landing page
+/// and the docs write.
+fn html_attr_targets(text: &str) -> Vec<&str> {
+    let mut targets = Vec::new();
+    for attr in [" href=\"", " src=\""] {
+        let mut rest = text;
+        while let Some(start) = rest.find(attr) {
+            let value = &rest[start + attr.len()..];
+            let Some(end) = value.find('"') else { break };
+            if !value[..end].is_empty() {
+                targets.push(&value[..end]);
+            }
+            rest = &value[end..];
+        }
+    }
+    targets
+}
+
+/// The lines of `body` outside ``` and ~~~ code fences.
+fn unfenced_lines(body: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut fence: Option<&str> = None;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if let Some(open) = fence {
+            if trimmed.starts_with(open) {
+                fence = None;
+            }
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            fence = Some("```");
+        } else if trimmed.starts_with("~~~") {
+            fence = Some("~~~");
+        } else {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+/// The GitHub-style anchors of a page's headings: lowercased, punctuation
+/// other than `-` and `_` dropped, spaces as `-`, and a `-N` suffix on a
+/// repeat: the GitHub convention `cli/docs/005` also follows.
+pub fn heading_anchors(body: &str) -> BTreeSet<String> {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut anchors = BTreeSet::new();
+    for line in unfenced_lines(body) {
+        let hashes = line.chars().take_while(|c| *c == '#').count();
+        if hashes == 0 || hashes > 6 || !line[hashes..].starts_with(' ') {
+            continue;
+        }
+        let text = line[hashes..].trim().trim_end_matches('#').trim();
+        let base: String = text
+            .to_lowercase()
+            .chars()
+            .filter_map(|c| match c {
+                ' ' => Some('-'),
+                c if c.is_alphanumeric() || c == '-' || c == '_' => Some(c),
+                _ => None,
+            })
+            .collect();
+        let count = seen.entry(base.clone()).or_insert(0);
+        let anchor = if *count == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{count}")
+        };
+        *count += 1;
+        anchors.insert(anchor);
+    }
+    anchors
 }
 
 /// `llms.txt`: the llms.txt-convention index of every published page.
@@ -254,11 +708,13 @@ pub fn write(site: &Site, out_dir: &Path) -> Result<usize, String> {
     Ok(site.files.len())
 }
 
-const USAGE: &str = "usage: cargo xtask site <out-dir> [--base-url <url>]";
+const USAGE: &str =
+    "usage: cargo xtask site <out-dir> [--base-url <url>] [--nginx-redirects <file>]";
 
 /// `cargo xtask site` entry point. `root` is the workspace root.
 pub fn run(root: &Path, args: &[String]) -> ExitCode {
     let mut out_dir: Option<PathBuf> = None;
+    let mut nginx: Option<PathBuf> = None;
     let mut config = SiteConfig::from_workspace(root);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -274,6 +730,13 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
+            "--nginx-redirects" => match args.next() {
+                Some(path) => nginx = Some(PathBuf::from(path)),
+                None => {
+                    eprintln!("xtask site: --nginx-redirects needs a value\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
             other if other.starts_with('-') || out_dir.is_some() => {
                 eprintln!("xtask site: unexpected argument {other:?}\n{USAGE}");
                 return ExitCode::from(2);
@@ -285,7 +748,21 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
         eprintln!("xtask site: missing <out-dir>\n{USAGE}");
         return ExitCode::from(2);
     };
-    let result = build(&config).and_then(|site| write(&site, &out_dir));
+    if !config.landing_dir().is_dir() {
+        eprintln!(
+            "xtask site: {} is missing; the site needs its landing page",
+            config.landing_dir().display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let result = build(&config).and_then(|site| {
+        let count = write(&site, &out_dir)?;
+        if let Some(nginx) = &nginx {
+            std::fs::write(nginx, &site.nginx_redirects)
+                .map_err(|e| format!("cannot write {}: {e}", nginx.display()))?;
+        }
+        Ok(count)
+    });
     match result {
         Ok(count) => {
             println!("xtask site: wrote {count} files to {}", out_dir.display());
@@ -332,23 +809,7 @@ fn first_heading(body: &str) -> Option<&str> {
 /// Every Markdown image target (`![alt](target)`) outside code fences.
 fn image_targets(body: &str) -> Vec<&str> {
     let mut targets = Vec::new();
-    let mut fence: Option<&str> = None;
-    for line in body.lines() {
-        let trimmed = line.trim_start();
-        if let Some(open) = fence {
-            if trimmed.starts_with(open) {
-                fence = None;
-            }
-            continue;
-        }
-        if trimmed.starts_with("```") {
-            fence = Some("```");
-            continue;
-        }
-        if trimmed.starts_with("~~~") {
-            fence = Some("~~~");
-            continue;
-        }
+    for line in unfenced_lines(body) {
         let mut rest = line;
         while let Some(start) = rest.find("![") {
             let after = &rest[start + 2..];

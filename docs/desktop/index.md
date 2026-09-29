@@ -1,7 +1,3 @@
----
-title: Desktop App
----
-
 # Desktop App
 
 The desktop app is a second client of the same daemon the TUI talks to. It does not replace the TUI and runs no agents of its own: the daemon owns every agent, whichever client started it, so an agent started in the TUI appears on the desktop Dashboard and one started from the desktop appears as a card in the TUI. Closing the desktop app leaves your agents running, as detaching the TUI does.

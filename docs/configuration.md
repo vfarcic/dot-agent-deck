@@ -1,8 +1,3 @@
----
-sidebar_position: 7
-title: Configuration
----
-
 # Configuration
 
 This page covers the configuration both clients share: the daemon's settings and your project's `.dot-agent-deck.toml`. The desktop app also has its own settings file, `desktop.toml`; see [Desktop app settings](#desktop-app-settings).

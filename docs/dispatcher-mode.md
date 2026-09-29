@@ -1,11 +1,3 @@
----
-sidebar_position: 5.6
-title: Dispatcher Mode
----
-
-import Tabs from '@theme/Tabs';
-import TabItem from '@theme/TabItem';
-
 # Dispatcher Mode
 
 ## What it is
@@ -30,26 +22,23 @@ If you just want an agent to do something for you right now, in front of you, yo
 
 ## Starting a dispatcher pane
 
-<Tabs groupId="client">
-<TabItem value="tui" label="TUI">
+**TUI:**
 
 1. Press `Ctrl+n`
 2. Navigate to the project directory and confirm it
 3. Cycle the **Mode** field to `dispatcher`
 4. Press `Enter`
 
-</TabItem>
-<TabItem value="desktop" label="Desktop">
+**Desktop:**
 
 1. Open **New agent** from the Dashboard (or press `Ctrl+N` / `⌘N`) and choose the daemon
 2. Browse to the project directory and press **Use this directory**
 3. Pick the **dispatcher** chip under **Mode**, and check **Command** names the agent you want (empty starts your `default_command`, or `claude`)
 4. Press **Create agent**; the new agent's terminal opens when the daemon lists it
 
-</TabItem>
-</Tabs>
+Then talk to it: *"Start work on the login timeout bug."* Here is a dispatcher in the TUI, asked for a standing loop rather than a single unit; in the desktop app the same conversation happens in the dispatcher agent's terminal pane.
 
-Then talk to it: *"Start work on the login timeout bug."*
+![A dispatcher pane in the TUI. The request asks for three dispatched agents or teams at a time, counting the two already running, and a stop at twenty in total; the dispatcher reads it back as a standing loop that keeps three units running, dispatches a fresh one each time a slot frees, and stops once twenty have been dispatched, with eighteen more to go](img/dispatch.webp)
 
 ## One agent, or a team?
 

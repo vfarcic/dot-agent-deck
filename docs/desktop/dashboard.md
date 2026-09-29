@@ -1,7 +1,3 @@
----
-title: Dashboard
----
-
 # Dashboard
 
 The **Agent dashboard** is the desktop app's main screen: every agent on the daemons you are watching, one row each. It is the desktop counterpart of the TUI's dashboard, which shows the same agents as cards (see [Session Management](../session-management.md)).

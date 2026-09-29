@@ -1,11 +1,3 @@
----
-sidebar_position: 5.5
-title: Orchestration
----
-
-import Tabs from '@theme/Tabs';
-import TabItem from '@theme/TabItem';
-
 # Orchestration
 
 Orchestrations are multi-agent pipelines where a designated **orchestrator** agent coordinates work across one or more **worker** agents. Each worker runs in its own pane, receives its tasks from the orchestrator, and reports back to it when it is done — you talk to the orchestrator, and it runs the team.
@@ -70,8 +62,7 @@ To write the config by hand, run `dot-agent-deck init` for a commented orchestra
 
 Both clients start an orchestration from their New agent flow, by choosing the orchestration as the **Mode**. The TUI opens it as an orchestration tab; the desktop app shows it as one group on its Dashboard.
 
-<Tabs groupId="client">
-<TabItem value="tui" label="TUI">
+**TUI:**
 
 Opening an orchestration tab uses the same `Ctrl+n` flow as a regular pane, but the **Mode** field selects an orchestration instead of `No mode`.
 
@@ -84,8 +75,7 @@ A new tab opens with one pane per role. The role cards appear on the left sideba
 
 ![The demo-loop orchestration tab with both roles at work: the tab bar shows Dashboard and demo-loop, two role cards are stacked in the left sidebar, planner (Claude Code, reading src/checkout/flow.ts, Last: 2s) and builder (Codex, editing src/checkout/RetryPayment.tsx, Last: 3s), both Working, and the orchestrator role, planner, is selected with its pane active on the right](/img/orchestration-tui.png)
 
-</TabItem>
-<TabItem value="desktop" label="Desktop">
+**Desktop:**
 
 1. Open **New agent** from the Dashboard (or press `Ctrl+N` / `⌘N`) and choose the daemon.
 2. Browse to the project directory that contains your `.dot-agent-deck.toml` with an `[[orchestrations]]` block (it is tagged **project**) and press **Use this directory**.
@@ -95,9 +85,6 @@ A new tab opens with one pane per role. The role cards appear on the left sideba
 The Dashboard shows the run as an **ORCHESTRATION** group with a row per role, numbered in role order, and an **ORCHESTRATOR** badge on the start role, the one you message. Click a role's row to open its terminal. The group's **Close** stops every role, after a confirmation that lists them (**Close all N roles**). See [Desktop app → Dashboard](desktop/dashboard.md) and [New agent](desktop/new-agent.md).
 
 ![The desktop app's Dashboard with an activated orchestration: below the standalone agents, an ORCHESTRATION group named demo-loop with a Close button and a numbered row per role, 01 planner carrying the ORCHESTRATOR badge and 02 builder](/img/orchestration-desktop.png)
-
-</TabItem>
-</Tabs>
 
 An orchestration can also be started **in an isolated copy of the repository** rather than in your working tree, by asking a dispatcher pane for it — useful for running several orchestrations in parallel without them treading on each other. See [Dispatcher Mode](dispatcher-mode.md).
 

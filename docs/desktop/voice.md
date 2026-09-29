@@ -1,7 +1,3 @@
----
-title: Voice Control
----
-
 # Voice Control
 
 The desktop app can be driven by voice: open screens, switch daemons, start the New agent flow, and type into an agent. The TUI has no voice control.

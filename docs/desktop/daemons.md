@@ -1,7 +1,3 @@
----
-title: Daemons
----
-
 # Daemons
 
 The desktop app can watch several daemons at once: the one on this machine and any number of remote ones reached over ssh. The TUI attaches to one daemon at a time, and reaches a remote one with `dot-agent-deck connect` (see [Remote Environments](../remote-environments.md)).

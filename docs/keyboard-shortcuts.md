@@ -1,8 +1,3 @@
----
-sidebar_position: 6
-title: Keyboard Shortcuts
----
-
 # Keyboard Shortcuts
 
 Everything on this page is the TUI's. The desktop app has a few shortcuts of its own, listed on [Desktop app → Settings](desktop/settings.md#keyboard-shortcuts), and `keybindings.toml` does not affect it.
