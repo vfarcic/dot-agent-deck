@@ -71,7 +71,11 @@ For a watch loop, `bacon test-fast` (or `bacon test-e2e` / `bacon test-e2e-live`
 
 ## Developer docs
 
-Maintainer-facing references that are intentionally **not** published to the documentation site live under [`docs/develop/`](docs/develop/) (excluded from the Docusaurus build). They render as plain Markdown here on GitHub:
+Maintainer-facing references that are intentionally **not** published live under [`docs/develop/`](docs/develop/). They render as plain Markdown here on GitHub.
+
+What *is* published is listed in [`docs/published.toml`](docs/published.toml): each user page there goes to the website as raw Markdown, into its `llms.txt` and `llms-full.txt`, and into the binary's `dot-agent-deck docs`. To add a user page, add a `[[page]]` entry whose `title` equals the page's first `#` heading. `cargo xtask site <out-dir>` builds the whole site locally (landing page, Markdown, `llms` files, redirects) and runs its link check; no Node is involved. Nothing under `docs/develop/` can be published: the build refuses it, and `cargo test-fast` fails if a user page is missing from the manifest or a maintainer page reaches the output (CLAUDE.md rule 11).
+
+The developer pages:
 
 - [Dispatcher mode — design record](docs/develop/dispatcher-mode.md) — the *why* behind PRD #220: the seed's mechanics-not-methodology scope, why `--list-targets` is answered by the daemon rather than the CLI, what each shape actually spawns, the committed-content-only edge of `git worktree add`, the three close-path defects and their fixes, and what was deliberately deferred to #222 / Phase 2. The user-facing page is [`docs/dispatcher-mode.md`](docs/dispatcher-mode.md).
 - [Experimental flag](docs/develop/experimental-flag.md) — gate in-flight, work-in-progress surfaces behind the `experimental` flag during development, so unfinished UI can merge to `main` without showing up in normal use.
