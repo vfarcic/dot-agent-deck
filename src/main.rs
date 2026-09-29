@@ -229,6 +229,18 @@ enum Commands {
     /// PTY keystroke injection. Uses `DOT_AGENT_DECK_PANE_ID` to scope the
     /// request, exactly like `agent-event`.
     GetSeed,
+    /// Print the user documentation for this version, embedded in the binary
+    /// (no network, no daemon). With no topic, list the topics; with a topic
+    /// (e.g. `orchestration`, `desktop/voice`), print that page's Markdown;
+    /// with `--all`, print every page in reading order.
+    Docs {
+        /// The page to print: its path under the docs without `.md`, as
+        /// listed by `dot-agent-deck docs`.
+        topic: Option<String>,
+        /// Print every page in reading order.
+        #[arg(long, conflicts_with = "topic")]
+        all: bool,
+    },
     /// Set up the Pi orchestrator integration (PRD #201). Detects `pi` on
     /// PATH, materializes the bundled orchestrator extension into Pi's global
     /// extension dir, and enables it (Pi auto-discovers the dir). Prints the
@@ -1507,6 +1519,24 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
+        }
+        Some(Commands::Docs { topic, all }) => {
+            use dot_agent_deck::embedded_docs::{self, DocsOutput};
+            match embedded_docs::run(embedded_docs::PAGES, topic.as_deref(), all) {
+                DocsOutput::Stdout(text) => {
+                    match embedded_docs::write_output(std::io::stdout(), &text) {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(e) => {
+                            eprintln!("error: cannot write the docs to stdout: {e}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                DocsOutput::Error(message) => {
+                    eprint!("{message}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Some(Commands::GetSeed) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {

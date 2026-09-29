@@ -4512,6 +4512,43 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** the exact wording of the rejection message (clap's default unknown-argument text or a custom friendly message both satisfy it).
 - **Platform coverage:** mac+linux.
 
+#### cli/docs
+
+##### cli/docs/001 — `dot-agent-deck docs` lists every published topic and its description.
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive).
+- **Agent:** none.
+- **Asserts:** one line per `docs/published.toml` entry, in manifest order, containing its slug and description; a missing or empty manifest fails clearly.
+- **Does not assert:** exact list formatting beyond the one-line topic and description contract.
+- **Platform coverage:** mac+linux.
+
+##### cli/docs/002 — A top-level and a nested topic print a preamble followed by unchanged Markdown.
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive).
+- **Agent:** none.
+- **Asserts:** `docs orchestration` and `docs desktop/voice` exit 0, start with one preamble line mentioning `dot-agent-deck docs`, and then print their source files byte for byte.
+- **Does not assert:** exact preamble wording.
+- **Platform coverage:** mac+linux.
+
+##### cli/docs/003 — An unknown topic fails and lists the valid topics.
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive).
+- **Agent:** none.
+- **Asserts:** an unknown slug exits non-zero and the diagnostic names every manifest slug.
+- **Does not assert:** exact error wording or whether the diagnostic uses stdout or stderr.
+- **Platform coverage:** mac+linux.
+
+##### cli/docs/004 — `docs --all` includes every published page in manifest order.
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive).
+- **Agent:** none.
+- **Asserts:** exit 0 and the complete original Markdown of each page appears in manifest order.
+- **Does not assert:** exact separators between pages.
+- **Platform coverage:** mac+linux.
+
+##### cli/docs/005 — Relative Markdown links stay within published pages and resolve to headings.
+- **Layer:** L2 (repository Markdown check in the e2e-gated CLI docs test file).
+- **Agent:** none.
+- **Asserts:** each relative `.md` link from a manifest page resolves against its containing directory to another manifest slug, and each linked anchor matches a GitHub-style heading slug in the target page.
+- **Does not assert:** external URLs or image links.
+- **Platform coverage:** mac+linux.
+
 ### Shared remote registry (issue #1350)
 
 #### remote/registry

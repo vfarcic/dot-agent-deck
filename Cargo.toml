@@ -113,6 +113,10 @@ getrandom = "0.4"
 # revived the bug #250 exists to fix. Same version pin as the package dep.
 [build-dependencies]
 semver = "1"
+# PRD #1419: `build.rs` parses `docs/published.toml` with the shared
+# `src/published_docs.rs` parser to embed the `docs` subcommand's pages.
+# Same version as the package dependency.
+toml = "1.0"
 
 [dev-dependencies]
 tempfile = "3"
