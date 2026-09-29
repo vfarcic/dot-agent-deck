@@ -9535,6 +9535,27 @@ impl AgentPtyRegistry {
             }
             None => crate::draft_deferral::FirstWriteDecision::Now { capped: false },
         };
+        // Does `target` still own the pane and still run? A paneless agent has
+        // no pane→agent mapping to rebind, so the meaningful re-check is that
+        // the agent still exists — a removal (`None`) is `Stale`. Run under the
+        // held writer, after every await that sits between it and the payload.
+        let ownership_lost = |target: &PaneWriterTarget| {
+            if is_paneless {
+                if self.writer_target_for_agent(&target.agent_id).is_none() {
+                    return Some(GuardedSend::Stale);
+                }
+            } else {
+                match self.writer_target_for_pane(pane_id) {
+                    Some(current) if current.agent_id == target.agent_id => {}
+                    Some(_) => return Some(GuardedSend::WrongSession),
+                    None => return Some(GuardedSend::Stale),
+                }
+            }
+            target
+                .exited
+                .load(Ordering::SeqCst)
+                .then_some(GuardedSend::Stale)
+        };
         let (mut w, capped) = loop {
             // Issue #544: wait WITHOUT the writer while the draft is pending.
             // Every pass after a sleep re-resolves the target, so a pane that
@@ -9573,22 +9594,9 @@ impl AgentPtyRegistry {
             // barrier the TOCTOU test holds open by locking the writer externally.
             let w = before_write_deadline(within(deferred), target.writer.lock()).await?;
             // Re-resolve identity: the pane may have rebound to a new agent, or the
-            // target may have exited, while we waited for the writer. A paneless
-            // agent has no pane→agent mapping to rebind, so the meaningful re-check
-            // is that the agent still exists — a removal (`None`) is `Stale`.
-            if is_paneless {
-                if self.writer_target_for_agent(&target.agent_id).is_none() {
-                    return finish(GuardedSend::Stale, deferred);
-                }
-            } else {
-                match self.writer_target_for_pane(pane_id) {
-                    Some(current) if current.agent_id == target.agent_id => {}
-                    Some(_) => return finish(GuardedSend::WrongSession, deferred),
-                    None => return finish(GuardedSend::Stale, deferred),
-                }
-            }
-            if target.exited.load(Ordering::SeqCst) {
-                return finish(GuardedSend::Stale, deferred);
+            // target may have exited, while we waited for the writer.
+            if let Some(refusal) = ownership_lost(&target) {
+                return finish(refusal, deferred);
             }
             // Issue #544: the decision again, UNDER the writer. User bytes are
             // recorded while their writer is held ([`PaneWriter`]), so this read
@@ -9743,6 +9751,14 @@ impl AgentPtyRegistry {
             }
             _ => None,
         };
+        // Qodo, PR #1414: the identity and liveness check again, because the
+        // echo watch's setup above — and `revalidate` before it — is a yield
+        // point. The writer keeps other input out of the pane, not the agent
+        // from exiting or the pane from changing hands, so a target that went
+        // meanwhile would otherwise be written through its stale writer.
+        if let Some(refusal) = ownership_lost(&target) {
+            return finish(refusal, deferred);
+        }
         // Issue #1383 × #544: the caller's write-time sample, taken HERE rather
         // than in `revalidate` because the echo watch's setup above awaits a
         // blocking-pool snapshot and parse. The writer keeps input out of the
@@ -20189,6 +20205,150 @@ mod spawn_tests {
         );
 
         let snap = reg.snapshot(&successor).unwrap_or_default();
+        assert!(
+            !snap.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
+            "the refused payload must not appear in the SUCCESSOR's scrollback"
+        );
+
+        reg.shutdown_all();
+    }
+
+    /// Qodo, PR #1414: an echo-gated write parked in its echo watch's setup —
+    /// under the writer, after every identity check and `revalidate` — whose
+    /// target is closed meanwhile is refused as `Stale` and writes nothing. The
+    /// setup awaits a blocking-pool snapshot and parse, and the writer does not
+    /// keep the agent alive across that await.
+    #[tokio::test]
+    async fn echo_gated_send_refuses_a_target_closed_during_its_echo_watch() {
+        const PANE: &str = "closed-during-echo-watch";
+
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn agent");
+
+        let (reached, release) = reg.pause_next_echo_watch_for_test();
+        let task = tokio::spawn({
+            let reg = Arc::clone(&reg);
+            let id = id.clone();
+            async move {
+                reg.write_and_submit_guarded_after_echo(
+                    PANE,
+                    "Read .dot-agent-deck/closed-during-echo-watch.md",
+                    &id,
+                    || async { true },
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .expect("the write never reached its echo watch")
+            .expect("the paused echo watch was dropped");
+
+        reg.close_agent(&id).expect("close agent");
+        drop(release);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the write finishes once the echo watch is released")
+            .expect("the write does not panic")
+            .expect("guarded send result");
+        assert_eq!(
+            outcome,
+            GuardedSendDetail::Outcome(GuardedSend::Stale),
+            "a target closed while its write sat in the echo watch's setup must be refused as \
+             Stale, not written through its stale writer"
+        );
+
+        reg.shutdown_all();
+    }
+
+    /// Qodo, PR #1414: the rebind half of the test above — the pane changes
+    /// hands while the write sits in its echo watch's setup, so the write is
+    /// refused as `WrongSession` and the successor never sees the payload.
+    #[tokio::test]
+    async fn echo_gated_send_refuses_a_pane_rebound_during_its_echo_watch() {
+        const PANE: &str = "rebound-during-echo-watch";
+        const MARKER: &str = "rebound-during-echo-watch-marker";
+
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let spawn = || {
+            reg.spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+        };
+        let original = spawn().expect("spawn original agent");
+
+        let (reached, release) = reg.pause_next_echo_watch_for_test();
+        let task = tokio::spawn({
+            let reg = Arc::clone(&reg);
+            let original = original.clone();
+            async move {
+                reg.write_and_submit_guarded_after_echo(
+                    PANE,
+                    &format!("Read {MARKER}"),
+                    &original,
+                    || async { true },
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .expect("the write never reached its echo watch")
+            .expect("the paused echo watch was dropped");
+
+        reg.close_agent(&original).expect("close original agent");
+        let successor = spawn().expect("spawn successor agent");
+        assert_ne!(
+            original, successor,
+            "the rebind must produce a NEW agent id"
+        );
+        drop(release);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the write finishes once the echo watch is released")
+            .expect("the write does not panic")
+            .expect("guarded send result");
+        assert_eq!(
+            outcome,
+            GuardedSendDetail::Outcome(GuardedSend::WrongSession),
+            "a pane that changed hands while the write sat in the echo watch's setup must be \
+             refused as WrongSession"
+        );
+
+        // The successor is up and echoing before its scrollback is read, so
+        // "no marker" cannot pass merely because it had not started.
+        let ready = reg
+            .write_and_submit_guarded(PANE, "SUCCESSOR-READY", &successor, || async { true })
+            .await
+            .expect("readiness write result");
+        assert_eq!(ready, GuardedSend::Applied);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut snap = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            snap = reg.snapshot(&successor).unwrap_or_default();
+            if snap
+                .windows(b"SUCCESSOR-READY".len())
+                .any(|w| w == b"SUCCESSOR-READY")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            snap.windows(b"SUCCESSOR-READY".len())
+                .any(|w| w == b"SUCCESSOR-READY"),
+            "precondition: the successor's PTY must be echoing"
+        );
         assert!(
             !snap.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
             "the refused payload must not appear in the SUCCESSOR's scrollback"
