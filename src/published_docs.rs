@@ -246,26 +246,41 @@ impl Boundary {
 
     /// The canonical image directory. It must be either a real directory at
     /// `docs/img` (inside the published tree already) or resolve to exactly
-    /// the canonical `<workspace>/site/static/img`, where `<workspace>` is the
-    /// directory holding `docs/`. Any other target is refused, because the
-    /// generator publishes the whole image directory: `docs/img -> ../prds`
-    /// would otherwise publish the PRDs.
+    /// `<workspace>/site/static/img` as a real directory, where `<workspace>`
+    /// is the canonical directory holding `docs/`. The allowed target is the
+    /// literal join, never canonicalized itself, so a symlink at `site`,
+    /// `site/static` or `site/static/img` makes it fail: otherwise
+    /// `site/static/img -> ../../docs/develop` would pass the comparison.
+    /// Any other target is refused, because the generator publishes the whole
+    /// image directory: `docs/img -> ../prds` would otherwise publish the
+    /// PRDs. A directory that is, contains or sits inside `docs/develop/` is
+    /// refused as well.
     fn image_dir(&self) -> Result<PathBuf, BoundaryError> {
         let lexical = self.docs.join(IMAGE_DIR);
         let real = lexical
             .canonicalize()
             .map_err(|e| BoundaryError(format!("cannot resolve {}: {e}", lexical.display())))?;
-        let expected = self
+        if self
+            .develop
+            .iter()
+            .any(|d| real.starts_with(d) || d.starts_with(&real))
+        {
+            return Err(BoundaryError(format!(
+                "docs/{IMAGE_DIR} resolves to {}, which overlaps docs/{UNPUBLISHED_DIR}/, \
+                 which is never published",
+                real.display()
+            )));
+        }
+        let allowed = self
             .docs
             .parent()
-            .map(|workspace| workspace.join(IMAGE_TARGET))
-            .and_then(|target| target.canonicalize().ok());
-        if real == lexical || Some(&real) == expected.as_ref() {
+            .map(|workspace| workspace.join(IMAGE_TARGET));
+        if real == lexical || Some(&real) == allowed.as_ref() {
             return Ok(real);
         }
         Err(BoundaryError(format!(
             "docs/{IMAGE_DIR} resolves to {}; it must be a directory inside docs/ or resolve \
-             to {IMAGE_TARGET} beside docs/",
+             to {IMAGE_TARGET} beside docs/, a real directory with no symlink in `{IMAGE_TARGET}`",
             real.display()
         )))
     }
@@ -360,7 +375,8 @@ pub fn image_source(
 }
 
 /// The canonical image directory (`docs/img`): a real directory inside
-/// `docs/`, or a symlink resolving to exactly [`IMAGE_TARGET`] beside `docs/`.
+/// `docs/`, or a symlink resolving to exactly [`IMAGE_TARGET`] beside `docs/`,
+/// with no symlink among that target's own components.
 pub fn image_dir(docs_dir: &Path) -> Result<PathBuf, BoundaryError> {
     Boundary::new(docs_dir)?.image_dir()
 }
@@ -505,6 +521,55 @@ mod tests {
             image_dir(&docs).unwrap(),
             docs.canonicalize().unwrap().join("img")
         );
+    }
+
+    /// Scenario: `docs/img` keeps its normal `../site/static/img` symlink, but
+    /// `site/static/img` itself is a symlink into `docs/develop/` holding a
+    /// `secret.png`. The image directory and an image reference through it
+    /// are both refused, so the maintainer file is not published at `/img/`.
+    #[test]
+    fn image_dir_refuses_a_symlinked_site_static_img_into_develop() {
+        let (root, docs) = tree();
+        fs::write(docs.join("develop/secret.png"), b"png").unwrap();
+        fs::remove_dir_all(root.path().join("site/static/img")).unwrap();
+        symlink("../../docs/develop", root.path().join("site/static/img")).unwrap();
+        let err = image_dir(&docs).unwrap_err().to_string();
+        assert!(err.contains("docs/develop/"), "{err}");
+        assert!(image_source(&docs, &page("start"), "img/secret.png").is_err());
+    }
+
+    /// Scenario: `site/static/img` is a symlink to a directory outside the
+    /// checkout, or `site/static` is a symlink to another directory that has
+    /// an `img/` in it. Either way the image directory is refused, because
+    /// the allowed target is the real `site/static/img` beside `docs/`.
+    #[test]
+    fn image_dir_refuses_a_symlink_anywhere_in_site_static_img() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("private.png"), b"png").unwrap();
+
+        let (root, docs) = tree();
+        fs::remove_dir_all(root.path().join("site/static/img")).unwrap();
+        symlink(outside.path(), root.path().join("site/static/img")).unwrap();
+        let err = image_dir(&docs).unwrap_err().to_string();
+        assert!(err.contains("site/static/img"), "{err}");
+        assert!(image_source(&docs, &page("start"), "img/private.png").is_err());
+
+        let (root, docs) = tree();
+        fs::create_dir_all(outside.path().join("static/img")).unwrap();
+        fs::write(outside.path().join("static/img/private.png"), b"png").unwrap();
+        fs::remove_dir_all(root.path().join("site/static")).unwrap();
+        symlink(
+            outside.path().join("static"),
+            root.path().join("site/static"),
+        )
+        .unwrap();
+        assert!(image_dir(&docs).is_err());
+        assert!(image_source(&docs, &page("start"), "img/private.png").is_err());
+
+        let (root, docs) = tree();
+        fs::rename(root.path().join("site"), outside.path().join("site")).unwrap();
+        symlink(outside.path().join("site"), root.path().join("site")).unwrap();
+        assert!(image_dir(&docs).is_err());
     }
 
     #[test]

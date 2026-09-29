@@ -272,6 +272,49 @@ fn generator_rejects_an_image_dir_pointing_at_another_sibling_directory() {
     assert!(err.contains("site/static/img"), "{err}");
 }
 
+/// Scenario: `docs/img` keeps its normal `../site/static/img` symlink, but
+/// `site/static/img` is itself a symlink into `docs/develop/` (which holds a
+/// `secret.png`), then to a directory outside the checkout, and then
+/// `site/static` is a symlink. Each build fails and publishes nothing.
+#[cfg(unix)]
+#[test]
+fn generator_rejects_a_symlinked_site_static_img() {
+    use std::os::unix::fs::symlink;
+
+    let outside = tempfile::tempdir().unwrap();
+    let fx = Fixture::new();
+    let root = fx.docs().parent().unwrap().to_path_buf();
+    fs::create_dir_all(root.join("site/static")).unwrap();
+    fs::rename(fx.docs().join("img"), root.join("site/static/img")).unwrap();
+    symlink("../site/static/img", fx.docs().join("img")).unwrap();
+    assert!(build(&fx.config).is_ok());
+    let real_img = outside.path().join("real-img");
+    fs::rename(root.join("site/static/img"), &real_img).unwrap();
+
+    fs::create_dir_all(fx.docs().join("develop")).unwrap();
+    fs::write(fx.docs().join("develop/secret.png"), b"PNG-secret").unwrap();
+    // The pages' own image references resolve there too, so the refusal is
+    // reached whichever image the build looks at first.
+    fs::write(fx.docs().join("develop/shot.png"), b"PNG-secret").unwrap();
+    fs::write(fx.docs().join("develop/rel.png"), b"PNG-secret").unwrap();
+    symlink("../../docs/develop", root.join("site/static/img")).unwrap();
+    let err = build(&fx.config).unwrap_err();
+    assert!(err.contains("docs/develop/"), "{err}");
+
+    fs::remove_file(root.join("site/static/img")).unwrap();
+    symlink(&real_img, root.join("site/static/img")).unwrap();
+    let err = build(&fx.config).unwrap_err();
+    assert!(err.contains("site/static/img"), "{err}");
+
+    fs::remove_file(root.join("site/static/img")).unwrap();
+    fs::create_dir_all(outside.path().join("static")).unwrap();
+    fs::rename(&real_img, outside.path().join("static/img")).unwrap();
+    fs::remove_dir_all(root.join("site/static")).unwrap();
+    symlink(outside.path().join("static"), root.join("site/static")).unwrap();
+    let err = build(&fx.config).unwrap_err();
+    assert!(err.contains("site/static/img"), "{err}");
+}
+
 /// Scenario: A non-image file (a Markdown note) sits in the image directory.
 /// The build fails naming the file instead of publishing it at `/img/`.
 #[test]
