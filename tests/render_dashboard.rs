@@ -1149,12 +1149,11 @@ fn palette_session(status: SessionStatus) -> SessionState {
     }
 }
 
-/// Scenario: Render a dashboard card whose agent is blocked because its credits
-/// are depleted, then render a stats bar with one blocked agent. The card must
-/// show a Blocked badge and credit reason, and both surfaces must use the error colour.
-/// A full Blocked card must keep its last tool line visible at every density.
-/// When it is also orphaned, both status rows survive and any visible prompt
-/// history starts with the `Prmt:` label.
+/// Scenario: Render a credits-depleted Blocked card and blocked stats bar,
+/// checking the badge, reason, and error colour. At every density, a full
+/// Blocked card keeps its credit reason and newest tool line visible. An
+/// Orphaned+Blocked card keeps both status rows, its newest tool line, and the
+/// `Prmt:` label on the first visible prompt at every density.
 #[spec("status/badge/002")]
 #[test]
 fn status_badge_002_blocked_card_snapshot() {
