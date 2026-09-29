@@ -18343,8 +18343,13 @@ mod tests {
 
         // Well past the 300 ms window.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        let orch_screen =
-            String::from_utf8_lossy(&registry.snapshot(&orch).expect("orchestrator")).into_owned();
+        let orch_screen = String::from_utf8_lossy(
+            &registry
+                .snapshot_off_runtime(&orch)
+                .await
+                .expect("orchestrator"),
+        )
+        .into_owned();
         assert!(
             !orch_screen.contains(NOTICE),
             "an acknowledged worker was reported silent: {orch_screen:?}"
@@ -18515,9 +18520,9 @@ mod tests {
             registry.pending_deliveries().is_pending(WORKER_PANE),
             "precondition: the retry is armed"
         );
+        let worker_screen = registry.snapshot_off_runtime(&worker).await;
         assert!(
-            !registry
-                .snapshot(&worker)
+            !worker_screen
                 .map(|screen| String::from_utf8_lossy(&screen)
                     .contains(".dot-agent-deck/worker-task"))
                 .unwrap_or(false),
@@ -18577,7 +18582,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("tempdir");
         // The BASENAME gives the pane its launch identity (fact S).
         let stub = cwd.path().join("claude");
-        std::fs::write(
+        tokio::fs::write(
             &stub,
             r#"#!/usr/bin/env python3
 import os, sys, termios
@@ -18608,10 +18613,12 @@ while True:
             os.write(1, bytes([byte]))
 "#,
         )
+        .await
         .expect("write stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+        tokio::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .await
             .expect("chmod stub");
-        std::fs::write(
+        tokio::fs::write(
             cwd.path().join(".dot-agent-deck.toml"),
             format!(
                 "[[orchestrations]]\nname = \"test-orchestration\"\n\n\
@@ -18620,6 +18627,7 @@ while True:
                 stub.display()
             ),
         )
+        .await
         .expect("write config");
         let cwd_str = cwd.path().to_string_lossy().into_owned();
 
@@ -18672,9 +18680,10 @@ while True:
             )
             .await;
 
-        let screen = |agent: &str| {
+        let screen = async |agent: &str| {
             registry
-                .snapshot(agent)
+                .snapshot_off_runtime(agent)
+                .await
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .unwrap_or_default()
         };
@@ -18682,7 +18691,7 @@ while True:
         let worker = loop {
             if let Some(record) = registry.agent_records().into_iter().find(|record| {
                 record.pane_id_env.as_deref() == Some(WORKER_PANE) && record.id != old_agent
-            }) && screen(&record.id).contains("SWALLOW-STUB-READY")
+            }) && screen(&record.id).await.contains("SWALLOW-STUB-READY")
             {
                 break record.id;
             }
@@ -18717,7 +18726,7 @@ while True:
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(
-            !screen(&worker).contains("SWALLOW-STUB-SWALLOWED"),
+            !screen(&worker).await.contains("SWALLOW-STUB-SWALLOWED"),
             "precondition: the pointer waits for the draft"
         );
         // More than the bus holds, while the pointer waits.
@@ -18736,15 +18745,18 @@ while True:
         }
         registry.note_deck_bytes_for_test(WORKER_PANE, b"\x1b[201~");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !screen(&worker).contains("SWALLOW-STUB-SWALLOWED") {
+        while !screen(&worker).await.contains("SWALLOW-STUB-SWALLOWED") {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the pointer never reached the stub after the draft ended: {:?}",
-                screen(&worker)
+                screen(&worker).await
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(!screen(&worker).contains(SUBMITTED), "precondition: parked");
+        assert!(
+            !screen(&worker).await.contains(SUBMITTED),
+            "precondition: parked"
+        );
 
         // The late start, after the pointer went in.
         event_tx
@@ -18761,12 +18773,12 @@ while True:
             ))
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while !screen(&worker).contains(SUBMITTED) {
+        while !screen(&worker).await.contains(SUBMITTED) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "a late SessionStart after the pointer went in did not submit it; the recovery \
                  read a receiver that fell behind during the draft wait: {:?}",
-                screen(&worker)
+                screen(&worker).await
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -18911,8 +18923,13 @@ while True:
 
         // Well past the window.
         tokio::time::sleep(WINDOW + std::time::Duration::from_millis(1500)).await;
-        let orch_screen =
-            String::from_utf8_lossy(&registry.snapshot(&orch).expect("orchestrator")).into_owned();
+        let orch_screen = String::from_utf8_lossy(
+            &registry
+                .snapshot_off_runtime(&orch)
+                .await
+                .expect("orchestrator"),
+        )
+        .into_owned();
         assert!(
             !orch_screen.contains(NOTICE),
             "an acknowledged worker was reported silent with the retry off: {orch_screen:?}"
@@ -19040,8 +19057,14 @@ while True:
             worker.clone(),
             "coder".to_string(),
         );
-        let orch_screen = || {
-            String::from_utf8_lossy(&registry.snapshot(&orch).expect("orchestrator")).into_owned()
+        let orch_screen = async || {
+            String::from_utf8_lossy(
+                &registry
+                    .snapshot_off_runtime(&orch)
+                    .await
+                    .expect("orchestrator"),
+            )
+            .into_owned()
         };
 
         tokio::time::sleep(std::time::Duration::from_millis(450)).await;
@@ -19051,9 +19074,9 @@ while True:
             "precondition: the SessionStart held the re-delivery"
         );
         assert!(
-            !orch_screen().contains(NOTICE),
+            !orch_screen().await.contains(NOTICE),
             "the report fired while a re-delivery was still pending: {:?}",
-            orch_screen()
+            orch_screen().await
         );
 
         assert_eq!(
@@ -19066,11 +19089,11 @@ while True:
         assert_eq!(redeliveries.attempts(), 1);
         let counted = "tried 1 more times to get the task into the same process";
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !orch_screen().contains(counted) {
+        while !orch_screen().await.contains(counted) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the report never arrived with the final count: {:?}",
-                orch_screen()
+                orch_screen().await
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -19216,7 +19239,8 @@ while True:
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
         while std::time::Instant::now() < deadline {
             let orch_screen =
-                String::from_utf8_lossy(&registry.snapshot(&orch).expect("orch")).into_owned();
+                String::from_utf8_lossy(&registry.snapshot_off_runtime(&orch).await.expect("orch"))
+                    .into_owned();
             assert!(
                 !orch_screen.contains(NOTICE),
                 "a quota-blocked worker was reported as having gone quiet: {orch_screen:?}"

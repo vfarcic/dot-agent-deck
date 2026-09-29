@@ -11848,6 +11848,21 @@ impl AgentPtyRegistry {
         Ok(agent.bus.snapshot())
     }
 
+    /// [`Self::snapshot`] off the async worker, for async tests that poll a
+    /// pane: the snapshot takes the registry's synchronous mutex and copies the
+    /// scrollback, so it runs on the blocking pool (Qodo, #1414).
+    #[cfg(test)]
+    pub(crate) async fn snapshot_off_runtime(
+        self: &Arc<Self>,
+        id: &str,
+    ) -> Result<Vec<u8>, AgentPtyError> {
+        let registry = Arc::clone(self);
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || registry.snapshot(&id))
+            .await
+            .expect("the snapshot task does not panic")
+    }
+
     /// Current number of live broadcast subscribers for an agent. Returns
     /// `None` if the agent is not in the registry.
     pub fn receiver_count(&self, id: &str) -> Option<usize> {
@@ -20335,7 +20350,10 @@ mod spawn_tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         let mut snap = Vec::new();
         while tokio::time::Instant::now() < deadline {
-            snap = reg.snapshot(&successor).unwrap_or_default();
+            snap = reg
+                .snapshot_off_runtime(&successor)
+                .await
+                .unwrap_or_default();
             if snap
                 .windows(b"SUCCESSOR-READY".len())
                 .any(|w| w == b"SUCCESSOR-READY")

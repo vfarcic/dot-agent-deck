@@ -2826,8 +2826,13 @@ while chunk := os.read(0, 4096):
                 })
                 .expect("spawn worker stand-in");
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            while !String::from_utf8_lossy(&registry.snapshot(&agent).unwrap_or_default())
-                .contains("READY")
+            while !String::from_utf8_lossy(
+                &registry
+                    .snapshot_off_runtime(&agent)
+                    .await
+                    .unwrap_or_default(),
+            )
+            .contains("READY")
             {
                 assert!(
                     tokio::time::Instant::now() < deadline,

@@ -583,15 +583,20 @@ while True:
     }
 
     async fn wait_for(
-        registry: &AgentPtyRegistry,
+        registry: &Arc<AgentPtyRegistry>,
         agent: &str,
         needle: &str,
         within: Duration,
     ) -> bool {
         let deadline = tokio::time::Instant::now() + within;
         loop {
-            let screen =
-                String::from_utf8_lossy(&registry.snapshot(agent).unwrap_or_default()).into_owned();
+            let screen = String::from_utf8_lossy(
+                &registry
+                    .snapshot_off_runtime(agent)
+                    .await
+                    .unwrap_or_default(),
+            )
+            .into_owned();
             if screen.contains(needle) {
                 return true;
             }
@@ -641,16 +646,18 @@ while True:
             .await
             .expect("echo-gated write");
         assert_eq!(outcome, GuardedSendDetail::Outcome(GuardedSend::Applied));
+        let submitted = wait_for(
+            &gated,
+            &agent,
+            &format!("SUBMITTED {POINTER}\r\n"),
+            Duration::from_secs(5),
+        )
+        .await;
+        let screen = gated.snapshot_off_runtime(&agent).await.unwrap_or_default();
         assert!(
-            wait_for(
-                &gated,
-                &agent,
-                &format!("SUBMITTED {POINTER}\r\n"),
-                Duration::from_secs(5)
-            )
-            .await,
+            submitted,
             "the echo-gated submit did not submit the pointer alone; screen: {:?}",
-            String::from_utf8_lossy(&gated.snapshot(&agent).unwrap_or_default())
+            String::from_utf8_lossy(&screen)
         );
         gated.shutdown_all();
     }

@@ -153,7 +153,7 @@ impl Drop for EnvGuard {
 /// elapses, returning the final snapshot either way so the caller can
 /// assert (and print it on failure).
 async fn wait_for_snapshot_needle(
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     agent_id: &str,
     needle: &[u8],
     timeout: Duration,
@@ -165,23 +165,39 @@ async fn wait_for_snapshot_needle(
 }
 
 async fn wait_for_snapshot_match(
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     agent_id: &str,
     timeout: Duration,
     matches: impl Fn(&[u8]) -> bool,
 ) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Ok(snap) = registry.snapshot(agent_id)
+        if let Ok(snap) = snapshot_off_runtime(registry, agent_id).await
             && matches(&snap)
         {
             return snap;
         }
         if tokio::time::Instant::now() >= deadline {
-            return registry.snapshot(agent_id).unwrap_or_default();
+            return snapshot_off_runtime(registry, agent_id)
+                .await
+                .unwrap_or_default();
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// The registry's snapshot takes its synchronous mutex and copies the
+/// scrollback, so the async polls above run it on the blocking pool (Qodo,
+/// #1414).
+async fn snapshot_off_runtime(
+    registry: &Arc<AgentPtyRegistry>,
+    agent_id: &str,
+) -> Result<Vec<u8>, dot_agent_deck::agent_pty::AgentPtyError> {
+    let registry = Arc::clone(registry);
+    let agent_id = agent_id.to_string();
+    tokio::task::spawn_blocking(move || registry.snapshot(&agent_id))
+        .await
+        .expect("the snapshot task does not panic")
 }
 
 fn snapshot_contains(snapshot: &[u8], needle: &[u8]) -> bool {
@@ -453,10 +469,11 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
     let stub = cwd.path().join("slow-readiness-agent.py");
     write_slow_readiness_stub(&stub);
     let command = stub.to_string_lossy().into_owned();
-    std::fs::write(
+    tokio::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
         clear_true_config(&command),
     )
+    .await
     .expect("write slow-readiness orchestration config");
     let cwd_str = cwd.path().to_string_lossy().into_owned();
     let old_agent_id = daemon
