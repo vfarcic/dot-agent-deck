@@ -4364,6 +4364,13 @@ struct DelegationTracker {
     /// [`AgentPtyRegistry::arm_waiting_notice`]'s cooldown. Removed on pane
     /// close, so it is bounded by the panes alive.
     waiting_notice_sent_at: HashMap<String, Instant>,
+    /// PR #1398 finding #18: per worker pane, a value that changes every time
+    /// one of its delegations is resolved — see
+    /// [`AgentPtyRegistry::delegation_resolution_epoch`]. Inserted when a
+    /// commission is armed, so a pane never delegated to holds no entry; moved
+    /// on by every later arm, completion, release and restart retirement;
+    /// removed on pane close, so it is bounded by the panes alive.
+    resolution_epochs: HashMap<String, u64>,
 }
 
 /// Issue #447: one worker pane's pending "this delegated worker is waiting for
@@ -6124,6 +6131,10 @@ impl AgentPtyRegistry {
         // worker once it knows who that is, under this arm's id (Qodo, #1347).
         entry.worker_agent_id = None;
         entry.newest_arm_id = Some(id);
+        // A newer delegate resolves the older one's notices (a supersede).
+        tracker
+            .resolution_epochs
+            .insert(worker_pane_id.to_string(), id);
         tracker
             .commission_dispatches_in_flight
             .entry(worker_pane_id.to_string())
@@ -6374,6 +6385,47 @@ impl AgentPtyRegistry {
         }
     }
 
+    /// PR #1398 finding #18: where `worker_pane_id`'s delegations stand, as a
+    /// value that moves on every time one of them is resolved — a new delegate
+    /// armed over it (a supersede), a `work-done` credited, an undelivered
+    /// delegate released, or the worker replaced by `pane restart` or a
+    /// `clear = true` respawn — and that is gone once the pane closes. `None`
+    /// for a pane never delegated to.
+    ///
+    /// A deck notice about a worker (idle, went quiet, waiting for input,
+    /// exited) is composed when its watch fires and may then wait up to the
+    /// draft cap on the orchestrator's unsent draft. Its record is consumed
+    /// before that wait, so nothing is left for a completion to cancel: the
+    /// notice captures this value when it fires, BEFORE it consumes its
+    /// record, and its write-time re-check refuses the write unless
+    /// [`Self::delegation_resolution_epoch_is`] still holds. Capturing before
+    /// the take is what makes it airtight: a resolution earlier than the
+    /// capture has already taken the record (or replaced it), and one after it
+    /// moves the value.
+    pub fn delegation_resolution_epoch(&self, worker_pane_id: &str) -> Option<u64> {
+        self.delegations
+            .lock()
+            .unwrap()
+            .resolution_epochs
+            .get(worker_pane_id)
+            .copied()
+    }
+
+    /// Whether nothing has resolved one of `worker_pane_id`'s delegations since
+    /// [`Self::delegation_resolution_epoch`] returned `epoch`.
+    pub fn delegation_resolution_epoch_is(&self, worker_pane_id: &str, epoch: Option<u64>) -> bool {
+        self.delegation_resolution_epoch(worker_pane_id) == epoch
+    }
+
+    /// Move `worker_pane_id`'s [`Self::delegation_resolution_epoch`] on. A pane
+    /// with no entry was never delegated to, so no notice holds a value to
+    /// invalidate, and none is created. Caller holds the tracker lock.
+    fn note_delegation_resolved(&self, tracker: &mut DelegationTracker, worker_pane_id: &str) {
+        if let Some(epoch) = tracker.resolution_epochs.get_mut(worker_pane_id) {
+            *epoch = self.delegation_seq.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     /// Issue #448: credit a `work-done` from `worker_pane_id` against the
     /// commission ledger, and report whether the orchestrator had actually asked
     /// for anything — see [`WorkDoneProvenance`].
@@ -6394,6 +6446,7 @@ impl AgentPtyRegistry {
         now: Instant,
     ) -> WorkDoneProvenance {
         let mut tracker = self.delegations.lock().unwrap();
+        self.note_delegation_resolved(&mut tracker, worker_pane_id);
         Self::expire_commissions(&mut tracker, worker_pane_id, now);
         let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return WorkDoneProvenance::Unsolicited;
@@ -6439,6 +6492,7 @@ impl AgentPtyRegistry {
     /// that is the direction that can only lengthen a survivor's life.
     pub fn release_delegation_commission(&self, worker_pane_id: &str) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
+        self.note_delegation_resolved(&mut tracker, worker_pane_id);
         let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return false;
         };
@@ -6480,6 +6534,7 @@ impl AgentPtyRegistry {
     ///   agent's, including when every queued dispatch armed none.
     pub fn cancel_watches_of_replaced_agent(&self, worker_pane_id: &str) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
+        self.note_delegation_resolved(&mut tracker, worker_pane_id);
         let silence = tracker.silence_watches.remove(worker_pane_id).is_some();
         let record_seq = tracker.records.get(worker_pane_id).map(|record| record.seq);
         let owned_by_a_queued_dispatch = record_seq.is_some_and(|seq| {
@@ -6540,6 +6595,7 @@ impl AgentPtyRegistry {
         keep_own: bool,
     ) -> u32 {
         let mut tracker = self.delegations.lock().unwrap();
+        self.note_delegation_resolved(&mut tracker, worker_pane_id);
         let in_flight = tracker
             .commission_dispatches_in_flight
             .get(worker_pane_id)
@@ -6882,6 +6938,7 @@ impl AgentPtyRegistry {
         // below, and a notice finds its recipient in that ledger.)
         tracker.waiting_notices.remove(pane_id);
         tracker.waiting_notice_sent_at.remove(pane_id);
+        tracker.resolution_epochs.remove(pane_id);
         let dropped_commissions = Self::drain_commissions_touching(&mut tracker, pane_id);
         if dropped_commissions > 0 {
             tracing::debug!(
@@ -6909,6 +6966,7 @@ impl AgentPtyRegistry {
         Self::drain_silence_watches_touching(&mut tracker, pane_id);
         tracker.waiting_notices.remove(pane_id);
         tracker.waiting_notice_sent_at.remove(pane_id);
+        tracker.resolution_epochs.remove(pane_id);
         Self::drain_commissions_touching(&mut tracker, pane_id);
         let swept = Self::drain_delegations_touching(&mut tracker, pane_id);
         if !closed {
@@ -7345,6 +7403,11 @@ impl AgentPtyRegistry {
         worker_pane_id: &str,
         delegation: OutstandingDelegation,
     ) -> Option<GuardedSend> {
+        // PR #1398 finding #18: a completion that lands while this notice waits
+        // on the orchestrator's draft moves the value, and the re-check below
+        // refuses. One that lands between the EOF sweep and this line is left to
+        // the commission check beside it.
+        let resolution = self.delegation_resolution_epoch(worker_pane_id);
         let notice = crate::state::compose_worker_exited_notice(worker_pane_id);
         let orchestrator_pane_id = delegation.orchestrator_pane_id.clone();
         let expected_agent_id = delegation.orchestrator_agent_id.clone();
@@ -7364,6 +7427,14 @@ impl AgentPtyRegistry {
                     // Issue #708: a `work-done` credited since the sweep means
                     // the delegation did NOT fail — see this function's doc.
                     if !revalidate_registry.owes_delegation_commission(&revalidate_worker) {
+                        return false;
+                    }
+                    if !crate::state::delegation_still_unresolved(
+                        &revalidate_registry,
+                        &revalidate_worker,
+                        resolution,
+                        "worker-exited notice",
+                    ) {
                         return false;
                     }
                     crate::state::orchestration_still_matches(
@@ -20650,6 +20721,68 @@ mod spawn_tests {
             WorkDoneProvenance::Unsolicited,
             "the worker's own close swept its ledger entry too"
         );
+    }
+
+    /// PR #1398 finding #18: every way a worker's delegation is resolved moves
+    /// the value a waiting notice captured when it fired — a new delegate armed
+    /// over it, a `work-done`, an undelivered delegate released, and both halves
+    /// of a restart — and a pane close forgets it. A pane never delegated to has
+    /// none, and resolving it creates none.
+    #[test]
+    fn delegation_resolution_epoch_moves_on_every_resolution() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        assert_eq!(reg.delegation_resolution_epoch("worker"), None);
+        assert_eq!(
+            reg.retire_delegation_commission("worker"),
+            WorkDoneProvenance::Unsolicited
+        );
+        assert_eq!(
+            reg.delegation_resolution_epoch("worker"),
+            None,
+            "an uncommissioned completion must not start tracking the pane"
+        );
+
+        let arm = |supersede| {
+            assert!(matches!(
+                reg.arm_delegation_commission("worker", "orch", Some("orch-agent"), supersede),
+                CommissionArm::Armed { .. }
+            ));
+        };
+        arm(false);
+        let resolutions: [(&str, &dyn Fn()); 5] = [
+            ("a superseding delegate", &|| arm(true)),
+            ("a work-done", &|| {
+                reg.retire_delegation_commission("worker");
+            }),
+            ("an undelivered delegate's release", &|| {
+                reg.release_delegation_commission("worker");
+            }),
+            ("a restart cancelling the watches", &|| {
+                reg.cancel_watches_of_replaced_agent("worker");
+            }),
+            ("a restart retiring the commissions", &|| {
+                reg.retire_commissions_of_replaced_agent("worker", false);
+            }),
+        ];
+        for (what, resolve) in resolutions {
+            let captured = reg.delegation_resolution_epoch("worker");
+            assert!(captured.is_some(), "a delegated pane is tracked");
+            assert!(reg.delegation_resolution_epoch_is("worker", captured));
+            resolve();
+            assert!(
+                !reg.delegation_resolution_epoch_is("worker", captured),
+                "{what} did not invalidate a notice captured before it"
+            );
+        }
+
+        let captured = reg.delegation_resolution_epoch("worker");
+        reg.begin_pane_close("worker");
+        assert!(
+            !reg.delegation_resolution_epoch_is("worker", captured),
+            "a closed worker pane still read as unresolved"
+        );
+        reg.finish_pane_close("worker", true);
+        assert_eq!(reg.delegation_resolution_epoch("worker"), None);
     }
 
     /// Issue #447: the waiting-for-input notice finds its recipient in the

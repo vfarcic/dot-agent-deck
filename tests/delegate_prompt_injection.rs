@@ -4128,6 +4128,20 @@ impl SilenceHarness {
         writer.flush().expect("flush worker user bytes");
     }
 
+    async fn send_orchestrator_user_bytes(&self, bytes: &[u8]) {
+        use std::io::Write as _;
+
+        let handle = self
+            .registry
+            .subscribe(&self.orchestrator_agent_id)
+            .expect("attach draft-test orchestrator");
+        let mut writer = handle.writer.lock().await;
+        writer
+            .write_all(bytes)
+            .expect("write orchestrator user bytes");
+        writer.flush().expect("flush orchestrator user bytes");
+    }
+
     fn orchestrator_snapshot(&self) -> Vec<u8> {
         self.registry
             .snapshot(&self.orchestrator_agent_id)
@@ -4628,6 +4642,134 @@ fn idle_worker_026_queued_delegate_clocks_start_after_its_pointer() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         });
+}
+
+/// Which response watch a stale-notice test arms.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum ResponseWatch {
+    /// PRD #126's idle-worker watch: "has not responded with work-done".
+    Idle,
+    /// PRD #249's silent-worker watch: "delegated worker went quiet".
+    Silence,
+}
+
+/// PR #1398 finding #18: a response watch fires while the ORCHESTRATOR holds
+/// an unsent draft, so its notice waits on that draft; the worker's
+/// `work-done` then arrives during the wait. Once the user submits the draft,
+/// the work-done feedback must arrive and the stale notice must not.
+#[cfg(unix)]
+fn run_stale_response_notice_after_work_done(watch: ResponseWatch) {
+    let (idle_ms, silence_ms, notice) = match watch {
+        ResponseWatch::Idle => ("500", "0", "has not responded with work-done"),
+        ResponseWatch::Silence => ("0", "500", "delegated worker went quiet"),
+    };
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, idle_ms),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, silence_ms),
+        (DRAFT_DEFER_CAP_ENV, "60000"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build stale-response-notice runtime")
+        .block_on(async {
+            const DRAFT: &[u8] = b"orchestrator-draft-544-f18";
+            let harness = SilenceHarness::new(64).await;
+            harness.delegate_and_wait_for_pointer().await;
+            harness.send_orchestrator_user_bytes(DRAFT).await;
+            let typed = wait_for_snapshot_needle(
+                &harness.registry,
+                &harness.orchestrator_agent_id,
+                DRAFT,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                snapshot_contains(&typed, DRAFT),
+                "orchestrator draft never reached its PTY: {:?}",
+                String::from_utf8_lossy(&typed)
+            );
+
+            // Well past the 500 ms window: the watch has fired and its notice
+            // is waiting on the orchestrator's draft.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let waiting = harness.orchestrator_snapshot();
+            assert!(
+                !String::from_utf8_lossy(&waiting).contains(notice),
+                "the notice did not wait for the orchestrator's draft: {:?}",
+                String::from_utf8_lossy(&waiting)
+            );
+
+            let delivery = harness
+                .state
+                .prepare_work_done(
+                    WorkDoneSignal {
+                        pane_id: WORKER_PANE.to_string(),
+                        task: "Finished while the notice waited.".to_string(),
+                        done: false,
+                        timestamp: chrono::Utc::now(),
+                        token: None,
+                    },
+                    &harness.registry,
+                )
+                .await;
+            let delivery_registry = Arc::clone(&harness.registry);
+            let delivered = tokio::spawn(async move { delivery.deliver(&delivery_registry).await });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            harness.send_orchestrator_user_bytes(b"\r").await;
+            let completed = wait_for_snapshot_needle(
+                &harness.registry,
+                &harness.orchestrator_agent_id,
+                b"has completed their task",
+                Duration::from_secs(5),
+            )
+            .await;
+            assert!(
+                snapshot_contains(&completed, b"has completed their task"),
+                "the work-done feedback was not delivered after the draft was submitted: {:?}",
+                String::from_utf8_lossy(&completed)
+            );
+            delivered.await.expect("work-done delivery task");
+            // Both writes were released by the same Enter; give the notice
+            // every chance to land before asserting it did not.
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            let after = harness.orchestrator_snapshot();
+            let text = String::from_utf8_lossy(&after);
+            assert!(
+                !text.contains(notice),
+                "a notice about a worker that had already reported work-done was delivered \
+                 after the orchestrator's draft cleared: {text:?}"
+            );
+        });
+}
+
+/// Scenario: The orchestrator has typed an unsent draft when a worker's
+/// idle-worker window runs out, so the "has not responded" report waits on
+/// that draft. The worker reports work-done during the wait; after the user
+/// presses Enter the orchestrator gets the completion and never the stale
+/// idle report.
+#[spec("scheduler/idle-worker/027")]
+#[test]
+#[cfg(unix)]
+fn idle_worker_027_waiting_idle_report_is_dropped_after_work_done() {
+    run_stale_response_notice_after_work_done(ResponseWatch::Idle);
+}
+
+/// Scenario: The orchestrator has typed an unsent draft when a worker's
+/// no-event window runs out, so the "went quiet" report waits on that draft.
+/// The worker reports work-done during the wait; after the user presses Enter
+/// the orchestrator gets the completion and never the stale silence report.
+#[spec("scheduler/idle-worker/028")]
+#[test]
+#[cfg(unix)]
+fn idle_worker_028_waiting_silence_report_is_dropped_after_work_done() {
+    run_stale_response_notice_after_work_done(ResponseWatch::Silence);
 }
 
 /// Scenario: Clear an unsent worker draft with Ctrl+U while a production

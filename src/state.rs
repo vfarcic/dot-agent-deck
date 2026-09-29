@@ -2921,6 +2921,32 @@ pub fn compose_idle_worker_prompt(role: &str, elapsed: std::time::Duration) -> S
 /// and the registry membership holds only the un-defaulted field, so the two
 /// sources can disagree about the cwd for a perfectly healthy pane — a
 /// comparison that would refuse a legitimate nudge.
+/// PR #1398 finding #18: the write-time re-check every deck notice about a
+/// worker makes, in its `revalidate` closure: refuse the notice when one of the
+/// worker's delegations has been resolved — a `work-done`, a supersede, a
+/// release or a restart — since the notice's watch fired and captured
+/// `resolution` ([`AgentPtyRegistry::delegation_resolution_epoch`]). The notice
+/// may have waited minutes on the orchestrator's unsent draft by then, and a
+/// report that a worker never answered, delivered after it did, is worse than
+/// none. The refusal is logged here; the caller reports nothing.
+pub(crate) fn delegation_still_unresolved(
+    registry: &AgentPtyRegistry,
+    worker_pane_id: &str,
+    resolution: Option<u64>,
+    notice: &'static str,
+) -> bool {
+    if registry.delegation_resolution_epoch_is(worker_pane_id, resolution) {
+        return true;
+    }
+    tracing::info!(
+        worker_pane_id = %worker_pane_id,
+        notice,
+        "the worker's delegation was resolved (work-done, supersede, release or restart) while \
+         the notice waited to be written; not sent"
+    );
+    false
+}
+
 pub(crate) fn orchestration_still_matches(
     expected: Option<&OrchestrationIdentity>,
     live: Option<&crate::agent_pty::PaneOrchestration>,
@@ -3368,6 +3394,10 @@ fn arm_idle_worker_watch(
             );
             return;
         }
+        // PR #1398 finding #18: captured BEFORE the take, so the write below can
+        // refuse once a completion, supersede, release or restart has resolved
+        // this delegation while the notice waited on the orchestrator's draft.
+        let resolution = registry.delegation_resolution_epoch(&worker_pane_id);
         let Some(delegation) = registry.take_outstanding_delegation_if(&worker_pane_id, seq) else {
             tracing::debug!(
                 pane_id = %worker_pane_id,
@@ -3381,6 +3411,7 @@ fn arm_idle_worker_watch(
         let expected_orchestration = delegation.orchestration.clone();
         let revalidate_registry = Arc::clone(&registry);
         let revalidate_pane = orchestrator_pane_id.clone();
+        let revalidate_worker = worker_pane_id.clone();
         let outcome = registry
             .write_and_submit_guarded_first_write(
                 &orchestrator_pane_id,
@@ -3388,6 +3419,14 @@ fn arm_idle_worker_watch(
                 &delegation.orchestrator_agent_id,
                 || async move {
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                        return false;
+                    }
+                    if !delegation_still_unresolved(
+                        &revalidate_registry,
+                        &revalidate_worker,
+                        resolution,
+                        "idle-worker watch",
+                    ) {
                         return false;
                     }
                     orchestration_still_matches(
@@ -3931,6 +3970,10 @@ fn arm_waiting_notice_watch(
             }
             _ = tokio::time::sleep_until(deadline) => {}
         }
+        // PR #1398 finding #18: captured before the ledger read below, so a
+        // completion that lands while the notice waits on the orchestrator's
+        // draft refuses it at write time.
+        let resolution = registry.delegation_resolution_epoch(&worker_pane_id);
         if !registry.waiting_notice_is_current(&worker_pane_id, seq) {
             return;
         }
@@ -4014,6 +4057,12 @@ fn arm_waiting_notice_watch(
                         || revalidate_registry
                             .commission_owed_to_agent(&revalidate_worker, &revalidate_worker_agent)
                             != Some(owner)
+                        || !delegation_still_unresolved(
+                            &revalidate_registry,
+                            &revalidate_worker,
+                            resolution,
+                            "waiting notice",
+                        )
                     {
                         return false;
                     }
@@ -4725,6 +4774,8 @@ fn arm_delegate_silence_watch(
         // One-shot: consume our own record. A `false` means work-done, a
         // supersede or a pane close resolved this delegation while the window
         // ran and the cancellation had not been observed yet — suppress.
+        // PR #1398 finding #18: captured before the take — see the idle watch.
+        let resolution = registry.delegation_resolution_epoch(&worker_pane_id);
         if !registry.cancel_silence_watch_if(&worker_pane_id, seq) {
             tracing::debug!(
                 pane_id = %worker_pane_id,
@@ -4803,6 +4854,7 @@ fn arm_delegate_silence_watch(
         let notice = compose_delegate_silence_notice(window, pane_text.as_deref());
         let revalidate_registry = Arc::clone(&registry);
         let revalidate_pane = orchestrator_pane_id.clone();
+        let revalidate_worker = worker_pane_id.clone();
         let outcome = registry
             .write_and_submit_guarded_first_write(
                 &orchestrator_pane_id,
@@ -4810,6 +4862,14 @@ fn arm_delegate_silence_watch(
                 &expected_agent_id,
                 || async move {
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                        return false;
+                    }
+                    if !delegation_still_unresolved(
+                        &revalidate_registry,
+                        &revalidate_worker,
+                        resolution,
+                        "silent-worker watch",
+                    ) {
                         return false;
                     }
                     orchestration_still_matches(

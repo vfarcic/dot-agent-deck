@@ -6356,6 +6356,20 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** a queued dispatch that ends without writing (the queued mark's seq-guarding and dequeue are pinned by the `agent_pty` unit test `delegation_idle_clock_holds_a_queued_pointer_write_until_it_dequeues`), real-agent event handling, rendered card state, or the exact wording of either report.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/idle-worker/027 — An idle-worker report waiting on the orchestrator's draft is dropped when the worker reports work-done meanwhile (issue #544, PR #1398 review finding #18).
+- **Layer:** fast integration (production delegate handler, idle-worker watch and work-done handler with real `cat` PTYs and shortened test clocks).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** with an unsent draft typed into the orchestrator pane, the idle-worker window elapses and its report waits; the worker's `work-done` arrives during that wait; after Enter the orchestrator receives the work-done feedback and never the "has not responded with work-done" report. Verified red on the pre-fix code, where the stale report was delivered right after the draft was submitted.
+- **Does not assert:** the other resolutions the same check refuses on (supersede, release, `pane restart`), which share the one generation bump pinned by the `agent_pty` unit test `delegation_resolution_epoch_moves_on_every_resolution`; real-agent event handling; the exact wording of either message.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/028 — A went-quiet report waiting on the orchestrator's draft is dropped when the worker reports work-done meanwhile (issue #544, PR #1398 review finding #18).
+- **Layer:** fast integration (production delegate handler, silent-worker watch and work-done handler with real `cat` PTYs and shortened test clocks).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** with an unsent draft typed into the orchestrator pane, the no-event window elapses and its report waits; the worker's `work-done` arrives during that wait; after Enter the orchestrator receives the work-done feedback and never the "delegated worker went quiet" report. Verified red on the pre-fix code, where the stale report was delivered right after the draft was submitted.
+- **Does not assert:** the other resolutions the same check refuses on (see `scheduler/idle-worker/027`), real-agent event handling, or the exact wording of either message.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/live
 
 ##### scheduler/live/001 — A scheduled fire surfaces its card LIVE to an already-attached TUI, without a disconnect/reconnect (PRD #127 finding #2).

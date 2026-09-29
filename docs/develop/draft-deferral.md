@@ -60,3 +60,7 @@ A restart that lands during the wait replaces the worker, so the write's identit
 - **One FIFO queue per target pane, drained by at most one task**, which exists only while that queue holds work. Several reports waiting on the same pane's draft are therefore written in the order the daemon received them, each as a message of its own. Across panes deliveries run concurrently, so one pane's draft delays nothing written anywhere else.
 - **A panicking delivery ends only itself.** Each delivery runs as its own task; a panic is logged as a warning naming the pane (never its payload) and the drain moves on to the next item.
 - **A bound on pending deliveries across all panes**, `MAX_PENDING_PANE_DELIVERIES` (256). At the bound the enqueuing hook connection waits for a slot while holding its connection permit — backpressure onto new hook connections, never a dropped delivery — logged once per saturation episode.
+
+## A deck report can go stale while it waits
+
+The deck's own reports about a worker — idle-worker, went-quiet, waiting-for-input and worker-exited — are first writes into the orchestrator's pane, so they wait on its draft like everything else. What they report can stop being true during that wait: the worker may report `work-done`, or be re-delegated to, released or restarted. Their write-time re-check therefore also refuses a report once the worker's delegation has been resolved since the report fired (PR #1398 finding #18). The mechanism is in [Worker reports](worker-reports.md#cancellation-and-identity-binding).
