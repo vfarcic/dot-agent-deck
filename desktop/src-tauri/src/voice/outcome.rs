@@ -43,7 +43,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use super::dictation::{
-    DICTATION_OPENERS, SUBMIT_PHRASES, opening_with, strip_opening, whole_utterance_is,
+    DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS, SUBMIT_PHRASES,
+    VOICE_OFF_PHRASES, opening_with, strip_opening, whole_utterance_is,
 };
 use super::resolver::{IntentError, IntentRequest, IntentResolver};
 use super::schema::{
@@ -52,7 +53,10 @@ use super::schema::{
 use super::table::{
     ActionGrounding, CommandRow, CommandTable, ParamKind, Requirement, Screen, spoken_words,
 };
-use super::{DesktopAgent, Transcript, VoiceChoice, VoiceDeck, VoiceDirectories, VoiceNewAgent};
+use super::{
+    DesktopAgent, Transcript, VoiceChoice, VoiceDeck, VoiceDictationTarget, VoiceDirectories,
+    VoiceNewAgent,
+};
 use crate::dto::{DesktopTab, safe_message};
 use crate::settings::LabelSharing;
 
@@ -71,6 +75,11 @@ const DICTATE_ROW: &str = "dictate_to_agent";
 const DICTATE_PARAM: &str = "prefix";
 /// The row a whole-utterance submit phrase dispatches.
 const SUBMIT_ROW: &str = "submit_prompt";
+/// The rows the dictation mode's own phrases dispatch (PRD #1260), and the one
+/// that turns voice off from inside it.
+const DICTATION_ON_ROW: &str = "dictation_on";
+const DICTATION_OFF_ROW: &str = "dictation_off";
+const VOICE_OFF_ROW: &str = "voice_off";
 /// PRD #1195 M3 — the Deck selector's row, and the one `deck_ref` row that is
 /// not about the New agent dialog.
 ///
@@ -544,6 +553,44 @@ pub async fn handle_utterance_with(
     labels: LabelSharing,
     show_deck: bool,
 ) -> VoiceResult {
+    handle_utterance_with_dictation(
+        resolver,
+        table,
+        screen,
+        agents,
+        decks,
+        directories,
+        new_agent,
+        None,
+        transcript,
+        labels,
+        show_deck,
+    )
+    .await
+}
+
+/// [`handle_utterance_with`], with the voice panel's dictation mode declared
+/// (PRD #1260) — which is what `desktop_voice_resolve` calls.
+///
+/// `dictation` is the agent the panel is typing to, or `None` in `Idle`. With
+/// one declared the utterance is answered by [`dictation_intercept`] and
+/// **never** reaches the Commands backend: no `IntentRequest` is built, so no
+/// observed name and no transcript leaves the machine for that stage, and
+/// `resolve_ms` is `None`. Without one, everything is as it was.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_utterance_with_dictation(
+    resolver: &dyn IntentResolver,
+    table: &CommandTable,
+    screen: Screen,
+    agents: &[DesktopAgent],
+    decks: &[VoiceDeck],
+    directories: Option<&VoiceDirectories>,
+    new_agent: Option<&VoiceNewAgent>,
+    dictation: Option<&VoiceDictationTarget>,
+    transcript: Transcript,
+    labels: LabelSharing,
+    show_deck: bool,
+) -> VoiceResult {
     let withheld = labels == LabelSharing::Withheld;
     let backend = resolver.backend_name();
     let finish = |outcome, resolve_ms| VoiceResult {
@@ -557,6 +604,13 @@ pub async fn handle_utterance_with(
     // and neither is worth spending on an empty string.
     if transcript.is_empty() {
         return finish(VoiceOutcome::no_match(transcript), None);
+    }
+
+    // The dictation mode (PRD #1260): answered here in full, whatever was said.
+    if dictation.is_some()
+        && let Some(outcome) = dictation_intercept(table, screen, &transcript)
+    {
+        return finish(outcome, None);
     }
 
     // The local fast paths, ahead of every backend call (PRD #802 D6, rebuilt).
@@ -1647,6 +1701,19 @@ fn local_intercept(
         }
     };
 
+    // The dictation mode's switches (PRD #1260), ahead of the opener below:
+    // "type on" opens with `type` and would otherwise type the word "on".
+    for (phrases, row_id) in [
+        (&DICTATION_ON_PHRASES[..], DICTATION_ON_ROW),
+        (&DICTATION_OFF_PHRASES[..], DICTATION_OFF_ROW),
+    ] {
+        if said_whole(transcript.text(), phrases.iter().copied())
+            && let Some(row) = table.row(row_id)
+        {
+            return Some(dispatch(row, Vec::new()));
+        }
+    }
+
     if whole_utterance_is(transcript.text(), &SUBMIT_PHRASES)
         && let Some(row) = table.row(SUBMIT_ROW)
     {
@@ -1673,6 +1740,99 @@ fn local_intercept(
             name: spec.name.clone(),
             kind: spec.kind,
             spoken: opener.to_string(),
+            value: typed.to_string(),
+            label: typed.to_string(),
+            deck_identity: None,
+        }],
+    ))
+}
+
+/// Whether the whole utterance, less an edge politeness word, is one of
+/// `phrases` — the comparison `heard_as_whole` grounding makes, so a phrase
+/// answered locally is answered for exactly the words its row would accept.
+fn said_whole<'a>(transcript: &str, phrases: impl IntoIterator<Item = &'a str>) -> bool {
+    let said = whole_utterance(transcript);
+    !said.is_empty()
+        && phrases
+            .into_iter()
+            .any(|phrase| spoken_words(phrase) == said)
+}
+
+/// One utterance while the dictation mode is on (PRD #1260), decided with no
+/// backend call at all.
+///
+/// # The order, and why it decides nothing today
+///
+/// 1. [`VOICE_OFF_PHRASES`] — turn voice off, which also ends the mode;
+/// 2. [`DICTATION_OFF_PHRASES`] — end the mode;
+/// 3. a submit — [`SUBMIT_PHRASES`] or one of `submit_prompt`'s own
+///    `heard_as_whole` entries ("go ahead");
+/// 4. anything else is typed, whole.
+///
+/// Each of the first three is a whole-utterance comparison, so a phrase said
+/// inside a longer sentence is typed. The lists are disjoint (linkage-check
+/// rule 14), so the order decides nothing; it is #802's decided one — the
+/// bigger stop first — so a future overlap cannot leave a live microphone
+/// after a user asked for it to stop.
+///
+/// # Typed whole
+///
+/// There is no opener to strip and no model to mark one, so the `prefix` param
+/// carries an empty `spoken` and the whole transcript as its value: "type fix
+/// the bug" said while dictating types all four words. The row's `heard_as`
+/// grounding is not consulted for it — the mode the user entered is the
+/// grounding — but its screen still is. `None` only for a table with no
+/// dictation row, which then falls through to the ordinary pipeline.
+fn dictation_intercept(
+    table: &CommandTable,
+    screen: Screen,
+    transcript: &Transcript,
+) -> Option<VoiceOutcome> {
+    let dispatch = |row: &CommandRow, params: Vec<ResolvedParam>| {
+        if !row.callable_on(screen) {
+            return VoiceOutcome::unavailable(transcript.clone(), row);
+        }
+        VoiceOutcome::Dispatch {
+            sentence: report(row, &params),
+            transcript: transcript.clone(),
+            action: row.id.clone(),
+            invoke: row.invoke.clone(),
+            params,
+        }
+    };
+    let text = transcript.text();
+
+    for (phrases, row_id) in [
+        (&VOICE_OFF_PHRASES[..], VOICE_OFF_ROW),
+        (&DICTATION_OFF_PHRASES[..], DICTATION_OFF_ROW),
+    ] {
+        if said_whole(text, phrases.iter().copied())
+            && let Some(row) = table.row(row_id)
+        {
+            return Some(dispatch(row, Vec::new()));
+        }
+    }
+    if let Some(row) = table.row(SUBMIT_ROW) {
+        let submits = said_whole(text, SUBMIT_PHRASES)
+            || matches!(&row.grounding, ActionGrounding::HeardAsWhole(phrases)
+                if said_whole(text, phrases.iter().map(String::as_str)));
+        if submits {
+            return Some(dispatch(row, Vec::new()));
+        }
+    }
+
+    let row = table.row(DICTATE_ROW)?;
+    let spec = row
+        .params
+        .iter()
+        .find(|spec| spec.name == DICTATE_PARAM && spec.kind == ParamKind::SpokenPrefix)?;
+    let typed = text.trim();
+    Some(dispatch(
+        row,
+        vec![ResolvedParam {
+            name: spec.name.clone(),
+            kind: spec.kind,
+            spoken: String::new(),
             value: typed.to_string(),
             label: typed.to_string(),
             deck_identity: None,
@@ -6309,6 +6469,112 @@ mod tests {
         assert_eq!(params.len(), 1, "got {params:?}");
         assert_eq!(params[0].kind, ParamKind::SpokenPrefix);
         &params[0].value
+    }
+
+    struct NoCommandsResolver;
+
+    impl IntentResolver for NoCommandsResolver {
+        fn resolve<'a>(
+            &'a self,
+            _request: IntentRequest<'a>,
+        ) -> crate::voice::resolver::ResolveFuture<'a> {
+            panic!("a dictation mode utterance reached the Commands backend")
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "unreachable-commands"
+        }
+    }
+
+    /// Scenario: the two spoken mode switches are answered locally before the
+    /// one-shot `type` opener can turn their last word into prompt text.
+    #[tokio::test]
+    async fn voice_outcome_type_on_and_off_switch_mode_without_typing_or_resolving() {
+        for (said, action) in [
+            ("type on", "dictation_on"),
+            ("okay, type on please", "dictation_on"),
+            ("type off", "dictation_off"),
+            ("please type off now", "dictation_off"),
+        ] {
+            let resolver = NoCommandsResolver;
+            let answer = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &[],
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await;
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Dispatch { action: got, params, .. }
+                if got == action && params.is_empty()),
+                "{said}: {:?}",
+                answer.outcome
+            );
+            assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+        }
+    }
+
+    /// Scenario: a declared dictation target keeps every utterance local to
+    /// Rust. Reserved whole utterances control the mode; ordinary text,
+    /// including a `type` opener and embedded stop words, is returned whole.
+    #[tokio::test]
+    async fn voice_outcome_dictating_classifies_reserved_words_before_verbatim_text_without_resolving()
+     {
+        let target = VoiceDictationTarget {
+            deck_id: "deck-one".to_string(),
+            agent_id: "tester".to_string(),
+        };
+        for (said, action, text) in [
+            ("voice off", "voice_off", None),
+            ("type off", "dictation_off", None),
+            ("send it", "submit_prompt", None),
+            ("go ahead", "submit_prompt", None),
+            ("okay, send it please", "submit_prompt", None),
+            (
+                "type fix the bug",
+                "dictate_to_agent",
+                Some("type fix the bug"),
+            ),
+            (
+                "we should stop typing the logs",
+                "dictate_to_agent",
+                Some("we should stop typing the logs"),
+            ),
+            (
+                "and then send it to the reviewer",
+                "dictate_to_agent",
+                Some("and then send it to the reviewer"),
+            ),
+        ] {
+            let resolver = NoCommandsResolver;
+            let answer = handle_utterance_with_dictation(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &[],
+                None,
+                None,
+                Some(&target),
+                Transcript::new(said),
+                LabelSharing::Shared,
+                true,
+            )
+            .await;
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Dispatch { action: got, .. } if got == action),
+                "{said}: {:?}",
+                answer.outcome
+            );
+            if let Some(text) = text {
+                assert_eq!(typed(&answer.outcome), text, "{said}");
+            }
+            assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+        }
     }
 
     #[tokio::test]

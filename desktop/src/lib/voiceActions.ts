@@ -185,6 +185,18 @@ export type VoiceActionContext = {
    * which only the surface holds. */
   submitAgentPrompt: (target: VoiceDispatchTarget) => void;
   /**
+   * Enter the dictation mode for the pane on screen (PRD #1260): every later
+   * utterance is typed into that agent's prompt until the mode ends.
+   *
+   * Served by the voice surface, because the mode is the surface's own state —
+   * one of its panel states, beside a pending send — and it refuses entry,
+   * through {@link reportRefused}, on a pane that cannot take input.
+   */
+  startDictation: (target: VoiceDispatchTarget) => void;
+  /** Leave the dictation mode. Sends nothing: what was typed stays in the
+   * prompt. The voice surface's, for {@link startDictation}'s reason. */
+  stopDictation: () => void;
+  /**
    * Close the voice surface's own overlay.
    *
    * **Published only while that overlay is OPEN**, and that is the whole
@@ -437,6 +449,22 @@ export const VOICE_ACTIONS = {
     /** Presses Enter, and nothing else. It types nothing — a request to write
         something is `dictateToAgent`. */
     run: (context: Pick<VoiceActionContext, "submitAgentPrompt">, target: VoiceDispatchTarget) => context.submitAgentPrompt(target),
+  },
+
+  startDictation: {
+    label: "Type everything said into the open agent's prompt until told to stop",
+    voice: true,
+    needs: ["startDictation"],
+    /** Targets the pane on screen — the row declares no agent param and is
+        `screens = ["agent"]` — and never a pane the user is not looking at. */
+    run: (context: Pick<VoiceActionContext, "startDictation">, target: VoiceDispatchTarget) => context.startDictation(target),
+  },
+
+  stopDictation: {
+    label: "Stop typing what is said into the agent's prompt",
+    voice: true,
+    needs: ["stopDictation"],
+    run: (context: Pick<VoiceActionContext, "stopDictation">) => context.stopDictation(),
   },
 
   closeTopmost: {
@@ -992,7 +1020,7 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused">;
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused">;
 /**
  * `Partial`, because a panel can serve one of these and not another.
  *

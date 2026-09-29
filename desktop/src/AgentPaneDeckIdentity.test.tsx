@@ -465,6 +465,56 @@ describe("agent pane identity fence", () => {
     expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).toBeNull();
   });
 
+  /** Scenario: a writable pane enters sticky dictation by voice while it is
+   * modal. The only reachable controls outside it are Voice and Stop typing;
+   * Stop typing remains in the tab order as a non-voice exit. */
+  it("keeps only Voice and Stop typing reachable outside a dictating pane", async () => {
+    let recording = false;
+    let delivered = false;
+    const microphoneStatus = (state: "idle" | "recording" | "done") => ({
+      state, capturedMs: state === "done" ? 900 : 0, maxMs: 30_000,
+      capped: false, available: true, backend: "remote" as const,
+    });
+    const deck = harness(
+      documentSelectingOneDeck(),
+      {
+        resolveVoice: vi.fn(async (utterance: string) => ({
+          outcome: {
+            kind: "dispatch" as const, transcript: utterance,
+            action: "dictation_on", invoke: "startDictation", params: [],
+            sentence: "Typing to Planner.",
+          },
+          resolveMs: null, backend: "stub",
+        })),
+        voiceStart: vi.fn(async () => { recording = true; return microphoneStatus("recording"); }),
+        voiceStatus: vi.fn(async () => {
+          if (!recording) return microphoneStatus("idle");
+          if (!delivered) { delivered = true; return microphoneStatus("done"); }
+          return microphoneStatus("recording");
+        }),
+        voiceStop: vi.fn(async () => {
+          recording = false;
+          return {
+            outcome: { kind: "heard" as const, transcript: "type on", sentence: "Heard: “type on”." },
+            transcribeMs: 12, backend: "stub", audioMs: 900,
+          };
+        }),
+        voiceCancel: vi.fn(async () => microphoneStatus("idle")),
+      },
+      (agent) => agent.id === "planner" ? { ...agent, status: "running", writeLease: "write" } : agent,
+    );
+    render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "deck" }} />);
+    fireEvent.click(openControl("Planner"));
+    const pane = screen.getByTestId("agent-pane-overlay");
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    const stop = await screen.findByRole("button", { name: "Stop typing" });
+    await waitFor(() => expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull());
+    expect(reachableOutside(pane)).toEqual([screen.getByTestId("voice-trigger"), stop]);
+    expect(stop.tabIndex).toBeGreaterThanOrEqual(0);
+    stop.focus();
+    expect(stop).toHaveFocus();
+  });
+
   /**
    * Scenario: a daemon-origin pane is open on the local deck when the selected
    * deck moves to build-box, which runs a Planner of its own with the same id.

@@ -242,6 +242,22 @@ pub struct VoiceNewAgentForm {
     pub withheld_modes: Vec<VoiceChoice>,
 }
 
+/// The agent the voice panel is in the dictation mode for (PRD #1260), declared
+/// with each utterance while the mode is on and absent otherwise.
+///
+/// The Rust side keeps no memory between utterances, so the mode travels in the
+/// declaration exactly as the New agent dialog's state does. Its presence is
+/// the whole signal: an utterance declared with one is classified locally
+/// against the reserved phrases and otherwise typed whole, and nothing reaches
+/// the Commands backend. The composite `{deck_id, agent_id}` rather than a bare
+/// agent id, because an agent id is only unique within its deck.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceDictationTarget {
+    pub deck_id: String,
+    pub agent_id: String,
+}
+
 /// One entry of a closed set on screen: the id the dialog selects by, and the
 /// label it renders — which is what a user says.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -250,7 +266,10 @@ pub struct VoiceChoice {
     pub id: String,
     pub label: String,
 }
-pub use dictation::{DICTATION_OPENERS, SUBMIT_PHRASES};
+pub use dictation::{
+    DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS, SUBMIT_PHRASES,
+    VOICE_OFF_PHRASES,
+};
 
 pub use capture::{
     AudioFormat, AudioSource, AudioStream, Capture, CaptureError, CaptureSession, CaptureState,
@@ -262,8 +281,8 @@ pub use hold::VoiceHold;
 pub use outcome::{
     ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, SWITCH_DECK_ROW, VoiceDeckIdentity,
     VoiceDeckSelection, VoiceOutcome, VoiceResult, address_deck_switch, handle_utterance,
-    handle_utterance_with, refuse_switch_beyond_selector, resolve_agent_type_ref, resolve_deck_ref,
-    resolve_dir_ref, resolve_mode_ref,
+    handle_utterance_with, handle_utterance_with_dictation, refuse_switch_beyond_selector,
+    resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref, resolve_mode_ref,
 };
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{

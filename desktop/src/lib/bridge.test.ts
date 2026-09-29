@@ -387,11 +387,11 @@ describe("TauriDeckBridge", () => {
     const deckStep = [{ deckId: "deck-local" }, { deckId: "deck-build", reason: "No daemon is listening on the configured socket." }];
     bridge.declareVoiceScreen("overview", undefined, undefined, deckStep);
     await bridge.resolveVoice("new agent on the build box");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent on the build box", screen: "overview", directories: null, newAgent: null, deckStep, endpoints: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent on the build box", screen: "overview", directories: null, newAgent: null, deckStep, endpoints: null, dictation: null });
 
     bridge.declareVoiceScreen("overview");
     await bridge.resolveVoice("new agent");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent", screen: "overview", directories: null, newAgent: null, deckStep: null, endpoints: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent", screen: "overview", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null });
   });
 
   /**
@@ -408,7 +408,29 @@ describe("TauriDeckBridge", () => {
     const endpoints = { remote: [{ id: "newbox01", host: "new-box", port: 22 }], selection: "local" };
     bridge.declareVoiceScreen("deck", undefined, undefined, undefined, endpoints);
     await bridge.resolveVoice("switch deck to the new box");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "switch deck to the new box", screen: "deck", directories: null, newAgent: null, deckStep: null, endpoints });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "switch deck to the new box", screen: "deck", directories: null, newAgent: null, deckStep: null, endpoints, dictation: null });
+  });
+
+  /**
+   * Scenario (PRD #1260): the dictation mode's target declared with an
+   * utterance travels to `desktop_voice_resolve` as `dictation`, which is what
+   * keeps that utterance off the Commands backend; the next declaration made
+   * without one sends `null` again, so the mode never outlives the panel's own
+   * state.
+   */
+  it("sends the declared dictation target with the utterance it was declared for", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    invoke.mockResolvedValue({ outcome: { kind: "no_match", sentence: "", transcript: "" } });
+
+    const dictation = { deckId: "deck-local", agentId: "coder" };
+    bridge.declareVoiceScreen("agent", undefined, undefined, undefined, undefined, dictation);
+    await bridge.resolveVoice("run the tests");
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "run the tests", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation });
+
+    bridge.declareVoiceScreen("agent");
+    await bridge.resolveVoice("type on");
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "type on", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null });
   });
 
   /**

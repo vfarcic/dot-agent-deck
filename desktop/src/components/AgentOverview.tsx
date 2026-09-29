@@ -679,10 +679,17 @@ export function stopTargetName(agent: OverviewAgent): string {
  * passes it to whichever view is mounted; a caller that renders this screen
  * standalone gets everything except the control that needs a document.
  */
-export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice }: {
+export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice, onConfirmationChange }: {
   runtime: DeckRuntimeState;
   settings?: DesktopSettingsState;
   onNavigate: (view: DeckView) => void;
+  /**
+   * PRD #1260 — told whenever a D5 confirmation opens or closes here, by
+   * click or by voice. The voice panel does not own the confirmation and
+   * learns of it only through this: an opening one pre-empts the dictation
+   * mode, which does not resume when it is answered.
+   */
+  onConfirmationChange?: (open: boolean) => void;
   /**
    * An agent's pane is open over this screen (PRD #1105), which is where the
    * keyboard belongs — so the New agent shortcut stands down: `Ctrl+N` is
@@ -990,6 +997,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "overview" });
   }, [voiceContext]);
   const [confirm, setConfirm] = useState<ConfirmState>();
+  const confirmationOpen = confirm !== undefined;
+  const confirmationChanged = useRef(onConfirmationChange);
+  confirmationChanged.current = onConfirmationChange;
+  useEffect(() => { confirmationChanged.current?.(confirmationOpen); }, [confirmationOpen]);
+  /* An overview unmounted with a confirmation up takes the confirmation with it. */
+  useEffect(() => () => { confirmationChanged.current?.(false); }, []);
   const [overrideError, setOverrideError] = useState<string>();
   /**
    * PRD #1223 U4 — see {@link StopControlsContext}. The deck an agent is on is

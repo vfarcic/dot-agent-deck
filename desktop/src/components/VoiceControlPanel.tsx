@@ -77,7 +77,7 @@
  * comment on the returned element has the reasoning and the one it replaced.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Mic, MicOff, Undo2, X } from "lucide-react";
+import { Mic, MicOff, SquarePen, Undo2, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
@@ -335,6 +335,39 @@ export const VOICE_DICTATION_SUBMIT = "\r";
  */
 export const VOICE_NOTHING_TO_CLOSE = "Nothing to close — this is the screen itself.";
 
+/**
+ * PRD #1260 — what the report says when a capped segment was TYPED rather than
+ * discarded, because the dictation mode was on.
+ *
+ * {@link VOICE_CAP_DISCARDED}'s reasoning is about commands, which are one to
+ * four words; a dictated paragraph is not, and discarding thirty seconds of it
+ * is the worst outcome available. So while dictating the segment is
+ * transcribed and typed like any other, and this says it ran to the limit.
+ */
+export const VOICE_CAP_TYPED = "That ran to the 30 s limit with no pause in it, so it was typed as one piece.";
+
+/**
+ * PRD #1260 — what the report says when `type off` was said with no mode on.
+ * Rust cannot know — it keeps no memory between utterances — so the surface
+ * answers for its own state.
+ */
+export const VOICE_NOT_DICTATING = "Not typing to any agent, so there was nothing to stop.";
+
+/**
+ * PRD #1260 — the sentences about the dictation mode's own state, which only
+ * this surface holds: that it ended, and why; and that entry was refused on a
+ * pane that cannot take input. The label is the deck's own text and crosses
+ * `displayText` at the render seam like every other free-form string here.
+ */
+export function dictationStopped(label: string, why?: string): string {
+  return why === undefined
+    ? `Typing mode off. Nothing was sent to ${label}.`
+    : `Typing mode off — ${why}. Nothing was sent to ${label}.`;
+}
+export function dictationRefused(label: string, reason: string): string {
+  return `Typing mode not started for ${label}: ${reason}`;
+}
+
 /** The voice half of the runtime, which a runtime may not have at all. */
 type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "voiceCommands" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel" | "sendTerminalInput" | "desktopFeatures">;
 
@@ -356,6 +389,33 @@ const OPEN_DECK_COMMAND = "open_deck";
  * version of that collision this app has.
  */
 type Pending = { deckId: string; agentId: string; label: string };
+
+/**
+ * PRD #1260 — the pane on screen, as the host sees it: whose it is, what the
+ * deck calls that agent, and why its terminal cannot take input right now, if
+ * it cannot. The dictation mode targets this and ends when it changes.
+ */
+export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string };
+
+/**
+ * PRD #1260 — the voice panel's state, the one model #1260, #1261 and #1184
+ * share (see "Voice panel states and precedence" in the PRD).
+ *
+ * `idle` is one-shot commands, today's behaviour, with any pending one-shot
+ * send carried beside it as {@link Pending}. `dictating` types every utterance
+ * into one agent's prompt: the utterance is declared to Rust with the target,
+ * which answers it locally and never calls the Commands backend. `deck` is the
+ * selected deck at entry, because a deck change is one of the context changes
+ * that ends the mode. #1261's `AwaitingChoice` is the next variant.
+ *
+ * Only one state at a time, and ending one returns to `idle`, never to a state
+ * that was pre-empted.
+ */
+type VoicePanelState =
+  | { kind: "idle" }
+  | { kind: "dictating"; target: Pending; deck: string | undefined };
+
+const IDLE: VoicePanelState = { kind: "idle" };
 
 /**
  * What the surface is doing, which is not the same as whether voice is ON.
@@ -507,6 +567,22 @@ interface VoiceControlPanelProps {
    * works as a microphone; the rows naming these members simply cannot run.
    */
   channel?: VoicePanelChannel;
+  /**
+   * PRD #1260 — the agent pane on screen, or `undefined` for none. What the
+   * dictation mode enters for, and what ends it when it closes, changes agent
+   * or stops taking input.
+   */
+  pane?: VoicePane;
+  /** PRD #1260 — the selected deck, whose change ends the dictation mode. */
+  selectedDeckId?: string;
+  /**
+   * PRD #1260 — a D5 confirmation is open (held by the overview). It outranks
+   * the dictation mode: opening one ends the mode, and it does not resume.
+   */
+  confirmationOpen?: boolean;
+  /** PRD #1260 — told when the dictation mode starts or ends, so the host can
+   * mark the pane it is typing into. */
+  onDictationChange?: (target: Pending | undefined) => void;
 }
 
 /**
@@ -552,7 +628,7 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, selectedDeckId, confirmationOpen = false, onDictationChange }: VoiceControlPanelProps) {
   /* Held in a ref so the resolve and the overlay read the host's latest getter
      without either callback being rebuilt when the host re-renders. */
   const directoriesRef = useRef(directories);
@@ -599,7 +675,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   */
   const [undo, setUndo] = useState<{ run: () => void }>();
   /** Set by `reportRefused` while `resolveOne` is dispatching, so a refused
-      dispatch reports only its refusal (see there). */
+      dispatch reports only its refusal (see there). Also set where the
+      dispatch is answered in this surface's own words because only the
+      surface knows the state it changed — leaving the dictation mode, whose
+      target Rust never remembers (PRD #1260). */
   const refusedRef = useRef(false);
 
   /*
@@ -627,6 +706,28 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const [pending, setPendingState] = useState<Pending>();
   const pendingRef = useRef<Pending | undefined>(undefined);
   const setPending = useCallback((next?: Pending) => { pendingRef.current = next; setPendingState(next); }, []);
+  /**
+   * PRD #1260 — the panel state ({@link VoicePanelState}), mirrored into a ref
+   * for the reason `pending` is: the cycle reads it between its own awaits, to
+   * decide what to declare and whether a capped segment is typed or dropped.
+   */
+  const [panelState, setPanelStateState] = useState<VoicePanelState>(IDLE);
+  const panelStateRef = useRef<VoicePanelState>(IDLE);
+  const dictationChanged = useRef(onDictationChange);
+  dictationChanged.current = onDictationChange;
+  const setPanelState = useCallback((next: VoicePanelState) => {
+    const was = panelStateRef.current;
+    panelStateRef.current = next;
+    setPanelStateState(next);
+    if (was.kind === "dictating" || next.kind === "dictating") dictationChanged.current?.(next.kind === "dictating" ? next.target : undefined);
+  }, []);
+  /** The host's view of the pane and the deck, for the entry check. */
+  const paneRef = useRef(pane);
+  paneRef.current = pane;
+  const selectedDeckRef = useRef(selectedDeckId);
+  selectedDeckRef.current = selectedDeckId;
+  const confirmationRef = useRef(confirmationOpen);
+  confirmationRef.current = confirmationOpen;
   /** Seconds left before the typed text is sent, or `undefined` for no pending send. */
   const [sendIn, setSendIn] = useState<number>();
   const sendTimer = useRef<number | undefined>(undefined);
@@ -866,6 +967,45 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
      would otherwise keep running with nothing behind it. */
   useEffect(() => cancelPendingSend, [cancelPendingSend]);
 
+  /**
+   * PRD #1260 — leave the dictation mode, saying so and why. Sends nothing:
+   * whatever was typed stays in the prompt, visible and editable (#802 D6's
+   * "never auto-submits on exit", kept). Answers whether a mode was on.
+   */
+  const endDictation = useCallback((why?: string) => {
+    const mode = panelStateRef.current;
+    if (mode.kind !== "dictating") return false;
+    setPanelState(IDLE);
+    setProblem(dictationStopped(mode.target.label, why));
+    return true;
+  }, [setPanelState]);
+
+  /*
+    PRD #1260 — every context change ends the mode, and it never follows the
+    user: the pane closing or showing another agent (navigation, `Escape`,
+    `closeAgent`, a retired agent), the agent no longer taking input, the
+    selected deck changing, and a D5 confirmation opening, which outranks the
+    mode and does not give it back when answered. Each is something the host
+    already observes and hands down; the mode subscribes rather than polls.
+  */
+  const paneDeckId = pane?.deckId;
+  const paneAgentId = pane?.agentId;
+  const paneBlocked = pane?.inputBlocked;
+  useEffect(() => {
+    const mode = panelStateRef.current;
+    if (mode.kind !== "dictating") return;
+    if (confirmationOpen) endDictation("a confirmation opened");
+    else if (paneDeckId !== mode.target.deckId || paneAgentId !== mode.target.agentId) endDictation("the pane closed");
+    else if (paneBlocked !== undefined) endDictation(`the pane stopped taking input: ${paneBlocked}`);
+    else if (selectedDeckId !== mode.deck) endDictation("the deck changed");
+  }, [confirmationOpen, endDictation, paneAgentId, paneBlocked, paneDeckId, panelState, selectedDeckId]);
+
+  /* The host marks the pane it is typing into; a panel going away takes the
+     mode with it, so it must not leave the mark behind. */
+  useEffect(() => () => {
+    if (panelStateRef.current.kind === "dictating") dictationChanged.current?.(undefined);
+  }, []);
+
   /** Everything the last utterance left behind, cleared before the next one. */
   const forget = useCallback(() => {
     setProblem(undefined);
@@ -917,9 +1057,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const declaredNewAgent = newAgentRef.current?.();
     const declaredInstance = newAgentInstanceRef.current?.();
     const declaredEndpoints = endpointsRef.current?.();
+    /* PRD #1260 — while the dictation mode is on, its target rides the
+       declaration, and Rust answers the utterance with no Commands backend
+       call at all. */
+    const mode = panelStateRef.current;
+    const declaredDictation = mode.kind === "dictating" ? { deckId: mode.target.deckId, agentId: mode.target.agentId } : undefined;
     setPhase("resolving");
     try {
-      declareVoiceScreen?.(declared, declaredDirectories, declaredNewAgent, declaredEndpoints);
+      declareVoiceScreen?.(declared, declaredDirectories, declaredNewAgent, declaredEndpoints, declaredDictation);
       const answer = await resolveVoice(utterance);
       // Abandoned, or replaced by a later utterance. Say nothing and run
       // nothing: voice is off, or this belongs to the cycle that replaced it.
@@ -971,10 +1116,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * sentences. The cost is stated plainly: speech during those seconds is not
    * captured, which is why the report says what it is doing.
    */
-  const takeUtterance = useCallback(async () => {
+  const takeUtterance = useCallback(async (capped = false) => {
     if (!voiceStop) return;
     const ours = claim();
     forget();
+    /* PRD #1260 — a capped segment reaches here only while dictating, where it
+       is the user's own words rather than a runaway command. */
+    if (capped) setProblem(VOICE_CAP_TYPED);
     /* A new utterance has arrived, so whatever was about to be sent is no
        longer the whole of what the user said. The poll below cancels on SPEECH,
        which covers the sentence still being spoken; this covers the gap between
@@ -1054,7 +1202,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     */
     if (pendingRef.current && status.speech && sendTimer.current !== undefined) cancelPendingSend();
     if (status.capped) {
-      await discardCapped();
+      /* PRD #1260 — while dictating, a capped segment is typed rather than
+         thrown away: a dictated paragraph is not a one-to-four-word command. */
+      if (panelStateRef.current.kind === "dictating") await takeUtterance(true);
+      else await discardCapped();
       return;
     }
     if (status.state === "done") await takeUtterance();
@@ -1185,6 +1336,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        after, so a pending send cannot fire during it. */
     cancelPendingSend();
     setPending(undefined);
+    /* PRD #1260 — voice off ends the dictation mode too, sending nothing. The
+       report is the release's own, so the mode ends without a sentence. */
+    setPanelState(IDLE);
     /* The webview half of the same release. `voiceCancel` frees the DEVICE;
        this frees the pipeline behind it, which the device has no say over — a
        transcription or a resolution already handed to a backend arrives
@@ -1222,7 +1376,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        handler routes `unreleased` here), and without this the button would fall
        back to `Voice…` after a release that actually succeeded. */
     setKnown(true);
-  }, [cancelPendingSend, claim, releasedAfterRefusal, setOn, setPending, setPhase, voiceCancel]);
+  }, [cancelPendingSend, claim, releasedAfterRefusal, setOn, setPanelState, setPending, setPhase, voiceCancel]);
 
   /**
    * What the discovery overlay is showing, or `undefined` for closed
@@ -1300,6 +1454,30 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * into and has not is the silent failure it must not have.
    */
   const typeIntoAgent = useCallback((target: VoiceDispatchTarget) => {
+    const mode = panelStateRef.current;
+    /* PRD #1260 — while dictating, the words go to the mode's own target and
+       NO countdown is armed: in a mode the user is, by definition, going to
+       say more, and sending is "send it" or their own Enter. */
+    if (mode.kind === "dictating") {
+      const aim = mode.target;
+      if (aim.deckId !== target.deckId || aim.agentId !== target.agentId) {
+        endDictation("the pane changed");
+        return;
+      }
+      const typed = dictationText(target.text ?? "");
+      if (typed === "") return;
+      void sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed).then(
+        () => undefined,
+        /* A terminal that refuses once will refuse every utterance after it,
+           so the mode ends with the refusal rather than repeating it. */
+        (cause) => {
+          const now = panelStateRef.current;
+          if (now.kind === "dictating" && now.target.deckId === aim.deckId && now.target.agentId === aim.agentId) setPanelState(IDLE);
+          setProblem(sentenceOf(cause));
+        },
+      );
+      return;
+    }
     const aim: Pending = { deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId };
     const typed = dictationText(target.text ?? "");
     /* Nothing to type. Rust refuses an empty remainder before it ever becomes a
@@ -1312,7 +1490,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       () => { setPending(aim); armSend(aim); },
       (cause) => { setPending(undefined); setProblem(sentenceOf(cause)); },
     );
-  }, [armSend, cancelPendingSend, sendTerminalInput, setPending]);
+  }, [armSend, cancelPendingSend, endDictation, sendTerminalInput, setPanelState, setPending]);
 
   /**
    * Press Enter in the open agent's prompt, because the user said to.
@@ -1335,6 +1513,46 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     refusedRef.current = true;
     setProblem(reason);
   }, []);
+  /**
+   * PRD #1260 — enter the dictation mode for the pane on screen.
+   *
+   * **Refused on a pane that cannot take input**, with the pane's own reason:
+   * the residual one-shot dictation accepts — nothing checks before typing —
+   * is not acceptable for a mode, where the failure would repeat on every
+   * utterance. Refused through `reportRefused`, so the report renders only
+   * the refusal and never "Typing to …" beside it.
+   *
+   * Entering cancels a pending one-shot send rather than sending it, and the
+   * mode never arms one of its own.
+   */
+  const startDictation = useCallback((target: VoiceDispatchTarget) => {
+    const shown = paneRef.current;
+    const label = target.agentLabel ?? shown?.label ?? target.agentId;
+    if (!shown || shown.deckId !== target.deckId || shown.agentId !== target.agentId) {
+      reportRefused(dictationRefused(label, "its pane is not the one on screen."));
+      return;
+    }
+    if (shown.inputBlocked !== undefined) {
+      reportRefused(dictationRefused(label, shown.inputBlocked));
+      return;
+    }
+    if (confirmationRef.current) {
+      reportRefused(dictationRefused(label, "a confirmation is open — answer it first."));
+      return;
+    }
+    cancelPendingSend();
+    setPending(undefined);
+    setPanelState({ kind: "dictating", target: { deckId: target.deckId, agentId: target.agentId, label }, deck: selectedDeckRef.current });
+  }, [cancelPendingSend, reportRefused, setPanelState, setPending]);
+  /**
+   * PRD #1260 — leave the dictation mode by voice. Answered in this surface's
+   * own words (the `refusedRef` path), because only the surface knows whose
+   * prompt it was typing into — or that it was typing into none.
+   */
+  const stopDictation = useCallback(() => {
+    refusedRef.current = true;
+    if (!endDictation()) setProblem(VOICE_NOT_DICTATING);
+  }, [endDictation]);
 
   /*
     PRD #802 — publish the members only this surface can serve, so a row naming
@@ -1361,6 +1579,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       stopVoice,
       typeIntoAgent,
       submitAgentPrompt,
+      startDictation,
+      stopDictation,
       reportNothingToClose,
       reportRefused,
       ...(voiceCommands ? { showVoiceCommands } : {}),
@@ -1389,8 +1609,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     between utterances too, which is right: it is a label for an empty row
     rather than a first-run tutorial.
   */
-  const emptyState = indicator === "on" && pending === undefined && problem === undefined && capture === undefined && result === undefined;
-  const reporting = note !== undefined || pending !== undefined || problem !== undefined || capture !== undefined || result !== undefined;
+  /* PRD #1260 — whose prompt the dictation mode is typing into, if it is on. */
+  const dictating = panelState.kind === "dictating" ? panelState.target : undefined;
+  const dictatingLabel = dictating ? displayText(dictating.label, DISPLAY_LIMITS.name) : undefined;
+  const emptyState = indicator === "on" && dictating === undefined && pending === undefined && problem === undefined && capture === undefined && result === undefined;
+  const reporting = note !== undefined || dictating !== undefined || pending !== undefined || problem !== undefined || capture !== undefined || result !== undefined;
 
   return (
     /*
@@ -1436,6 +1659,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
            showed one without the other would be on for one of them only. Four
            values rather than two — see {@link VoiceIndicator}. */
         aria-pressed={INDICATOR_PRESSED[indicator]}
+        /* PRD #1260 — the mode is part of the control's state, so it is part
+           of its announced name while it is on, beside the pressed state. */
+        aria-label={dictatingLabel === undefined ? undefined : `${INDICATOR_LABEL[indicator]} — typing to ${dictatingLabel}`}
         /* Something is in flight and the control is not idle at the state it is
            showing. It is the announced half of the same honesty the word
            carries, and of the click below being serialised rather than racing. */
@@ -1469,6 +1695,22 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         {indicator === "off" ? <MicOff size={16} /> : <Mic size={16} />}
         <span>{INDICATOR_LABEL[indicator]}</span>
       </button>
+      {/*
+        PRD #1260 — the dictation mode's non-voice exit, shown only while the
+        mode is on. It leaves voice listening and sends nothing.
+
+        Inside the row, so it carries the row's `VOICE_PEER_PROPS` exemption
+        exactly as the Voice button does: clickable and tabbable behind the
+        agent pane's modal fence, which is the point — a misheard "type off" is
+        exactly when a user reaches for it. The keyboard route to it is Tab;
+        no shortcut is bound, because on the agent screen every key belongs to
+        the agent's terminal.
+      */}
+      {dictating && (
+        <button type="button" className="button secondary compact voice-stop-typing" data-testid="voice-stop-typing" onClick={() => { endDictation(); }}>
+          <SquarePen size={13} /> Stop typing
+        </button>
+      )}
       {/*
         The report is the row's right-hand cell, beside the button rather than in
         a dialog — which is what makes continuous voice possible at all: a dialog
@@ -1507,6 +1749,19 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
             {/* Not through `displayText`: this is a literal in this file, not
                 free-form text from a microphone, a model or a daemon. */}
             {emptyState && <p className="voice-hint" data-testid="voice-hint">{VOICE_EMPTY_STATE}</p>}
+            {/*
+              PRD #1260 — the dictation mode, named for as long as it is on,
+              with the reserved phrases that stay live in it. The only other
+              wording this file builds around a value from elsewhere, for the
+              countdown's reason below: nothing Rust-side remembers the mode.
+            */}
+            {dictatingLabel !== undefined && (
+              <p className="voice-dictation" data-testid="voice-dictating">
+                {"Typing to "}
+                {dictatingLabel}
+                {". Say “type off” to stop, “send it” to send."}
+              </p>
+            )}
             {/*
               PRD #802 D6 — where the microphone is aimed, and the countdown.
 

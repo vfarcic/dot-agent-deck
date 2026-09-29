@@ -502,6 +502,8 @@ pub(crate) mod tests {
                 "voice_off".to_string(),
                 "list_commands".to_string(),
                 "dictate_to_agent".to_string(),
+                "dictation_on".to_string(),
+                "dictation_off".to_string(),
                 "submit_prompt".to_string(),
                 "open_new_agent".to_string(),
                 "open_dir".to_string(),

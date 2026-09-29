@@ -655,6 +655,8 @@ mod tests {
                 "voice_off",
                 "list_commands",
                 "dictate_to_agent",
+                "dictation_on",
+                "dictation_off",
                 "submit_prompt",
                 "open_new_agent",
                 "open_dir",

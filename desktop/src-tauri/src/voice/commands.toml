@@ -83,7 +83,9 @@
 #                    For a row whose action cannot be taken back, where an
 #                    unrelated occurrence of one ordinary word ("tell it to put
 #                    END after the report") must not be enough. Same own-words
-#                    rule. Exactly one row uses it, `submit_prompt`
+#                    rule. Four rows use it — `submit_prompt`,
+#                    `discard_new_agent`, and the dictation mode's pair, whose
+#                    switch changes how every later utterance is treated
 #                    (`voice_table_whole_utterance_rows_are_the_deliberate_set`);
 #                    on an ordinary row it would make natural speech fail.
 #   heard_as_whole_while
@@ -544,6 +546,55 @@ heard_as    = ["type", "write", "say", "dictate", "tell", "ask", "want", "prompt
   [[commands.params]]
   name = "prefix"
   kind = "spoken_prefix"
+
+# PRD #1260 — the dictation MODE, entered and left by whole utterances.
+#
+# **A mode again, and the two failures that removed the first one answered
+# rather than reintroduced.** The pair is `heard_as_whole`, so only an
+# utterance that IS one of these phrases switches anything — "we should stop
+# typing the logs" is typed, never an exit, so nothing is truncated
+# mid-sentence. And a missed exit lands visibly and UNSENT in the prompt,
+# because the mode arms no countdown: sending is `submit_prompt` or the user's
+# own Enter.
+#
+# **Answered locally in both directions, and never by the model while the mode
+# is on.** `voice::dictation::DICTATION_ON_PHRASES` / `DICTATION_OFF_PHRASES`
+# are matched ahead of the `type` opener (which would otherwise type the word
+# "on"), and while the mode is on every utterance is classified in Rust — the
+# off phrases, "voice off", a submit, or typed whole — with no backend call.
+# These rows are what the discovery overlay lists and what the model answers
+# for the same words in `Idle`; linkage-check rule 14 keeps each list named in
+# its row's description.
+#
+# No target param: the mode targets the pane on screen, and ends when that
+# pane does (the panel owns the state — `VoiceControlPanel.tsx`).
+[[commands]]
+id          = "dictation_on"
+description = """Start typing mode for the open agent: from now on everything the user says is
+typed into that agent's prompt until they stop it. Use only when the WHOLE utterance is "type on",
+"typing on", "start typing", "dictation on", "start dictation" or "keep typing". Nothing is sent
+while typing — sending is `submit_prompt`. A request to type particular words is
+`dictate_to_agent`, not this."""
+invoke      = "startDictation"
+screens     = ["agent"]
+unavailable_hint = "typing mode needs an agent's pane open — open one first"
+report      = "Typing to the agent."
+asks_to     = "start typing to the agent"
+try_saying  = "type on"
+heard_as_whole = ["type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing"]
+
+[[commands]]
+id          = "dictation_off"
+description = """Stop typing mode, so utterances are commands again. Use only when the WHOLE
+utterance is "type off", "typing off", "stop typing", "dictation off", "stop dictation" or
+"done typing". It sends nothing: whatever was typed stays in the agent's prompt."""
+invoke      = "stopDictation"
+screens     = ["agent"]
+unavailable_hint = "typing mode is only on in an agent's pane"
+report      = "Stopped typing."
+asks_to     = "stop typing to the agent"
+try_saying  = "type off"
+heard_as_whole = ["type off", "typing off", "stop typing", "dictation off", "stop dictation", "done typing"]
 
 # PRD #802 D6 — press Enter in the open agent's prompt.
 #

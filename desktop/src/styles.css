@@ -1384,6 +1384,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    what the browser tier measures. Between `.reader-overlay` (80) and
    `.dialog-backdrop` (100): a modal dialog still belongs on top of a pane. */
 .agent-pane-overlay { position: fixed; z-index: 90; inset: 0; margin: 0; display: flex; padding: 14px 14px calc(14px + var(--voice-reserved)); background: rgb(var(--scrim-rgb) / .74); }
+/* PRD #1260 — the dictation mode, marked on the pane it is typing into so it is
+   visible where the user is looking. Pinned to the pane's top edge, over the
+   scrim's padding rather than over the tile's own header. */
+.agent-pane-dictating { position: absolute; z-index: 1; top: 0; left: 50%; transform: translateX(-50%); max-width: calc(100% - 28px); margin: 0; padding: 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 0 0 7px 7px; color: var(--on-accent); background: var(--amber-ink); font-size: 11px; font-weight: 650; line-height: 14px; }
 /* Every rule below is keyed off `data-presentation`, the seam M1 put on the
    tile, and every one of them exists to outrank something. The compound
    `.agent-tile[data-presentation="overlay"]` is (0,2,0) rather than the (0,1,0)
@@ -1555,3 +1559,6 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    name. `--amber` rather than the muted ink the hint uses, because this is the
    one line in the row that says something is ABOUT to happen. */
 .voice-dictation { flex: 0 1 auto; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--amber-ink); font-size: 11px; font-weight: 600; }
+/* PRD #1260 — the dictation mode's non-voice exit, beside the Voice button and
+   never squeezed out by a long report. */
+.voice-stop-typing { flex: 0 0 auto; }

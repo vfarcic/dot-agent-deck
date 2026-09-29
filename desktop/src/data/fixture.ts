@@ -1157,6 +1157,26 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Typed.",
   },
   {
+    // PRD #1260 — the dictation mode's switches, whole-utterance equality like
+    // the real fast path (`voice::dictation::DICTATION_ON_PHRASES` and
+    // `DICTATION_OFF_PHRASES`), and ahead of the opener row in effect because
+    // the matcher tries equality first.
+    phrases: ["type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing"],
+    action: "dictation_on",
+    invoke: "startDictation",
+    screens: ["agent"],
+    unavailableHint: "typing mode needs an agent's pane open — open one first",
+    report: "Typing to the agent.",
+  },
+  {
+    phrases: ["type off", "typing off", "stop typing", "dictation off", "stop dictation", "done typing"],
+    action: "dictation_off",
+    invoke: "stopDictation",
+    screens: ["agent"],
+    unavailableHint: "typing mode is only on in an agent's pane",
+    report: "Stopped typing.",
+  },
+  {
     // Whole-utterance equality, which is what the phrase matcher already is —
     // the real fast path draws the same line, and for the reason its own
     // constant documents at length: a trailing rule would submit "the meeting
@@ -1214,9 +1234,30 @@ function fixtureHeard(transcript: string, situation: string): string {
  * would be the preview inventing a measurement, which is the same fabrication
  * `resolve_ms: None` exists to refuse on the Rust side.
  */
-export function resolveFixtureVoice(utterance: string, screen: VoiceScreen): VoiceResultDto {
+export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dictating = false): VoiceResultDto {
   const spoken = utterance.trim().toLowerCase();
   const stub = { resolveMs: null, backend: "stub" } as const;
+  /* PRD #1260 — while the dictation mode is on the real pipeline asks no model
+     and matches only the reserved whole utterances, typing everything else
+     whole. The same rule here, over this module's own rows. */
+  if (dictating) {
+    const reserved = FIXTURE_VOICE_COMMANDS.find((candidate) =>
+      ["voice_off", "dictation_off", "submit_prompt"].includes(candidate.action) && candidate.phrases.includes(spoken));
+    const text = utterance.trim();
+    return {
+      ...stub,
+      outcome: reserved
+        ? { kind: "dispatch", transcript: utterance, action: reserved.action, invoke: reserved.invoke, params: [], sentence: reserved.report }
+        : {
+          kind: "dispatch",
+          transcript: utterance,
+          action: "dictate_to_agent",
+          invoke: "dictateToAgent",
+          params: [{ name: "prefix", kind: "spoken_prefix", spoken: "", value: text, label: text }],
+          sentence: `Typed: “${text}”.`,
+        },
+    };
+  }
   const command = FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.phrases.includes(spoken))
     ?? FIXTURE_VOICE_COMMANDS.find((candidate) => (candidate.openers ?? []).some((opener) => fixtureOpening(utterance, opener) !== undefined));
   if (!command) {

@@ -738,6 +738,18 @@ export interface VoiceDeckChoiceDto {
 }
 
 /**
+ * PRD #1260 — the agent the voice panel is in the dictation mode for, declared
+ * with each utterance while the mode is on and absent otherwise —
+ * `voice::VoiceDictationTarget`. Its presence is the whole signal: Rust then
+ * answers the utterance locally (the reserved phrases, or the words typed
+ * whole) and calls no Commands backend.
+ */
+export interface VoiceDictationTargetDto {
+  deckId: string;
+  agentId: string;
+}
+
+/**
  * What the New agent dialog shows BESIDES its browser, declared with an
  * utterance while the dialog is open (PRD #1223) — `voice::VoiceNewAgent`.
  *
@@ -1569,9 +1581,12 @@ export interface DeckBridge {
    * section the Deck selector is rendering. `useDesktopSettings.save` applies
    * an edit at once and writes it behind, so this — not `desktop.toml` — is
    * the list "switch deck to …" has to resolve against, or a deck the selector
-   * already shows is refused until the write lands.
+   * already shows is refused until the write lands. `dictation` is the sixth
+   * (PRD #1260): the agent the panel is typing to while the dictation mode is
+   * on ({@link VoiceDictationTargetDto}), which keeps that utterance off the
+   * Commands backend entirely.
    */
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto): void;
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void;
   /**
    * Take one utterance — transcribed from the microphone — to an outcome
    * carrying the sentence to show (PRD #802 M6).
@@ -2572,10 +2587,14 @@ class FixtureDeckBridge implements DeckBridge {
    */
   private voiceScreen: VoiceScreen = "deck";
 
+  /** PRD #1260 — the dictation mode declared with that screen, if it is on. */
+  private voiceDictation: VoiceDictationTargetDto | undefined;
+
   /* The preview's vocabulary has no directory rows, so a declared browser is
      accepted and has nothing to feed. */
-  declareVoiceScreen(screen: VoiceScreen): void {
+  declareVoiceScreen(screen: VoiceScreen, _directories?: VoiceDirectoriesDto, _newAgent?: VoiceNewAgentDto, _deckStep?: VoiceDeckChoiceDto[], _endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void {
     this.voiceScreen = screen;
+    this.voiceDictation = dictation;
   }
 
   /**
@@ -2588,7 +2607,7 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     await Promise.resolve();
-    return resolveFixtureVoice(utterance, this.voiceScreen);
+    return resolveFixtureVoice(utterance, this.voiceScreen, this.voiceDictation !== undefined);
   }
 
   /**
@@ -4109,18 +4128,21 @@ export class TauriDeckBridge implements DeckBridge {
   private voiceDeckStep: VoiceDeckChoiceDto[] | undefined;
   /** PRD #1195 — the Deck selector's section as it was rendered. */
   private voiceEndpoints: EndpointSettingsDto | undefined;
+  /** PRD #1260 — the dictation mode's target, while the mode is on. */
+  private voiceDictation: VoiceDictationTargetDto | undefined;
 
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto): void {
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void {
     this.voiceScreen = screen;
     this.voiceDirectories = directories;
     this.voiceNewAgent = newAgent;
     this.voiceDeckStep = deckStep;
     this.voiceEndpoints = endpoints;
+    this.voiceDictation = dictation;
   }
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     const invoke = await this.getInvoke();
-    return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null }));
+    return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null, dictation: this.voiceDictation ?? null }));
   }
 
   /**

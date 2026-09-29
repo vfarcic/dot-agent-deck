@@ -4,7 +4,7 @@ import { enterDeck } from "./support/overview";
 const SETTINGS_KEY = "dot-agent-deck.desktop-settings";
 
 /** Load the browser fixture with its speech backend enabled and canned utterance ready. */
-async function openWithSpeech(page: Page) {
+async function openWithSpeech(page: Page, path = "/?fixture=1&state=connected") {
   await page.addInitScript((key) => {
     window.localStorage.setItem(key, JSON.stringify({
       version: 1,
@@ -13,7 +13,7 @@ async function openWithSpeech(page: Page) {
       zoom: { level: 1 },
     }));
   }, SETTINGS_KEY);
-  await page.goto("/?fixture=1&state=connected");
+  await page.goto(path);
   await enterDeck(page);
 }
 
@@ -150,6 +150,21 @@ test.describe("the voice row is reserved space", () => {
     // And the control in it is reachable, not merely visible: this is the
     // `VOICE_PEER_PROPS` exemption and the z-order, asserted together.
     await voiceButton(page).click({ trial: true });
+  });
+
+  /** Scenario: open a writable agent's modal pane and enter dictation with the
+   * browser fixture's spoken script. Stop typing stays in the tab order and
+   * passes the browser's real click hit test behind that modal. */
+  test("Stop typing is clickable and tabbable behind the agent pane", async ({ page }) => {
+    await openWithSpeech(page, "/?fixture=1&state=crowded&voice=type%20on");
+    await page.getByRole("button", { name: "Open coder agent" }).click();
+    await voiceButton(page).click();
+    const stop = page.getByRole("button", { name: "Stop typing" });
+    await expect(stop).toBeVisible();
+    await expect.poll(() => stop.evaluate((button) => button.closest("[inert]") === null && (button as HTMLButtonElement).tabIndex >= 0)).toBe(true);
+    await stop.click({ trial: true });
+    await stop.focus();
+    await expect(stop).toBeFocused();
   });
 
   /**

@@ -1240,6 +1240,8 @@ mod tests {
                 // targeting rule is "the pane the user is looking at", so with
                 // no pane open there is no one agent to mean.
                 ("dictate_to_agent", "dictateToAgent", vec!["agent"]),
+                ("dictation_on", "startDictation", vec!["agent"]),
+                ("dictation_off", "stopDictation", vec!["agent"]),
                 ("submit_prompt", "submitAgentPrompt", vec!["agent"]),
                 // `overview` alone: the dialog lives there (PRD #1223).
                 ("open_new_agent", "openNewAgent", vec!["overview"]),
@@ -1831,8 +1833,18 @@ mod tests {
             .map(|row| row.id.as_str())
             .collect();
         // `discard_new_agent` (#1247) for `submit_prompt`'s reason: it cannot
-        // be taken back, and "discard" is an ordinary word.
-        assert_eq!(whole, vec!["submit_prompt", "discard_new_agent"]);
+        // be taken back, and "discard" is an ordinary word. The dictation
+        // mode's pair (PRD #1260) because a switch changes how every later
+        // utterance is treated, so it must not ground on words said in passing.
+        assert_eq!(
+            whole,
+            vec![
+                "dictation_on",
+                "dictation_off",
+                "submit_prompt",
+                "discard_new_agent"
+            ]
+        );
     }
 
     /// The rows whose grounding changes with a declared context (PRD #1223,
@@ -2236,9 +2248,55 @@ mod tests {
                 "voice_off",
                 "list_commands",
                 "dictate_to_agent",
+                "dictation_on",
+                "dictation_off",
                 "submit_prompt"
             ]
         );
+    }
+
+    /// Scenario: each mode switch is an agent-pane-only command whose phrases
+    /// ground the whole utterance. A word mentioned inside a prompt cannot
+    /// switch the mode through the Commands path.
+    #[test]
+    fn voice_table_dictation_switch_rows_are_agent_only_and_whole_utterance_grounded() {
+        let table = super::table();
+        for (id, invoke, phrases) in [
+            (
+                "dictation_on",
+                "startDictation",
+                [
+                    "type on",
+                    "typing on",
+                    "start typing",
+                    "dictation on",
+                    "start dictation",
+                    "keep typing",
+                ],
+            ),
+            (
+                "dictation_off",
+                "stopDictation",
+                [
+                    "type off",
+                    "typing off",
+                    "stop typing",
+                    "dictation off",
+                    "stop dictation",
+                    "done typing",
+                ],
+            ),
+        ] {
+            let row = table.row(id).unwrap_or_else(|| panic!("missing {id} row"));
+            assert_eq!(row.invoke, invoke, "{id}");
+            assert_eq!(row.screens, vec![Screen::Agent], "{id}");
+            assert!(row.params.is_empty(), "{id} takes no params");
+            assert_eq!(
+                row.grounding,
+                ActionGrounding::HeardAsWhole(phrases.iter().map(|s| s.to_string()).collect()),
+                "{id}"
+            );
+        }
     }
 
     #[test]

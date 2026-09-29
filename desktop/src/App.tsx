@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -40,7 +40,7 @@ import { HandoffRail } from "./components/HandoffRail";
 import { SelectDeckNote } from "./components/SelectDeckNote";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
-import { VoiceControlPanel } from "./components/VoiceControlPanel";
+import { VoiceControlPanel, type VoicePane } from "./components/VoiceControlPanel";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
 import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
@@ -56,7 +56,7 @@ import { useZoom } from "./hooks/useZoom";
 import { useShellOverlays, type RailScreen, type ScreenOverlays } from "./hooks/useShellOverlays";
 import { agentKey } from "./lib/agentKey";
 import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
-import { unreachableDeckTerminalState } from "./lib/terminalInput";
+import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopOrchestrationPlatformIssue } from "./lib/platform";
 import { selectsAllDecks } from "./lib/endpoints";
@@ -181,6 +181,14 @@ export default function App() {
  * it names the screen to keep mounted underneath and renders the pane over it,
  * which is why the switch below reads `base` rather than `view.kind`.
  */
+/**
+ * PRD #1260 — the agent the voice panel's dictation mode is typing into, for
+ * the pane to mark. Provided by {@link DeckShell} only while the mode is on
+ * AND aimed at the pane on screen, so {@link AgentPaneFrame} can compare the
+ * agent id alone: at most one pane is open, and it is that view's.
+ */
+const PaneDictation = createContext<{ agentId: string; label: string } | undefined>(undefined);
+
 export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = { kind: "overview" } }: { runtime: DeckRuntimeState; orchestrationPlatformIssue?: string; initialView?: DeckView }) {
   const [requestedView, setView] = useState<DeckView>(initialView);
   /**
@@ -563,6 +571,39 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (paneAgentRetired) closeAgent();
   }, [paneAgentRetired, closeAgent]);
   /**
+   * PRD #1260 — the pane on screen as the voice panel's dictation mode sees
+   * it: whose it is, what the deck calls it, and why it cannot take input if
+   * it cannot. `undefined` whenever no pane is RENDERED, which is the same
+   * condition each screen draws it on — so a pane that went away for any
+   * reason ends the mode, and the mode never follows the user to another.
+   *
+   * Writability is what this app already holds about the pane's agent
+   * (`terminalInputState`: its lease, its status, the last delivery verdict),
+   * plus the deck having a live link at all; nothing is sent to find out.
+   */
+  const paneShownAgent = base === "overview" ? (paneDeck ? paneAgentShown : undefined) : paneAgent;
+  const paneInput = agentView && paneShownAgent ? terminalInputState(paneShownAgent, runtime.terminalInputResults?.[agentKey(agentView.deckId, agentView.agentId)]) : undefined;
+  const voicePane = useMemo<VoicePane | undefined>(() => (agentView && paneShownAgent && paneInput
+    ? {
+      deckId: agentView.deckId,
+      agentId: agentView.agentId,
+      label: paneShownAgent.displayName,
+      inputBlocked: paneInput.readOnly
+        ? (paneInput.notice ?? "its terminal cannot take input.")
+        : (!paneDeckAttachable || heldPaneAgent ? "its deck is not answering." : undefined),
+    }
+    : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent]);
+  /** PRD #1260 — a D5 confirmation open on the overview, which outranks dictation. */
+  // voice-registry-exempt: a mirror of the overview's own confirmation state, written only by its report so the voice panel can see it; it opens nothing
+  const [confirmationOpen, setConfirmationOpen] = useState(false);
+  /** PRD #1260 — whom the voice panel's dictation mode is typing to, for the pane's mark. */
+  // voice-registry-exempt: a mirror of the voice panel's own mode, written only by its report so the pane can mark it; the mode itself is entered through `VOICE_ACTIONS.startDictation`
+  const [dictating, setDictating] = useState<{ deckId: string; agentId: string; label: string }>();
+  const paneDictation = useMemo(
+    () => (dictating && agentView && dictating.deckId === agentView.deckId && dictating.agentId === agentView.agentId ? { agentId: dictating.agentId, label: dictating.label } : undefined),
+    [agentView, dictating],
+  );
+  /**
    * PRD #802 M6 — run one resolved voice command, and answer with how to undo it.
    *
    * # It dispatches through the registry, and that is the design's central rule
@@ -747,7 +788,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     ? (
       <>
         {/* voice-registry-exempt: the overview's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS` */}
-        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} />
+        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} onConfirmationChange={setConfirmationOpen} />
         {/*
           The overview mounts no terminal of its own (PRD #745's commitment), so
           there is no tile here to promote and the pane is a sibling of the
@@ -801,13 +842,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     or re-created by a navigation.
   */
   return (
-    <>
+    <PaneDictation.Provider value={paneDictation}>
       {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
       <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
       {screenNode}
-      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} />
+      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} selectedDeckId={selectedDeckId} confirmationOpen={base === "overview" && confirmationOpen} onDictationChange={setDictating} />
       <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
-    </>
+    </PaneDictation.Provider>
   );
 }
 
@@ -974,6 +1015,10 @@ function AgentPaneFrame({ open, onOpen, onClose, ...tile }: Omit<AgentTileProps,
     siblings rather than marking one subtree.
   */
   const paneRef = useInertBackground<HTMLDivElement>(open);
+  /* PRD #1260 — the mode marked where the user is looking, not only in the
+     voice row at the bottom of the window. */
+  const dictation = useContext(PaneDictation);
+  const dictatingHere = open && dictation !== undefined && dictation.agentId === tile.agent.id;
   return (
     <div
       ref={paneRef}
@@ -987,6 +1032,12 @@ function AgentPaneFrame({ open, onOpen, onClose, ...tile }: Omit<AgentTileProps,
          proceeds into the pane's own controls. */
       tabIndex={open ? -1 : undefined}
     >
+      {dictatingHere && (
+        <p className="agent-pane-dictating" data-testid="agent-pane-dictating">
+          {"Typing to "}
+          {displayText(dictation.label, DISPLAY_LIMITS.name)}
+        </p>
+      )}
       <AgentTile
         {...tile}
         presentation={open ? "overlay" : "tile"}

@@ -2948,6 +2948,19 @@ fn validate_voice_new_agent(new_agent: &voice::VoiceNewAgent) -> Result<(), Stri
     Ok(())
 }
 
+/// PRD #1260 — the dictation target a webview may declare: two ids, each
+/// bounded like the deck id a form declares, and neither empty, since a mode
+/// aimed at nobody is not a mode.
+fn validate_voice_dictation(dictation: &voice::VoiceDictationTarget) -> Result<(), String> {
+    let bad = |value: &str| value.is_empty() || value.len() > MAX_VOICE_DECK_ID_BYTES;
+    if bad(&dictation.deck_id) || bad(&dictation.agent_id) {
+        return Err(
+            "the typing target sent with that command names no agent a pane shows".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// The bounds on the deck step a webview may declare (PRD #1223), checked by
 /// [`validate_voice_deck_step`] for [`validate_voice_directories`]' reason.
 ///
@@ -3061,6 +3074,14 @@ fn selector_rows_beyond_voice(
 /// an IPC argument between this app's own webview and its own Rust half, in
 /// one binary, and never reaches the daemon.
 ///
+/// **`dictation` is the sixth** (PRD #1260): the agent the voice panel is in
+/// the dictation mode for, present only while the mode is on. Its presence
+/// makes the utterance local — classified against the reserved phrases and
+/// otherwise typed, with no Commands backend call
+/// ([`voice::handle_utterance_with_dictation`]). Bounded like the deck id above
+/// and trusted no further: the typing itself goes through the webview's own
+/// `sendTerminalInput` to the pane on screen, never to whatever this names.
+///
 /// # One `ListAgents` per utterance
 ///
 /// [`get_snapshot`] fetches rather than reading a cache, which is one daemon
@@ -3088,6 +3109,7 @@ async fn desktop_voice_resolve(
     new_agent: Option<voice::VoiceNewAgent>,
     deck_step: Option<Vec<voice::VoiceDeckChoice>>,
     endpoints: Option<crate::settings::EndpointSettings>,
+    dictation: Option<voice::VoiceDictationTarget>,
 ) -> Result<voice::VoiceResult, String> {
     ensure_main_webview(&webview)?;
     if utterance.len() > MAX_UTTERANCE_BYTES {
@@ -3103,6 +3125,9 @@ async fn desktop_voice_resolve(
     }
     if let Some(deck_step) = &deck_step {
         validate_voice_deck_step(deck_step)?;
+    }
+    if let Some(dictation) = &dictation {
+        validate_voice_dictation(dictation)?;
     }
     // Read per call rather than cached, for `voice_speech_settings`'s reason: a
     // user who changes the backend, the endpoint or the model uses it on the
@@ -3122,6 +3147,7 @@ async fn desktop_voice_resolve(
             new_agent: new_agent.as_ref(),
             deck_step: deck_step.as_deref(),
             endpoints: endpoints.as_ref(),
+            dictation: dictation.as_ref(),
         },
         voice::Transcript::new(utterance),
         settings.labels,
@@ -3139,12 +3165,13 @@ struct VoiceDeclaration<'a> {
     new_agent: Option<&'a voice::VoiceNewAgent>,
     deck_step: Option<&'a [voice::VoiceDeckChoice]>,
     endpoints: Option<&'a crate::settings::EndpointSettings>,
+    dictation: Option<&'a voice::VoiceDictationTarget>,
 }
 
 /// [`desktop_voice_resolve`] once the live state is read: the decks voice
 /// resolves against, the utterance's outcome, and a switch addressed to the
 /// Deck selector's token. Separate so it runs without a webview or a daemon.
-// Eight: each piece `desktop_voice_resolve` reads or is sent, as `handle_utterance_with` takes them.
+// Eight: each piece `desktop_voice_resolve` reads or is sent, as `handle_utterance_with_dictation` takes them.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_declared_utterance(
     resolver: &dyn voice::IntentResolver,
@@ -3162,7 +3189,7 @@ async fn resolve_declared_utterance(
     // lags it by a queued write — rather than only the ones the app observes,
     // which under a single-deck selection is the one deck already shown.
     let selections = selector_voice_decks(declared.endpoints, &mut decks, declared.deck_step);
-    let mut result = voice::handle_utterance_with(
+    let mut result = voice::handle_utterance_with_dictation(
         resolver,
         voice::table(),
         screen,
@@ -3170,6 +3197,7 @@ async fn resolve_declared_utterance(
         &decks,
         declared.directories,
         declared.new_agent,
+        declared.dictation,
         transcript,
         labels,
         show_deck,
@@ -5210,6 +5238,7 @@ mod tests {
                 new_agent: None,
                 deck_step: None,
                 endpoints: Some(endpoints),
+                dictation: None,
             },
             voice::Transcript::new(said),
             crate::settings::LabelSharing::Shared,

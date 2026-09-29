@@ -351,6 +351,8 @@ mod tests {
                 "voice_off".to_string(),
                 "list_commands".to_string(),
                 "dictate_to_agent".to_string(),
+                "dictation_on".to_string(),
+                "dictation_off".to_string(),
                 "submit_prompt".to_string(),
                 "open_new_agent".to_string(),
                 "open_dir".to_string(),
@@ -422,6 +424,8 @@ mod tests {
                 "voice_off",
                 "list_commands",
                 "dictate_to_agent",
+                "dictation_on",
+                "dictation_off",
                 "submit_prompt",
                 "open_new_agent",
                 "open_dir",
@@ -588,6 +592,8 @@ mod tests {
                 // The dictation pair is `agent`-only: with no pane on screen
                 // there is no one agent whose prompt "type this" could mean.
                 ("dictate_to_agent".to_string(), false),
+                ("dictation_on".to_string(), false),
+                ("dictation_off".to_string(), false),
                 ("submit_prompt".to_string(), false),
                 ("open_new_agent".to_string(), false),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
@@ -621,6 +627,8 @@ mod tests {
                 ("voice_off".to_string(), true),
                 ("list_commands".to_string(), true),
                 ("dictate_to_agent".to_string(), false),
+                ("dictation_on".to_string(), false),
+                ("dictation_off".to_string(), false),
                 ("submit_prompt".to_string(), false),
                 ("open_new_agent".to_string(), true),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
@@ -652,6 +660,8 @@ mod tests {
                 ("voice_off".to_string(), true),
                 ("list_commands".to_string(), true),
                 ("dictate_to_agent".to_string(), true),
+                ("dictation_on".to_string(), true),
+                ("dictation_off".to_string(), true),
                 ("submit_prompt".to_string(), true),
                 ("open_new_agent".to_string(), false),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
