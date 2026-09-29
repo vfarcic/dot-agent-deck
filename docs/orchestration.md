@@ -164,7 +164,7 @@ If a worker gets stuck — it never reports back, or it sits at a permission pro
 
 The deck sends messages into panes for you — a delegated task, a worker's report, a scheduled prompt, the reports in [Idle Workers & Notifications](idle-workers-and-notifications.md). If you have typed something into that pane and not sent it yet, the deck's message **waits** instead of being sent together with your text. Press **Enter** to send what you typed, or **Ctrl+U** or **Ctrl+C** to clear it, and the waiting message follows on its own. Other panes, and the rest of the orchestration, keep running meanwhile.
 
-The wait lasts at most **60 seconds**, so a stray keystroke cannot stall an unattended run. After that the message is sent anyway — possibly together with your text — and the pane's card shows **Error**. To change the limit, set `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` (milliseconds) on the command that starts the deck, or `0` to switch the wait off. A daemon that is already running keeps its old value until you restart it.
+The wait lasts at most **60 seconds**, so a stray keystroke cannot stall an unattended run. After that the message is sent anyway — possibly together with your text — and the pane's status shows **Error**. To change the limit, set `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` (milliseconds) on the command that starts the deck, or `0` to switch the wait off. A daemon that is already running keeps its old value until you restart it.
 
 Only text you typed **through the deck** makes a message wait. Text the agent puts in its own input box — a prompt recalled from history, an autocompletion — does not, and messages the deck or the desktop app send at your request, such as a new orchestration's first prompt, never wait.
 

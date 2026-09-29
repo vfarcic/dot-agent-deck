@@ -99,7 +99,7 @@ After the daemon restarts, the next run opens a new tab even when reuse is on.
 
 If a run reuses a tab you are typing in, its prompt **waits** until you stop typing for about 5 seconds; otherwise it arrives immediately. Set `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` (milliseconds) to change the 5 seconds.
 
-If you have left unsent text in the tab, the prompt also waits until you press Enter or clear it with Ctrl+U or Ctrl+C, so it is not sent together with your text. Either way it waits at most 60 seconds from the start of the run, then arrives anyway. See [A deck prompt waits while you have an unsent draft](orchestration.md#a-deck-prompt-waits-while-you-have-an-unsent-draft).
+If you have left unsent text in the run's pane — in either client — the prompt also waits until you press Enter or clear it with Ctrl+U or Ctrl+C, so it is not sent together with your text. Either way it waits at most 60 seconds from the start of the run, then arrives anyway. See [A deck prompt waits while you have an unsent draft](orchestration.md#a-deck-prompt-waits-while-you-have-an-unsent-draft).
 
 ## Daemon must be running
 
