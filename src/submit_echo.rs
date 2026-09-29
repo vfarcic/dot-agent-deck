@@ -40,8 +40,11 @@
 //! delegate pointer and its re-send, and every notice to an orchestrator. The
 //! same load lost the submit of a 282-byte work-done notice written the same
 //! way in 4 of 90 trials, and none of 60 with the gate. A pane that does not echo its input (a raw-mode
-//! stand-in, a program that hides what is typed) pays the whole bound on every
-//! write, and the writer is held for it. Claude Code, Codex and OpenCode show
+//! stand-in, a program that hides what is typed) pays the whole bound, with
+//! the writer held for it, once per [`ECHO_UNOBSERVED_WINDOW`]: after a gated
+//! write times out with no echo, the pane's later submits keep only the fixed
+//! delay until the window lapses, so a queue of notices does not stack one
+//! bound per message in front of the user's keystrokes. Claude Code, Codex and OpenCode show
 //! what is typed in their composer; Devin and Pi were not measured.
 //!
 //! **A heuristic, not an attestation.** The watch counts the token anywhere
@@ -85,6 +88,16 @@ use tokio::sync::broadcast;
 /// The longest a gated submit holds its CR waiting for the payload to render.
 /// Twice the slowest paint measured under 48 busy-loops on 16 CPUs (1.06 s).
 pub const SUBMIT_ECHO_BOUND: Duration = Duration::from_secs(2);
+
+/// How long a pane whose gated submit timed out with no echo keeps only the
+/// fixed `SUBMIT_DELAY` before its next gated submit probes again (issue #1383).
+///
+/// A time window rather than a count of writes, because what it bounds is the
+/// writer-held stall rate: a burst of notices to a pane that does not echo pays
+/// one bound per window however many it holds, where "the next N writes"
+/// would stall again after every N. A slow but echoing pane that misses the
+/// bound once keeps the pre-#1243 floor for at most this long.
+pub const ECHO_UNOBSERVED_WINDOW: Duration = Duration::from_secs(60);
 
 /// The longest payload that is gated. Claude Code 2.1.284 shows a single-line
 /// paste of more than 800 characters as a `[Pasted text #N]` placeholder rather
