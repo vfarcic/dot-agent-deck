@@ -114,7 +114,7 @@ The generated file is a commented orchestration starter you can edit. It will no
 
 #### Agent-assisted config generation
 
-When you open the New Agent form (`Ctrl+n`) for a directory without a `.dot-agent-deck.toml`, a yellow tip suggests pressing `g` on the dashboard to create one.
+This is a TUI feature: the desktop app has no equivalent of the `g` flow below (see [What the TUI has and the desktop app does not](desktop/index.md#what-the-tui-has-and-the-desktop-app-does-not)). In the TUI, when you open the New Agent form (`Ctrl+n`) for a directory without a `.dot-agent-deck.toml`, a yellow tip suggests pressing `g` on the dashboard to create one.
 
 From the dashboard, press `g` on an agent's card to open a dialog with three options (navigate with arrow keys, confirm with Enter):
 
