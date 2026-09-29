@@ -98,6 +98,7 @@ Both signals the loop trusts are same-user and unattested, and [hook-provenance.
 - **A second copy is unlikely, not impossible.** The retype decision reads the screen, not the composer: a composer that neither shows its text nor submits it on Enter, or an agent that starts a turn without reporting one within the grace, still gets a second copy. The task-file header's "same task" line is the backstop.
 - **The probe's Enter submits whatever the composer holds.** A worker whose input box holds unsent text of its own when a re-send fires would have it submitted. A re-send only fires after the worker has said nothing at all since the pointer went in, when the box should hold the pointer or nothing, and not after a human has typed into the pane.
 - **The echo gate is a heuristic** (above).
+- **A late event from a superseded delegation can stop a newer one's re-sends.** Hook events carry no delivery id, so on a `clear = false` worker a turn event still arriving from the earlier delegation is taken as proof for the newer pointer, which then stays typed once with no re-send — the safe direction, never a duplicate, and the same trade a stale `work-done` makes.
 
 ## Logs
 

@@ -906,6 +906,10 @@ impl Watch {
                 _ = &mut self.exited => return Err(RetryEnd::AgentExited),
                 msg = self.event_rx.recv() => match msg {
                     Ok(BroadcastMsg::Event(event)) => {
+                        // Matched by pane and agent only: events carry no
+                        // delivery id, so a late event from a superseded
+                        // delegation can stop this loop. Safe direction — the
+                        // pointer stays typed once — like a stale work-done.
                         if event.pane_id.as_deref() != Some(pane_id)
                             || event.agent_id.as_deref() != Some(worker_agent_id)
                         {
@@ -2216,6 +2220,16 @@ while chunk := os.read(0, 4096):
     os.write(1, chunk.replace(b'\r', b'').replace(b'\n', b''))
 "#;
 
+    /// Whether `python3` can be spawned. Through Tokio's process API so the
+    /// check does not block a runtime worker.
+    async fn python3_available() -> bool {
+        tokio::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .await
+            .is_ok_and(|out| out.status.success())
+    }
+
     struct Fixture {
         registry: Arc<AgentPtyRegistry>,
         agent: String,
@@ -2249,11 +2263,7 @@ while chunk := os.read(0, 4096):
         /// — it paints each ignored Enter after the pointer as `^M`. `None`
         /// where `python3` is not available.
         async fn start_composer(pane: &str) -> Option<Self> {
-            let available = std::process::Command::new("python3")
-                .arg("--version")
-                .output()
-                .is_ok_and(|out| out.status.success());
-            if !available {
+            if !python3_available().await {
                 return None;
             }
             Some(
@@ -2573,11 +2583,7 @@ while chunk := os.read(0, 4096):
     /// been cleared by the time the retype step reads it.
     #[tokio::test]
     async fn retry_loop_never_retypes_a_pointer_the_probe_saw_in_the_composer() {
-        let available = std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .is_ok_and(|out| out.status.success());
-        if !available {
+        if !python3_available().await {
             eprintln!("SKIP: python3 is not available");
             return;
         }
