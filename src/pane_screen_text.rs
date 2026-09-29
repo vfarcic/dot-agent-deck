@@ -103,6 +103,49 @@ pub fn visible_tail_lines(snapshot: &[u8], rows: u16, cols: u16, max_lines: usiz
     tail
 }
 
+/// Issue #1383: every row of the rendered screen, blank ones included so the
+/// index is a screen row, the row the terminal cursor is on, and the cursor's
+/// column.
+///
+/// Rows are trimmed and rule-collapsed like [`visible_tail_lines`]'s. The
+/// column is counted in `char`s of that processed row rather than in cells,
+/// and it counts the cell UNDER the cursor too: it is the length of the row's
+/// text up to and including the cursor cell, so `row.chars().take(column)` is
+/// everything at or before the cursor. Including that cell covers a line that
+/// fills the row exactly, where the terminal parks the cursor ON the last
+/// character (pending wrap) rather than after it. `None` when the snapshot is
+/// empty or the parser panicked (the same vt100 0.16.2 short-pane edge case
+/// [`visible_tail_lines`] contains).
+pub fn visible_rows_and_cursor(
+    snapshot: &[u8],
+    rows: u16,
+    cols: u16,
+) -> Option<(Vec<String>, usize, usize)> {
+    if snapshot.is_empty() {
+        return None;
+    }
+    let (rows, cols) = parser_init_dims(rows, cols);
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(snapshot);
+        let screen = parser.screen();
+        let lines = screen
+            .rows(0, cols)
+            .map(|row| collapse_rules(row.trim()))
+            .collect::<Vec<_>>();
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        // Processed the same way as the whole row, so the count indexes it:
+        // `collapse_rules` streams left to right, so it maps a prefix of the
+        // row onto a prefix of its output.
+        let through_cursor = screen
+            .rows(0, cursor_col.saturating_add(1).min(cols))
+            .nth(usize::from(cursor_row))
+            .map_or(0, |left| collapse_rules(left.trim_start()).chars().count());
+        (lines, usize::from(cursor_row), through_cursor)
+    }))
+    .ok()
+}
+
 /// Shrink runs of one repeated non-alphanumeric character to
 /// [`MAX_REPEATED_RULE_RUN`], leaving everything else byte-for-byte alone.
 fn collapse_rules(line: &str) -> String {
@@ -178,6 +221,37 @@ mod tests {
             visible_tail_lines(b"content\r\n", 0, 0, MAX_REPORTED_ROWS),
             vec!["content".to_string()]
         );
+    }
+
+    #[test]
+    fn visible_rows_and_cursor_reports_the_cursor_row_and_keeps_blank_rows() {
+        let (rows, cursor, column) =
+            visible_rows_and_cursor(b"history\r\n\r\n> typed\x1b[4;1Hfooter\x1b[3;8H", 24, 80)
+                .expect("parsed");
+        assert_eq!(&rows[..4], ["history", "", "> typed", "footer"]);
+        assert_eq!(rows.len(), 24, "every screen row, so the index is a row");
+        assert_eq!(cursor, 2);
+        assert_eq!(
+            column,
+            "> typed".len(),
+            "the cursor sits right after the text"
+        );
+        // Leading padding is trimmed from the row, and from the count with it.
+        let (rows, _, column) =
+            visible_rows_and_cursor(b"   > ab\x1b[1;5H", 24, 80).expect("parsed");
+        assert_eq!(rows[0], "> ab");
+        assert_eq!(
+            &rows[0][..column],
+            "> ",
+            "through the cell under the cursor"
+        );
+        // A line that fills the row parks the cursor on its last character.
+        let (rows, _, column) = visible_rows_and_cursor(b"0123456789", 24, 10).expect("parsed");
+        assert_eq!(
+            rows[0].chars().take(column).collect::<String>(),
+            "0123456789"
+        );
+        assert_eq!(visible_rows_and_cursor(b"", 24, 80), None);
     }
 
     #[test]

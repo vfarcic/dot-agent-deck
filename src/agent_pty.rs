@@ -2288,7 +2288,10 @@ pub enum GuardedSendDetail {
 /// before the gate existed.
 #[derive(Debug, Clone, Copy)]
 enum FirstWrite {
-    Immediate,
+    /// Write at once. `deadline` bounds what the write does before its first
+    /// byte — queueing on the writer and `revalidate` — exactly as
+    /// [`FirstWrite::Defer`]'s does; `None` is no bound.
+    Immediate { deadline: Option<Instant> },
     /// Wait while a draft is pending, within the cap measured from `started`.
     Defer {
         started: Instant,
@@ -2652,35 +2655,56 @@ async fn drain_stranded_payload(w: &mut (dyn std::io::Write + Send), landed: &[u
 /// text of the user's. What stays genuinely ambiguous is what the agent's editor
 /// did with the bytes while they were there, which is why the outcome is
 /// unchanged.
+///
+/// Issue #1243: with an `echo` watch the CR is also held until the payload has
+/// rendered on the agent's screen, bounded by
+/// [`crate::submit_echo::SUBMIT_ECHO_BOUND`]; [`SUBMIT_DELAY`] stays the floor.
+/// A watch that lags behind the output or cannot parse it — including a
+/// snapshot it could not parse before the payload went in — holds the CR to the
+/// bound; only a closed output bus drops it to the floor
+/// ([`crate::submit_echo::EchoOutcome`]). The watch only times the CR, so every
+/// outcome above is classified exactly as without one. How the wait ended is
+/// returned beside the delivery — `None` when there was no watch or the payload
+/// never fully went in — for [`PaneWriter::note_echo_outcome`].
 async fn deliver_payload_and_submit(
     w: &mut (dyn std::io::Write + Send),
     payload: &[u8],
-) -> PayloadDelivery {
+    echo: Option<crate::submit_echo::EchoWatch>,
+) -> (PayloadDelivery, Option<crate::submit_echo::EchoOutcome>) {
     match write_all_tracked(w, payload) {
         WriteProgress::Complete => {}
         // Payload partially written — bytes may have reached the PTY.
         WriteProgress::Partial(landed) => {
-            return PayloadDelivery::Ambiguous {
-                stranded: drain_stranded_payload(w, &payload[..landed]).await,
-            };
+            let stranded = drain_stranded_payload(w, &payload[..landed]).await;
+            return (PayloadDelivery::Ambiguous { stranded }, None);
         }
         // Nothing written — safe to retry.
-        WriteProgress::NothingWritten(e) => return PayloadDelivery::CleanFailure(e),
+        WriteProgress::NothingWritten(e) => return (PayloadDelivery::CleanFailure(e), None),
     }
     let _ = w.flush();
-    tokio::time::sleep(SUBMIT_DELAY).await;
+    let written_at = tokio::time::Instant::now();
+    let mut echoed = None;
+    if let Some(echo) = echo {
+        let outcome = echo.wait(crate::submit_echo::SUBMIT_ECHO_BOUND).await;
+        tracing::debug!(
+            outcome = ?outcome,
+            waited_ms = written_at.elapsed().as_millis(),
+            "guarded submit: waited for the payload to render before the CR"
+        );
+        echoed = Some(outcome);
+    }
+    tokio::time::sleep_until(written_at + SUBMIT_DELAY).await;
     // The payload already landed; ANY failure writing the submit CR now leaves
     // the target holding un-submitted payload bytes — ambiguous, not clean.
     match write_all_tracked(w, b"\r") {
         WriteProgress::Complete => {}
         WriteProgress::Partial(_) | WriteProgress::NothingWritten(_) => {
-            return PayloadDelivery::Ambiguous {
-                stranded: drain_stranded_payload(w, payload).await,
-            };
+            let stranded = drain_stranded_payload(w, payload).await;
+            return (PayloadDelivery::Ambiguous { stranded }, echoed);
         }
     }
     let _ = w.flush();
-    PayloadDelivery::Applied
+    (PayloadDelivery::Applied, echoed)
 }
 
 /// PRD #249 M3: the [`SubmitMode::Notice`] counterpart of
@@ -3674,8 +3698,8 @@ impl PaneInputState {
     /// Issue #424 H3: a terminator SUBMITS the input box. Whatever we had put
     /// there is now the agent's problem and not ours, so every payload record
     /// for this pane stops guarding — which is what lets an ordinary later
-    /// delivery of the same fixed text (a delegate worker pointer is
-    /// deliberately the same one-line path across hand-offs) be admitted instead
+    /// delivery of the same fixed text (a delegate worker pointer re-sent in
+    /// place by issue #1383's retry is byte-identical) be admitted instead
     /// of matching a finished delivery's digest and being refused before writing
     /// a byte. The user-input clock still advances, so the blind probe stays
     /// refused: the box the probe wanted to submit is gone either way.
@@ -3915,6 +3939,15 @@ pub struct PaneWriter {
     /// passed its ownership check before the close and finishes after it can no
     /// longer bring a closed pane's clocks back.
     retired: Arc<AtomicBool>,
+    /// Issue #1383 (audit): until when this pane's echo gate is suspended,
+    /// because its last gated submit waited out
+    /// [`crate::submit_echo::SUBMIT_ECHO_BOUND`] without the payload ever
+    /// appearing. See [`Self::echo_gate_suspended`].
+    ///
+    /// Held here rather than in [`PaneInputState`] because a writer belongs to
+    /// one agent: a new agent in the pane comes with a new writer, and a closed
+    /// pane drops its writer, so neither can inherit the mark.
+    echo_unobserved_until: Option<Instant>,
 }
 
 impl PaneWriter {
@@ -3929,6 +3962,57 @@ impl PaneWriter {
             pane_id_env,
             state,
             retired,
+            echo_unobserved_until: None,
+        }
+    }
+
+    /// Issue #1383 (audit): whether a gated submit into this pane should skip
+    /// its echo watch and keep only the `SUBMIT_DELAY` floor.
+    ///
+    /// Every gated submit holds this writer while it waits for its echo, so on
+    /// a pane that never shows what is typed — a raw-mode stand-in, an agent
+    /// that renders a placeholder instead of the text — each queued automatic
+    /// write would add a whole bound, and the user's own keystrokes would wait
+    /// behind all of them. Once one gated write has timed out with no echo, the
+    /// writes after it within [`crate::submit_echo::ECHO_UNOBSERVED_WINDOW`] go
+    /// at the floor, so such a pane pays one bound per window rather than one
+    /// per message. The first gated write after the window probes again.
+    fn echo_gate_suspended(&self) -> bool {
+        self.echo_unobserved_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Issue #1383 (audit): record how a gated submit's echo wait ended.
+    ///
+    /// Only [`EchoOutcome::TimedOut`] — the bound passed and the payload never
+    /// appeared — suspends the gate. A watch that lost the thread
+    /// ([`EchoOutcome::Lost`]) could not tell, which is the heavy-load case the
+    /// gate exists for, and a closed bus means the agent is gone; neither says
+    /// the pane does not echo, so both leave the mark as it was. A rendered
+    /// echo clears it.
+    ///
+    /// [`EchoOutcome::TimedOut`]: crate::submit_echo::EchoOutcome::TimedOut
+    /// [`EchoOutcome::Lost`]: crate::submit_echo::EchoOutcome::Lost
+    fn note_echo_outcome(
+        &mut self,
+        pane_id: &str,
+        agent_id: &str,
+        outcome: crate::submit_echo::EchoOutcome,
+    ) {
+        use crate::submit_echo::{ECHO_UNOBSERVED_WINDOW, EchoOutcome};
+        match outcome {
+            EchoOutcome::TimedOut => {
+                tracing::debug!(
+                    pane_id = %pane_id,
+                    agent_id = %agent_id,
+                    window_secs = ECHO_UNOBSERVED_WINDOW.as_secs(),
+                    "guarded submit saw no echo within the bound; later submits to this pane \
+                     keep only the fixed delay until the window lapses"
+                );
+                self.echo_unobserved_until = Some(Instant::now() + ECHO_UNOBSERVED_WINDOW);
+            }
+            EchoOutcome::Rendered => self.echo_unobserved_until = None,
+            EchoOutcome::Lost | EchoOutcome::Closed => {}
         }
     }
 
@@ -4041,6 +4125,10 @@ impl std::io::Write for PaneWriter {
         self.inner.flush()
     }
 }
+
+/// See [`AgentPtyRegistry::pause_next_echo_watch_for_test`].
+#[cfg(test)]
+type EchoWatchPause = Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>;
 
 /// In-process registry of agent PTYs owned by the daemon. M1.1 only exposed
 /// the in-process API; M1.2 wires it to the streaming attach protocol via
@@ -4225,6 +4313,13 @@ pub struct AgentPtyRegistry {
     focus_applied: tokio::sync::watch::Sender<u64>,
     /// Issue #714: see [`Self::codex_rollout_arms`].
     codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms,
+    /// Issue #1383: see [`Self::pending_deliveries`].
+    pending_deliveries: crate::delegate_retry::PendingDeliveries,
+    /// Issue #1383 test seam: when set, the next [`Self::echo_watch`] reports
+    /// that it reached its setup and waits there for the release — see
+    /// [`Self::pause_next_echo_watch_for_test`].
+    #[cfg(test)]
+    echo_watch_pause: EchoWatchPause,
 }
 
 /// PRD #1105 — the shortest gap between two focus passes, and so the bound on
@@ -5575,6 +5670,29 @@ enum SubmitMode {
     Notice,
 }
 
+/// Issue #1243: what holds a submitted write's CR back. Ignored for a notice,
+/// which has no CR.
+///
+/// Every production submit takes [`Self::Echo`]: every one of them is the deck
+/// typing into an agent that may be too busy to finish a paste within
+/// [`SUBMIT_DELAY`]. A payload the watch cannot follow — see
+/// [`crate::submit_echo::echo_token`] — keeps the fixed delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitGate {
+    /// [`SUBMIT_DELAY`] after the payload, as before #1243. A test seam for
+    /// the pre-#1243 shape, and the value a notice passes.
+    Delay,
+    /// Until the payload renders on the agent's screen, bounded by
+    /// [`crate::submit_echo::SUBMIT_ECHO_BOUND`], never sooner than
+    /// [`SUBMIT_DELAY`]. A CR written while a starved agent is still inside its
+    /// paste window is taken as a newline, and the text sits unsubmitted. A
+    /// pane that does not echo what is typed pays the whole bound, with the
+    /// writer held, once per [`crate::submit_echo::ECHO_UNOBSERVED_WINDOW`]
+    /// ([`PaneWriter::echo_gate_suspended`]). Claude Code, Codex and OpenCode show what is typed in their
+    /// composer; Devin and Pi were not measured.
+    Echo,
+}
+
 /// Issue #876 test-only fault seam: a [`std::io::Write`] that accepts `budget`
 /// bytes and then fails — either once, healing so that everything after it is
 /// accepted, or permanently. Both halves are needed, because the drain
@@ -5711,7 +5829,17 @@ impl AgentPtyRegistry {
             focus_pass: Mutex::new(()),
             focus_applied: tokio::sync::watch::Sender::new(0),
             codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms::default(),
+            pending_deliveries: crate::delegate_retry::PendingDeliveries::default(),
+            #[cfg(test)]
+            echo_watch_pause: Mutex::new(None),
         }
+    }
+
+    /// Issue #1383: the delegate deliveries a retry loop is watching, one per
+    /// worker pane. Held here because the dispatch path and the hook loop's
+    /// `ack` and `work-done` handlers share this registry and nothing else.
+    pub fn pending_deliveries(&self) -> &crate::delegate_retry::PendingDeliveries {
+        &self.pending_deliveries
     }
 
     /// Issue #714: the queue through which the daemon's hook loop asks its
@@ -7773,6 +7901,47 @@ impl AgentPtyRegistry {
         self.launcher_handoff_agents.lock().unwrap().len()
     }
 
+    /// Issue #1383 × #544 test seam: feed `bytes` into `pane_id`'s input model
+    /// as though the deck had written them, without writing them to the PTY —
+    /// how a test opens or closes a bracketed paste, and with it a pending
+    /// draft ([`Self::draft_pending`]), with no user keystroke on record.
+    #[cfg(test)]
+    pub(crate) fn note_deck_bytes_for_test(&self, pane_id: &str, bytes: &[u8]) {
+        self.pane_input
+            .lock()
+            .unwrap()
+            .note_deck_bytes(pane_id, bytes);
+    }
+
+    /// Issue #1383 test seam: take and hold `pane_id`'s live writer, so a test
+    /// can park a guarded write on it and change state underneath. The writer
+    /// is released when the returned guard drops.
+    #[cfg(test)]
+    pub(crate) async fn hold_pane_writer_for_test(
+        &self,
+        pane_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<PaneWriter> {
+        self.writer_target_for_pane(pane_id)
+            .expect("a live writer for the pane")
+            .writer
+            .lock_owned()
+            .await
+    }
+
+    /// Issue #1383 test seam: hold the next echo-gated write inside its echo
+    /// watch's setup — under the pane's writer, after `revalidate`, before the
+    /// payload. The first receiver resolves once the write is parked there;
+    /// dropping or sending on the returned sender lets it go on.
+    #[cfg(test)]
+    pub(crate) fn pause_next_echo_watch_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.echo_watch_pause.lock().unwrap() = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
     /// Issue #542 test seam: does any pane-keyed clock hold `pane_id_env`?
     #[cfg(test)]
     fn pane_input_tracks(&self, pane_id_env: &str) -> bool {
@@ -8911,7 +9080,10 @@ impl AgentPtyRegistry {
     ///    SAME live, non-exited agent, and `revalidate()` (the caller's
     ///    liveness/session recheck against `AppState`) must still hold — else
     ///    [`GuardedSend::Stale`]/[`GuardedSend::WrongSession`] with NO bytes written.
-    /// 5. Write payload → `SUBMIT_DELAY` → CR, all under the held writer.
+    /// 5. Write payload → CR, all under the held writer. Issue #1243: the CR
+    ///    waits until the payload renders on the agent's screen, bounded by
+    ///    [`crate::submit_echo::SUBMIT_ECHO_BOUND`] and never sooner than
+    ///    `SUBMIT_DELAY`; see [`SubmitGate::Echo`].
     ///
     /// PRD #20 Greptile (paneless guarded send): a daemon-side agent that carries
     /// no pane maps to the `<no-pane>` sentinel and can never be resolved by pane
@@ -8970,10 +9142,81 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
+            SubmitGate::Echo,
             expected_agent_id,
             revalidate,
-            FirstWrite::Immediate,
+            FirstWrite::Immediate { deadline: None },
             None,
+            || {},
+        )
+        .await
+        .map(|sent| sent.detail)
+    }
+
+    /// [`Self::write_and_submit_guarded_detailed`] with a deadline on what the
+    /// write does before its first byte — queueing on the writer and
+    /// `revalidate` — returning [`AgentPtyError::DeadlineElapsed`] with nothing
+    /// written once it passes. Once the payload has started the write runs to
+    /// its CR and reports its real outcome, as
+    /// [`Self::write_and_submit_guarded_first_write_within`] does.
+    ///
+    /// Issue #1243: for a caller that would otherwise wrap the write in a
+    /// timeout of its own. The CR can wait up to
+    /// [`crate::submit_echo::SUBMIT_ECHO_BOUND`] for the payload to render, and
+    /// a timeout that fired in that wait would drop the write with the payload
+    /// in the box, unsubmitted and with no #424 record that it is there.
+    pub async fn write_and_submit_guarded_detailed_within<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: &str,
+        revalidate: impl FnOnce() -> Fut,
+        deadline: Instant,
+    ) -> Result<GuardedSendDetail, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        self.write_guarded(
+            pane_id,
+            text,
+            SubmitMode::Submit,
+            SubmitGate::Echo,
+            expected_agent_id,
+            revalidate,
+            FirstWrite::Immediate {
+                deadline: Some(deadline),
+            },
+            None,
+            || {},
+        )
+        .await
+        .map(|sent| sent.detail)
+    }
+
+    /// Issue #1243 test seam: [`Self::write_and_submit_guarded_detailed`] with
+    /// the pre-#1243 fixed [`SUBMIT_DELAY`] before the CR, so a test can show
+    /// the paste-window loss the echo gate prevents.
+    #[cfg(test)]
+    pub(crate) async fn write_and_submit_guarded_fixed_delay<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: &str,
+        revalidate: impl FnOnce() -> Fut,
+    ) -> Result<GuardedSendDetail, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        self.write_guarded(
+            pane_id,
+            text,
+            SubmitMode::Submit,
+            SubmitGate::Delay,
+            expected_agent_id,
+            revalidate,
+            FirstWrite::Immediate { deadline: None },
+            None,
+            || {},
         )
         .await
         .map(|sent| sent.detail)
@@ -9010,9 +9253,11 @@ impl AgentPtyRegistry {
     ///
     /// Only non-empty payloads are gated: an empty one is a submit-only probe,
     /// which #424 already refuses once the user has typed. The TUI/desktop
-    /// `WriteAndSubmit` RPC deliberately stays on the immediate entry — the TUI
-    /// calls it from its UI thread, and the desktop's `SubmitText` is the user's
-    /// own submit.
+    /// `WriteAndSubmit` RPC stays on the immediate entry: the desktop's
+    /// `SubmitText` is the user's own submit, and the TUI called the RPC on
+    /// its UI thread. Since issue #1383 the TUI starts the call and polls for
+    /// the answer instead; moving its prompts onto this entry was not
+    /// revisited there.
     pub async fn write_and_submit_guarded_first_write<Fut>(
         &self,
         pane_id: &str,
@@ -9054,6 +9299,7 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
+            SubmitGate::Echo,
             expected_agent_id,
             revalidate,
             FirstWrite::Defer {
@@ -9062,6 +9308,7 @@ impl AgentPtyRegistry {
                 cap_ceiling: None,
             },
             None,
+            || {},
         )
         .await
     }
@@ -9073,6 +9320,18 @@ impl AgentPtyRegistry {
     /// [`PaneDispatchHold`]. It may still be down when this returns a refusal
     /// reached during the wait; call [`PaneDispatchHold::resume`] before
     /// acting on the outcome.
+    ///
+    /// Issue #1243: deferred behind the worker's draft FIRST and only then
+    /// echo-gated, like every submit ([`SubmitGate::Echo`]): the watch is
+    /// subscribed under the writer on the pass that writes, after the wait.
+    ///
+    /// Issue #1383 × #544: `before_payload` runs under the writer on the pass
+    /// that writes, after `revalidate` and the echo watch's setup and
+    /// immediately before the payload's first byte — the latest point at which
+    /// a caller can still subscribe to what the worker does next without
+    /// missing anything the payload causes. Not called for a write refused
+    /// before that point.
+    #[allow(clippy::too_many_arguments)]
     pub async fn write_and_submit_guarded_first_write_parking<Fut>(
         &self,
         pane_id: &str,
@@ -9081,6 +9340,7 @@ impl AgentPtyRegistry {
         revalidate: impl FnOnce() -> Fut,
         started: Instant,
         hold: &mut PaneDispatchHold,
+        before_payload: impl FnOnce(),
     ) -> Result<FirstWriteSend, AgentPtyError>
     where
         Fut: std::future::Future<Output = bool>,
@@ -9089,6 +9349,7 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
+            SubmitGate::Echo,
             expected_agent_id,
             revalidate,
             FirstWrite::Defer {
@@ -9097,6 +9358,7 @@ impl AgentPtyRegistry {
                 cap_ceiling: None,
             },
             Some(hold),
+            before_payload,
         )
         .await
     }
@@ -9126,6 +9388,7 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
+            SubmitGate::Echo,
             expected_agent_id,
             revalidate,
             FirstWrite::Defer {
@@ -9134,6 +9397,7 @@ impl AgentPtyRegistry {
                 cap_ceiling: Some(cap_ceiling),
             },
             None,
+            || {},
         )
         .await
         .map(|sent| sent.detail.outcome())
@@ -9174,6 +9438,7 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
+            SubmitGate::Echo,
             expected_agent_id,
             revalidate,
             FirstWrite::Defer {
@@ -9182,6 +9447,7 @@ impl AgentPtyRegistry {
                 cap_ceiling: None,
             },
             None,
+            || {},
         )
         .await
     }
@@ -9245,13 +9511,52 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Notice,
+            SubmitGate::Delay,
             expected_agent_id,
             revalidate,
-            FirstWrite::Immediate,
+            FirstWrite::Immediate { deadline: None },
             None,
+            || {},
         )
         .await
         .map(|sent| sent.detail.outcome())
+    }
+
+    /// Issue #1243: subscribe to `agent_id`'s output for an echo-gated submit of
+    /// `payload`. `None` when the payload is not eligible, the pane's geometry
+    /// gets no gate, or the agent is gone; a snapshot the watch cannot parse
+    /// still returns one, which holds the CR to the bound. Must be awaited
+    /// before the payload is written.
+    ///
+    /// The subscription copies up to [`SCROLLBACK_CAP_BYTES`] under the bus's
+    /// synchronous mutex and the watch parses all of it, so both run on the
+    /// blocking pool rather than on an async worker (Qodo, #1414).
+    async fn echo_watch(
+        &self,
+        agent_id: &str,
+        payload: &[u8],
+    ) -> Option<crate::submit_echo::EchoWatch> {
+        crate::submit_echo::echo_token(payload)?;
+        let (bus, rows, cols) = {
+            let inner = self.inner.lock().unwrap();
+            let agent = inner.agents.get(agent_id)?;
+            (Arc::clone(&agent.bus), agent.pty_rows, agent.pty_cols)
+        };
+        let payload = payload.to_vec();
+        #[cfg(test)]
+        let pause = self.echo_watch_pause.lock().unwrap().take();
+        #[cfg(test)]
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+        tokio::task::spawn_blocking(move || {
+            let (snapshot, rx) = bus.subscribe();
+            crate::submit_echo::EchoWatch::new(&snapshot, rx, rows, cols, &payload)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// The shared body of [`Self::write_and_submit_guarded`] (payload +
@@ -9266,10 +9571,12 @@ impl AgentPtyRegistry {
         pane_id: &str,
         text: &str,
         mode: SubmitMode,
+        submit_gate: SubmitGate,
         expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
         first_write: FirstWrite,
         mut park: Option<&mut PaneDispatchHold>,
+        before_payload: impl FnOnce(),
     ) -> Result<FirstWriteSend, AgentPtyError>
     where
         Fut: std::future::Future<Output = bool>,
@@ -9318,7 +9625,7 @@ impl AgentPtyRegistry {
         // Issue #544: see [`Self::write_and_submit_guarded_first_write_within`].
         let write_deadline = match first_write {
             FirstWrite::Defer { deadline, .. } => deadline,
-            FirstWrite::Immediate => None,
+            FirstWrite::Immediate { deadline } => deadline,
         };
         let within = |deferred: Duration| write_deadline.map(|at| at + deferred);
         let gate = match first_write {
@@ -9342,6 +9649,27 @@ impl AgentPtyRegistry {
                 crate::draft_deferral::decide_first_write(pending, Instant::now(), started, cap)
             }
             None => crate::draft_deferral::FirstWriteDecision::Now { capped: false },
+        };
+        // Does `target` still own the pane and still run? A paneless agent has
+        // no pane→agent mapping to rebind, so the meaningful re-check is that
+        // the agent still exists — a removal (`None`) is `Stale`. Run under the
+        // held writer, after every await that sits between it and the payload.
+        let ownership_lost = |target: &PaneWriterTarget| {
+            if is_paneless {
+                if self.writer_target_for_agent(&target.agent_id).is_none() {
+                    return Some(GuardedSend::Stale);
+                }
+            } else {
+                match self.writer_target_for_pane(pane_id) {
+                    Some(current) if current.agent_id == target.agent_id => {}
+                    Some(_) => return Some(GuardedSend::WrongSession),
+                    None => return Some(GuardedSend::Stale),
+                }
+            }
+            target
+                .exited
+                .load(Ordering::SeqCst)
+                .then_some(GuardedSend::Stale)
         };
         let (mut w, capped) = loop {
             // Issue #544: wait WITHOUT the writer while the draft is pending.
@@ -9381,22 +9709,9 @@ impl AgentPtyRegistry {
             // barrier the TOCTOU test holds open by locking the writer externally.
             let w = before_write_deadline(within(deferred), target.writer.lock()).await?;
             // Re-resolve identity: the pane may have rebound to a new agent, or the
-            // target may have exited, while we waited for the writer. A paneless
-            // agent has no pane→agent mapping to rebind, so the meaningful re-check
-            // is that the agent still exists — a removal (`None`) is `Stale`.
-            if is_paneless {
-                if self.writer_target_for_agent(&target.agent_id).is_none() {
-                    return finish(GuardedSend::Stale, deferred);
-                }
-            } else {
-                match self.writer_target_for_pane(pane_id) {
-                    Some(current) if current.agent_id == target.agent_id => {}
-                    Some(_) => return finish(GuardedSend::WrongSession, deferred),
-                    None => return finish(GuardedSend::Stale, deferred),
-                }
-            }
-            if target.exited.load(Ordering::SeqCst) {
-                return finish(GuardedSend::Stale, deferred);
+            // target may have exited, while we waited for the writer.
+            if let Some(refusal) = ownership_lost(&target) {
+                return finish(refusal, deferred);
             }
             // Issue #544: the decision again, UNDER the writer. User bytes are
             // recorded while their writer is held ([`PaneWriter`]), so this read
@@ -9450,8 +9765,8 @@ impl AgentPtyRegistry {
         // Issue #424 H3: the predicate is keyed on the bytes AND scoped to the
         // lifetime of the delivery that wrote them, which is what keeps it from
         // refusing an ordinary later delivery of the same fixed text — a delegate
-        // worker pointer is deliberately identical across hand-offs, so equal
-        // payloads are the normal case, not an exotic one. See
+        // pointer re-sent in place (issue #1383) is identical to the first write,
+        // so equal payloads are the normal case, not an exotic one. See
         // [`Self::user_typed_since_writing_payload`] for the full lifecycle.
         if matches!(mode, SubmitMode::Submit) {
             let refuse = if payload.is_empty() {
@@ -9542,8 +9857,50 @@ impl AgentPtyRegistry {
                 detail: crate::draft_deferral::DRAFT_CAP_NOTICE,
             });
         }
+        // Issue #1243: subscribed before the payload is written, so no byte of
+        // its echo is missed. The writer is held, so nothing else is typed
+        // into this pane in between.
+        //
+        // Issue #1383 (audit): skipped while this pane's last gated write saw
+        // no echo within the bound — see [`PaneWriter::echo_gate_suspended`].
+        let echo = match (&mode, submit_gate) {
+            (SubmitMode::Submit, SubmitGate::Echo) if !w.echo_gate_suspended() => {
+                self.echo_watch(&target.agent_id, &payload).await
+            }
+            _ => None,
+        };
+        // Qodo, PR #1414: the identity and liveness check again, because the
+        // echo watch's setup above — and `revalidate` before it — is a yield
+        // point. The writer keeps other input out of the pane, not the agent
+        // from exiting or the pane from changing hands, so a target that went
+        // meanwhile would otherwise be written through its stale writer.
+        if let Some(refusal) = ownership_lost(&target) {
+            return finish(refusal, deferred);
+        }
+        // Issue #1383 (audit): and the deadline again, for the same reason. The
+        // echo watch's setup can wait on a saturated blocking pool and parse a
+        // full scrollback, so a write that was inside its deadline above can be
+        // well past it here — and this is still before the first byte.
+        if within(deferred).is_some_and(|at| Instant::now() >= at) {
+            return Err(AgentPtyError::DeadlineElapsed);
+        }
+        // Issue #1383 × #544: the caller's write-time sample, taken HERE rather
+        // than in `revalidate` because the echo watch's setup above awaits a
+        // blocking-pool snapshot and parse. The writer keeps input out of the
+        // pane meanwhile but not the agent's events, so a receiver subscribed
+        // before that await could read one the worker emitted in the gap — its
+        // turn on the user's just-submitted draft, typically — as caused by
+        // bytes not yet written.
+        before_payload();
         let delivery = match mode {
-            SubmitMode::Submit => deliver_payload_and_submit(&mut w.daemon(), &payload).await,
+            SubmitMode::Submit => {
+                let (delivery, echoed) =
+                    deliver_payload_and_submit(&mut w.daemon(), &payload, echo).await;
+                if let Some(outcome) = echoed {
+                    w.note_echo_outcome(pane_id, &target.agent_id, outcome);
+                }
+                delivery
+            }
             SubmitMode::Notice => deliver_payload_as_notice(&mut w.daemon(), &payload).await,
         };
         match delivery {
@@ -9847,6 +10204,20 @@ impl AgentPtyRegistry {
                     .any(|a| a.pane_id_env.as_deref() == Some(pane));
                 if !still_claimed {
                     self.pane_input.lock().unwrap().forget_closed_pane(pane);
+                    // Issue #1383 (Qodo, PR #1414): the pane's delivery
+                    // bookkeeping goes with it. Whether a dispatch is in flight
+                    // is read under this same hold, because a `clear = true`
+                    // delegate can re-create this pane id for a delivery it
+                    // noted before this close; see `forget_pane`. Peeked rather
+                    // than `pane_dispatch_lock`, which would add a map entry for
+                    // a pane that never dispatched.
+                    let dispatch_idle = self
+                        .dispatch_mutexes
+                        .lock()
+                        .unwrap()
+                        .get(pane)
+                        .is_none_or(|mutex| mutex.try_lock().is_ok());
+                    self.pending_deliveries.forget_pane(pane, id, dispatch_idle);
                 }
             }
             agent
@@ -11607,6 +11978,21 @@ impl AgentPtyRegistry {
             .get(id)
             .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
         Ok(agent.bus.snapshot())
+    }
+
+    /// [`Self::snapshot`] off the async worker, for async tests that poll a
+    /// pane: the snapshot takes the registry's synchronous mutex and copies the
+    /// scrollback, so it runs on the blocking pool (Qodo, #1414).
+    #[cfg(test)]
+    pub(crate) async fn snapshot_off_runtime(
+        self: &Arc<Self>,
+        id: &str,
+    ) -> Result<Vec<u8>, AgentPtyError> {
+        let registry = Arc::clone(self);
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || registry.snapshot(&id))
+            .await
+            .expect("the snapshot task does not panic")
     }
 
     /// Current number of live broadcast subscribers for an agent. Returns
@@ -17591,7 +17977,7 @@ mod spawn_tests {
     /// Attach a measured viewer belonging to `client` (`None`: a client that
     /// predates focus).
     fn attach_for(
-        registry: &AgentPtyRegistry,
+        registry: &Arc<AgentPtyRegistry>,
         id: &str,
         geometry: Option<(u16, u16)>,
         client: Option<&str>,
@@ -18151,6 +18537,106 @@ mod spawn_tests {
         }
     }
 
+    /// Records when each write lands, on the Tokio clock.
+    #[derive(Default)]
+    struct TimedWriter {
+        writes: Vec<(tokio::time::Instant, Vec<u8>)>,
+    }
+
+    impl std::io::Write for TimedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes
+                .push((tokio::time::Instant::now(), buf.to_vec()));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl TimedWriter {
+        fn cr_at(&self) -> tokio::time::Instant {
+            self.writes
+                .iter()
+                .find(|(_, bytes)| bytes.as_slice() == b"\r")
+                .map(|(at, _)| *at)
+                .expect("the submit CR was written")
+        }
+    }
+
+    /// Qodo round 4 on PR #1414: an echo watch that lags behind a busy agent's
+    /// output must not let the CR go at the `SUBMIT_DELAY` floor — that is the
+    /// CR #1243 saw taken into a starved agent's paste. It holds to the bound.
+    /// A closed output bus, where nothing will ever paint, keeps the floor; a
+    /// snapshot the watch could not parse before the write holds to the bound.
+    #[tokio::test(start_paused = true)]
+    async fn deliver_payload_holds_the_cr_to_the_echo_bound_when_the_watch_lags() {
+        use crate::submit_echo::{EchoWatch, SUBMIT_ECHO_BOUND};
+        let payload = b"Read the task file for your task. [delivery d-7f3a9c21]";
+
+        let (tx, rx) = tokio::sync::broadcast::channel(2);
+        let echo = EchoWatch::new(b"", rx, 24, 80, payload).expect("eligible");
+        // More output than the watch's queue holds: its next receive lags.
+        for _ in 0..4 {
+            tx.send(Arc::new(b"busy worker output ".to_vec())).unwrap();
+        }
+        let mut w = TimedWriter::default();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, payload, Some(echo)).await,
+            (
+                PayloadDelivery::Applied,
+                Some(crate::submit_echo::EchoOutcome::Lost)
+            )
+        );
+        assert!(
+            w.cr_at() - started >= SUBMIT_ECHO_BOUND,
+            "the CR went {:?} after the payload, before the {SUBMIT_ECHO_BOUND:?} bound",
+            w.cr_at() - started
+        );
+
+        let (tx, rx) = tokio::sync::broadcast::channel(2);
+        let echo = EchoWatch::new(b"", rx, 24, 80, payload).expect("eligible");
+        drop(tx);
+        let mut w = TimedWriter::default();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, payload, Some(echo)).await,
+            (
+                PayloadDelivery::Applied,
+                Some(crate::submit_echo::EchoOutcome::Closed)
+            )
+        );
+        assert_eq!(
+            w.cr_at() - started,
+            SUBMIT_DELAY,
+            "a closed bus keeps the floor"
+        );
+
+        // Qodo round 7: a snapshot the watch could not parse before the write
+        // holds the CR to the bound as well, not to the floor.
+        let (_tx, rx) = tokio::sync::broadcast::channel(2);
+        crate::submit_echo::fail_parse_for_test(true);
+        let echo = EchoWatch::new(b"> ", rx, 24, 80, payload);
+        crate::submit_echo::fail_parse_for_test(false);
+        let echo = echo.expect("an eligible payload keeps its watch over a failed parse");
+        let mut w = TimedWriter::default();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, payload, Some(echo)).await,
+            (
+                PayloadDelivery::Applied,
+                Some(crate::submit_echo::EchoOutcome::Lost)
+            )
+        );
+        assert!(
+            w.cr_at() - started >= SUBMIT_ECHO_BOUND,
+            "the CR went {:?} after the payload over an unparseable snapshot, before the \
+             {SUBMIT_ECHO_BOUND:?} bound",
+            w.cr_at() - started
+        );
+    }
+
     #[tokio::test]
     async fn deliver_payload_classifies_partial_write_as_ambiguous() {
         // Payload fully written AND submit CR written → Applied.
@@ -18159,7 +18645,7 @@ mod spawn_tests {
             written: 0,
         };
         assert_eq!(
-            deliver_payload_and_submit(&mut w, b"hello").await,
+            deliver_payload_and_submit(&mut w, b"hello", None).await.0,
             PayloadDelivery::Applied
         );
 
@@ -18170,7 +18656,7 @@ mod spawn_tests {
             written: 0,
         };
         assert!(matches!(
-            deliver_payload_and_submit(&mut w, b"hello").await,
+            deliver_payload_and_submit(&mut w, b"hello", None).await.0,
             PayloadDelivery::CleanFailure(_)
         ));
 
@@ -18183,7 +18669,7 @@ mod spawn_tests {
             written: 0,
         };
         assert_eq!(
-            deliver_payload_and_submit(&mut w, b"hello").await,
+            deliver_payload_and_submit(&mut w, b"hello", None).await.0,
             PayloadDelivery::Ambiguous { stranded: 2 }
         );
 
@@ -18195,7 +18681,7 @@ mod spawn_tests {
             written: 0,
         };
         assert_eq!(
-            deliver_payload_and_submit(&mut w, b"hello").await,
+            deliver_payload_and_submit(&mut w, b"hello", None).await.0,
             PayloadDelivery::Ambiguous {
                 stranded: b"hello".len()
             }
@@ -18214,7 +18700,7 @@ mod spawn_tests {
         // errored. Exactly two erases must follow them.
         let (mut w, log) = HealingFaultyWriter::healing(2);
         assert_eq!(
-            deliver_payload_and_submit(&mut w, b"hello").await,
+            deliver_payload_and_submit(&mut w, b"hello", None).await.0,
             PayloadDelivery::Ambiguous { stranded: 0 },
             "the two bytes that landed were erased again, so nothing is left in the box"
         );
@@ -18228,7 +18714,7 @@ mod spawn_tests {
         // box and the whole payload must come back out.
         let (mut w, log) = HealingFaultyWriter::healing(b"hello".len());
         assert_eq!(
-            deliver_payload_and_submit(&mut w, b"hello").await,
+            deliver_payload_and_submit(&mut w, b"hello", None).await.0,
             PayloadDelivery::Ambiguous { stranded: 0 }
         );
         assert_eq!(
@@ -18252,7 +18738,7 @@ mod spawn_tests {
         let payload = "⚠ went quiet".as_bytes();
         let (mut w, log) = HealingFaultyWriter::healing(payload.len());
         assert_eq!(
-            deliver_payload_and_submit(&mut w, payload).await,
+            deliver_payload_and_submit(&mut w, payload, None).await.0,
             PayloadDelivery::Ambiguous {
                 stranded: payload.len()
             }
@@ -18269,7 +18755,7 @@ mod spawn_tests {
         let payload = b"\x1b[200~one\ntwo\x1b[201~";
         let (mut w, log) = HealingFaultyWriter::healing(4);
         assert_eq!(
-            deliver_payload_and_submit(&mut w, payload).await,
+            deliver_payload_and_submit(&mut w, payload, None).await.0,
             PayloadDelivery::Ambiguous { stranded: 4 }
         );
         assert_eq!(log.lock().unwrap().as_slice(), b"\x1b[20");
@@ -18280,7 +18766,7 @@ mod spawn_tests {
         let payload = vec![b'x'; MAX_DRAINABLE_STRANDED_BYTES + 1];
         let (mut w, log) = HealingFaultyWriter::healing(payload.len());
         assert_eq!(
-            deliver_payload_and_submit(&mut w, &payload).await,
+            deliver_payload_and_submit(&mut w, &payload, None).await.0,
             PayloadDelivery::Ambiguous {
                 stranded: payload.len()
             }
@@ -18295,7 +18781,7 @@ mod spawn_tests {
         let payload = vec![b'x'; MAX_DRAINABLE_STRANDED_BYTES];
         let (mut w, _log) = HealingFaultyWriter::healing(payload.len());
         assert_eq!(
-            deliver_payload_and_submit(&mut w, &payload).await,
+            deliver_payload_and_submit(&mut w, &payload, None).await.0,
             PayloadDelivery::Ambiguous { stranded: 0 }
         );
     }
@@ -18352,7 +18838,7 @@ mod spawn_tests {
             faulted: false,
         };
         assert_eq!(
-            deliver_payload_and_submit(&mut w, b"hello").await,
+            deliver_payload_and_submit(&mut w, b"hello", None).await.0,
             PayloadDelivery::Ambiguous { stranded: 2 },
             "three of the five erases landed, so two payload bytes are still in the input box"
         );
@@ -18366,8 +18852,8 @@ mod spawn_tests {
     ///
     /// This is the pairing the fix turns on. #715's refusal is the right answer
     /// while bytes of ours are sitting in that input box and the wrong one once
-    /// they are gone: kept unconditionally it costs a delegation (the worker
-    /// pointer is the same fixed one-liner on every hand-off) to guard a box
+    /// they are gone: kept unconditionally it costs a delegation (a worker
+    /// pointer re-sent in place is byte-identical, issue #1383) to guard a box
     /// that is already clean, which is #424's prompt-loss half wearing #715's
     /// clothes.
     #[cfg(unix)]
@@ -18723,6 +19209,86 @@ mod spawn_tests {
     /// Issue #542: closing an agent drops its launcher standing and, with no
     /// other record left on the pane, all three pane-keyed clocks — and a
     /// declaration arriving after the close cannot put the standing back.
+    #[tokio::test]
+    async fn close_agent_forgets_the_panes_deliveries_but_not_an_in_flight_dispatchs() {
+        // Issue #1383 (Qodo, PR #1414): a pane that closes for good takes its
+        // delivery bookkeeping with it.
+        const PANE: &str = "issue-1383-closed-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn = |pane: &str| {
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/sh"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn sh")
+        };
+        let first = spawn(PANE);
+        let deliveries = registry.pending_deliveries();
+        let _armed = deliveries.arm(
+            PANE,
+            "d-11111111",
+            &first,
+            Some(1),
+            crate::delegate_retry::RetypePolicy::Allowed,
+        );
+        assert!(
+            deliveries.acknowledge(PANE, "d-11111111", Some(&first))
+                != crate::delegate_retry::AckOutcome::Unknown
+        );
+        let _second_armed = deliveries.arm(
+            PANE,
+            "d-22222222",
+            &first,
+            None,
+            crate::delegate_retry::RetypePolicy::Allowed,
+        );
+        registry.close_agent(&first).expect("close");
+        assert!(
+            !deliveries.tracks_pane(PANE),
+            "a pane nothing names any more must keep no delivery state"
+        );
+
+        // A `clear = true` delegate noted its delivery under the dispatch lock,
+        // and the pane's previous agent was then closed under it (issue #606's
+        // recreate). The delivery belongs to the agent that dispatch is
+        // bringing up, and must survive.
+        let old = spawn(PANE);
+        let dispatch_lock = registry.pane_dispatch_lock(PANE);
+        let dispatch = dispatch_lock.lock().await;
+        deliveries.supersede(PANE);
+        deliveries.note_delivery(PANE, "d-33333333");
+        registry.close_agent(&old).expect("close");
+        let fresh = spawn(PANE);
+        assert!(
+            deliveries.bind_current(PANE, "d-33333333", &fresh, Some(3)),
+            "the in-flight dispatch's delivery must survive the close"
+        );
+        drop(dispatch);
+        assert_eq!(
+            deliveries.acknowledge(PANE, "d-33333333", Some(&fresh)),
+            crate::delegate_retry::AckOutcome::NotPending {
+                silence_seq: Some(3)
+            }
+        );
+
+        // A `clear = true` respawn keeps the pane id and closes nothing, so
+        // the delivery it noted stays put.
+        deliveries.supersede(PANE);
+        deliveries.note_delivery(PANE, "d-44444444");
+        let respawned = registry
+            .respawn_agent_for_pane(PANE, "cat")
+            .await
+            .expect("respawn");
+        assert!(deliveries.bind_current(PANE, "d-44444444", &respawned, None));
+
+        // Closing the pane's last agent with no dispatch in flight forgets it.
+        registry.close_agent(&respawned).expect("close");
+        assert!(!deliveries.tracks_pane(PANE));
+        registry.shutdown_all();
+    }
+
     #[tokio::test]
     async fn close_agent_empties_launcher_standing_and_pane_clocks() {
         const PANE: &str = "issue-542-closed-pane";
@@ -19444,6 +20010,372 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
+    /// Issue #1243: the immediate entry's deadline bounds what happens before
+    /// the first byte and nothing after it. Queued behind a held writer, the
+    /// write gives up at the deadline with nothing written. Into a pane that
+    /// does not echo, the CR waits out the echo gate's whole bound, well past
+    /// the deadline, and is still written: a timeout around the write would
+    /// have dropped it there, leaving the payload in the box unsubmitted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detailed_within_bounds_only_the_time_before_the_first_byte() {
+        const PANE: &str = "issue-1243-detailed-within";
+        const TEXT: &str = "Read the task file. ECHO-GATE-SENTINEL";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sink = dir.path().join("sink");
+        let command = format!("stty raw -echo; exec cat > '{}'", sink.display());
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&command),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        // Let `stty` take effect before anything is typed.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let target = registry.writer_target_for_pane(PANE).expect("target");
+        let held = target.writer.lock().await;
+        let queued = tokio::time::timeout(
+            Duration::from_secs(5),
+            registry.write_and_submit_guarded_detailed_within(
+                PANE,
+                TEXT,
+                &agent,
+                || async { true },
+                Instant::now() + Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("the deadline bounds a write queued on the writer");
+        assert!(
+            matches!(queued, Err(AgentPtyError::DeadlineElapsed)),
+            "queued on a held writer past the deadline: {queued:?}"
+        );
+        drop(held);
+
+        let started = Instant::now();
+        let sent = registry
+            .write_and_submit_guarded_detailed_within(
+                PANE,
+                TEXT,
+                &agent,
+                || async { true },
+                started + Duration::from_millis(300),
+            )
+            .await
+            .expect("a write under way is not dropped at its deadline");
+        assert_eq!(sent, GuardedSendDetail::Outcome(GuardedSend::Applied));
+        assert!(
+            started.elapsed() >= crate::submit_echo::SUBMIT_ECHO_BOUND,
+            "precondition: the CR waited out the echo bound on a pane that does not echo; \
+             took {:?}",
+            started.elapsed()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let expected = format!("{TEXT}\r");
+        loop {
+            let got = std::fs::read_to_string(&sink).unwrap_or_default();
+            if got == expected {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pane received {got:?}, not the payload and its CR once"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        registry.shutdown_all();
+    }
+
+    /// Issue #1383: spawn a stand-in that never shows what is typed — raw
+    /// mode, echo off — into `pane`, copying its input to `sink`. Every gated
+    /// submit into it therefore times out with no echo.
+    #[cfg(unix)]
+    async fn spawn_no_echo_sink(
+        registry: &Arc<AgentPtyRegistry>,
+        pane: &str,
+        sink: &std::path::Path,
+    ) -> String {
+        let command = format!("stty raw -echo; exec cat >> '{}'", sink.display());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&command),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        // Let `stty` take effect before anything is typed.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        agent
+    }
+
+    /// Issue #1383: wait until `sink` holds exactly `expected`.
+    #[cfg(unix)]
+    async fn await_sink(sink: &std::path::Path, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = std::fs::read_to_string(sink).unwrap_or_default();
+            if got == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pane received {got:?}, not {expected:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Issue #1383: one gated submit, timed.
+    #[cfg(unix)]
+    async fn timed_submit(
+        registry: &Arc<AgentPtyRegistry>,
+        pane: &str,
+        agent: &str,
+        text: &str,
+    ) -> Duration {
+        let started = Instant::now();
+        let sent = registry
+            .write_and_submit_guarded(pane, text, agent, || async { true })
+            .await
+            .expect("guarded send result");
+        assert_eq!(sent, GuardedSend::Applied);
+        started.elapsed()
+    }
+
+    /// Issue #1383 (audit): the deadline is checked again after the echo
+    /// watch's setup. A replacement write that passed its deadline check, then
+    /// sat in that setup — a saturated blocking pool, a large scrollback — until
+    /// the deadline was gone, is refused and writes nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detailed_within_refuses_a_deadline_that_passed_during_the_echo_watch_setup() {
+        const PANE: &str = "issue-1383-deadline-during-echo-watch";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sink = dir.path().join("sink");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = spawn_no_echo_sink(&registry, PANE, &sink).await;
+
+        let (reached, release) = registry.pause_next_echo_watch_for_test();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let task = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            let agent = agent.clone();
+            async move {
+                registry
+                    .write_and_submit_guarded_detailed_within(
+                        PANE,
+                        "Read the task file. STALE-SEED-SENTINEL",
+                        &agent,
+                        || async { true },
+                        deadline,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .expect("the write never reached its echo watch")
+            .expect("the paused echo watch was dropped");
+        tokio::time::sleep(deadline.saturating_duration_since(Instant::now())).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(release);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the write finishes once the echo watch is released")
+            .expect("the write does not panic");
+        assert!(
+            matches!(outcome, Err(AgentPtyError::DeadlineElapsed)),
+            "a deadline that passed during the echo watch's setup must refuse the write: \
+             {outcome:?}"
+        );
+        // The pane is still up and writable, and the refused seed never
+        // reached it: the next write is the only thing it has received.
+        timed_submit(
+            &registry,
+            PANE,
+            &agent,
+            "Read the task file. FRESH-SENTINEL",
+        )
+        .await;
+        await_sink(&sink, "Read the task file. FRESH-SENTINEL\r").await;
+        registry.shutdown_all();
+    }
+
+    /// Issue #1383 (audit): once a gated submit into a pane has timed out with
+    /// no echo, the next submit to that pane is not held to the bound — so a
+    /// queue of notices to a pane that does not echo stalls once, not once per
+    /// message.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pane_that_did_not_echo_skips_the_gate_on_its_next_submit() {
+        use crate::submit_echo::SUBMIT_ECHO_BOUND;
+        const PANE: &str = "issue-1383-no-echo-skips";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sink = dir.path().join("sink");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = spawn_no_echo_sink(&registry, PANE, &sink).await;
+
+        let first = timed_submit(
+            &registry,
+            PANE,
+            &agent,
+            "Read the task file. FIRST-SENTINEL",
+        )
+        .await;
+        assert!(
+            first >= SUBMIT_ECHO_BOUND,
+            "precondition: the first submit waited out the bound on a pane that does not \
+             echo; took {first:?}"
+        );
+        for n in 0..3 {
+            let later = timed_submit(
+                &registry,
+                PANE,
+                &agent,
+                &format!("Read the task file. LATER-SENTINEL-{n}"),
+            )
+            .await;
+            assert!(
+                later < SUBMIT_ECHO_BOUND / 2,
+                "submit {n} after a no-echo timeout was held {later:?}; it should keep only \
+                 the fixed delay"
+            );
+        }
+        await_sink(
+            &sink,
+            "Read the task file. FIRST-SENTINEL\r\
+             Read the task file. LATER-SENTINEL-0\r\
+             Read the task file. LATER-SENTINEL-1\r\
+             Read the task file. LATER-SENTINEL-2\r",
+        )
+        .await;
+        registry.shutdown_all();
+    }
+
+    /// Issue #1383 (audit): the suspension lasts one window. The first gated
+    /// submit after it lapses probes the pane again — held to the bound when it
+    /// still does not echo — and that probe suspends the gate afresh.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_echo_gate_applies_again_once_the_no_echo_window_lapses() {
+        use crate::submit_echo::SUBMIT_ECHO_BOUND;
+        const PANE: &str = "issue-1383-no-echo-window";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sink = dir.path().join("sink");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = spawn_no_echo_sink(&registry, PANE, &sink).await;
+
+        timed_submit(
+            &registry,
+            PANE,
+            &agent,
+            "Read the task file. FIRST-SENTINEL",
+        )
+        .await;
+        let target = registry.writer_target_for_pane(PANE).expect("target");
+        {
+            let mut w = target.writer.lock().await;
+            assert!(
+                w.echo_gate_suspended(),
+                "precondition: a no-echo timeout suspended the gate"
+            );
+            // The window, lapsed.
+            w.echo_unobserved_until = Some(Instant::now());
+        }
+
+        let probe = timed_submit(
+            &registry,
+            PANE,
+            &agent,
+            "Read the task file. PROBE-SENTINEL",
+        )
+        .await;
+        assert!(
+            probe >= SUBMIT_ECHO_BOUND,
+            "the first submit after the window lapsed must wait for its echo again; took \
+             {probe:?}"
+        );
+        let after = timed_submit(
+            &registry,
+            PANE,
+            &agent,
+            "Read the task file. AFTER-SENTINEL",
+        )
+        .await;
+        assert!(
+            after < SUBMIT_ECHO_BOUND / 2,
+            "a probe that saw no echo suspends the gate again; the next submit was held \
+             {after:?}"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Issue #1383 (audit): the suspension belongs to one pane's agent. Another
+    /// pane keeps its gate, and so does a new agent in the same pane.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_no_echo_suspension_does_not_reach_another_pane_or_agent() {
+        use crate::submit_echo::SUBMIT_ECHO_BOUND;
+        const SILENT: &str = "issue-1383-no-echo-silent";
+        const OTHER: &str = "issue-1383-no-echo-other";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let silent = spawn_no_echo_sink(&registry, SILENT, &dir.path().join("silent")).await;
+        let other = spawn_no_echo_sink(&registry, OTHER, &dir.path().join("other")).await;
+
+        timed_submit(
+            &registry,
+            SILENT,
+            &silent,
+            "Read the task file. SILENT-SENTINEL",
+        )
+        .await;
+        let skipped = timed_submit(
+            &registry,
+            SILENT,
+            &silent,
+            "Read the task file. SKIP-SENTINEL",
+        )
+        .await;
+        assert!(
+            skipped < SUBMIT_ECHO_BOUND / 2,
+            "precondition: the silent pane's gate is suspended; its submit took {skipped:?}"
+        );
+
+        let elsewhere = timed_submit(
+            &registry,
+            OTHER,
+            &other,
+            "Read the task file. OTHER-SENTINEL",
+        )
+        .await;
+        assert!(
+            elsewhere >= SUBMIT_ECHO_BOUND,
+            "another pane's first submit must still wait for its echo; took {elsewhere:?}"
+        );
+
+        registry.close_agent(&silent).expect("close silent agent");
+        let successor = spawn_no_echo_sink(&registry, SILENT, &dir.path().join("successor")).await;
+        assert_ne!(silent, successor, "the rebind must produce a new agent id");
+        let rebound = timed_submit(
+            &registry,
+            SILENT,
+            &successor,
+            "Read the task file. SUCCESSOR-SENTINEL",
+        )
+        .await;
+        assert!(
+            rebound >= SUBMIT_ECHO_BOUND,
+            "a new agent in the pane must not inherit its predecessor's suspension; took \
+             {rebound:?}"
+        );
+        registry.shutdown_all();
+    }
+
     /// Issue #544 (PR #1398 re-review): a first write's deadline bounds only
     /// what happens BEFORE its first byte. Once the payload is in the pane the
     /// write runs to completion — its `SUBMIT_DELAY` and CR included — and is
@@ -19795,6 +20727,153 @@ mod spawn_tests {
         );
 
         let snap = reg.snapshot(&successor).unwrap_or_default();
+        assert!(
+            !snap.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
+            "the refused payload must not appear in the SUCCESSOR's scrollback"
+        );
+
+        reg.shutdown_all();
+    }
+
+    /// Qodo, PR #1414: an echo-gated write parked in its echo watch's setup —
+    /// under the writer, after every identity check and `revalidate` — whose
+    /// target is closed meanwhile is refused as `Stale` and writes nothing. The
+    /// setup awaits a blocking-pool snapshot and parse, and the writer does not
+    /// keep the agent alive across that await.
+    #[tokio::test]
+    async fn echo_gated_send_refuses_a_target_closed_during_its_echo_watch() {
+        const PANE: &str = "closed-during-echo-watch";
+
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn agent");
+
+        let (reached, release) = reg.pause_next_echo_watch_for_test();
+        let task = tokio::spawn({
+            let reg = Arc::clone(&reg);
+            let id = id.clone();
+            async move {
+                reg.write_and_submit_guarded_detailed(
+                    PANE,
+                    "Read .dot-agent-deck/closed-during-echo-watch.md",
+                    &id,
+                    || async { true },
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .expect("the write never reached its echo watch")
+            .expect("the paused echo watch was dropped");
+
+        reg.close_agent(&id).expect("close agent");
+        drop(release);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the write finishes once the echo watch is released")
+            .expect("the write does not panic")
+            .expect("guarded send result");
+        assert_eq!(
+            outcome,
+            GuardedSendDetail::Outcome(GuardedSend::Stale),
+            "a target closed while its write sat in the echo watch's setup must be refused as \
+             Stale, not written through its stale writer"
+        );
+
+        reg.shutdown_all();
+    }
+
+    /// Qodo, PR #1414: the rebind half of the test above — the pane changes
+    /// hands while the write sits in its echo watch's setup, so the write is
+    /// refused as `WrongSession` and the successor never sees the payload.
+    #[tokio::test]
+    async fn echo_gated_send_refuses_a_pane_rebound_during_its_echo_watch() {
+        const PANE: &str = "rebound-during-echo-watch";
+        const MARKER: &str = "rebound-during-echo-watch-marker";
+
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let spawn = || {
+            reg.spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+        };
+        let original = spawn().expect("spawn original agent");
+
+        let (reached, release) = reg.pause_next_echo_watch_for_test();
+        let task = tokio::spawn({
+            let reg = Arc::clone(&reg);
+            let original = original.clone();
+            async move {
+                reg.write_and_submit_guarded_detailed(
+                    PANE,
+                    &format!("Read {MARKER}"),
+                    &original,
+                    || async { true },
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .expect("the write never reached its echo watch")
+            .expect("the paused echo watch was dropped");
+
+        reg.close_agent(&original).expect("close original agent");
+        let successor = spawn().expect("spawn successor agent");
+        assert_ne!(
+            original, successor,
+            "the rebind must produce a NEW agent id"
+        );
+        drop(release);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the write finishes once the echo watch is released")
+            .expect("the write does not panic")
+            .expect("guarded send result");
+        assert_eq!(
+            outcome,
+            GuardedSendDetail::Outcome(GuardedSend::WrongSession),
+            "a pane that changed hands while the write sat in the echo watch's setup must be \
+             refused as WrongSession"
+        );
+
+        // The successor is up and echoing before its scrollback is read, so
+        // "no marker" cannot pass merely because it had not started.
+        let ready = reg
+            .write_and_submit_guarded(PANE, "SUCCESSOR-READY", &successor, || async { true })
+            .await
+            .expect("readiness write result");
+        assert_eq!(ready, GuardedSend::Applied);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut snap = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            snap = reg
+                .snapshot_off_runtime(&successor)
+                .await
+                .unwrap_or_default();
+            if snap
+                .windows(b"SUCCESSOR-READY".len())
+                .any(|w| w == b"SUCCESSOR-READY")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            snap.windows(b"SUCCESSOR-READY".len())
+                .any(|w| w == b"SUCCESSOR-READY"),
+            "precondition: the successor's PTY must be echoing"
+        );
         assert!(
             !snap.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
             "the refused payload must not appear in the SUCCESSOR's scrollback"

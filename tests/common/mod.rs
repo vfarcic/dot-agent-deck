@@ -1141,6 +1141,13 @@ impl TuiDeck {
             // post-respawn buffer. The two real readiness scenarios opt back in
             // explicitly after this pin.
             ("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "0"),
+            // Issue #1383: the daemon re-sends a delegate's task pointer into the
+            // same worker while nothing proves it arrived. Stand-in workers
+            // declared as a real agent emit no event, and several tests count
+            // pointer occurrences, so the production schedule would type
+            // duplicate pointers into them. Pinned off here; a test that wants
+            // the retry overrides it via `with_env`.
+            ("DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS", "0"),
         ];
         // PATH is required for the deck to spawn its own daemon
         // subcommand (it shells out via `current_exe`, but lookups like
@@ -9157,6 +9164,12 @@ pub fn spawn_daemon_serve_with_env(
     // non-zero value through `extra_env` after this baseline.
     env.push((
         "DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS".into(),
+        "0".into(),
+    ));
+    // Issue #1383: same pin as `TuiDeck` — the in-place delegate retry is off
+    // by default here; a test that wants it sets it in `extra_env`.
+    env.push((
+        "DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS".into(),
         "0".into(),
     ));
     for (k, v) in extra_env {

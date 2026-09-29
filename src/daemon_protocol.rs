@@ -510,6 +510,16 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// above, what makes it *refused*.
 pub const PROTOCOL_VERSION: u32 = 10;
 
+/// Issue #1383: the longest the daemon may hold the Enter of one
+/// [`AttachRequest::WriteAndSubmit`] waiting for its payload to render on a
+/// pane that never shows it. The reply comes after that Enter, so a client
+/// timing the RPC must allow longer than this or it can report a failure for a
+/// write that is still going ahead. It is a property of this RPC, which is why
+/// it is published here; the value is
+/// [`crate::submit_echo::SUBMIT_ECHO_BOUND`], and this is an alias of it rather
+/// than a second number to keep in step.
+pub const WRITE_AND_SUBMIT_ECHO_BOUND: Duration = crate::submit_echo::SUBMIT_ECHO_BOUND;
+
 /// The attach-protocol version the daemon's `Hello` handler advertises as
 /// [`AttachResponse::server_version`]. [`PROTOCOL_VERSION`] in every shipped
 /// build.
