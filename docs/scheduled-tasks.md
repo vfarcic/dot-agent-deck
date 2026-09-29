@@ -63,11 +63,11 @@ Both doors below open the same guided authoring agent (the desktop app has only 
 Either way an agent opens — running the command you chose, which defaults to your [`default_command`](configuration.md#default-command), or `claude` if that is unset — and walks you through it. It:
 
 - asks you for the fields (name, cron, working directory, command, prompt, …);
-- asks for the **command that launches your agent** — one that starts `claude`, `opencode`, `pi`, `codex` or `devin`, directly (`claude --model opus`, `opencode --model gpt-4o`) or through a project wrapper (`devbox run agent-new`, `npm run agent`). Any other command runs, but its card shows no live status. The command is **required**;
+- asks for the **command that launches your agent** — one that starts `claude`, `opencode`, `pi`, `codex` or `devin`, directly (`claude --model opus`, `opencode --model gpt-4o`) or through a project wrapper (`devbox run agent-new`, `npm run agent`). Any other command runs, but the deck cannot track its status. The command is **required**;
 - lets you **try the prompt with the same agent** before saving;
 - **confirms the whole schedule** with you, then saves it.
 
-When it is done it tells you the pane can be closed — it existed only to create the schedule. When the schedule runs, a single-agent run **appears live in its own pane** on the deck, while an orchestration run opens in its tab when you next open the deck.
+When it is done it tells you the pane can be closed — it existed only to create the schedule. When the schedule runs, a single-agent run **appears live in its own pane** on the deck, while an orchestration run opens in its tab when you next open the deck. The desktop app shows both on its Dashboard like agents you started yourself: a single-agent run as a row, an orchestration run as an **ORCHESTRATION** group.
 
 ## What happens when a schedule runs
 

@@ -6,13 +6,13 @@ title: Idle Workers & Notifications
 
 If a worker in an [orchestration](orchestration.md) gets stuck — it stops responding, sits at a prompt, or exits without finishing its task — the deck tells the orchestrator, so the orchestrator can chase the worker, hand the task to another role, or let you know. What it does with that news is up to the instructions you give it.
 
-This only happens inside an orchestration tab. A plain agent pane, a workspace mode and a single-agent schedule never get these reports.
+This only happens inside an orchestration — an orchestration tab in the TUI, an **ORCHESTRATION** group on the desktop app's Dashboard. A plain agent pane, a workspace mode and a single-agent schedule never get these reports.
 
 The deck does not message you itself. To hear about a stuck run on your phone, have the orchestrator send the message — see [Getting these moments to you](#getting-these-moments-to-you).
 
 ## The reports
 
-Each report appears in the orchestrator's pane as a new message, marked `dot-agent-deck daemon report` so the orchestrator knows it comes from the deck and not from you, and asks the orchestrator to decide what to do next.
+Each report appears in the orchestrator's pane as a new message — the same in the TUI and the desktop app — marked `dot-agent-deck daemon report` so the orchestrator knows it comes from the deck and not from you, and asks the orchestrator to decide what to do next.
 
 | Report starts with | When you get it | How to tune it |
 |---|---|---|
@@ -30,7 +30,7 @@ Good to know:
 - **After an "exited" report, the worker still counts as busy with its task**, so run `dot-agent-deck pane restart <role>` (or use `delegate --supersede`) before giving that role new work; see [One task per worker at a time](orchestration.md#one-task-per-worker-at-a-time).
 - **The "blocked" report asks the orchestrator to look at the worker's card first**, because a usage limit can clear on its own: reassign or tell you if the card still shows Blocked, keep waiting if the worker is working again.
 - **`⚠ respawn failed for role …` is shown but not sent.** When the deck cannot start a replacement worker at all, this line appears in the orchestrator's input box without Enter, so the orchestrator acts on it only once you send it.
-- **If you are part-way through typing in the orchestrator's pane**, a report waits until you send or clear what you typed — see [A deck prompt waits while you have an unsent draft](orchestration.md#a-deck-prompt-waits-while-you-have-an-unsent-draft).
+- **If you are part-way through typing in the orchestrator's pane**, in the TUI or the desktop app, a report waits until you send or clear what you typed — see [A deck prompt waits while you have an unsent draft](orchestration.md#a-deck-prompt-waits-while-you-have-an-unsent-draft).
 
 ## Configuring the timeout
 

@@ -50,7 +50,7 @@ flowchart TD
     Release -->|work-done| PR
 ```
 
-You can detach from the deck and reattach whenever you like: the orchestration keeps running, and every worker's report is in the orchestrator's pane when you come back.
+You can detach the TUI, or close the desktop app, and come back whenever you like: the orchestration keeps running, and every worker's report is in the orchestrator's pane when you come back.
 
 ## Quick setup
 
@@ -162,17 +162,17 @@ If a worker gets stuck — it never reports back, or it sits at a permission pro
 
 ### A deck prompt waits while you have an unsent draft
 
-The deck sends messages into panes for you — a delegated task, a worker's report, a scheduled prompt, the reports in [Idle Workers & Notifications](idle-workers-and-notifications.md). If you have typed something into that pane and not sent it yet, the deck's message **waits** instead of being sent together with your text. Press **Enter** to send what you typed, or **Ctrl+U** or **Ctrl+C** to clear it, and the waiting message follows on its own. Other panes, and the rest of the orchestration, keep running meanwhile.
+The deck sends messages into panes for you — a delegated task, a worker's report, a scheduled prompt, the reports in [Idle Workers & Notifications](idle-workers-and-notifications.md). If you have typed something into that pane — in the TUI or in the desktop app's terminal — and not sent it yet, the deck's message **waits** instead of being sent together with your text. Press **Enter** to send what you typed, or **Ctrl+U** or **Ctrl+C** to clear it, and the waiting message follows on its own. Other panes, and the rest of the orchestration, keep running meanwhile.
 
-The wait lasts at most **60 seconds**, so a stray keystroke cannot stall an unattended run. After that the message is sent anyway — possibly together with your text — and the pane's status shows **Error**. To change the limit, set `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` (milliseconds) on the command that starts the deck, or `0` to switch the wait off. A daemon that is already running keeps its old value until you restart it.
+The wait lasts at most **60 seconds**, so a stray keystroke cannot stall an unattended run. After that the message is sent anyway — possibly together with your text — and the pane's status shows **Error** (**FAILED** in the desktop app). To change the limit, set `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` (milliseconds) on the command that starts the deck, or `0` to switch the wait off. A daemon that is already running keeps its old value until you restart it.
 
-Only text you typed **through the deck** makes a message wait. Text the agent puts in its own input box — a prompt recalled from history, an autocompletion — does not, and messages the deck or the desktop app send at your request, such as a new orchestration's first prompt, never wait.
+Only text you typed **through the deck**, in either client, makes a message wait. Text the agent puts in its own input box — a prompt recalled from history, an autocompletion — does not, and messages the deck or the desktop app send at your request, such as a new orchestration's first prompt, never wait.
 
 ### One task per worker at a time
 
 A worker that has been given a task stays busy with it until it sends `work-done`, and until then the deck will not give it another one. `dot-agent-deck delegate` then exits non-zero with `this delegate was NOT sent`, naming the worker, how many tasks it still owes, and how long ago the oldest was sent. When a delegate names several `--to` roles, the free ones still get the task: the command prints a warning naming the busy ones and exits 0 — re-send to just those roles, since repeating the whole delegate would give the free roles the task twice.
 
-What counts is whether the worker has reported back, not what its card says: a card can show `Working` or idle while the worker still owes a `work-done`. A worker whose agent exited without reporting is still busy too; `dot-agent-deck pane restart <role>` frees it. If the orchestrator's own agent has been replaced since it delegated, the new orchestrator is not blocked by the old one's tasks — the delegate is sent, and the command says which earlier task it superseded.
+What counts is whether the worker has reported back, not what its status says: its card in the TUI can show `Working` or idle, and its row in the desktop app **RUNNING** or **WAITING**, while the worker still owes a `work-done`. A worker whose agent exited without reporting is still busy too; `dot-agent-deck pane restart <role>` frees it. If the orchestrator's own agent has been replaced since it delegated, the new orchestrator is not blocked by the old one's tasks — the delegate is sent, and the command says which earlier task it superseded.
 
 When the earlier task is not coming back, there are three ways out:
 
@@ -186,7 +186,7 @@ When the earlier task is not coming back, there are three ways out:
 
 With `clear = false` the agent is left running. The task is typed straight into the session that is already sitting there, so delivery is immediate and the worker keeps everything it learned from previous delegations.
 
-With `clear = true` — the default — every task starts fresh. The deck stops the worker's agent, starts the role's `command` again in the same pane, and hands the task to the new agent. The role card stays where it is with the same name, but the previous conversation is gone, so each task gets a clean context instead of one long, drifting session.
+With `clear = true` — the default — every task starts fresh. The deck stops the worker's agent, starts the role's `command` again in the same pane, and hands the task to the new agent. The role's card in the TUI, or its row in the desktop app, stays where it is with the same name, but the previous conversation is gone, so each task gets a clean context instead of one long, drifting session.
 
 The role's pane does not even have to exist. If you closed it, or its agent died, the next task starts a fresh worker from the role's `command`, so a role stays reachable for as long as the orchestration runs. If the new worker cannot be started, the orchestrator is told in its pane; see [A delegated worker never came up](#a-delegated-worker-never-came-up).
 
@@ -270,7 +270,7 @@ The deck recognises the agent when `command` starts it directly: `claude --model
 
 What you see when it cannot tell:
 
-- The role card reads **No agent** and shows no status. A **Codex** role stays blank from launch until you delegate its first task to it, and then quietly starts working; a Claude role behind the same wrapper looks fine, because Claude identifies itself as soon as it starts.
+- In the TUI the role card reads **No agent** and shows no status; in the desktop app the row's **CLI** column is blank. A **Codex** role stays blank from launch until you delegate its first task to it, and then quietly starts working; a Claude role behind the same wrapper looks fine, because Claude identifies itself as soon as it starts.
 - A Codex, Pi or OpenCode role with `clear = true` behind a launcher waits up to **30 seconds** for every task. `dot-agent-deck validate` warns about each such role.
 
 Set `agent` to say which agent the launcher starts:
@@ -542,7 +542,7 @@ command = "devbox run agent-coder-oc"
 The rules:
 
 - **`extends` names the parent's literal `name`.** The parent may appear anywhere in the file, above or below. A block with no `name` cannot be a parent.
-- **Roles are matched by name and keep the parent's order**, so a variant opens with the same role cards as its parent, whatever order you write the overrides in.
+- **Roles are matched by name and keep the parent's order**, so a variant opens with the same roles, in the same order, as its parent, whatever order you write the overrides in.
 - **An omitted field keeps the parent's value.** Restate only what differs. To turn off an inherited `clear = true`, write `clear = false` explicitly — an omitted boolean means "inherit", not "false".
 - **A role name the parent does not have is added** as a new role, and must carry its own `command` since there is nothing to inherit one from.
 - **Chains work** (`a` extends `b` extends `c`); a cycle is rejected when the file is read.
@@ -552,7 +552,7 @@ An `extends` that names an orchestration that does not exist, or forms a cycle, 
 
 ### Which orchestration a schedule opens
 
-**Most of the time you do not need a default.** When you start an orchestration yourself you choose it: the New Agent form (`Ctrl+n`) lists every orchestration in its Mode field, and a [dispatcher pane](dispatcher-mode.md) asks before it starts anything.
+**Most of the time you do not need a default.** When you start an orchestration yourself you choose it: the TUI's New Agent form (`Ctrl+n`) lists every orchestration in its Mode field, the desktop app's **New agent** offers each one as a **Mode** chip, and a [dispatcher pane](dispatcher-mode.md) asks before it starts anything.
 
 `default = true` is for when **there is nobody to ask** — a [schedule](scheduled-tasks.md) whose working directory defines several orchestrations:
 
@@ -620,7 +620,7 @@ So when you pick an orchestration whose directory already runs one, the New Agen
     and one working tree; /worktree-prd isolates.
 ```
 
-Press `Enter` and the tab opens anyway. If the two really need to run at once, give each its own worktree instead.
+Press `Enter` and the tab opens anyway. The desktop app's **New agent** shows the same warning, and **Activate orchestration** still starts the run. If the two really need to run at once, give each its own worktree instead.
 
 ## Troubleshooting
 
