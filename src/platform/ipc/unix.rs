@@ -165,35 +165,43 @@ impl IpcListener {
         Ok(IpcStream(stream))
     }
 
-    /// Adopt an already-bound [`tokio::net::UnixListener`], refusing it unless
-    /// the inode at its own address is this user's socket at exactly `0o600` —
-    /// the same predicate a client's `verify_endpoint_trusted` applies before it
-    /// connects.
+    /// Bind a listener at `endpoint`, owner-only, **without** touching the
+    /// process umask — by making the socket's directory owner-only first.
     ///
-    /// For a caller that cannot use [`bind`], whose owner-only guarantee comes
-    /// from flipping the **process** umask around `bind(2)`: under a plain
-    /// `cargo test` that flip is visible to every sibling test, and the desktop
+    /// [`bind`] gets its guarantee by flipping the **process** umask around
+    /// `bind(2)`, which every other thread in the process sees for that moment.
+    /// Under a plain `cargo test` that is every sibling test, and the desktop
     /// crate's lib tests, which run the production attach server in-process,
-    /// raced on it (issue #1078). Such a caller binds plainly and restates the
-    /// mode itself; this checks that it did rather than trusting it. Unlike
-    /// [`bind`] there is no window this closes: a listener is owner-only by the
-    /// time it is adopted, or it is refused.
+    /// raced on it (issue #1078). This gets the same guarantee from the
+    /// directory instead: [`ensure_owner_only_dir`] creates `endpoint`'s parent
+    /// at `0o700`, or tightens an existing one to it, refusing a symlink or a
+    /// directory another user owns. With the parent owner-only no other user
+    /// can reach the socket while it is bound at the ambient umask, and the
+    /// `0o600` restatement [`bind`] also performs follows.
+    ///
+    /// It tightens the parent as a side effect, so point it only at a directory
+    /// that is meant to be this user's alone. Like [`ensure_owner_only_dir`] it
+    /// vouches for the final component only; an ancestor another user controls
+    /// is outside what it can promise.
     ///
     /// [`bind`]: Self::bind
-    pub fn adopt_owner_only(listener: UnixListener) -> io::Result<Self> {
-        let address = listener.local_addr()?;
-        let Some(endpoint) = address.as_pathname() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "an unnamed or abstract socket has no inode to check",
-            ));
-        };
-        crate::platform::fsperm::verify_endpoint_trusted(endpoint).map_err(|reason| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("refusing to adopt {}: {reason}", endpoint.display()),
-            )
-        })?;
+    /// [`ensure_owner_only_dir`]: crate::platform::fsperm::ensure_owner_only_dir
+    pub fn bind_in_owner_only_dir(endpoint: &Path) -> io::Result<Self> {
+        let parent = endpoint
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} names no directory to make owner-only",
+                        endpoint.display()
+                    ),
+                )
+            })?;
+        crate::platform::fsperm::ensure_owner_only_dir(parent)?;
+        let listener = UnixListener::bind(endpoint)?;
+        crate::platform::fsperm::set_endpoint_mode_owner_only(endpoint)?;
         Ok(Self(listener))
     }
 
@@ -868,37 +876,57 @@ mod tests {
         );
     }
 
-    /// Scenario: a listener is bound plainly in a temp dir and its socket set to
-    /// `0o600`; adopting it succeeds. Another is left group- and
-    /// world-accessible (`0o666`); adopting it is refused as a permission
-    /// error naming the socket, so the owner-only guarantee [`IpcListener::bind`]
-    /// gives cannot be skipped by adopting instead (issue #1078).
-    #[tokio::test]
-    async fn adopting_a_listener_requires_an_owner_only_socket() {
+    /// Scenario: a socket is bound in a directory that does not exist yet, and
+    /// another in an existing world-readable (`0o755`) one. Both directories end
+    /// up `0o700`, both sockets `0o600`, and a client connects to each. A
+    /// symlink standing where the directory should be is refused rather than
+    /// followed (issue #1078).
+    #[test]
+    fn binding_in_an_owner_only_dir_makes_the_dir_and_the_socket_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
-
-        let owner_only = dir.path().join("owner-only.sock");
-        let listener = tokio::net::UnixListener::bind(&owner_only).expect("bind");
-        std::fs::set_permissions(&owner_only, std::fs::Permissions::from_mode(0o600))
-            .expect("chmod 0o600");
-        assert!(
-            IpcListener::adopt_owner_only(listener).is_ok(),
-            "this user's socket at exactly 0o600 is what a client trusts, so it is adopted"
-        );
-
-        let open = dir.path().join("open.sock");
-        let listener = tokio::net::UnixListener::bind(&open).expect("bind");
-        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o666))
-            .expect("chmod 0o666");
-        let refused = match IpcListener::adopt_owner_only(listener) {
-            Ok(_) => panic!("a socket other local users can reach must not be adopted"),
-            Err(err) => err,
+        let mode = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777
         };
-        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("a runtime to bind in");
+        let _entered = runtime.enter();
+        let root = tempfile::tempdir().expect("tempdir");
+
+        let fresh = root.path().join("fresh");
+        let open = root.path().join("open");
+        std::fs::create_dir(&open).expect("create the open dir");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 0o755");
+        for dir in [&fresh, &open] {
+            let endpoint = dir.join("attach.sock");
+            let _listener = IpcListener::bind_in_owner_only_dir(&endpoint).expect("bind");
+            assert_eq!(mode(dir), 0o700, "{} is owner-only", dir.display());
+            assert_eq!(
+                mode(&endpoint),
+                0o600,
+                "{} is owner-only",
+                endpoint.display()
+            );
+            UnixStream::connect(&endpoint).expect("a client reaches the listener");
+        }
+
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).expect("create the link target");
+        let linked = root.path().join("linked");
+        std::os::unix::fs::symlink(&target, &linked).expect("plant the symlink");
         assert!(
-            refused.to_string().contains("open.sock"),
-            "the refusal names the socket: {refused}"
+            IpcListener::bind_in_owner_only_dir(&linked.join("attach.sock")).is_err(),
+            "a symlinked directory must be refused, not followed"
+        );
+        assert!(
+            !target.join("attach.sock").exists(),
+            "nothing was bound through the link"
         );
     }
 }

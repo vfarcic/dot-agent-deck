@@ -9,13 +9,11 @@
 //! directory with no execute bit, so its next `bind` failed `EACCES`. That was
 //! one of the causes that kept `cargo test --lib` red.
 //!
-//! So the tests that run the production attach server bind here instead: a
-//! plain `bind(2)` at the ambient umask, then the same `0o600` restatement
-//! `IpcListener::bind` performs as defense in depth. The inode the client's
-//! trust check sees is the same — this user's socket at exactly `0o600`. What
-//! these tests no longer exercise is the flip itself, the production helper's
-//! way of creating the inode owner-only with no bind-then-chmod window; the
-//! root crate's own tests cover that helper.
+//! So the tests that run the production attach server bind through
+//! `IpcListener::bind_in_owner_only_dir`, which makes the socket's directory
+//! owner-only first and then binds at the ambient umask. The inode the client's
+//! trust check sees is the same — this user's socket at exactly `0o600` — and
+//! the scratch directory it sits in is tightened to `0o700`.
 
 use std::path::Path;
 
@@ -26,9 +24,5 @@ use dot_agent_deck::platform::ipc::IpcListener;
 /// Unlike `bind_attach_listener` it does not clear a stale inode first: every
 /// caller binds in a fresh scratch directory, where there is none.
 pub(crate) fn bind_owner_only(socket: &Path) -> std::io::Result<IpcListener> {
-    let listener = tokio::net::UnixListener::bind(socket)?;
-    dot_agent_deck::platform::fsperm::set_endpoint_mode_owner_only(socket)?;
-    // Checked, not trusted: `adopt_owner_only` refuses anything but this user's
-    // socket at exactly `0o600`.
-    IpcListener::adopt_owner_only(listener)
+    IpcListener::bind_in_owner_only_dir(socket)
 }

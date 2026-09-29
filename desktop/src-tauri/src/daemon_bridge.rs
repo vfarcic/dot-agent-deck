@@ -4058,7 +4058,8 @@ mod tests {
     /// inside the flip made a directory with no execute bit, whose next `bind`
     /// failed `EACCES` (issue #1078). [`crate::test_listener::bind_owner_only`]
     /// makes the same inode — this user's socket at exactly `0o600`, which is
-    /// what `verify_endpoint_trusted` checks — without the flip. What these
+    /// what `verify_endpoint_trusted` checks — without the flip, by making the
+    /// socket's directory owner-only before binding in it. What these
     /// tests no longer exercise is the flip itself, the production helper's way
     /// of creating the inode owner-only with no bind-then-chmod window; the
     /// root crate's own tests cover that helper.
