@@ -109,7 +109,10 @@ impl CardDensity {
     /// `Tools` counters onto the bottom border, deleting the card-width axis
     /// that used to add a stats row (and a sixth height) to narrow cards. Any
     /// future line `render_session_card` gains must be added here in the same
-    /// change, or cards overlap / leave a blank tail row.
+    /// change, or cards overlap / leave a blank tail row. The one exception is
+    /// a CONDITIONAL status row (`Orphaned`, the Blocked reason): those are
+    /// fitted inside this height by `fit_card_rows` (issue #1368), because
+    /// every card in a grid row shares one height.
     fn card_height(self) -> u16 {
         let prompts = self.max_prompts() as u16;
         let tools = self.max_tools() as u16;
@@ -20431,19 +20434,25 @@ fn render_session_card(
         .map(|n| n.to_string_lossy())
         .unwrap_or_else(|| "—".into());
 
-    let mut lines: Vec<Line<'_>> = Vec::new();
-
     // PRD #339: with the counters on the border, `Dir:` gets the whole inner
     // width at every card width — one un-branched form, always ellipsized (the
     // old narrow branch bare-clipped the path with no `…`).
     let dir_label_len = 6; // "Dir:  "
-    lines.push(Line::from(vec![
+    let dir_line = Line::from(vec![
         Span::styled("Dir:  ", text_primary()),
         Span::raw(truncate_with_ellipsis(
             cwd_display.as_ref(),
             w.saturating_sub(dir_label_len),
         )),
-    ]));
+    ]);
+
+    // Issue #1368: the conditional rows below (`Orphaned`, the Blocked reason)
+    // are NOT part of `CardDensity::card_height` — every card in a grid row
+    // shares one height, and a card's height stays a function of density alone.
+    // They are collected separately so `fit_card_rows` can make room for them
+    // inside that height instead of letting the Paragraph clip the newest tool
+    // line off the bottom.
+    let mut status_lines: Vec<Line<'_>> = Vec::new();
 
     // Issue #770: say what the title badge means, in the one place a reader
     // looks when a card stops behaving. Placed directly under `Dir:` so it
@@ -20451,7 +20460,7 @@ fn render_session_card(
     // the fact that explains why those rows keep advancing while the run has in
     // fact stalled.
     if is_orphaned {
-        lines.push(Line::from(Span::styled(
+        status_lines.push(Line::from(Span::styled(
             truncate_with_ellipsis("Orphaned — delegation unavailable", w),
             Style::default().fg(palette::status_color(&SessionStatus::Error)),
         )));
@@ -20490,14 +20499,15 @@ fn render_session_card(
             Some(detail) => format!("⚠ {label}{resets} — {detail}"),
             None => format!("⚠ {label}{resets}"),
         };
-        lines.push(Line::from(Span::styled(
+        status_lines.push(Line::from(Span::styled(
             truncate_with_ellipsis(&text, w),
             Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
         )));
     }
 
+    let mut prompt_lines: Vec<Line<'_>> = Vec::new();
     if is_placeholder {
-        lines.push(Line::from(Span::styled(
+        prompt_lines.push(Line::from(Span::styled(
             "Launch an agent to get started",
             text_primary(),
         )));
@@ -20507,21 +20517,83 @@ fn render_session_card(
             let prefix = if i == 0 { "Prmt: " } else { "      " };
             let max_prompt = w.saturating_sub(6);
             let display = truncate_with_ellipsis(prompt, max_prompt);
-            lines.push(Line::from(vec![
+            prompt_lines.push(Line::from(vec![
                 Span::styled(prefix, text_primary()),
                 Span::raw(display),
             ]));
         }
     }
 
-    if density != CardDensity::Compact {
+    let tool_lines = recent_tool_lines(session, density.max_tools());
+
+    let plan = fit_card_rows(
+        inner.height as usize,
+        status_lines.len(),
+        prompt_lines.len(),
+        density != CardDensity::Compact,
+        tool_lines.len(),
+    );
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    if plan.dir {
+        lines.push(dir_line);
+    }
+    lines.extend(status_lines);
+    let skip_prompts = prompt_lines.len() - plan.prompts;
+    lines.extend(prompt_lines.into_iter().skip(skip_prompts));
+    if plan.separator {
         lines.push(Line::from(""));
     }
-    let tool_lines = recent_tool_lines(session, density.max_tools());
     lines.extend(tool_lines);
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
+}
+
+/// Which of a card's sheddable rows [`render_session_card`] draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CardRowPlan {
+    dir: bool,
+    /// How many of the NEWEST prompt rows to keep.
+    prompts: usize,
+    separator: bool,
+}
+
+/// Fit a card's rows into `budget` inner rows (issue #1368).
+///
+/// A card's height is a function of density alone ([`CardDensity::card_height`])
+/// because a grid row shares one height, so the conditional status rows — the
+/// `Orphaned` line and the Blocked reason — have to find room inside it. Rows are
+/// shed in this order until everything fits: the blank separator (dropped
+/// whenever a status row is shown, so a Blocked card's tools never jump a row as
+/// the history fills), then prompts oldest-first, then `Dir:`. Status rows and
+/// tool history are never shed here; the tool rows are what the card is for, and
+/// the status row is why the card needs attention. A card with no status row at
+/// its own density's height already fits, so its layout is unchanged.
+fn fit_card_rows(
+    budget: usize,
+    status_rows: usize,
+    prompt_rows: usize,
+    separator: bool,
+    tool_rows: usize,
+) -> CardRowPlan {
+    let mut plan = CardRowPlan {
+        dir: true,
+        prompts: prompt_rows,
+        separator: separator && status_rows == 0,
+    };
+    let used = |p: &CardRowPlan| {
+        usize::from(p.dir) + status_rows + p.prompts + usize::from(p.separator) + tool_rows
+    };
+    if used(&plan) > budget {
+        plan.separator = false;
+    }
+    while used(&plan) > budget && plan.prompts > 0 {
+        plan.prompts -= 1;
+    }
+    if used(&plan) > budget {
+        plan.dir = false;
+    }
+    plan
 }
 
 fn flash_dot(status: &SessionStatus, tick: u64) -> &'static str {
@@ -31430,6 +31502,37 @@ mod tests {
         assert_eq!(CardDensity::Compact.card_height(), 5);
         assert_eq!(CardDensity::Normal.card_height(), 8);
         assert_eq!(CardDensity::Spacious.card_height(), 10);
+    }
+
+    /// Issue #1368: a status row is fitted inside the density's height — the
+    /// separator goes first, then the oldest prompts, then `Dir:` — and a card
+    /// without one keeps every row at its own density's height.
+    #[test]
+    fn fit_card_rows_makes_room_for_status_rows() {
+        let plan = |d: CardDensity, status| {
+            let budget = d.card_height() as usize - 2;
+            fit_card_rows(
+                budget,
+                status,
+                d.max_prompts(),
+                d != CardDensity::Compact,
+                d.max_tools(),
+            )
+        };
+        let row = |dir, prompts, separator| CardRowPlan {
+            dir,
+            prompts,
+            separator,
+        };
+        assert_eq!(plan(CardDensity::Normal, 0), row(true, 1, true));
+        assert_eq!(plan(CardDensity::Spacious, 0), row(true, 3, true));
+        assert_eq!(plan(CardDensity::Compact, 0), row(true, 1, false));
+        assert_eq!(plan(CardDensity::Normal, 1), row(true, 1, false));
+        assert_eq!(plan(CardDensity::Spacious, 1), row(true, 3, false));
+        assert_eq!(plan(CardDensity::Compact, 1), row(true, 0, false));
+        assert_eq!(plan(CardDensity::Normal, 2), row(true, 0, false));
+        assert_eq!(plan(CardDensity::Spacious, 2), row(true, 2, false));
+        assert_eq!(plan(CardDensity::Compact, 2), row(false, 0, false));
     }
 
     /// Review finding S1: the card grid must re-clamp a stale scroll offset
