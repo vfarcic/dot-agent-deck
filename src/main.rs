@@ -730,13 +730,18 @@ enum AckStream {
 /// daemon keeps re-sending the pointer in that case, which the task file tells
 /// the worker to expect.
 ///
-/// Only a recognisable ack from the daemon with `accepted: true` prints
-/// "Acknowledged". `NoReply` — which is how a daemon older than `ack` answers,
-/// because it predates the verb — and a line that is not an ack this build
-/// understands are both reported on stderr as "could not confirm", still with
-/// exit 0: nothing proves the deck saw the ack, so the worker must not be told
-/// it did, and nothing proves it failed either, so the worker carries on.
+/// Only a recognisable ack with `accepted: true` whose `delivery` says the id
+/// named the pane's current delivery prints "Acknowledged" (PR #1414 review:
+/// admission alone is not a match). An id the deck does not know — mistyped, or
+/// an earlier task's — is said so on stderr, still with exit 0. `NoReply` —
+/// which is how a daemon older than `ack` answers, because it predates the verb
+/// — an admission that carries no `delivery`, and a line that is not an ack
+/// this build understands are all reported on stderr as "could not confirm",
+/// still with exit 0: nothing proves the deck matched the ack, so the worker
+/// must not be told it did, and nothing proves it failed either, so the worker
+/// carries on.
 fn ack_report(reply: &AckReply) -> (AckStream, String) {
+    use dot_agent_deck::event::AckDelivery;
     use dot_agent_deck::hook::SocketReply;
     const CARRY_ON: &str = "this is harmless — carry on with your task.";
     let not_confirmed = |why: &str| {
@@ -753,10 +758,21 @@ fn ack_report(reply: &AckReply) -> (AckStream, String) {
             not_confirmed("the deck did not answer; it may predate acknowledgements")
         }
         AckReply::Socket(SocketReply::Line(line)) => match parse_signal_ack(line) {
-            Some(ack) if ack.accepted => (
-                AckStream::Stdout,
-                "Acknowledged. Carry on with your task.".to_string(),
-            ),
+            Some(ack) if ack.accepted => match ack.delivery {
+                Some(delivery) if delivery.recorded() => (
+                    AckStream::Stdout,
+                    "Acknowledged. Carry on with your task.".to_string(),
+                ),
+                Some(AckDelivery::Unknown) => (
+                    AckStream::Stderr,
+                    format!(
+                        "The deck has no delivery under that id for this pane (mistyped, or from \
+                         an earlier task), so it may send the task pointer again; {CARRY_ON}"
+                    ),
+                ),
+                Some(_) => not_confirmed("the deck's reply was not one this build understands"),
+                None => not_confirmed("the deck did not say whether the delivery id matched"),
+            },
             Some(ack) => not_confirmed(&format!(
                 "the deck refused it{}",
                 ack.reason
@@ -4002,22 +4018,40 @@ mod tests {
 
     /// Issue #1383: `ack` exits 0 whatever happens, and says on stderr — never
     /// as a failure — when receipt could not be confirmed. Only an accepted ack
-    /// from the daemon prints "Acknowledged"; an unanswered one (an older
-    /// daemon) does not.
+    /// whose id matched the pane's delivery prints "Acknowledged"; an unanswered
+    /// one (an older daemon) and a bare admission (PR #1414 review) do not.
     #[test]
     fn ack_report_is_never_a_failure_and_says_what_happened() {
+        use dot_agent_deck::event::{AckDelivery, SignalAck};
         use dot_agent_deck::hook::SocketReply;
-        let accepted =
-            serde_json::to_string(&dot_agent_deck::event::SignalAck::accepted()).unwrap();
-        let refused = serde_json::to_string(&dot_agent_deck::event::SignalAck::refused(
-            "missing_token",
-            "no token",
-        ))
-        .unwrap();
+        let line = |ack: SignalAck| {
+            AckReply::Socket(SocketReply::Line(serde_json::to_string(&ack).unwrap()))
+        };
+        let refused =
+            serde_json::to_string(&SignalAck::refused("missing_token", "no token")).unwrap();
         let cases = [
             (
-                AckReply::Socket(SocketReply::Line(accepted)),
+                line(SignalAck::acknowledged(AckDelivery::Stopped)),
                 AckStream::Stdout,
+            ),
+            (
+                line(SignalAck::acknowledged(AckDelivery::AlreadyAcknowledged)),
+                AckStream::Stdout,
+            ),
+            (
+                line(SignalAck::acknowledged(AckDelivery::NotPending)),
+                AckStream::Stdout,
+            ),
+            // Admitted, but the daemon did not say the id matched: an admission
+            // is not a match.
+            (line(SignalAck::accepted()), AckStream::Stderr),
+            // A delivery outcome a later daemon added.
+            (
+                AckReply::Socket(SocketReply::Line(
+                    r#"{"kind":"signal_ack","accepted":true,"delivery":"something_new"}"#
+                        .to_string(),
+                )),
+                AckStream::Stderr,
             ),
             // An older daemon that does not know `ack` answers nothing: that
             // must not read as "Acknowledged".
@@ -4050,6 +4084,16 @@ mod tests {
                 }
             }
         }
+        // A mistyped or stale id is said so, still harmlessly and never as
+        // "Acknowledged".
+        let (stream, unknown) = ack_report(&line(SignalAck::acknowledged(AckDelivery::Unknown)));
+        assert_eq!(stream, AckStream::Stderr, "{unknown}");
+        assert!(!unknown.contains("Acknowledged"), "{unknown}");
+        assert!(unknown.contains("no delivery under that id"), "{unknown}");
+        assert!(
+            unknown.ends_with("this is harmless — carry on with your task."),
+            "{unknown}"
+        );
         let (_, refused_message) = ack_report(&AckReply::Socket(SocketReply::Line(
             serde_json::to_string(&dot_agent_deck::event::SignalAck::refused(
                 "missing_token",

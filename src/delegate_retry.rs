@@ -19,16 +19,20 @@
 //! respawns anything.
 //!
 //! Every re-delivery starts with a submit-only probe — a bare Enter — and reads
-//! the worker's screen. When the delivery id is visible there, the pointer is
-//! most likely parked unsubmitted in the agent's composer (issue #1243's shape),
-//! and the re-delivery never types it again: after the grace below it presses
-//! Enter once more if the id is still on screen, because an agent that took the
-//! first CR into a paste swallows the next Enter. When it is not visible, the screen
+//! the worker's screen. When the pointer ends at the cursor, it is most likely
+//! parked unsubmitted in the agent's composer (issue #1243's shape), and the
+//! re-delivery never types it again: after the grace below it presses Enter
+//! once more if it is still there, because an agent that took the first CR into
+//! a paste swallows the next Enter. When the id shows only in the transcript,
+//! the pointer was submitted: that re-delivery is the probe's Enter alone, and
+//! once any reading has seen that the pointer is never typed again for this
+//! delivery. When it is not visible, the screen
 //! cannot tell an empty composer from one holding the pointer where the screen
 //! does not show it, so the loop waits a short grace ([`probe_grace`]) for the
 //! turn that Enter would start, and types the pointer again, with the same id,
-//! only if the worker is still silent. A screen blanked by a resize since the
-//! pointer went in gets the Enter alone. The task file tells the worker that a
+//! only if the worker is still silent. A screen the deck cannot read — blanked
+//! by a resize since the pointer went in, empty, unparseable or too large —
+//! gets the Enter alone. The task file tells the worker that a
 //! repeated pointer is the same task.
 //!
 //! That ordering makes a doubled pointer unlikely, not impossible: a composer
@@ -233,17 +237,20 @@ pub fn pointer_suffix(delivery_id: &str) -> String {
 /// Daemon-written on every delegation, whatever the role's `prompt_template`
 /// says, so no project has to opt in. It also tells the worker that a failing
 /// `ack` is harmless: a `dot-agent-deck` binary in the pane older than the
-/// daemon rejects the unknown subcommand, and the task must not stall on that.
+/// daemon rejects the unknown subcommand, and a role whose tool allowlist does
+/// not yet name `ack` refuses it or asks for approval (PR #1414 review). The
+/// task must not stall on either.
 pub fn task_file_ack_header(delivery_id: &str) -> String {
     let bin = crate::platform::paths::binary_name();
     format!(
         "## First: acknowledge this task\n\n\
-         Run this command via Bash before anything else:\n\n\
+         Run this command via Bash first:\n\n\
          ```bash\n\
          {bin} ack {delivery_id}\n\
          ```\n\n\
          It tells the deck this task reached you, so it stops re-sending the pointer. If the \
-         command fails or is not recognised, ignore that and carry on with the task. If you see \
+         command fails, is not recognised, or is refused or needs an approval you do not get, \
+         skip it and carry on with the task. If you see \
          this task pointer more than once, it is the same task: do not start it again."
     )
 }
@@ -325,14 +332,20 @@ pub enum Composer {
     /// The delivery id is on screen, but the pointer does not end at the
     /// cursor: most likely a submitted pointer still in the transcript above an input box that holds
     /// something else, or nothing. The re-delivery is the submit-only probe and
-    /// nothing more — no second Enter into that other input, and no second
-    /// copy of a pointer that was most likely already submitted.
+    /// nothing more — no second Enter into that other input — and, once any
+    /// reading has seen this, the delivery is never retyped (PR #1414 review):
+    /// a later screen that no longer shows the pointer has most likely only
+    /// scrolled it away. Later re-deliveries still press their probe Enter,
+    /// because a worker that is not reading its terminal yet has the pointer
+    /// and each Enter echoed into this shape by the line discipline alone
+    /// (`orchestration/delegate/042`).
     PointerInHistory,
-    /// The screen shows nothing at all, and the PTY was resized since the
-    /// pointer was typed. A resize drops the scrollback ring the screen is read
-    /// from, so a blank screen then says nothing about the composer — an agent
-    /// that has not repainted still holds whatever it held. The re-delivery is
-    /// the submit-only probe alone, never a second copy.
+    /// The screen says nothing about the composer: it shows nothing at all and
+    /// the PTY was resized since the pointer was typed (a resize drops the
+    /// scrollback ring the screen is read from, and an agent that has not
+    /// repainted still holds whatever it held), or the snapshot is empty, does
+    /// not parse, or is over [`MAX_RETRY_SCREEN_CELLS`]. The re-delivery is the
+    /// submit-only probe alone, never a second copy.
     Unreadable,
     /// No trace of it on screen — which is not proof the composer is empty. The
     /// probe, then a retype only after an unanswered grace.
@@ -548,11 +561,29 @@ pub enum AckOutcome {
     Stopped { silence_seq: Option<u64> },
     /// The pane's last acknowledged delivery, acknowledged again. A no-op.
     AlreadyAcknowledged,
-    /// Nothing pending matches: a delivery that already ended (a turn began,
-    /// the schedule ran out, it was superseded), one that was never armed (the
-    /// retry is off, or a Pi seed delivery), or another generation's id. A
-    /// no-op.
+    /// The pane's current delivery, with no retry pending to stop: its loop
+    /// already ended (most often because a turn began, which a real agent
+    /// reports before the `ack` it runs as a tool) or was never armed (the retry
+    /// is off, the agent type is not retried, or a Pi seed delivery). A no-op,
+    /// but a genuine acknowledgement of the task the pane was last given.
+    NotPending,
+    /// The id is not the pane's current delivery: mistyped, an earlier
+    /// delegation's, or one presented by another agent on the pane while its
+    /// retry is pending. A no-op, so a pending retry keeps running.
     Unknown,
+}
+
+impl AckOutcome {
+    /// Whether the id named the pane's current delivery, so the worker can be
+    /// told its acknowledgement was recorded.
+    pub fn matched(self) -> bool {
+        match self {
+            AckOutcome::Stopped { .. }
+            | AckOutcome::AlreadyAcknowledged
+            | AckOutcome::NotPending => true,
+            AckOutcome::Unknown => false,
+        }
+    }
 }
 
 struct PendingDelivery {
@@ -571,6 +602,11 @@ struct PendingInner {
     /// The last delivery id acknowledged per pane, so a repeat ack is told
     /// apart from one that never matched anything.
     last_acked: HashMap<String, String>,
+    /// The delivery id of each pane's most recent delegation, whether or not a
+    /// retry was armed for it and after its loop ends, so an ack that arrives
+    /// once the loop has already stopped is told apart from a mistyped or stale
+    /// id.
+    current: HashMap<String, String>,
 }
 
 /// The deliveries a retry loop is watching, one per worker pane.
@@ -602,6 +638,9 @@ impl PendingDeliveries {
         let mut inner = self.inner.lock().unwrap();
         inner.next_seq += 1;
         let seq = inner.next_seq;
+        inner
+            .current
+            .insert(pane_id.to_string(), delivery_id.to_string());
         inner.records.insert(
             pane_id.to_string(),
             PendingDelivery {
@@ -623,14 +662,28 @@ impl PendingDeliveries {
     pub fn supersede(&self, pane_id: &str) -> bool {
         let mut inner = self.inner.lock().unwrap();
         inner.last_acked.remove(pane_id);
+        inner.current.remove(pane_id);
         inner.records.remove(pane_id).is_some()
+    }
+
+    /// Record `delivery_id` as the pane's current delivery, armed or not, so
+    /// its ack reads as [`AckOutcome::NotPending`] rather than
+    /// [`AckOutcome::Unknown`] when no retry is pending. Called by every
+    /// delegation, after [`Self::supersede`].
+    pub fn note_delivery(&self, pane_id: &str, delivery_id: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .current
+            .insert(pane_id.to_string(), delivery_id.to_string());
     }
 
     /// Acknowledge `delivery_id` on `pane_id`.
     ///
     /// Matches only the pane's CURRENT delivery, and, when the caller presents
     /// an agent id, only that delivery's worker — an older generation's ack
-    /// cannot stop a newer generation's loop. Idempotent.
+    /// cannot stop a newer generation's loop. Idempotent. The outcome is what
+    /// the `ack` CLI reports to the worker; see [`AckOutcome::matched`].
     pub fn acknowledge(
         &self,
         pane_id: &str,
@@ -654,12 +707,27 @@ impl PendingDeliveries {
                 silence_seq: record.silence_seq,
             };
         }
+        // Still pending under this id, but presented by another agent: the
+        // retry keeps running, so it must not read as recorded.
+        if inner.records.contains_key(pane_id) {
+            return AckOutcome::Unknown;
+        }
         if inner
             .last_acked
             .get(pane_id)
             .is_some_and(|last| last == delivery_id)
         {
             return AckOutcome::AlreadyAcknowledged;
+        }
+        if inner
+            .current
+            .get(pane_id)
+            .is_some_and(|current| current == delivery_id)
+        {
+            inner
+                .last_acked
+                .insert(pane_id.to_string(), delivery_id.to_string());
+            return AckOutcome::NotPending;
         }
         AckOutcome::Unknown
     }
@@ -918,6 +986,10 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
             .unwrap_or_default()
     };
     let mut last_classification: Option<Composer> = None;
+    // PR #1414 review: latched once any reading saw the pointer submitted
+    // (`Composer::PointerInHistory`). From then on this delivery is never
+    // retyped, whatever a later screen shows.
+    let mut seen_submitted = false;
     // The PTY geometry epoch the pointer's bytes were last typed at. A resize
     // clears the scrollback the composer is read from (PRD #104 M3), so after one
     // a blank screen is no evidence the pointer is gone.
@@ -957,23 +1029,34 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
             }
             let attempt = index + 1;
             anchor = tokio::time::Instant::now();
-            let composer =
+            let probe =
                 match redeliver(&redeliver_ctx, Phase::Probe, attempt, &mut pointer_epoch).await {
                     Attempt::Written(composer) => {
                         last_classification = Some(composer);
                         redeliveries.fetch_add(1, Ordering::SeqCst);
                         composer
                     }
-                    Attempt::Skipped => continue,
+                    // The probe never declines: it writes its Enter whatever the screen shows.
+                    Attempt::Skipped | Attempt::Declined(_) => continue,
                     Attempt::Stop(end) => break 'outer end,
                 };
-            // A resize-blanked screen gets the Enter and nothing more, as
-            // before this audit: the deck knows it cannot read that screen, and
-            // a worker that has not repainted since is one that may well hold
-            // the pointer already (`orchestration/delegate/043` attaches the
-            // worker pane, which resizes it, after the task was accepted).
-            if composer == Composer::Unreadable {
-                continue;
+            match probe {
+                // A screen the deck cannot read gets the Enter and nothing
+                // more, as before this audit: a resize-blanked one belongs to a
+                // worker that has not repainted since and may well hold the
+                // pointer already (`orchestration/delegate/043` attaches the
+                // worker pane, which resizes it, after the task was accepted).
+                Composer::Unreadable => continue,
+                // PR #1414 review: the pointer was already submitted. The
+                // probe's Enter is all this attempt sends; the grace and the
+                // retype step could only add a second copy, over a screen that
+                // scrolled the pointer away meanwhile. Latched, so no later
+                // attempt retypes it either.
+                Composer::PointerInHistory => {
+                    seen_submitted = true;
+                    continue;
+                }
+                Composer::PointerInComposer | Composer::Absent => {}
             }
             // The screen does not show the pointer, which cannot tell an empty
             // composer from one holding the pointer off-screen or unechoed. The
@@ -1003,8 +1086,21 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
             {
                 break 'outer end;
             }
-            match redeliver(&redeliver_ctx, Phase::Retype, attempt, &mut pointer_epoch).await {
-                Attempt::Written(composer) => last_classification = Some(composer),
+            match redeliver(
+                &redeliver_ctx,
+                Phase::Retype {
+                    probe,
+                    seen_submitted,
+                },
+                attempt,
+                &mut pointer_epoch,
+            )
+            .await
+            {
+                Attempt::Written(composer) | Attempt::Declined(composer) => {
+                    last_classification = Some(composer);
+                    seen_submitted |= composer == Composer::PointerInHistory;
+                }
                 Attempt::Skipped => {}
                 Attempt::Stop(end) => break 'outer end,
             }
@@ -1047,8 +1143,47 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
     end
 }
 
+/// The largest screen, in character cells, the retry reads. Above it the
+/// screen reads as [`Composer::Unreadable`] — the probe's Enter, never a
+/// retype — rather than building and scanning a parser the size of an attach
+/// client's geometry on every attempt. The echo gate's cap, for the same
+/// reason; see [`crate::submit_echo::MAX_ECHO_WATCH_CELLS`].
+pub const MAX_RETRY_SCREEN_CELLS: u32 = crate::submit_echo::MAX_ECHO_WATCH_CELLS;
+
+/// Read the worker's screen for this delivery: [`classify_composer`] over the
+/// snapshot, or [`Composer::Unreadable`] when the screen cannot be read at all
+/// — over [`MAX_RETRY_SCREEN_CELLS`], an empty snapshot, or a parser panic.
+/// None of those is evidence the pointer is gone, so none of them may retype.
+fn read_composer(
+    snapshot: &[u8],
+    rows: u16,
+    cols: u16,
+    delivery_id: &str,
+    after_id: &str,
+    resized_since_write: bool,
+) -> Composer {
+    if u32::from(rows) * u32::from(cols) > MAX_RETRY_SCREEN_CELLS {
+        return Composer::Unreadable;
+    }
+    let Some((screen_rows, cursor_row, cursor_col)) =
+        crate::pane_screen_text::visible_rows_and_cursor(snapshot, rows, cols)
+    else {
+        return Composer::Unreadable;
+    };
+    classify_composer(
+        &screen_rows,
+        cursor_row,
+        cursor_col,
+        delivery_id,
+        after_id,
+        resized_since_write,
+    )
+}
+
 enum Attempt {
     Written(Composer),
+    /// The screen was read, and what it showed means nothing is written.
+    Declined(Composer),
     Skipped,
     Stop(RetryEnd),
 }
@@ -1063,7 +1198,14 @@ enum Phase {
     /// After a probe went unanswered: type the pointer again over a screen that
     /// does not show it, press Enter once more over an input box that holds it
     /// (issue #1243), or do nothing when it shows only in the transcript.
-    Retype,
+    /// `probe` is what this attempt's probe read: a pointer the probe saw in
+    /// the input box is never retyped, whatever the screen shows now.
+    /// `seen_submitted` is whether any reading of this delivery has seen the
+    /// pointer submitted, after which it is never retyped at all.
+    Retype {
+        probe: Composer,
+        seen_submitted: bool,
+    },
 }
 
 /// The per-loop constants [`redeliver`] reads.
@@ -1123,21 +1265,16 @@ async fn redeliver(
         return Attempt::Skipped;
     }
     let composer = match registry.snapshot_with_pty_size(worker_agent_id) {
-        Ok((bytes, rows, cols)) => {
-            let (screen_rows, cursor_row, cursor_col) =
-                crate::pane_screen_text::visible_rows_and_cursor(&bytes, rows, cols)
-                    .unwrap_or_default();
-            classify_composer(
-                &screen_rows,
-                cursor_row,
-                cursor_col,
-                delivery_id,
-                pointer
-                    .rsplit_once(delivery_id)
-                    .map_or("", |(_, after_id)| after_id),
-                registry.geometry_changes_of(worker_agent_id) != *pointer_epoch,
-            )
-        }
+        Ok((bytes, rows, cols)) => read_composer(
+            &bytes,
+            rows,
+            cols,
+            delivery_id,
+            pointer
+                .rsplit_once(delivery_id)
+                .map_or("", |(_, after_id)| after_id),
+            registry.geometry_changes_of(worker_agent_id) != *pointer_epoch,
+        ),
         Err(_) => return Attempt::Stop(RetryEnd::AgentExited),
     };
     // Only the SECOND Enter is scoped to the input box (auditor M2 / reviewer
@@ -1153,11 +1290,11 @@ async fn redeliver(
         (Phase::Probe, _) => "",
         // The unanswered Enter left it in the composer: a copy would double
         // it. Press Enter once more instead (issue #1243, see the loop).
-        (Phase::Retype, Composer::PointerInComposer) => "",
-        // Only in the transcript: the input box holds something else, or
-        // nothing, and an Enter there would submit that. The pointer most
-        // likely went in already, so no copy either.
-        (Phase::Retype, Composer::PointerInHistory) => {
+        (Phase::Retype { .. }, Composer::PointerInComposer) => "",
+        // Only in the transcript: the Enter submitted it, so the task landed.
+        // The input box holds something else, or nothing, and an Enter there
+        // would submit that; a copy would be a second turn for the same task.
+        (Phase::Retype { .. }, Composer::PointerInHistory) => {
             info!(
                 pane_id = %escape_id_for_log(pane_id),
                 role = %escape_id_for_log(role),
@@ -1165,28 +1302,68 @@ async fn redeliver(
                 attempt,
                 total_attempts,
                 "delegate retry: after the Enter the pointer shows only above the worker's input \
-                 box, not in it; not pressing Enter into whatever that box holds, and not \
-                 retyping a pointer that most likely went in"
+                 box, not in it, so it was submitted; not pressing Enter into whatever that box \
+                 holds, and never retyping it for this delivery"
             );
-            return Attempt::Skipped;
+            return Attempt::Declined(composer);
         }
-        (Phase::Retype, Composer::Unreadable) => {
+        (Phase::Retype { .. }, Composer::Unreadable) => {
             info!(
                 pane_id = %escape_id_for_log(pane_id),
                 role = %escape_id_for_log(role),
                 delivery_id = %delivery_id,
                 attempt,
                 total_attempts,
-                "delegate retry: the worker's screen was cleared by a resize after the Enter; not \
-                 retyping into a composer the deck cannot read"
+                "delegate retry: the worker's screen cannot be read after the Enter (cleared by a \
+                 resize, empty, unparseable or over the size cap); not retyping into a composer \
+                 the deck cannot read"
             );
-            return Attempt::Skipped;
+            return Attempt::Declined(composer);
+        }
+        // PR #1414 review: the probe saw the pointer in the input box, so its
+        // disappearance since is the Enter taking it or the screen moving on,
+        // never evidence the box is empty.
+        (
+            Phase::Retype {
+                probe: Composer::PointerInComposer,
+                ..
+            },
+            Composer::Absent,
+        ) => {
+            info!(
+                pane_id = %escape_id_for_log(pane_id),
+                role = %escape_id_for_log(role),
+                delivery_id = %delivery_id,
+                attempt,
+                total_attempts,
+                "delegate retry: the pointer was in the worker's input box before the Enter and \
+                 is gone from its screen now; not retyping it"
+            );
+            return Attempt::Declined(composer);
+        }
+        (
+            Phase::Retype {
+                seen_submitted: true,
+                ..
+            },
+            Composer::Absent,
+        ) => {
+            info!(
+                pane_id = %escape_id_for_log(pane_id),
+                role = %escape_id_for_log(role),
+                delivery_id = %delivery_id,
+                attempt,
+                total_attempts,
+                "delegate retry: an earlier reading showed the pointer already submitted, so its \
+                 absence from the screen now is not evidence it never went in; not retyping it"
+            );
+            return Attempt::Declined(composer);
         }
         // Issue #1383 audit: a worker whose delivery the deck cannot confirm
         // (#1390) may have taken the first pointer, cleared it and started
         // working without any turn the loop can see. A copy would be a second
         // turn for the same task.
-        (Phase::Retype, Composer::Absent) if retype == RetypePolicy::Never => {
+        (Phase::Retype { .. }, Composer::Absent) if retype == RetypePolicy::Never => {
             info!(
                 pane_id = %escape_id_for_log(pane_id),
                 role = %escape_id_for_log(role),
@@ -1197,9 +1374,9 @@ async fn redeliver(
                  confirm a delivered prompt (a wrapper-hosted pane), so the pointer that left \
                  its screen may already be running; not retyping it"
             );
-            return Attempt::Skipped;
+            return Attempt::Declined(composer);
         }
-        (Phase::Retype, Composer::Absent) => pointer,
+        (Phase::Retype { .. }, Composer::Absent) => pointer,
     };
     let revalidate_registry = Arc::clone(registry);
     let revalidate_pane = pane_id.to_string();
@@ -1285,8 +1462,9 @@ async fn redeliver(
                     (Phase::Probe, Composer::PointerInComposer) =>
                         "the pointer is in its input box, so pressed Enter instead of retyping it",
                     (Phase::Probe, Composer::Unreadable) =>
-                        "its screen was cleared by a resize since the pointer went in, so pressed \
-                         Enter rather than risk typing a second copy",
+                        "its screen cannot be read (cleared by a resize since the pointer went in, \
+                         empty, unparseable or over the size cap), so pressed Enter rather than \
+                         risk typing a second copy",
                     (Phase::Probe, Composer::Absent) if retype == RetypePolicy::Never =>
                         "the pointer is not on its screen, so pressed Enter; its agent cannot \
                          confirm a delivered prompt, so the pointer is never retyped",
@@ -1296,12 +1474,13 @@ async fn redeliver(
                          retyped only if the worker stays silent",
                     (Phase::Probe, Composer::PointerInHistory) =>
                         "the pointer shows on its screen but not in its input box, so pressed \
-                         Enter rather than type a second copy; no second Enter follows",
-                    (Phase::Retype, Composer::PointerInComposer) =>
+                         Enter rather than type a second copy; no second Enter follows, and it is \
+                         never retyped for this delivery",
+                    (Phase::Retype { .. }, Composer::PointerInComposer) =>
                         "the pointer is still in its input box after the Enter, and an agent that \
                          took the first CR into a paste swallows the next Enter, so pressed Enter \
                          once more rather than retyping it",
-                    (Phase::Retype, _) =>
+                    (Phase::Retype { .. }, _) =>
                         "the worker stayed silent after the Enter, so re-typed the pointer into \
                          the same process",
                 }
@@ -1471,7 +1650,11 @@ mod tests {
             "{} ack d-7f3a9c21",
             crate::platform::paths::binary_name()
         )));
-        assert!(header.contains("If the command fails or is not recognised"));
+        assert!(header.contains("If the command fails, is not recognised"));
+        // PR #1414 review: a role whose allowlist does not name `ack` yet must
+        // not stall at the approval prompt.
+        assert!(header.contains("needs an approval you do not get"));
+        assert!(header.contains("skip it and carry on with the task"));
         assert!(header.contains("it is the same task: do not start it again"));
     }
 
@@ -1790,6 +1973,52 @@ mod tests {
         );
     }
 
+    /// PR #1414 review (Greptile P1): a screen the deck cannot read at all —
+    /// an empty snapshot, or one the parser panics on — is `Unreadable`, never
+    /// `Absent`, so it can never earn a retype.
+    #[test]
+    fn read_composer_an_empty_snapshot_is_unreadable_not_absent() {
+        assert_eq!(
+            read_composer(b"", 24, 80, "d-7f3a9c21", "]", false),
+            Composer::Unreadable
+        );
+        // The same helper reads a real screen as usual.
+        assert_eq!(
+            read_composer(b"> [delivery d-7f3a9c21]", 24, 80, "d-7f3a9c21", "]", false),
+            Composer::PointerInComposer
+        );
+        assert_eq!(
+            read_composer(b"> ", 24, 80, "d-7f3a9c21", "]", false),
+            Composer::Absent
+        );
+    }
+
+    /// PR #1414 review (Greptile P2): the retry's screen read has the echo
+    /// gate's size bound. Over it, the screen is not parsed at all and reads as
+    /// `Unreadable` (the probe's Enter, never a retype), even when the pointer
+    /// is plainly there.
+    #[test]
+    fn read_composer_over_the_cell_cap_is_unreadable() {
+        let screen = b"> [delivery d-7f3a9c21]";
+        assert_eq!(
+            read_composer(screen, 4096, 4096, "d-7f3a9c21", "]", false),
+            Composer::Unreadable
+        );
+        // 1000 x 123 = 123,000 cells, inside the cap.
+        assert_eq!(
+            read_composer(screen, 123, 1000, "d-7f3a9c21", "]", false),
+            Composer::PointerInComposer
+        );
+        // One row over the cap, whichever axis carries it.
+        let cols = 1000u16;
+        let rows = u16::try_from(MAX_RETRY_SCREEN_CELLS / u32::from(cols) + 1).unwrap();
+        assert!(u32::from(rows) * u32::from(cols) > MAX_RETRY_SCREEN_CELLS);
+        assert_eq!(
+            read_composer(screen, rows, cols, "d-7f3a9c21", "]", false),
+            Composer::Unreadable
+        );
+    }
+
     #[test]
     fn classify_composer_a_screen_blanked_by_a_resize_is_unreadable() {
         assert_eq!(
@@ -1829,6 +2058,50 @@ mod tests {
         assert_eq!(
             store.acknowledge("p1", "d-11111111", Some("a1")),
             AckOutcome::AlreadyAcknowledged
+        );
+    }
+
+    /// PR #1414 review: an ack that arrives after the pane's retry already
+    /// ended — a real agent reports the turn before the `ack` it runs as a
+    /// tool — or for a delivery never armed is still the pane's current
+    /// delivery, and reads as recorded. An earlier delegation's id does not.
+    #[test]
+    fn pending_deliveries_ack_of_the_current_delivery_with_nothing_pending_is_recorded() {
+        let store = PendingDeliveries::default();
+        let armed = store.arm("p1", "d-11111111", "a1", None, RetypePolicy::Allowed);
+        assert!(store.finish("p1", armed.seq));
+        assert_eq!(
+            store.acknowledge("p1", "d-11111111", Some("a1")),
+            AckOutcome::NotPending
+        );
+        assert!(AckOutcome::NotPending.matched());
+        assert_eq!(
+            store.acknowledge("p1", "d-11111111", Some("a1")),
+            AckOutcome::AlreadyAcknowledged
+        );
+        assert_eq!(
+            store.acknowledge("p1", "d-22222222", Some("a1")),
+            AckOutcome::Unknown
+        );
+        assert!(!AckOutcome::Unknown.matched());
+
+        // Never armed (retry off, or an agent type that is not retried).
+        store.supersede("p1");
+        store.note_delivery("p1", "d-33333333");
+        assert!(!store.is_pending("p1"));
+        assert_eq!(
+            store.acknowledge("p1", "d-11111111", None),
+            AckOutcome::Unknown,
+            "a superseded delivery's id is stale"
+        );
+        assert_eq!(
+            store.acknowledge("p1", "d-33333333", None),
+            AckOutcome::NotPending
+        );
+        assert_eq!(
+            store.acknowledge("p2", "d-33333333", None),
+            AckOutcome::Unknown,
+            "another pane's delivery"
         );
     }
 
@@ -2254,7 +2527,6 @@ while chunk := os.read(0, 4096):
         let (handle, redeliveries) = fx.deliver_and_retry("150,150").await;
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
         assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
-        fx.received_lines(3).await;
         // Past the loop's end, so a late fourth line would be in the sink too.
         tokio::time::sleep(Duration::from_millis(200)).await;
         let lines = fx.received_lines(3).await;
@@ -2262,6 +2534,91 @@ while chunk := os.read(0, 4096):
             lines,
             [POINTER, "", ""],
             "one probe Enter per re-delivery, no second Enter and no copy: {lines:?}"
+        );
+        fx.stop();
+    }
+
+    /// PR #1414 review (Qodo): the first probe sees the pointer submitted, then
+    /// the worker's output clears the screen. The second re-delivery's readings
+    /// are `Absent`, but the first reading is latched: that re-delivery presses
+    /// its probe Enter and never retypes the pointer.
+    #[tokio::test]
+    async fn retry_loop_never_retypes_a_pointer_the_probe_saw_submitted() {
+        let fx = Fixture::spawn("retry-history-cleared", |sink| {
+            format!(
+                "printf READY; IFS= read -r line; printf '%s\\n' \"$line\" > '{s}'; \
+                 IFS= read -r line; printf '%s\\n' \"$line\" >> '{s}'; \
+                 printf '\\033[2J\\033[3J\\033[H'; exec cat >> '{s}'",
+                s = sink.display()
+            )
+        })
+        .await;
+        // The second re-delivery comes a second after the first, and its
+        // retype step half a second after its probe, well after the clear.
+        let (handle, redeliveries) = fx.deliver_and_retry("200,1000").await;
+        assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
+        assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let lines = fx.received_lines(3).await;
+        assert_eq!(
+            lines,
+            [POINTER, "", ""],
+            "one probe Enter per re-delivery and never a second copy: {lines:?}"
+        );
+        fx.stop();
+    }
+
+    /// PR #1414 review (Qodo): a probe that saw the pointer in the input box
+    /// never leads to a full retype in that attempt, even when the screen has
+    /// been cleared by the time the retype step reads it.
+    #[tokio::test]
+    async fn retry_loop_never_retypes_a_pointer_the_probe_saw_in_the_composer() {
+        let available = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !available {
+            eprintln!("SKIP: python3 is not available");
+            return;
+        }
+        // `COMPOSER`, except that the probe's Enter (the second CR) clears the
+        // screen instead of being ignored.
+        const CLEARING_COMPOSER: &str = r#"import os
+import sys
+import tty
+
+tty.setraw(0)
+sink = open(sys.argv[1], 'ab', buffering=0)
+os.write(1, b'READY')
+crs = 0
+while chunk := os.read(0, 4096):
+    sink.write(chunk)
+    crs += chunk.count(b'\r')
+    if crs == 2:
+        os.write(1, b'\x1b[2J\x1b[3J\x1b[H')
+        crs = 3
+    else:
+        os.write(1, chunk.replace(b'\r', b'').replace(b'\n', b''))
+"#;
+        let fx = Fixture::spawn("retry-composer-cleared", |sink| {
+            let script = sink.with_file_name("composer.py");
+            std::fs::write(&script, CLEARING_COMPOSER).unwrap();
+            format!(
+                "exec python3 -u '{}' '{}'",
+                script.display(),
+                sink.display()
+            )
+        })
+        .await;
+        let (handle, redeliveries) = fx.deliver_and_retry("1000").await;
+        assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
+        assert_eq!(redeliveries.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let raw = std::fs::read_to_string(&fx.sink).unwrap_or_default();
+        assert_eq!(
+            raw.matches(ID).count(),
+            1,
+            "a pointer the probe saw in the input box must not be typed again: {raw:?}"
         );
         fx.stop();
     }

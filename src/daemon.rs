@@ -3102,17 +3102,22 @@ fn hook_line_for_log(line: &str) -> String {
 /// [`AgentPtyRegistry::retire_silence_watch`], whose oldest-first accounting
 /// belongs to `work-done`.
 ///
-/// Every outcome is a no-op for the caller, who was answered at the gate. The
-/// id is producer-supplied, so a malformed one is logged only as a length and
-/// looks nothing up.
-pub(crate) fn handle_delivery_ack(registry: &AgentPtyRegistry, signal: &crate::event::AckSignal) {
+/// Returns what the caller is told (PR #1414 review): the hook loop writes it
+/// back as [`crate::event::SignalAck::acknowledged`], so the `ack` CLI says
+/// "Acknowledged" only for an id that named the pane's current delivery. The
+/// id is producer-supplied, so a malformed one is logged only as a length,
+/// looks nothing up, and answers [`crate::event::AckDelivery::Unknown`].
+pub(crate) fn handle_delivery_ack(
+    registry: &AgentPtyRegistry,
+    signal: &crate::event::AckSignal,
+) -> crate::event::AckDelivery {
     if !crate::delegate_retry::is_valid_delivery_id(&signal.delivery_id) {
         warn!(
             pane_id = %escape_id_for_log(&signal.pane_id),
             delivery_id_len = signal.delivery_id.len(),
             "Received an ack whose delivery id is not shaped like one this daemon mints; ignored"
         );
-        return;
+        return crate::event::AckDelivery::Unknown;
     }
     let outcome = registry.pending_deliveries().acknowledge(
         &signal.pane_id,
@@ -3132,6 +3137,7 @@ pub(crate) fn handle_delivery_ack(registry: &AgentPtyRegistry, signal: &crate::e
         silence_cancelled,
         "Received ack"
     );
+    outcome.into()
 }
 
 async fn run_hook_loop(
@@ -3727,11 +3733,20 @@ async fn run_hook_loop_with_idle_timeout(
                                     }
                                 }
                                 DaemonMessage::Ack(signal) => {
-                                    // Issue #1383: the gate already answered the
-                                    // caller. The id is producer-supplied, so it is
-                                    // validated before it reaches a lookup or a log
-                                    // field.
-                                    handle_delivery_ack(&pty_registry, &signal);
+                                    // Issue #1383: the id is producer-supplied, so
+                                    // it is validated before it reaches a lookup or
+                                    // a log field. Answered HERE, after the lookup
+                                    // (PR #1414 review), so the worker is told
+                                    // whether its id matched rather than only that
+                                    // the gate admitted it — this verb's one line.
+                                    let delivery = handle_delivery_ack(&pty_registry, &signal);
+                                    if let Ok(json) = serde_json::to_string(
+                                        &crate::event::SignalAck::acknowledged(delivery),
+                                    ) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
                                 }
                                 DaemonMessage::GetSeed(req) => {
                                     // PRD #201 native prompt delivery: hand the
@@ -7682,8 +7697,13 @@ mod hook_ingestion_tests {
         let ack = fx
             .ack(PROV_WORKER_PANE, Some(&token), "d-1383abcd")
             .await
-            .expect("an admitted ack is answered at the gate");
+            .expect("an admitted ack is answered");
         assert!(ack.is_signal_ack() && ack.accepted, "{ack:?}");
+        assert_eq!(
+            ack.delivery,
+            Some(crate::event::AckDelivery::Stopped),
+            "the reply must say the id matched, not only that the gate admitted it"
+        );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while fx
             .registry
@@ -7740,6 +7760,36 @@ mod hook_ingestion_tests {
         fx.stop().await;
     }
 
+    /// Scenario: PR #1414 review — an attested ack whose delivery id is shaped
+    /// correctly but is not the pane's delivery (mistyped, or an earlier
+    /// task's) is answered as admitted but UNKNOWN, so the CLI does not print
+    /// "Acknowledged", and the pending delivery stays armed.
+    #[tokio::test]
+    async fn delivery_ack_with_an_unknown_id_is_answered_as_unknown() {
+        let fx = ProvenanceFixture::start().await;
+        let armed = fx.registry.pending_deliveries().arm(
+            PROV_WORKER_PANE,
+            "d-1383abcd",
+            &fx.worker_agent,
+            None,
+            crate::delegate_retry::RetypePolicy::Allowed,
+        );
+        let token = fx.worker_token.clone();
+        let ack = fx
+            .ack(PROV_WORKER_PANE, Some(&token), "d-1383abce")
+            .await
+            .expect("answered");
+        assert!(ack.is_signal_ack() && ack.accepted, "{ack:?}");
+        assert_eq!(ack.delivery, Some(crate::event::AckDelivery::Unknown));
+        assert!(
+            fx.registry
+                .pending_deliveries()
+                .is_current(PROV_WORKER_PANE, armed.seq),
+            "an unknown id must not stop the delivery"
+        );
+        fx.stop().await;
+    }
+
     /// Scenario: issue #1383 — an attested ack whose delivery id is not shaped
     /// like one the daemon mints is answered (the gate admitted it) and then
     /// ignored: nothing is looked up, and the pending delivery stays armed.
@@ -7757,8 +7807,9 @@ mod hook_ingestion_tests {
         let ack = fx
             .ack(PROV_WORKER_PANE, Some(&token), "d-1383ABCD\n")
             .await
-            .expect("answered at the gate");
+            .expect("answered");
         assert!(ack.accepted, "{ack:?}");
+        assert_eq!(ack.delivery, Some(crate::event::AckDelivery::Unknown));
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             fx.registry

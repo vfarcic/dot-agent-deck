@@ -1399,12 +1399,16 @@ impl DaemonMessage {
     /// provenance gate, or `None` for a verb whose own handler answers on the
     /// connection.
     ///
-    /// Only the three fire-and-forget verbs (`work_done`, `dispatch`, and since
-    /// issue #1383 `ack`) are `Some`, and the exhaustive `match` is what enforces
-    /// the invariant the hook loop depends on: **exactly one line per message**. `delegate`, `restart_role`, `spawn_role`,
-    /// `list_targets` and `get_seed` all write their own response after their
-    /// handler runs, so an admission line here would be a second one and the
-    /// caller — which reads exactly one line — would take the ack for the answer.
+    /// Only the two fire-and-forget verbs (`work_done` and `dispatch`) are
+    /// `Some`, and the exhaustive `match` is what enforces the invariant the hook
+    /// loop depends on: **exactly one line per message**. `delegate`,
+    /// `restart_role`, `spawn_role`, `list_targets`, `get_seed` and `ack` all
+    /// write their own response after their handler runs, so an admission line
+    /// here would be a second one and the caller — which reads exactly one line
+    /// — would take the ack for the answer. `ack` answers after its handler
+    /// (PR #1414 review) because admission is not what its caller needs to know:
+    /// [`SignalAck::acknowledged`] says whether the id matched a delivery, and the
+    /// handler is a map lookup, so answering after it parks nobody.
     ///
     /// It is written at the gate, **before** the handler runs, and that is
     /// deliberate rather than incidental. `dispatch`'s handler is awaited inline
@@ -1415,14 +1419,15 @@ impl DaemonMessage {
     /// succeeded.
     pub fn provenance_ack_reply(&self) -> Option<String> {
         match self {
-            DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) | DaemonMessage::Ack(_) => {
+            DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) => {
                 serde_json::to_string(&SignalAck::accepted()).ok()
             }
             DaemonMessage::Delegate(_)
             | DaemonMessage::RestartRole(_)
             | DaemonMessage::SpawnRole(_)
             | DaemonMessage::ListTargets(_)
-            | DaemonMessage::GetSeed(_) => None,
+            | DaemonMessage::GetSeed(_)
+            | DaemonMessage::Ack(_) => None,
         }
     }
 }
@@ -1507,6 +1512,56 @@ pub struct SignalAck {
     /// remedy where there is one. `None` on an admission.
     #[serde(default)]
     pub error: Option<String>,
+    /// Issue #1383 / PR #1414 review: on an admitted `ack`, whether its delivery
+    /// id matched the pane's current delivery. `None` on every other verb, on a
+    /// refusal, and from a daemon that wrote the admission before looking the id
+    /// up. Additive and optional, so a CLI that predates it still parses the
+    /// line (see `an_ack_with_unknown_fields_still_reads_as_an_acceptance`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<AckDelivery>,
+}
+
+/// What an admitted `ack` did with its delivery id. The wire form of
+/// [`crate::delegate_retry::AckOutcome`], which it mirrors variant for variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AckDelivery {
+    /// It matched the pane's pending delivery, whose retry is now stopped.
+    Stopped,
+    /// The pane's last acknowledged delivery, acknowledged again.
+    AlreadyAcknowledged,
+    /// The pane's current delivery, with no retry pending to stop.
+    NotPending,
+    /// Not the pane's current delivery: mistyped, stale, or another agent's.
+    Unknown,
+    /// A value a later daemon added. Never written by this build; read so a
+    /// new outcome does not make the whole ack unparseable.
+    #[serde(other)]
+    Unrecognised,
+}
+
+impl AckDelivery {
+    /// Whether the worker may be told its acknowledgement was recorded.
+    pub fn recorded(self) -> bool {
+        match self {
+            AckDelivery::Stopped | AckDelivery::AlreadyAcknowledged | AckDelivery::NotPending => {
+                true
+            }
+            AckDelivery::Unknown | AckDelivery::Unrecognised => false,
+        }
+    }
+}
+
+impl From<crate::delegate_retry::AckOutcome> for AckDelivery {
+    fn from(outcome: crate::delegate_retry::AckOutcome) -> Self {
+        use crate::delegate_retry::AckOutcome;
+        match outcome {
+            AckOutcome::Stopped { .. } => AckDelivery::Stopped,
+            AckOutcome::AlreadyAcknowledged => AckDelivery::AlreadyAcknowledged,
+            AckOutcome::NotPending => AckDelivery::NotPending,
+            AckOutcome::Unknown => AckDelivery::Unknown,
+        }
+    }
 }
 
 /// The value [`SignalAck::kind`] carries on every ack this daemon writes.
@@ -1525,6 +1580,15 @@ impl SignalAck {
             accepted: true,
             reason: None,
             error: None,
+            delivery: None,
+        }
+    }
+
+    /// The answer to an admitted `ack`, written after its id was looked up.
+    pub fn acknowledged(delivery: AckDelivery) -> Self {
+        Self {
+            delivery: Some(delivery),
+            ..Self::accepted()
         }
     }
 
@@ -1536,6 +1600,7 @@ impl SignalAck {
             accepted: false,
             reason: Some(reason.to_string()),
             error: Some(message.to_string()),
+            delivery: None,
         }
     }
 
@@ -3310,6 +3375,36 @@ mod tests {
         assert!(ack.accepted);
     }
 
+    /// PR #1414 review: `delivery` is additive and optional — absent from every
+    /// line that does not carry it, so a reply to `work-done` is byte-for-byte
+    /// what it was, and a value a later daemon adds still parses.
+    #[test]
+    fn ack_delivery_is_an_additive_optional_field() {
+        let admitted = serde_json::to_string(&SignalAck::accepted()).unwrap();
+        assert!(!admitted.contains("delivery"), "{admitted}");
+        let refused = serde_json::to_string(&SignalAck::refused("missing_token", "m")).unwrap();
+        assert!(!refused.contains("delivery"), "{refused}");
+        for (delivery, wire) in [
+            (AckDelivery::Stopped, "stopped"),
+            (AckDelivery::AlreadyAcknowledged, "already_acknowledged"),
+            (AckDelivery::NotPending, "not_pending"),
+            (AckDelivery::Unknown, "unknown"),
+        ] {
+            let line = serde_json::to_string(&SignalAck::acknowledged(delivery)).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(value["delivery"], wire, "{line}");
+            let back: SignalAck = serde_json::from_str(&line).unwrap();
+            assert_eq!(back.delivery, Some(delivery));
+            assert_eq!(delivery.recorded(), delivery != AckDelivery::Unknown);
+        }
+        let later: SignalAck = serde_json::from_str(
+            r#"{"kind":"signal_ack","accepted":true,"delivery":"something_new"}"#,
+        )
+        .expect("a later outcome must not make the ack unparseable");
+        assert_eq!(later.delivery, Some(AckDelivery::Unrecognised));
+        assert!(!AckDelivery::Unrecognised.recorded());
+    }
+
     fn ack_message() -> DaemonMessage {
         DaemonMessage::Ack(AckSignal {
             pane_id: "pane-7".to_string(),
@@ -3358,18 +3453,26 @@ mod tests {
         assert!(serde_json::from_str::<AgentEvent>(&json).is_err());
     }
 
-    /// Issue #1383: `ack` joins the fire-and-forget family — attested by its
-    /// pane, answered at the gate with a `SignalAck` either way.
+    /// Issue #1383: `ack` is attested by its pane like `work-done` and answers
+    /// a refusal at the gate with a `SignalAck`. An admission is NOT answered at
+    /// the gate (PR #1414 review): its handler answers once it has looked the id
+    /// up, so the reply can say whether it matched.
     #[test]
-    fn ack_is_gated_and_answered_like_work_done() {
+    fn ack_is_gated_like_work_done_and_answered_after_its_lookup() {
         let msg = ack_message();
         assert_eq!(msg.claimed_pane(), "pane-7");
         assert_eq!(msg.presented_token(), Some("tok"));
         assert_eq!(msg.verb(), "ack");
-        let accepted: SignalAck =
-            serde_json::from_str(&msg.provenance_ack_reply().expect("answered at the gate"))
-                .unwrap();
+        assert!(
+            msg.provenance_ack_reply().is_none(),
+            "an admitted ack is answered by its handler; a gate line would be a second one"
+        );
+        let accepted: SignalAck = serde_json::from_str(
+            &serde_json::to_string(&SignalAck::acknowledged(AckDelivery::Stopped)).unwrap(),
+        )
+        .unwrap();
         assert!(accepted.is_signal_ack() && accepted.accepted);
+        assert_eq!(accepted.delivery, Some(AckDelivery::Stopped));
         let refused: SignalAck = serde_json::from_str(
             &msg.provenance_refusal_reply("missing_token", "no token")
                 .expect("a refusal is answered"),

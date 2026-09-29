@@ -7398,8 +7398,12 @@ async fn dispatch_one_owned(
     // Issue #1383: the id this delivery is acknowledged and retried under. Minted
     // on every delegation, so the pointer and the task file look the same whether
     // or not a retry is armed for it — a Pi seed and a delivery with the retry
-    // switched off carry one too, and an `ack` of theirs is a logged no-op.
+    // switched off carry one too, and an `ack` of theirs is a logged no-op
+    // that the worker is still told was recorded.
     let delivery_id = crate::delegate_retry::mint_delivery_id();
+    registry
+        .pending_deliveries()
+        .note_delivery(&pane_id, &delivery_id);
     let task_body = resolve_delegate_task_body(
         cwd.as_deref(),
         prompt_template,
