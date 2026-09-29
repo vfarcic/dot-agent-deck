@@ -43,7 +43,7 @@ fn open_mode_tab(deck: &TuiDeck, right_presses: usize, selected_mode: &str) {
 }
 
 fn open_second_tab(deck: &TuiDeck) {
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     open_mode_tab(deck, 1, "demo mode");
 }
 
@@ -51,7 +51,7 @@ fn open_second_tab(deck: &TuiDeck) {
 /// active after creation), click the inactive `Dashboard` tab header in the
 /// top strip. The deck must switch to the Dashboard view — the same outcome
 /// as pressing Tab / Ctrl+PageUp — so the dashboard's session-count title
-/// (`dot-agent-deck — N session(s)`, shown only on the Dashboard tab, not on
+/// (`dot-agent-deck — N agent(s)`, shown only on the Dashboard tab, not on
 /// a Mode tab) appears, proving click-to-switch funnels through the shared
 /// tab-switch action.
 #[spec("mouse/tabstrip/001")]
@@ -89,7 +89,7 @@ fn tabstrip_002_click_close_glyph_closes_tab() {
 
     // The glyph is a request, not a one-click teardown: the tab and its close
     // affordance remain behind the shared Cancel-default modal.
-    deck.wait_for_string("Close this tab and all its panes?");
+    deck.wait_for_string("Close this tab and all its agents?");
     assert!(deck.snapshot_grid().contains('×'));
     deck.send_bytes(b"\x1b[B"); // Down → select Close
     deck.send_bytes(b"\r"); // Enter → confirm
@@ -106,7 +106,7 @@ fn tabstrip_003_inactive_close_binds_target_and_modal_suppresses_navigation() {
     const TAB_PREV: &[u8] = b"\x1b[5;5~";
 
     let deck = TuiDeck::launch_with_fixture("tab-close-targets");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     open_mode_tab(&deck, 1, "alpha mode");
     deck.wait_for_string("ALPHA_TAB_SENTINEL");
     open_mode_tab(&deck, 2, "beta mode");
@@ -115,7 +115,7 @@ fn tabstrip_003_inactive_close_binds_target_and_modal_suppresses_navigation() {
     // `wait_for_in_grid` returns the first ×: alpha's, while beta remains active.
     let (col, row) = deck.wait_for_in_grid("×");
     deck.click(col, row);
-    deck.wait_for_string("Close this tab and all its panes?");
+    deck.wait_for_string("Close this tab and all its agents?");
     assert!(deck.snapshot_grid().contains("BETA_TAB_SENTINEL"));
 
     // Each navigation chord is followed by a modal-selection move that makes

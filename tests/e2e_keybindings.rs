@@ -54,7 +54,7 @@ fn remap_001_global_action_rebind() {
         )
         .launch_with_fixture("minimal");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Alt+Shift+l: Alt sends an ESC prefix; Shift+l is the uppercase
     // `L`. One write so crossterm decodes it as a single chord.
@@ -73,7 +73,7 @@ fn remap_001_global_action_rebind() {
     // order; a second toggle would have produced "Layout: stacked".
     deck.send_keys(b"\x14"); // Ctrl+t
     deck.send_keys(b"?"); // help (default binding, unchanged)
-    deck.wait_for_string("Create new pane");
+    deck.wait_for_string("Create new agent");
     assert!(
         !deck.snapshot_grid().contains("Layout: stacked"),
         "old default Ctrl+t still toggled the layout after the action was \
@@ -86,7 +86,7 @@ fn remap_001_global_action_rebind() {
 /// Scenario: Stage a `keybindings.toml` that rebinds the dashboard
 /// `help` action from `?` to `F1`, launch against the `minimal` fixture,
 /// and press `F1`. The help overlay should appear (it carries the
-/// "Create new pane" line).
+/// "Create new agent" line).
 #[spec("keybindings/remap/002")]
 #[test]
 fn remap_002_dashboard_action_rebind() {
@@ -100,15 +100,15 @@ fn remap_002_dashboard_action_rebind() {
         )
         .launch_with_fixture("minimal");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // F1 under TERM=xterm-256color is the SS3 sequence ESC O P.
     deck.send_keys(b"\x1bOP");
 
-    // The help overlay lists "Create new pane" among the global
+    // The help overlay lists "Create new agent" among the global
     // shortcuts. RED today: F1 is not bound to anything, so the overlay
     // never opens and this times out.
-    deck.wait_for_string("Create new pane");
+    deck.wait_for_string("Create new agent");
 }
 
 /// Scenario: Stage a `keybindings.toml` that tries to hijack `Ctrl+C`
@@ -133,7 +133,7 @@ fn safety_001_ctrl_c_always_quits() {
         )
         .launch_with_fixture("minimal");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Ctrl+C == 0x03.
     deck.send_keys(b"\x03");
@@ -168,7 +168,7 @@ fn safety_002_ctrl_c_survives_tab_nav_hijack() {
         )
         .launch_with_fixture("minimal");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Ctrl+C == 0x03.
     deck.send_keys(b"\x03");
@@ -197,7 +197,7 @@ fn unbind_001_empty_binding_is_noop() {
         )
         .launch_with_fixture("minimal");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Ctrl+n == 0x0e. With new_pane unbound this must do nothing; today
     // the deck ignores the config and Ctrl+n opens the directory picker.
@@ -208,7 +208,7 @@ fn unbind_001_empty_binding_is_noop() {
     // directory picker had opened (RED, today), `?` is swallowed and the
     // help overlay never appears, so this times out.
     deck.send_keys(b"?");
-    deck.wait_for_string("Create new pane");
+    deck.wait_for_string("Create new agent");
 
     // And the directory-picker chrome must be absent.
     assert!(
@@ -240,11 +240,11 @@ fn fallback_001_malformed_config() {
         .launch_with_fixture("minimal");
 
     // The deck still launches to its empty dashboard.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Default bindings still work: `?` opens the help overlay.
     deck.send_keys(b"?");
-    deck.wait_for_string("Create new pane");
+    deck.wait_for_string("Create new agent");
 
     // A warning mentioning "keybindings" is printed to stderr at startup
     // (merged into the PTY byte stream before the TUI clears the screen,
@@ -256,7 +256,7 @@ fn fallback_001_malformed_config() {
 
 /// Scenario: Seed a global `schedules.toml` (one enabled task, `kbsopen`) via
 /// `DOT_AGENT_DECK_SCHEDULES`, launch against the `minimal` fixture, and from
-/// the empty dashboard press the DEFAULT lowercase `s`. The "Scheduled Tasks"
+/// the empty dashboard press the DEFAULT lowercase `s`. The "Schedules"
 /// manager dialog must open — proving the dialog open-shortcut is routed
 /// through the keybinding registry with a case-insensitive default (lowercase
 /// `s` as well as `S`, like the registry's `t`/`T` and `l`/`L` pairs), rather
@@ -291,7 +291,7 @@ fn scheduler_001_lowercase_s_opens_manager() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Default lowercase `s` in dashboard command mode.
     deck.send_keys(b"s");

@@ -40,7 +40,10 @@
 //!
 //! The one mechanical approximation to "did you forget a capability" is pinning
 //! a count of interactive controls, which PRD #802's Open Question 3 recommends
-//! against for this PR with its churn cost named. [`VOICE_REGISTRY_RULE`] says
+//! against for this PR with its churn cost named. PRD #1195 chose a narrower
+//! approximation instead and gave it a rule of its own — rule 18,
+//! [`crate::voice_capability_state`], which guards the STATE a capability owns
+//! rather than counting clicks. [`VOICE_REGISTRY_RULE`] says
 //! all of this at the failure itself, because the PRD's own Risks section is
 //! explicit that reading the guard as stronger is the risk.
 //!
@@ -1087,6 +1090,10 @@ mod tests {
         }
     }
 
+    /// Scenario: scan the checked-in command table and action registry. The
+    /// deck-switch row's deck reference resolves through the closed kind set,
+    /// while the planted unknown-kind test below still produces a finding.
+    ///
     /// The tree itself. This is what makes the four planted-input tests below
     /// mean something: they prove the scanner CAN fail, and this proves the
     /// checked-in sources do not.
@@ -1094,6 +1101,18 @@ mod tests {
     fn the_checked_in_table_and_registry_resolve_against_each_other() {
         let findings = check(&checked_in());
         assert!(findings.is_empty(), "rule 14: {}", findings.join("\n"));
+        let sources = checked_in();
+        let mut parse_findings = Vec::new();
+        let rows = command_rows(&sources.commands_toml, &mut parse_findings);
+        assert!(parse_findings.is_empty(), "{}", parse_findings.join("\n"));
+        let deck = rows
+            .iter()
+            .find(|row| row.id == "switch_deck")
+            .expect("switch_deck row");
+        assert_eq!(
+            deck.params,
+            vec![("deck".to_string(), "deck_ref".to_string())]
+        );
     }
 
     /// And that the scan is not vacuous: a rule that found no rows, no entries
@@ -1122,10 +1141,18 @@ mod tests {
         );
         assert_eq!(
             kinds,
-            ["agent_ref", "spoken_prefix"]
-                .into_iter()
-                .map(str::to_string)
-                .collect()
+            [
+                "agent_ref",
+                "agent_type_ref",
+                "deck_ref",
+                "dir_ref",
+                "mode_ref",
+                "orchestration_ref",
+                "spoken_prefix",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
         );
         // Every row's `invoke` is classified `voice: true`, which is the state
         // assertion 4 is about.
@@ -1203,7 +1230,7 @@ mod tests {
         let findings = planted(|sources| {
             sources.commands_toml = sources
                 .commands_toml
-                .replace("screens     = [\"deck\"]", "screens     = [\"dashboard\"]");
+                .replace("screens     = [\"agent\"]", "screens     = [\"dashboard\"]");
         });
         assert_reports(&findings, "names the screen `dashboard`");
     }

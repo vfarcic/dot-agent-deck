@@ -308,7 +308,7 @@ fn lock_path_for(socket_path: &Path, override_root: Option<&Path>) -> PathBuf {
 /// Subprocess daemons (spawned via `dot-agent-deck daemon serve`)
 /// inherit `DOT_AGENT_DECK_LOCK_DIR` from their parent's environment,
 /// so the env-var fallback still applies when the override is absent.
-fn lock_root(override_root: Option<&Path>) -> PathBuf {
+pub(crate) fn lock_root(override_root: Option<&Path>) -> PathBuf {
     if let Some(p) = override_root {
         return p.to_path_buf();
     }
@@ -1062,6 +1062,18 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     };
 
+    // Issue #714: unconditional for the same reason — a Codex turn that its
+    // provider's usage limit ended says so only in its rollout, which no hook
+    // reports. Idle unless a Codex turn is armed.
+    let codex_rollout_handle = {
+        let registry = pty_registry.clone();
+        let monitor_state = state.clone();
+        let monitor_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            run_codex_rollout_monitor(registry, monitor_state, monitor_event_tx).await;
+        })
+    };
+
     let result = run_hook_loop(
         listener,
         state,
@@ -1090,6 +1102,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         h.abort();
     }
     shell_activity_handle.abort();
+    codex_rollout_handle.abort();
     scheduler_handle.abort();
     if let Some(h) = orphan_handle {
         h.abort();
@@ -1522,12 +1535,26 @@ async fn run_idle_monitor(
 /// that the broadcast happens whether or not the local `apply_event` accepts
 /// the event, e.g. for an unmanaged pane id — is unchanged: both run under
 /// the same guard, unconditionally.
-async fn ingest_event(
+pub async fn ingest_event(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
-    registry: &AgentPtyRegistry,
-    mut event: AgentEvent,
+    registry: &Arc<AgentPtyRegistry>,
+    event: AgentEvent,
 ) {
+    ingest_event_unless(state, event_tx, registry, event, || false).await;
+}
+
+/// [`ingest_event`], except that `stale` is asked once the `AppState` write
+/// lock is held, and a `true` drops the event before it is broadcast or
+/// applied. Asked under that lock so nothing the lock orders can slip between
+/// the verdict and the apply. Returns whether the event was ingested.
+async fn ingest_event_unless(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    mut event: AgentEvent,
+    stale: impl FnOnce() -> bool,
+) -> bool {
     // Issue #770: half of the orphan verdict, asked of the registry BEFORE the
     // `AppState` write lock is taken. Sequencing, not style: `has_live_pane`
     // takes the registry's own mutex, and every other path in the daemon that
@@ -1539,6 +1566,32 @@ async fn ingest_event(
         .as_deref()
         .is_some_and(|pane_id| registry.has_live_pane(pane_id));
     let mut state = state.write().await;
+    if stale() {
+        return false;
+    }
+    // Issue #714: keep the registry's per-agent quota-block latch in step with
+    // the card. A `QuotaBlocked` latches a fresh epoch for the pane's live
+    // owner — the key the orchestrator notice below is claimed and re-checked
+    // against — and work evidence lifts it, the latch's half of the rule
+    // `apply_event` applies to the card. Only the generation the event names is
+    // credited. Done UNDER the `AppState` write lock on purpose: a block and a
+    // work event are applied to the latch in the same order as to the card, so
+    // the notice's write-time re-check can never see a latch the card
+    // contradicts. Taking the registry inside this lock is the nesting
+    // `apply_event`'s own ownership oracle already takes on every event, so it
+    // adds no new lock order.
+    let mut reported_block = None;
+    if let Some(pane_id) = event.pane_id.as_deref() {
+        if event.event_type == crate::event::EventType::QuotaBlocked {
+            if let Some(agent_id) = event.agent_id.as_deref()
+                && let Some(epoch) = registry.note_quota_block(pane_id, agent_id)
+            {
+                reported_block = Some((pane_id.to_string(), agent_id.to_string(), epoch));
+            }
+        } else if crate::quota_block::is_work_evidence(&event) {
+            registry.quota_note_work_event(pane_id, event.agent_id.as_deref());
+        }
+    }
     // The other half, plus the stamp: is this an orchestration role pane whose
     // role registration a daemon restart destroyed while its agent survived?
     // The verdict is the daemon's alone — any inbound value is dropped first,
@@ -1552,8 +1605,403 @@ async fn ingest_event(
     // registry has never heard of the pane, and a non-`SessionStart` frame is
     // dropped. The card that needs the badge is an attached TUI's.
     state.stamp_orchestration_orphan(&mut event, daemon_owns_pane);
+    // Issue #320: the registry's generation verdict, stamped for the same
+    // reason and at the same point as the orphan marker — an attached TUI has
+    // no registry, and without it ordered a takeover by the frame's type and
+    // producer clock, so a late frame from the OUTGOING generation retired the
+    // live card there while the daemon refused it here. See
+    // `PANE_GENERATION_METADATA_KEY`.
+    state.stamp_pane_generation(&mut event);
+    // PRD #1223: the pane-closed marker is the daemon's alone too — it makes an
+    // attached TUI drop the pane — so a producer's copy never reaches the
+    // fan-out. The daemon's own removal is broadcast directly and never passes
+    // through here (`crate::spawn::surface_attach_stopped_agent`).
+    event
+        .metadata
+        .remove(crate::event::DAEMON_PANE_CLOSED_METADATA_KEY);
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
-    state.apply_event(event);
+    // Issue #447: `apply_event` plus the orchestrator-facing consumer of a
+    // delegated worker's `WaitingForInput` — see the method's doc, including
+    // why the pane's live agent is read there, under this lock, and not before
+    // it like `daemon_owns_pane` above.
+    state.apply_event_watching_waiting(event, registry);
+    drop(state);
+    if let Some((pane_id, agent_id, epoch)) = reported_block {
+        notify_orchestrator_of_quota_block(registry, &pane_id, &agent_id, epoch);
+    }
+    true
+}
+
+/// Issue #714: the one notice to the orchestrator of a worker whose block
+/// `epoch` was just reported, if the worker still owes a `work-done`.
+///
+/// Claimed here and WRITTEN on a task of its own
+/// ([`AgentPtyRegistry::spawn_worker_blocked_notice`]): every pane's hooks pass
+/// through [`ingest_event`], and a write stalled on another pane's writer must
+/// not hold any of them up. Returns the delivery's handle, `None` when no notice
+/// was claimed.
+///
+/// The block is re-checked against the latch before the notice is claimed
+/// ([`AgentPtyRegistry::quota_block_current`]) and again, writer-held, right
+/// before it is written: a genuine work hook can clear the card between the
+/// apply and the claim, and a worker that is working again must not be reported
+/// as blocked. A notice suppressed before the claim stays owed, and so does one
+/// refused at the write (the claim is released), so a later block of the same
+/// delegation still reports.
+fn notify_orchestrator_of_quota_block(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    agent_id: &str,
+    epoch: u64,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !registry.quota_block_current(pane_id, agent_id, epoch) {
+        debug!(
+            pane_id = %pane_id,
+            agent_id = %agent_id,
+            "quota: the block cleared before the orchestrator was told; no blocked-worker notice"
+        );
+        return None;
+    }
+    registry.spawn_worker_blocked_notice(pane_id, agent_id, epoch, None)
+}
+
+/// Issue #714: normalise a PRODUCER's raw event before it is ingested.
+///
+/// A producer's `quota_blocked` is admitted: it is status reporting from the
+/// same producers, over the same same-uid socket, as every other status, so it
+/// adds no trust boundary (`crate::hook_provenance` leaves raw events out of
+/// scope). What is guarded is where the privilege is used — the orchestrator
+/// notice is fixed text claimed only for a delegation bound to the event's
+/// agent — and the shape of what is stored, normalised here:
+///
+/// * on a `quota_blocked`, the kind is mapped onto a known value, the reset is
+///   kept only when it parses and lies in a sane window, and the detail is
+///   scrubbed ([`normalize_quota_blocked_metadata`]);
+/// * every other event type loses every `quota_blocked_*` key, so a reason can
+///   only ever travel with the status it explains;
+/// * `quota_blocked_source` and `quota_blocked_lifted`, the daemon's own
+///   markers (its Codex-rollout block, and the lift after a pane restart), are
+///   stripped from every producer frame;
+/// * the Codex rollout keys survive only on the Codex events that carry them
+///   (`SessionStart`, `UserPromptSubmit` → `Thinking`, `Stop` → `Idle`), and
+///   only within their bounds ([`crate::codex_rollout_tail::admissible_path`],
+///   [`crate::codex_rollout_tail::admissible_turn_id`]) — an empty or oversized
+///   value loses its key, the event stays. Never on a subagent's event (issue
+///   #1354, [`crate::event::SUBAGENT_ID_METADATA_KEY`]): a thread-spawned Codex
+///   subagent keeps the parent's session but names its own rollout and turn,
+///   and arming on it would move the parent's watch onto the subagent's log. The hook CLI applies the same
+///   bounds, but a raw frame on the socket need not have come through it, and
+///   these values are copied into the arm queue before anything else looks at
+///   them.
+fn admit_producer_event(event: &mut AgentEvent) {
+    use crate::quota_block::{
+        QUOTA_BLOCKED_LIFTED_METADATA_KEY, QUOTA_BLOCKED_METADATA_KEYS,
+        QUOTA_BLOCKED_SOURCE_METADATA_KEY,
+    };
+    event.metadata.remove(QUOTA_BLOCKED_SOURCE_METADATA_KEY);
+    event.metadata.remove(QUOTA_BLOCKED_LIFTED_METADATA_KEY);
+    if event.event_type == crate::event::EventType::QuotaBlocked {
+        normalize_quota_blocked_metadata(
+            &mut event.metadata,
+            chrono::Utc::now().timestamp_millis(),
+        );
+    } else {
+        for key in QUOTA_BLOCKED_METADATA_KEYS {
+            event.metadata.remove(key);
+        }
+    }
+    let codex_rollout_event = event.agent_type == crate::event::AgentType::Codex
+        && !event.is_from_subagent()
+        && matches!(
+            event.event_type,
+            crate::event::EventType::SessionStart
+                | crate::event::EventType::Thinking
+                | crate::event::EventType::Idle
+        );
+    use crate::codex_rollout_tail::{
+        CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY, admissible_path,
+        admissible_turn_id,
+    };
+    let drop_path = !codex_rollout_event
+        || event
+            .metadata
+            .get(CODEX_TRANSCRIPT_PATH_METADATA_KEY)
+            .is_some_and(|p| !admissible_path(p));
+    if drop_path {
+        event.metadata.remove(CODEX_TRANSCRIPT_PATH_METADATA_KEY);
+    }
+    let drop_turn = !codex_rollout_event
+        || event
+            .metadata
+            .get(CODEX_TURN_ID_METADATA_KEY)
+            .is_some_and(|t| !admissible_turn_id(t));
+    if drop_turn {
+        event.metadata.remove(CODEX_TURN_ID_METADATA_KEY);
+    }
+}
+
+/// Issue #714: normalise the `quota_blocked_*` keys of a `quota_blocked` event
+/// at time `now_ms` — an unknown or missing kind becomes `unknown`, a reset that
+/// does not parse as epoch milliseconds within the plausible window around now
+/// ([`crate::quota_block::reset_at_is_plausible`]) is removed
+/// (the event stays), and the detail is scrubbed and bounded.
+fn normalize_quota_blocked_metadata(
+    metadata: &mut std::collections::HashMap<String, String>,
+    now_ms: i64,
+) {
+    use crate::quota_block::{
+        BlockedKind, QUOTA_BLOCKED_DETAIL_METADATA_KEY, QUOTA_BLOCKED_KIND_METADATA_KEY,
+        QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, scrub_detail,
+    };
+    let kind = metadata
+        .get(QUOTA_BLOCKED_KIND_METADATA_KEY)
+        .map_or(BlockedKind::Unknown, |k| BlockedKind::from_wire(k));
+    metadata.insert(
+        QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
+        kind.as_wire().to_string(),
+    );
+    if !metadata
+        .get(QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY)
+        .and_then(|v| v.parse::<i64>().ok())
+        .is_some_and(|at| crate::quota_block::reset_at_is_plausible(at, now_ms))
+    {
+        metadata.remove(QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY);
+    }
+    match metadata
+        .get(QUOTA_BLOCKED_DETAIL_METADATA_KEY)
+        .map(|d| scrub_detail(d))
+    {
+        Some(detail) if !detail.is_empty() => {
+            metadata.insert(QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(), detail);
+        }
+        _ => {
+            metadata.remove(QUOTA_BLOCKED_DETAIL_METADATA_KEY);
+        }
+    }
+}
+
+/// Issue #714: queue the Codex rollout tailer's side of a Codex hook event
+/// (`crate::codex_rollout_tail`). `SessionStart` / `UserPromptSubmit` name the
+/// rollout and the turn to watch; a native `Stop` for the watched turn disarms
+/// it. Only for an event whose pane and agent name the pane's LIVE owner, so a
+/// payload can never make the daemon read a file on another pane's behalf. The
+/// file itself is opened and read by [`run_codex_rollout_monitor`], never here.
+fn queue_codex_rollout_arm(registry: &AgentPtyRegistry, event: &AgentEvent) {
+    use crate::codex_rollout_tail::{
+        ArmCommand, ArmRequest, CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY,
+    };
+    if event.agent_type != crate::event::AgentType::Codex
+        || event.is_daemon_synthetic()
+        || event.is_wrapper_output_classified()
+    {
+        return;
+    }
+    let (Some(pane_id), Some(agent_id)) = (event.pane_id.as_deref(), event.agent_id.as_deref())
+    else {
+        return;
+    };
+    let path = event
+        .metadata
+        .get(CODEX_TRANSCRIPT_PATH_METADATA_KEY)
+        .cloned();
+    let turn_id = event.metadata.get(CODEX_TURN_ID_METADATA_KEY).cloned();
+    let command = match event.event_type {
+        crate::event::EventType::Idle => {
+            let Some(turn_id) = turn_id else {
+                return;
+            };
+            ArmCommand::Disarm {
+                agent_id: agent_id.to_string(),
+                turn_id,
+            }
+        }
+        crate::event::EventType::SessionStart | crate::event::EventType::Thinking
+            if path.is_some() || turn_id.is_some() =>
+        {
+            ArmCommand::Arm(ArmRequest {
+                pane_id: pane_id.to_string(),
+                agent_id: agent_id.to_string(),
+                session_id: event.session_id.clone(),
+                path,
+                turn_id,
+            })
+        }
+        _ => return,
+    };
+    if !registry.is_live_owner(pane_id, agent_id) {
+        debug!(
+            pane_id = %escape_id_for_log(pane_id),
+            "codex rollout: ignored an arm from an agent that is not the pane's live owner"
+        );
+        return;
+    }
+    registry.codex_rollout_arms().push(command);
+}
+
+/// Issues #714 and #1359: the daemon half of Codex failed-turn detection
+/// (`crate::codex_rollout_tail`).
+///
+/// Every [`crate::codex_rollout_tail::POLL_INTERVAL`] it applies the arm
+/// commands the hook loop queued, then polls every armed tailer on a blocking
+/// thread — the file I/O happens there, outside every lock the daemon holds —
+/// and reports each failed turn it finds as ONE event through [`ingest_event`],
+/// the same path, lock order and orchestrator notice a producer's report takes:
+/// a `QuotaBlocked` for a usage limit, an `Error` for anything else. The event
+/// is filed under the arming hook's session id and carries the registry agent;
+/// a `QuotaBlocked` is also marked with
+/// [`crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY`] as the daemon's own.
+///
+/// A poll with no armed tailer does no I/O at all. No internal shutdown signal —
+/// torn down by `.abort()` in `run_daemon_with`'s cleanup, like the
+/// shell-activity monitor.
+async fn run_codex_rollout_monitor(
+    registry: Arc<AgentPtyRegistry>,
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+) {
+    let mut tailers = crate::codex_rollout_tail::CodexRolloutTailers::default();
+    loop {
+        tokio::time::sleep(crate::codex_rollout_tail::POLL_INTERVAL).await;
+        for command in registry.codex_rollout_arms().drain() {
+            tailers.apply(command);
+        }
+        let failures;
+        (tailers, failures) = poll_codex_rollouts(&registry, tailers).await;
+        for failure in failures {
+            report_codex_rollout_failure(&state, &event_tx, &registry, failure).await;
+        }
+    }
+}
+
+/// Issue #1359: report one failed turn a poll found — unless Codex has moved
+/// on to another turn since the poll began.
+///
+/// The poll runs on a blocking thread while the hook loop keeps going, so the
+/// agent's next `UserPromptSubmit` can put the card on Thinking before this
+/// failure is ingested, and the older turn's `Error` (or `QuotaBlocked`) would
+/// then repaint the newer turn's card (Qodo and Greptile on PR #1375). The hook
+/// loop queues that prompt's arm before it applies the prompt, and nothing
+/// drains the queue until the next tick, so a newer arm still queued when the
+/// `AppState` write lock is held is the proof: the failure is dropped. A
+/// prompt that has not reached the queue by then has not reached the card
+/// either, and lands after the failure.
+async fn report_codex_rollout_failure(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    failure: crate::codex_rollout_tail::CodexTurnFailure,
+) {
+    use crate::quota_signals::FailureOutcome;
+    let pane_id = failure.pane_id.clone();
+    let agent_id = failure.agent_id.clone();
+    let turn_id = failure.turn_id.clone();
+    let outcome = failure.outcome.clone();
+    let event = codex_rollout_failure_event(failure);
+    let superseded = || {
+        registry
+            .codex_rollout_arms()
+            .supersedes(&agent_id, &turn_id)
+    };
+    if !ingest_event_unless(state, event_tx, registry, event, superseded).await {
+        tracing::debug!(
+            agent_id = %escape_id_for_log(&agent_id),
+            "codex rollout: dropped a failed turn that a newer turn superseded"
+        );
+        return;
+    }
+    // Logged only once the card really changed, so a dropped stale failure
+    // never reads as a status change (Qodo on PR #1375).
+    match outcome {
+        FailureOutcome::Blocked { kind, .. } => warn!(
+            pane_id = %escape_id_for_log(&pane_id),
+            agent_id = %escape_id_for_log(&agent_id),
+            kind = kind.as_wire(),
+            "quota: the Codex session log records a usage-limit failure; marked Blocked"
+        ),
+        FailureOutcome::Error => warn!(
+            pane_id = %escape_id_for_log(&pane_id),
+            agent_id = %escape_id_for_log(&agent_id),
+            "the Codex session log records a failed turn; marked Error"
+        ),
+    }
+}
+
+/// Issue #714: one poll of `tailers` on a blocking thread, handing the set back
+/// with the failed turns found. A poll that panicked loses the set rather than the
+/// monitor: every agent's next Codex prompt arms afresh.
+async fn poll_codex_rollouts(
+    registry: &Arc<AgentPtyRegistry>,
+    mut tailers: crate::codex_rollout_tail::CodexRolloutTailers,
+) -> (
+    crate::codex_rollout_tail::CodexRolloutTailers,
+    Vec<crate::codex_rollout_tail::CodexTurnFailure>,
+) {
+    let registry = Arc::clone(registry);
+    tokio::task::spawn_blocking(move || {
+        let failures = tailers.tick(|pane_id, agent_id| registry.is_live_owner(pane_id, agent_id));
+        (tailers, failures)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        warn!(error = %e, "codex rollout: a poll failed; every tailer was reset");
+        Default::default()
+    })
+}
+
+/// Issues #714 and #1359: the event the daemon reports for a failed turn read
+/// from a Codex rollout — `QuotaBlocked` for a usage limit, `Error` for any
+/// other failure. An `Error` carries no provider text, like the Claude Code
+/// `StopFailure` it gives parity with: the card shows the status, and the
+/// message stays in the rollout it came from.
+fn codex_rollout_failure_event(failure: crate::codex_rollout_tail::CodexTurnFailure) -> AgentEvent {
+    use crate::quota_block::{
+        QUOTA_BLOCKED_DETAIL_METADATA_KEY, QUOTA_BLOCKED_KIND_METADATA_KEY,
+        QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, QUOTA_BLOCKED_SOURCE_CODEX_ROLLOUT,
+        QUOTA_BLOCKED_SOURCE_METADATA_KEY,
+    };
+    use crate::quota_signals::FailureOutcome;
+    let now = chrono::Utc::now();
+    let mut metadata = std::collections::HashMap::new();
+    let event_type = match failure.outcome {
+        FailureOutcome::Blocked { kind, resets_at_ms } => {
+            metadata.insert(
+                QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
+                kind.as_wire().to_string(),
+            );
+            if let Some(at) = resets_at_ms {
+                metadata.insert(
+                    QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY.to_string(),
+                    at.to_string(),
+                );
+            }
+            if let Some(message) = failure.message {
+                metadata.insert(QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(), message);
+            }
+            normalize_quota_blocked_metadata(&mut metadata, now.timestamp_millis());
+            metadata.insert(
+                QUOTA_BLOCKED_SOURCE_METADATA_KEY.to_string(),
+                QUOTA_BLOCKED_SOURCE_CODEX_ROLLOUT.to_string(),
+            );
+            crate::event::EventType::QuotaBlocked
+        }
+        FailureOutcome::Error => crate::event::EventType::Error,
+    };
+    AgentEvent {
+        session_id: failure.session_id,
+        agent_type: crate::event::AgentType::Codex,
+        event_type,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: now,
+        user_prompt: None,
+        metadata,
+        pane_id: Some(failure.pane_id),
+        agent_id: Some(failure.agent_id),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    }
 }
 
 /// Issue #424 (reviewer blocker 3): teach the registry how to turn a
@@ -2946,14 +3394,26 @@ async fn run_hook_loop_with_idle_timeout(
                                     // put the role registration back. The read guard
                                     // below is released before the detached dispatch
                                     // task ever takes the write lock.
+                                    // Issue #580 review (Qodo, #1285): the
+                                    // sender the gate attested, so the busy
+                                    // check cannot re-resolve a predecessor's
+                                    // delegate onto a successor that took the
+                                    // pane in between.
+                                    let sender_agent_id = match &provenance {
+                                        crate::hook_provenance::Provenance::Attested {
+                                            agent_id,
+                                        } => Some(agent_id.clone()),
+                                        _ => None,
+                                    };
                                     let resp = state
                                         .read()
                                         .await
-                                        .handle_delegate_with_state(
+                                        .handle_attested_delegate(
                                             signal,
                                             &pty_registry,
                                             &event_tx,
                                             Some(&state),
+                                            sender_agent_id.as_deref(),
                                         )
                                         .await;
                                     // Answer on the same connection, like
@@ -3225,7 +3685,7 @@ async fn run_hook_loop_with_idle_timeout(
                                     }
                                 }
                             }
-                        } else if let Ok(event) = serde_json::from_str::<AgentEvent>(&line) {
+                        } else if let Ok(mut event) = serde_json::from_str::<AgentEvent>(&line) {
                             // `tool_name`/`tool_detail` are logged so a post-mortem can
                             // name the command an agent was running, not just that it ran
                             // one. Four "fleet death" investigations (2026-07-28 23:05,
@@ -3269,6 +3729,10 @@ async fn run_hook_loop_with_idle_timeout(
                                      Unknown and otherwise ignored; check the hook for a typo"
                                 );
                             }
+                            // Issue #714: normalise the quota-block keys, and hand
+                            // a Codex event's rollout and turn to the tailer.
+                            admit_producer_event(&mut event);
+                            queue_codex_rollout_arm(&pty_registry, &event);
                             // Persist the agent type this hook revealed into
                             // the PTY registry (keyed by pane id), so a later
                             // `list_agents` — e.g. a fresh `dot-agent-deck
@@ -3408,6 +3872,262 @@ mod orphan_watchdog_tests {
     }
 }
 
+/// Issue #714: producer admission of the quota-block contract. Platform
+/// independent — it touches no socket and spawns nothing.
+#[cfg(test)]
+mod quota_admission_tests {
+    use super::*;
+    use crate::event::AgentType;
+    use spec::spec;
+
+    pub(super) fn quota_frame(event_type: crate::event::EventType) -> AgentEvent {
+        AgentEvent {
+            session_id: "s".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some("pane-1".to_string()),
+            agent_id: Some("1".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// Scenario: Post a `quota_blocked` event on the hook socket as a producer
+    /// would, with a forged daemon source marker, an unknown kind and an
+    /// out-of-range reset, and a `thinking` event carrying quota-reason keys.
+    /// The block is admitted with its kind normalised and the marker and bad
+    /// reset stripped; the thinking frame loses every quota key and paints no
+    /// reason.
+    #[spec("status/blocked/006")]
+    #[test]
+    fn status_blocked_006_producer_quota_blocked_is_admitted_and_normalised() {
+        use crate::quota_block::{
+            QUOTA_BLOCKED_DETAIL_METADATA_KEY, QUOTA_BLOCKED_KIND_METADATA_KEY,
+            QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, QUOTA_BLOCKED_SOURCE_METADATA_KEY,
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let with = |event_type, pairs: &[(&str, String)]| {
+            let mut event = quota_frame(event_type);
+            for (k, v) in pairs {
+                event.metadata.insert(k.to_string(), v.clone());
+            }
+            event
+                .metadata
+                .insert("other".to_string(), "kept".to_string());
+            event
+        };
+
+        // A producer's block is admitted and normalised.
+        let mut block = with(
+            crate::event::EventType::QuotaBlocked,
+            &[
+                (QUOTA_BLOCKED_KIND_METADATA_KEY, "made_up_kind".to_string()),
+                (
+                    QUOTA_BLOCKED_SOURCE_METADATA_KEY,
+                    "codex_rollout".to_string(),
+                ),
+                (
+                    QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY,
+                    (now + 3_600_000).to_string(),
+                ),
+                (
+                    QUOTA_BLOCKED_DETAIL_METADATA_KEY,
+                    "limit\u{202e} hit\n".to_string(),
+                ),
+            ],
+        );
+        let raw = serde_json::to_string(&block).unwrap();
+        assert!(raw.contains("\"quota_blocked\""), "{raw}");
+        admit_producer_event(&mut block);
+        assert!(
+            !block.is_daemon_synthetic(),
+            "a producer cannot claim the daemon's source"
+        );
+        assert!(
+            !block
+                .metadata
+                .contains_key(QUOTA_BLOCKED_SOURCE_METADATA_KEY)
+        );
+        assert_eq!(block.metadata[QUOTA_BLOCKED_KIND_METADATA_KEY], "unknown");
+        assert_eq!(
+            block.metadata[QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY],
+            (now + 3_600_000).to_string()
+        );
+        assert_eq!(
+            block.metadata[QUOTA_BLOCKED_DETAIL_METADATA_KEY],
+            "limit hit"
+        );
+        assert_eq!(block.metadata["other"], "kept");
+
+        // Resets outside the window, or not a number, are dropped — not the event.
+        for bad in [
+            (now - 2 * 3_600_000).to_string(),
+            (now + 500 * 86_400_000).to_string(),
+            "soon".to_string(),
+        ] {
+            let mut event = with(
+                crate::event::EventType::QuotaBlocked,
+                &[
+                    (QUOTA_BLOCKED_KIND_METADATA_KEY, "usage_limit".to_string()),
+                    (QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, bad.clone()),
+                ],
+            );
+            admit_producer_event(&mut event);
+            assert_eq!(
+                event.metadata[QUOTA_BLOCKED_KIND_METADATA_KEY],
+                "usage_limit"
+            );
+            assert!(
+                !event
+                    .metadata
+                    .contains_key(QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY),
+                "{bad} kept"
+            );
+        }
+
+        // Every other event type loses every quota key.
+        let mut smuggled = with(
+            crate::event::EventType::Thinking,
+            &[
+                (
+                    QUOTA_BLOCKED_KIND_METADATA_KEY,
+                    "credits_depleted".to_string(),
+                ),
+                (QUOTA_BLOCKED_DETAIL_METADATA_KEY, "forged".to_string()),
+                (QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, now.to_string()),
+                (
+                    QUOTA_BLOCKED_SOURCE_METADATA_KEY,
+                    "codex_rollout".to_string(),
+                ),
+            ],
+        );
+        admit_producer_event(&mut smuggled);
+        assert_eq!(
+            smuggled.metadata.keys().collect::<Vec<_>>(),
+            vec!["other"],
+            "{:?}",
+            smuggled.metadata
+        );
+
+        // End to end through the state: the admitted block paints the card; the
+        // stripped frame would not have.
+        let mut state = crate::state::AppState::default();
+        state.register_pane("pane-1".to_string());
+        state.apply_event(smuggled);
+        assert_eq!(
+            state.sessions["s"].status,
+            crate::state::SessionStatus::Thinking
+        );
+        assert!(state.sessions["s"].blocked.is_none());
+        state.apply_event(block);
+        assert_eq!(
+            state.sessions["s"].status,
+            crate::state::SessionStatus::Blocked
+        );
+        let reason = state.sessions["s"].blocked.clone().expect("a reason");
+        assert_eq!(reason.kind, crate::state::BlockedKind::Unknown);
+        assert_eq!(reason.resets_at_ms, Some(now + 3_600_000));
+
+        // The Codex rollout keys survive only on the Codex events that carry them.
+        let codex_keys = [
+            (
+                crate::codex_rollout_tail::CODEX_TRANSCRIPT_PATH_METADATA_KEY,
+                "/x/rollout-a.jsonl".to_string(),
+            ),
+            (
+                crate::codex_rollout_tail::CODEX_TURN_ID_METADATA_KEY,
+                "t".to_string(),
+            ),
+        ];
+        let mut claude = with(crate::event::EventType::Thinking, &codex_keys);
+        admit_producer_event(&mut claude);
+        assert_eq!(claude.metadata.len(), 1, "{:?}", claude.metadata);
+        let mut codex = with(crate::event::EventType::Thinking, &codex_keys);
+        codex.agent_type = AgentType::Codex;
+        admit_producer_event(&mut codex);
+        assert_eq!(codex.metadata.len(), 3, "{:?}", codex.metadata);
+        // Issue #1354: a thread-spawned Codex subagent's hooks carry the
+        // parent's session and the subagent's own rollout and turn, so they
+        // lose both keys rather than re-arm the parent's watch.
+        let mut subagent = with(crate::event::EventType::Thinking, &codex_keys);
+        subagent.agent_type = AgentType::Codex;
+        subagent.metadata.insert(
+            crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
+            "a7c1".to_string(),
+        );
+        admit_producer_event(&mut subagent);
+        assert_eq!(subagent.metadata.len(), 2, "{:?}", subagent.metadata);
+        assert!(subagent.is_from_subagent());
+    }
+
+    /// Issue #1359: a failed Codex turn read from the rollout becomes one
+    /// event for the card — `QuotaBlocked`, marked as the daemon's own, for a
+    /// usage limit, and `Error`, with no quota metadata and no provider text,
+    /// for any other failure — and each paints the card it names.
+    #[test]
+    fn codex_rollout_failures_report_blocked_or_error() {
+        use crate::codex_rollout_tail::CodexTurnFailure;
+        use crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY;
+        use crate::quota_signals::FailureOutcome;
+        let failure = |outcome| CodexTurnFailure {
+            pane_id: "pane-1".to_string(),
+            agent_id: "agent-1".to_string(),
+            session_id: "s".to_string(),
+            turn_id: "t1".to_string(),
+            outcome,
+            message: Some("provider text".to_string()),
+        };
+        let mut state = crate::state::AppState::default();
+        state.register_pane("pane-1".to_string());
+        state.apply_event(AgentEvent {
+            agent_type: AgentType::Codex,
+            agent_id: Some("agent-1".to_string()),
+            ..quota_frame(crate::event::EventType::Thinking)
+        });
+        assert_eq!(
+            state.sessions["s"].status,
+            crate::state::SessionStatus::Thinking
+        );
+
+        let error = codex_rollout_failure_event(failure(FailureOutcome::Error));
+        assert_eq!(error.event_type, crate::event::EventType::Error);
+        assert_eq!(error.agent_type, AgentType::Codex);
+        assert_eq!(error.session_id, "s");
+        assert_eq!(error.pane_id.as_deref(), Some("pane-1"));
+        assert_eq!(error.agent_id.as_deref(), Some("agent-1"));
+        assert!(error.metadata.is_empty(), "{:?}", error.metadata);
+        assert!(error.tool_detail.is_none());
+        state.apply_event(error);
+        assert_eq!(
+            state.sessions["s"].status,
+            crate::state::SessionStatus::Error
+        );
+
+        let block = codex_rollout_failure_event(failure(FailureOutcome::Blocked {
+            kind: crate::quota_block::BlockedKind::CreditsDepleted,
+            resets_at_ms: None,
+        }));
+        assert_eq!(block.event_type, crate::event::EventType::QuotaBlocked);
+        assert!(
+            block
+                .metadata
+                .contains_key(QUOTA_BLOCKED_SOURCE_METADATA_KEY)
+        );
+        state.apply_event(block);
+        assert_eq!(
+            state.sessions["s"].status,
+            crate::state::SessionStatus::Blocked
+        );
+    }
+}
+
 // PRD #42 M2/review: these tests bind a real Unix socket, chmod it via
 // `PermissionsExt`, and spawn `/bin/sh` agents — none of which exist on
 // Windows. Gate the whole block to Unix so the Windows `cargo nextest run`
@@ -3421,6 +4141,793 @@ mod hook_ingestion_tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{UnixListener, UnixStream};
+
+    /// Issue #714: the Codex rollout tailer is armed only for an event whose
+    /// pane and agent name the pane's live owner, and only by a genuine Codex
+    /// hook — not by the wrapper's output classifier.
+    #[test]
+    fn codex_rollout_arm_needs_the_live_owner() {
+        use crate::codex_rollout_tail::{
+            ArmCommand, CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY,
+        };
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let owner = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "codex-arm".to_string(),
+                )]),
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let prompt = |agent: &str| {
+            let mut event =
+                super::quota_admission_tests::quota_frame(crate::event::EventType::Thinking);
+            event.agent_type = AgentType::Codex;
+            event.pane_id = Some("codex-arm".to_string());
+            event.agent_id = Some(agent.to_string());
+            event.metadata.insert(
+                CODEX_TRANSCRIPT_PATH_METADATA_KEY.to_string(),
+                "/x/rollout-a.jsonl".to_string(),
+            );
+            event
+                .metadata
+                .insert(CODEX_TURN_ID_METADATA_KEY.to_string(), "t1".to_string());
+            event
+        };
+        queue_codex_rollout_arm(&registry, &prompt("someone-else"));
+        let mut classified = prompt(&owner);
+        classified.metadata.insert(
+            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
+        );
+        queue_codex_rollout_arm(&registry, &classified);
+        assert!(registry.codex_rollout_arms().drain().is_empty());
+
+        queue_codex_rollout_arm(&registry, &prompt(&owner));
+        let mut stop = prompt(&owner);
+        stop.event_type = crate::event::EventType::Idle;
+        queue_codex_rollout_arm(&registry, &stop);
+        let queued = registry.codex_rollout_arms().drain();
+        assert!(
+            matches!(&queued[..], [ArmCommand::Arm(req), ArmCommand::Disarm { turn_id, .. }]
+                if req.turn_id.as_deref() == Some("t1") && turn_id == "t1"),
+            "{queued:?}"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Issue #1359 (Qodo on PR #1375): a poll that found turn `t1`'s failure
+    /// can finish after Codex's next `UserPromptSubmit` has put the card on
+    /// Thinking. That failure is stale and must not repaint the card. The hook
+    /// loop queues a prompt's arm before it applies the prompt, so the newer
+    /// arm is still in the queue when the failure is reported. A re-arm of the
+    /// same turn does not supersede it, and with no newer arm it is an Error.
+    #[tokio::test]
+    async fn a_codex_failure_superseded_by_a_newer_turn_does_not_repaint_the_card() {
+        use crate::codex_rollout_tail::{
+            CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY, CodexTurnFailure,
+        };
+        use crate::quota_signals::FailureOutcome;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let owner = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "codex-race".to_string(),
+                )]),
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane("codex-race".to_string());
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let prompt = |turn: &str| {
+            let mut event =
+                super::quota_admission_tests::quota_frame(crate::event::EventType::Thinking);
+            event.agent_type = AgentType::Codex;
+            event.pane_id = Some("codex-race".to_string());
+            event.agent_id = Some(owner.clone());
+            event.metadata.insert(
+                CODEX_TRANSCRIPT_PATH_METADATA_KEY.to_string(),
+                "/x/rollout-a.jsonl".to_string(),
+            );
+            event
+                .metadata
+                .insert(CODEX_TURN_ID_METADATA_KEY.to_string(), turn.to_string());
+            event
+        };
+        // The hook loop's order for a prompt: queue its arm, then apply it.
+        let submit = |turn: &'static str| {
+            let event = prompt(turn);
+            queue_codex_rollout_arm(&registry, &event);
+            ingest_event(&state, &event_tx, &registry, event)
+        };
+        let failure = || CodexTurnFailure {
+            pane_id: "codex-race".to_string(),
+            agent_id: owner.clone(),
+            session_id: "s".to_string(),
+            turn_id: "t1".to_string(),
+            outcome: FailureOutcome::Error,
+            message: None,
+        };
+        let status = || async { state.read().await.sessions["s"].status.clone() };
+
+        // Turn t1 is armed and the monitor has drained it; a poll finds its
+        // failure while turn t2 is submitted.
+        submit("t1").await;
+        registry.codex_rollout_arms().drain();
+        submit("t2").await;
+        report_codex_rollout_failure(&state, &event_tx, &registry, failure()).await;
+        assert_eq!(
+            status().await,
+            crate::state::SessionStatus::Thinking,
+            "the older turn's failure repainted the newer turn's card"
+        );
+
+        // A re-arm of the same turn does not supersede its own failure.
+        registry.codex_rollout_arms().drain();
+        submit("t1").await;
+        report_codex_rollout_failure(&state, &event_tx, &registry, failure()).await;
+        assert_eq!(status().await, crate::state::SessionStatus::Error);
+
+        // Control: nothing newer queued, so the failure is reported.
+        registry.codex_rollout_arms().drain();
+        submit("t1").await;
+        registry.codex_rollout_arms().drain();
+        report_codex_rollout_failure(&state, &event_tx, &registry, failure()).await;
+        assert_eq!(status().await, crate::state::SessionStatus::Error);
+        registry.shutdown_all();
+    }
+
+    /// Issue #714 (audit A1): raw frames written straight to the hook socket —
+    /// not built by the hook CLI, so none of its bounds applied — carrying a
+    /// megabyte `codex_transcript_path` or `codex_turn_id` for a live Codex
+    /// owner. Admission drops each oversized or empty key, keeps the event and
+    /// any in-bounds key, and nothing oversized reaches the arm queue.
+    #[tokio::test]
+    async fn raw_oversized_codex_rollout_frames_are_bounded_at_admission() {
+        use crate::codex_rollout_tail::{
+            ArmCommand, CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY,
+            MAX_METADATA_BYTES, MAX_TURN_ID_BYTES,
+        };
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let owner = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "codex-raw".to_string(),
+                )]),
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+
+        let dir = tempfile::tempdir().unwrap();
+        // Plain bind, for the umask reason given in
+        // `run_hook_loop_persists_agent_type_into_registry`.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod tempdir");
+        let sock = dir.path().join("hook.sock");
+        let listener =
+            IpcListener::from_tokio_listener(UnixListener::bind(&sock).expect("bind hook socket"));
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        // The registry ownership oracle, installed as `run_daemon_with` does,
+        // so the owner's frames are admitted to the state at all.
+        let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+        {
+            let mut st = state.write().await;
+            st.set_agent_ownership(Arc::downgrade(&ownership));
+            st.register_pane("codex-raw".to_string());
+        }
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let handle = tokio::spawn({
+            let (registry, state) = (registry.clone(), state.clone());
+            let shutdown = Arc::new(Notify::new());
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
+        });
+
+        let huge_path = format!("/x/{}/rollout-a.jsonl", "p".repeat(1024 * 1024));
+        let huge_turn = "t".repeat(1024 * 1024);
+        let valid_path = "/x/rollout-a.jsonl";
+        let frame = |session: &str, path: &str, turn: &str| {
+            serde_json::json!({
+                "session_id": session,
+                "agent_type": "codex",
+                "event_type": "thinking",
+                "timestamp": "2026-09-26T12:00:00Z",
+                "pane_id": "codex-raw",
+                "agent_id": owner,
+                "metadata": {
+                    CODEX_TRANSCRIPT_PATH_METADATA_KEY: path,
+                    CODEX_TURN_ID_METADATA_KEY: turn,
+                },
+            })
+        };
+        let frames = [
+            frame("raw-both-huge", &huge_path, &huge_turn),
+            frame("raw-huge-path", &huge_path, "t-ok"),
+            frame(
+                "raw-just-over",
+                &"q".repeat(MAX_METADATA_BYTES + 1),
+                &"u".repeat(MAX_TURN_ID_BYTES + 1),
+            ),
+            frame("raw-empty", "", ""),
+            frame("raw-valid", valid_path, "t-valid"),
+        ];
+        let mut stream = UnixStream::connect(&sock)
+            .await
+            .expect("connect hook socket");
+        for f in &frames {
+            stream
+                .write_all(format!("{f}\n").as_bytes())
+                .await
+                .expect("write hook line");
+        }
+        stream.flush().await.unwrap();
+
+        // Every frame is relayed — an invalid key costs the key, not the event —
+        // and each carries only the keys that were in bounds.
+        let mut relayed = std::collections::HashMap::new();
+        while relayed.len() < frames.len() {
+            let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("every frame is relayed")
+                .expect("broadcast open");
+            if let BroadcastMsg::Event(event) = msg {
+                relayed.insert(event.session_id.clone(), event);
+            }
+        }
+        // A value too long to print is summarised, so a regression reports
+        // its size instead of dumping a megabyte into the failure.
+        let keys = |session: &str| {
+            let meta = &relayed[session].metadata;
+            let shown = |key: &str| {
+                meta.get(key).map(|v| {
+                    if v.len() > 64 {
+                        format!("<{} bytes>", v.len())
+                    } else {
+                        v.clone()
+                    }
+                })
+            };
+            (
+                shown(CODEX_TRANSCRIPT_PATH_METADATA_KEY),
+                shown(CODEX_TURN_ID_METADATA_KEY),
+            )
+        };
+        assert_eq!(keys("raw-both-huge"), (None, None));
+        assert_eq!(keys("raw-huge-path"), (None, Some("t-ok".to_string())));
+        assert_eq!(keys("raw-just-over"), (None, None));
+        assert_eq!(keys("raw-empty"), (None, None));
+        assert_eq!(
+            keys("raw-valid"),
+            (Some(valid_path.to_string()), Some("t-valid".to_string()))
+        );
+
+        let queued = registry.codex_rollout_arms().drain();
+        let arms: Vec<(Option<&str>, Option<&str>)> = queued
+            .iter()
+            .map(|c| match c {
+                ArmCommand::Arm(req) => (req.path.as_deref(), req.turn_id.as_deref()),
+                ArmCommand::Disarm { .. } => panic!("no Stop was sent: {c:?}"),
+            })
+            .collect();
+        assert_eq!(
+            arms,
+            vec![(None, Some("t-ok")), (Some(valid_path), Some("t-valid"))],
+            "only in-bounds values are queued"
+        );
+        assert!(queued.iter().all(|c| c.byte_len() < 4 * MAX_METADATA_BYTES));
+
+        handle.abort();
+        let _ = handle.await;
+        registry.shutdown_all();
+    }
+
+    /// PRD #1223: the pane-closed marker is daemon-authoritative. A producer
+    /// posting it on the hook socket must not reach an attached TUI with it —
+    /// that would let any same-uid process make a TUI drop a live pane.
+    #[tokio::test]
+    async fn ingest_strips_a_producer_supplied_pane_closed_marker() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut rx) = broadcast::channel(8);
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            crate::event::DAEMON_PANE_CLOSED_METADATA_KEY.to_string(),
+            crate::event::DAEMON_PANE_CLOSED_METADATA_VALUE.to_string(),
+        );
+        let forged = AgentEvent {
+            session_id: "pane-victim".to_string(),
+            agent_type: AgentType::None,
+            event_type: crate::event::EventType::SessionEnd,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some("victim".to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        };
+        assert!(forged.is_daemon_pane_closed(), "precondition");
+        ingest_event(&state, &event_tx, &registry, forged).await;
+        let BroadcastMsg::Event(relayed) = rx.try_recv().expect("the event is relayed") else {
+            panic!("expected an event");
+        };
+        assert!(
+            !relayed.is_daemon_pane_closed(),
+            "the relayed copy must not carry the marker: {:?}",
+            relayed.metadata
+        );
+    }
+
+    /// Issue #714 (audit N1/N2): a Codex worker stand-in and an orchestrator
+    /// stand-in (both `cat`), the daemon's `AppState` with the registry
+    /// ownership oracle installed as `run_daemon_with` installs it, and an
+    /// outstanding delegation from the orchestrator to the worker bound to the
+    /// worker's agent id — everything a blocked-worker notice needs to be owed.
+    struct QuotaNoticeFixture {
+        registry: Arc<AgentPtyRegistry>,
+        state: SharedState,
+        event_tx: broadcast::Sender<BroadcastMsg>,
+        worker_pane: &'static str,
+        worker_id: String,
+        orch_pane: &'static str,
+        orch_id: String,
+    }
+
+    impl QuotaNoticeFixture {
+        const NOTICE: &'static str = "delegated worker blocked by a provider usage limit";
+
+        async fn new(worker_pane: &'static str, orch_pane: &'static str) -> Self {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let spawn = |pane: &str, agent_type: AgentType| {
+                registry
+                    .spawn_agent(SpawnOptions {
+                        command: Some("/bin/cat"),
+                        env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                            DOT_AGENT_DECK_PANE_ID.to_string(),
+                            pane.to_string(),
+                        )]),
+                        agent_type: Some(agent_type),
+                        ..SpawnOptions::default()
+                    })
+                    .expect("spawn stand-in")
+            };
+            let worker_id = spawn(worker_pane, AgentType::Codex);
+            let orch_id = spawn(orch_pane, AgentType::ClaudeCode);
+            let state: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            {
+                let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+                let mut st = state.write().await;
+                st.set_agent_ownership(Arc::downgrade(&ownership));
+                st.register_pane(worker_pane.to_string());
+                st.register_pane(orch_pane.to_string());
+            }
+            let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let fx = Self {
+                registry,
+                state,
+                event_tx,
+                worker_pane,
+                worker_id,
+                orch_pane,
+                orch_id,
+            };
+            fx.arm_delegation();
+            fx
+        }
+
+        fn arm_delegation(&self) {
+            let armed = self
+                .registry
+                .arm_outstanding_delegation(
+                    self.worker_pane,
+                    "coder",
+                    self.orch_pane,
+                    &self.orch_id,
+                    None,
+                )
+                .expect("arm the delegation");
+            self.registry.bind_delegation_worker_agent_id(
+                self.worker_pane,
+                armed.seq,
+                &self.worker_id,
+            );
+        }
+
+        fn worker_event(&self, event_type: crate::event::EventType) -> AgentEvent {
+            AgentEvent {
+                session_id: format!("{}-session", self.worker_pane),
+                agent_type: AgentType::Codex,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: std::collections::HashMap::new(),
+                pane_id: Some(self.worker_pane.to_string()),
+                agent_id: Some(self.worker_id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+
+        /// The worker's own `quota_blocked` report.
+        fn quota_blocked(&self) -> AgentEvent {
+            let mut event = self.worker_event(crate::event::EventType::QuotaBlocked);
+            event.metadata.insert(
+                crate::quota_block::QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
+                "usage_limit".to_string(),
+            );
+            event
+        }
+
+        /// The worker reports a block through [`ingest_event`] — latch, card and
+        /// orchestrator notice, the production path. Returns the latched epoch.
+        async fn report_block(&self) -> u64 {
+            ingest_event(
+                &self.state,
+                &self.event_tx,
+                &self.registry,
+                self.quota_blocked(),
+            )
+            .await;
+            self.registry
+                .quota_published_epoch(self.worker_pane, &self.worker_id)
+                .expect("the report latched a block")
+        }
+
+        /// Only the first half of [`ingest_event`] for a block — the latch and
+        /// the card, under the `AppState` write lock — so a test can interleave
+        /// a work hook before the notice is attempted.
+        async fn latch_block(&self) -> u64 {
+            let mut state = self.state.write().await;
+            let epoch = self
+                .registry
+                .note_quota_block(self.worker_pane, &self.worker_id)
+                .expect("the worker owns its pane");
+            state.apply_event(self.quota_blocked());
+            epoch
+        }
+
+        async fn work_hook(&self) {
+            let thinking = self.worker_event(crate::event::EventType::Thinking);
+            ingest_event(&self.state, &self.event_tx, &self.registry, thinking).await;
+        }
+
+        async fn blocked_cards(&self) -> usize {
+            self.state
+                .read()
+                .await
+                .sessions
+                .values()
+                .filter(|s| s.status == crate::state::SessionStatus::Blocked)
+                .count()
+        }
+
+        /// [`Self::notices`], polled until at least one has landed and the
+        /// count has stopped moving.
+        async fn settled_notices(&self) -> usize {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut last = self.notices().await;
+            loop {
+                let now = self.notices().await;
+                if now > 0 && now == last {
+                    return now;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the notice never reached the orchestrator"
+                );
+                last = now;
+            }
+        }
+
+        /// How many blocked-worker notices have reached the orchestrator's
+        /// pane, after giving an in-flight echo time to land.
+        async fn notices(&self) -> usize {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let snap = self.registry.snapshot(&self.orch_id).expect("orchestrator");
+            let needle = Self::NOTICE.as_bytes();
+            snap.windows(needle.len()).filter(|w| *w == needle).count()
+        }
+    }
+
+    /// Failure bound for an await that runs while a test holds the
+    /// orchestrator's pane writer.
+    const HELD_WRITER_BOUND: Duration = Duration::from_secs(10);
+
+    /// Await `fut` while the test holds the orchestrator's pane writer in
+    /// `held`. A regression that makes `fut` wait on that writer would
+    /// otherwise deadlock the test, so past [`HELD_WRITER_BOUND`] the guard is
+    /// released and the test fails naming `what`.
+    async fn bounded_while_holding<G, T>(
+        held: &mut Option<G>,
+        what: &str,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        match tokio::time::timeout(HELD_WRITER_BOUND, fut).await {
+            Ok(value) => value,
+            Err(_) => {
+                drop(held.take());
+                panic!(
+                    "{what} did not finish within {HELD_WRITER_BOUND:?} while the \
+                     orchestrator's pane writer was held"
+                );
+            }
+        }
+    }
+
+    /// Issue #714 (audit N2, R2): a genuine work hook that clears the block
+    /// after it was applied, but before the orchestrator is told, suppresses the
+    /// notice — whether it lands before the notice is claimed or between the
+    /// claim and the write. Either way the notice stays owed: a second block of
+    /// the SAME delegation, reported by the worker, then delivers exactly one
+    /// notice, and a third block of it delivers none.
+    #[tokio::test]
+    async fn quota_block_cleared_before_the_notice_is_not_reported() {
+        let fx = QuotaNoticeFixture::new("quota-cleared-worker", "quota-cleared-orch").await;
+
+        // latch → work hook → claim: nothing is claimed or written.
+        let epoch = fx.latch_block().await;
+        assert_eq!(
+            fx.blocked_cards().await,
+            1,
+            "precondition: the block applied"
+        );
+        fx.work_hook().await;
+        assert_eq!(
+            fx.blocked_cards().await,
+            0,
+            "precondition: the hook cleared it"
+        );
+        assert!(
+            notify_orchestrator_of_quota_block(&fx.registry, fx.worker_pane, &fx.worker_id, epoch)
+                .is_none(),
+            "a cleared block claimed a notice"
+        );
+        assert_eq!(fx.notices().await, 0, "a cleared block was reported");
+
+        // latch → claim → work hook → write: the writer-held re-check refuses.
+        let epoch = fx.latch_block().await;
+        let notice = fx
+            .registry
+            .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
+            .expect("the first suppression left the notice owed");
+        fx.work_hook().await;
+        fx.registry
+            .deliver_worker_blocked_notice(fx.worker_pane, &fx.worker_id, epoch, notice)
+            .await;
+        assert_eq!(
+            fx.notices().await,
+            0,
+            "a block cleared after the claim was reported"
+        );
+
+        // A second block of the SAME delegation (not re-armed): the refused
+        // claim was released, so the notice is delivered — once (`cat` shows it
+        // twice: the tty echo and its output) — and claimed.
+        fx.report_block().await;
+        let delivered = fx.settled_notices().await;
+        assert_eq!(delivered, 2, "expected exactly one notice (echo + output)");
+        assert!(
+            fx.registry
+                .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
+                .is_none(),
+            "the delivered notice was not claimed"
+        );
+
+        // A third block of the same delegation reports nothing more.
+        fx.work_hook().await;
+        fx.report_block().await;
+        assert_eq!(fx.notices().await, delivered, "the delegation re-notified");
+        fx.registry.shutdown_all();
+    }
+
+    /// Issue #714 (audit F-A2): block 1 claims the blocked-worker notice and
+    /// waits on the orchestrator's writer, which is held busy. A work hook lifts
+    /// block 1 and the worker reports block 2 of the SAME delegation while the
+    /// writer is still busy, so block 2 finds the notice claimed and skips it.
+    /// When the writer frees, block 1's write is refused and released — and the
+    /// notice is then delivered for block 2, exactly once. A third block of the
+    /// delegation reports nothing more.
+    #[tokio::test]
+    async fn quota_refused_notice_hands_the_claim_to_a_newer_block() {
+        let fx = QuotaNoticeFixture::new("quota-handoff-worker", "quota-handoff-orch").await;
+        let writer = fx
+            .registry
+            .agent_writer(&fx.orch_id)
+            .expect("the orchestrator's writer");
+        let mut held = Some(writer.lock().await);
+
+        let first = bounded_while_holding(&mut held, "latching block 1", fx.latch_block()).await;
+        let notice = fx
+            .registry
+            .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
+            .expect("block 1 claims the notice");
+        let delivery = {
+            let registry = Arc::clone(&fx.registry);
+            let (pane, agent) = (fx.worker_pane.to_string(), fx.worker_id.clone());
+            tokio::spawn(async move {
+                registry
+                    .deliver_worker_blocked_notice(&pane, &agent, first, notice)
+                    .await;
+            })
+        };
+        // Let block 1's write reach the busy writer.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !delivery.is_finished(),
+            "precondition: the write waits on the writer"
+        );
+
+        bounded_while_holding(&mut held, "the work hook", fx.work_hook()).await;
+        let second = bounded_while_holding(&mut held, "reporting block 2", fx.report_block()).await;
+        assert_ne!(second, first);
+        assert_eq!(fx.blocked_cards().await, 1, "precondition: block 2 applied");
+
+        drop(held.take());
+        tokio::time::timeout(Duration::from_secs(30), delivery)
+            .await
+            .expect("block 1's refused write never returned once the writer freed")
+            .expect("the delivery task");
+        let delivered = fx.settled_notices().await;
+        assert_eq!(delivered, 2, "expected exactly one notice (echo + output)");
+        assert!(
+            fx.registry
+                .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
+                .is_none(),
+            "block 2's delivered notice was not claimed"
+        );
+
+        fx.work_hook().await;
+        fx.report_block().await;
+        assert_eq!(fx.notices().await, delivered, "the delegation re-notified");
+        fx.registry.shutdown_all();
+    }
+
+    /// Issue #714 (review): every pane's hooks pass through `ingest_event`, so
+    /// ingesting a worker's block must not wait on the orchestrator's pane
+    /// writer. Hold that writer and ingest the worker's `quota_blocked`: it
+    /// returns at once with the card Blocked and the notice already claimed,
+    /// and the notice lands — once — only when the writer frees.
+    #[tokio::test]
+    async fn quota_publish_does_not_wait_on_a_busy_orchestrator_writer() {
+        let fx = QuotaNoticeFixture::new("quota-busy-worker", "quota-busy-orch").await;
+        let writer = fx
+            .registry
+            .agent_writer(&fx.orch_id)
+            .expect("the orchestrator's writer");
+        let mut held = Some(writer.lock().await);
+
+        bounded_while_holding(&mut held, "ingesting a block", fx.report_block()).await;
+        assert_eq!(fx.blocked_cards().await, 1);
+        assert_eq!(
+            fx.notices().await,
+            0,
+            "precondition: the notice waits on the held writer"
+        );
+        assert!(
+            fx.registry
+                .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
+                .is_none(),
+            "the notice must be claimed before its write is spawned"
+        );
+
+        drop(held.take());
+        assert_eq!(
+            fx.settled_notices().await,
+            2,
+            "expected exactly one notice (echo + output)"
+        );
+        fx.registry.shutdown_all();
+    }
+
+    /// Issue #714 (review): a notice task waiting on a stalled orchestrator
+    /// writer is cancelled when its delegation is superseded, so repeated
+    /// delegations to a blocked worker leave at most one notice queued on that
+    /// writer, and releasing it delivers only the current delegation's notice.
+    #[tokio::test]
+    async fn superseded_blocked_notices_do_not_queue_on_a_stalled_orchestrator_writer() {
+        let fx = QuotaNoticeFixture::new("quota-stall-worker", "quota-stall-orch").await;
+        let writer = fx
+            .registry
+            .agent_writer(&fx.orch_id)
+            .expect("the orchestrator's writer");
+        let mut held = Some(writer.lock().await);
+
+        bounded_while_holding(&mut held, "ingesting the block", fx.report_block()).await;
+        assert_eq!(
+            fx.blocked_cards().await,
+            1,
+            "precondition: the block applied"
+        );
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let armed = fx
+                .registry
+                .arm_outstanding_delegation(
+                    fx.worker_pane,
+                    "coder",
+                    fx.orch_pane,
+                    &fx.orch_id,
+                    None,
+                )
+                .expect("arm the delegation");
+            fx.registry
+                .bind_delegation_worker_agent_id(fx.worker_pane, armed.seq, &fx.worker_id);
+            tasks.push(
+                fx.registry
+                    .report_published_block_to_new_delegation(
+                        fx.worker_pane,
+                        armed.seq,
+                        &fx.worker_id,
+                    )
+                    .expect("each new delegation is reported"),
+            );
+        }
+
+        // A failure bound only: an abort lands on the task's next poll.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let pending = tasks.iter().filter(|t| !t.is_finished()).count();
+            if pending <= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{pending} notice tasks still queued on the stalled writer"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let last = tasks.pop().expect("the current delegation's task");
+        assert!(
+            tasks.iter().all(|t| t.is_finished()),
+            "a superseded delegation's notice task is still waiting"
+        );
+        assert!(
+            !last.is_finished(),
+            "the current delegation's notice must still be waiting on the writer"
+        );
+        assert_eq!(fx.notices().await, 0, "precondition: nothing written yet");
+
+        drop(held.take());
+        tokio::time::timeout(Duration::from_secs(30), last)
+            .await
+            .expect("the current notice was delivered once the writer freed")
+            .expect("the notice task");
+        assert_eq!(
+            fx.settled_notices().await,
+            2,
+            "expected exactly one notice, the current delegation's (echo + output)"
+        );
+        assert!(
+            fx.registry
+                .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
+                .is_none(),
+            "the current delegation keeps the claim its delivered notice took"
+        );
+        fx.registry.shutdown_all();
+    }
 
     /// Scenario: Surface a hookless scheduled pane only through the daemon's live broadcast, leaving daemon AppState intentionally empty, then publish the exact delivery notice used when the 256-watch cap rejects the next confirmation. The already-visible attached-TUI card must receive an Error event through the production sink.
     #[spec("scheduler/dispatch/017")]
@@ -5736,6 +7243,7 @@ mod hook_ingestion_tests {
                 pane_id: claimed_pane.to_string(),
                 task: "PROVENANCE-TASK".to_string(),
                 to: vec!["worker".to_string()],
+                supersede: false,
                 timestamp: chrono::Utc::now(),
                 token: token.map(str::to_string),
             });
@@ -6047,6 +7555,65 @@ mod hook_ingestion_tests {
         fx.stop().await;
     }
 
+    /// Scenario: issue #530 — an attested `dispatch` that its handler then
+    /// REJECTS (it names an orchestration the caller's directory does not
+    /// define) is still acknowledged as `accepted`, and that acknowledgement is
+    /// the only line the connection ever carries. The rejection reaches the
+    /// caller as a `dispatch:` line typed into its own pane instead.
+    ///
+    /// This pins what `dot-agent-deck dispatch`'s exit status actually asserts,
+    /// which the CLI's help, the dispatcher seed and both dispatcher-mode pages
+    /// now state: exit 0 is the provenance gate admitting the request, not the
+    /// worktree, the spawn, the prompt's delivery or its confirmation. A change
+    /// that starts answering after the handler makes this fail, and is then a
+    /// change to a documented contract rather than a silent one.
+    #[tokio::test]
+    async fn a_dispatch_its_handler_rejects_is_still_acknowledged_as_accepted() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fx = ProvenanceFixture::start().await;
+        const MISSING: &str = "no-such-orchestration-530";
+        let msg = crate::event::DaemonMessage::Dispatch(crate::event::DispatchSignal {
+            pane_id: PROV_ORCH_PANE.to_string(),
+            name: "exit-status-probe".to_string(),
+            task: Some("never started".to_string()),
+            shape: Some(crate::event::DispatchShape::Orchestration {
+                name: Some(MISSING.to_string()),
+            }),
+            timestamp: chrono::Utc::now(),
+            token: Some(fx.orchestrator_token.clone()),
+        });
+        let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
+        let mut stream = UnixStream::connect(&fx.sock).await.expect("connect");
+        stream.write_all(line.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+        // Read to EOF: the hook loop awaits the handler inline on this
+        // connection, so EOF arrives only once the dispatch has been decided.
+        // Anything the handler wrote back would therefore be in `buf` too.
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).await.unwrap();
+        let lines: Vec<&str> = buf.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "a dispatch must answer exactly one line, the gate's ack: {buf:?}"
+        );
+        let ack: crate::event::SignalAck = serde_json::from_str(lines[0])
+            .unwrap_or_else(|e| panic!("dispatch reply was not a SignalAck ({e}): {buf:?}"));
+        assert!(ack.is_signal_ack(), "{ack:?}");
+        assert!(
+            ack.accepted,
+            "the ack is written at the gate, before the handler rejects the shape, so it must \
+             read as accepted — which is exactly why exit 0 cannot mean the unit started: {ack:?}"
+        );
+        assert!(
+            fx.orchestrator_saw(MISSING, Duration::from_secs(20)).await,
+            "the handler's rejection must reach the caller's pane, the one place the dispatch's \
+             outcome is reported"
+        );
+        fx.stop().await;
+    }
+
     /// Is `pid` gone? Mirrors `agent_pty::spawn_tests::pid_is_dead`, which is
     /// private to that module. Unix-only, like this whole block.
     fn pid_is_dead(pid: u32) -> bool {
@@ -6167,6 +7734,356 @@ mod hook_ingestion_tests {
             state.read().await.sessions.len() == 1,
             "the daemon state itself is unaffected by the registry going away"
         );
+    }
+
+    /// Issue #320: one frame as a generation's hook would post it, naming its
+    /// pane and its registry agent id.
+    fn takeover_frame_320(
+        pane: &str,
+        agent_id: &str,
+        session_id: &str,
+        event_type: crate::event::EventType,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> AgentEvent {
+        AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp,
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(pane.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// Issue #320: a pane that has changed hands, observed from both ends of
+    /// the fan-out — the daemon's own `AppState` (registry oracle installed, as
+    /// `run_daemon_with` installs it) and an attached TUI's (no oracle, fed
+    /// every relayed frame the way `spawn_event_subscriber` feeds it).
+    struct Takeover320 {
+        registry: Arc<AgentPtyRegistry>,
+        _ownership: Arc<dyn crate::state::AgentOwnership>,
+        daemon: SharedState,
+        tui: crate::state::AppState,
+        event_tx: broadcast::Sender<BroadcastMsg>,
+        rx: broadcast::Receiver<BroadcastMsg>,
+        pane: String,
+        old: String,
+        new: String,
+    }
+
+    impl Takeover320 {
+        /// The OUTGOING generation `old` runs on the pane, opens its card and
+        /// exits; the INCOMING generation `new` then claims the pane. Nothing
+        /// from `new` has been ingested yet.
+        async fn new(pane: &str) -> Self {
+            let mut fixture = Self::start(pane, "/usr/bin/true").await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while fixture.registry.live_count() != 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the outgoing generation's child never exited"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            fixture.new = fixture
+                .registry
+                .spawn_agent(Self::spawn_options(pane, "/bin/cat"))
+                .expect("the pane must be reusable once its child is gone");
+            fixture
+        }
+
+        /// The `clear = true` shape instead: `respawn_agent_for_pane` lifts the
+        /// outgoing generation's record out of the registry BEFORE the incoming
+        /// one is published, so there is no record left to carry a handover
+        /// flag when the outgoing agent's late frame is read.
+        async fn by_respawn(pane: &str) -> Self {
+            let mut fixture = Self::start(pane, "/bin/cat").await;
+            fixture.new = fixture
+                .registry
+                .respawn_agent_for_pane(pane, "/bin/cat")
+                .await
+                .expect("respawn the pane's agent in place");
+            fixture
+        }
+
+        fn spawn_options(pane: &str, command: &'static str) -> SpawnOptions<'static> {
+            SpawnOptions {
+                command: Some(command),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )]),
+                ..SpawnOptions::default()
+            }
+        }
+
+        /// The outgoing generation runs `command` on the pane and opens its
+        /// card with a `SessionStart`.
+        async fn start(pane: &str, command: &'static str) -> Self {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let old = registry
+                .spawn_agent(Self::spawn_options(pane, command))
+                .expect("spawn the outgoing generation");
+            let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+            let daemon: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            daemon
+                .write()
+                .await
+                .set_agent_ownership(Arc::downgrade(&ownership));
+            let mut tui = crate::state::AppState::default();
+            // The TUI registers the panes it draws; the daemon never does for
+            // an ordinary spawn — the registry is its answer.
+            tui.register_pane(pane.to_string());
+            let (event_tx, rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let mut fixture = Self {
+                registry,
+                _ownership: ownership,
+                daemon,
+                tui,
+                event_tx,
+                rx,
+                pane: pane.to_string(),
+                old,
+                new: String::new(),
+            };
+            let (old, pane) = (fixture.old.clone(), fixture.pane.clone());
+            fixture
+                .ingest(takeover_frame_320(
+                    &pane,
+                    &old,
+                    "old-session",
+                    crate::event::EventType::SessionStart,
+                    chrono::Utc::now() - chrono::Duration::seconds(60),
+                ))
+                .await;
+            fixture
+        }
+
+        /// Post `event` through the daemon's real ingestion and relay what the
+        /// daemon broadcast into the TUI's state.
+        async fn ingest(&mut self, event: AgentEvent) -> AgentEvent {
+            ingest_event(&self.daemon, &self.event_tx, &self.registry, event).await;
+            let BroadcastMsg::Event(relayed) = self.rx.try_recv().expect("the frame is relayed")
+            else {
+                panic!("expected an event on the fan-out");
+            };
+            self.tui.apply_event(relayed.clone());
+            relayed
+        }
+
+        /// Every card on the pane, by the generation it names, on each side.
+        async fn owners(&self) -> (Vec<Option<String>>, Vec<Option<String>>) {
+            let on_pane = |state: &crate::state::AppState| {
+                let mut owners: Vec<Option<String>> = state
+                    .sessions
+                    .values()
+                    .filter(|s| s.pane_id.as_deref() == Some(self.pane.as_str()))
+                    .map(|s| s.agent_id.clone())
+                    .collect();
+                owners.sort();
+                owners
+            };
+            (on_pane(&*self.daemon.read().await), on_pane(&self.tui))
+        }
+
+        async fn assert_one_live_card(&self, after: &str) {
+            let want = vec![Some(self.new.clone())];
+            let (daemon, tui) = self.owners().await;
+            assert_eq!(
+                daemon, want,
+                "daemon: after {after}, the pane must carry the live generation's card \
+                 and nothing else"
+            );
+            assert_eq!(
+                tui, want,
+                "attached TUI: after {after}, the pane must carry the live generation's \
+                 card and nothing else — a frame was ordered by its type or its \
+                 producer clock instead of by the pane's generation"
+            );
+        }
+
+        /// The incoming generation announces itself with a `SessionStart`
+        /// stamped EARLIER than the outgoing card's last activity — case B's
+        /// shape, where a start's producer clock is not ordering evidence — and
+        /// must still take the pane over on both sides.
+        async fn take_over(&mut self) {
+            let (new, pane) = (self.new.clone(), self.pane.clone());
+            let relayed = self
+                .ingest(takeover_frame_320(
+                    &pane,
+                    &new,
+                    "new-session",
+                    crate::event::EventType::SessionStart,
+                    chrono::Utc::now() - chrono::Duration::seconds(120),
+                ))
+                .await;
+            assert_eq!(
+                relayed.pane_generation_verdict(),
+                Some(crate::event::GenerationVerdict::Current),
+                "the incoming generation's frame is relayed as the pane's current one"
+            );
+            self.assert_one_live_card("the incoming SessionStart").await;
+        }
+    }
+
+    impl Drop for Takeover320 {
+        fn drop(&mut self) {
+            self.registry.shutdown_all();
+        }
+    }
+
+    /// Issue #320: a late `SessionStart` from the OUTGOING generation — the
+    /// frame PRD #92 F9 followup-7 documents a slow-booting old agent firing —
+    /// arrives after the incoming one owns the pane. It announces a generation
+    /// the registry has already seen displaced, so it must neither retire the
+    /// live card nor add one beside it, on either side of the fan-out.
+    #[tokio::test]
+    async fn a_late_outgoing_session_start_cannot_retire_the_live_card() {
+        let mut deck = Takeover320::new("takeover-start-320").await;
+        deck.take_over().await;
+
+        let (old, pane) = (deck.old.clone(), deck.pane.clone());
+        deck.ingest(takeover_frame_320(
+            &pane,
+            &old,
+            "old-session",
+            crate::event::EventType::SessionStart,
+            chrono::Utc::now(),
+        ))
+        .await;
+        deck.assert_one_live_card("the outgoing generation's late SessionStart")
+            .await;
+    }
+
+    /// Issue #320, the sibling class #284 added: an outgoing NON-start frame
+    /// stamped at-or-newer than the live card's high-water mark. The producer
+    /// clock says "newer"; the registry says "displaced", and the registry is
+    /// what decides.
+    #[tokio::test]
+    async fn a_late_outgoing_frame_stamped_newer_cannot_retire_the_live_card() {
+        let mut deck = Takeover320::new("takeover-newer-320").await;
+        deck.take_over().await;
+
+        let (old, pane) = (deck.old.clone(), deck.pane.clone());
+        deck.ingest(takeover_frame_320(
+            &pane,
+            &old,
+            "old-session",
+            crate::event::EventType::Thinking,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        ))
+        .await;
+        deck.assert_one_live_card("the outgoing generation's late, newer-stamped Thinking")
+            .await;
+    }
+
+    /// Issue #320, the other direction of the same discriminator: the incoming
+    /// generation's first frame is an ordinary status report (Pi's shape — it
+    /// sends no `SessionStart`) stamped OLDER than the outgoing card's last
+    /// activity. The registry names it the pane's current generation, so it
+    /// retires the stale card on both sides; the producer clock is not weighed.
+    #[tokio::test]
+    async fn the_current_generation_supersedes_whatever_its_first_frame_is_stamped() {
+        let mut deck = Takeover320::new("takeover-older-320").await;
+
+        let (new, pane) = (deck.new.clone(), deck.pane.clone());
+        deck.ingest(takeover_frame_320(
+            &pane,
+            &new,
+            "new-session",
+            crate::event::EventType::Thinking,
+            chrono::Utc::now() - chrono::Duration::seconds(120),
+        ))
+        .await;
+        deck.assert_one_live_card("the incoming generation's older-stamped first frame")
+            .await;
+    }
+
+    /// Issue #320, on the path PRD #92 F9 followup-7 is actually about: a
+    /// `clear = true` respawn replaces the pane's agent IN PLACE, removing the
+    /// outgoing record before the incoming one is published. The outgoing
+    /// agent's late `SessionStart` must still be recognised as displaced.
+    #[tokio::test]
+    async fn a_late_frame_from_a_generation_replaced_in_place_cannot_retire_the_live_card() {
+        let mut deck = Takeover320::by_respawn("takeover-respawn-320").await;
+        deck.take_over().await;
+
+        let (old, pane) = (deck.old.clone(), deck.pane.clone());
+        let relayed = deck
+            .ingest(takeover_frame_320(
+                &pane,
+                &old,
+                "old-session",
+                crate::event::EventType::SessionStart,
+                chrono::Utc::now(),
+            ))
+            .await;
+        assert_eq!(
+            relayed.pane_generation_verdict(),
+            Some(crate::event::GenerationVerdict::Displaced),
+            "the registry published the outgoing generation on this pane, so it knows \
+             it was replaced even though its record is gone"
+        );
+        deck.assert_one_live_card("the replaced generation's late SessionStart")
+            .await;
+    }
+
+    /// Issue #320: the generation marker is the REGISTRY's answer and nobody
+    /// else's. A producer's own copy is removed before the fan-out, and an agent
+    /// id the registry never published on the pane — an invented one, as a
+    /// stand-in or a forgery would carry — is relayed with no verdict at all,
+    /// so it is ordered exactly as it was before this marker existed.
+    #[tokio::test]
+    async fn the_generation_marker_is_the_registrys_answer_only() {
+        let mut deck = Takeover320::new("takeover-marker-320").await;
+        deck.take_over().await;
+        let pane = deck.pane.clone();
+
+        let mut forged = takeover_frame_320(
+            &pane,
+            "an-id-the-registry-never-minted",
+            "forged-session",
+            crate::event::EventType::Thinking,
+            chrono::Utc::now(),
+        );
+        forged.metadata.insert(
+            crate::event::PANE_GENERATION_METADATA_KEY.to_string(),
+            crate::event::PANE_GENERATION_CURRENT.to_string(),
+        );
+        let relayed = deck.ingest(forged).await;
+        assert_eq!(
+            relayed
+                .metadata
+                .get(crate::event::PANE_GENERATION_METADATA_KEY),
+            None,
+            "a producer-supplied marker must not survive, and an id the registry never \
+             published on the pane gets no verdict of its own"
+        );
+
+        // A pane the registry holds nothing for gets no verdict either, whatever
+        // the producer claimed.
+        let mut elsewhere = takeover_frame_320(
+            "a-pane-the-registry-never-heard-of",
+            &deck.new.clone(),
+            "elsewhere-session",
+            crate::event::EventType::Thinking,
+            chrono::Utc::now(),
+        );
+        elsewhere.metadata.insert(
+            crate::event::PANE_GENERATION_METADATA_KEY.to_string(),
+            crate::event::PANE_GENERATION_DISPLACED.to_string(),
+        );
+        let relayed = deck.ingest(elsewhere).await;
+        assert_eq!(relayed.pane_generation_verdict(), None);
     }
 }
 

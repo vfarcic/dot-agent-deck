@@ -4,7 +4,7 @@
 **Priority**: High (the pane status a user reads is wrong for minutes at a time, and the mechanism meant to prevent it has never fired)
 **Created**: 2026-08-06
 **GitHub Issue**: [#386](https://github.com/vfarcic/dot-agent-deck/issues/386) (filed upstream — the `Stop → Idle` assumption exists in upstream's own code)
-**Related**: [#370](https://github.com/vfarcic/dot-agent-deck/issues/370) (`prds/370-shell-activity-status.md`) — **supersedes its mechanism, not its goal**; see "Relationship to #370" below. [#234](https://github.com/vfarcic/dot-agent-deck/issues/234) (`prds/234-screen-state-observation-hookless-agents.md`) — adjacent, different mechanism (vt100 screen-diff for hookless agents); do not conflate. Code: `src/platform/proc/{mod.rs,unix.rs,windows.rs}` (`foreground_pgid`, to be joined by the descendant scan), `src/agent_pty.rs` (`RunningAgent::shell_foreground_busy`, `shell_foreground_busy_snapshot`), `src/daemon.rs` (`run_shell_activity_monitor`, the `pane_hook_session_id` gate), `src/state.rs` (`AppState::apply_event`'s `ShellBusy`/`ShellIdle` arms, `SessionState::shell_synthetic_working`), `src/hook.rs` (`"Stop" => EventType::Idle` — read, not changed).
+**Related**: [#370](https://github.com/vfarcic/dot-agent-deck/issues/370) (`prds/done/370-shell-activity-status.md`) — **supersedes its mechanism, not its goal**; see "Relationship to #370" below. [#234](https://github.com/vfarcic/dot-agent-deck/issues/234) (`prds/234-screen-state-observation-hookless-agents.md`) — adjacent, different mechanism (vt100 screen-diff for hookless agents); do not conflate. Code: `src/platform/proc/{mod.rs,unix.rs,windows.rs}` (`foreground_pgid`, to be joined by the descendant scan), `src/agent_pty.rs` (`RunningAgent::shell_foreground_busy`, `shell_foreground_busy_snapshot`), `src/daemon.rs` (`run_shell_activity_monitor`, the `pane_hook_session_id` gate), `src/state.rs` (`AppState::apply_event`'s `ShellBusy`/`ShellIdle` arms, `SessionState::shell_synthetic_working`), `src/hook.rs` (`"Stop" => EventType::Idle` — read, not changed).
 
 ## Problem Statement
 
@@ -100,7 +100,7 @@ Foreground and background Bash calls have the **identical** process shape, so a 
 
 Everything #370 built downstream of the primitive is **kept, not rewritten**: the wire types (`EventType::ShellBusy`/`ShellIdle` and the `#[serde(other)] Unknown` catch-all), `PROTOCOL_VERSION` 7, the daemon poll task, the precedence rules, and their unit tests. This PRD replaces one function's body and deletes one gate.
 
-`prds/370-shell-activity-status.md` gets a Work Log entry recording that its mechanism never fired, that M5/M6 were never completed, and that it is superseded here. Its history stays intact and is not rewritten.
+`prds/done/370-shell-activity-status.md` gets a Work Log entry recording that its mechanism never fired, that M5/M6 were never completed, and that it is superseded here. Its history stays intact and is not rewritten.
 
 ## Scope
 

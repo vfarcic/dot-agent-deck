@@ -32,7 +32,7 @@ fn mode_001_side_panes_render_simultaneously_under_stacked_global() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 32)
         .launch_with_fixture("mode-two-side-panes");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Open the deck's single `demo` mode (Ctrl+N -> directory picker -> current
     // dir -> new-pane form -> Right to select `demo` -> Submit).

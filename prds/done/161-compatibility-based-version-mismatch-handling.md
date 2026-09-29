@@ -211,7 +211,7 @@ Applied so far in this PRD's work: the `prompts` source and the vendored copy of
 - `build.rs` — exact-release-tag signal — **deferred** (only needed for option B).
 - `.claude/skills/dot-ai-tag-release/analyze.sh` — already recalibrated (D5); mirror to the `prompts` repo (M2.1).
 - `pyproject.toml` — `breaking` type comment, sharpened locally (M2.2).
-- `prds/103-local-daemon-build-version-handshake.md` — parent; this PRD revises its policy.
+- `prds/done/103-local-daemon-build-version-handshake.md` — parent; this PRD revises its policy.
 
 ## Risks and Mitigations
 

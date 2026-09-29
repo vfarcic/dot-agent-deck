@@ -4,7 +4,7 @@
 
 ## What replaced it
 
-[PRD #126](../../prds/126-agent-driven-notifications.md) was rescoped from "dogfood, no deck code" into a shipped feature plus a much smaller recipe. Two things came out of it:
+[PRD #126](../../prds/done/126-agent-driven-notifications.md) was rescoped from "dogfood, no deck code" into a shipped feature plus a much smaller recipe. Two things came out of it:
 
 - **A daemon-side idle-worker detector** (deck code) — the daemon tracks each outstanding delegation and, after `worker_response_timeout_minutes` (default 120, `0` disables) with no `work-done`, injects one self-describing prompt into the orchestrator. The daemon never notifies; it only reports the condition, and the orchestrator decides what to do.
 - **An orchestrator-only notification recipe** — the `orchestrator` role's `prompt_template` in `.dot-agent-deck.toml` sends a short, fire-and-forget Telegram message at the workflow's pause-for-human moments, including the daemon's idle-worker event. Workers never notify and never wait on the user: a blocked worker returns its question through `work-done` and the orchestrator escalates. (This originally went through a `telegram` MCP server declared in `.mcp.json`; since 2026-09-11 it goes through `scripts/notify.sh` instead, for the reason below.)
@@ -13,7 +13,7 @@ The user-facing documentation for both — the feature and an example recipe wit
 
 ## Why the history is worth keeping
 
-The dogfood is what produced the design, so its findings are recorded in the PRD's [Background](../../prds/126-agent-driven-notifications.md#background-the-dogfood-that-led-here) section rather than repeated here. In short: agent-driven notification works and is genuinely fire-and-forget; "one `.mcp.json` for every agent" is a myth (only Claude reads it natively), which is exactly why orchestrator-only is the right topology; the public ntfy topic was acceptable only because the payload was one status sentence; and the one thing config provably could not do — notice a delegated worker that went silent — is what became the daemon feature.
+The dogfood is what produced the design, so its findings are recorded in the PRD's [Background](../../prds/done/126-agent-driven-notifications.md#background-the-dogfood-that-led-here) section rather than repeated here. In short: agent-driven notification works and is genuinely fire-and-forget; "one `.mcp.json` for every agent" is a myth (only Claude reads it natively), which is exactly why orchestrator-only is the right topology; the public ntfy topic was acceptable only because the payload was one status sentence; and the one thing config provably could not do — notice a delegated worker that went silent — is what became the daemon feature.
 
 The full retired setup (script internals, the ntfy topic caveat, the two-record expectation log, the reconciliation procedure) is in this file's git history if you ever need it: `git log --follow -- docs/develop/notifications-dogfood.md`.
 

@@ -6,7 +6,7 @@
 //! session length, worst exactly when an orchestration has run long enough to
 //! compact. This file pins the fix: a `Compacting` event, or a
 //! `/clear`-originated `SessionStart`, on the orchestrator start-role pane
-//! re-delivers the `.dot-agent-deck/orchestrator-context.md` pointer, scoped
+//! re-delivers the `.dot-agent-deck/orchestrator-context-*.md` pointer, scoped
 //! to the start role only, through the SAME readiness-gating and delivery-
 //! confirmation discipline the spawn-time seed already uses
 //! (`deliver_orchestrator_prompt`, `src/ui.rs`).
@@ -42,7 +42,7 @@ use dot_agent_deck::event::{
 };
 use spec::spec;
 
-const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
+const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context";
 
 /// How long the spawn-time remit pointer has to reach the start role's pane.
 ///
@@ -103,10 +103,16 @@ const CONFIRMATION_APPLIED_TIMEOUT: Duration = Duration::from_secs(30);
 const INJECTED_EVENT_APPLIED_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the delivery log's pointer count must hold steady before this
-/// file trusts it as the baseline every later assertion counts from. Must
-/// exceed the deck's own `unconfirmed_retry_delay(1)` — 500ms
-/// (`src/prompt_delivery.rs`) — since that is the window in which an
-/// unconfirmed delivery earns its one automatic replacement payload write.
+/// file trusts it as the baseline every later assertion counts from. Sized
+/// when the deck's first retry window, `unconfirmed_retry_delay(1)`, was a
+/// flat 500ms, so that it exceeded the window in which an unconfirmed
+/// delivery earns its one automatic replacement payload write. Issue #637
+/// floored that window at the producer's confirmation latency, and this
+/// fixture reports as Codex, so it is now 10s
+/// (`SLOW_CONFIRMATION_LATENCY`, `src/prompt_delivery.rs`) and this window no
+/// longer exceeds it. What it still absorbs is a replacement already SENT when
+/// the settle begins — the pointer line a `python3` fork has yet to append. A
+/// replacement now needs `confirm_submission` to miss 10s rather than 500ms.
 const DELIVERY_SETTLE_QUIET_WINDOW: Duration = Duration::from_millis(1500);
 
 /// Ceiling on how long [`settled_pointer_count`] will wait for the count to
@@ -187,8 +193,9 @@ fn wait_for_applied(
 ///
 /// Hardcoding those literals assumed the spawn-time delivery had produced
 /// exactly ONE pointer line, which holds only while the fixture's
-/// `confirm_submission` beats the deck's 500ms `unconfirmed_retry_delay(1)`.
-/// Under load it does not: the deck then writes its one automatic
+/// `confirm_submission` beats the deck's first retry window
+/// (`unconfirmed_retry_delay(1)`, 500ms when this was written and 10s for this
+/// fixture's Codex producer since issue #637). Under load it did not: the deck then writes its one automatic
 /// REPLACEMENT payload (`MAX_PAYLOAD_SUBMISSIONS` is 2,
 /// `src/prompt_delivery.rs`) and the fixture logs that as a second pointer
 /// line with no re-assertion behind it. So every negative check here ("must
@@ -408,8 +415,11 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 /// than a marker file for any new phase this script grows.
 ///
 /// **Timing hazard 2, the second one**: `confirm_submission` completing inside
-/// `unconfirmed_retry_delay(1)` — 500ms (`src/prompt_delivery.rs`) — of the
-/// initial write is not enforced by anything, and under load it does not.
+/// `unconfirmed_retry_delay(1)` (`src/prompt_delivery.rs`) of the initial write
+/// is not enforced by anything. That window was 500ms when this was measured,
+/// and under load the fixture missed it; since issue #637 it is floored at the
+/// producer's confirmation latency — 10s for this fixture's Codex producer —
+/// so missing it now takes a far heavier load than the one measured below.
 /// `MAX_PAYLOAD_SUBMISSIONS` there is 2, so a delivery still unconfirmed past
 /// that window earns one automatic *replacement* payload write, appending a
 /// second `DELIVERED_POINTER` line to the log with no re-assertion behind it.
@@ -772,14 +782,14 @@ fn open_and_confirm_initial_delivery(
     std::path::PathBuf,
     usize,
 ) {
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     write_executable(
         &deck.workdir().join("orchestrator-remit.sh"),
         ORCHESTRATOR_REMIT_SCRIPT,
     );
 
     open_orchestration(deck);
-    deck.wait_for_absence("New Agent");
+    deck.wait_for_absence("┌ New Agent");
 
     let socket = deck.attach_socket_path().to_path_buf();
     let record = role_agent_record(&socket, "orchestrator");
@@ -1070,8 +1080,8 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
 /// stdin a second time — the orchestrator's remit re-asserting itself on
 /// `/clear`, exactly as it already re-asserts on compaction, via the same
 /// reused delivery machinery. It must then re-assert EXACTLY once: a sentinel
-/// comment is stamped into `.dot-agent-deck/orchestrator-context.md` before
-/// the trigger, the re-assertion's own rewrite of that file must destroy it
+/// comment is stamped into the fixed `.dot-agent-deck/orchestrator-context.md`
+/// mirror before the trigger, the re-assertion's refresh of that mirror must destroy it
 /// (proving the sentinel detects a re-arm at all), and a freshly stamped one
 /// must then survive the settle-and-hold window that follows.
 #[spec("orchestration/remit/004")]
@@ -1126,7 +1136,8 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
     //
     // Settled first, for the same reason the baseline is: the re-assertion's
     // OWN delivery earns a replacement payload write if the fixture's
-    // confirmation misses the deck's 500ms window, and counting from an
+    // confirmation misses the deck's first retry window (500ms when this
+    // reddened, 10s for this Codex fixture since #637), and counting from an
     // unsettled figure would read that designed retry as a second
     // re-assertion. Under a 64-way CPU load this reddened here specifically,
     // on the literal "must not reach a third line".
@@ -1340,10 +1351,19 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
     // (`src/spawn.rs`), without needing a second, separately-launched fixture
     // for the daemon dispatch path.
     const TASK_SENTINEL: &str = "SENTINEL-TASK-remit007: verify PR #500 and report.";
-    let context_path = deck
-        .workdir()
-        .join(".dot-agent-deck")
-        .join("orchestrator-context.md");
+    let context_dir = deck.workdir().join(".dot-agent-deck");
+    let context_path = std::fs::read_dir(&context_dir)
+        .expect("list published contexts")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("orchestrator-context-") && name.ends_with(".md")
+                })
+        })
+        .expect("the opened tab published its own unique context");
     let mut seeded =
         std::fs::read_to_string(&context_path).expect("read the spawn-written context file");
     seeded.push_str("\n## Your task\n\n");
@@ -1374,8 +1394,20 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
         deck.snapshot_grid()
     );
 
-    let after_reassert = std::fs::read_to_string(&context_path)
-        .expect("read the context file after the re-assertion rewrite");
+    let after_reassert = std::fs::read_dir(&context_dir)
+        .expect("list re-armed contexts")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path != &context_path)
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("orchestrator-context-") && name.ends_with(".md")
+                })
+        })
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .expect("re-arm published a new unique context");
     assert!(
         after_reassert.contains(TASK_SENTINEL),
         "the dispatched task must survive a compaction re-assertion rather than being wiped \

@@ -3,10 +3,12 @@
 mod agent_hook_config;
 pub mod agent_pty;
 pub mod agent_registry;
+pub mod authoring_seeds;
 pub mod bounded_read;
 pub mod build_id;
 pub mod build_version_handshake;
 pub mod codex_hooks_manage;
+pub mod codex_rollout_tail;
 pub mod config;
 pub mod config_gen;
 pub mod config_validation;
@@ -17,7 +19,11 @@ pub mod daemon_client;
 pub mod daemon_protocol;
 pub mod daemon_status;
 pub mod daemon_stop;
+pub mod deck_list;
 pub mod devin_hooks_manage;
+// PRD #1223 M1: the daemon's one-level, bounded directory listing that backs
+// the desktop's new-agent directory step.
+pub mod directory_listing;
 pub mod dispatch;
 pub mod dispatch_return;
 pub mod embedded_pane;
@@ -47,6 +53,8 @@ pub mod lifetime_tag;
 pub mod logging;
 pub mod login_shell;
 pub mod mode_manager;
+// PRD #1223 M2: what the daemon reports about itself to a new-agent form.
+pub mod new_agent_options;
 pub mod opencode_manage;
 pub mod orchestrator_context;
 pub mod orchestrator_ext;
@@ -65,6 +73,8 @@ pub mod project_config;
 // selected over the attach socket.
 pub mod project_resolve;
 pub mod prompt_delivery;
+pub mod quota_block;
+pub mod quota_signals;
 pub mod remote;
 pub mod remote_doctor;
 pub mod remote_tunnel;

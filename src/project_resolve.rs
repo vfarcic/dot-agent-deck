@@ -156,7 +156,7 @@ pub const MAX_PROJECTED_NAME_BYTES: usize = 512;
 ///   launchable set, which is the property the picker's whole existence rests
 ///   on.
 /// * **Loosening the consumer** was the alternative and does not work: the
-///   desktop's own `validate_workflow_shape` is not the binding limit — the
+///   desktop's own `validate_orchestration_shape` is not the binding limit — the
 ///   daemon's is. Raising the desktop's check to 512 would have moved the same
 ///   refusal one hop later, into the spawn, where it arrives as a failed launch
 ///   with roles already started instead of as a project that cannot be offered.
@@ -205,6 +205,13 @@ pub const MAX_ENUMERATION_CANDIDATES: usize = 32;
 /// duration, and no such claim is made: a `stat` on an unresponsive network
 /// mount takes as long as it takes, which is the availability limit this bound
 /// contains rather than removes.
+///
+/// PRD #1223's `list-directories` and `new-agent-options` arms do NOT take these
+/// permits. They first did (the listing) or took none (the options query), and
+/// audit A4 moved both into a pool of their own,
+/// [`crate::new_agent_options::MAX_CONCURRENT_NEW_AGENT_QUERIES`], taken with
+/// try-acquire and refused as busy when full, so a burst of slow listings
+/// cannot hold the permits this module's verbs queue for.
 pub const MAX_CONCURRENT_PROJECT_READS: usize = 4;
 
 // ---------------------------------------------------------------------------
@@ -730,6 +737,157 @@ where
     .map_err(|_| ProjectResolveError::Internal)
 }
 
+/// How long the daemon gives one `PrepareOrchestration`, from the moment its
+/// handler has validated the request and collected the seed candidates
+/// (issue #1233 item 4).
+///
+/// **Ten seconds**, below the desktop's 15 s per-call bound, so a deck that
+/// advertises [`crate::daemon_protocol::CAP_PREPARE_DEADLINE`] answers before a
+/// client that bounds the call gives up on it. The bound covers the wait for a
+/// [`MAX_CONCURRENT_PROJECT_READS`] permit ([`run_bounded_answer`]) and the work
+/// itself ([`prepare_orchestration_before`]), and an expired preparation is
+/// **withdrawn** rather than merely answered late: a token it issued is
+/// revoked, a context file it published is removed best effort
+/// ([`crate::orchestrator_context::withdraw_published_context`]), and it does
+/// not write the compatibility mirror. That is the property a client-side
+/// timeout alone could not give, because dropping the client's future stops
+/// none of the daemon's work.
+///
+/// **The reply is bounded too, including when a blocking call stalls**
+/// (issue #1233 audit). [`run_bounded_answer`] answers "expired" at the
+/// deadline unless the work committed first (and nothing blocking stands
+/// between a commit and its answer), and the [`ReplyLatch`] makes that answer
+/// binding on the work: a preparation still running refuses at its next
+/// deadline check — at the latest its last gate, where it finds the latch
+/// abandoned — revoking any token it issued and withdrawing any file it
+/// published. A blocking call that never returns is still
+/// not *interrupted* — a blocking thread cannot be cancelled — so it holds its
+/// permit and thread until it does; it just can no longer delay the answer or
+/// leave anything usable behind when it finishes.
+pub const PREPARE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Who decides whether a preparation is answered — the blocking work or the
+/// reply that gave up waiting for it — so that exactly one of them does
+/// (issue #1233 audit).
+///
+/// The work calls [`ReplyLatch::commit`] at its last gate, after every side
+/// effect but the post-reply mirror; the reply calls [`ReplyLatch::abandon`]
+/// when its deadline fires first. Whichever gets there first wins, and the
+/// other learns it: a work that cannot commit revokes its token and withdraws
+/// its file (not the directory creation or housekeeping its publish did), and
+/// a reply that cannot abandon waits for the answer the work is about to send
+/// (nothing blocking stands between a commit and that send).
+#[derive(Debug, Default)]
+pub struct ReplyLatch(std::sync::Mutex<LatchState>);
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum LatchState {
+    #[default]
+    Open,
+    Committed,
+    Abandoned,
+}
+
+impl ReplyLatch {
+    /// Claim the answer for the work: `false` once the reply has abandoned it.
+    pub fn commit(&self) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match *state {
+            LatchState::Open | LatchState::Committed => {
+                *state = LatchState::Committed;
+                true
+            }
+            LatchState::Abandoned => false,
+        }
+    }
+
+    /// Give up on the work: `false` once it has committed.
+    pub fn abandon(&self) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match *state {
+            LatchState::Open | LatchState::Abandoned => {
+                *state = LatchState::Abandoned;
+                true
+            }
+            LatchState::Committed => false,
+        }
+    }
+}
+
+/// Work to run after the answer has been handed over, on the same blocking
+/// thread and under the same permit — issue #1233's compatibility mirror.
+pub type AfterReply = Box<dyn FnOnce() + Send>;
+
+/// Why [`run_bounded_answer`] gave up at its deadline without an answer. Both
+/// causes reach a client as the same `preparation-expired` refusal; they are
+/// told apart for the daemon's log, where they point at different remedies
+/// (issue #1233 re-review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expired {
+    /// No [`MAX_CONCURRENT_PROJECT_READS`] permit freed up: the work never ran.
+    NoPermit,
+    /// A permit was held and the work ran, but it had not committed when the
+    /// deadline fired, so the [`ReplyLatch`] was abandoned — the work refuses
+    /// and withdraws at its next latch check.
+    Abandoned,
+}
+
+/// [`run_bounded`] under a `deadline` that bounds the **answer**, not only the
+/// permit wait (issue #1233 item 4 and its audit).
+///
+/// * `Err(`[`Expired`]`)` when the deadline passed before an answer: either no
+///   permit freed up (`f` never ran), or `f` had not committed and the
+///   [`ReplyLatch`] was abandoned — so an `f` that checks the latch, as the
+///   preparation does at its last gate, refuses and withdraws.
+/// * `f` returns its answer and, optionally, work to run **after** the answer
+///   has gone: that work cannot delay the reply. This function runs it
+///   whenever `f` returns it; the preparation returns it only for an answer it
+///   committed.
+///
+/// A blocking thread cannot be cancelled, so a stalled `f` keeps its thread and
+/// permit until it returns; what it cannot do is hold the reply.
+pub async fn run_bounded_answer<T, F>(
+    deadline: tokio::time::Instant,
+    f: F,
+) -> Result<Result<T, Expired>, ProjectResolveError>
+where
+    F: FnOnce(&ReplyLatch) -> (T, Option<AfterReply>) + Send + 'static,
+    T: Send + 'static,
+{
+    let permit =
+        match tokio::time::timeout_at(deadline, project_fs_limit().clone().acquire_owned()).await {
+            Err(_elapsed) => return Ok(Err(Expired::NoPermit)),
+            Ok(permit) => permit.map_err(|_| ProjectResolveError::Internal)?,
+        };
+    let latch = Arc::new(ReplyLatch::default());
+    let work_latch = Arc::clone(&latch);
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    // Detached: the answer arrives over `rx`, and what runs after it is not
+    // this reply's business.
+    //
+    // A panic inside `f` after it committed — between the preparation's last
+    // gate and `tx.send` — delivers no answer (the reply reads `Internal`) yet
+    // withdraws nothing, because the work had committed: its token and
+    // published file are then bounded by the token TTL and the coordination
+    // retention sweep, not by withdrawal. Only non-blocking construction of the
+    // answer stands in that window.
+    drop(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let (answer, after) = f(&work_latch);
+        let _ = tx.send(answer);
+        if let Some(after) = after {
+            after();
+        }
+    }));
+    match tokio::time::timeout_at(deadline, &mut rx).await {
+        Ok(answer) => answer.map(Ok).map_err(|_| ProjectResolveError::Internal),
+        Err(_elapsed) if latch.abandon() => Ok(Err(Expired::Abandoned)),
+        // The work committed just before the deadline fired; its answer is
+        // already on its way.
+        Err(_elapsed) => rx.await.map(Ok).map_err(|_| ProjectResolveError::Internal),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The daemon's own startup cwd
 // ---------------------------------------------------------------------------
@@ -992,29 +1150,40 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
 // ---------------------------------------------------------------------------
 
 /// Resolve, compose and **publish** — the whole of
-/// [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`] behind one
+/// [`crate::daemon_protocol::AttachRequest::PrepareOrchestration`] behind one
 /// blocking call.
 ///
 /// The ordering is the point, and it is what makes "a failed preparation starts
-/// no roles" true rather than aspirational: every step that can fail runs
-/// before anything observable is created, the publish is the last step with a
-/// side effect outside this process, and this function starts nothing. Roles are
-/// started by a later `StartAgent` sequence that never runs if this returns
-/// `Err`. (The token minted after the publish is an in-memory record, so it
-/// cannot exist for a preparation that failed.)
+/// no roles" true rather than aspirational: every step that can refuse the
+/// request on its own merits runs before anything observable is created, and
+/// this function starts nothing. Roles are started by a later `StartAgent`
+/// sequence that never runs if this returns `Err`. Since issue #1233 two things
+/// follow the publish: the compatibility mirror write, and — under
+/// [`prepare_orchestration_before`]'s deadline — a refusal that withdraws the
+/// publish best effort. (The token minted after the publish is an in-memory
+/// record; a preparation refused after minting it revokes it, so no live token
+/// outlasts a refused preparation. One that committed and then lost its answer
+/// to a panic before it was sent is not refused, and is bounded by the token
+/// TTL and the retention sweep instead — see [`run_bounded_answer`].)
 ///
 /// **What the returned token binds, and why that is not a detail.** PRD #819's
 /// original design had this issue a token recording only its issuance time, and
 /// the audit of the finished branch showed that binds nothing usable: the
-/// coordinator context is published at a path fixed per project, so a second
-/// preparation in the same project replaces the first's artifact while the
-/// first's token is still inside its TTL. The record now carries the canonical
-/// directory and its inode identity, the config revision, the orchestration and
-/// the published bytes' digest and inode ([`crate::prep_token::PrepBinding`]),
-/// and every spawn presenting the token re-checks all of it
-/// ([`revalidate_preparation`]). The **second** preparation is the one whose
-/// artifact is on disk and whose token validates; the first is refused at its
-/// spawn rather than launched against the wrong brief.
+/// orchestrator context was then published at a path fixed per project, so a
+/// second preparation in the same project replaced the first's artifact while
+/// the first's token was still inside its TTL. The record now carries the
+/// canonical directory and its inode identity, the config revision, the
+/// orchestration and the published bytes' digest and inode
+/// ([`crate::prep_token::PrepBinding`]), and every spawn presenting the token
+/// re-checks all of it ([`revalidate_preparation`]).
+///
+/// **Since issue #1233 each preparation publishes its own file**
+/// (`orchestrator-context-<32 hex>.md`), and the prompt it returns names that
+/// file, so two preparations in one project each keep their own context and both
+/// tokens stay valid — including after the first launch's last role has started,
+/// the window the binding alone could not cover. The fixed
+/// `orchestrator-context.md` is refreshed afterwards as a compatibility mirror
+/// and is bound by nothing.
 ///
 /// **One canonical string, carried end to end.** `path` is canonicalised once,
 /// here, and the same `PathBuf` is what the config is read from, what the
@@ -1026,16 +1195,94 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
 /// from one spelling and a launch built from another disagree about the name.
 ///
 /// **Blocking** — the caller goes through [`run_bounded`]. Returns either the
-/// prepared workflow or the exact `error` string the refusal carries; the
+/// prepared orchestration or the exact `error` string the refusal carries; the
 /// detail is logged daemon-locally on every failure, whichever refusal goes
 /// back.
-pub fn prepare_workflow_for_wire(
+///
+/// Under no deadline, and with the compatibility mirror written before this
+/// returns; the daemon's verb calls [`prepare_orchestration_before`] with
+/// [`PREPARE_DEADLINE`] and writes the mirror after its reply.
+pub fn prepare_orchestration_for_wire(
     path: &str,
     orchestration: &str,
     task: &str,
     expected_revision: Option<&str>,
     seeds: &[ProjectCandidate],
-) -> Result<crate::event::PreparedWorkflow, String> {
+) -> Result<crate::event::PreparedOrchestration, String> {
+    let prepared = prepare_orchestration_before(
+        path,
+        orchestration,
+        task,
+        expected_revision,
+        seeds,
+        None,
+        &std::time::Instant::now,
+        None,
+    )?;
+    let (answer, mirror) = prepared.into_parts();
+    mirror.write();
+    Ok(answer)
+}
+
+/// A preparation that passed every gate: the answer, and the compatibility
+/// mirror write still owed for it (issue #1233 audit).
+///
+/// The mirror is handed back rather than written so the caller can answer
+/// first — see [`crate::orchestrator_context::PendingMirror`]. Only a
+/// preparation that passed its last gate — committed to an answer — produces
+/// one.
+#[derive(Debug)]
+pub struct Prepared {
+    answer: crate::event::PreparedOrchestration,
+    mirror: crate::orchestrator_context::PendingMirror,
+}
+
+impl Prepared {
+    /// The answer, and the mirror to write once it has gone.
+    pub fn into_parts(
+        self,
+    ) -> (
+        crate::event::PreparedOrchestration,
+        crate::orchestrator_context::PendingMirror,
+    ) {
+        (self.answer, self.mirror)
+    }
+}
+
+/// [`prepare_orchestration_for_wire`] under a `deadline`, read through `now`,
+/// and answerable only while `latch` lets it commit (issue #1233 item 4 and its
+/// audit).
+///
+/// The deadline is checked on entry, immediately before the publish,
+/// immediately after it, and — the **last gate** — after the token is issued,
+/// together with [`ReplyLatch::commit`]. Expired before the publish, nothing is
+/// written. Expired after it, the file just published is withdrawn, best
+/// effort ([`crate::orchestrator_context::withdraw_published_context`]), and no
+/// token is issued. Expired at the last gate, or with a `latch` the reply already
+/// abandoned, the token is revoked ([`crate::prep_token::revoke`]) and the file
+/// withdrawn. Every one of those answers [`preparation_expired_refusal`], and
+/// none of them writes the compatibility mirror: it is returned un-written in
+/// [`Prepared`], only for a preparation that passed the last gate, so the
+/// caller writes it after answering. `now` is a parameter so a test can expire
+/// the deadline at exactly one of those points.
+///
+/// **Blocking**, like [`prepare_orchestration_for_wire`].
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_orchestration_before(
+    path: &str,
+    orchestration: &str,
+    task: &str,
+    expected_revision: Option<&str>,
+    seeds: &[ProjectCandidate],
+    deadline: Option<std::time::Instant>,
+    now: &dyn Fn() -> std::time::Instant,
+    latch: Option<&ReplyLatch>,
+) -> Result<Prepared, String> {
+    let expired = || deadline.is_some_and(|deadline| now() >= deadline);
+    if expired() {
+        warn!("prepare-orchestration refused: its deadline passed before any work began");
+        return Err(preparation_expired_refusal());
+    }
     // --- resolve. Failures here take the disclosure split, exactly as
     // `resolve_for_wire`'s do: a path the daemon already knows gets the detail,
     // and every other path gets one fixed sentence.
@@ -1061,7 +1308,7 @@ pub fn prepare_workflow_for_wire(
     let (dir, config, revision) = match outcome {
         Ok(resolved) => resolved,
         Err(err) => {
-            warn!(reason = %err, "prepare-workflow refused: the project did not resolve");
+            warn!(reason = %err, "prepare-orchestration refused: the project did not resolve");
             return Err(split(&err, canonical.as_deref()));
         }
     };
@@ -1072,7 +1319,7 @@ pub fn prepare_workflow_for_wire(
     if let Some(expected) = expected_revision
         && expected != revision
     {
-        warn!("prepare-workflow refused: the client's config revision is stale");
+        warn!("prepare-orchestration refused: the client's config revision is stale");
         return Err(stale_revision_refusal());
     }
 
@@ -1086,29 +1333,33 @@ pub fn prepare_workflow_for_wire(
     // refusals below carry their own codes and their own sentences rather than
     // the one generic one.
     //
-    // Same selection rule the spawn uses (`crate::spawn::decide_target`):
-    // roleless entries are skipped, because two entries can resolve to the SAME
-    // name and matching the empty one would refuse a target the listing
-    // legitimately offered.
-    let Some(orch) = config
-        .orchestrations
-        .iter()
-        .filter(|o| !o.roles.is_empty())
-        .find(|o| {
-            crate::project_config::resolve_orchestration_name(&o.name, &dir) == orchestration
-        })
-    else {
-        warn!(
-            "prepare-workflow refused: the project defines no orchestration under the requested name"
-        );
-        return Err(no_such_orchestration_refusal());
+    // Roleless entries are skipped, as `crate::spawn::decide_target` skips
+    // them: two entries can resolve to the SAME name, and matching the empty one
+    // would refuse a target the listing legitimately offered. Issue #1233: two
+    // ROLE-BEARING entries under one name are refused as ambiguous rather than
+    // resolved to the first, before anything is published or issued.
+    let orch = match find_orchestration(&config, orchestration, &dir) {
+        Ok(orch) => orch,
+        Err(OrchestrationLookup::Missing) => {
+            warn!(
+                "prepare-orchestration refused: the project defines no orchestration under the requested name"
+            );
+            return Err(no_such_orchestration_refusal());
+        }
+        Err(OrchestrationLookup::Ambiguous(count)) => {
+            warn!(
+                count,
+                "prepare-orchestration refused: the project defines more than one orchestration with roles under the requested name"
+            );
+            return Err(ambiguous_orchestration_refusal());
+        }
     };
     // The projection caps ARE a resolve failure — `resolve_for_wire` refuses the
     // same config for the same reason — so this one takes the disclosure split
     // rather than its own code. Answering it differently here would hand an
     // arbitrary caller a role cardinality that the resolve verb withholds.
     let roles = project_roles_onto_wire(orch).map_err(|err| {
-        warn!(reason = %err, "prepare-workflow refused: the orchestration exceeds a projection bound");
+        warn!(reason = %err, "prepare-orchestration refused: the orchestration exceeds a projection bound");
         split(&err, Some(dir.as_path()))
     })?;
 
@@ -1122,15 +1373,27 @@ pub fn prepare_workflow_for_wire(
         .as_ref()
         .and_then(crate::prep_token::inode_identity);
 
+    // Issue #1233 item 4: the last point at which refusing costs nothing.
+    if expired() {
+        warn!("prepare-orchestration refused: its deadline passed before the publish");
+        return Err(preparation_expired_refusal());
+    }
+
     // --- compose and publish. Last, and the only step with a side effect.
-    // `Attended` (issue #703): every caller of this verb today is the desktop's
-    // live-loop launch panel, which will not launch without a task prompt AND has
-    // the person who typed it watching the panes it opens. A later off-box or
+    // `Attended` (issue #703): every caller of this verb today is a desktop
+    // launch — the Runs panel or the New agent dialog — with the person who
+    // started it watching the panes it opens. Either may send an empty task
+    // (issue #1044, PRD #1223), which the composer treats as no task at all:
+    // no `## Your task` section and the "wait for instructions" pointer, exactly
+    // the TUI `Ctrl+n` output (`project/launch/004`). A later off-box or
     // headless caller (#741) is the point at which this stops being derivable
     // here and the attendance has to travel on
-    // `AttachRequest::PrepareWorkflow` — a wire change, with CLAUDE.md rule 12's
+    // `AttachRequest::PrepareOrchestration` — a wire change, with CLAUDE.md rule 12's
     // cross-version test attached to it. It is deliberately not pre-built.
-    let prepared = crate::orchestrator_context::prepare_orchestrator_context(
+    //
+    // Unmirrored (issue #1233): the compatibility mirror is refreshed only once
+    // this preparation is certain to be answered, below.
+    let prepared = crate::orchestrator_context::prepare_unmirrored_orchestrator_context(
         orch,
         &dir,
         Some(task),
@@ -1147,16 +1410,28 @@ pub fn prepare_workflow_for_wire(
         warn!(
             project = %dir.display(),
             reason = %err,
-            "prepare-workflow refused: the coordinator context was not published"
+            "prepare-orchestration refused: the orchestrator context was not published"
         );
         publish_refusal(&err, &dir)
     })?;
 
+    // Issue #1233 item 4: a publish that finished past the deadline is
+    // withdrawn rather than answered, so a client that stopped waiting cannot
+    // leave a context behind it — and no token is issued for one.
+    if expired() {
+        warn!(
+            project = %dir.display(),
+            "prepare-orchestration refused: its deadline passed during the publish; withdrawing it"
+        );
+        crate::orchestrator_context::withdraw_published_context(&prepared.published());
+        return Err(preparation_expired_refusal());
+    }
+
     // --- bind the record to what was just approved.
     //
     // PRD #819's audit finding: a token that records only its issuance time
-    // binds nothing, so a launch can present a live token and spawn against an
-    // artifact some *other* preparation published at the same fixed path. The
+    // binds nothing, so a launch could present a live token and spawn against an
+    // artifact some *other* preparation published at the then-fixed path. The
     // record therefore carries the canonical directory and its inode identity,
     // the config revision resolved against, the orchestration, and the exact
     // published bytes' digest and inode — and every spawn presenting the token
@@ -1171,22 +1446,92 @@ pub fn prepare_workflow_for_wire(
         context_path: prepared.context_path.clone(),
         context_identity: prepared.context_identity,
         context_digest: context_digest(&prepared.content),
+        coordinator_prompt: prepared.prompt.clone(),
     });
 
-    Ok(crate::event::PreparedWorkflow {
+    // Issue #1233 audit: the LAST gate, after every side effect this function
+    // performs. Checking before the issue — as this did until the audit — left
+    // the issue itself, and everything after it, outside the deadline. From here
+    // to the return nothing touches a filesystem, so a preparation that passes
+    // has its answer sent without anything blocking in between, and one that
+    // fails leaves no live token and withdraws its file best effort.
+    if expired() || !latch.is_none_or(ReplyLatch::commit) {
+        warn!(
+            project = %dir.display(),
+            "prepare-orchestration refused: its deadline passed before it could be answered; \
+             revoking its token and withdrawing its context"
+        );
+        crate::prep_token::revoke(&token);
+        crate::orchestrator_context::withdraw_published_context(&prepared.published());
+        return Err(preparation_expired_refusal());
+    }
+
+    // Not written here: the caller answers first and writes it afterwards
+    // (issue #1233 audit). See `CONTEXT_FILE_NAME` for who reads it.
+    let mirror = crate::orchestrator_context::PendingMirror::new(
+        prepared.dir.clone(),
+        prepared.publish_seq,
+        prepared.content,
+    );
+
+    let answer = crate::event::PreparedOrchestration {
         context_path: prepared.context_path.to_string_lossy().into_owned(),
         // The canonical directory this preparation actually resolved to, so the
         // spawn does not have to trust the caller's spelling — see
-        // `PreparedWorkflow::path`.
+        // `PreparedOrchestration::path`.
         path: dir.to_string_lossy().into_owned(),
         token,
         roles,
         // The composer already built the pointer line and until PRD #819 M6 it
         // was dropped on the floor here. The client spawning the roles is the
         // party that delivers it, and it may not compose its own copy — see
-        // `PreparedWorkflow::prompt`.
+        // `PreparedOrchestration::prompt`.
         prompt: prepared.prompt,
-    })
+    };
+    Ok(Prepared { answer, mirror })
+}
+
+/// Why [`find_orchestration`] found no single orchestration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestrationLookup {
+    /// No role-bearing orchestration resolves to the name.
+    Missing,
+    /// This many role-bearing orchestrations resolve to it (always two or more).
+    Ambiguous(usize),
+}
+
+/// The one role-bearing orchestration in `config` that resolves to `name`
+/// under `dir` (issue #1233).
+///
+/// **Roleless entries are not counted**, so a name is ambiguous only when two
+/// entries could each hand a caller a set of roles: a roleless duplicate cannot
+/// launch anything, and skipping it is the rule the launch verb already had.
+/// Before #1233 this was a first match, so a project declaring the same name
+/// twice launched the first declaration's roles for a caller that may have meant
+/// the second. The desktop refused that case itself before preparing, but only
+/// when it had resolved the project first — a caller that sends no revision, or
+/// resolves against one config and prepares against an edited one, reached the
+/// first match. This is the check at the one step that publishes.
+///
+/// `crate::spawn::decide_target`, which `dispatch --orchestration` uses, still
+/// takes the first match; that is follow-up #1396.
+pub fn find_orchestration<'a>(
+    config: &'a ProjectConfig,
+    name: &str,
+    dir: &Path,
+) -> Result<&'a crate::project_config::OrchestrationConfig, OrchestrationLookup> {
+    let mut matches = config
+        .orchestrations
+        .iter()
+        .filter(|o| !o.roles.is_empty())
+        .filter(|o| crate::project_config::resolve_orchestration_name(&o.name, dir) == name);
+    let Some(first) = matches.next() else {
+        return Err(OrchestrationLookup::Missing);
+    };
+    match matches.count() {
+        0 => Ok(first),
+        more => Err(OrchestrationLookup::Ambiguous(more + 1)),
+    }
 }
 
 /// Re-validate a preparation at spawn time: is the artifact this token was
@@ -1203,9 +1548,11 @@ pub fn prepare_workflow_for_wire(
 /// **These checks are PRD #819's audit fix, and without them the token means
 /// nothing at all.** The original design recorded only
 /// `(token, issued_at)`, so nothing here was possible: two clients preparing in
-/// the same project overwrite one fixed file, both tokens stay inside the TTL,
-/// and the earlier launch spawns a coordinator pointed at a path now holding the
-/// later client's brief. The record now carries what it approved
+/// the same project overwrote one fixed file, both tokens stayed inside the TTL,
+/// and the earlier launch spawned a coordinator pointed at a path then holding
+/// the later client's brief. (Issue #1233 has since given each preparation a
+/// file of its own, so that interleaving no longer replaces anything; these
+/// checks now catch a context changed by something other than a preparation.) The record now carries what it approved
 /// ([`crate::prep_token::PrepBinding`]) and this function re-checks every part
 /// of it:
 ///
@@ -1216,8 +1563,8 @@ pub fn prepare_workflow_for_wire(
 /// 3. the config still reads and its [`config_revision`] is unchanged;
 /// 4. the orchestration is still defined, with roles, under the prepared name;
 /// 5. the published coordinator context is the same **inode** and the same
-///    **bytes** — which is what catches the interleaving above, since a second
-///    publish `rename(2)`s a fresh inode over the destination.
+///    **bytes** — a file deleted and recreated under its name, or rewritten in
+///    place, is caught.
 ///
 /// **It is the conjunction that carries the claim, not any single check**, and
 /// two of them are individually defeasible: an inode number is reusable
@@ -1252,7 +1599,18 @@ pub fn prepare_workflow_for_wire(
 pub fn revalidate_preparation(
     binding: &crate::prep_token::PrepBinding,
 ) -> Result<(), PreparationStale> {
+    // The held directory is dropped here: this entry point answers a question
+    // and spawns nothing, so there is no later use for the object it verified.
     revalidate_approved_roles(binding).map(|_| ())
+}
+
+/// What [`revalidate_approved_roles`] passed: the roles the approved
+/// orchestration declares, and on Unix the project directory those checks
+/// verified, still open.
+struct ApprovedProject {
+    roles: Vec<ApprovedRole>,
+    #[cfg(unix)]
+    dir: VerifiedProjectDir,
 }
 
 /// [`revalidate_preparation`], plus the role identities the approved
@@ -1266,18 +1624,37 @@ pub fn revalidate_preparation(
 /// exists to close.
 fn revalidate_approved_roles(
     binding: &crate::prep_token::PrepBinding,
-) -> Result<Vec<ApprovedRole>, PreparationStale> {
+) -> Result<ApprovedProject, PreparationStale> {
     let dir = canonicalize_project_dir(&binding.project_dir)
         .map_err(|_| PreparationStale::ProjectUnresolved)?;
     if dir != binding.project_dir {
         return Err(PreparationStale::ProjectMoved);
     }
-    let identity = std::fs::symlink_metadata(&dir)
-        .ok()
-        .as_ref()
-        .and_then(crate::prep_token::inode_identity);
-    if identity != binding.project_identity {
-        return Err(PreparationStale::ProjectReplaced);
+    // Issue #1233 item 2: the identity is read from an open descriptor, not a
+    // second pathname lookup, and the descriptor is KEPT — it is what the spawn
+    // enters (`crate::agent_pty::spawn_in`). Every failure of the open is the
+    // same finding the old `symlink_metadata` comparison reached for it: the
+    // path now names no directory (`ENOENT`), a symlink (`ELOOP` under
+    // `O_NOFOLLOW`) or a non-directory (`ENOTDIR`) — none of which is the
+    // directory this preparation approved.
+    #[cfg(unix)]
+    let verified_dir = {
+        let verified =
+            VerifiedProjectDir::open(&dir).map_err(|_| PreparationStale::ProjectReplaced)?;
+        if Some(verified.identity()) != binding.project_identity {
+            return Err(PreparationStale::ProjectReplaced);
+        }
+        verified
+    };
+    #[cfg(not(unix))]
+    {
+        let identity = std::fs::symlink_metadata(&dir)
+            .ok()
+            .as_ref()
+            .and_then(crate::prep_token::inode_identity);
+        if identity != binding.project_identity {
+            return Err(PreparationStale::ProjectReplaced);
+        }
     }
 
     let (config, revision) =
@@ -1287,26 +1664,35 @@ fn revalidate_approved_roles(
     }
     // Cheap, and not a tautology given the revision matched: `config_revision`
     // is a change hint rather than a commitment, so this asks the config itself
-    // the question the hint only stands in for.
-    let Some(orch) = config
-        .orchestrations
-        .iter()
-        .filter(|o| !o.roles.is_empty())
-        .find(|o| {
-            crate::project_config::resolve_orchestration_name(&o.name, &dir)
-                == binding.orchestration
-        })
-    else {
-        return Err(PreparationStale::OrchestrationGone);
+    // the question the hint only stands in for — including issue #1233's "is
+    // the name still unambiguous", which the preparation refused to answer with
+    // a first match.
+    let orch = match find_orchestration(&config, &binding.orchestration, &dir) {
+        Ok(orch) => orch,
+        Err(OrchestrationLookup::Missing) => return Err(PreparationStale::OrchestrationGone),
+        Err(OrchestrationLookup::Ambiguous(_)) => {
+            return Err(PreparationStale::OrchestrationAmbiguous);
+        }
     };
     // Captured before the context checks so the returned list is the one the
     // orchestration lookup just matched, rather than a second lookup's.
+    //
+    // Issue #523: `start` is the orchestrator SEAT by the one rule, not the
+    // bare flag, so `verify_prepared_start_role` accepts exactly the membership
+    // a seat-computing client sends (`TabMembership::is_start_role` means the
+    // seat) and the configured Pi seed follows the same role. The desktop, the
+    // one client today, refuses to launch without exactly one `start = true`
+    // role, and for such a config the two readings are the same value.
+    let seat = orch.orchestrator_role_index();
     let approved_roles: Vec<ApprovedRole> = orch
         .roles
         .iter()
-        .map(|role| ApprovedRole {
+        .enumerate()
+        .map(|(index, role)| ApprovedRole {
             name: role.name.clone(),
-            start: role.start,
+            start: index == seat,
+            command: role.command.clone(),
+            agent_type: role.resolved_agent_type(),
         })
         .collect();
 
@@ -1317,16 +1703,146 @@ fn revalidate_approved_roles(
     if context_digest(&content) != binding.context_digest {
         return Err(PreparationStale::ContextRewritten);
     }
-    Ok(approved_roles)
+    Ok(ApprovedProject {
+        roles: approved_roles,
+        #[cfg(unix)]
+        dir: verified_dir,
+    })
 }
 
 /// One role of the orchestration a preparation approved, as the config declares
-/// it: the exact name a spawn must send back, and whether that role is the one
-/// the orchestration starts.
+/// it: the exact name a spawn must send back, whether that role is the
+/// orchestration's orchestrator seat (`start`: by
+/// [`crate::project_config::OrchestrationConfig::orchestrator_role_index`],
+/// issue #523, not the bare flag), and — for PRD #1223 M6's opted-in start — what the TUI
+/// takes from the role's config when it spawns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ApprovedRole {
     name: String,
     start: bool,
+    command: String,
+    agent_type: Option<crate::event::AgentType>,
+}
+
+/// PRD #1223 M6: the configured role a prepared start was matched to, as the
+/// config read that just passed every staleness check declares it.
+///
+/// This is what [`verify_prepared_start_role`] hands back so a start that opts
+/// into `use_configured_command` can spawn the role the way the TUI's
+/// orchestration launch does (`src/tab.rs`): `command` is the role's configured
+/// command, `agent_type` its [`crate::project_config::OrchestrationRoleConfig::resolved_agent_type`]
+/// (a declared `agent` wins, else the type the command infers), and `name` /
+/// `start` the identity the request was already matched against.
+///
+/// **Daemon-side only.** It never goes on the wire:
+/// [`crate::event::ProjectRole`]'s note — command strings stay on the machine
+/// the agents run on — is the reason this is a separate type rather than a
+/// widening of that one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRoleConfig {
+    pub name: String,
+    pub start: bool,
+    pub command: String,
+    pub agent_type: Option<crate::event::AgentType>,
+}
+
+/// What [`verify_prepared_start_role`] answers: the configured role the request
+/// was matched to, and — on Unix — the project directory the staleness checks
+/// verified, **held open** (issue #1233 item 2).
+///
+/// **Daemon-side only**, like [`PreparedRoleConfig`]: nothing here reaches the
+/// wire.
+#[derive(Debug)]
+pub struct VerifiedPreparedStart {
+    pub role: PreparedRoleConfig,
+    /// The directory object whose identity matched the binding. The daemon arm
+    /// holds this until the spawn has returned and hands it to
+    /// [`crate::agent_pty::AgentPtyRegistry::spawn_agent_in`], so the child is
+    /// started in the object that was checked rather than in whatever the
+    /// pathname names by then.
+    #[cfg(unix)]
+    pub project_dir: VerifiedProjectDir,
+}
+
+/// A project directory opened once and identified from the open descriptor
+/// (issue #1233 item 2).
+///
+/// The check it replaces read the identity with `symlink_metadata(path)`, and the
+/// spawn then entered the directory by `cmd.cwd(path)` — two pathname lookups
+/// with the whole config and context re-validation between them, so a directory
+/// renamed away and replaced after the check was the one the agent started in.
+/// Here the identity is the `fstat` of a descriptor opened with
+/// `O_DIRECTORY | O_NOFOLLOW`, so what was checked is an **object**, and the
+/// spawn can enter that object (on Linux, through `/proc/self/fd/N` — see
+/// [`crate::agent_pty::spawn_in`]) or at least re-compare the pathname against it
+/// (every other Unix).
+///
+/// `cfg(unix)` because the verbs that mint a prepared start are refused on every
+/// other platform (`crate::daemon_protocol::PROJECT_ERR_UNSUPPORTED_PLATFORM`),
+/// and there is no inode identity to hold there anyway.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct VerifiedProjectDir {
+    fd: std::os::fd::OwnedFd,
+    identity: crate::prep_token::InodeIdentity,
+}
+
+#[cfg(unix)]
+impl VerifiedProjectDir {
+    /// Open `path` as a directory without following a final symlink, and read
+    /// its identity from the descriptor.
+    ///
+    /// `O_CLOEXEC` so the descriptor never outlives an `execve` — it is only
+    /// ever meant to be visible to a forked child *before* the exec, which is
+    /// where the Linux spawn path's `chdir` runs. `O_NONBLOCK` is not needed:
+    /// `O_DIRECTORY` refuses a FIFO before any blocking open could happen.
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_dir() {
+            // `O_DIRECTORY` already guarantees this; checked from the handle
+            // anyway so the type's invariant does not rest on one flag's
+            // spelling across every Unix.
+            return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+        let identity = crate::prep_token::inode_identity(&metadata)
+            .ok_or_else(|| std::io::Error::other("no inode identity on this platform"))?;
+
+        let mut fd: OwnedFd = file.into();
+        // The Linux spawn path names this descriptor inside the forked child,
+        // AFTER std has `dup2`'d the PTY onto 0, 1 and 2 and BEFORE the `chdir`.
+        // A daemon started with a closed stdio slot would have handed us one of
+        // those numbers, and the child's `/proc/self/fd/N` would then be the
+        // PTY. Moving it above 2 up front makes that impossible by construction.
+        if fd.as_raw_fd() <= libc::STDERR_FILENO {
+            // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` on a descriptor we own; the
+            // result is a fresh descriptor we take sole ownership of.
+            let dup = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if dup < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            fd = unsafe { OwnedFd::from_raw_fd(dup) };
+        }
+        Ok(Self { fd, identity })
+    }
+
+    /// The `(dev, ino)` the descriptor was verified against.
+    pub fn identity(&self) -> crate::prep_token::InodeIdentity {
+        self.identity
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for VerifiedProjectDir {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
 }
 
 /// Why a preparation no longer describes what it approved.
@@ -1353,15 +1869,19 @@ pub enum PreparationStale {
     ConfigChanged,
     /// The prepared orchestration is no longer defined with roles.
     OrchestrationGone,
-    /// The published coordinator context could not be read back.
+    /// More than one orchestration with roles now resolves to the prepared
+    /// name (issue #1233), so there is no single one to start.
+    OrchestrationAmbiguous,
+    /// The published orchestrator context could not be read back.
     ContextUnreadable,
     /// Something other than a regular file now sits at the published path.
     ContextNotRegularFile,
     /// What sits there is larger than this daemon publishes.
     ContextTooLarge,
-    /// Same path, different inode — which is what a second publish's
-    /// `rename(2)` produces, and therefore the interleaving case PRD #819's
-    /// audit found.
+    /// Same path, different inode — the file was deleted and recreated. Before
+    /// issue #1233 this was what a second preparation's publish produced (the
+    /// interleaving PRD #819's audit found); a publish now writes a file of its
+    /// own, so it is what something other than the deck produces.
     ContextReplaced,
     /// Same inode, different bytes — an in-place rewrite, which a `>` redirect
     /// or another tool's `fs::write` performs.
@@ -1378,15 +1898,18 @@ impl PreparationStale {
             Self::ConfigUnreadable => "the prepared project's config no longer reads",
             Self::ConfigChanged => "the project config changed after the preparation",
             Self::OrchestrationGone => "the prepared orchestration is no longer defined with roles",
-            Self::ContextUnreadable => "the published coordinator context could not be read back",
+            Self::OrchestrationAmbiguous => {
+                "more than one orchestration with roles now has the prepared name"
+            }
+            Self::ContextUnreadable => "the published orchestrator context could not be read back",
             Self::ContextNotRegularFile => {
-                "the published coordinator context is no longer a regular file"
+                "the published orchestrator context is no longer a regular file"
             }
             Self::ContextTooLarge => {
-                "the published coordinator context is larger than this daemon publishes"
+                "the published orchestrator context is larger than this daemon publishes"
             }
-            Self::ContextReplaced => "the published coordinator context has been replaced",
-            Self::ContextRewritten => "the published coordinator context has been rewritten",
+            Self::ContextReplaced => "the published orchestrator context has been replaced",
+            Self::ContextRewritten => "the published orchestrator context has been rewritten",
         }
     }
 }
@@ -1557,7 +2080,7 @@ impl std::fmt::Display for PreparedStartRefusal {
 ///
 /// * the submitted `cwd` is the daemon's own canonical spelling of the prepared
 ///   project directory. Compared as the string this daemon minted and handed
-///   back on [`crate::event::PreparedWorkflow::path`] — **not** re-canonicalised,
+///   back on [`crate::event::PreparedOrchestration::path`] — **not** re-canonicalised,
 ///   because re-resolving here would ask the filesystem the question again and
 ///   accept any other spelling that happens to land on the same directory, which
 ///   is the class of drift PRD #220 is about;
@@ -1580,11 +2103,14 @@ impl std::fmt::Display for PreparedStartRefusal {
 /// here is **identity** (project, orchestration, role) and not **content**.
 /// Binding the command would also buy nothing this socket protects: a peer that
 /// wants to run an arbitrary command calls `StartAgent` and presents no token.
+/// PRD #1223 M6 added the other direction rather than a binding: a start that
+/// opts into `use_configured_command` sends no command at all and runs the one
+/// [`verify_prepared_start_role`] read from the approved config.
 ///
 /// Nor are `rows`, `cols`, `display_name`, `env`, `agent_type`, `seed`,
 /// `role_index`, `display_title` or `orchestration_id`: each is either
 /// presentation, per-launch shape, or an identity the client mints for itself,
-/// and none of them names the project or the workflow this token approved.
+/// and none of them names the project or the orchestration this token approved.
 ///
 /// **This is still not an authorization check.** It stops a request from
 /// consuming a preparation that was made for something else; it stops nothing a
@@ -1602,10 +2128,35 @@ pub fn verify_prepared_start(
     binding: &crate::prep_token::PrepBinding,
     request: &PreparedStartRequest,
 ) -> Result<(), PreparedStartRefusal> {
+    verify_prepared_start_role(binding, request).map(|_| ())
+}
+
+/// [`verify_prepared_start`], answering the configured role the request was
+/// matched to (PRD #1223 M6).
+///
+/// Every check is [`verify_prepared_start`]'s, in the same order, and the role
+/// comes from the **same** config read the staleness checks passed — so a start
+/// that runs the role's configured command runs the command this preparation
+/// approved, never one read again after the config could have moved. That is the
+/// property that keeps an opted-in start inside the existing staleness gate: an
+/// edited config refuses with `stale-preparation`, and no command from it runs.
+///
+/// On Unix it also answers the project directory the identity check verified,
+/// **still open** ([`VerifiedPreparedStart::project_dir`], issue #1233 item 2).
+/// A caller that spawns must hand that to
+/// [`crate::agent_pty::AgentPtyRegistry::spawn_agent_in`] rather than dropping
+/// it and spawning by pathname, or the check proves nothing about the directory
+/// the agent starts in.
+///
+/// **Blocking** — the caller goes through [`run_bounded`].
+pub fn verify_prepared_start_role(
+    binding: &crate::prep_token::PrepBinding,
+    request: &PreparedStartRequest,
+) -> Result<VerifiedPreparedStart, PreparedStartRefusal> {
     use PreparedStartRefusal::{Mismatch, Stale};
 
     // The prepared directory as the daemon spelled it. `canonicalize_project_dir`
-    // refuses a non-UTF-8 path, so a binding minted by `prepare_workflow_for_wire`
+    // refuses a non-UTF-8 path, so a binding minted by `prepare_orchestration_for_wire`
     // always has one; a `None` here could only come from a hand-built binding and
     // is treated as "nothing the caller could have matched".
     let approved_dir = binding.project_dir.to_str();
@@ -1624,8 +2175,9 @@ pub fn verify_prepared_start(
         return Err(Mismatch(PreparationMismatch::OrchestrationCwdDiffers));
     }
 
-    let approved_roles = revalidate_approved_roles(binding).map_err(Stale)?;
-    let Some(role) = approved_roles
+    let approved = revalidate_approved_roles(binding).map_err(Stale)?;
+    let Some(role) = approved
+        .roles
         .iter()
         .find(|role| role.name == membership.role)
     else {
@@ -1634,7 +2186,17 @@ pub fn verify_prepared_start(
     if role.start != membership.is_start_role {
         return Err(Mismatch(PreparationMismatch::StartMarkerDiffers));
     }
-    Ok(())
+    let role = PreparedRoleConfig {
+        name: role.name.clone(),
+        start: role.start,
+        command: role.command.clone(),
+        agent_type: role.agent_type.clone(),
+    };
+    Ok(VerifiedPreparedStart {
+        role,
+        #[cfg(unix)]
+        project_dir: approved.dir,
+    })
 }
 
 /// Read the coordinator context back for [`revalidate_preparation`], under the
@@ -1685,7 +2247,7 @@ fn read_published_context(
 pub fn stale_preparation_refusal() -> String {
     format!(
         "{}: that preparation no longer matches the project it was made against; prepare the \
-         workflow again",
+         orchestration again",
         crate::daemon_protocol::PROJECT_ERR_STALE_PREPARATION
     )
 }
@@ -1724,7 +2286,7 @@ pub fn stale_revision_refusal() -> String {
     )
 }
 
-/// The refusal a `PrepareWorkflow` naming an orchestration the project does not
+/// The refusal a `PrepareOrchestration` naming an orchestration the project does not
 /// define gets.
 ///
 /// It deliberately lists nothing. The available names are config *content* for
@@ -1734,6 +2296,36 @@ pub fn no_such_orchestration_refusal() -> String {
     format!(
         "{}: that project defines no orchestration with roles under that name",
         crate::daemon_protocol::PROJECT_ERR_NO_ORCHESTRATION
+    )
+}
+
+/// The refusal a `PrepareOrchestration` naming an orchestration the project
+/// declares more than once, with roles each time, gets (issue #1233).
+///
+/// Worded like the desktop's own preflight refusal, which it backs up at the
+/// step that publishes. It names no count and no role: the caller already holds
+/// the project's listing if it resolved first, and a caller that did not is
+/// told only what to change.
+pub fn ambiguous_orchestration_refusal() -> String {
+    format!(
+        "{}: that project defines more than one orchestration with roles under that name; \
+         rename one to launch it",
+        crate::daemon_protocol::PROJECT_ERR_AMBIGUOUS_ORCHESTRATION
+    )
+}
+
+/// The refusal a `PrepareOrchestration` whose [`PREPARE_DEADLINE`] passed gets
+/// (issue #1233 item 4).
+///
+/// **Retryable**, and about the daemon's load rather than the request, like
+/// [`crate::daemon_protocol::PROJECT_ERR_BUSY`]: nothing was published and no
+/// token issued, so sending the same request again is safe.
+pub fn preparation_expired_refusal() -> String {
+    format!(
+        "{}: the daemon could not prepare the orchestration within {}s, so it prepared nothing; \
+         try again",
+        crate::daemon_protocol::PROJECT_ERR_PREPARATION_EXPIRED,
+        PREPARE_DEADLINE.as_secs()
     )
 }
 
@@ -1763,6 +2355,7 @@ pub fn publish_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const SMALL_PROJECT: &str = r#"
 [[orchestrations]]
@@ -1783,6 +2376,24 @@ command = "cat"
     /// disclosure tests are asserting against a payload that genuinely reaches
     /// the error, not one the renderer happens to omit.
     const MALFORMED: &str = "bogus = \u{1b}[31mPWNED\u{1b}[0m\n";
+
+    /// Every `orchestrator-context*` entry in `dir`'s `.dot-agent-deck` — the
+    /// per-publish files and the compatibility mirror alike (issue #1233).
+    fn published_contexts(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir.join(crate::orchestrator_context::CONTEXT_DIR_NAME))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("orchestrator-context")
+                    })
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 
     fn write_project(dir: &Path, toml: &str) {
         std::fs::write(dir.join(CONFIG_FILE_NAME), toml).expect("seed project config");
@@ -2462,7 +3073,7 @@ command = "cat"
         );
     }
 
-    /// A resolve carries the revision a later `PrepareWorkflow` echoes back.
+    /// A resolve carries the revision a later `PrepareOrchestration` echoes back.
     /// Without it the launch verb has nothing to compare against and the
     /// staleness check is unreachable from a client.
     #[test]
@@ -2495,12 +3106,10 @@ command = "cat"
         let project = root.join("staleness-project");
         std::fs::create_dir_all(&project).expect("create the project dir");
         write_project(&project, SMALL_PROJECT);
-        let context = project
-            .join(crate::orchestrator_context::CONTEXT_DIR_NAME)
-            .join(crate::orchestrator_context::CONTEXT_FILE_NAME);
+        let context_dir = project.join(crate::orchestrator_context::CONTEXT_DIR_NAME);
 
         let stale = config_revision("something else entirely");
-        let refusal = prepare_workflow_for_wire(
+        let refusal = prepare_orchestration_for_wire(
             project.to_str().expect("utf-8 scratch path"),
             "loop",
             "a task",
@@ -2513,9 +3122,9 @@ command = "cat"
             "expected the stable stale-revision code, got {refusal}"
         );
         assert!(
-            !context.exists(),
-            "the revision check must run before the publish, but {} was written",
-            context.display()
+            published_contexts(&project).is_empty(),
+            "the revision check must run before the publish, but {} holds a context",
+            context_dir.display()
         );
 
         // The matching revision goes through, so the refusal above is about
@@ -2523,7 +3132,7 @@ command = "cat"
         let current = read_project_config_with_revision(&project)
             .expect("read the config")
             .1;
-        let prepared = prepare_workflow_for_wire(
+        let prepared = prepare_orchestration_for_wire(
             project.to_str().expect("utf-8 scratch path"),
             "loop",
             "a task",
@@ -2531,11 +3140,389 @@ command = "cat"
             &[],
         )
         .expect("a matching revision must be accepted");
-        assert_eq!(Path::new(&prepared.context_path), context);
+        let context = Path::new(&prepared.context_path);
+        assert_eq!(context.parent(), Some(context_dir.as_path()));
         assert!(context.is_file(), "and the context is published");
         assert!(
             !prepared.token.is_empty(),
             "a preparation carries the token the later spawn presents"
+        );
+    }
+
+    /// Where the compatibility mirror of `project` lives.
+    fn mirror_of(project: &Path) -> PathBuf {
+        project
+            .join(crate::orchestrator_context::CONTEXT_DIR_NAME)
+            .join(crate::orchestrator_context::CONTEXT_FILE_NAME)
+    }
+
+    /// Whether the daemon-wide token store still holds a live token for
+    /// `project` (canonicalised, as the binding records it).
+    fn token_live_for(project: &Path) -> bool {
+        crate::prep_token::any_live_for(&std::fs::canonicalize(project).expect("canonicalize"))
+    }
+
+    /// A clock that answers "before the deadline" for its first `good`
+    /// readings and "after it" from then on, counting its readings.
+    fn clock_expiring_after(
+        good: u32,
+        start: std::time::Instant,
+        deadline: std::time::Instant,
+    ) -> (
+        std::rc::Rc<std::cell::Cell<u32>>,
+        impl Fn() -> std::time::Instant,
+    ) {
+        let readings = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let counted = std::rc::Rc::clone(&readings);
+        let clock = move || {
+            counted.set(counted.get() + 1);
+            if counted.get() > good {
+                deadline + Duration::from_secs(1)
+            } else {
+                start
+            }
+        };
+        (readings, clock)
+    }
+
+    /// Issue #1233 item 4: a preparation whose deadline has already passed is
+    /// refused before any work, and writes nothing and issues nothing.
+    #[test]
+    fn an_expired_preparation_publishes_nothing_and_issues_no_token() {
+        let (_guard, root) = scratch();
+        let project = root.join("expired-project");
+        std::fs::create_dir_all(&project).expect("create the project dir");
+        write_project(&project, SMALL_PROJECT);
+
+        let now = std::time::Instant::now();
+        let refusal = prepare_orchestration_before(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            None,
+            &[],
+            Some(now),
+            &|| now,
+            None,
+        )
+        .expect_err("an expired deadline must be refused");
+        assert!(
+            refusal.starts_with(crate::daemon_protocol::PROJECT_ERR_PREPARATION_EXPIRED),
+            "got {refusal}"
+        );
+        assert!(published_contexts(&project).is_empty());
+        assert!(!token_live_for(&project));
+    }
+
+    /// Issue #1233 item 4: a deadline that passes DURING the publish withdraws
+    /// it — the per-publish file is removed, no token is issued, and the
+    /// compatibility mirror is never written.
+    ///
+    /// The clock answers "before the deadline" for the entry and pre-publish
+    /// checks and "after it" from the third reading on, which is the check
+    /// straight after the publish.
+    #[test]
+    fn a_deadline_passing_during_the_publish_withdraws_it() {
+        let (_guard, root) = scratch();
+        let project = root.join("late-project");
+        std::fs::create_dir_all(&project).expect("create the project dir");
+        write_project(&project, SMALL_PROJECT);
+
+        let start = std::time::Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        let (readings, clock) = clock_expiring_after(2, start, deadline);
+        let refusal = prepare_orchestration_before(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            None,
+            &[],
+            Some(deadline),
+            &clock,
+            None,
+        )
+        .expect_err("a deadline passing during the publish must be refused");
+        assert!(
+            refusal.starts_with(crate::daemon_protocol::PROJECT_ERR_PREPARATION_EXPIRED),
+            "got {refusal}"
+        );
+        assert_eq!(
+            readings.get(),
+            3,
+            "the refusal came from the post-publish check"
+        );
+        assert!(
+            published_contexts(&project).is_empty(),
+            "the withdrawn file is gone and the mirror was never written: {:?}",
+            published_contexts(&project)
+        );
+        assert!(!token_live_for(&project));
+
+        // And a clock that never passes the deadline prepares as usual, which is
+        // what makes the refusal above about the deadline. The mirror is handed
+        // back un-written, for the caller to write after answering.
+        let prepared = prepare_orchestration_before(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            None,
+            &[],
+            Some(deadline),
+            &|| start,
+            None,
+        )
+        .expect("a preparation inside its deadline succeeds");
+        let (answer, mirror) = prepared.into_parts();
+        assert!(Path::new(&answer.context_path).is_file());
+        assert!(
+            !mirror_of(&project).exists(),
+            "the preparation itself does not write the mirror"
+        );
+        mirror.write();
+        assert!(
+            mirror_of(&project).is_file(),
+            "the caller writes it once the preparation is answered"
+        );
+    }
+
+    /// Issue #1233 audit: a deadline that passes DURING the token issue — the
+    /// last side effect — is caught by the gate after it: the token is revoked,
+    /// the per-publish file withdrawn, and no mirror is handed back to write.
+    #[test]
+    fn a_deadline_passing_during_the_token_issue_revokes_and_withdraws() {
+        let (_guard, root) = scratch();
+        let project = root.join("issue-late-project");
+        std::fs::create_dir_all(&project).expect("create the project dir");
+        write_project(&project, SMALL_PROJECT);
+
+        let start = std::time::Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        let (readings, clock) = clock_expiring_after(3, start, deadline);
+        let refusal = prepare_orchestration_before(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            None,
+            &[],
+            Some(deadline),
+            &clock,
+            None,
+        )
+        .expect_err("a deadline passing during the issue must be refused");
+        assert!(
+            refusal.starts_with(crate::daemon_protocol::PROJECT_ERR_PREPARATION_EXPIRED),
+            "got {refusal}"
+        );
+        assert_eq!(readings.get(), 4, "the refusal came from the last gate");
+        assert!(
+            !token_live_for(&project),
+            "the token issued before the last gate was revoked"
+        );
+        assert!(
+            published_contexts(&project).is_empty(),
+            "the file is withdrawn and no mirror written: {:?}",
+            published_contexts(&project)
+        );
+    }
+
+    /// Issue #1233 audit: a preparation whose reply already gave up on it — the
+    /// latch abandoned, as `run_bounded_answer` does at the deadline — is
+    /// withdrawn at its last gate even when its own clock reads in time, so a
+    /// work that finishes after the client was told "expired" leaves nothing
+    /// usable behind.
+    #[test]
+    fn an_abandoned_reply_revokes_the_token_and_withdraws_the_context() {
+        let (_guard, root) = scratch();
+        let project = root.join("abandoned-project");
+        std::fs::create_dir_all(&project).expect("create the project dir");
+        write_project(&project, SMALL_PROJECT);
+
+        let start = std::time::Instant::now();
+        let latch = ReplyLatch::default();
+        assert!(latch.abandon());
+        let refusal = prepare_orchestration_before(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            None,
+            &[],
+            Some(start + Duration::from_secs(10)),
+            &|| start,
+            Some(&latch),
+        )
+        .expect_err("an abandoned reply must not be answered");
+        assert!(
+            refusal.starts_with(crate::daemon_protocol::PROJECT_ERR_PREPARATION_EXPIRED),
+            "got {refusal}"
+        );
+        assert!(!token_live_for(&project));
+        assert!(published_contexts(&project).is_empty());
+
+        // A latch nobody abandoned lets the same preparation commit.
+        let latch = ReplyLatch::default();
+        prepare_orchestration_before(
+            project.to_str().expect("utf-8 scratch path"),
+            "loop",
+            "a task",
+            None,
+            &[],
+            Some(start + Duration::from_secs(10)),
+            &|| start,
+            Some(&latch),
+        )
+        .expect("an open latch commits");
+        assert!(
+            !latch.abandon(),
+            "the work committed, so the reply cannot abandon"
+        );
+    }
+
+    /// Issue #1233 item 4: with every project permit held, the bounded wait
+    /// gives up at its deadline and never runs the work.
+    #[tokio::test]
+    async fn run_bounded_answer_gives_up_at_the_deadline_without_running_the_work() {
+        let held = project_fs_limit()
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_PROJECT_READS as u32)
+            .await
+            .expect("saturate the project permits");
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_inner = std::sync::Arc::clone(&ran);
+        let outcome = run_bounded_answer(
+            tokio::time::Instant::now() + Duration::from_millis(50),
+            move |_| {
+                ran_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                ((), None)
+            },
+        )
+        .await
+        .expect("no internal error");
+        assert_eq!(
+            outcome,
+            Err(Expired::NoPermit),
+            "the deadline passed before a permit freed up"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the work never ran"
+        );
+
+        drop(held);
+        let outcome = run_bounded_answer(
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            |latch| (latch.commit().then_some(42), None),
+        )
+        .await
+        .expect("no internal error");
+        assert_eq!(outcome, Ok(Some(42)), "with a permit free the work runs");
+    }
+
+    /// Issue #1233 audit: a work that is still running at the deadline does not
+    /// hold the reply — it is answered `Expired::Abandoned` on time — and when it
+    /// does finish, its commit is refused, which is what makes it withdraw.
+    #[tokio::test]
+    async fn run_bounded_answer_answers_on_time_and_abandons_a_stalled_work() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel::<bool>();
+        let started = tokio::time::Instant::now();
+        let outcome = run_bounded_answer(started + Duration::from_millis(100), move |latch| {
+            // Stands in for a filesystem call that stalls past the deadline.
+            let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            let committed = latch.commit();
+            let _ = committed_tx.send(committed);
+            (committed, None)
+        })
+        .await
+        .expect("no internal error");
+        assert_eq!(
+            outcome,
+            Err(Expired::Abandoned),
+            "answered as expired because the running work was abandoned"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the answer did not wait for the stalled work ({:?})",
+            started.elapsed()
+        );
+
+        release_tx.send(()).expect("release the stalled work");
+        let committed = tokio::task::spawn_blocking(move || {
+            committed_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the work finished")
+        })
+        .await
+        .expect("join");
+        assert!(
+            !committed,
+            "a work that finishes after an expired answer cannot commit"
+        );
+    }
+
+    /// Issue #1233 audit: the post-reply work — the compatibility mirror — runs
+    /// only after the answer has been handed over, so a mirror write that
+    /// stalls past the deadline neither delays nor changes the answer.
+    #[tokio::test]
+    async fn run_bounded_answer_answers_before_a_stalled_after_reply() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel::<()>();
+        let started = tokio::time::Instant::now();
+        let outcome = run_bounded_answer(started + Duration::from_millis(100), move |latch| {
+            let after: AfterReply = Box::new(move || {
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                let _ = ran_tx.send(());
+            });
+            (latch.commit(), Some(after))
+        })
+        .await
+        .expect("no internal error");
+        assert_eq!(outcome, Ok(true), "the committed answer is delivered");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the answer did not wait for the after-reply work ({:?})",
+            started.elapsed()
+        );
+        assert!(
+            ran_rx.try_recv().is_err(),
+            "the after-reply work had not run when the answer arrived"
+        );
+        release_tx.send(()).expect("release the after-reply work");
+        tokio::task::spawn_blocking(move || {
+            ran_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the after-reply work ran after the answer")
+        })
+        .await
+        .expect("join");
+    }
+
+    /// Issue #1233: the lookup counts role-bearing matches only, and refuses
+    /// two of them rather than taking the first.
+    #[test]
+    fn find_orchestration_refuses_a_duplicated_role_bearing_name() {
+        let dir = Path::new("/p/project");
+        let parse = |toml: &str| -> ProjectConfig { toml::from_str(toml).expect("parse") };
+        let one = parse(SMALL_PROJECT);
+        assert_eq!(
+            find_orchestration(&one, "loop", dir).map(|o| o.roles.len()),
+            Ok(2)
+        );
+        assert_eq!(
+            find_orchestration(&one, "nope", dir).map(|_| ()),
+            Err(OrchestrationLookup::Missing)
+        );
+        let two = parse(&format!("{SMALL_PROJECT}\n{SMALL_PROJECT}"));
+        assert_eq!(
+            find_orchestration(&two, "loop", dir).map(|_| ()),
+            Err(OrchestrationLookup::Ambiguous(2))
+        );
+        let roleless = parse(&format!(
+            "[[orchestrations]]\nname = \"loop\"\n{SMALL_PROJECT}"
+        ));
+        assert_eq!(
+            find_orchestration(&roleless, "loop", dir).map(|o| o.roles.len()),
+            Ok(2),
+            "a roleless duplicate does not make the name ambiguous"
         );
     }
 
@@ -2549,7 +3536,7 @@ command = "cat"
         std::fs::create_dir_all(&project).expect("create the project dir");
         write_project(&project, SMALL_PROJECT);
 
-        let refusal = prepare_workflow_for_wire(
+        let refusal = prepare_orchestration_for_wire(
             project.to_str().expect("utf-8 scratch path"),
             "no-such-orchestration",
             "a task",
@@ -2588,7 +3575,7 @@ command = "cat"
         let alias = root.join("current");
         std::os::unix::fs::symlink(&project, &alias).expect("symlink");
 
-        let prepared = prepare_workflow_for_wire(
+        let prepared = prepare_orchestration_for_wire(
             alias.to_str().expect("utf-8 scratch path"),
             // The CANONICAL basename, because that is the name the resolve
             // offers; `current` is the spelling that must never name anything.
@@ -2600,14 +3587,16 @@ command = "cat"
         .expect("a launch through the alias must resolve and publish");
 
         assert_eq!(
-            Path::new(&prepared.context_path),
-            project
-                .join(crate::orchestrator_context::CONTEXT_DIR_NAME)
-                .join(crate::orchestrator_context::CONTEXT_FILE_NAME),
+            Path::new(&prepared.context_path).parent(),
+            Some(
+                project
+                    .join(crate::orchestrator_context::CONTEXT_DIR_NAME)
+                    .as_path()
+            ),
             "the context must land under the canonical directory, not under the alias"
         );
         assert!(
-            prepare_workflow_for_wire(
+            prepare_orchestration_for_wire(
                 alias.to_str().expect("utf-8 scratch path"),
                 "current",
                 "a task",
@@ -2622,7 +3611,7 @@ command = "cat"
     /// The launch verb's *resolve* refusals discloses exactly what the resolve
     /// verb's do — no more.
     ///
-    /// Prepare-workflow does filesystem work on a caller-supplied path just as
+    /// Prepare-orchestration does filesystem work on a caller-supplied path just as
     /// resolve-project does, so a refusal from that half must be
     /// indistinguishable in the same way: one code, one sentence, no parser
     /// source line, no raw OS error, no echo of the caller's path. A second
@@ -2635,7 +3624,7 @@ command = "cat"
         std::fs::create_dir(&project).expect("mkdir");
         write_project(&project, MALFORMED);
 
-        let refusal = prepare_workflow_for_wire(
+        let refusal = prepare_orchestration_for_wire(
             project.to_str().expect("utf-8 scratch path"),
             "loop",
             "a task",
@@ -2662,7 +3651,7 @@ command = "cat"
             "no raw OS error may escape: {refusal}"
         );
 
-        let missing = prepare_workflow_for_wire(
+        let missing = prepare_orchestration_for_wire(
             &format!("{}/no-such-dir", root.display()),
             "loop",
             "a task",
@@ -2694,7 +3683,7 @@ command = "cat"
         write_project(&project, &toml);
         let path = project.to_str().expect("utf-8 scratch path");
 
-        let prepare_refusal = prepare_workflow_for_wire(path, "loop", "a task", None, &[])
+        let prepare_refusal = prepare_orchestration_for_wire(path, "loop", "a task", None, &[])
             .expect_err("too many roles must be refused");
         let resolve_refusal =
             resolve_for_wire(path, &[]).expect_err("and the resolve refuses it too");

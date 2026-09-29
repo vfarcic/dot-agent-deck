@@ -210,7 +210,7 @@ fn launch_with_home(home: &Path, path_value: &str) -> TuiDeck {
         )
         .with_env("PATH", path_value)
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     deck
 }
 

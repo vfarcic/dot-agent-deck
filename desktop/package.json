@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
@@ -15,10 +18,12 @@
     "test:watch": "vitest",
     "test:browser": "playwright test",
     "test:browser:types": "tsc -p tsconfig.e2e.json",
+    "test:driver": "node --test --test-concurrency=1 \"driver/**/*.test.ts\"",
+    "test:driver:types": "tsc -p tsconfig.driver.json",
     "tauri": "tauri"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/api": "^2.12.0",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
@@ -28,7 +33,7 @@
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",
-    "@tauri-apps/cli": "^2.11.4",
+    "@tauri-apps/cli": "^2.12.0",
     "@testing-library/jest-dom": "^7.0.0",
     "@testing-library/react": "^16.3.2",
     "@types/node": "^26.5.0",

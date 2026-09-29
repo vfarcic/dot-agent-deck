@@ -286,7 +286,12 @@ impl AgentProcessGroup {
     /// Reap the agent and every descendant in its job. Returns `false` when
     /// there is no job to terminate (so the caller falls back to a single-process
     /// kill) or the call failed.
-    fn terminate_tree(&self, phase: &'static str) -> bool {
+    ///
+    /// `pub(crate)` for the one caller outside agent teardown: the Claude Code
+    /// version probe (`hooks_manage::probe_claude_version`), which adopts its
+    /// `claude --version` child into a job for the same reason an agent is
+    /// adopted — so a helper that outlives the direct child dies with it.
+    pub(crate) fn terminate_tree(&self, phase: &'static str) -> bool {
         let Some(job) = self.job.as_ref() else {
             return false;
         };

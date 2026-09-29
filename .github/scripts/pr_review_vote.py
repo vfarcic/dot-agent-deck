@@ -54,8 +54,13 @@ from pr_review_common import (  # noqa: E402
     gh_json,
     gh_ok,
     coverage_gap,
+    AUTO_MERGE_ARMED_MARKER,
+    independent_review_at,
+    INSUFFICIENT_MARKER,
+    NO_INDEPENDENT_REVIEW_MARKER,
     latest_verdict,
     pr_changed_paths,
+    pr_review_comments,
     trusted_verdicts_at,
     pr_comments,
     pr_reviews,
@@ -99,6 +104,7 @@ DENY_REASONS = {
     ),
     "MAINTAINERS.md": "This edits the **record of who the maintainers are**.",
     "greptile.json": "This edits the **other reviewer's configuration**.",
+    ".pr_agent.toml": "This edits the **other reviewer's configuration**.",
     ".github/": (
         "This edits **CI or repository automation**, which is how permissions and gates get "
         "widened."
@@ -318,23 +324,77 @@ def main():
     # what was read, and that is a broken reviewer rather than a quiet
     # no-vote. Loud beats silent, the same way a malformed verdict is loud.
     if decision == "APPROVE":
-        gap = coverage_gap(
-            trusted_verdicts_at(repo, pr_number, expected_sha),
-            pr_changed_paths(repo, pr_number),
+        # Issue #1270: what an approval from this workflow now asserts is
+        # "nothing is outstanding", and the evidence for that is somebody
+        # INDEPENDENT having read this head -- not this workflow, which is the
+        # actor being gated. Four agents read every diff here (the author's,
+        # the other maintainer's, Qodo's, then this one) and on 2026-09-24 this
+        # one contributed zero findings on both pull requests it read, so its
+        # job is to adjudicate that evidence rather than to be a fourth reader.
+        #
+        # Withheld, not refused: "nobody independent has read this head yet" is
+        # a reason to wait. A `fail` would turn an ordinary sequencing gap -- a
+        # push that outran the reviewer, or a pull request opened before Qodo
+        # existed, as #1235 was -- into a red job.
+        reviewer = independent_review_at(
+            expected_sha,
+            pr_comments(repo, pr_number),
+            pr_review_comments(repo, pr_number),
+            pr_reviews(repo, pr_number),
         )
-        if gap:
-            shown = ", ".join(gap[:5]) + (f" (+{len(gap) - 5} more)" if len(gap) > 5 else "")
-            fail(
-                f"#{pr_number}: APPROVE at {expected_sha[:8]} but no trusted verdict "
-                f"covers {len(gap)} changed file(s): {shown}. Refusing to vote -- an "
-                f"approval must rest on files something actually read."
+        if reviewer is None:
+            if already_noticed_at(
+                pr_comments(repo, pr_number),
+                expected_sha,
+                app_login,
+                NO_INDEPENDENT_REVIEW_MARKER,
+            ):
+                print(
+                    f"#{pr_number}: no independent review at {expected_sha[:8]}, already "
+                    "said so; not repeating it."
+                )
+                return
+            comment(
+                repo,
+                pr_number,
+                f"**No vote cast** for `{expected_sha[:8]}`, even though my verdict was "
+                f"`{decision}`.\n\nNo independent review covers this head yet. My approval "
+                "reports that nothing is outstanding, and that rests on somebody other than "
+                "me having read the code -- so there is nothing here for me to adjudicate."
+                "\n\nComment `/review` to ask for one, then re-run this workflow.",
             )
+            print(f"#{pr_number}: no independent review at {expected_sha[:8]}; no vote cast.")
             return
+        print(f"#{pr_number}: independent review at {expected_sha[:8]} by {reviewer}.")
+
+        # The union check (Qodo on #1268) applies only to a verdict that CLAIMS
+        # accumulated coverage, which since #1270 means a focused pass and
+        # nothing else. The ordinary gate never asserts it read the diff, so
+        # demanding full coverage of it would refuse every approval.
+        # `covered_paths` IS the claim, and its PRESENCE is what makes it --
+        # keyed on the key, not its truthiness, because `covered_paths: []` is a
+        # focused pass claiming it covered nothing, which must fail the union
+        # check rather than skip it (Greptile and Qodo on PR #1271).
+        if "covered_paths" in verdict:
+            gap = coverage_gap(
+                trusted_verdicts_at(repo, pr_number, expected_sha),
+                pr_changed_paths(repo, pr_number),
+            )
+            if gap:
+                shown = ", ".join(gap[:5]) + (f" (+{len(gap) - 5} more)" if len(gap) > 5 else "")
+                fail(
+                    f"#{pr_number}: APPROVE at {expected_sha[:8]} claims accumulated coverage, "
+                    f"but no trusted verdict covers {len(gap)} changed file(s): {shown}. "
+                    f"Refusing to vote -- a coverage claim must rest on files something read."
+                )
+                return
 
     if decision == "INSUFFICIENT":
         # Say it once per head. The verdict is fixed for this SHA, so a re-post
         # carries no new information and only teaches the reader to scroll past it.
-        if already_noticed_at(pr_comments(repo, pr_number), expected_sha, app_login):
+        if already_noticed_at(
+            pr_comments(repo, pr_number), expected_sha, app_login, INSUFFICIENT_MARKER
+        ):
             print(
                 f"#{pr_number}: verdict INSUFFICIENT and already said so for "
                 f"{expected_sha[:8]}; not repeating it."
@@ -360,7 +420,12 @@ def main():
             # what keeps the notice's own instruction honest: disarming drops out
             # of this branch entirely and the job votes. Reached only when armed,
             # so the guard can never strand a pull request the reader has acted on.
-            if already_noticed_at(pr_comments(repo, pr_number), expected_sha, app_login):
+            if already_noticed_at(
+                pr_comments(repo, pr_number),
+                expected_sha,
+                app_login,
+                AUTO_MERGE_ARMED_MARKER,
+            ):
                 print(
                     f"#{pr_number}: deny-listed, auto-merge still armed, and already said "
                     f"so for {expected_sha[:8]}; not repeating it."

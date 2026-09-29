@@ -87,8 +87,8 @@
    * palette's own light teal is 5.07:1 on `--c-bg` and 4.72:1 on `--c-bg-alt`.
    * The primary ramp cannot do this job: even `--ifm-color-primary-darkest`
    * `#279f95` is 3.24:1, still failing for normal text -- which is why the
-   * fix points at `--c-teal` instead of moving the ramp, leaving buttons,
-   * admonition accents and the navbar hover on the brand teal.
+   * fix points at `--c-teal` rather than at any step of that ramp. (Issue
+   * #1154 later moved the light ramp itself onto `--c-teal`; see below.)
    *
    * The previous pass moved `--ifm-link-color` alone and left "the active
    * sidebar item and the navbar hover" on the brand teal deliberately, to
@@ -109,10 +109,10 @@
    *
    * All four were already failing before the palette moved -- the light
    * background did not change -- and all four are fixed by pointing at the
-   * palette's own light teal rather than by moving `--ifm-color-primary`,
-   * which stays on the brand `#4ecdc4` so every FILL (buttons, the dot on a
-   * focused control, admonition accents) is untouched. In dark mode `--c-teal`
-   * IS `#4ecdc4`, so nothing there changes at all.
+   * palette's own light teal. Since issue #1154 the light primary ramp below
+   * is ALSO on `--c-teal`, so in both themes these six now resolve to the
+   * same colour as `--ifm-color-primary`; they stay pinned to the palette
+   * token so the text colour cannot drift if the ramp is regenerated.
    */
   --ifm-link-color: var(--c-teal);
   --ifm-menu-color-active: var(--c-teal);
@@ -131,13 +131,36 @@
    */
   --ifm-color-content-secondary: var(--c-dim);
 
-  --ifm-color-primary: #4ecdc4;
-  --ifm-color-primary-dark: #38c5bb;
-  --ifm-color-primary-darker: #2fc0b5;
-  --ifm-color-primary-darkest: #279f95;
-  --ifm-color-primary-light: #64d5cd;
-  --ifm-color-primary-lighter: #6dd8d1;
-  --ifm-color-primary-lightest: #8de2dc;
+  /*
+   * The primary ramp is per theme (issue #1154). Infima puts
+   * `--ifm-font-color-base-inverse` -- `--c-bg`, so WHITE here -- on the
+   * primary fill of `.button--primary` (the error page's "Try again"),
+   * `.hero--primary` and a hovered `.button--outline.button--primary`, and
+   * white on the brand `#4ecdc4` is 1.93:1. No step of that ramp reaches
+   * 4.5:1 (`-darkest` `#279f95` is 3.24:1), so the light theme's primary is
+   * the palette's light teal `--c-teal` instead, with the ramp regenerated
+   * from it the way Docusaurus's colour generator does (HSL lightness scaled
+   * by 0.9 / 0.85 / 0.7 down and 1.1 / 1.15 / 1.3 up). White on each fill
+   * Infima actually uses:
+   *
+   *   primary          #0a7c73   5.07:1  (rest)
+   *   primary-dark     #097068   5.95:1  (button hover)
+   *   primary-darker   #086962   6.55:1  (button active)
+   *
+   * `-darkest` is 8.43:1. The three LIGHTER steps are 4.34 / 3.98 / 3.20:1
+   * against white and nothing in Infima or the Docusaurus theme puts text on
+   * them -- do not put white text on them either. Moving the primary also
+   * carries every primary-coloured glyph in light mode (an outline primary
+   * button's label, `.text--primary`, the word-wrap toggle) from 1.93:1 to
+   * 5.07:1 on the page.
+   */
+  --ifm-color-primary: #0a7c73;
+  --ifm-color-primary-dark: #097068;
+  --ifm-color-primary-darker: #086962;
+  --ifm-color-primary-darkest: #075751;
+  --ifm-color-primary-light: #0b887f;
+  --ifm-color-primary-lighter: #0b8f84;
+  --ifm-color-primary-lightest: #0da196;
   --ifm-code-font-size: 95%;
   --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
 }
@@ -209,6 +232,15 @@ html[data-theme='dark'] {
   --ifm-pagination-nav-color-hover: var(--c-teal);
   --ifm-color-content-secondary: var(--c-dim);
 
+  /*
+   * The dark theme keeps the brand teal. Its inverse ink is `--c-bg`
+   * `#0a0e12`, so a primary button reads dark-on-teal: 10.01:1 at rest,
+   * 9.10:1 on `-dark` (hover), 8.60:1 on `-darker` (active). The primary
+   * badge ignores the inverse ink -- see the rule at the end of this file.
+   * (`.navbar--primary` has its own light-on-primary colours too, but only
+   * `themeConfig.navbar.style: 'primary'` renders it and this site does not
+   * set that; changing the navbar style means re-measuring it.)
+   */
   --ifm-color-primary: #4ecdc4;
   --ifm-color-primary-dark: #38c5bb;
   --ifm-color-primary-darker: #2fc0b5;
@@ -222,14 +254,27 @@ html[data-theme='dark'] {
 /*
  * The active entry in the table of contents is the one piece of coloured text
  * in the docs chrome with no variable behind it: Docusaurus's own rule pins it
- * to `--ifm-color-primary`, which is 1.93:1 on the light background. This is
- * the same fix as the tokens above, applied where a token cannot reach, and it
- * is a colour and nothing else -- weight, size and spacing are untouched.
- * In dark mode `--c-teal` is `--ifm-color-primary`, so it is a no-op there.
+ * to `--ifm-color-primary`, which was 1.93:1 on the light background while the
+ * light primary was `#4ecdc4`. This is the same fix as the tokens above,
+ * applied where a token cannot reach, and it is a colour and nothing else --
+ * weight, size and spacing are untouched. Since issue #1154 `--c-teal` is
+ * `--ifm-color-primary` in both themes, so this is a no-op today; it keeps
+ * the entry on the palette token if the ramp is ever regenerated.
  */
 .table-of-contents__link--active,
 .table-of-contents__link--active code,
 .table-of-contents__link:hover,
 .table-of-contents__link:hover code {
   color: var(--c-teal);
+}
+
+/*
+ * Infima gives every badge a literal `--ifm-color-white` label rather than
+ * the inverse ink its buttons use, so `.badge--primary` would be white on
+ * `#4ecdc4` in the dark theme: 1.93:1. Pointing it at the inverse ink makes it
+ * behave like `.button--primary` -- white on `#0a7c73` in light (5.07:1),
+ * `#0a0e12` on `#4ecdc4` in dark (10.01:1).
+ */
+.badge--primary {
+  --ifm-badge-color: var(--ifm-font-color-base-inverse);
 }

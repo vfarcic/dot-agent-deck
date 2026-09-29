@@ -3,7 +3,7 @@ source: tests/render_layout.rs
 expression: unzoomed
 ---
  orchestration                                                                                      
- dot-agent-deck — 2 session(s)    ┏orchestrator━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+ dot-agent-deck — 2 agent(s)      ┏orchestrator━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┏ ▸ 1 ClaudeCode · orche… ● Idle ┓┃                                                                ┃
 ┃Dir:  —                         ┃┃                                                                ┃
 ┃                                ┃┃                                                                ┃
@@ -30,5 +30,5 @@ expression: unzoomed
                                   ┃                                                                ┃
                                   ┃                                                                ┃
  2 active  │  2 idle  │  0 tools  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
- COMMAND  [Back to Pane Ctrl+D] [New Pane Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?]    
-[Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Scheduled Tasks s]
+ COMMAND  [Back to Pane Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?]   
+[Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]

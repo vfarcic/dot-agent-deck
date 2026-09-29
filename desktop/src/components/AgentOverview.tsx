@@ -1,9 +1,13 @@
 import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
-import { Blocks, Boxes, Columns3, LayoutList, Layers, Maximize2, Network, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
+import { Blocks, Boxes, CircleStop, Columns3, LayoutList, Layers, Maximize2, Network, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
+import { desktopFeaturesOf } from "../types";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
-import { VOICE_ACTIONS } from "../lib/voiceActions";
+import { VOICE_ACTIONS, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
+import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
+import { NewAgentDialog, NO_DIALOG_FOR_DECK, NO_DIALOG_TO_DISCARD, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
+import type { NewAgentDraft } from "../lib/newAgentDraft";
 import { DeckSelector } from "./DeckSelector";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
@@ -304,7 +308,7 @@ function roleIndexOf(agent: OverviewAgent): number {
 }
 
 /** Statuses in the order an operator scans them: what needs attention first. */
-const STATUS_ORDER: AgentStatus[] = ["running", "waiting", "failed", "queued", "passed", "stopped"];
+const STATUS_ORDER: AgentStatus[] = ["running", "waiting", "failed", "blocked", "queued", "passed", "stopped"];
 
 export function countByStatus(agents: OverviewAgent[]): { status: AgentStatus; count: number }[] {
   return STATUS_ORDER
@@ -558,9 +562,9 @@ export function useOverviewClock(intervalMs: number = OVERVIEW_CLOCK_TICK_MS): n
 
 /** What a reported write lease says on hover, in the daemon's own terms. */
 const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
-  write: "The deck holds a live, writable target for this agent — input typed on this screen reaches it.",
-  read: "History-only: the deck can replay this session but cannot deliver input to it.",
-  none: "View-only: the deck has no handle it can write to or resume.",
+  write: "The daemon holds a live, writable target for this agent — input typed on this screen reaches it.",
+  read: "History-only: the daemon can replay this session but cannot deliver input to it.",
+  none: "View-only: the daemon has no handle it can write to or resume.",
 };
 
 /**
@@ -608,6 +612,48 @@ const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
 const OpenAgentContext = createContext<((agent: OverviewAgent) => void) | undefined>(undefined);
 
 /**
+ * PRD #1223 U4 — closing what the New agent flow creates, from the screen it
+ * creates it on: one agent from its row, a whole orchestration from its card.
+ *
+ * Each asks the same {@link ConfirmDialog} the deck screen's stop asks, then
+ * sends a deck-scoped action — `stop_agent`, or `stop_orchestration` over every
+ * role the card lists — to the deck the agent is ON, never the selected one.
+ * A failure is filed by the runtime under its global error, which the overview's
+ * toast shows with the cleanup warning for any role whose stop the deck could
+ * not confirm.
+ *
+ * No control is disabled for its deck's state: rows and cards render only for
+ * a connected deck (`DaemonBody`), and a deck that drops between render and
+ * confirmation refuses the action, which the toast reports. While a stop is in
+ * flight the confirmation's own busy latch is what stops a second one.
+ */
+interface OverviewStopControls {
+  stopAgent: (agent: OverviewAgent) => void;
+  closeOrchestration: (group: OverviewGroup) => void;
+}
+
+const StopControlsContext = createContext<OverviewStopControls | undefined>(undefined);
+
+/*
+  PRD #802 D5 — why a spoken stop opened no confirmation. Each says nothing
+  was stopped, because nothing was.
+*/
+/** The agent a spoken stop named is no longer on the overview. */
+export const STOP_TARGET_GONE = "That agent is not on the dashboard any more, so nothing was closed.";
+/** The orchestration a spoken close named is no longer on the overview. */
+export const ORCHESTRATION_GONE = "That orchestration is not on the dashboard any more, so nothing was closed.";
+/** A confirmation is already open; a second would replace it under the user's pointer. */
+export const CONFIRMATION_ALREADY_OPEN = "A confirmation is already open — answer it first. Nothing else was stopped.";
+/** The New agent dialog is modal, so a stop's confirmation could not be reached behind it. */
+export const STOP_BEHIND_NEW_AGENT = "The New agent dialog is open — close it first. Nothing was stopped.";
+
+/** What a stop or close confirmation calls one agent — the sanitised identity its row shows, or, in an orchestration, its role. */
+export function stopTargetName(agent: OverviewAgent): string {
+  const raw = agent.tab.kind === "orchestration" && agent.tab.roleName ? agent.tab.roleName : agent.displayName;
+  return displayIdentity(raw, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
+}
+
+/**
  * The fleet at a glance: every agent the desktop can see, grouped the way the
  * daemon groups them, described only by things that are actually true — and
  * with no terminal anywhere on it. "Shows no output" and "opens no PTY" are
@@ -633,7 +679,29 @@ const OpenAgentContext = createContext<((agent: OverviewAgent) => void) | undefi
  * passes it to whichever view is mounted; a caller that renders this screen
  * standalone gets everything except the control that needs a document.
  */
-export function AgentOverview({ runtime, settings, onNavigate }: { runtime: DeckRuntimeState; settings?: DesktopSettingsState; onNavigate: (view: DeckView) => void }) {
+export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice }: {
+  runtime: DeckRuntimeState;
+  settings?: DesktopSettingsState;
+  onNavigate: (view: DeckView) => void;
+  /**
+   * An agent's pane is open over this screen (PRD #1105), which is where the
+   * keyboard belongs — so the New agent shortcut stands down: `Ctrl+N` is
+   * readline's next-history key, and an agent's terminal may be waiting for it.
+   */
+  agentPaneOpen?: boolean;
+  /**
+   * PRD #1223 U5 — where this screen publishes what a voice dispatch may need
+   * from it: `closeNewAgent`, only while the New agent dialog is open. Absent
+   * where nothing dispatches voice (a standalone render).
+   */
+  voiceChannel?: VoiceOverviewChannel;
+  /**
+   * PRD #1223 — the New agent dialog's voice slot, handed straight to it: the
+   * dialog writes what its directory browser shows and its three moves, the
+   * voice surface reads the first and this screen serves the second.
+   */
+  newAgentVoice?: NewAgentVoiceChannel;
+}) {
   const { fleet, snapshot, mode } = runtime;
   /*
    * This screen shows no terminal and opens no PTY (PRD #745 M7), and it no
@@ -658,7 +726,7 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
    * harness rather than about the screen.
    */
   /**
-   * The SELECTED deck's connection — the Deck selector's, and the rail lamp's.
+   * The SELECTED deck's connection — the Deck selector's.
    *
    * It is `fleet[0]`'s and deliberately not an aggregate: `selectionFallback`
    * describes THE SELECTION rather than a deck ("the deck you chose is gone"),
@@ -734,13 +802,173 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
   const known = aggregate.decksUp > 0;
   const countOf = (status: AgentStatus) => aggregate.counts.find((entry) => entry.status === status)?.count ?? 0;
   /**
-   * PRD #802 M2 — the overview's two rail buttons, its "Open deck" controls and
+   * PRD #802 M2 — the overview's "Open deck" controls and
    * its row-level open all dispatch through the action registry. The context is
    * one member wide because that is all this screen can serve: the overlays, the
    * selection and the fixture loop belong to `DeckSurface`.
    */
-  const voiceContext = useMemo(() => ({ navigate: onNavigate }), [onNavigate]);
-  const openDeck = () => VOICE_ACTIONS.openDeck.run(voiceContext);
+  /**
+   * PRD #1223 M4 — the New agent flow, and the runtime it runs against.
+   *
+   * `undefined` for a runtime without the two queries the flow needs — several
+   * render-only test runtimes are that shape — which removes every entry point
+   * rather than rendering a dialog that cannot load a directory.
+   */
+  const newAgentRuntime = useMemo<NewAgentRuntime | undefined>(() => (
+    runtime.listDirectories && runtime.newAgentOptions
+      ? {
+        fleet: runtime.fleet,
+        runAction: runtime.runAction,
+        clearError: runtime.clearError,
+        listDirectories: runtime.listDirectories,
+        newAgentOptions: runtime.newAgentOptions,
+        // PRD #1223 M6 — optional: a runtime without it offers no orchestration chips.
+        ...(runtime.newAgentOrchestrations ? { newAgentOrchestrations: runtime.newAgentOrchestrations } : {}),
+      }
+      : undefined
+  ), [runtime.clearError, runtime.fleet, runtime.listDirectories, runtime.newAgentOptions, runtime.newAgentOrchestrations, runtime.runAction]);
+  /** The open flow and the deck it preselects; `undefined` while it is closed. */
+  const [newAgent, setNewAgent] = useState<{ deckId?: string }>();
+  /** The open dialog's own close — every route it has, blocked while a start is in flight — published by the dialog (PRD #1223 U5). */
+  const newAgentClose = useRef<(() => string | undefined) | undefined>(undefined);
+  /** What the flow could not finish on screen: an agent the deck accepted and has not listed. */
+  const [newAgentNotice, setNewAgentNotice] = useState<string>();
+  /**
+   * Issue #1247 — the form the dialog handed back when it was last closed,
+   * replayed by the next open. Here rather than in the dialog because closing
+   * is the dialog's unmount; cleared by the dialog's Discard (which hands back
+   * nothing) and by a start the deck accepted. It lives as long as this screen
+   * does, so leaving the overview for the deck screen loses it — see
+   * `lib/newAgentDraft.ts` for the whole keep/discard list.
+   */
+  const [newAgentDraft, setNewAgentDraft] = useState<NewAgentDraft>();
+  const newAgentAvailable = newAgentRuntime !== undefined;
+  const openNewAgent = useCallback((deckId?: string) => {
+    if (!newAgentAvailable) return;
+    setNewAgentNotice(undefined);
+    setNewAgent({ deckId });
+  }, [newAgentAvailable]);
+  /*
+    PRD #802 D5 — the two stops by voice, each opening EXACTLY the
+    confirmation its manual control opens (`stopControls`, U4) and nothing
+    else: no deck action runs until the user presses that confirmation's
+    button. The agent is looked up in the fleet as it is NOW — the dispatch
+    names it by the deck and id Rust resolved against — and each refuses in
+    words rather than acting on a stale target:
+
+    - an agent or orchestration no longer on the overview;
+    - another confirmation already open, which a second one would silently
+      REPLACE under the user's pointer — the one mistake a confirmation must
+      not invite;
+    - the New agent dialog open, which is modal: a confirmation behind it
+      would be unreachable, and the user is doing something else.
+  */
+  const voiceStops = {
+    confirmStopAgent: (target: VoiceDispatchTarget): string | undefined => {
+      if (newAgent) return STOP_BEHIND_NEW_AGENT;
+      if (confirm) return CONFIRMATION_ALREADY_OPEN;
+      const deck = decks.find((candidate) => candidate.connected && candidate.snapshot.connection.deckId === target.deckId);
+      const agent = deck?.agents.find((candidate) => candidate.id === target.agentId);
+      if (!agent) return STOP_TARGET_GONE;
+      stopControls.stopAgent(agent);
+      return undefined;
+    },
+    confirmCloseOrchestration: (target: VoiceDispatchTarget): string | undefined => {
+      if (newAgent) return STOP_BEHIND_NEW_AGENT;
+      if (confirm) return CONFIRMATION_ALREADY_OPEN;
+      const deck = decks.find((candidate) => candidate.connected && candidate.snapshot.connection.deckId === target.deckId);
+      const group = deck?.groups.find((candidate) => candidate.kind === "orchestration" && candidate.agents.some((agent) => agent.id === target.orchestrationAgentId));
+      if (!group) return ORCHESTRATION_GONE;
+      stopControls.closeOrchestration(group);
+      return undefined;
+    },
+  };
+  /*
+    PRD #1223 U5 — publish `closeNewAgent` only while the dialog is open, so
+    `closeTopmost` can read its presence the way it reads the voice overlay's.
+    And `openNewAgent` — the `open_new_agent` row — only while it is CLOSED and
+    this runtime can serve the flow at all, the same two conditions the
+    `Ctrl+N` shortcut stands down on: a dispatch the overview cannot serve is
+    then refused against the entry's `needs` rather than reopening a dialog
+    mid-form. No dependency array, for the voice surface's reason: the slot
+    must hold the last committed closure, and the cleanup clears it on unmount.
+  */
+  useEffect(() => {
+    if (!voiceChannel) return;
+    /* PRD #1223 — the directory browser's three moves, served ALWAYS on this
+       screen and resolved against the dialog's slot at call time. Rust has
+       already refused them when no browser was declared; what reaches here is
+       a dispatch whose browser may have gone during the round trip, and that
+       is a sentence, not a `needs` miss. */
+    const move = (pick: (slot: NewAgentVoice) => string | undefined) => {
+      const slot = newAgentVoice?.current;
+      return slot ? pick(slot) : NO_DIRECTORY_BROWSER;
+    };
+    /* The form's three fills, the same way: served always, resolved against
+       the dialog's slot at call time, refusing in words when it has gone. */
+    const fill = (pick: (slot: NewAgentVoice) => string | undefined) => {
+      const slot = newAgentVoice?.current;
+      return slot ? pick(slot) : NO_NEW_AGENT_FORM;
+    };
+    const directoryMoves = {
+      openDirectory: (target: VoiceDispatchTarget) => move((slot) => slot.openDirectory(target)),
+      goToParentDirectory: (target: VoiceDispatchTarget) => move((slot) => slot.goToParentDirectory(target)),
+      useThisDirectory: (target: VoiceDispatchTarget) => move((slot) => slot.useThisDirectory(target)),
+      chooseNewAgentMode: (target: VoiceDispatchTarget) => fill((slot) => slot.chooseNewAgentMode(target)),
+      chooseNewAgentType: (target: VoiceDispatchTarget) => fill((slot) => slot.chooseNewAgentType(target)),
+      nameNewAgent: (target: VoiceDispatchTarget) => fill((slot) => slot.nameNewAgent(target)),
+      /* #1263 and #1247 — callable whenever the dialog is open, so a slot that
+         has gone during the round trip means the dialog closed, not that the
+         form has no deck. The slot is tested, not the call's answer: a
+         choice that WORKED answers `undefined`, and `?? NO_DIALOG_FOR_DECK`
+         on it reported every successful choice as "not open" (found on
+         PR #1340, once a refusal stopped rendering beside a success). */
+      chooseNewAgentDeck: (target: VoiceDispatchTarget) => {
+        const slot = newAgentVoice?.current;
+        return slot ? slot.chooseNewAgentDeck(target) : NO_DIALOG_FOR_DECK;
+      },
+      discardNewAgent: (target: VoiceDispatchTarget) => {
+        const slot = newAgentVoice?.current;
+        return slot ? slot.discardNewAgent(target) : NO_DIALOG_TO_DISCARD;
+      },
+      /* The dialog's own start, from its slot (PRD #1223). */
+      startNewAgent: (target: VoiceDispatchTarget) => {
+        const slot = newAgentVoice?.current;
+        return slot ? slot.startNewAgent(target) : NO_NEW_AGENT_DIALOG;
+      },
+      ...voiceStops,
+    };
+    voiceChannel.current = newAgent
+      ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves }
+      : newAgentAvailable ? { openNewAgent, ...directoryMoves } : directoryMoves;
+    return () => { voiceChannel.current = undefined; };
+  });
+  const voiceContext = useMemo(() => ({ navigate: onNavigate, openNewAgent }), [onNavigate, openNewAgent]);
+  /* Issue #1198 — the deck is an experimental surface, so every "Open deck"
+     door on this screen exists only while it is shown. `undefined` removes
+     the top bar's button and each deck group's alike. */
+  const openDeck = desktopFeaturesOf(runtime).showDeck ? () => VOICE_ACTIONS.openDeck.run(voiceContext) : undefined;
+  /**
+   * `Ctrl+N` / `Cmd+N`, the TUI's `Ctrl+n` (PRD #1223 M4) — on this screen only,
+   * because it is the screen the flow lives on.
+   *
+   * It stands down wherever the key belongs to something else: in a text field
+   * or xterm's helper textarea (the same selector the deck's own shortcuts
+   * skip), while an agent's pane is open over the screen, and while the flow
+   * is already open.
+   */
+  useEffect(() => {
+    if (!newAgentAvailable || agentPaneOpen || newAgent) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!isNewAgentShortcut(event)) return;
+      const target = event.target;
+      if (target instanceof Element && target.matches("input, textarea, select, [contenteditable='true'], .xterm-helper-textarea")) return;
+      event.preventDefault();
+      VOICE_ACTIONS.openNewAgent.run(voiceContext);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [agentPaneOpen, newAgent, newAgentAvailable, voiceContext]);
   /**
    * PRD #1105 M5 — the overview's entry point into an agent's pane.
    *
@@ -764,6 +992,51 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
   const [confirm, setConfirm] = useState<ConfirmState>();
   const [overrideError, setOverrideError] = useState<string>();
   /**
+   * PRD #1223 U4 — see {@link StopControlsContext}. The deck an agent is on is
+   * `daemonId`, the wire id every deck-targeted action names; the connection
+   * is read from the fleet as it is NOW, not from a copy the row captured.
+   */
+  const stopControls = useMemo<OverviewStopControls>(() => {
+    const deckOf = (deckId: string) => fleet.find((deck) => deck.connection.deckId === deckId);
+    const run = async (action: Parameters<DeckRuntimeState["runAction"]>[0]) => {
+      try {
+        await runtime.runAction(action);
+      } catch {
+        // Filed by the runtime under its global error — with the roles it
+        // could not confirm beside it — which the overview's toast renders.
+      }
+    };
+    return {
+      stopAgent: (agent) => {
+        const deck = deckOf(agent.daemonId);
+        if (!deck) return;
+        const name = stopTargetName(agent);
+        setConfirm({
+          title: `Close ${name}?`,
+          body: `This sends a stop request to ${name} on ${deckName(deck.connection)}. Unsaved terminal work may be interrupted.`,
+          label: "Close agent",
+          busyLabel: "Stopping…",
+          action: () => run({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id }),
+        });
+      },
+      closeOrchestration: (group) => {
+        const deckId = group.agents[0]?.daemonId;
+        const deck = deckId === undefined ? undefined : deckOf(deckId);
+        if (deckId === undefined || !deck) return;
+        const roles = group.agents.map((agent) => ({ agentId: agent.id, name: stopTargetName(agent) }));
+        const title = displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group));
+        const count = roles.length === 1 ? "its 1 role" : `all ${roles.length} of its roles`;
+        setConfirm({
+          title: `Close ${title}?`,
+          body: `This stops every role of this orchestration on ${deckName(deck.connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.`,
+          label: roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`,
+          busyLabel: "Stopping…",
+          action: () => run({ type: "stop_orchestration", deckId, roles }),
+        });
+      },
+    };
+  }, [fleet, runtime]);
+  /**
    * Issue #801. Daemon LIFECYCLE actions still live on the deck — this starts,
    * stops and replaces nothing. It relaxes this app's own build-stamp
    * comparison for this session, which is a judgement about what the user is
@@ -778,8 +1051,8 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
   const requestConnectAnyway = () => {
     if (mode !== "live" || !connection.buildStampMismatchOnly) return;
     setConfirm({
-      title: "Connect to a differently-built deck?",
-      body: "The wire protocol matched on both sides, so this deck and this app agree on the shape of everything they exchange. They were built from different commits, and a stamp difference can still mean divergent behaviour behind an identical wire — a field whose meaning changed while its shape did not. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
+      title: "Connect to a differently-built daemon?",
+      body: "The wire protocol matched on both sides, so this daemon and this app agree on the shape of everything they exchange. But a declared compatibility break separates the two builds — a field whose meaning changed while its shape did not — so some of what this daemon reports can be read with the wrong meaning. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
       label: "Connect anyway",
       busyLabel: "Connecting…",
       action: async () => {
@@ -802,21 +1075,11 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
   */
   const overviewScreen = (
     <div className="control-deck overview-screen">
-      <aside className="rail" aria-label="Primary navigation">
-        <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
-        <nav>
-          <OverviewRailButton icon={SquareTerminal} label="Deck" onClick={openDeck} testId="open-deck" />
-          <OverviewRailButton icon={LayoutList} label="Overview" active onClick={() => VOICE_ACTIONS.openOverview.run(voiceContext)} testId="open-overview" />
-        </nav>
-        <div className="rail-bottom">
-          <span className={`connection-lamp connection-${connection.status}`} title={connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined} />
-        </div>
-      </aside>
-
+      {/* The rail is the shell's — one rail, rendered once, beside every screen (#1197). */}
       <main className="deck-main">
         <header className="topbar">
           <div className="repo-context">
-            <div className="repo-line"><LayoutList size={15} /><strong>Agent overview</strong></div>
+            <div className="repo-line"><LayoutList size={15} /><strong>Agent dashboard</strong></div>
             {/* PRD #741 M9: the same control, in the same block, as the deck's. */}
             {settings && <DeckSelector settings={settings} connection={connection} />}
           </div>
@@ -834,12 +1097,13 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
               honest reading of a single-deck fleet, and hiding it would mean
               the caveat appears only once there is already something wrong.
             */}
-            <OverviewInstrument label="DECKS" testId="overview-count-decks">
+            <OverviewInstrument label="DAEMONS" testId="overview-count-decks">
               <strong className={aggregate.decksUp === decks.length ? undefined : "count-failed"} title={decksUpTitle(aggregate.decksUp, decks.length)}>{aggregate.decksUp}/{decks.length}</strong>
             </OverviewInstrument>
           </div>
           <div className="top-actions">
-            <button className="button secondary compact" data-testid="overview-open-deck" onClick={openDeck}><SquareTerminal size={14} /><span>Open deck</span></button>
+            {newAgentAvailable && <button className="button primary compact" data-testid="overview-new-agent" aria-label="New agent" title="New agent (Ctrl+N / ⌘N)" onClick={() => VOICE_ACTIONS.openNewAgent.run(voiceContext)}><Plus size={14} /><span>New agent</span></button>}
+            {openDeck && <button className="button secondary compact" data-testid="overview-open-deck" onClick={openDeck}><SquareTerminal size={14} /><span>Open daemons</span></button>}
             <OverviewColumnPicker columns={columns} onChange={setColumns} />
             <button className="button secondary compact" data-testid="overview-refresh" onClick={() => void runtime.reconnect()}><RefreshCw size={14} /><span>Refresh</span></button>
           </div>
@@ -848,11 +1112,17 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
         {mode === "fixture" && (
           <div className="fixture-bar">
             <span><Sparkles size={13} /> DEMO DATA</span>
-            <p>Deterministic fixture · no deck is attached and no agent is running.</p>
+            <p>Deterministic fixture · no daemon is attached and no agent is running.</p>
           </div>
         )}
 
-        <section className="overview-body" aria-label="Agent overview">
+        <section className="overview-body" aria-label="Agent dashboard">
+          {newAgentNotice && (
+            <div className="overview-banner" role="status" data-testid="overview-new-agent-notice">
+              <span>{newAgentNotice}</span>
+              <button type="button" aria-label="Dismiss" onClick={() => setNewAgentNotice(undefined)}><X size={13} /></button>
+            </div>
+          )}
           {/*
             One `daemon-group` per observed deck (PRD #742 M4). The section was
             already the outer unit when there was exactly one, and the comment
@@ -878,14 +1148,40 @@ export function AgentOverview({ runtime, settings, onNavigate }: { runtime: Deck
               onReconnect={() => void runtime.reconnect()}
               overrideError={deck.snapshot.connection.deckId === connection.deckId ? overrideError : undefined}
               onConnectAnyway={mode === "live" && deck.snapshot.connection.buildStampMismatchOnly ? requestConnectAnyway : undefined}
+              onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId }) : undefined}
             />
           ))}
         </section>
       </main>
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
+      {newAgent && newAgentRuntime && (
+        <NewAgentDialog
+          runtime={newAgentRuntime}
+          initialDeckId={newAgent.deckId}
+          draft={newAgentDraft}
+          closeRequest={newAgentClose}
+          voice={newAgentVoice}
+          onClose={(draft) => {
+            setNewAgentDraft(draft);
+            setNewAgent(undefined);
+          }}
+          onAppeared={(target) => {
+            setNewAgentDraft(undefined);
+            setNewAgent(undefined);
+            // PRD #1223 M5: only now — the deck lists the agent, so the pane's
+            // retirement check has a record to find.
+            VOICE_ACTIONS.openAgent.run(voiceContext, { ...target, from: "overview" });
+          }}
+          onNotAppeared={({ deckName: onDeck, agentName }) => {
+            setNewAgentDraft(undefined);
+            setNewAgent(undefined);
+            setNewAgentNotice(`Started ${agentName ? displayText(agentName, DISPLAY_LIMITS.name) : "an agent"} on ${onDeck}, but the daemon has not listed it yet.`);
+          }}
+        />
+      )}
     </div>
   );
-  return <OpenAgentContext.Provider value={openAgent}>{overviewScreen}</OpenAgentContext.Provider>;
+  return <OpenAgentContext.Provider value={openAgent}><StopControlsContext.Provider value={stopControls}>{overviewScreen}</StopControlsContext.Provider></OpenAgentContext.Provider>;
 }
 
 /** One deck of the fleet, as {@link AgentOverview} prepares it for rendering. */
@@ -898,17 +1194,17 @@ interface FleetDeck {
 }
 
 /**
- * How many of the fleet's decks are answering, as a sentence (PRD #742 M4).
+ * How many of the fleet's daemons are answering, as a sentence (PRD #742 M4).
  *
  * The instrument prints `2/3`, which is the compact reading; this is the hover,
  * and it is where the thing a ratio cannot say gets said — that the counts
- * beside it are over the decks that answered and not over the fleet.
+ * beside it are over the daemons that answered and not over the fleet.
  */
 function decksUpTitle(up: number, total: number): string {
-  if (total === 1) return up === 1 ? "The deck is answering." : "The deck is not answering, so nothing can be counted.";
-  if (up === total) return `All ${total} decks are answering.`;
-  if (up === 0) return `No deck is answering, so nothing can be counted. ${total} are configured.`;
-  return `${up} of ${total} decks are answering. Every count beside this one is over those ${up}; the decks that are not answering say so in their own group.`;
+  if (total === 1) return up === 1 ? "The daemon is answering." : "The daemon is not answering, so nothing can be counted.";
+  if (up === total) return `All ${total} daemons are answering.`;
+  if (up === 0) return `No daemon is answering, so nothing can be counted. ${total} are configured.`;
+  return `${up} of ${total} daemons are answering. Every count beside this one is over those ${up}; the daemons that are not answering say so in their own group.`;
 }
 
 /**
@@ -920,16 +1216,19 @@ function decksUpTitle(up: number, total: number): string {
  * nothing" and "we cannot see what this deck runs" are different statements and
  * only the first is a number.
  */
-function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, onReconnect, onConnectAnyway }: {
+function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, onReconnect, onConnectAnyway, onNewAgent }: {
   deck: FleetDeck;
   now: number;
   columns: OverviewColumnId[];
   /** How many decks are on screen — the note density, and nothing else. */
   fleetSize: number;
   overrideError?: string;
-  onOpenDeck: () => void;
+  /** Absent while the deck is hidden (issue #1198), which removes this group's Open deck buttons. */
+  onOpenDeck?: () => void;
   onReconnect: () => void;
   onConnectAnyway?: () => void;
+  /** Open the New agent flow with THIS deck preselected (PRD #1223 M4). Absent where the deck cannot take a spawn. */
+  onNewAgent?: () => void;
 }) {
   const connection = deck.snapshot.connection;
   const socketPath = connection.socketPath;
@@ -962,7 +1261,7 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
    */
   const buildStampsCaveat = connection.clientBuildVersion && connection.daemonBuildVersion
     && connection.clientBuildVersion !== connection.daemonBuildVersion
-    ? `Built from different commits — desktop ${connection.clientBuildVersion}, deck ${connection.daemonBuildVersion}.`
+    ? `Built from different commits — desktop ${connection.clientBuildVersion}, daemon ${connection.daemonBuildVersion}.`
     : undefined;
   /**
    * Everything hover can say about WHICH deck this is: its socket path, and
@@ -1031,6 +1330,7 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
           neighbours read as counted — never as a deck running nothing.
         */}
         {!deck.connected && <span className="daemon-unknown" data-testid="daemon-unknown" title={unknownPipsTitle(connection)}>—</span>}
+        {onNewAgent && <button type="button" className="button secondary compact daemon-new-agent" data-testid="daemon-new-agent" aria-label={`New agent on ${deckName(connection)}`} onClick={onNewAgent}><Plus size={13} /><span>New agent</span></button>}
       </header>
 
       <div className="daemon-group-body">
@@ -1046,6 +1346,7 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
           onOpenDeck={onOpenDeck}
           onReconnect={onReconnect}
           onConnectAnyway={onConnectAnyway}
+          onNewAgent={onNewAgent}
         />
       </div>
     </section>
@@ -1063,11 +1364,11 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
  * what is actually missing.
  */
 function unknownPipsTitle(connection: ConnectionView): string {
-  if (connection.pending) return "Not known yet — this deck has not reported, so its agents cannot be counted.";
-  return "Not known — this deck is not answering, so its agents cannot be counted.";
+  if (connection.pending) return "Not known yet — this daemon has not reported, so its agents cannot be counted.";
+  return "Not known — this daemon is not answering, so its agents cannot be counted.";
 }
 
-function DaemonBody({ agents, groups, now, columns, connection, message, compactNote, overrideError, onOpenDeck, onReconnect, onConnectAnyway }: {
+function DaemonBody({ agents, groups, now, columns, connection, message, compactNote, overrideError, onOpenDeck, onReconnect, onConnectAnyway, onNewAgent }: {
   agents: OverviewAgent[];
   groups: OverviewGroup[];
   /** The one instant every relative cell on this screen is measured against. */
@@ -1084,10 +1385,13 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
    */
   compactNote?: boolean;
   overrideError?: string;
-  onOpenDeck: () => void;
+  /** Absent while the deck is hidden (issue #1198): no Open deck button, and no sentence sending the user to it. */
+  onOpenDeck?: () => void;
   onReconnect: () => void;
   /** Absent unless the mismatch is stamp-only — see `requestConnectAnyway`. */
   onConnectAnyway?: () => void;
+  /** The New agent flow on this deck (PRD #1223 M4) — what the first-run note offers. */
+  onNewAgent?: () => void;
 }) {
   const noteClass = compactNote ? "overview-note is-compact" : "overview-note";
   /*
@@ -1105,9 +1409,9 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
   */
   if (connection.pending) {
     return (
-      <OverviewNote className={noteClass} testId="overview-pending" icon={<RefreshCw className="spin" size={24} />} title="Waiting for this deck">
-        <p>{message ?? "This deck has not reported yet."}</p>
-        <p className="overview-note-hint">It is counted in the fleet's total and not among the decks that answered, because nothing has answered for it yet. Its agents appear here as soon as it reports.</p>
+      <OverviewNote className={noteClass} testId="overview-pending" icon={<RefreshCw className="spin" size={24} />} title="Waiting for this daemon">
+        <p>{message ?? DECK_STATE_FALLBACK.pending}</p>
+        <p className="overview-note-hint">It is counted in the fleet's total and not among the daemons that answered, because nothing has answered for it yet. Its agents appear here as soon as it reports.</p>
       </OverviewNote>
     );
   }
@@ -1115,7 +1419,7 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
   if (connection.status === "loading") {
     return (
       <OverviewNote className={noteClass} testId="overview-loading" icon={<RefreshCw className="spin" size={24} />} title="Establishing control channel">
-        <p>Reading the deck's agent list. Nothing is attached while this runs.</p>
+        <p>Reading the daemon's agent list. Nothing is attached while this runs.</p>
       </OverviewNote>
     );
   }
@@ -1136,20 +1440,20 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
   */
   if (connection.unconfigured) {
     return (
-      <OverviewNote className={noteClass} testId="overview-unconfigured" icon={<ShieldAlert size={24} />} title="Deck not configured">
-        <p>{message ?? "This deck has no address yet."}</p>
-        <p className="overview-note-hint">Nothing has been asked of this deck, so it counts toward the fleet without counting as one that answered.</p>
+      <OverviewNote className={noteClass} testId="overview-unconfigured" icon={<ShieldAlert size={24} />} title="Daemon not configured">
+        <p>{message ?? DECK_STATE_FALLBACK.unconfigured}</p>
+        <p className="overview-note-hint">Nothing has been asked of this daemon, so it counts toward the fleet without counting as one that answered.</p>
       </OverviewNote>
     );
   }
 
   if (connection.status === "disconnected") {
     return (
-      <OverviewNote className={noteClass} testId="overview-disconnected" icon={<ShieldAlert size={24} />} title="Deck disconnected">
-        <p>{message ?? "No deck is listening on the configured socket."}</p>
-        <p className="overview-note-hint">Nothing can be said about the fleet until a deck answers, so this list is blank rather than stale. Start one from the deck screen, then reconnect.</p>
+      <OverviewNote className={noteClass} testId="overview-disconnected" icon={<ShieldAlert size={24} />} title="Daemon disconnected">
+        <p>{message ?? DECK_STATE_FALLBACK.disconnected}</p>
+        <p className="overview-note-hint">Nothing can be said about the fleet until a daemon answers, so this list is blank rather than stale. {onOpenDeck ? "Start one from the Daemons screen, then reconnect." : "Start one, then reconnect."}</p>
         <div>
-          <button className="button secondary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open deck</button>
+          {onOpenDeck && <button className="button secondary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open daemons</button>}
           <button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button>
         </div>
       </OverviewNote>
@@ -1158,18 +1462,18 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
 
   if (connection.status === "error") {
     return (
-      <OverviewNote className={noteClass} testId="overview-incompatible" icon={<ShieldAlert size={24} />} title="Incompatible deck">
-        <p>{message ?? "A deck answered but this build cannot speak to it."}</p>
+      <OverviewNote className={noteClass} testId="overview-incompatible" icon={<ShieldAlert size={24} />} title="Incompatible daemon">
+        <p>{message ?? DECK_STATE_FALLBACK.incompatible}</p>
         <p className="overview-note-hint">
           {connection.runningAgentCount === undefined
-            ? "A deck answered the handshake, but this build cannot read its agent list. Nothing is listed rather than guessed."
-            : `A deck answered the handshake and reports ${connection.runningAgentCount} running ${connection.runningAgentCount === 1 ? "agent" : "agents"}, but this build cannot read them. Nothing is listed rather than guessed.`}
-          {" "}Start, stop and replace live on the deck screen.
-          {onConnectAnyway && " Only the build stamps differ — the wire protocol agreed — so you can connect to this deck as it is."}
+            ? "A daemon answered the handshake, but this build cannot read its agent list. Nothing is listed rather than guessed."
+            : `A daemon answered the handshake and reports ${connection.runningAgentCount} running ${connection.runningAgentCount === 1 ? "agent" : "agents"}, but this build cannot read them. Nothing is listed rather than guessed.`}
+          {onOpenDeck && " Start, stop and replace live on the Daemons screen."}
+          {onConnectAnyway && " The wire protocol agreed, so you can still connect to this daemon as it is — but a declared compatibility break separates this daemon from this app, so read what it reports with that in mind."}
         </p>
         {overrideError && <p className="overview-note-hint" data-testid="overview-connect-anyway-error">{overrideError}</p>}
         <div>
-          <button className="button secondary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open deck</button>
+          {onOpenDeck && <button className="button secondary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open daemons</button>}
           {onConnectAnyway && <button className="button primary" data-testid="overview-connect-anyway" onClick={onConnectAnyway}><ShieldAlert size={14} /> Connect anyway</button>}
           <button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button>
         </div>
@@ -1180,10 +1484,16 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
   if (!agents.length) {
     return (
       <OverviewNote className={noteClass} testId="overview-first-run" icon={<Blocks size={26} />} title="No agents are running yet">
-        <p>The deck is healthy and owns nothing. This is what a fresh install looks like — not a failure.</p>
-        <p className="overview-note-hint">Launch a workflow from the deck's Workflows panel, or start an agent from the CLI in a project directory. Whatever the deck adopts shows up here on the next snapshot.</p>
+        <p>The daemon is healthy and owns nothing. This is what a fresh install looks like — not a failure.</p>
+        {/* The Orchestrations panel is named only where the screen it lives on is
+            shown (issue #1198); a sentence pointing at a hidden screen is a
+            door that is not there. */}
+        {onNewAgent
+          ? <p className="overview-note-hint">{onOpenDeck ? "Create an agent on this daemon, or activate an orchestration from the Daemons screen's Orchestrations panel." : "Create an agent on this daemon."} Whatever the daemon adopts shows up here on the next snapshot.</p>
+          : <p className="overview-note-hint">{onOpenDeck ? "Activate an orchestration from the Daemons screen's Orchestrations panel, or start an agent from the CLI in a project directory." : "Start an agent from the CLI in a project directory."} Whatever the daemon adopts shows up here on the next snapshot.</p>}
         <div>
-          <button className="button primary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open deck</button>
+          {onNewAgent && <button className="button primary" data-testid="overview-first-run-new-agent" onClick={onNewAgent}><Plus size={14} /> New agent</button>}
+          {onOpenDeck && <button className={onNewAgent ? "button secondary" : "button primary"} onClick={onOpenDeck}><SquareTerminal size={14} /> Open daemons</button>}
         </div>
       </OverviewNote>
     );
@@ -1332,7 +1642,7 @@ function OverviewColumnPicker({ columns, onChange }: { columns: OverviewColumnId
       </button>
       {open && (
         <div className="overview-columns-menu" data-testid="overview-columns-menu" role="group" aria-label="Columns">
-          <p>Every column the deck reports. There is nothing else to show.</p>
+          <p>Every column the daemon reports. There is nothing else to show.</p>
           {ALL_OVERVIEW_COLUMNS.map((column) => {
             const permanent = column === PERMANENT_COLUMN;
             return (
@@ -1387,6 +1697,8 @@ function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now:
   // Shown only when it says something: a subtitle that renders to nothing is an
   // empty `<code>` chip next to the heading, which reads as a rendering fault.
   const subtitle = group.subtitle ? displayText(group.subtitle, DISPLAY_LIMITS.name) : undefined;
+  const stopControls = useContext(StopControlsContext);
+  const groupName = displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group));
   return (
     <article
       className="overview-group"
@@ -1423,6 +1735,17 @@ function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now:
         <div className="overview-group-pips">{counts.map((entry) => (
           <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {entry.status}</span>
         ))}</div>
+        {/* PRD #1223 U4: the TUI's Ctrl+W on this orchestration's tab — every role, after a confirmation that names them. */}
+        {stopControls && group.kind === "orchestration" && (
+          <button
+            type="button"
+            className="button secondary compact overview-close-orchestration"
+            data-testid="overview-close-orchestration"
+            aria-label={`Close ${groupName} orchestration`}
+            title="Close every role of this orchestration"
+            onClick={() => stopControls.closeOrchestration(group)}
+          ><X size={12} /><span>Close</span></button>
+        )}
       </header>
       {/*
         A real `<table>`, because this screen IS a table and `<th scope="col">`
@@ -1506,6 +1829,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
     [#1073](https://github.com/vfarcic/dot-agent-deck/issues/1073).
   */
   const openAgent = useContext(OpenAgentContext);
+  const stopControls = useContext(StopControlsContext);
   // ONE instant for the whole screen, ticked by `useOverviewClock` so these two
   // cells keep counting between daemon events. Passed down rather than read
   // here so every row on a repaint is relative to the same moment rather than
@@ -1538,7 +1862,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
           <td className="overview-agent-name" role="cell" key={column}>
             {orchestration && <em className="overview-role-index" title={`Role ${orchestration.roleIndex} of this orchestration`}>{String(orchestration.roleIndex + 1).padStart(2, "0")}</em>}
             <strong>{name}</strong>
-            {orchestration?.isStartRole && <span className="coordinator-badge" title="Orchestration start role — the agent an operator messages">COORDINATOR</span>}
+            {orchestration?.isStartRole && <span className="coordinator-badge" title="Orchestration start role — the agent an operator messages">ORCHESTRATOR</span>}
             {/*
               The write lease the daemon reported (PRD #745 M8). Shown whenever it
               IS reported, including the ordinary writable case, so the rule a
@@ -1558,6 +1882,22 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
                 onClick={() => openAgent(agent)}
               ><Maximize2 size={12} /></button>
             )}
+            {/*
+              PRD #1223 U4 — stop this one agent, on the deck it is on. On the
+              ROW rather than in the pane overlay: the row is where the overview
+              already puts an agent's one action, it is reachable without
+              opening anything, and stopping from inside the pane would close
+              the pane under the reader the moment the deck stopped listing it.
+            */}
+            {stopControls && (
+              <button
+                className="overview-stop-agent"
+                data-testid="overview-stop-agent"
+                aria-label={`Close ${name} agent`}
+                title={`Close ${name}`}
+                onClick={() => stopControls.stopAgent(agent)}
+              ><CircleStop size={12} /></button>
+            )}
           </td>
         );
       case "lastActivityMs":
@@ -1574,7 +1914,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
           fabricated "just now" for a far-future stamp is the same lie in nicer
           clothes.
         */
-        return <td className="overview-activity" role="cell" key={column} title={activity && `Last activity reported by the deck: ${activity.title}`}>{activity?.label ?? ""}</td>;
+        return <td className="overview-activity" role="cell" key={column} title={activity && `Last activity reported by the daemon: ${activity.title}`}>{activity?.label ?? ""}</td>;
       case "spawnedAtMs":
         /*
           How long this agent's process has been running (PRD #745 M11) — the
@@ -1589,7 +1929,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
           its current iteration; a role nobody has restarted keeps its original
           record, so it reads as its whole lifetime.
         */
-        return <td className="overview-uptime" role="cell" key={column} title={uptime && `Spawned by the deck at: ${uptime.title}`}>{uptime?.label ?? ""}</td>;
+        return <td className="overview-uptime" role="cell" key={column} title={uptime && `Spawned by the daemon at: ${uptime.title}`}>{uptime?.label ?? ""}</td>;
       case "cli":
         /*
           The BINARY this agent runs, as the DAEMON reported it (issue #856). It
@@ -1736,10 +2076,6 @@ function OverviewNote({ className, testId, icon, title, children }: { className?
   return <div className={className ?? "overview-note"} data-testid={testId}>{icon}<h3>{title}</h3>{children}</div>;
 }
 
-function OverviewRailButton({ icon: Icon, label, active, onClick, testId }: { icon: typeof LayoutList; label: string; active?: boolean; onClick: () => void; testId: string }) {
-  return <button className={active ? "is-active" : ""} aria-current={active ? "page" : undefined} title={label} onClick={onClick} data-testid={testId}><Icon size={18} /><span>{label}</span></button>;
-}
-
 function OverviewInstrument({ label, children, testId }: { label: string; children: ReactNode; testId?: string }) {
   return <div className="instrument" data-testid={testId}><span>{label}</span>{children}</div>;
 }
@@ -1751,6 +2087,6 @@ function OverviewInstrument({ label, children, testId }: { label: string; childr
  * true when the daemon is unreachable.
  */
 function OverviewCount({ known, value, className }: { known: boolean; value: number; className?: string }) {
-  if (!known) return <strong className="count-unknown" title="Not known — the deck is not answering, so nothing can be counted.">—</strong>;
+  if (!known) return <strong className="count-unknown" title="Not known — the daemon is not answering, so nothing can be counted.">—</strong>;
   return <strong className={className}>{value}</strong>;
 }

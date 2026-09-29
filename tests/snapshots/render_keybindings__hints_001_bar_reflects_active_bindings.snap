@@ -2,4 +2,4 @@
 source: tests/render_keybindings.rs
 expression: text
 ---
- COMMAND  [Back to Pane Ctrl+D] [New Pane Ctrl+N] [Close Ctrl+W] [Toggle Layout Alt+Shift+L] [Help F1] [Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Scheduled Tasks s]
+ COMMAND  [Back to Pane Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Toggle Layout Alt+Shift+L] [Help F1] [Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]

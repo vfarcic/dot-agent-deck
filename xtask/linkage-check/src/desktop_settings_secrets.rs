@@ -132,7 +132,7 @@ const DESKTOP_SRC: &str = "desktop/src";
 /// layer. That is why `Option<String>` and `Vec<String>` still have no way in —
 /// they resolve to `String`, which is absent — and why there is no row for each
 /// container shape.
-const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 24] = [
+const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 25] = [
     (
         "u32",
         FieldKind::Scalar,
@@ -321,6 +321,17 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 24] = [
          deserializer and same MAX_VOICE_TOKEN_BYTES bound, so no text is \
          representable",
     ),
+    (
+        "LabelSharing",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: `shared` or `withheld` — \
+         whether a voice command request carries the names the app observed \
+         (PRD #1223, audit finding A1). A choice about what is SENT, never a \
+         value that is sent: no name, label or credential is stored here. A \
+         closed enum rather than a `bool`, which is not on this list. Same \
+         folding deserializer and same MAX_VOICE_TOKEN_BYTES bound as its \
+         three neighbours, so no text is representable",
+    ),
     // PRD #802's provider work: the two stages stopped being one token each
     // and became a backend plus the coordinates it is reached at. The endpoint
     // and the model are the values that COULD have been `String`s — this list
@@ -478,7 +489,7 @@ const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
 /// name scan on this side would repeat the mistake #827 is about: `endpoint:
 /// string` passes any name check and is a free-text field. A diff here is the
 /// review prompt.
-const PINNED_TS_FIELDS: [(&str, &str, &str); 24] = [
+const PINNED_TS_FIELDS: [(&str, &str, &str); 25] = [
     ("DesktopSettingsDto", "version", "number"),
     (
         "DesktopSettingsDto",
@@ -524,6 +535,9 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 24] = [
     ("VoiceSettingsDto", "activation", "string"),
     ("VoiceSettingsDto", "intent", "VoiceIntentStageDto"),
     ("VoiceSettingsDto", "transcription", "VoiceStageDto"),
+    // PRD #1223, audit finding A1: a closed token (`VOICE_LABEL_SHARING`) —
+    // whether names are SENT, never a name.
+    ("VoiceSettingsDto", "labels", "string"),
     // PRD #802's provider work. One interface for both stages, because both
     // hold the same three values and a second copy would be a second place to
     // forget a field. Every one is a REFERENCE — which backend, where it is,
@@ -578,7 +592,12 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 24] = [
 /// deleted the key. Removing it from the pin is the deliberate edit this check
 /// exists to force: the guard reddened on the merge that brought #827's pin and
 /// #819's deletion together, which is the mechanism working rather than failing.
-const PINNED_STORAGE_KEYS: [(&str, &str, bool); 5] = [
+///
+/// Issue #1045 renamed the desktop's "workflow" to the TUI's "orchestration", so
+/// the role-order key moved to `ORCHESTRATION_STORAGE_KEY`. The old one stays
+/// pinned as `LEGACY_WORKFLOW_STORAGE_KEY` because `App.tsx` still reads it once,
+/// to migrate a saved order, and then removes it.
+const PINNED_STORAGE_KEYS: [(&str, &str, bool); 6] = [
     (
         "FIXTURE_SETTINGS_KEY",
         "dot-agent-deck.desktop-settings",
@@ -590,7 +609,12 @@ const PINNED_STORAGE_KEYS: [(&str, &str, bool); 5] = [
         true,
     ),
     (
-        "WORKFLOW_STORAGE_KEY",
+        "ORCHESTRATION_STORAGE_KEY",
+        "dot-agent-deck.desktop.orchestration-preview.v1",
+        true,
+    ),
+    (
+        "LEGACY_WORKFLOW_STORAGE_KEY",
         "dot-agent-deck.desktop.workflow-preview.v1",
         true,
     ),

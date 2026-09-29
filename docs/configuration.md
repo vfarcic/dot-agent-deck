@@ -5,25 +5,41 @@ title: Configuration
 
 # Configuration
 
+This page covers the configuration both clients share: the daemon's settings and your project's `.dot-agent-deck.toml`. The desktop app also has its own settings file, `desktop.toml`; see [Desktop app settings](#desktop-app-settings).
+
 ## Default Command
 
 ```bash
-# Set the default command pre-filled in the new-pane form
+# Set the default command pre-filled in the New Agent form
 dot-agent-deck config set default_command "claude"
 
 # Read the current value
 dot-agent-deck config get default_command
 ```
 
-`default_command` is the agent command pre-filled in the **new-pane form**'s Command field and the value that seeds the **schedule-authoring** agent. Both the new-pane form and the Scheduled Tasks **Add/Edit** flow use the same form — you type the command directly into the **Command** field (it accepts `claude`, `opencode`, `pi`, `codex`, `devin`, a path, or any command), pre-filled from `default_command`. If `default_command` is unset, the schedule-authoring agent falls back to `claude`.
+`default_command` is the agent command pre-filled in the **New Agent** form's Command field and the value that seeds the **schedule-authoring** agent. Both the New Agent form and the Schedules **Add/Edit** flow use the same form — you type the command directly into the **Command** field (it accepts `claude`, `opencode`, `pi`, `codex`, `devin`, a path, or any command), pre-filled from `default_command`. If `default_command` is unset, the schedule-authoring agent falls back to `claude`.
 
-When `default_command` is **unset or empty**, the new-pane form's Command field is instead pre-filled with your **last command** — the most recent command you launched from the new-agent form, in any mode (schedule / issue-dispatch authoring included). This value is global, persists across deck restarts, and is only ever pre-filled into the editable field (never auto-run), so you can edit or clear it before you submit. On a fresh install — where you have never launched a command from the form — the field starts blank. An explicit `default_command` always takes precedence over this last-command fallback.
+When `default_command` is **unset or empty**, the New Agent form's Command field is instead pre-filled with your **last command** — the most recent command you launched from the New Agent form, in any mode (schedule / issue-dispatch authoring included). This value is global, persists across deck restarts, and is only ever pre-filled into the editable field (never auto-run), so you can edit or clear it before you submit. On a fresh install — where you have never launched a command from the form — the field starts blank. An explicit `default_command` always takes precedence over this last-command fallback.
+
+The desktop app's **New agent** pre-fills its **Command** the same way, from the `default_command` or last command of the daemon you chose it for. A Command you empty starts the daemon's default shell for a plain agent, and `default_command` (falling back to `claude`) for the **schedule** and **dispatcher** chips.
+
+## Default Directory
+
+```bash
+# The directory agent creation starts browsing in on this machine
+dot-agent-deck config set default_dir "/home/me/reports"
+
+# Unset it (browsing starts where it did before)
+dot-agent-deck config set default_dir ""
+```
+
+`default_dir` is a setting of the machine the daemon runs on: the directory that creating an agent on that daemon starts browsing in — useful when most of your agents there are started in the same place. Both clients honour it. The TUI's `Ctrl+n` directory picker, and its **Add** in the Schedules manager, open there; so does the desktop app's **New agent** dialog. Editing a schedule still opens at that schedule's own directory. It is a starting point, not a limit: `..` still walks above it. It must be an absolute path; `config set` refuses anything else. It lives in the config file on the daemon's host, beside `default_command`, so a remote daemon uses the value in *its* host's config file, not yours — the TUI runs on the remote host even when you `connect` to it, and the desktop asks the daemon for it. If the value is unset, or the directory is missing, is not a directory, or cannot be opened, nothing fails: the TUI's picker opens in the directory you launched the TUI from, and the desktop's dialog in your home directory on that daemon's host, as they do without the setting.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `DOT_AGENT_DECK_SOCKET` | `$XDG_RUNTIME_DIR/dot-agent-deck.sock` or `$TMPDIR/dot-agent-deck-{uid}/hook.sock` | Unix socket path for daemon IPC (hook ingestion). When `XDG_RUNTIME_DIR` is unset the endpoint goes in a per-user directory under the system temp dir (`/tmp` unless `$TMPDIR` says otherwise, and `/tmp` again if it says nothing), where `{uid}` is the user's POSIX uid. The deck creates that directory at mode `0700`, so two users on the same host get disjoint endpoints and neither can create an entry in the other's directory. The directory name is predictable, so on a shared host another user can still take it before your first launch — the deck then refuses to start and names it, rather than using it; set this variable and its attach sibling to a directory only you can write if that is a concern. The XDG path is already per-user, since `XDG_RUNTIME_DIR` typically resolves to `/run/user/{uid}`. |
+| `DOT_AGENT_DECK_SOCKET` | `$XDG_RUNTIME_DIR/dot-agent-deck.sock` or `$TMPDIR/dot-agent-deck-{uid}/hook.sock` | Unix socket path for daemon IPC (hook ingestion). When `XDG_RUNTIME_DIR` is unset the endpoint goes in a per-user directory under the system temp dir (`/tmp` unless `$TMPDIR` says otherwise, and `/tmp` again if it says nothing), where `{uid}` is the user's POSIX uid. The deck creates that directory at mode `0700`, so two users on the same host get disjoint endpoints and neither can create an entry in the other's directory. The directory name is predictable, so on a shared host another user can take it before your first launch; the deck will not use a directory someone else owns, and instead puts both endpoints in a sibling directory with an unguessable name (`dot-agent-deck-{uid}.` followed by 16 random hex digits) that it creates at mode `0700` and finds again on its own, logging a warning that names both. Set this variable and its attach sibling to a directory only you can write if you would rather choose the location yourself. The XDG path is already per-user, since `XDG_RUNTIME_DIR` typically resolves to `/run/user/{uid}`. |
 | `DOT_AGENT_DECK_ATTACH_SOCKET` | `$XDG_RUNTIME_DIR/dot-agent-deck-attach.sock` or `$TMPDIR/dot-agent-deck-{uid}/attach.sock` | Unix socket path for the streaming attach protocol the TUI and the desktop app connect over. Same directory and the same rules as `DOT_AGENT_DECK_SOCKET`; the two protocols have disjoint wire formats, so they never share one endpoint. |
 | `DOT_AGENT_DECK_CONFIG` | `~/.config/dot-agent-deck/config.toml` | Config file path |
 | `DOT_AGENT_DECK_SESSION` | `~/.config/dot-agent-deck/session.toml` | Session file path |
@@ -32,7 +48,7 @@ When `default_command` is **unset or empty**, the new-pane form's Command field 
 
 ## Project Configuration
 
-Per-project workspace modes are defined in `.dot-agent-deck.toml` at the project root. This file is loaded automatically when you select a directory in the new-pane flow.
+Per-project workspace modes are defined in `.dot-agent-deck.toml` at the project root. This file is loaded automatically when you select a directory in the New Agent form.
 
 ### Quick Example
 
@@ -90,3 +106,7 @@ These belong to no block, which makes their placement load-bearing: TOML assigns
 ### Scaffolding
 
 Run `dot-agent-deck init` inside a project directory to generate a starter `.dot-agent-deck.toml`.
+
+## Desktop app settings
+
+The desktop app keeps its own settings (appearance, zoom, voice, and the remote daemons you added) in `~/.config/dot-agent-deck/desktop.toml`, beside the TUI's files; `DOT_AGENT_DECK_DESKTOP_CONFIG` points it elsewhere. It shares no settings file with the TUI. See [Desktop app → Settings](desktop/settings.md#the-settings-file).

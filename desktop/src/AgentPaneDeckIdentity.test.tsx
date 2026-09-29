@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
-import { ALL_ENDPOINT_SELECTION, DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./lib/bridge";
+import { ALL_ENDPOINT_SELECTION, DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, LOCAL_ENDPOINT_SELECTION, type DesktopSettingsDto } from "./lib/bridge";
 import type { AgentSession, DeckRuntimeState, DeckSnapshot } from "./types";
 
 /**
@@ -41,6 +41,15 @@ const remoteRow = { id: REMOTE_ROW_ID, host: "build-box", user: "dev", port: 22,
 const documentWithFleet = (): DesktopSettingsDto => ({
   ...structuredClone(DEFAULT_DESKTOP_SETTINGS),
   endpoints: { remote: [structuredClone(remoteRow)], selection: ALL_ENDPOINT_SELECTION },
+});
+/**
+ * The same row stored, with ONE deck selected. The deck screen shows "Select a
+ * deck" under All Decks (#1083), so a test of a pane opened FROM the deck
+ * screen has to be on one deck; which deck is shown is still the runtime's.
+ */
+const documentSelectingOneDeck = (): DesktopSettingsDto => ({
+  ...structuredClone(DEFAULT_DESKTOP_SETTINGS),
+  endpoints: { remote: [structuredClone(remoteRow)], selection: LOCAL_ENDPOINT_SELECTION },
 });
 
 /**
@@ -83,6 +92,7 @@ function harness(
   const sendTerminalInput = vi.fn(async () => undefined);
   const base = {
     mode: "live",
+    desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
     terminalData: {},
     clearError: vi.fn(),
     runAction: vi.fn(async () => ({ ok: true })),
@@ -96,7 +106,7 @@ function harness(
     getSettings,
     saveSettings,
   };
-  /** The runtime as it looks while `selected` is the deck in force. */
+  /** The runtime as it looks while `selected` is the daemon in force. */
   const runtime = (selected: "local" | "remote"): DeckRuntimeState => ({
     ...base,
     ...extra,
@@ -120,7 +130,7 @@ function harness(
 const openControl = (name: string) => screen.getByRole("button", { name: `Open ${name} agent` });
 
 /**
- * PRD #1105 — the pane names a deck as well as an agent, and everything it
+ * PRD #1105 — the pane names a daemon as well as an agent, and everything it
  * reads is addressed by that pair.
  *
  * # What this file is, and what it used to be
@@ -141,7 +151,7 @@ const openControl = (name: string) => screen.getByRole("button", { name: `Open $
  * one without switching the process-global selection.
  *
  * So this file covers the full cross-deck pane, its composite lookup, and the
- * identity fence that refuses to retarget a deck-origin pane. Selection is no
+ * identity fence that refuses to retarget a daemon-origin pane. Selection is no
  * longer terminal ownership: moving it must not tear down, relabel or retarget
  * a pane whose stream was created for another deck.
  */
@@ -170,7 +180,7 @@ describe("agent pane deck identity", () => {
 
     fireEvent.click(openControl("Plan / architecture"));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
-    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close Planner agent" }));
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Back to dashboard" }));
 
     await waitFor(() => expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument());
     expect(deck.saveSettings).not.toHaveBeenCalled();
@@ -209,11 +219,11 @@ describe("agent pane deck identity", () => {
 
   /**
    * Scenario: with the local deck selected, open build-box's same-id Planner
-   * from All Decks. A real terminal mounts immediately, the declaration names
+   * from All daemons. A real terminal mounts immediately, the declaration names
    * build-box, and a keystroke is sent with build-box's identity rather than to
    * the selected local Planner.
    */
-  it("opens a non-selected deck's agent with a live terminal and routes its input to that deck", async () => {
+  it("opens a non-selected deck's agent with a live terminal and routes its input to that daemon", async () => {
     const deck = harness(
       documentWithFleet(),
       {
@@ -359,7 +369,7 @@ describe("agent pane deck identity", () => {
  *
  * Native cross-deck attach does not retire either half. The selection still
  * moves for reasons this window did not cause, and `aria-modal` is a claim that
- * has to be true whatever the deck story.
+ * has to be true whatever the daemon story.
  */
 describe("agent pane identity fence", () => {
   beforeEach(() => {
@@ -389,7 +399,7 @@ describe("agent pane identity fence", () => {
       available: true,
       backend: "remote" as const,
     });
-    const deck = harness(documentWithFleet(), {
+    const deck = harness(documentSelectingOneDeck(), {
       resolveVoice: vi.fn(async (utterance: string) => ({
         outcome: {
           kind: "dispatch" as const,
@@ -433,24 +443,30 @@ describe("agent pane identity fence", () => {
     const pane = await screen.findByTestId("agent-pane-overlay");
     const undo = screen.getByRole("button", { name: "Undo" });
 
-    expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull();
+    // Waited for, not read straight after `findByTestId`. The pane opens from
+    // the voice-status poll, an update outside `act`, so React defers
+    // `useInertBackground`'s walk to a passive-effect flush — while
+    // `findByTestId` resolves on the mutation that inserted the pane, which can
+    // land first. Under CI load it did: the walk had not run at all (no `[inert]`
+    // anywhere, focus not yet moved), and one flush later it had.
+    await waitFor(() => expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull());
     // Voice and its report are peers, not background. Equality to this complete
     // set keeps the containment assertion strict: any other reachable control
     // is a regression, rather than something an allow-list filter could hide.
     expect(reachableOutside(pane)).toEqual([screen.getByTestId("voice-trigger"), undo]);
     // And the pane itself is genuinely live, so this is containment rather than
     // a screen that has simply been switched off.
-    expect(within(pane).getByRole("button", { name: "Close Planner agent" })).toBeVisible();
+    expect(within(pane).getByRole("button", { name: "Back to dashboard" })).toBeVisible();
     expect(pane.contains(document.activeElement)).toBe(true);
 
-    fireEvent.click(within(pane).getByRole("button", { name: "Close Planner agent" }));
+    fireEvent.click(within(pane).getByRole("button", { name: "Back to dashboard" }));
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(document.querySelectorAll("[inert]")).toHaveLength(0);
     expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).toBeNull();
   });
 
   /**
-   * Scenario: a deck-origin pane is open on the local deck when the selected
+   * Scenario: a daemon-origin pane is open on the local deck when the selected
    * deck moves to build-box, which runs a Planner of its own with the same id.
    * The pane does not adopt it — no pane is on screen at all — and it does not
    * come back when the original deck is selected again, because the view was
@@ -462,12 +478,12 @@ describe("agent pane identity fence", () => {
    *
    * A deck-origin pane CLOSES where the overview-origin pane above keeps its
    * identity, and the difference is the screen underneath. The deck surface
-   * renders the selected deck and nothing else, so a deck-origin pane's claim —
-   * *"this agent, on the deck you are looking at"* — stops being true of
+   * renders the selected deck and nothing else, so a daemon-origin pane's claim —
+   * *"this agent, on the daemon you are looking at"* — stops being true of
    * anything on screen; there is nothing left for it to be a pane over.
    */
-  it("closes a deck-origin pane when the selected deck moves out from under it", async () => {
-    const deck = harness();
+  it("closes a daemon-origin pane when the selected deck moves out from under it", async () => {
+    const deck = harness(documentSelectingOneDeck());
     const paneView = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "deck" as const };
     const { rerender } = render(<DeckShell runtime={deck.runtime("local")} initialView={paneView} />);
 
@@ -481,7 +497,7 @@ describe("agent pane identity fence", () => {
     // a tile among tiles, offering Open rather than wearing the pane the user
     // opened for the other machine's agent.
     expect(screen.getByTestId("agent-tile-planner-on-build-box")).toHaveAttribute("data-presentation", "tile");
-    expect(screen.queryByRole("button", { name: /^Close .* agent$/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Back to dashboard" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Open Planner on build-box agent" })).toBeVisible();
 
     await act(async () => { rerender(<DeckShell runtime={deck.runtime("local")} initialView={paneView} />); });
@@ -491,7 +507,7 @@ describe("agent pane identity fence", () => {
   });
 
   /**
-   * Scenario: hand the deck surface an open-pane identity naming a deck it is
+   * Scenario: hand the daemon surface an open-pane identity naming a daemon it is
    * not showing, and read back what it promoted. Nothing.
    *
    * This drives `DeckSurface` directly rather than through `DeckShell`, and
@@ -525,7 +541,7 @@ describe("agent pane identity fence", () => {
     wrongDeck.unmount();
 
     // The control: the same surface with the identity it IS showing does
-    // promote, so the refusal above is about the deck rather than about the
+    // promote, so the refusal above is about the daemon rather than about the
     // prop being ignored.
     render(
       <DeckSurface

@@ -49,6 +49,7 @@ fn delivery_007_hook_teaches_daemon_agent_type_for_reconnect() {
             tab_membership: None,
             agent_type: None,
             seed: None,
+            authoring_kind: None,
         })
         .expect("StartAgent over the attach socket");
     assert!(
@@ -142,6 +143,7 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
             tab_membership: None,
             agent_type: None,
             seed: None,
+            authoring_kind: None,
         })
         .expect("StartAgent over the attach socket");
     assert!(
@@ -282,6 +284,7 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
             tab_membership: None,
             agent_type: Some(AgentType::Pi),
             seed: None,
+            authoring_kind: None,
         })
         .expect("StartAgent ordinary pane over the real daemon attach socket");
     assert!(

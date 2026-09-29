@@ -9,7 +9,7 @@
 //!
 //! The bug: in external-daemon mode the TUI never queried the daemon for
 //! existing agents on startup, so an ssh-reconnect via `dot-agent-deck
-//! connect` showed "No active sessions" even though the daemon had live
+//! connect` showed "No active agents" even though the daemon had live
 //! agents from the previous TUI session. `DaemonClient::list_agents` had
 //! zero production callers.
 //!
@@ -375,6 +375,7 @@ fn make_session(
         agent_type: AgentType::ClaudeCode,
         cwd: None,
         status,
+        blocked: None,
         active_tool: None,
         started_at: last_activity,
         last_activity,
@@ -387,6 +388,7 @@ fn make_session(
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     }
 }
 
@@ -500,7 +502,7 @@ async fn hydrate_creates_panes_for_existing_agents() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hydrate_returns_empty_when_no_agents_exist() {
     // Empty `list_agents` result: dashboard should fall through to its
-    // normal "No active sessions..." view. The hydrate call must not error
+    // normal "No active agents..." view. The hydrate call must not error
     // and must not create any panes.
     let server = start_real_server().await;
     let ctrl = Arc::new(EmbeddedPaneController::new(
@@ -1445,14 +1447,28 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
     let role_names = ["orchestrator", "coder"];
     // Tab A and Tab B carry distinct per-tab tokens; the third pair carries
     // none, standing in for a client that predates PRD #140.
-    let tabs: [(&str, Option<&str>); 3] = [
-        ("a", Some("orch-inst-aaaa1111")),
-        ("b", Some("orch-inst-bbbb2222")),
-        ("legacy", None),
+    //
+    // Issue #555: the two tokened tabs carry distinct run TITLES, as the
+    // `Ctrl+n` form's `<folder>-orchestrator-N` suggestion gives them. Two tabs
+    // under one resolved title in one directory are two indistinguishable tab
+    // labels, which the daemon now refuses; what this test is about is the
+    // per-tab token, and the titles are no part of the identity it checks.
+    let tabs: [(&str, Option<&str>, Option<&str>); 3] = [
+        (
+            "a",
+            Some("orch-inst-aaaa1111"),
+            Some("route-iso-orchestrator-1"),
+        ),
+        (
+            "b",
+            Some("orch-inst-bbbb2222"),
+            Some("route-iso-orchestrator-2"),
+        ),
+        ("legacy", None, None),
     ];
 
     let mut spawned_ids: Vec<String> = Vec::new();
-    for (tab_tag, orchestration_id) in tabs {
+    for (tab_tag, orchestration_id, display_title) in tabs {
         for (role_index, role_name) in role_names.iter().enumerate() {
             let id = client
                 .start_agent(StartAgentOptions {
@@ -1469,7 +1485,7 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
                         role_name: (*role_name).to_string(),
                         is_start_role: role_index == 0,
                         orchestration_cwd: Some(cwd.clone()),
-                        display_title: None,
+                        display_title: display_title.map(str::to_string),
                         orchestration_id: orchestration_id.map(str::to_string),
                     }),
                     ..Default::default()
@@ -2905,6 +2921,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         last_user_prompt: Some("build the feature".into()),
         live_target: None,
         last_activity_ms: None,
+        blocked: None,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -3050,6 +3067,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         )),
                         live_target: None,
                         last_activity_ms: None,
+                        blocked: None,
                     }),
                     spawned_at_ms: None,
                     cli_name: None,
@@ -3170,6 +3188,7 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         agent_type: AgentType::ClaudeCode,
         cwd: None,
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -3182,8 +3201,10 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     };
-    let (buffer, _) = render_card_grid_to_buffer(&[(&session, Some(name))], Some(0), 0, 80, 20);
+    let (buffer, _) =
+        render_card_grid_to_buffer(&[(&session, Some(name))], Some(0), 0, now, 80, 20);
     let area = *buffer.area();
     for y in 0..area.height {
         for x in 0..area.width {
@@ -3282,6 +3303,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         agent_type: AgentType::None,
         cwd: None,
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: None,
         started_at: Utc::now(),
         last_activity: Utc::now(),
@@ -3294,6 +3316,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as

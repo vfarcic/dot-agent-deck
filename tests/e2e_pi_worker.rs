@@ -372,6 +372,7 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         pane_id: ORCH_PANE.to_string(),
         task,
         to: vec![WORKER_ROLE.to_string()],
+        supersede: false,
         timestamp: chrono::Utc::now(),
         token: None,
     };

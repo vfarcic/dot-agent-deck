@@ -171,6 +171,11 @@ mod pr_review_verdict;
 /// installed systemd timer is Linux-only for the same reason.
 #[cfg(all(test, target_os = "linux"))]
 mod reap_orphans;
+/// Issue #324: no task variable spliced into `Taskfile.yml`'s shell text, and
+/// the release tasks' VERSION/NAME validator. Tests only, and Unix only — the
+/// validator is `scripts/release-channel-vars.sh`, driven here under `bash`.
+#[cfg(all(test, unix))]
+mod release_channel_vars;
 /// PRD #740: the job-graph properties in `release.yml` that keep a desktop
 /// bundler failure off the CLI release. Tests only — nothing can run that
 /// workflow outside a tag, so a bad edit is otherwise observable only after a
@@ -200,10 +205,22 @@ mod site_image_refs;
 /// property exists purely at run time in repository files.
 #[cfg(test)]
 mod skill_frontmatter;
+/// Issue #688: a `src/` unit test that spawns a hook emitter — a
+/// Wrapper-strategy `agent_type`, or a command naming an agent or the deck —
+/// pins that child's deck endpoints through `src/test_isolation.rs`. Like
+/// `desktop_project_boundary` this carries a live rule — rule 17 in [`RULES`] —
+/// as well as its own planted-bad-input tests.
+mod unit_test_endpoint_pin;
 /// Issue #521: the `/verify-pr` scripts' `KEY=value` output contract. Tests
 /// only — there is no runtime rule here, the scripts enforce themselves.
 #[cfg(test)]
 mod verify_pr_stream;
+/// PRD #1195 M2: the React state behind a voice registry capability is written
+/// only where the registry's action context is built, and every `useState` in
+/// the app shell is registry-owned or classified. Rule 14's sibling — it proves
+/// the capability side rule 14 cannot see — and like it a live rule, rule 18
+/// in [`RULES`], with its own planted-bad-input tests.
+mod voice_capability_state;
 /// PRD #802 M3: the voice command table (`commands.toml`) against the frontend
 /// action registry (`desktop/src/lib/voiceActions.ts`), plus the two closed sets
 /// the table's columns draw from. Like `desktop_project_boundary` this one
@@ -477,8 +494,9 @@ const SELF_CONTAINED_RULE: &str = "`crate::` path in a `#[path]`-shared file —
      arrive as an argument instead. Sharing it this way is what costs 12 extra \
      fast-tier executions rather than the ~530 `mod common;` would (issue #474)";
 
-/// The file rule 9 guards. Repo-relative, joined onto the workspace root, so
-/// the platform separator is whatever `Path::join` produces.
+/// The file rule 9 guards. Repo-relative and forward-slashed; joined onto the
+/// workspace root through [`paths::join_repo_relative`], so the path a finding
+/// prints uses the native separator throughout (issue #1137).
 const SELF_CONTAINED_PATH: &str = "src/test_temp.rs";
 
 /// The `crate::` paths rule 9 forbids.
@@ -520,7 +538,7 @@ fn self_contained_violations(display: &str, text: &str) -> Vec<String> {
 /// behind would otherwise turn the rule into a no-op that still prints `ok` —
 /// the same shape of silence the rule exists to end.
 fn check_self_contained(root: &Path) -> Vec<String> {
-    let path = root.join(SELF_CONTAINED_PATH);
+    let path = paths::join_repo_relative(root, SELF_CONTAINED_PATH);
     match std::fs::read_to_string(&path) {
         Ok(text) => self_contained_violations(&path.display().to_string(), &text),
         Err(e) => vec![format!(
@@ -858,7 +876,9 @@ const RULES: &[Rule] = &[
     Rule {
         number: 6,
         name: "no-ignored-spec-test",
-        summary: "No `#[ignore]` on `#[spec(...)]`-annotated tests (Decision 26).",
+        summary: "No `#[ignore]` on `#[spec(...)]`-annotated tests (Decision 26), except CLAUDE.md \
+                  rule 6's owned quarantine mark `#[ignore = \"quarantined: <owner>, #<issue>\"]` \
+                  (issue #488).",
         check: rule_no_ignored_spec_test,
     },
     Rule {
@@ -952,6 +972,31 @@ const RULES: &[Rule] = &[
                   path at build time, so `onBrokenLinks: 'throw'` never sees a dead one: the page \
                   builds clean and the browser 404s (issue #1200). See `site_image_refs`.",
         check: rule_site_image_refs,
+    },
+    Rule {
+        number: 17,
+        name: "unit-test-emitter-pins-endpoints",
+        summary: "A `fn` in `src/` test code that spawns a hook emitter it can see as a literal — a \
+                  `SpawnOptions` with a Wrapper-strategy `agent_type`, or a `SpawnOptions` / \
+                  `Command` whose command names a registered agent or the deck binary — calls \
+                  `test_isolation::pin_unreachable_endpoints` or `unreachable_endpoints`. \
+                  Clearing the test's own environment does not stop a child resolving the \
+                  developer's live daemon itself (issue #688). A tripwire for literals, not a \
+                  proof; see `unit_test_endpoint_pin`.",
+        check: rule_unit_test_emitter_pins_endpoints,
+    },
+    Rule {
+        number: 18,
+        name: "voice-capability-state",
+        summary: "The state behind a voice registry capability is reached through `VOICE_ACTIONS` \
+                  — PRD #1195 M2. A `set*` setter named in an action context construction site \
+                  (an object literal typed by a type built from `VoiceActionContext`) is written \
+                  nowhere else in `desktop/src/App.tsx` or `desktop/src/hooks/useShellOverlays.ts` \
+                  unless the write is a dismissal (last argument `false`) or carries a \
+                  `voice-registry-exempt: <reason>` comment, and every `useState` there is \
+                  registry-owned or carries that comment. It sees only those two files and only \
+                  `set*` identifiers; see `voice_capability_state`.",
+        check: rule_voice_capability_state,
     },
 ];
 
@@ -1080,20 +1125,58 @@ fn rule_no_raw_wait_in_e2e(inputs: &Inputs) -> Vec<String> {
 /// The old line scan credited a test with any `#[ignore]` sitting between the
 /// annotation and the next plain `fn`, which could belong to a different
 /// function entirely.
+///
+/// **One exception, and it is CLAUDE.md rule 6's, not a loosening of Decision
+/// 26** (issue #488). Rule 6 (#908) names quarantine as the costly way to clear
+/// a red test — a named owner, an expiry issue, and the test "marked in the
+/// tree, `#[ignore = "quarantined: <owner>, #<issue>"]`, so a run reports it
+/// skipped instead of failed". This check predated that and refused every
+/// `#[ignore]`, so the mark rule 6 prescribes could not land on any `#[spec]`
+/// test — which is every e2e test — and the only escapes left were the ones
+/// rule 6 refuses: fix it now, or leave it red. So exactly that form passes,
+/// and nothing looser: a bare `#[ignore]`, a free-text reason such as
+/// `"flaky"`, or a mark missing its owner or issue number still fails, because
+/// the owner and the issue are what stop a quarantine becoming the graveyard
+/// Decision 26 was written against.
 fn rule_no_ignored_spec_test(inputs: &Inputs) -> Vec<String> {
-    inputs
-        .discovered
+    unquarantined_ignores(&inputs.discovered)
+}
+
+/// The body of [`rule_no_ignored_spec_test`], taking the discovered tests
+/// directly so it is testable without assembling a whole [`Inputs`].
+fn unquarantined_ignores(discovered: &[xtask_docs::DiscoveredTest]) -> Vec<String> {
+    discovered
         .iter()
-        .filter(|ann| ann.ignored)
+        .filter(|ann| ann.ignored && !is_quarantine_mark(ann.ignore_reason.as_deref()))
         .map(|ann| {
             format!(
-                "{}: #[spec({:?})] annotates an #[ignore]-d test `{}` (Decision 26)",
+                "{}: #[spec({:?})] annotates an #[ignore]-d test `{}` (Decision 26) — the only \
+                 accepted form is CLAUDE.md rule 6's quarantine mark \
+                 `#[ignore = \"quarantined: <owner>, #<issue>\"]`",
                 ann.source_path.display(),
                 ann.spec_id,
                 ann.fn_name
             )
         })
         .collect()
+}
+
+/// Whether an `#[ignore = "…"]` reason is CLAUDE.md rule 6's quarantine mark,
+/// `quarantined: <owner>, #<issue>` — a GitHub login and an issue number, and
+/// nothing else. `None` (a bare `#[ignore]`) never is.
+///
+/// The owner must be shaped like a login GitHub would issue: 1–39 characters,
+/// alphanumerics separated by single hyphens, no leading or trailing hyphen —
+/// otherwise a mark could name an owner nobody can be.
+fn is_quarantine_mark(reason: Option<&str>) -> bool {
+    static MARK: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^quarantined: ([A-Za-z0-9](?:-?[A-Za-z0-9])*), #[1-9][0-9]*$")
+            .expect("quarantine mark regex compiles")
+    });
+    const MAX_LOGIN_LEN: usize = 39;
+    reason
+        .and_then(|reason| MARK.captures(reason))
+        .is_some_and(|caps| caps[1].len() <= MAX_LOGIN_LEN)
 }
 
 /// Rule 7 (PRD #77 Decision 30 / M4.3). The `xtask-docs` library raises `Err`
@@ -1143,6 +1226,16 @@ fn rule_git_program_literal(inputs: &Inputs) -> Vec<String> {
     git_program_literal::run(&inputs.root)
 }
 
+/// Rule 18 (PRD #1195 M2). Its own walk of `desktop/src/` — the context types
+/// and construction sites are derived from the whole production tree, the
+/// owned setters are then checked in the app shell's files — with a TSX lexer
+/// of its own, for rule 12's reason as well: a different tree, and an input
+/// going missing (the shell files, `VoiceActionContext`, a construction site)
+/// must be reported rather than quietly emptying the rule.
+fn rule_voice_capability_state(inputs: &Inputs) -> Vec<String> {
+    voice_capability_state::run(&inputs.root)
+}
+
 /// Rule 14 (PRD #802 M3). Read straight off its own four files for rule 12's
 /// reason — a different tree, and an input going missing must be reported
 /// rather than quietly emptying the rule.
@@ -1159,6 +1252,14 @@ fn rule_no_bare_git_ctor(inputs: &Inputs) -> Vec<String> {
 /// finding rather than a vacuous pass.
 fn rule_site_image_refs(inputs: &Inputs) -> Vec<String> {
     site_image_refs::run(&inputs.root)
+}
+
+/// Rule 17 (issue #688). Its own walk of `src/`, because it needs the AST —
+/// which `fn` holds a spawn, and which code is test code — and because its
+/// inputs going missing (the agent registry, the pin helpers) must be reported
+/// rather than quietly emptying the rule.
+fn rule_unit_test_emitter_pins_endpoints(inputs: &Inputs) -> Vec<String> {
+    unit_test_endpoint_pin::run(&inputs.root)
 }
 
 /// Run every registered rule, tagging each finding with its rule's number.
@@ -1349,8 +1450,10 @@ fn scan_sources(root: &Path, tests_dir: &Path) -> (Vec<SpecOccurrence>, ScannedF
 /// this tool cannot reason without — a parse failure here would make rules
 /// 1/2/4/6 report garbage, so it is fatal rather than a finding.
 fn gather_inputs(root: PathBuf) -> Result<Inputs, ExitCode> {
-    let catalog_path = root.join(CATALOG_PATH);
-    let allowlist_path = root.join(ALLOWLIST_PATH);
+    // By component, not `root.join("a/b")`, so the paths the two messages
+    // below print are native on Windows rather than mixed (issue #1137).
+    let catalog_path = paths::join_repo_relative(&root, CATALOG_PATH);
+    let allowlist_path = paths::join_repo_relative(&root, ALLOWLIST_PATH);
     let tests_dir = root.join(TESTS_DIR);
 
     let catalog_ids = match parse_catalog_ids(&catalog_path) {
@@ -3091,7 +3194,75 @@ mod tests {
             scenario: Some("Scenario: synthetic.".to_string()),
             steps: Vec::new(),
             ignored: false,
+            ignore_reason: None,
         }
+    }
+
+    // --- rule 6: the quarantine mark (issue #488) ---
+
+    #[test]
+    fn quarantine_mark_accepts_exactly_the_rule_6_form() {
+        assert!(is_quarantine_mark(Some("quarantined: vfarcic, #488")));
+        assert!(is_quarantine_mark(Some("quarantined: some-user, #1")));
+        assert!(is_quarantine_mark(Some("quarantined: a, #2")));
+        let longest = format!("quarantined: {}, #3", "a".repeat(39));
+        assert!(is_quarantine_mark(Some(&longest)));
+    }
+
+    /// PR #1351 review: an owner no GitHub account could have must not pass.
+    #[test]
+    fn quarantine_mark_refuses_an_impossible_owner() {
+        let too_long = format!("quarantined: {}, #488", "a".repeat(40));
+        for reason in [
+            "quarantined: vfarcic-, #488",
+            "quarantined: -vfarcic, #488",
+            "quarantined: vf--arcic, #488",
+            "quarantined: vf_arcic, #488",
+            "quarantined: @vfarcic, #488",
+            too_long.as_str(),
+        ] {
+            assert!(
+                !is_quarantine_mark(Some(reason)),
+                "{reason:?} must not pass"
+            );
+        }
+    }
+
+    #[test]
+    fn quarantine_mark_refuses_anything_looser() {
+        for reason in [
+            None,
+            Some(""),
+            Some("flaky"),
+            Some("quarantined"),
+            Some("quarantined: vfarcic"),
+            Some("quarantined: #488"),
+            Some("quarantined: vfarcic, 488"),
+            Some("quarantined: vfarcic, #0"),
+            Some("quarantined: vfarcic, #488 until fixed"),
+            Some("Quarantined: vfarcic, #488"),
+            Some("quarantined:vfarcic,#488"),
+        ] {
+            assert!(!is_quarantine_mark(reason), "{reason:?} must not pass");
+        }
+    }
+
+    #[test]
+    fn rule_6_passes_a_quarantined_spec_test_and_fails_every_other_ignore() {
+        let mut quarantined = bound("tests/e2e_a.rs", "a/b/001", "b_001_quarantined");
+        quarantined.ignored = true;
+        quarantined.ignore_reason = Some("quarantined: vfarcic, #488".to_string());
+        let mut bare = bound("tests/e2e_a.rs", "a/b/002", "b_002_bare");
+        bare.ignored = true;
+        let mut free_text = bound("tests/e2e_a.rs", "a/b/003", "b_003_free_text");
+        free_text.ignored = true;
+        free_text.ignore_reason = Some("flaky".to_string());
+        let plain = bound("tests/e2e_a.rs", "a/b/004", "b_004_plain");
+
+        let errors = unquarantined_ignores(&[quarantined, bare, free_text, plain]);
+        assert_eq!(errors.len(), 2, "{errors:#?}");
+        assert!(errors[0].contains("b_002_bare"), "{errors:#?}");
+        assert!(errors[1].contains("b_003_free_text"), "{errors:#?}");
     }
 
     fn occurrence(file: &str, id: &str, line: usize) -> SpecOccurrence {

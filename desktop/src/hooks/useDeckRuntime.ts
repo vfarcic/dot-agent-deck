@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createFixtureSnapshot } from "../data/fixture";
 import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
-import type { DesktopSettingsDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
+import type { DesktopSettingsDto, EndpointSettingsDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
+import { voiceDeckStep } from "../lib/newAgent";
 import { agentKey } from "../lib/agentKey";
+import { LaunchCleanupError } from "../lib/actionError";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
+import { deckName } from "../lib/displayText";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { isDelivered } from "../types";
-import type { AgentTarget, DeckAction, DeckFleet, DeckRuntimeState, DeckSnapshot, RuntimeMode, SendResult, TerminalBuffer } from "../types";
+import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, RuntimeMode, SendResult, TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -42,7 +45,7 @@ function seedSnapshot(mode: RuntimeMode): DeckSnapshot {
       agents: [],
       evidence: [],
       handoffs: [],
-      connection: { status: "loading", message: "Connecting to the local deck…" },
+      connection: { status: "loading", message: "Connecting to the local daemon…" },
     };
   }
   const initial = createFixtureSnapshot("empty");
@@ -75,8 +78,13 @@ export function useDeckRuntime(): DeckRuntimeState {
    */
   const selectedDeckIdRef = useRef<string | undefined>(snapshot.connection.deckId);
   selectedDeckIdRef.current = snapshot.connection.deckId;
+  /* PRD #1223 — the fleet as of the last render, so a declaration made from a
+     callback describes the deck step the New agent dialog would show NOW, and
+     a cleanup warning (issue #1234) names the deck its action was sent to. */
+  const fleetRef = useRef(fleet);
+  fleetRef.current = fleet;
   /**
-   * The latest reported failure, or nothing.
+   * The latest reported failure's sentence, or nothing.
    *
    * PRD #742 M8 carried a `{ message, id }` here so `App` could suppress one
    * dismissed failure by id rather than by sentence. Issue #1046 landed on
@@ -84,8 +92,32 @@ export function useDeckRuntime(): DeckRuntimeState {
    * (see {@link clearError}), which answers the same question with less: a
    * cleared error is per-occurrence by construction, so a second failure
    * carrying an identical sentence sets it again and shows.
+   *
+   * One slot, and every writer replaces it: the next failure, the next action
+   * and `reconnect()` all do. That is right for a sentence and wrong for a
+   * safety warning, which is why the roles a failed launch could not confirm
+   * are stopped are NOT held here — see `cleanupWarnings` below.
    */
   const [error, setError] = useState<string>();
+  /**
+   * Issue #1234 — every unconfirmed-stop warning the user has not dismissed.
+   *
+   * PRD #1223 audit V7 put these roles in the failure slot beside the sentence,
+   * first as a second `useState` and then, after audit W1 found a later
+   * rejection could inherit an earlier one's roles, as one atomic value with
+   * it. That made the pairing honest and kept the lifetime wrong: with two
+   * actions in flight, a `LaunchCleanupError` and an ordinary rejection
+   * straight after it land in one React batch, the second replaces the whole
+   * failure, and no frame ever names roles that may still be running. Starting
+   * any action and `reconnect()` cleared them the same way.
+   *
+   * So they get a lifetime of their own. A rejection APPENDS an entry, only
+   * `dismissCleanupWarning` removes one, and the id is minted per rejection so
+   * a dismissal aimed at one entry cannot take a later one naming the same
+   * roles with it.
+   */
+  const [cleanupWarnings, setCleanupWarnings] = useState<readonly CleanupWarningEntry[]>([]);
+  const nextCleanupWarningId = useRef(0);
   // PTY bytes deliberately bypass React state. Routing every output chunk
   // through setState re-rendered the whole deck per chunk per agent — with six
   // streaming agents the main thread spent its time reconciling instead of
@@ -108,7 +140,7 @@ export function useDeckRuntime(): DeckRuntimeState {
    *
    * Held here rather than in a tile because the send that produces one is not
    * the tile's — the composer that used to own this is gone, and what remains
-   * are PROGRAMMATIC sends: the coordinator's seed prompt at workflow launch,
+   * are PROGRAMMATIC sends: the orchestrator's seed prompt at orchestration activation,
    * and whatever else dispatches through the guarded verb.
    *
    * A record here is one PAST ATTEMPT, never current state, which is why
@@ -285,6 +317,17 @@ export function useDeckRuntime(): DeckRuntimeState {
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       setError(message);
+      // Issue #1234: the roles as data (audit V7), in a queue of their own, so
+      // a later rejection replacing the sentence above cannot take them too.
+      if (cause instanceof LaunchCleanupError) {
+        nextCleanupWarningId.current += 1;
+        // A deck-scoped action names its deck; every other one went to the
+        // selection as it was when the action was sent.
+        const targetDeckId = "deckId" in action && typeof action.deckId === "string" ? action.deckId : sentToDeckId;
+        const target = fleetRef.current.find((deck) => deck.connection.deckId === targetDeckId);
+        const entry: CleanupWarningEntry = { id: nextCleanupWarningId.current, stops: cause.unconfirmedStops, ...(target ? { deck: deckName(target.connection) } : {}) };
+        setCleanupWarnings((current) => [...current, entry]);
+      }
       throw cause;
     }
   }, [bridge, noteTerminalInputResult]);
@@ -298,14 +341,24 @@ export function useDeckRuntime(): DeckRuntimeState {
    * clear it at the start of each attempt, and what a failed connection leaves
    * behind for the banner is `snapshot.connection`, which this does not touch.
    */
-  const clearError = useCallback(() => setError(undefined), []);
+  const clearError = useCallback(() => {
+    setError(undefined);
+  }, []);
+
+  /* Issue #1234 — the one writer that removes a cleanup warning. */
+  const dismissCleanupWarning = useCallback((id: number) => {
+    setCleanupWarnings((current) => (current.some((entry) => entry.id === id) ? current.filter((entry) => entry.id !== id) : current));
+  }, []);
 
   const getSettings = useCallback(() => bridge.getSettings(), [bridge]);
   // Stable for the lifetime of the bridge: `useZoom` holds it across a
   // capture-phase listener whose effect must not be torn down and re-registered
   // on every render.
   const setZoom = useCallback((level: number) => bridge.setZoom(level), [bridge]);
-  const saveSettings = useCallback((settings: DesktopSettingsDto) => bridge.saveSettings(settings), [bridge]);
+  const saveSettings = useCallback(
+    (settings: DesktopSettingsDto, base?: DesktopSettingsDto) => bridge.saveSettings(settings, base),
+    [bridge],
+  );
   // PRD #741 M10. Not wrapped in the `setError` bookkeeping `runAction` uses,
   // for the same reason `listProjects` is not: every outcome here is a
   // classified report the panel renders in place, and routing an unreachable
@@ -338,9 +391,12 @@ export function useDeckRuntime(): DeckRuntimeState {
    * routing "no matching action" into the deck's global error toast would
    * present a voice answer as a fault of the screen behind it.
    */
-  const declareVoiceScreen = useCallback((screen: VoiceScreen) => bridge.declareVoiceScreen(screen), [bridge]);
+  /* Every declaration carries the New agent dialog's deck step, computed from
+     the same `fleet` the dialog reads, so what voice says it preselected and
+     what the dialog preselects are judged against one list. */
+  const declareVoiceScreen = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, endpoints?: EndpointSettingsDto) => bridge.declareVoiceScreen(screen, directories, newAgent, voiceDeckStep(fleetRef.current), endpoints), [bridge]);
   const resolveVoice = useCallback((utterance: string) => bridge.resolveVoice(utterance), [bridge]);
-  const voiceCommands = useCallback((screen: VoiceScreen) => bridge.voiceCommands(screen), [bridge]);
+  const voiceCommands = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto) => bridge.voiceCommands(screen, directories, newAgent), [bridge]);
   const voiceStart = useCallback(() => bridge.voiceStart(), [bridge]);
   const voiceStop = useCallback(() => bridge.voiceStop(), [bridge]);
   const voiceStatus = useCallback(() => bridge.voiceStatus(), [bridge]);
@@ -359,6 +415,12 @@ export function useDeckRuntime(): DeckRuntimeState {
   // its own state and says what it means.
   const listProjects = useCallback(() => bridge.listProjects(), [bridge]);
   const resolveProject = useCallback((path: string) => bridge.resolveProject(path), [bridge]);
+  // PRD #1223 M4, and for the same reason: a deck that cannot list, a path it
+  // refuses and a deck that left the fleet are all things the New agent dialog
+  // says in place, not faults of the screen behind it.
+  const listDirectories = useCallback((deckId: string, path?: string, options?: DeckListingOptions) => (options ? bridge.listDirectories(deckId, path, options) : bridge.listDirectories(deckId, path)), [bridge]);
+  const newAgentOptions = useCallback((deckId: string) => bridge.newAgentOptions(deckId), [bridge]);
+  const newAgentOrchestrations = useCallback((deckId: string, path: string) => bridge.newAgentOrchestrations(deckId, path), [bridge]);
 
   // PRD #882: the geometry the daemon has applied per agent. Held here rather
   // than inside each tile because the push is per agent and arrives on one
@@ -382,14 +444,30 @@ export function useDeckRuntime(): DeckRuntimeState {
     });
   }, [bridge]);
 
+  // Issue #1198: the app's experimental surfaces, asked ONCE per bridge. The
+  // flag is a presentation switch read at startup — changing it means
+  // restarting the app — so there is no re-query to race a navigation with.
+  // A missing method or a refused call leaves this `undefined`, which every
+  // reader takes as all hidden (`desktopFeaturesOf`).
+  const [desktopFeatures, setDesktopFeatures] = useState<DesktopFeatures>();
+  useEffect(() => {
+    let cancelled = false;
+    const ask = typeof bridge.desktopFeatures === "function" ? bridge.desktopFeatures() : undefined;
+    void ask?.then((features) => { if (!cancelled) setDesktopFeatures(features); }, () => undefined);
+    return () => { cancelled = true; };
+  }, [bridge]);
+
   return {
     appliedGeometry,
+    desktopFeatures,
     mode,
     snapshot,
     fleet,
     terminalData: EMPTY_TERMINAL_DATA,
     terminalFeed,
     error,
+    cleanupWarnings,
+    dismissCleanupWarning,
     clearError,
     runAction,
     terminalInputResults,
@@ -399,6 +477,9 @@ export function useDeckRuntime(): DeckRuntimeState {
     reconnect,
     listProjects,
     resolveProject,
+    listDirectories,
+    newAgentOptions,
+    newAgentOrchestrations,
     getSettings,
     saveSettings,
     testEndpoint,

@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
-  Activity,
   AlertTriangle,
   ArrowRight,
   Blocks,
@@ -16,7 +15,6 @@ import {
   GitBranch,
   HelpCircle,
   History,
-  Keyboard,
   LayoutList,
   Network,
   PanelRight,
@@ -34,15 +32,18 @@ import {
   Zap,
 } from "lucide-react";
 import { AgentOverview } from "./components/AgentOverview";
+import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
-import { DeckSelector } from "./components/DeckSelector";
+import { DeckSelector, chooseDeckSelection } from "./components/DeckSelector";
 import { HandoffRail } from "./components/HandoffRail";
-import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
+import { SelectDeckNote } from "./components/SelectDeckNote";
+import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel } from "./components/VoiceControlPanel";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
+import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
@@ -52,16 +53,32 @@ import { useInertBackground } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRecord";
 import { useZoom } from "./hooks/useZoom";
+import { useShellOverlays, type RailScreen, type ScreenOverlays } from "./hooks/useShellOverlays";
 import { agentKey } from "./lib/agentKey";
-import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
+import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
 import { unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
-import { desktopWorkflowPlatformIssue } from "./lib/platform";
-import type { VoiceOutcomeDto } from "./lib/bridge";
-import type { AgentSession, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
+import { desktopOrchestrationPlatformIssue } from "./lib/platform";
+import { selectsAllDecks } from "./lib/endpoints";
+import { deckScreenSnapshot } from "./lib/deckScreen";
+import { LaunchCleanupError } from "./lib/actionError";
+import { CleanupWarning } from "./components/CleanupWarning";
+import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
+import { desktopFeaturesOf } from "./types";
+import type { AgentSession, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
+import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
-const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
+const ORCHESTRATION_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.orchestration-preview.v1");
+/**
+ * Where the saved role order lived before issue #1045 renamed the desktop's
+ * "workflow" to the TUI's "orchestration". Read once, when the new key holds
+ * nothing, so an order saved by an older build survives the rename; a value
+ * that validates is written to {@link ORCHESTRATION_STORAGE_KEY} in normalized
+ * form and the legacy key removed (`planStoredRoleOrder`).
+ */
+const LEGACY_WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
+
 /**
  * The daemon's stable refusal codes this screen recognises, matched as CODES
  * rather than as prose. Each is the first token of `AttachResponse.error`,
@@ -92,7 +109,7 @@ const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-prev
  * `preparation-mismatch` (`PROJECT_ERR_PREPARATION_MISMATCH`, PRD #819 Greptile
  * P1(a)) is deliberately NOT in that list and falls through to the generic
  * notice carrying the daemon's own sentence. It means this app submitted a
- * project, workflow or role other than the one the daemon prepared, which is a
+ * project, orchestration or role other than the one the daemon prepared, which is a
  * defect in this client rather than a state the user can be walked out of —
  * re-preparing and sending the same thing again earns the same refusal, so
  * offering that as a remedy would be a lie. Nothing was started either way.
@@ -110,6 +127,38 @@ function evidenceOpenOnFirstLoad(): boolean {
   return window.innerWidth >= 1260;
 }
 
+/**
+ * Every {@link DeckOverlay}, for the deck's blanket close. Written as a
+ * record's keys so that adding an overlay to the union is a type error here
+ * rather than an overlay the Deck button and `Escape` silently leave open —
+ * the property the `Record<DeckOverlay, …>` of setters this replaced carried.
+ */
+const DECK_OVERLAYS = Object.keys({ projects: true, prompts: true, profiles: true, orchestration: true, settings: true } satisfies Record<DeckOverlay, true>) as DeckOverlay[];
+
+/**
+ * The registry entry voice's `open_deck` row invokes — typed against the
+ * registry, so renaming the entry breaks this rather than the gate below.
+ */
+const OPEN_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "openDeck";
+
+/**
+ * The registry entry voice's `switch_deck` row invokes (PRD #1195 M3), whose
+ * `deck_ref` value is the Deck selector's token rather than a fleet key — see
+ * `VoiceDispatchTarget.deckSelection`.
+ */
+const SWITCH_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "switchDeck";
+
+/**
+ * Issue #1198 — what a view that names the deck is shown as while the deck is
+ * hidden: the overview, and a pane opened over the deck opens over the
+ * overview instead. Views that do not name the deck come back unchanged.
+ */
+function overviewInsteadOfDeck(view: DeckView): DeckView {
+  if (view.kind === "deck") return { kind: "overview" };
+  if (view.kind === "agent" && view.from === "deck") return { ...view, from: "overview" };
+  return view;
+}
+
 export default function App() {
   return <DeckShell runtime={useDeckRuntime()} />;
 }
@@ -122,16 +171,29 @@ export default function App() {
  * deck. `DeckView` is a discriminated union from the start so PRD #745
  * iteration 3's group and single-agent views arrive as added variants.
  *
- * The deck stays the default: launching the app lands exactly where it does
- * today.
+ * The overview is the default (issue #1196): it is the landing screen PRD
+ * #745 built, and the rail lists it first. Nothing persists the last view, so
+ * every launch opens there; a caller that wants the deck passes
+ * `initialView`, as the tests do.
  *
  * PRD #1105 M2 narrowed the first sentence rather than repealing it. The two
  * SCREEN variants still replace one another; the `"agent"` variant does not —
  * it names the screen to keep mounted underneath and renders the pane over it,
  * which is why the switch below reads `base` rather than `view.kind`.
  */
-export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind: "deck" } }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; initialView?: DeckView }) {
-  const [view, setView] = useState<DeckView>(initialView);
+export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = { kind: "overview" } }: { runtime: DeckRuntimeState; orchestrationPlatformIssue?: string; initialView?: DeckView }) {
+  const [requestedView, setView] = useState<DeckView>(initialView);
+  /**
+   * Issue #1198 — the app's experimental surfaces, read once at startup. The
+   * deck is one of them, so while it is hidden a view that names it — an
+   * `initialView`, a deep link, a pane opened over it — is SHOWN as the
+   * overview instead. Derived rather than written back, so nothing about the
+   * request is lost and no effect races the first render; every navigation
+   * control that could ask for the deck is itself withheld below (the rail,
+   * the overview's Open deck buttons, voice's `open_deck`).
+   */
+  const features = desktopFeaturesOf(runtime);
+  const view = useMemo(() => (features.showDeck ? requestedView : overviewInsteadOfDeck(requestedView)), [features.showDeck, requestedView]);
   /**
    * The settings document and the zoom keys live HERE, not in the deck,
    * because both are the app's and not one screen's — and `DeckShell` is the
@@ -147,6 +209,22 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    */
   const settings = useDesktopSettings(runtime);
   useZoom(runtime, settings);
+  /**
+   * PRD #1195 — the settings as of the LATEST render, for a voice dispatch
+   * that writes them. `VoiceControlPanel` captures `dispatchVoice` when an
+   * utterance BEGINS and calls it when the answer lands, so a `settings` closed
+   * over by that callback is the document from before the round trip: a
+   * `switch_deck` judged against it accepts an address Settings has since
+   * changed, and writing from it undoes every edit made meanwhile. Read here
+   * instead, as `useZoom` reads its own copy.
+   *
+   * No separate wait on an in-flight save is needed: `useDesktopSettings.save`
+   * applies each document to its state at once and queues the disk writes in
+   * order, dropping a superseded response, so the latest render already holds
+   * the document the queue will end on, and a write from here queues behind it.
+   */
+  const latestSettings = useRef(settings);
+  latestSettings.current = settings;
   /**
    * PRD #802 M7 — where the mounted deck publishes the context it can serve.
    *
@@ -166,6 +244,21 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * what `voice_off` needs and what neither the deck nor this shell can offer.
    */
   const panelVoiceContext = useRef<VoicePanelContext | undefined>(undefined);
+  /**
+   * PRD #1223 U5 — the OVERVIEW's half, published while it is mounted:
+   * `closeNewAgent` while the New agent dialog is open, so `close` can close
+   * that dialog rather than report "nothing to close"; `openNewAgent` while it
+   * is closed; and the directory browser's three moves.
+   */
+  const overviewVoiceContext = useRef<Partial<VoiceOverviewContext> | undefined>(undefined);
+  /**
+   * PRD #1223 — the New agent dialog's own slot: what its directory browser
+   * shows, and its three moves. Created here rather than in the overview
+   * because the voice surface, which declares the browser with each
+   * utterance, is this shell's child and not the overview's; the overview
+   * hands the slot to the dialog and serves the moves by reading it.
+   */
+  const newAgentVoice = useRef<NewAgentVoice | undefined>(undefined);
   const agentView = view.kind === "agent" ? view : undefined;
   /**
    * Back, and the whole of it. The destination is read off the view rather
@@ -173,6 +266,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * the app's `initialView`, a future deep link — closes to a real screen
    * instead of to nothing.
    */
+  // voice-registry-exempt: the view's own back, which opens nothing — the effects below call it when a pane's subject goes away, and the dispatch context's `closeAgentView` reaches it
   const closeAgent = useCallback(() => setView((current) => (current.kind === "agent" ? { kind: current.from } : current)), []);
   /**
    * PRD #802 M2 — the same close, dispatched through the action registry.
@@ -218,6 +312,37 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [agentView, closeAgentView]);
   const base = agentView?.from ?? view.kind;
+  /**
+   * Issue #1197 — the one rail, and the overlays it shows as open. Held here
+   * because this is the only component mounted for every screen; the deck's
+   * panels read their half through `DeckSurface`'s `overlays` prop.
+   */
+  const screen: RailScreen = base === "overview" ? "overview" : "deck";
+  const { open: overlaysOpen, setOverlay, closeOverlays, deck: deckOverlays } = useShellOverlays(screen);
+  const railContext = useMemo<RailContext>(() => ({
+    navigate: setView,
+    // Settings opens over whichever screen is up; the deck's own panels exist
+    // only on the deck, so asking for one elsewhere goes there first.
+    openOverlay: (overlay) => {
+      if (overlay === "settings") return setOverlay(screen, overlay, true);
+      if (screen !== "deck") setView({ kind: "deck" });
+      setOverlay("deck", overlay, true);
+    },
+    closeOverlays: () => closeOverlays(screen),
+  }), [closeOverlays, screen, setOverlay]);
+  /**
+   * `Escape` closes Settings over the overview. The deck's own blanket
+   * dismissal covers it there, and the overview has no such handler.
+   */
+  const overviewSettingsOpen = screen === "overview" && Boolean(overlaysOpen.settings);
+  useEffect(() => {
+    if (!overviewSettingsOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOverlay("overview", "settings", false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [overviewSettingsOpen, setOverlay]);
   const selectedDeckId = runtime.snapshot.connection.deckId;
   /** The fleet entry the open pane's agent lives on, if the app is observing it. */
   const paneDeck = agentView ? runtime.fleet.find((entry) => entry.connection.deckId === agentView.deckId) : undefined;
@@ -506,7 +631,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * aimed: it types one utterance into the pane that is already open, so there
    * is no navigation to observe and nothing for the flag to suppress.
    */
-  const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>) => {
+  const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto, declaredNewAgent?: VoiceNewAgentDto) => {
     const previous = view;
     /*
       One target for every entry, built from the outcome's own resolved params —
@@ -525,6 +650,23 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
        model marked, and `value` is what this app resolved that boundary to in
        its own transcript. The model's string never reaches a terminal. */
     const dictated = outcome.params.find((param) => param.kind === "spoken_prefix");
+    /* PRD #1223 — the deck a `deck_ref` resolved to, against the observed
+       fleet, Rust-side. Its own member rather than `deckId`, which falls back
+       to the selected deck below and so cannot say "the user named none". */
+    const namedDeck = outcome.params.find((param) => param.kind === "deck_ref");
+    /* PRD #1223 — the child a `dir_ref` resolved to, against the browser's
+       children on screen: its `value` is the deck's own path for it. */
+    const namedDirectory = outcome.params.find((param) => param.kind === "dir_ref");
+    /* PRD #1223 — the Mode chip and the agent entry a `mode_ref` and an
+       `agent_type_ref` resolved to, against the form AS DECLARED: `value` is
+       the id the dialog selects by. */
+    const namedMode = outcome.params.find((param) => param.kind === "mode_ref");
+    const namedAgentType = outcome.params.find((param) => param.kind === "agent_type_ref");
+    const declaredForm = declaredNewAgent?.form;
+    /* PRD #1223 — the orchestration card an `orchestration_ref` resolved to,
+       named by one member's agent id on the selected deck, whose agents Rust
+       resolved it against. */
+    const namedOrchestration = outcome.params.find((param) => param.kind === "orchestration_ref");
     const target: VoiceDispatchTarget = {
       /* The dictation pair targets the pane on SCREEN — its row declares no
          agent param and is `screens = ["agent"]`, so `agentView` is defined
@@ -544,27 +686,68 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       agentLabel: agent?.label ?? paneAgent?.displayName,
       text: dictated?.value,
       agentViewOpen: agentView !== undefined,
+      ...(namedDeck
+        ? (outcome.invoke === SWITCH_DECK_INVOKE
+          ? { deckSelection: namedDeck.value, ...(namedDeck.deckIdentity ? { deckIdentity: namedDeck.deckIdentity } : {}) }
+          : { preselectDeckId: namedDeck.value })
+        : {}),
+      ...(namedDirectory ? { directoryPath: namedDirectory.value } : {}),
+      /* What the utterance was judged against, so a directory move can refuse
+         a browser that has moved on since (see the member's own comment). */
+      ...(declaredDirectories ? { declaredDirectories: { deckId: declaredDirectories.deckId, path: declaredDirectories.path } } : {}),
+      ...(namedMode ? { modeId: namedMode.value } : {}),
+      ...(namedAgentType ? { agentTypeId: namedAgentType.value } : {}),
+      ...(declaredForm ? { declaredForm: { deckId: declaredForm.deckId, path: declaredForm.path } } : {}),
+      ...(namedOrchestration ? { orchestrationAgentId: namedOrchestration.value } : {}),
     };
     let moved = false;
     const context: VoiceDispatchContext = {
       ...deckVoiceContext.current,
+      /* The overview's, which is never mounted beside the deck, so the two
+         cannot both publish (PRD #1223 U5). */
+      ...overviewVoiceContext.current,
       /* After the deck's, and the two sets are disjoint by construction — see
          `VoicePanelContext`, which is a narrow `Pick` precisely so a screen and
          the voice surface can never offer the same member. */
       ...panelVoiceContext.current,
+      /* The shell's, so Settings opens from the overview as from the deck (#1197). */
+      openOverlay: railContext.openOverlay,
+      closeOverlays: railContext.closeOverlays,
+      /* Only while Settings is open, so `close` reads its presence (#1197). */
+      ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
+      /* The Deck selector's own write, which its menu calls too (PRD #1195). */
+      switchDeck: (selection, identity) => chooseDeckSelection(latestSettings.current, selection, identity),
       navigate: (next) => { moved = true; setView(next); },
       closeAgentView: () => { moved = true; closeAgent(); },
     };
+    /* Issue #1198 — the deck is hidden, so voice does not go there even when a
+       resolver names it. The crate already withholds `open_deck` from what the
+       model is offered (`voice::schema::annotate_for`); this is the same gate at
+       the dispatch seam, for an answer that arrives anyway. Refused like any
+       dispatch the host cannot serve, so the report says nothing ran. */
+    if (outcome.invoke === OPEN_DECK_INVOKE && !features.showDeck) return undefined;
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
+    // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, paneAgent, selectedDeckId, view]);
+  }, [agentView, base, closeAgent, features.showDeck, overlaysOpen.settings, paneAgent, railContext, screen, selectedDeckId, setOverlay, view]);
+  /** PRD #1223 — what the directory browser shows, read at declaration time. */
+  const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
+  /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
+  const readNewAgent = useCallback(() => newAgentVoice.current?.newAgent, []);
+  /* Which mount of the dialog that declaration came from — never sent to Rust,
+     read only to refuse an answer whose dialog has been replaced (PRD #1223). */
+  const readNewAgentInstance = useCallback(() => newAgentVoice.current?.instance, []);
+  /* PRD #1195 — the Deck selector's section as it renders, not as it is on
+     disk: `save` applies an edit at once and writes it behind. */
+  const readEndpoints = useCallback(() => latestSettings.current.settings.endpoints, []);
   /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
      and `DeckSurface`'s own promotion condition. */
   const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId } : undefined;
   const screenNode = base === "overview"
     ? (
       <>
-        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} />
+        {/* voice-registry-exempt: the overview's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS` */}
+        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} />
         {/*
           The overview mounts no terminal of its own (PRD #745's commitment), so
           there is no tile here to promote and the pane is a sibling of the
@@ -573,9 +756,27 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
           actually requires.
         */}
         {agentView && paneDeck && paneAgentShown && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} />}
+        {/*
+          PRD #1223 audit W2 — the runtime's last failure, on THIS screen too.
+
+          The New agent flow lives here, and its dialog deliberately leaves the
+          runtime's error alone once it is unmounted (`NewAgentDialog`'s
+          `mounted` ref) because by then it is the only copy of the failure.
+          The only surface rendering that copy was the deck's toast, which is
+          unmounted whenever this screen is up — so a launch that failed with
+          roles still possibly running was reported nowhere, and this screen's
+          Refresh calls `reconnect()`, which clears it unseen.
+
+          `runtime.error` alone: the notice beside it on the deck is that
+          screen's own state, and this screen has none. The two are never
+          mounted together, so there is at most one toast. The cleanup
+          warnings ride with it but outlive it (issue #1234).
+        */}
+        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
       </>
     )
-    : <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} />;
+    // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
+    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} overlays={deckOverlays} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
     shape is the whole of that decision.
@@ -588,17 +789,24 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     sentence and the Undo would go with it, and `open_overview` would be the one
     command whose report nobody ever sees.
 
-    The two children are POSITIONAL, which is what makes the panel survive: React
-    reconciles by position, so the screen at index 0 may change type freely while
-    index 1 keeps the same fiber and therefore the same panel state. This
-    deliberately returns one fragment on both paths rather than the screen alone
-    on one of them, because a fragment on one path and a `DeckSurface` on the
-    other is a different root type and would remount everything under it.
+    The children are POSITIONAL, which is what makes the panel survive: React
+    reconciles by position, so the screen at index 1 may change type freely while
+    the panel at index 2 keeps the same fiber and therefore the same panel state.
+    This deliberately returns one fragment on both paths rather than the screen
+    alone on one of them, because a fragment on one path and a `DeckSurface` on
+    the other is a different root type and would remount everything under it.
+
+    The rail (issue #1197) and the Settings sheet sit beside the screen for the
+    same reason: they are the app's, not one screen's, so neither is torn down
+    or re-created by a navigation.
   */
   return (
     <>
+      {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
+      <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
       {screenNode}
-      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} />
+      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} />
+      <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
     </>
   );
 }
@@ -670,7 +878,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
  * unnecessary rather than merely unwise.
  */
 function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; onClose: () => void }) {
-  const [tab, setTab] = useState<PanelTab>("terminal");
+  const [tab, setTab] = useState<PanelTab>("terminal"); // voice-registry-exempt: the pane-over-the-overview's own tab strip, a control inside one pane
   return (
     <AgentPaneFrame
       open
@@ -802,13 +1010,47 @@ function AgentPaneFrame({ open, onOpen, onClose, ...tile }: Omit<AgentTileProps,
  * so a later `save` against the wrong one would write state no screen reads.
  * Here there is exactly one instance per tree.
  */
-export function ControlDeck(props: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
+export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
   const settings = useDesktopSettings(props.runtime);
-  return <DeckSurface {...props} settings={settings} />;
+  // Issue #1197: the rail and the Settings sheet are the shell's, so a deck
+  // rendered on its own carries the same pair {@link DeckShell} does.
+  const { open, setOverlay, closeOverlays, deck } = useShellOverlays("deck");
+  const context: RailContext = {
+    navigate: (view) => props.onNavigate?.(view),
+    openOverlay: (overlay) => setOverlay("deck", overlay, true),
+    closeOverlays: () => closeOverlays("deck"),
+  };
+  return (
+    <>
+      {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
+      <NavigationRail screen="deck" overlays={open} context={context} connection={props.runtime.snapshot.connection} features={desktopFeaturesOf(props.runtime)} onShowShortcuts={() => setOverlay("deck", "shortcuts", true)} />
+      <DeckSurface {...props} settings={settings} overlays={deck} />
+      <ShellSettings runtime={props.runtime} settings={settings} open={open.settings ?? false} onClose={() => setOverlay("deck", "settings", false)} />
+    </>
+  );
 }
 
-export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel }) {
-  const { snapshot, mode, setShownTerminals } = runtime;
+export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays }) {
+  const { mode, setShownTerminals } = runtime;
+  // #1083: this screen cannot merge across decks, so under All Decks it shows
+  // "Select a deck" and renders nothing of the local deck the selection
+  // resolves to underneath — see `deckScreenSnapshot`. Two sources, either of
+  // which is enough: the stored token, which moves the moment the selector is
+  // used, and the crate's own `allDecks` on the snapshot, which travels WITH
+  // the local deck's content — so a start with All Decks stored cannot flash
+  // local tiles while the settings read is still in flight.
+  const allDecks = selectsAllDecks(settings.settings.endpoints) || runtime.snapshot.allDecks === true;
+  const snapshot = useMemo(() => deckScreenSnapshot(runtime.snapshot, allDecks), [runtime.snapshot, allDecks]);
+  const features = desktopFeaturesOf(runtime);
+  /**
+   * Issue #1197 — the overlay booleans are held by the shell that renders the
+   * one rail, because the rail shows them as active and Settings opens over the
+   * overview as well. A deck rendered bare, as some tests do, keeps a state of
+   * its own so it still renders the same.
+   */
+  const ownOverlays = useShellOverlays("deck").deck;
+  const overlays = shellOverlays ?? ownOverlays;
+  const setOverlay = overlays.set;
   /**
    * Which tile is promoted, decided on the FULL `(deckId, agentId)` identity.
    *
@@ -830,30 +1072,22 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
     : undefined;
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
-  const [selectedEvidenceId, setSelectedEvidenceId] = useState("");
+  const [selectedEvidenceId, setSelectedEvidenceId] = useState(""); // voice-registry-exempt: which evidence item the drawer shows — a selection within the drawer, which the drawer's rows and J/K set
   const [evidenceOpen, setEvidenceOpen] = useState(evidenceOpenOnFirstLoad);
-  const [projectsOpen, setProjectsOpen] = useState(false);
-  const [profilesOpen, setProfilesOpen] = useState(false);
-  const [promptsOpen, setPromptsOpen] = useState(false);
-  const [selectedPromptId, setSelectedPromptId] = useState("");
+  const projectsOpen = overlays.open.projects ?? false;
+  const profilesOpen = overlays.open.profiles ?? false;
+  const promptsOpen = overlays.open.prompts ?? false;
+  const [selectedPromptId, setSelectedPromptId] = useState(""); // voice-registry-exempt: which stored prompt the library panel is editing — a selection within that panel
   const [terminalFocus, setTerminalFocus] = useState<{ agentId: string; token: number }>();
-  const [workflowOpen, setWorkflowOpen] = useState(false);
-  const [paletteOpen, setPaletteOpen] = useState(false);
-  const [helpOpen, setHelpOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [notice, setNotice] = useState<string>();
-  const [confirm, setConfirm] = useState<ConfirmState>();
-  // Memoised so the context value is stable across renders; `runtime.testEndpoint`
-  // is itself stable for the lifetime of the bridge.
-  const settingsBridge = useMemo(
-    () => ({
-      testEndpoint: runtime.testEndpoint,
-      secretStatus: runtime.secretStatus,
-      storeSecret: runtime.storeSecret,
-      forgetSecret: runtime.forgetSecret,
-    }),
-    [runtime.testEndpoint, runtime.secretStatus, runtime.storeSecret, runtime.forgetSecret],
-  );
+  const orchestrationOpen = overlays.open.orchestration ?? false;
+  const [paletteOpen, setPaletteOpen] = useState(false); // voice-registry-exempt: the command palette is the registry's own surface: it lists entries and runs them, and opening it runs none
+  const helpOpen = overlays.open.shortcuts ?? false;
+  // voice-registry-exempt: the shortcut sheet is a `ShellOverlay` and not a `DeckOverlay` — no registry entry opens it; `?` and the rail's bottom button do
+  const setHelpOpen = (open: boolean) => setOverlay("shortcuts", open);
+  /* Issue #1234: a sentence only. The roles a failed launch could not confirm
+     are stopped are the runtime's `cleanupWarnings`, which outlive any notice. */
+  const [notice, setNotice] = useState<string>(); // voice-registry-exempt: the toast's sentence, reporting what an action did
+  const [confirm, setConfirm] = useState<ConfirmState>(); // voice-registry-exempt: the confirmation an action that starts or stops agents asks first — opened by the action it guards, never on its own
   const { profiles, updateProfile, resetProfiles } = useAgentProfiles(snapshot.profiles);
   /*
    * PRD #819 M6: the projects come from the daemon and nothing is remembered.
@@ -922,11 +1156,21 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
     listProjects: runtime.listProjects,
     resolveProject: runtime.resolveProject,
     revision: projectsRevision,
-    enabled: mode === "live" && snapshot.connection.status === "connected",
+    enabled: mode === "live" && snapshot.connection.status === "connected" && !allDecks,
   });
-  const activeProject = projectState.selected;
+  const activeProject = allDecks ? undefined : projectState.selected;
+  // Issue #1044 — the selected deck's live orchestrations, which the Runs
+  // launch's Run name is suggested against and checked for collisions in, the
+  // way the New agent dialog reads the deck it targets.
+  const orchestrationDeckId = snapshot.connection.deckId;
+  const orchestrationLiveTitles = useMemo(() => (orchestrationDeckId ? liveOrchestrationTitles(runtime.fleet, orchestrationDeckId) : []), [runtime.fleet, orchestrationDeckId]);
+  const orchestrationLiveDirectories = useMemo(() => (orchestrationDeckId ? liveOrchestrationDirectories(runtime.fleet, orchestrationDeckId) : []), [runtime.fleet, orchestrationDeckId]);
+  // Read at CONFIRM time, not when the dialog was built: the confirmation can
+  // sit open while another run takes the title (PR #1333 review).
+  const orchestrationLiveTitlesRef = useRef(orchestrationLiveTitles);
+  orchestrationLiveTitlesRef.current = orchestrationLiveTitles;
   const { prompts, addPrompt, updatePrompt, removePrompt } = usePromptLibrary();
-  const [profileOrder, setProfileOrder] = useState<string[]>([]);
+  const [profileOrder, setProfileOrder] = useState<string[]>([]); // voice-registry-exempt: the orchestration editor's draft role order, edited inside that panel
 
   // PRD #743: applied on LOAD as well as on change. Keeping it in one effect
   // keyed on the stored value means the panel only has to save — the change
@@ -947,6 +1191,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
 
   useEffect(() => {
     if (!selectedAgentId || !snapshot.agents.some((agent) => agent.id === selectedAgentId)) {
+      // voice-registry-exempt: an invariant, not a control — keeps the selection on a live agent when the snapshot moves under it
       setSelectedAgentId(snapshot.agents[0]?.id ?? "");
     }
   }, [selectedAgentId, snapshot.agents]);
@@ -966,19 +1211,36 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   useEffect(() => {
     if (!profiles.length || profileOrder.length) return;
     try {
-      const stored = JSON.parse(window.localStorage.getItem(WORKFLOW_STORAGE_KEY) ?? "null") as { order?: string[] } | null;
-      setProfileOrder(stored?.order?.length ? stored.order : profiles.map((profile) => profile.id));
+      const current = window.localStorage.getItem(ORCHESTRATION_STORAGE_KEY);
+      const plan = planStoredRoleOrder(current, current === null ? window.localStorage.getItem(LEGACY_WORKFLOW_STORAGE_KEY) : null);
+      if (plan.write !== undefined) window.localStorage.setItem(ORCHESTRATION_STORAGE_KEY, plan.write);
+      if (plan.removeLegacy) window.localStorage.removeItem(LEGACY_WORKFLOW_STORAGE_KEY);
+      setProfileOrder(reconcileRoleOrder(plan.order, profiles.map((profile) => profile.id)));
     } catch {
       setProfileOrder(profiles.map((profile) => profile.id));
     }
   }, [profileOrder.length, profiles]);
 
+  // The seed above runs once, so a profile that joins later — `resetProfiles`
+  // restoring a default the stored draft lacked — would render at the end of
+  // the editor without being in the order `moveStage` indexes, and its Move
+  // buttons would do nothing. Keep the order naming exactly the profiles that
+  // exist whenever they change (PR #1342 review).
+  useEffect(() => {
+    const ids = profiles.map((profile) => profile.id);
+    setProfileOrder((current) => {
+      if (!current.length) return current;
+      const next = reconcileRoleOrder(current, ids);
+      return next.length === current.length && next.every((id, index) => id === current[index]) ? current : next;
+    });
+  }, [profiles]);
+
   useEffect(() => {
     if (!profileOrder.length) return;
     try {
-      window.localStorage.setItem(WORKFLOW_STORAGE_KEY, JSON.stringify({ order: profileOrder }));
+      window.localStorage.setItem(ORCHESTRATION_STORAGE_KEY, JSON.stringify({ order: profileOrder }));
     } catch {
-      // Keep the workflow preview usable when storage is unavailable.
+      // Keep the orchestration preview usable when storage is unavailable.
     }
   }, [profileOrder]);
 
@@ -1046,54 +1308,54 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   };
 
   /**
-   * Issue #1042: the terminal IS the input path now, so the palette's
-   * "Message coordinator…" entry puts the caret where the agent's own CLI
-   * grammar lives instead of in a composer that no longer exists. It still
-   * sends nothing — it selects the agent, shows its terminal, and asks that
-   * terminal to take focus.
+   * Every deck overlay closed, the deck itself left alone. Only the deck's own
+   * panels: the shortcut sheet is not a {@link DeckOverlay} and has its own
+   * close. Each write is `setOverlay(…, false)`, a dismissal, which is why it
+   * may live outside the context below (PRD #1195's capability-state rule).
    */
-  const focusTerminal = (agentId: string) => {
-    setSelectedAgentId(agentId);
-    setTabs((current) => ({ ...current, [agentId]: "terminal" }));
-    setTerminalFocus((current) => ({ agentId, token: (current?.token ?? 0) + 1 }));
-  };
-
+  const closeOverlays = () => DECK_OVERLAYS.forEach((overlay) => setOverlay(overlay, false));
   /**
    * PRD #802 M2 — the deck's half of the action registry's context, and the one
-   * place the rail buttons, the palette entries and the tile's open/close pair
-   * reach their state from.
+   * place the rail buttons, the palette entries, the tile's open/close pair and
+   * (since PRD #1195 M1) the in-panel controls reach their state from.
    *
-   * A `Record<DeckOverlay, …>` rather than a switch, so adding an overlay to the
-   * union is a type error here rather than a silently unreachable case. Each
-   * setter is React's own and therefore stable, which is what makes it safe for
-   * the `window` keydown effect below to close over the first render's copy.
-   */
-  const overlaySetters: Record<DeckOverlay, (open: boolean) => void> = {
-    projects: setProjectsOpen,
-    prompts: setPromptsOpen,
-    profiles: setProfilesOpen,
-    workflow: setWorkflowOpen,
-    settings: setSettingsOpen,
-  };
-  const closeOverlays = () => Object.values(overlaySetters).forEach((setOpen) => setOpen(false));
-  /**
+   * **The setters are named INSIDE this literal, and that is load-bearing**
+   * (PRD #1195 M2): `xtask/linkage-check`'s capability-state rule derives the
+   * registry-owned setters from what this literal names, and fails the build
+   * on a write to one of them anywhere else that is not a dismissal or does
+   * not carry a written exemption. A helper defined above and referenced here
+   * would hide its setters from that derivation, which is why
+   * `focusTerminal`'s body is written in place rather than beside it.
+   *
+   * Each setter is React's own or `useShellOverlays`' stable one, which is what
+   * makes it safe for the `window` keydown effect below to close over the
+   * first render's copy.
+   *
    * **`onNavigate` and `onCloseAgent` stay optional here rather than in the
    * registry.** Both have been optional props since PRD #1105, so a deck
    * mounted without them renders and its Overview button does nothing — the
    * behaviour this move must not change. Deciding what an absent prop means is
-   * the host's job; the registry's job is to be the dispatch seam for the rail,
-   * the palette and every voice-reachable capability. Five of its `no_voice`
-   * entries also have a second `setState` path in this file — `voiceActions.ts`
-   * names them, and the narrower claim is the true one.
+   * the host's job; the registry's job is to be the dispatch seam.
    */
   const voiceContext: VoiceScreenContext = {
     navigate: (view) => onNavigate?.(view),
     closeAgentView: () => onCloseAgent?.(),
-    openOverlay: (overlay) => overlaySetters[overlay](true),
+    openOverlay: (overlay) => setOverlay(overlay, true),
     closeOverlays,
-    toggleEvidence: () => setEvidenceOpen((open) => !open),
+    toggleEvidence: (open) => setEvidenceOpen((current) => open ?? !current),
     selectAgent: setSelectedAgentId,
-    focusTerminal,
+    /*
+     * Issue #1042: the terminal IS the input path now, so the palette's
+     * "Message coordinator…" entry puts the caret where the agent's own CLI
+     * grammar lives instead of in a composer that no longer exists. It still
+     * sends nothing — it selects the agent, shows its terminal, and asks that
+     * terminal to take focus.
+     */
+    focusTerminal: (agentId) => {
+      setSelectedAgentId(agentId);
+      setTabs((current) => ({ ...current, [agentId]: "terminal" }));
+      setTerminalFocus((current) => ({ agentId, token: (current?.token ?? 0) + 1 }));
+    },
     advanceFixture: () => { void perform({ type: "advance_fixture" }); },
   };
 
@@ -1135,8 +1397,8 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       if (event.key === "Escape") {
         // Not a registry dispatch, and the distinction is worth keeping: this
         // is a blanket DISMISSAL — palette, shortcut sheet, confirm dialog and
-        // every overlay at once — rather than the Runs control, which shows the
-        // deck. It shares `closeOverlays` so the five setters are written once.
+        // every overlay at once — rather than the Deck control, which shows the
+        // deck. It shares `closeOverlays` so the deck overlays are listed once.
         setPaletteOpen(false); setHelpOpen(false); closeOverlays(); setConfirm(undefined);
         return;
       }
@@ -1186,33 +1448,33 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       if (!canControlDaemon) return;
       const liveAgents = snapshot.connection.runningAgentCount;
       setConfirm({
-        title: "Stop the local deck?",
+        title: "Stop the local daemon?",
         body: liveAgents && liveAgents > 0
-          ? `The deck reports ${liveAgents} live agent${liveAgents === 1 ? "" : "s"}. This safe stop will be refused until those agents are stopped individually.`
-          : "This stops the deck running on this machine. No live agents are reported, so this only shuts down the control service.",
-        label: "Stop deck",
+          ? `The daemon reports ${liveAgents} live agent${liveAgents === 1 ? "" : "s"}. This safe stop will be refused until those agents are closed individually.`
+          : "This stops the daemon running on this machine. No live agents are reported, so this only shuts down the daemon.",
+        label: "Stop daemon",
         busyLabel: "Stopping…",
-        action: async () => { await perform({ type: "stop_daemon" }, "Local deck stopped."); },
+        action: async () => { await perform({ type: "stop_daemon" }, "Local daemon stopped."); },
       });
       return;
     }
     setConfirm({
-      title: `Stop ${selectedAgent.role}?`,
+      title: `Close ${selectedAgent.role}?`,
       body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.`,
-      label: "Stop agent",
+      label: "Close agent",
       busyLabel: "Stopping…",
-      action: async () => { await perform({ type: "stop_agent", agentId: selectedAgent.id }, `${selectedAgent.role} stop requested.`); },
+      action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id }, `${selectedAgent.role} close requested.`); },
     });
   };
 
   const requestRestartDaemon = () => {
     if (!snapshot.connection.daemonDetected || snapshot.connection.runningAgentCount !== 0) return;
     setConfirm({
-      title: "Replace the incompatible deck?",
-      body: "The deck now running reports no live agents. Agent Deck will stop it and start the exact build bundled with this desktop app.",
-      label: "Replace deck",
+      title: "Replace the incompatible daemon?",
+      body: "The daemon now running reports no live agents. Agent Deck will stop it and start the exact build bundled with this desktop app.",
+      label: "Replace daemon",
       busyLabel: "Replacing…",
-      action: async () => { await perform({ type: "restart_daemon" }, "Matching deck started and reconnected."); },
+      action: async () => { await perform({ type: "restart_daemon" }, "Matching daemon started and reconnected."); },
     });
   };
 
@@ -1231,8 +1493,8 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const requestConnectAnyway = () => {
     if (!snapshot.connection.buildStampMismatchOnly) return;
     setConfirm({
-      title: "Connect to a differently-built deck?",
-      body: "The wire protocol matched on both sides, so this deck and this app agree on the shape of everything they exchange. They were built from different commits, and a stamp difference can still mean divergent behaviour behind an identical wire — a field whose meaning changed while its shape did not. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
+      title: "Connect to a differently-built daemon?",
+      body: "The wire protocol matched on both sides, so this daemon and this app agree on the shape of everything they exchange. But a declared compatibility break separates the two builds — a field whose meaning changed while its shape did not — so some of what this daemon reports can be read with the wrong meaning. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
       label: "Connect anyway",
       busyLabel: "Connecting…",
       action: async () => {
@@ -1241,7 +1503,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           // The allowance is read by the NEXT handshake, so the reconnect is
           // what actually connects; the crate caches no verdict.
           await runtime.reconnect();
-          setNotice("Connected to the differently-built deck. The mismatch stays in the connection banner for this session.");
+          setNotice("Connected to the differently-built daemon. The mismatch stays in the connection banner for this session.");
         } catch (cause) {
           setNotice(cause instanceof Error ? cause.message : String(cause));
         }
@@ -1251,14 +1513,14 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
 
   const requestStartDaemon = () => {
     setConfirm({
-      title: "Start the local deck?",
-      body: "Agent Deck will start the deck on this machine and reconnect this control room. No agent is launched until you explicitly launch a workflow.",
-      label: "Start deck",
+      title: "Start the local daemon?",
+      body: "Agent Deck will start the daemon on this machine and reconnect this control room. No agent is started until you explicitly activate an orchestration.",
+      label: "Start daemon",
       busyLabel: "Starting…",
       action: async () => {
         try {
           await runtime.runAction({ type: "start_daemon" });
-          setNotice("Local deck started and control channel reconnected.");
+          setNotice("Local daemon started and control channel reconnected.");
         } catch (cause) {
           setNotice(cause instanceof Error ? cause.message : String(cause));
         }
@@ -1266,7 +1528,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
     });
   };
 
-  const requestLaunch = (config: WorkflowLaunchConfig) => {
+  const requestLaunch = (config: OrchestrationLaunchConfig) => {
     const generatedCount = config.roles.length - config.customCommandCount;
     const commandCopy = config.customCommandCount > 0
       ? `${generatedCount} commands are generated from their current profile fields; ${config.customCommandCount} explicit custom command override${config.customCommandCount === 1 ? " bypasses" : "s bypass"} those fields. Custom commands may carry arbitrary permissions and are not covered by structured permission claims.`
@@ -1275,21 +1537,47 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       ? ` Among generated commands, ${config.generatedFullAccessCount} role${config.generatedFullAccessCount === 1 ? " runs" : "s run"} unrestricted — Claude Code with bypassPermissions, or Codex with no sandbox — so ${config.generatedFullAccessCount === 1 ? "it acts" : "they act"} without asking.`
       : "";
     setConfirm({
-      title: `Launch ${config.displayName}?`,
-      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and sends your task prompt to the coordinator. ${commandCopy}${accessCopy} This launch does not rewrite project TOML.`,
-      label: "Launch live loop",
-      busyLabel: "Launching…",
+      title: `Activate ${config.displayName}?`,
+      // Issue #1044: the task is optional. Without one the orchestrator is still
+      // briefed — the daemon's context names its role and team — and then waits.
+      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and ${config.taskPrompt ? "sends your task prompt to the orchestrator" : "briefs the orchestrator with no task, so it waits for you to type one into its pane"}.${config.displayTitle ? ` The run is named ${displayText(config.displayTitle, DISPLAY_LIMITS.name)}.` : ""} ${commandCopy}${accessCopy} Activating does not rewrite project TOML.`,
+      label: "Activate orchestration",
+      busyLabel: "Activating…",
       action: async () => {
         try {
           // The display twins come off with the two counts: they exist for the
           // dialog and the notice, and the daemon gets the identities alone
           // (PRD #819 audit fix).
           const { customCommandCount: _customCommandCount, generatedFullAccessCount: _generatedFullAccessCount, displayName: _displayName, displayPath: _displayPath, ...launch } = config;
-          await runtime.runAction({ type: "start_workflow", ...launch });
-          setWorkflowOpen(false);
+          // `displayTitle` is NOT a display twin: it rides along as the run's
+          // title (issue #1044), absent when the Name was left empty. The
+          // sheet's collision check ran when Activate was pressed; it runs again
+          // here, against the titles live now, with the same refusal.
+          if (orchestrationLiveTitlesRef.current.includes(config.displayTitle ?? config.name)) {
+            setNotice(`Nothing was started: ${ORCHESTRATION_TITLE_TAKEN}`);
+            return;
+          }
+          await runtime.runAction({ type: "activate_orchestration", ...launch });
+          setOverlay("orchestration", false);
           await runtime.reconnect();
-          setNotice(`${config.displayName} launched with ${config.roles.length} configured roles.`);
+          setNotice(`${config.displayName} activated with ${config.roles.length} configured roles.`);
         } catch (cause) {
+          /*
+           * PRD #1223 audit V2 — FIRST, ahead of every refusal-code translation
+           * below. Each of those says "Nothing was started", and a launch whose
+           * rollback could not confirm a role stopped can carry one of their
+           * codes too: a `stale-preparation` refusal of a later role after an
+           * earlier one had started is exactly that composite. The roles arrive
+           * as data (`LaunchCleanupError`) and the runtime has already queued
+           * them as a warning of their own (issue #1234), so this only has to
+           * keep the untranslated sentence — the sentence itself stays the
+           * runtime's error, which takes the toast's place once this is
+           * dismissed.
+           */
+          if (cause instanceof LaunchCleanupError) {
+            setNotice(cause.message);
+            return;
+          }
           const message = cause instanceof Error ? cause.message : String(cause);
           /*
            * PRD #819 M6, state 2. The daemon re-resolves on launch, and
@@ -1303,9 +1591,9 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           if (message.includes(PROJECT_UNRESOLVED_CODE)) {
             projectState.clearSelection();
             void projectState.refresh();
-            setWorkflowOpen(false);
-            setProjectsOpen(true);
-            setNotice("That project is no longer one this deck knows — nothing is running there any more. Choose another, or paste its path again.");
+            setOverlay("orchestration", false);
+            VOICE_ACTIONS.openProjects.run(voiceContext);
+            setNotice("That project is no longer one this daemon knows — nothing is running there any more. Choose another, or paste its path again.");
             return;
           }
           /*
@@ -1316,7 +1604,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
            */
           if (message.includes(PROJECT_STALE_REVISION_CODE) && activeProject) {
             void projectState.select(activeProject.path);
-            setNotice("This project's .dot-agent-deck.toml changed since the workflows were listed, so nothing was started. It has been re-read — check the workflow and launch again.");
+            setNotice("This project's .dot-agent-deck.toml changed since the orchestrations were listed, so nothing was started. It has been re-read — check the orchestration and activate it again.");
             return;
           }
           /*
@@ -1331,8 +1619,8 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           if ((message.includes(PROJECT_STALE_PREPARATION_CODE) || message.includes(PROJECT_STALE_TOKEN_CODE)) && activeProject) {
             void projectState.select(activeProject.path);
             setNotice(message.includes(PROJECT_STALE_PREPARATION_CODE)
-              ? "This launch's prepared coordinator context no longer matches what the deck approved — another launch in this project replaced it, or the project moved. Nothing was started. The project has been re-read; launch again to prepare a fresh one."
-              : "The deck no longer holds this launch's preparation — it expired, or the deck was replaced. Nothing was started. The project has been re-read; launch again to prepare a fresh one.");
+              ? "This launch's prepared orchestrator context no longer matches what the daemon approved — another launch in this project replaced it, or the project moved. Nothing was started. The project has been re-read; activate again to prepare a fresh one."
+              : "The daemon no longer holds this launch's preparation — it expired, or the daemon was replaced. Nothing was started. The project has been re-read; activate again to prepare a fresh one.");
             return;
           }
           /*
@@ -1342,7 +1630,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
            * sentence already names what to do instead, so pass it through.
            */
           if (message.includes(PROJECT_UNSUPPORTED_PLATFORM_CODE)) {
-            setWorkflowOpen(false);
+            setOverlay("orchestration", false);
             setNotice(message);
             return;
           }
@@ -1381,44 +1669,28 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
    * registry key per live agent.
    */
   const commandItems = [
-    ...(coordinator ? [{ label: "Message coordinator…", hint: `Focus ${coordinator.displayName}'s terminal`, icon: Send, run: () => VOICE_ACTIONS.messageCoordinator.run(voiceContext, { agentId: coordinator.id }) }] : []),
-    { label: "Manage projects", hint: "Choose repositories & workflows", icon: FolderGit2, run: () => VOICE_ACTIONS.openProjects.run(voiceContext) },
-    { label: "Open prompt library", hint: "Reusable workflow launch prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) },
-    { label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => VOICE_ACTIONS.openAgentProfiles.run(voiceContext) },
-    { label: "Edit workflow order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openWorkflowOrder.run(voiceContext) },
+    ...(coordinator ? [{ label: "Message orchestrator…", hint: `Focus ${coordinator.displayName}'s terminal`, icon: Send, run: () => VOICE_ACTIONS.messageCoordinator.run(voiceContext, { agentId: coordinator.id }) }] : []),
+    /* Issue #1198 — each experimental panel's entry follows its own field, as
+       its rail entry does. The palette itself is the deck's (it is bound here,
+       and the deck is unmounted while `showDeck` is off), so it needs no gate
+       of its own. NOT gated, and named so the residual is known: the panels'
+       in-deck doors — the run graph's Edit loop, the empty deck's Configure
+       agents, and the Projects ↔ Orchestrations cross-links inside those panels.
+       Each sits inside a surface that is itself hidden with the flag off, and
+       all five fields follow the one flag today; if they ever diverge, those
+       doors need gates of their own. */
+    ...(features.showProjects ? [{ label: "Manage projects", hint: "Choose projects & orchestrations", icon: FolderGit2, run: () => VOICE_ACTIONS.openProjects.run(voiceContext) }] : []),
+    ...(features.showPrompts ? [{ label: "Open prompt library", hint: "Reusable orchestration task prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) }] : []),
+    ...(features.showAgentProfiles ? [{ label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => VOICE_ACTIONS.openAgentProfiles.run(voiceContext) }] : []),
+    ...(features.showOrchestrations ? [{ label: "Edit orchestration order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext) }] : []),
     { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => VOICE_ACTIONS.openSettings.run(voiceContext) },
-    { label: evidenceOpen ? "Hide evidence drawer" : "Show evidence drawer", hint: "Toggle transition evidence", icon: PanelRight, run: () => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext) },
+    { label: evidenceOpen ? "Hide events drawer" : "Show events drawer", hint: "Toggle transition events", icon: PanelRight, run: () => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext) },
     ...snapshot.agents.map((agent, index) => ({ label: `Focus ${agent.role}`, hint: `Shortcut ${index + 1}`, icon: SquareTerminal, run: () => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id }) })),
     ...(mode === "fixture" ? [{ label: "Advance fixture", hint: "Move the deterministic loop one node", icon: Zap, run: () => VOICE_ACTIONS.advanceFixture.run(voiceContext) }] : []),
   ];
 
   return (
-    <div className={`control-deck ${evidenceOpen ? "with-evidence" : ""}`}>
-      <aside className="rail" aria-label="Primary navigation">
-        <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
-        <nav>
-          {/* PRD #802 M2: every one of these dispatches through the action registry. */}
-          <RailButton icon={FolderGit2} label="Projects" active={projectsOpen} onClick={() => VOICE_ACTIONS.openProjects.run(voiceContext)} testId="open-projects" />
-          <RailButton icon={Activity} label="Runs" active={!projectsOpen && !workflowOpen && !profilesOpen && !promptsOpen && !settingsOpen} onClick={() => VOICE_ACTIONS.showRuns.run(voiceContext)} />
-          {/* The one rail button that is a real view rather than an overlay toggle. */}
-          <RailButton icon={LayoutList} label="Overview" onClick={() => VOICE_ACTIONS.openOverview.run(voiceContext)} testId="open-overview" />
-          <RailButton icon={BookMarked} label="Prompts" active={promptsOpen} onClick={() => VOICE_ACTIONS.openPromptLibrary.run(voiceContext)} testId="open-prompts" />
-          <RailButton icon={Network} label="Workflows" active={workflowOpen} onClick={() => VOICE_ACTIONS.openWorkflowOrder.run(voiceContext)} />
-          <RailButton icon={Bot} label="Agent Profiles" active={profilesOpen} onClick={() => VOICE_ACTIONS.openAgentProfiles.run(voiceContext)} testId="open-agent-profiles" />
-          <RailButton icon={Settings2} label="Settings" active={settingsOpen} onClick={() => VOICE_ACTIONS.openSettings.run(voiceContext)} testId="open-settings" />
-        </nav>
-        <div className="rail-bottom">
-          <button aria-label="Keyboard shortcuts" title="Keyboard shortcuts" onClick={() => setHelpOpen(true)}><Keyboard size={18} /></button>
-          {/* PRD #741 final audit F5: `connection.message` is daemon-supplied —
-              it embeds the REMOTE daemon's `build_version`, which is an
-              unvalidated string on the wire — and `safe_message` on the Rust
-              side covers category `Cc` only, so the bidi controls reach here
-              intact. Same seam treatment as every other daemon string on this
-              screen. */}
-          <span className={`connection-lamp connection-${snapshot.connection.status}`} title={snapshot.connection.message && displayText(snapshot.connection.message, DISPLAY_LIMITS.message)} />
-        </div>
-      </aside>
-
+    <div className={`control-deck ${evidenceOpen && !allDecks ? "with-evidence" : ""}`}>
       <main className="deck-main">
         <header className="topbar">
           <div className="repo-context">
@@ -1449,31 +1721,31 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
             */}
             <DeckSelector settings={settings} connection={snapshot.connection} />
           </div>
-          <div className="run-instruments">
+          {!allDecks && <div className="run-instruments">
             <Instrument label="HEALTH" testId="run-health"><span className={`health-value health-${snapshot.health}`}><i />{snapshot.health}</span></Instrument>
             <Instrument label="NODE"><strong>{String(snapshot.currentNode).padStart(2, "0")}<em>/{String(snapshot.totalNodes).padStart(2, "0")}</em></strong></Instrument>
             {/* Em dash, this deck's established "not known": no daemon tracks an attempt count (PRD #745 M8). */}
             <Instrument label="ATTEMPT"><strong>{snapshot.currentAttempt === undefined ? "—" : String(snapshot.currentAttempt).padStart(2, "0")}</strong></Instrument>
             <Instrument label="ELAPSED"><strong>{snapshot.elapsed}</strong></Instrument>
             <Instrument label="SPEND"><strong>{mode === "fixture" ? `$${snapshot.spend.toFixed(2)}` : "—"}</strong></Instrument>
-          </div>
+          </div>}
           <div className="top-actions">
             <button className="command-trigger" onClick={() => setPaletteOpen(true)}><Search size={14} /><span>Command</span><kbd>⌘ K</kbd></button>
             <button
               className="button secondary compact"
               data-testid="pause-run"
               disabled={mode === "live" || snapshot.connection.status !== "connected"}
-              title={mode === "live" ? "Whole-run pause is not yet exposed by the deck" : snapshot.paused ? "Resume fixture run" : "Pause fixture run"}
+              title={mode === "live" ? "Whole-run pause is not yet exposed by the daemon" : snapshot.paused ? "Resume fixture run" : "Pause fixture run"}
               onClick={() => void perform({ type: snapshot.paused ? "resume_run" : "pause_run" }, snapshot.paused ? "Fixture resumed." : "Fixture paused.")}
             >{snapshot.paused ? <Play size={14} /> : <Pause size={14} />}<span>{snapshot.paused ? "Resume" : "Pause"}</span></button>
             <button
               className="button danger compact"
               data-testid="stop-run"
-              aria-label={selectedAgent ? `Stop ${selectedAgent.role}` : "Stop deck"}
-              title={selectedAgent ? `Stop ${selectedAgent.role}` : canControlDaemon ? "Stop the local deck" : snapshot.connection.localOnlyReason ?? "Deck is not connected"}
+              aria-label={selectedAgent ? `Close ${selectedAgent.role}` : "Stop daemon"}
+              title={selectedAgent ? `Close ${selectedAgent.role}` : canControlDaemon ? "Stop the local daemon" : snapshot.connection.localOnlyReason ?? "Daemon is not connected"}
               disabled={!selectedAgent && !canControlDaemon}
               onClick={requestStop}
-            ><CircleStop size={14} /><span>Stop</span></button>
+            ><CircleStop size={14} /><span>{selectedAgent ? "Close" : "Stop"}</span></button>
           </div>
         </header>
 
@@ -1496,7 +1768,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         {(snapshot.connection.status !== "connected" || snapshot.connection.buildStampMismatchOnly || snapshot.connection.selectionFallback) && (
           <div className={`connection-banner connection-${snapshot.connection.status}`} role="alert">
             {snapshot.connection.status === "loading" ? <RefreshCw className="spin" size={16} /> : <ShieldAlert size={16} />}
-            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? (snapshot.connection.selectionFallback ? "Using the deck on this machine" : "Connected to a differently-built deck") : snapshot.connection.status === "error" ? "Desktop bridge error" : "Deck disconnected"}</strong><span data-testid="connection-banner-message">{snapshot.connection.message && displayText(snapshot.connection.message, DISPLAY_LIMITS.message)}</span>{/*
+            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? (snapshot.connection.selectionFallback ? "Using the daemon on this machine" : "Connected to a differently-built daemon") : snapshot.connection.status === "error" ? "Desktop bridge error" : "Daemon disconnected"}</strong><span data-testid="connection-banner-message">{snapshot.connection.message && displayText(snapshot.connection.message, DISPLAY_LIMITS.message)}</span>{/*
               PRD #741 M7. The stored selection could not be honoured, so the
               app is on the local deck — and it says which of the two reasons it
               was. This is why the banner's condition now includes it: a
@@ -1504,12 +1776,22 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
               the substitution would be silent, and acting on the wrong machine's
               agents is the outcome that makes it worth a row.
             */}{snapshot.connection.selectionFallback && <span data-testid="selection-fallback">{displayText(snapshot.connection.selectionFallback, DISPLAY_LIMITS.message)}</span>}{/* PRD #741 M7: why Start and Replace are absent, said once, where they would have been. */}{remoteDeck && snapshot.connection.localOnlyReason && <span data-testid="remote-deck-notice">{displayText(snapshot.connection.localOnlyReason, DISPLAY_LIMITS.message)}</span>}</div>
-            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && !remoteDeck && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start deck</button>}{mode === "live" && !remoteDeck && snapshot.connection.daemonDetected && snapshot.connection.status === "error" && snapshot.connection.runningAgentCount === 0 && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace deck</button>}{mode === "live" && snapshot.connection.status === "error" && snapshot.connection.buildStampMismatchOnly && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
+            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && !remoteDeck && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{mode === "live" && !remoteDeck && snapshot.connection.daemonDetected && snapshot.connection.status === "error" && snapshot.connection.runningAgentCount === 0 && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{mode === "live" && snapshot.connection.status === "error" && snapshot.connection.buildStampMismatchOnly && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
           </div>
         )}
 
-        <section className="workflow-strip" aria-labelledby="workflow-title">
-          <header><div><span className="section-kicker">RUN GRAPH</span><h1 id="workflow-title">Visible deterministic loop</h1></div><button onClick={() => setWorkflowOpen(true)}><SlidersHorizontal size={13} /> Edit loop</button></header>
+        {allDecks && (
+          <section className="workspace-section" aria-label="Select a daemon">
+            <SelectDeckNote testId="deck-select-deck" title="Select a daemon to see its runs">
+              <p>All daemons is every daemon at once, and this screen works on one: each tile here is a live terminal into that daemon&apos;s agents.</p>
+              <p className="overview-note-hint">Choose a daemon in the Daemon selector above. The dashboard shows every daemon together.</p>
+              <div><button className="button secondary" data-testid="deck-select-deck-overview" onClick={() => VOICE_ACTIONS.openOverview.run(voiceContext)}><LayoutList size={14} /> Open dashboard</button></div>
+            </SelectDeckNote>
+          </section>
+        )}
+
+        {!allDecks && <section className="workflow-strip" aria-labelledby="workflow-title">
+          <header><div><span className="section-kicker">RUN GRAPH</span><h1 id="workflow-title">Visible deterministic loop</h1></div><button onClick={() => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext)}><SlidersHorizontal size={13} /> Edit loop</button></header>
           <div className="workflow-track">
             {orderedStages.length ? orderedStages.map((stage, index) => (
               <div className={`workflow-node node-${stage.status} ${stage.enabled ? "" : "is-disabled"}`} key={stage.id} data-testid={`workflow-node-${stage.id}`}>
@@ -1517,16 +1799,16 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
                 <div><strong>{stage.label}</strong><small>{stage.enabled ? (stage.attempt === undefined ? stage.status : `${stage.status} · att ${stage.attempt}`) : "skipped"}</small></div>
                 {index < orderedStages.length - 1 && <i className="workflow-link" aria-hidden="true" />}
               </div>
-            )) : <div className="workflow-empty">No workflow nodes reported. Open <button onClick={() => setWorkflowOpen(true)}>Edit loop</button> to inspect configuration.</div>}
+            )) : <div className="workflow-empty">No workflow nodes reported. Open <button onClick={() => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext)}>Edit loop</button> to inspect configuration.</div>}
           </div>
-        </section>
+        </section>}
 
-        <HandoffRail handoffs={snapshot.handoffs} />
+        {!allDecks && <HandoffRail handoffs={snapshot.handoffs} />}
 
-        <section className="workspace-section" aria-label="Agent terminals">
+        {!allDecks && <section className="workspace-section" aria-label="Agent terminals">
           <header className="workspace-header">
             <div><span className="section-kicker">AGENT DECK</span><h2>Live work surfaces</h2></div>
-            <div className="workspace-tools"><span>{snapshot.agents.length} agents</span><span>{snapshot.agents.filter((agent) => agent.status === "running").length} active</span><button className={evidenceOpen ? "is-active" : ""} onClick={() => setEvidenceOpen((open) => !open)}><PanelRight size={14} /> Evidence</button></div>
+            <div className="workspace-tools"><span>{snapshot.agents.length} agents</span><span>{snapshot.agents.filter((agent) => agent.status === "running").length} active</span><button className={evidenceOpen ? "is-active" : ""} onClick={() => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext)}><PanelRight size={14} /> Events</button></div>
           </header>
           {snapshot.connection.status === "loading" && !snapshot.agents.length ? <LoadingDeck /> : snapshot.agents.length ? (
             <div className="agent-grid">
@@ -1554,12 +1836,13 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
                   evidence={snapshot.evidence}
                   inputResult={runtime.terminalInputResults?.[agentKey(agent.daemonId, agent.id)]}
                   terminalFocusToken={terminalFocus?.agentId === agent.id ? terminalFocus.token : 0}
-                  onSelect={() => setSelectedAgentId(agent.id)}
+                  onSelect={() => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id })}
+                  // voice-registry-exempt: a tile's own tab strip, a control inside one tile; `focusTerminal` writes the same map only to show the terminal it focuses
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}
                   onTerminalInput={runtime.sendTerminalInput}
                   onTerminalResize={runtime.resizeTerminal}
                   appliedGeometry={runtime.appliedGeometry?.[agentKey(agent.daemonId, agent.id)]}
-                  onEvidenceSelect={(id) => { setSelectedEvidenceId(id); setEvidenceOpen(true); }}
+                  onEvidenceSelect={(id) => { setSelectedEvidenceId(id); VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext, { open: true }); }}
                   onRename={mode === "live" ? renameAgent : undefined}
                   /*
                     Opening SELECTS as well, which is the difference between the
@@ -1574,60 +1857,135 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
                 />
               ))}
             </div>
-          ) : <EmptyDeck onReconnect={() => void runtime.reconnect()} onProfiles={() => setProfilesOpen(true)} />}
-        </section>
+          ) : <EmptyDeck onReconnect={() => void runtime.reconnect()} onProfiles={() => VOICE_ACTIONS.openAgentProfiles.run(voiceContext)} />}
+        </section>}
       </main>
 
-      {evidenceOpen && <EvidenceDrawer evidence={snapshot.evidence} selected={selectedEvidence} onSelect={setSelectedEvidenceId} onClose={() => setEvidenceOpen(false)} />}
+      {evidenceOpen && !allDecks && <EvidenceDrawer evidence={snapshot.evidence} selected={selectedEvidence} onSelect={setSelectedEvidenceId} onClose={() => setEvidenceOpen(false)} />}
 
       <ProjectsPanel
         open={projectsOpen}
         state={projectState}
-        onClose={() => setProjectsOpen(false)}
-        onConfigureWorkflow={() => { setProjectsOpen(false); setWorkflowOpen(true); }}
+        onClose={() => setOverlay("projects", false)}
+        onConfigureOrchestration={() => { setOverlay("projects", false); VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext); }}
+        allDecks={allDecks}
       />
       <PromptLibraryPanel
         open={promptsOpen}
         prompts={prompts}
         selectedId={selectedPromptId}
         onSelect={setSelectedPromptId}
-        onClose={() => setPromptsOpen(false)}
+        onClose={() => setOverlay("prompts", false)}
         onAdd={() => setSelectedPromptId(addPrompt())}
         onUpdate={updatePrompt}
         onRemove={(id) => { removePrompt(id); setNotice("Prompt removed from this device's library."); }}
       />
-      <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <WorkflowPanel key={activeProject?.path ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setWorkflowOpen(false); setProjectsOpen(true); }} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} />
-      {/*
-        PRD #741 M10. The provider is mounted HERE rather than inside the sheet,
-        because `SettingsSheet` is a #803-owned rendering component and the
-        contract it keeps is that a feature adding a section never opens it. The
-        deck already holds the runtime, so this is where the bridge is; see
-        `lib/settingsBridge.tsx` for why it is a context and not a fifth panel
-        prop.
-      */}
-      <SettingsBridgeProvider value={settingsBridge}>
-        <SettingsSheet
-          open={settingsOpen}
-          onClose={() => setSettingsOpen(false)}
-          settings={settings.settings}
-          onSave={settings.save}
-          saveError={settings.saveError}
-          path={settings.path}
-          loaded={settings.loaded}
-          mode={mode}
-        />
-      </SettingsBridgeProvider>
+      <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setOverlay("profiles", false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
+      <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOverlay("orchestration", false); VOICE_ACTIONS.openProjects.run(voiceContext); }} onClose={() => setOverlay("orchestration", false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={orchestrationPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} liveTitles={orchestrationLiveTitles} liveDirectories={orchestrationLiveDirectories} deckId={orchestrationDeckId} />
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
-      {(notice || runtime.error) && <div className="toast" data-testid="toast" role="status"><AlertTriangle size={15} /><span>{notice ?? runtime.error}</span><button aria-label="Dismiss message" onClick={dismissToast}><X size={14} /></button></div>}
+      {/* PRD #1223 audit V7: the roles a rollback could not confirm are shown
+          above the sentence — since issue #1234 from the runtime's own queue,
+          whether the sentence is a notice or the runtime's error. The overview
+          mounts its own copy of this over `runtime.error` alone (audit W2) —
+          it has no notice of its own, and it is not mounted at the same time
+          as this one. */}
+      <Toast message={notice || runtime.error} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
     </div>
   );
 }
 
-function RailButton({ icon: Icon, label, active, onClick, testId }: { icon: typeof Activity; label: string; active?: boolean; onClick: () => void; testId?: string }) {
-  return <button className={active ? "is-active" : ""} aria-current={active ? "page" : undefined} title={label} onClick={onClick} data-testid={testId}><Icon size={18} /><span>{label}</span></button>;
+/**
+ * The one message surface either screen shows: a failed action's sentence, the
+ * roles a rollback could not confirm are stopped above it, and a dismiss each.
+ *
+ * One component rather than markup per screen (PRD #1223 audit W2). The deck
+ * had the only copy, and the overview mounts INSTEAD of the deck — so a launch
+ * that failed after the New agent dialog was gone, which is the case the
+ * runtime holds these roles for at all, was reported on a screen the user was
+ * no longer on. The overview's Refresh then cleared it unseen.
+ *
+ * The message goes through `displayText` like every other daemon-influenced
+ * string here, because a role name reaches it inside the failure sentence.
+ *
+ * # The warnings are not the message (issue #1234)
+ *
+ * Each cleanup warning is its own box with its own dismiss, rendered whether or
+ * not there is a sentence at all: the sentence is one replaceable slot — a
+ * later failure, a new action, `reconnect()` or a deck notice takes its place —
+ * while a warning that roles may still be running ends only when the user
+ * dismisses THAT warning.
+ */
+function Toast({ message, onDismiss, warnings, onDismissWarning }: { message?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void }) {
+  /* The newest entries are at the bottom, so an overflowing stack is kept
+     scrolled there whenever something is added or the message changes. */
+  const stack = useRef<HTMLDivElement>(null);
+  const newestWarning = warnings?.at(-1)?.id;
+  useEffect(() => {
+    if (stack.current) stack.current.scrollTop = stack.current.scrollHeight;
+  }, [newestWarning, message]);
+  if (!message && !warnings?.length) return null;
+  return (
+    <div className="toast-stack" ref={stack}>
+      {warnings?.map((warning) => (
+        <div key={warning.id} className="toast" data-testid="cleanup-toast">
+          <AlertTriangle size={15} />
+          <CleanupWarning stops={warning.stops} deck={warning.deck} testId="toast-cleanup-warning" className="toast-body" />
+          <button aria-label="Dismiss cleanup warning" onClick={() => onDismissWarning?.(warning.id)}><X size={14} /></button>
+        </div>
+      ))}
+      {message && (
+        <div className="toast" data-testid="toast" role="status">
+          <AlertTriangle size={15} />
+          <div className="toast-body">
+            <span>{displayText(message, DISPLAY_LIMITS.message)}</span>
+          </div>
+          <button aria-label="Dismiss message" onClick={onDismiss}><X size={14} /></button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The Settings sheet, mounted by the shell rather than by a screen (issue
+ * #1197), because the one rail offers Settings on the overview as well as on
+ * the deck.
+ *
+ * PRD #741 M10. The provider is mounted HERE rather than inside the sheet,
+ * because `SettingsSheet` is a #803-owned rendering component and the contract
+ * it keeps is that a feature adding a section never opens it. The shell already
+ * holds the runtime, so this is where the bridge is; see
+ * `lib/settingsBridge.tsx` for why it is a context and not a fifth panel prop.
+ */
+function ShellSettings({ runtime, settings, open, onClose }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; open: boolean; onClose: () => void }) {
+  // Memoised so the context value is stable across renders; `runtime.testEndpoint`
+  // is itself stable for the lifetime of the bridge.
+  const settingsBridge = useMemo(
+    () => ({
+      testEndpoint: runtime.testEndpoint,
+      secretStatus: runtime.secretStatus,
+      storeSecret: runtime.storeSecret,
+      forgetSecret: runtime.forgetSecret,
+    }),
+    [runtime.testEndpoint, runtime.secretStatus, runtime.storeSecret, runtime.forgetSecret],
+  );
+  return (
+    <SettingsBridgeProvider value={settingsBridge}>
+      <SettingsSheet
+        open={open}
+        onClose={onClose}
+        settings={settings.settings}
+        onSave={settings.save}
+        saveError={settings.saveError}
+        path={settings.path}
+        problem={settings.problem}
+        loaded={settings.loaded}
+        mode={runtime.mode}
+      />
+    </SettingsBridgeProvider>
+  );
 }
 
 function Instrument({ label, children, testId }: { label: string; children: ReactNode; testId?: string }) {
@@ -1636,17 +1994,17 @@ function Instrument({ label, children, testId }: { label: string; children: Reac
 
 function EvidenceDrawer({ evidence, selected, onSelect, onClose }: { evidence: EvidenceItem[]; selected?: EvidenceItem; onSelect: (id: string) => void; onClose: () => void }) {
   return (
-    <aside className="evidence-drawer" data-testid="evidence-drawer" aria-label="Transition evidence">
-      <header><div><span className="section-kicker">EVENT LEDGER</span><h2>Transition evidence</h2></div><button aria-label="Close evidence drawer" onClick={onClose}><X size={16} /></button></header>
+    <aside className="evidence-drawer" data-testid="evidence-drawer" aria-label="Transition events">
+      <header><div><span className="section-kicker">EVENTS</span><h2>Transition events</h2></div><button aria-label="Close events drawer" onClick={onClose}><X size={16} /></button></header>
       <div className="evidence-filter"><button className="is-active">All <span>{evidence.length}</span></button><button>Failures <span>{evidence.filter((item) => item.verdict === "FIX" || item.verdict === "ERROR").length}</span></button></div>
-      <div className="evidence-list" role="listbox" aria-label="Run evidence">
+      <div className="evidence-list" role="listbox" aria-label="Events">
         {evidence.length ? evidence.map((item) => (
           <button key={item.id} role="option" aria-selected={item.id === selected?.id} className={item.id === selected?.id ? "is-active" : ""} onClick={() => onSelect(item.id)}>
             <span className={`verdict verdict-${item.verdict.toLowerCase()}`}>{item.verdict}</span>
             <div><strong>{item.title}</strong><small>{item.to ? <>{item.from} <ArrowRight size={10} /> {item.to}</> : item.from}</small></div>
             <time>{item.at}</time>
           </button>
-        )) : <div className="evidence-empty"><History size={20} /><strong>No events yet</strong><span>Live hook and handoff events appear here as agents work — delegations, deliveries, failures, and work-done reports included.</span></div>}
+        )) : <div className="evidence-empty"><History size={20} /><strong>No events yet</strong><span>Live hook and delegation events appear here as agents work — delegations, deliveries, failures, and work-done reports included.</span></div>}
       </div>
       {selected && (
         <div className="evidence-detail">
@@ -1667,16 +2025,16 @@ function LoadingDeck() {
 }
 
 function EmptyDeck({ onReconnect, onProfiles }: { onReconnect: () => void; onProfiles: () => void }) {
-  return <div className="empty-deck"><Blocks size={28} /><h3>No active agent surfaces</h3><p>Connect to a running deck or prepare agent profiles before starting the loop.</p><div><button className="button secondary" onClick={onProfiles}><Bot size={14} /> Configure agents</button><button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button></div></div>;
+  return <div className="empty-deck"><Blocks size={28} /><h3>No active agent surfaces</h3><p>Connect to a running daemon or prepare agent profiles before activating an orchestration.</p><div><button className="button secondary" onClick={onProfiles}><Bot size={14} /> Configure agents</button><button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button></div></div>;
 }
 
 function CommandPalette({ commands, onClose }: { commands: { label: string; hint: string; icon: typeof Bot; run: () => void }[]; onClose: () => void }) {
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(""); // voice-registry-exempt: the palette's search text
   const filtered = commands.filter((item) => `${item.label} ${item.hint}`.toLowerCase().includes(query.toLowerCase()));
   return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section className="command-palette" role="dialog" aria-modal="true" aria-label="Command menu" onMouseDown={(event) => event.stopPropagation()}><label><Search size={17} /><input autoFocus placeholder="Search controls, agents, and views…" value={query} onChange={(event) => setQuery(event.target.value)} /><kbd>ESC</kbd></label><div>{filtered.map(({ label, hint, icon: Icon, run }) => <button key={label} onClick={() => { run(); onClose(); }}><Icon size={16} /><span><strong>{label}</strong><small>{hint}</small></span><ChevronRight size={14} /></button>)}{!filtered.length && <p>No matching controls.</p>}</div><footer><span><Command size={12} /> local control surface</span><span><kbd>↵</kbd> select</span></footer></section></div>;
 }
 
 function ShortcutHelp({ onClose }: { onClose: () => void }) {
-  const shortcuts = [["⌘ K", "Command menu"], ["⌘/Ctrl + / − / 0", "Zoom in, out, reset"], ["1 — 4", "Focus agent"], ["J / K", "Move through evidence"], ["?", "Shortcut guide"], ["ESC", "Close overlay"]];
+  const shortcuts = [["⌘ K", "Command menu"], ["⌘/Ctrl + / − / 0", "Zoom in, out, reset"], ["1 — 4", "Focus agent"], ["J / K", "Move through events"], ["?", "Shortcut guide"], ["ESC", "Close overlay"]];
   return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section className="shortcut-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcut-title" onMouseDown={(event) => event.stopPropagation()}><header><div><HelpCircle size={18} /><h2 id="shortcut-title">Control keys</h2></div><button aria-label="Close shortcut guide" onClick={onClose}><X size={16} /></button></header>{shortcuts.map(([keys, label]) => <div key={keys}><span>{label}</span><kbd>{keys}</kbd></div>)}</section></div>;
 }

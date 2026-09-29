@@ -182,9 +182,9 @@ fn pane_input_008_stream_rejection_surfaces_feedback_and_exits_input_mode() {
 #[cfg(unix)]
 fn pane_input_007_orchestrator_prompt_retries_after_non_applied_result() {
     const MARKER: &str = "ORCHESTRATORRESULTMARKER20";
-    const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
+    const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context";
     let deck = TuiDeck::launch_with_fixture("send-result-orchestration");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     let script = deck.workdir().join("orchestrator-send-result.sh");
     write_executable(
         &script,

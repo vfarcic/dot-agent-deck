@@ -7,6 +7,7 @@ use dot_agent_deck::agent_pty::{
     AgentRecord, TabMembership, clamp_pty_dims, is_valid_cwd, is_valid_display_name,
     is_valid_orchestration_cwd, is_valid_pane_id_env,
 };
+use dot_agent_deck::authoring_seeds::AuthoringKind;
 use dot_agent_deck::daemon_client::Endpoint;
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
 use dot_agent_deck::event::{
@@ -131,6 +132,17 @@ pub struct DesktopSnapshot {
     /// question, and an answer from here would be one the crate would have to
     /// keep in step with a stream it does not observe.
     pub observed: Vec<ObservedDeckDto>,
+    /// The applied selection is **All Decks** (#1083).
+    ///
+    /// Under All Decks the selected deck's snapshot is the local deck's, only
+    /// because the watcher and the tunnels need an endpoint. The webview's
+    /// single-deck screens read this to show "Select a deck" instead of that
+    /// content. It is on the snapshot rather than left to the webview's settings
+    /// read because it then arrives WITH the content it qualifies: a start with
+    /// All Decks stored cannot render local tiles while that read is in flight.
+    /// A property of the applied document, like [`Self::fleet`], so every
+    /// deck's snapshot carries the same value.
+    pub all_decks: bool,
 }
 
 /// One deck the app connects to, named without having been heard from (PRD
@@ -268,7 +280,7 @@ pub struct DesktopConnection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_fallback: Option<String>,
     /// Why the project-aware surfaces — choosing a project, preparing and
-    /// launching a workflow — are unavailable against this daemon (PRD #741 M8).
+    /// activating an orchestration — are unavailable against this daemon (PRD #741 M8).
     ///
     /// **The field that replaces the build stamp as the thing a screen acts
     /// on.** It is derived from what the daemon ADVERTISED in its `Hello` reply,
@@ -285,6 +297,19 @@ pub struct DesktopConnection {
     /// "no sentence" is exactly what absence should mean.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_actions_reason: Option<String>,
+    /// Why the New agent flow cannot start anything on this deck (PRD #1223):
+    /// the deck does not advertise `list-directories`, and browsing is the
+    /// only way the flow chooses a directory. `None` means it can; omitted from
+    /// the wire when `None`, for [`Self::project_actions_reason`]'s reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_agent_reason: Option<String>,
+    /// Whether the deck honours the New agent directory browser's listing
+    /// options (issue #1240): it advertises `list-directories-options`, so the
+    /// browser offers Show hidden, lists symlinked directories and sends its
+    /// filter to the deck when the deck's own cap cut a listing short. Always on
+    /// the wire, like [`Self::build_stamp_mismatch_only`]: the dialog branches
+    /// on it to decide whether a control EXISTS.
+    pub listing_options: bool,
 }
 
 /// The three endpoint-shaped fields of [`DesktopConnection`], **for one deck**.
@@ -321,7 +346,7 @@ pub(crate) fn selection_fields(
         Endpoint::Remote(_) => "remote",
     };
     let local_only = endpoint
-        .require_local("Stop deck")
+        .require_local("Stop daemon")
         .err()
         .map(|error| safe_display_text(error.to_string()));
     (kind, local_only, selected_deck().fallback)
@@ -442,7 +467,31 @@ pub struct DesktopAgent {
     /// comparison is actually made against is the webview.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spawned_at_ms: Option<i64>,
+    /// Issue #714: why the agent is `blocked` — present only beside
+    /// `status: "blocked"`, copied from `SessionSnapshot.blocked`. Absent from an
+    /// older daemon, which never reports the status either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<DesktopBlocked>,
     pub tab: DesktopTab,
+}
+
+/// Issue #714: the webview's view of a `BlockedReason`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopBlocked {
+    /// `usage_limit`, `credits_depleted` or `unknown` — the daemon's wire value.
+    pub kind: &'static str,
+    /// When the agent reported the block, epoch milliseconds.
+    pub detected_at_ms: i64,
+    /// The agent's own error message. Agent-controlled text, so scrubbed of
+    /// control and bidi characters at this seam ([`safe_display_text`]) before
+    /// the webview sees it, and rendered through `displayText` there as well.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// When the provider said the limit resets, epoch milliseconds — absent
+    /// when it did not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -503,17 +552,75 @@ pub enum DesktopAction {
         #[serde(default)]
         start_if_missing: bool,
     },
+    /// Start one plain agent on the deck `deck_id` names (PRD #1223 M3).
     StartAgent {
+        /// The target deck's wire id — `connection.deckId`, the value
+        /// [`DeckScope::resolve`] accepts — and **required**, which is the
+        /// point. This arm used to read the applied selection through
+        /// `trusted_daemon()`, and under **All Decks** that resolves to the
+        /// local deck (#1083): the overview, the one screen that shows every
+        /// deck at once, would have started the agent on whichever deck
+        /// happened to be selected. A start with no deck is now refused at
+        /// decode rather than defaulted, so there is no selection-reading path
+        /// left to fall back to.
+        deck_id: String,
         command: Option<String>,
         cwd: Option<String>,
         display_name: Option<String>,
         rows: Option<u16>,
         cols: Option<u16>,
+        /// PRD #1223 M7: start an AUTHORING agent — the TUI's `schedule`,
+        /// `schedule: issues` or `dispatcher` option — whose seed the deck
+        /// composes and delivers once the agent is ready. Absent is a plain
+        /// agent, byte for byte what this action sent before.
+        ///
+        /// The crate's own closed enum rather than a string, so a kind this
+        /// build does not know fails the decode instead of reaching a deck as a
+        /// plain start with no seed — the failure the deck's capability gate
+        /// exists to prevent, one hop earlier.
+        #[serde(default)]
+        authoring_kind: Option<AuthoringKind>,
     },
-    StartWorkflow {
+    /// Start one of a project's orchestrations on the deck `deck_id` names,
+    /// the way the TUI's `Ctrl+n` does (PRD #1223 M6): no task prompt, the
+    /// form's Name as the run's title, and every role run with the command its
+    /// project config gives it — on the deck, which reads the config there.
+    ///
+    /// Not [`Self::ActivateOrchestration`], which is the Runs screen's launch and keeps
+    /// its own form rules (desktop profile commands, no Pi coordinator). The
+    /// two share the daemon verbs and the bridge's rollback
+    /// and coordinator-delivery machinery, and none of those form rules.
+    StartOrchestration {
+        /// The target deck's wire id, required for [`Self::StartAgent`]'s
+        /// reason.
+        deck_id: String,
+        /// The daemon-canonical project path the dialog's `ResolveProject`
+        /// answered with, **verbatim**.
+        path: String,
+        /// The orchestration name as that reply offered it, verbatim.
+        orchestration: String,
+        /// The run's title — the form's Name. Absent when the Name is empty,
+        /// which is the TUI's rule: the tab then takes the orchestration's name.
+        #[serde(default)]
+        display_title: Option<String>,
+        /// The `configRevision` the dialog resolved against, echoed to
+        /// `prepare-orchestration` as the Runs launch echoes it.
+        #[serde(default)]
+        config_revision: Option<String>,
+        rows: Option<u16>,
+        cols: Option<u16>,
+    },
+    ActivateOrchestration {
         /// The orchestration name, as offered by the daemon's
         /// `resolve-project` reply for `cwd`.
         name: String,
+        /// The run's title — the form's Name (issue #1044). Absent when the
+        /// Name is empty, which is the TUI's rule and
+        /// [`Self::StartOrchestration`]'s: the tab then takes the
+        /// orchestration's name. `#[serde(default)]`, so a webview built before
+        /// the field existed still launches, untitled.
+        #[serde(default)]
+        display_title: Option<String>,
         /// The daemon-**canonical** project path, exactly as
         /// `resolve-project` or `list-projects` spelled it. PRD #819 M6: the
         /// webview never derives this from its own environment and never
@@ -521,19 +628,40 @@ pub enum DesktopAction {
         /// basename and an empty orchestration name is derived from that
         /// basename (PRD #220).
         cwd: String,
+        /// The coordinator's task, which may be empty (issue #1044): the
+        /// daemon then composes the context without a task section and the
+        /// coordinator waits for the user's instructions, as under the TUI.
         task_prompt: String,
-        roles: Vec<WorkflowRoleInput>,
+        roles: Vec<OrchestrationRoleInput>,
         rows: Option<u16>,
         cols: Option<u16>,
         /// The `configRevision` the webview last resolved against, echoed
-        /// through to `prepare-workflow`. `#[serde(default)]` and absent means
+        /// through to `prepare-orchestration`. `#[serde(default)]` and absent means
         /// "no expectation": a launch assembled without a resolve still works,
         /// it just does not get the staleness check.
         #[serde(default)]
         config_revision: Option<String>,
     },
     StopAgent {
+        /// The deck the agent runs on — `connection.deckId`, resolved with
+        /// [`DeckScope::resolve`] exactly as the start actions resolve theirs
+        /// (PRD #1223 U4). This arm read the applied selection until then, so
+        /// under **All Decks**, which resolves to the local deck (#1083), an
+        /// agent started on another deck from the overview could not be
+        /// stopped without switching the selection first. Required, for
+        /// [`Self::StartAgent`]'s reason: a stop with no deck is refused at
+        /// decode rather than defaulted.
+        deck_id: String,
         agent_id: String,
+    },
+    /// PRD #1223 U4 — close a whole orchestration: stop every role the
+    /// webview's fleet entry lists for it, on the deck `deck_id` names,
+    /// concurrently. The TUI's Ctrl+W does the same over its tab's panes
+    /// (`close_panes_concurrently`); there is no orchestration-wide daemon
+    /// verb, and this adds none — it is `StopAgent` fanned out.
+    StopOrchestration {
+        deck_id: String,
+        roles: Vec<StopOrchestrationRole>,
     },
     StopDaemon {
         #[serde(default)]
@@ -564,13 +692,130 @@ pub enum DesktopAction {
     },
 }
 
+/// One role a [`DesktopAction::StopOrchestration`] stops: the deck's agent id,
+/// and the name the confirmation showed — which is what a role whose stop could
+/// not be confirmed is reported as. The name is display text only; nothing is
+/// resolved by it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkflowRoleInput {
+pub struct StopOrchestrationRole {
+    pub agent_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationRoleInput {
     pub role: String,
     pub command: String,
     #[serde(default)]
     pub start: bool,
+}
+
+/// What `desktop_run_action` rejects with (PRD #1223 audit F6).
+///
+/// **A bare string for every failure but one**, exactly as before this type
+/// existed — `#[serde(untagged)]` serialises [`Self::Message`] as the string
+/// itself, so every existing `catch` on the webview side reads the same value it
+/// always read. The one exception is a launch whose rollback could not confirm
+/// that every role it touched is stopped: that failure is an object carrying
+/// the list as data, so the webview can put "these may still be running" in
+/// front of the reader without parsing it back out of the prose — where it is
+/// the LAST clause, after the primary error and every started role's name, and
+/// so the first thing a display clamp cuts.
+///
+/// Serialize-only, so `untagged`'s deserialisation cost (see
+/// `settings::StageSpec`) does not arise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum DesktopActionError {
+    Message(String),
+    LaunchCleanup(DesktopLaunchCleanupFailure),
+}
+
+/// What `desktop_set_settings` rejects with (issue #1350's review).
+///
+/// A plain sentence — exactly what every failure rejected with before — except
+/// for a save that failed **after** its deck edits reached the shared
+/// `remotes.toml`: that rejects with `{ message, written }`, where `written` is
+/// the settings as both files now hold them, so the webview can show what is
+/// actually on disk instead of either the edit it asked for or the document it
+/// had before. A save refused because the deck list changed outside the app
+/// (`SaveFailure::deck_list_conflict`) wrote nothing and rejects the same way,
+/// for the same reason: the window's copy is stale.
+/// `desktop/src/lib/settingsError.ts` is the webview's half.
+///
+/// Serialize-only, like [`DesktopActionError`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum DesktopSettingsSaveError {
+    Message(String),
+    Partial(DesktopPartialSettingsSave),
+}
+
+/// A save whose deck edits landed and whose `desktop.toml` write did not, or
+/// one refused as a deck-list conflict — see [`DesktopSettingsSaveError`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopPartialSettingsSave {
+    /// The whole error, naming which half was saved, through [`safe_message`].
+    pub message: String,
+    /// The settings re-read from disk after the failure.
+    pub written: crate::settings::DesktopSettings,
+}
+
+impl From<String> for DesktopSettingsSaveError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+/// A failed launch that could not confirm its cleanup — see
+/// [`DesktopActionError`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopLaunchCleanupFailure {
+    /// The whole error, as a string rejection would have carried it.
+    pub message: String,
+    /// Every role the launch started, or may have started, whose stop it could
+    /// not confirm — each through [`safe_message`]. Never empty: a launch
+    /// whose cleanup was confirmed rejects with a plain
+    /// [`DesktopActionError::Message`].
+    pub unconfirmed_stops: Vec<String>,
+}
+
+impl DesktopActionError {
+    /// The sentence either variant carries.
+    #[cfg(test)]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Message(message) => message,
+            Self::LaunchCleanup(failure) => &failure.message,
+        }
+    }
+
+    /// A launch failure, as the variant its cleanup calls for.
+    pub fn launch(message: String, unconfirmed_stops: Vec<String>) -> Self {
+        if unconfirmed_stops.is_empty() {
+            return Self::Message(message);
+        }
+        Self::LaunchCleanup(DesktopLaunchCleanupFailure {
+            message,
+            unconfirmed_stops: unconfirmed_stops.iter().map(safe_message).collect(),
+        })
+    }
+}
+
+impl From<String> for DesktopActionError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<&str> for DesktopActionError {
+    fn from(message: &str) -> Self {
+        Self::Message(message.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -658,8 +903,8 @@ pub enum TerminalState {
 // kept the result as the ONLY copy. That breaks the principle the whole PRD
 // exists to establish — the daemon owns canonical identity — because the
 // desktop stores these values and later sends them back: `path` becomes
-// `PrepareWorkflow.cwd` and every `StartAgent.cwd`, an orchestration `name`
-// becomes `StartWorkflow.name`, a role `name` becomes the requested role and
+// `PrepareOrchestration.cwd` and every `StartAgent.cwd`, an orchestration `name`
+// becomes `ActivateOrchestration.name`, a role `name` becomes the requested role and
 // the pane's `display_name`, and `config_revision` is echoed back so a config
 // edited under the picker is refused. Two concrete failures followed:
 //
@@ -725,7 +970,7 @@ pub struct DesktopProjectListing {
 pub struct DesktopProject {
     /// The daemon-canonical absolute path, **byte for byte**. This is the
     /// identity, and the exact string that goes back on `resolve-project`,
-    /// `prepare-workflow` and every `StartAgent.cwd`. The webview must never
+    /// `prepare-orchestration` and every `StartAgent.cwd`. The webview must never
     /// re-spell it — and, since the audit fix, neither does this seam.
     pub path: String,
     /// [`Self::path`] made safe to render. Never sent anywhere.
@@ -760,7 +1005,7 @@ pub struct DesktopResolvedProject {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopOrchestration {
-    /// **Verbatim** — this goes back as `PrepareWorkflow.orchestration`, and a
+    /// **Verbatim** — this goes back as `PrepareOrchestration.orchestration`, and a
     /// name the daemon offered must be a name the daemon can find again.
     pub name: String,
     /// [`Self::name`] made safe to render.
@@ -772,7 +1017,7 @@ pub struct DesktopOrchestration {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopOrchestrationRole {
-    /// **Verbatim** — `order_workflow_roles` matches the requested roles against
+    /// **Verbatim** — `order_orchestration_roles` matches the requested roles against
     /// these by exact name, and the name becomes the pane's `display_name` and
     /// its `TabMembership.role_name`.
     pub name: String,
@@ -826,7 +1071,7 @@ pub(crate) fn map_resolved_project(project: ResolvedProject) -> DesktopResolvedP
     //
     // PRD #819 Greptile P2(e): PLATFORM-AWARE, and it used to split on `/`
     // alone. Project resolution is not refused on Windows — only
-    // `PrepareWorkflow` is, with `unsupported-platform`, because only its
+    // `PrepareOrchestration` is, with `unsupported-platform`, because only its
     // publish carries an owner-only guarantee it cannot deliver there. So a
     // Windows client lists and resolves, and a canonical Windows path
     // (`\\?\C:\Users\dev\project`) contains no `/` at all: the whole path
@@ -852,6 +1097,258 @@ pub(crate) fn map_resolved_project(project: ResolvedProject) -> DesktopResolvedP
     }
 }
 
+// ---------------------------------------------------------------------------
+// PRD #1223 M4 — the New agent dialog's two deck-targeted queries.
+//
+// Both answer about ONE named deck, and both can be answered "this deck cannot"
+// — a deck that predates the verb — which is a state the dialog degrades on
+// rather than an error, so it is a variant here rather than an `Err`. The
+// shapes follow the project DTOs above: every path is carried **verbatim**,
+// because it is what goes back to the daemon, and has a scrubbed display twin
+// beside it where it is rendered.
+// ---------------------------------------------------------------------------
+
+/// One directory of a deck's filesystem as that deck listed it, or the deck's
+/// answer that it has no listing verb.
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DesktopDirectoryListing {
+    Listing {
+        /// The daemon's canonical spelling of the directory, **byte for
+        /// byte** — for a typed path, what the flow carries from here on.
+        path: String,
+        /// `path` made safe to render. Never sent anywhere.
+        display_path: String,
+        /// The parent's canonical path as the daemon computed it, which is
+        /// what "up" sends. The webview never derives one by trimming `path`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
+        entries: Vec<DesktopDirectoryEntry>,
+        /// The daemon's entry cap or time budget cut the listing short.
+        truncated: bool,
+    },
+    /// The deck does not advertise `list-directories` — a deck older than PRD
+    /// #1223. The dialog never asks such a deck (its connection carries
+    /// `newAgentReason`, which disables it at the deck step), so this is the
+    /// crate's own answer should one be asked anyway.
+    Unsupported,
+}
+
+/// One subdirectory in a [`DesktopDirectoryListing`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopDirectoryEntry {
+    /// The canonical path the daemon joined, **verbatim**: the string entering
+    /// this directory sends back.
+    pub path: String,
+    /// The entry's name, made safe to render. Display-only.
+    pub display_name: String,
+    /// It holds a `.dot-agent-deck.toml` the daemon's project reader would open.
+    pub is_project: bool,
+    /// Issue #1240: the entry is a symlink the daemon listed by its target, so
+    /// [`Self::path`] is where it leads and need not lie under the listing.
+    pub is_symlink: bool,
+}
+
+/// Issue #1240: what the New agent dialog asks a deck to widen or narrow about
+/// one listing. Every field defaults to off, which is the PRD #1223 listing.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DesktopListingOptions {
+    /// List `.`-named directories too.
+    pub include_hidden: bool,
+    /// List symlinks to directories too, by their targets.
+    pub include_symlinks: bool,
+    /// Keep only directories whose name contains this, before the deck's cap.
+    pub filter: Option<String>,
+}
+
+impl DesktopDirectoryListing {
+    /// The listing variant, built from the daemon reply's parts.
+    ///
+    /// Takes parts rather than the root crate's reply type because the desktop
+    /// may not name that module: `xtask/linkage-check`'s rule 12 bounds which
+    /// root modules the production desktop reaches across, and the module that
+    /// owns the reply also owns a filesystem listing a client must never run.
+    pub(crate) fn listing(
+        path: String,
+        parent: Option<String>,
+        entries: impl IntoIterator<Item = (String, String, bool, bool)>,
+        truncated: bool,
+    ) -> Self {
+        Self::Listing {
+            display_path: display_only(&path),
+            path,
+            parent,
+            entries: entries
+                .into_iter()
+                .map(
+                    |(name, path, is_project, is_symlink)| DesktopDirectoryEntry {
+                        path,
+                        display_name: display_only(&name),
+                        is_project,
+                        is_symlink,
+                    },
+                )
+                .collect(),
+            truncated,
+        }
+    }
+}
+
+/// The orchestrations the New agent form can offer for one directory on one
+/// deck (PRD #1223 M6) — the deck's `ResolveProject` answer, or why there is
+/// nothing to offer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DesktopNewAgentOrchestrations {
+    /// The directory is a project on that deck. Its `path` is the deck's
+    /// canonical spelling, which is what the launch sends.
+    Project(DesktopResolvedProject),
+    /// The deck refused it with `ResolveProject`'s generic `unresolved` code —
+    /// an ordinary directory, which is a normal answer here and not an error.
+    NotProject,
+    /// The deck cannot launch an orchestration from this flow, and `reason`
+    /// says why: it lacks the project verbs (the connection's
+    /// `projectActionsReason`) or cannot start a role with its configured
+    /// command. The form withholds its orchestration chips and shows this.
+    Unsupported { reason: String },
+}
+
+/// What the New agent form needs to know about one deck, or the deck's answer
+/// that it cannot say.
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DesktopNewAgentOptions {
+    /// The deck answered `new-agent-options` about itself.
+    Deck {
+        /// The deck host's configured `default_command`, **verbatim** — it is
+        /// the Command field's first prefill and goes back on the start.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_command: Option<String>,
+        /// The deck host's configured `default_dir` (PRD #1223), canonical and
+        /// already vetted by the deck — absent when unset or unusable. It is
+        /// never rendered from here: the form sends it back as the first
+        /// directory listing's path, and what the user reads is that
+        /// listing's own `displayPath`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_dir: Option<String>,
+        /// The agent registry the DECK was built with, in its order.
+        agents: Vec<DesktopAgentOption>,
+        /// The deck's own experimental flag.
+        experimental: bool,
+        /// The authoring kinds the deck can compose a seed for.
+        authoring_kinds: Vec<String>,
+        /// The command this app last started a plain agent with on this deck.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_command: Option<String>,
+    },
+    /// The deck does not advertise `new-agent-options` — a deck older than PRD
+    /// #1223 — so nothing here comes from it.
+    Unsupported {
+        /// The agent registry compiled into THIS app, which is the only one
+        /// left to offer and is labelled as such by the form.
+        desktop_agents: Vec<DesktopAgentOption>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_command: Option<String>,
+    },
+}
+
+/// One entry of an agent registry, for the New agent form.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopAgentOption {
+    /// The registry's stable key (`claude`, `opencode`, …), verbatim.
+    pub id: String,
+    /// The registry's label, made safe to render.
+    pub display_name: String,
+    /// What choosing this agent writes into Command, **verbatim**.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_command: Option<String>,
+}
+
+impl DesktopAgentOption {
+    pub(crate) fn new(id: String, display_name: &str, default_command: Option<String>) -> Self {
+        Self {
+            id,
+            display_name: display_only(display_name),
+            default_command,
+        }
+    }
+}
+
+/// The agent registry compiled into this app, projected the way a deck
+/// projects its own for `new-agent-options`: each entry's first
+/// `detect_basenames` value as the id, its label, its default command, in
+/// registry order — and an entry with no basename left out rather than given an
+/// invented id.
+///
+/// This is the older-deck fallback's list and nothing else. A deck that answers
+/// the query supplies its own, because the agents a spawn can use are the ones
+/// the DECK's build knows.
+pub(crate) fn desktop_agent_registry() -> Vec<DesktopAgentOption> {
+    dot_agent_deck::agent_registry::ALL
+        .iter()
+        .filter_map(|spec| {
+            Some(DesktopAgentOption::new(
+                (*spec.detect_basenames.first()?).to_string(),
+                spec.label,
+                spec.default_command.map(str::to_string),
+            ))
+        })
+        .collect()
+}
+
+/// Which of the app's experimental surfaces this desktop process shows (issue
+/// #1198), for the webview to gate its render and navigation seams on.
+///
+/// Each field is ONE wrapper in the root crate's `features` module (CLAUDE.md
+/// #9), called in this process — so the flag is the desktop's own, read from
+/// this process's environment (`DOT_AGENT_DECK_EXPERIMENTAL`, or the file
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` names) with no project walk; see
+/// [`crate::init_features`]. It is deliberately NOT the per-deck
+/// `experimental` a deck reports in [`DesktopNewAgentOptions`]: these surfaces
+/// belong to the app, not to any one deck, and the app observes several.
+///
+/// All `false` is the shipped default. The overview, the agent overlay and
+/// Settings have no field because they are never gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopFeatures {
+    pub show_deck: bool,
+    pub show_projects: bool,
+    pub show_prompts: bool,
+    pub show_orchestrations: bool,
+    pub show_agent_profiles: bool,
+}
+
+impl DesktopFeatures {
+    /// The surfaces the process-global flag shows. Read through the wrappers
+    /// on each call; the flag behind them is resolved once at startup.
+    pub(crate) fn current() -> Self {
+        use dot_agent_deck::features;
+        Self {
+            show_deck: features::show_desktop_deck(),
+            show_projects: features::show_desktop_projects(),
+            show_prompts: features::show_desktop_prompts(),
+            show_orchestrations: features::show_desktop_orchestrations(),
+            show_agent_profiles: features::show_desktop_agent_profiles(),
+        }
+    }
+}
+
 /// The STRING-SHAPE check the desktop may make on a path the **user** typed,
 /// before spending a daemon round trip on it.
 ///
@@ -863,7 +1360,7 @@ pub(crate) fn map_resolved_project(project: ResolvedProject) -> DesktopResolvedP
 pub(crate) fn validate_pasted_project_path(path: &str) -> Result<(), String> {
     if !is_valid_orchestration_cwd(path) {
         return Err(
-            "enter an absolute directory path, without control characters, that the deck can see"
+            "enter an absolute directory path, without control characters, that the daemon can see"
                 .into(),
         );
     }
@@ -889,6 +1386,7 @@ fn session_status_name(status: &SessionStatus) -> &'static str {
         SessionStatus::WaitingForInput => "waiting_for_input",
         SessionStatus::Idle => "idle",
         SessionStatus::Error => "error",
+        SessionStatus::Blocked => "blocked",
         SessionStatus::Unknown => "unknown",
     }
 }
@@ -966,6 +1464,20 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         .and_then(|snapshot| snapshot.live_target.as_ref())
         .map(|target| write_lease_name(&target.writable));
     let last_activity_ms = live.and_then(|snapshot| snapshot.last_activity_ms);
+    // Issue #714: only beside the status it explains.
+    let blocked = live
+        .filter(|snapshot| snapshot.status == SessionStatus::Blocked)
+        .and_then(|snapshot| snapshot.blocked.as_ref())
+        .map(|reason| DesktopBlocked {
+            kind: reason.kind.as_wire(),
+            detected_at_ms: reason.detected_at_ms,
+            detail: reason
+                .detail
+                .as_deref()
+                .map(safe_display_text)
+                .filter(|detail| !detail.is_empty()),
+            resets_at_ms: reason.resets_at_ms,
+        });
     // PRD #745 M11: off the RECORD, not the live snapshot — the daemon knows
     // when it spawned a process whether or not that process has ever emitted an
     // event.
@@ -993,6 +1505,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         write_lease,
         last_activity_ms,
         spawned_at_ms,
+        blocked,
         tab,
     }
 }
@@ -1040,10 +1553,17 @@ pub(crate) fn safe_display_text(text: impl AsRef<str>) -> String {
 /// local deck was substituted — "that deck is gone" and "that deck has no
 /// socket path yet" are different things to tell a user, and neither is
 /// "connected to local".
+///
+/// `all_decks` is `true` under **All Decks**, where `endpoint` is the local
+/// deck only because the plumbing needs one (see
+/// `crate::settings::EndpointSettings::resolve`). It is what lets an operation
+/// that acts on one deck refuse instead of taking that local deck as the
+/// user's choice — [`DeckScope::one_selected`] (#1083).
 #[derive(Debug, Clone)]
 pub(crate) struct SelectedDeck {
     pub(crate) endpoint: Endpoint,
     pub(crate) fallback: Option<String>,
+    pub(crate) all_decks: bool,
 }
 
 impl Default for SelectedDeck {
@@ -1051,9 +1571,17 @@ impl Default for SelectedDeck {
         Self {
             endpoint: Endpoint::local(),
             fallback: None,
+            all_decks: false,
         }
     }
 }
+
+/// Why an operation that acts on ONE deck refused to run under **All Decks**
+/// (#1083). The webview gates these operations behind its "Select a deck"
+/// state first, so this is the backstop a user should not normally see — and
+/// it says what to do rather than what went wrong, like that state does.
+pub(crate) const ALL_DECKS_NEEDS_ONE_DECK: &str =
+    "All daemons is selected, which is every daemon at once. Select a daemon to act on one.";
 
 /// The applied selection — the deck in force AND the set the fleet observes, as
 /// **one value under one lock** (PRD #742 M8).
@@ -1226,6 +1754,7 @@ pub(crate) fn apply_settings_selection(
         fallback: resolved
             .fallback
             .map(|fallback| safe_display_text(fallback.to_string())),
+        all_decks: settings.selects_all_decks(),
     };
     let observed = settings.connectable_endpoints();
     if let Ok(mut slot) = APPLIED_SELECTION.write() {
@@ -1321,6 +1850,27 @@ impl DeckScope {
         }
     }
 
+    /// The selected deck, captured for an operation that acts on **one** deck
+    /// and has no deck of its own to name — or a refusal under **All Decks**.
+    ///
+    /// [`Self::selected`] answers All Decks with the local deck, which is right
+    /// for the plumbing that needs an endpoint and wrong for an operation: a
+    /// project listing, a workflow launch or a keystroke sent there would land
+    /// on this machine's deck because the user chose *every* deck (#1083). So
+    /// this refuses with [`ALL_DECKS_NEEDS_ONE_DECK`] instead, before any deck
+    /// is contacted. ONE read, so the flag and the endpoint describe the same
+    /// applied selection.
+    pub(crate) fn one_selected() -> Result<Self, String> {
+        let applied = applied_selection();
+        if applied.selected.all_decks {
+            return Err(ALL_DECKS_NEEDS_ONE_DECK.to_string());
+        }
+        Ok(Self {
+            endpoint: applied.selected.endpoint,
+            observed_generation: applied.observed_generation,
+        })
+    }
+
     /// The deck one wire id names, or the selected deck when the caller named
     /// none.
     ///
@@ -1370,7 +1920,7 @@ impl DeckScope {
             .find(|endpoint| deck_wire_id(endpoint) == deck_id)
             .ok_or_else(|| {
                 format!(
-                    "that deck is not one this app is observing: {}",
+                    "that daemon is not one this app is observing: {}",
                     safe_message(deck_id)
                 )
             })?;
@@ -1435,7 +1985,7 @@ impl DeckScope {
                 "the fleet changed while this operation was in flight, so nothing was published for {deck}"
             )
         } else {
-            format!("that deck left the fleet while this operation was in flight: {deck}")
+            format!("that daemon left the fleet while this operation was in flight: {deck}")
         })
     }
 
@@ -1608,6 +2158,11 @@ pub(crate) fn unconfigured_fleet() -> Vec<UnconfiguredDeckDto> {
 /// `fleet` with nothing here to name it would otherwise be an unnameable group.
 /// Deriving from here cannot produce one — every entry carries its own name —
 /// and the next arrival restates all three.
+/// Whether the applied selection is All Decks — [`DesktopSnapshot::all_decks`].
+pub(crate) fn all_decks_applied() -> bool {
+    selected_deck().all_decks
+}
+
 pub(crate) fn observed_fleet_decks() -> Vec<ObservedDeckDto> {
     observed_decks()
         .iter()
@@ -1625,7 +2180,8 @@ pub(crate) fn observed_fleet_decks() -> Vec<ObservedDeckDto> {
 /// [`crate::settings::SelectionFallback::NoRemoteSocket`] states in the
 /// selector's — deliberately the settings panel's own vocabulary rather than a
 /// third one, because a user who sees this is being sent to that panel.
-const UNCONFIGURED_DECK_REASON: &str = "Not configured yet — press Test connection in Settings.";
+pub(crate) const UNCONFIGURED_DECK_REASON: &str =
+    "Not configured yet — press Test connection in Settings.";
 
 /// The observed fleet as [`DesktopSnapshot::fleet`] carries it — every observed
 /// deck's [`deck_wire_id`], selected deck first, never empty (PRD #742 M5).
@@ -1712,6 +2268,8 @@ pub(crate) fn disconnected_snapshot(
             // Nothing was advertised because nothing answered. A disconnected
             // screen is already saying the only thing there is to say.
             project_actions_reason: None,
+            new_agent_reason: None,
+            listing_options: false,
         },
         agents: Vec::new(),
         // Issue #887: nothing answered, so this daemon reported no revision.
@@ -1721,6 +2279,7 @@ pub(crate) fn disconnected_snapshot(
         fleet: observed_fleet(),
         unconfigured: unconfigured_fleet(),
         observed: observed_fleet_decks(),
+        all_decks: all_decks_applied(),
     }
 }
 
@@ -1812,25 +2371,28 @@ pub(crate) fn mint_desktop_pane_id() -> String {
     pane_id
 }
 
-pub(crate) fn validate_workflow_shape(
+pub(crate) fn validate_orchestration_shape(
     name: &str,
     cwd: &str,
-    roles: &[WorkflowRoleInput],
+    roles: &[OrchestrationRoleInput],
     rows: u16,
     cols: u16,
 ) -> Result<(u16, u16), String> {
-    const MAX_WORKFLOW_ROLES: usize = 16;
+    const MAX_ORCHESTRATION_ROLES: usize = 16;
     if !is_valid_display_name(name) {
         return Err(
-            "workflow name is invalid, oversized, empty, or contains control characters".into(),
+            "orchestration name is invalid, oversized, empty, or contains control characters"
+                .into(),
         );
     }
     if !is_valid_orchestration_cwd(cwd) {
-        return Err("workflow cwd must be a valid absolute path without control characters".into());
+        return Err(
+            "orchestration cwd must be a valid absolute path without control characters".into(),
+        );
     }
-    if roles.is_empty() || roles.len() > MAX_WORKFLOW_ROLES {
+    if roles.is_empty() || roles.len() > MAX_ORCHESTRATION_ROLES {
         return Err(format!(
-            "workflow roles must contain 1..={MAX_WORKFLOW_ROLES} entries"
+            "orchestration roles must contain 1..={MAX_ORCHESTRATION_ROLES} entries"
         ));
     }
     let mut names = HashSet::with_capacity(roles.len());
@@ -1838,13 +2400,13 @@ pub(crate) fn validate_workflow_shape(
     for role in roles {
         if !is_valid_display_name(&role.role) {
             return Err(format!(
-                "invalid workflow role name: {}",
+                "invalid orchestration role name: {}",
                 safe_message(&role.role)
             ));
         }
         if !names.insert(role.role.as_str()) {
             return Err(format!(
-                "duplicate workflow role: {}",
+                "duplicate orchestration role: {}",
                 safe_message(&role.role)
             ));
         }
@@ -1853,16 +2415,18 @@ pub(crate) fn validate_workflow_shape(
     }
     if start_count != 1 {
         return Err(format!(
-            "workflow must define exactly one start role (found {start_count})"
+            "orchestration must define exactly one start role (found {start_count})"
         ));
     }
     validate_dimensions(rows, cols)
 }
 
-pub(crate) fn ensure_desktop_workflow_platform_supported(target_os: &str) -> Result<(), String> {
+pub(crate) fn ensure_desktop_orchestration_platform_supported(
+    target_os: &str,
+) -> Result<(), String> {
     if target_os == "windows" {
         return Err(
-            "desktop workflow launch is unavailable on Windows in this preview because profile commands are POSIX-shell quoted; use the TUI or launch commands manually until native Windows command construction is implemented"
+            "desktop orchestration activation is unavailable on Windows in this preview because profile commands are POSIX-shell quoted; use the TUI or run commands manually until native Windows command construction is implemented"
                 .into(),
         );
     }
@@ -2094,11 +2658,11 @@ mod tests {
         );
         let reason = local_only.expect("a remote deck must say why Stop and Replace are off");
         assert!(
-            reason.contains("Stop deck") && reason.contains("deploy@build-box"),
+            reason.contains("Stop daemon") && reason.contains("deploy@build-box"),
             "the explanation must name the operation and the deck: {reason}"
         );
         assert!(
-            reason.contains("not the machine that deck runs on"),
+            reason.contains("not the machine that daemon runs on"),
             "the explanation is `Endpoint::require_local`'s, not a second one written here: \
              {reason}"
         );
@@ -2365,6 +2929,7 @@ mod tests {
                 last_user_prompt: None,
                 live_target: None,
                 last_activity_ms: None,
+                blocked: None,
             }),
             spawned_at_ms: None,
             // Issue #856: as the DAEMON reported it. The fixture agent is
@@ -2452,6 +3017,47 @@ mod tests {
         // `agent_mapping_surfaces_the_spawn_instant_unchanged` for the present
         // case, which keeps `live` untouched).
         assert!(mapped.spawned_at_ms.is_none());
+    }
+
+    /// Issue #714: a quota-blocked session maps to its own `"blocked"` status,
+    /// its reason rides beside it with the agent-controlled detail scrubbed of
+    /// control and bidi characters, and the reason never outlives the status.
+    #[test]
+    fn blocked_status_maps_to_blocked_with_reason() {
+        assert_eq!(session_status_name(&SessionStatus::Blocked), "blocked");
+        let mut record = fixture_record();
+        let live = record
+            .live
+            .as_mut()
+            .expect("fixture carries a live snapshot");
+        live.status = SessionStatus::Blocked;
+        live.blocked = Some(dot_agent_deck::state::BlockedReason {
+            kind: dot_agent_deck::state::BlockedKind::CreditsDepleted,
+            detected_at_ms: 1_700_000_000_000,
+            detail: Some("purchase \u{202e}more\u{7} credits".to_string()),
+            resets_at_ms: Some(1_700_000_360_000),
+        });
+        let mapped = map_agent(record.clone());
+        assert_eq!(mapped.status, "blocked");
+        let blocked = mapped.blocked.as_ref().expect("reason carried");
+        assert_eq!(blocked.kind, "credits_depleted");
+        assert_eq!(blocked.detected_at_ms, 1_700_000_000_000);
+        assert_eq!(blocked.detail.as_deref(), Some("purchase more credits"));
+        let value = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(value["blocked"]["kind"], "credits_depleted");
+        assert_eq!(value["blocked"]["detectedAtMs"], 1_700_000_000_000_i64);
+        assert_eq!(value["blocked"]["resetsAtMs"], 1_700_000_360_000_i64);
+
+        // A reason beside any other status is not reported.
+        record.live.as_mut().unwrap().status = SessionStatus::Thinking;
+        let mapped = map_agent(record);
+        assert!(mapped.blocked.is_none());
+        assert!(
+            serde_json::to_value(&mapped)
+                .unwrap()
+                .get("blocked")
+                .is_none()
+        );
     }
 
     /// PRD #745 M8: the two `SessionSnapshot` fields the desktop's own DTO used
@@ -2624,6 +3230,7 @@ mod tests {
     fn profile_start_action_uses_camel_case_fields() {
         let action: DesktopAction = serde_json::from_value(serde_json::json!({
             "type": "start_agent",
+            "deckId": "deck-000000000000dec1",
             "command": "codex --model gpt-5.6-sol",
             "cwd": "/tmp/project",
             "displayName": "builder",
@@ -2634,12 +3241,129 @@ mod tests {
         assert!(matches!(
             action,
             DesktopAction::StartAgent {
+                deck_id,
                 display_name: Some(name),
                 rows: Some(30),
                 cols: Some(110),
                 ..
-            } if name == "builder"
+            } if name == "builder" && deck_id == "deck-000000000000dec1"
         ));
+    }
+
+    /// Scenario: the webview sends a `start_agent` that names no deck. It must
+    /// fail to decode — PRD #1223 M3 made `deckId` required so that a start can
+    /// never fall back to the applied selection, which under All Decks is the
+    /// local deck whatever the user was looking at (#1083).
+    #[test]
+    fn a_start_agent_action_without_a_deck_is_refused_at_decode() {
+        let refused = serde_json::from_value::<DesktopAction>(serde_json::json!({
+            "type": "start_agent",
+            "command": "codex"
+        }));
+        let error = match refused {
+            Ok(_) => panic!("a start with no deck must not decode"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("deckId"),
+            "the refusal names the field: {error}"
+        );
+    }
+
+    /// Scenario: the webview sends `start_agent` with an `authoringKind` (PRD
+    /// #1223 M7). Each of the three kinds decodes to the crate's own enum, an
+    /// absent one decodes as a plain start, and a kind this build does not know
+    /// fails the decode rather than reaching a deck as a plain start with no
+    /// seed.
+    #[test]
+    fn a_start_agent_action_carries_a_closed_authoring_kind() {
+        let decode = |kind: Option<&str>| {
+            let mut action = serde_json::json!({
+                "type": "start_agent",
+                "deckId": "deck-000000000000dec1",
+                "command": "claude",
+                "cwd": "/srv/repo",
+            });
+            if let Some(kind) = kind {
+                action["authoringKind"] = kind.into();
+            }
+            serde_json::from_value::<DesktopAction>(action)
+        };
+        for kind in AuthoringKind::ALL {
+            assert!(
+                matches!(
+                    decode(Some(kind.as_str())),
+                    Ok(DesktopAction::StartAgent { authoring_kind: Some(decoded), .. }) if decoded == kind
+                ),
+                "{} decodes",
+                kind.as_str()
+            );
+        }
+        assert!(matches!(
+            decode(None),
+            Ok(DesktopAction::StartAgent {
+                authoring_kind: None,
+                ..
+            })
+        ));
+        assert!(
+            decode(Some("orchestration")).is_err(),
+            "an unknown kind is refused at decode"
+        );
+    }
+
+    /// Scenario: the webview sends `start_orchestration` (PRD #1223 M6). The
+    /// deck, path and orchestration are required — a launch with no deck is
+    /// refused at decode rather than defaulted to the selection — and the run
+    /// title and config revision are optional and carried verbatim.
+    #[test]
+    fn a_start_orchestration_action_names_its_deck_and_carries_its_title() {
+        let decoded = serde_json::from_value::<DesktopAction>(serde_json::json!({
+            "type": "start_orchestration",
+            "deckId": "deck-000000000000dec1",
+            "path": "/srv/repo",
+            "orchestration": "loop",
+            "displayTitle": "repo-orchestrator-2",
+            "configRevision": "fnv1a128-00",
+        }));
+        assert!(matches!(
+            decoded,
+            Ok(DesktopAction::StartOrchestration {
+                ref deck_id,
+                ref path,
+                ref orchestration,
+                display_title: Some(ref title),
+                config_revision: Some(ref revision),
+                rows: None,
+                cols: None,
+            }) if deck_id == "deck-000000000000dec1"
+                && path == "/srv/repo"
+                && orchestration == "loop"
+                && title == "repo-orchestrator-2"
+                && revision == "fnv1a128-00"
+        ));
+        assert!(matches!(
+            serde_json::from_value::<DesktopAction>(serde_json::json!({
+                "type": "start_orchestration",
+                "deckId": "deck-000000000000dec1",
+                "path": "/srv/repo",
+                "orchestration": "loop",
+            })),
+            Ok(DesktopAction::StartOrchestration {
+                display_title: None,
+                config_revision: None,
+                ..
+            })
+        ));
+        assert!(
+            serde_json::from_value::<DesktopAction>(serde_json::json!({
+                "type": "start_orchestration",
+                "path": "/srv/repo",
+                "orchestration": "loop",
+            }))
+            .is_err(),
+            "a launch with no deck is refused at decode"
+        );
     }
 
     #[test]
@@ -2685,36 +3409,36 @@ mod tests {
     }
 
     #[test]
-    fn workflow_shape_requires_unique_roles_and_one_start() {
+    fn orchestration_shape_requires_unique_roles_and_one_start() {
         let roles = vec![
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "planner".into(),
                 command: "codex --model gpt-5.6-sol".into(),
                 start: true,
             },
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "builder".into(),
                 command: "codex --model gpt-5.6-sol".into(),
                 start: false,
             },
         ];
         assert_eq!(
-            validate_workflow_shape("loop", "/tmp/project", &roles, 50, 200).unwrap(),
+            validate_orchestration_shape("loop", "/tmp/project", &roles, 50, 200).unwrap(),
             (50, 200)
         );
         let mut duplicate = roles.clone();
         duplicate[1].role = "planner".into();
-        assert!(validate_workflow_shape("loop", "/tmp/project", &duplicate, 50, 200).is_err());
+        assert!(validate_orchestration_shape("loop", "/tmp/project", &duplicate, 50, 200).is_err());
         let mut no_start = roles;
         no_start[0].start = false;
-        assert!(validate_workflow_shape("loop", "/tmp/project", &no_start, 50, 200).is_err());
+        assert!(validate_orchestration_shape("loop", "/tmp/project", &no_start, 50, 200).is_err());
     }
 
     #[test]
-    fn desktop_workflow_platform_guard_blocks_windows_only() {
-        assert!(ensure_desktop_workflow_platform_supported("macos").is_ok());
-        assert!(ensure_desktop_workflow_platform_supported("linux").is_ok());
-        let error = ensure_desktop_workflow_platform_supported("windows").unwrap_err();
+    fn desktop_orchestration_platform_guard_blocks_windows_only() {
+        assert!(ensure_desktop_orchestration_platform_supported("macos").is_ok());
+        assert!(ensure_desktop_orchestration_platform_supported("linux").is_ok());
+        let error = ensure_desktop_orchestration_platform_supported("windows").unwrap_err();
         assert!(error.contains("unavailable on Windows"));
         assert!(error.contains("POSIX-shell quoted"));
     }
@@ -2740,7 +3464,7 @@ mod tests {
     /// Scenario: the daemon lists a project whose canonical path carries a
     /// strippable control character. The DTO must carry that path byte for
     /// byte — it is the string that goes back on `resolve-project`,
-    /// `prepare-workflow` and every `StartAgent.cwd` — while the display twin
+    /// `prepare-orchestration` and every `StartAgent.cwd` — while the display twin
     /// is scrubbed. `primary` is checked in the same test because the webview
     /// compares it against `path` to mark the active row: scrubbing one and not
     /// the other silently breaks that marker.
@@ -2801,7 +3525,7 @@ mod tests {
     /// must label it `project`, not with the whole path.
     ///
     /// PRD #819 Greptile P2(e). The basename used to be `path.rsplit('/')`, and
-    /// project resolution is NOT refused on Windows — only `PrepareWorkflow` is,
+    /// project resolution is NOT refused on Windows — only `PrepareOrchestration` is,
     /// with `unsupported-platform`, because only its publish carries an
     /// owner-only guarantee it cannot deliver there. So a Windows client lists
     /// and resolves, every segment fell out of the `/` split, and the whole path
@@ -2900,8 +3624,8 @@ mod tests {
 
     /// Scenario: an orchestration and one of its roles carry control
     /// characters. Both names are protocol identities — the orchestration's
-    /// goes back as `PrepareWorkflow.orchestration`, the role's is matched by
-    /// `order_workflow_roles` and becomes the pane's `display_name` — so both
+    /// goes back as `PrepareOrchestration.orchestration`, the role's is matched by
+    /// `order_orchestration_roles` and becomes the pane's `display_name` — so both
     /// cross verbatim, with escaped twins for the picker.
     #[test]
     fn orchestration_and_role_names_reach_the_daemon_unmodified() {
@@ -2928,25 +3652,84 @@ mod tests {
         assert!(orchestration.roles[0].start);
     }
 
+    /// Scenario (PRD #1223 audit F6): `desktop_run_action`'s rejection is the
+    /// bare string every webview `catch` already reads — including a launch
+    /// whose cleanup was confirmed — and only a launch that could not confirm
+    /// every stop rejects with an object carrying the roles as data.
+    #[test]
+    fn a_launch_rejection_carries_unconfirmed_stops_as_data_and_every_other_is_a_string() {
+        assert_eq!(
+            serde_json::to_value(DesktopActionError::from("deck refused")).unwrap(),
+            serde_json::json!("deck refused")
+        );
+        assert_eq!(
+            serde_json::to_value(DesktopActionError::launch(
+                "failed; stopped 2 already-started role(s)".into(),
+                Vec::new()
+            ))
+            .unwrap(),
+            serde_json::json!("failed; stopped 2 already-started role(s)"),
+            "a confirmed rollback needs no warning, so it keeps the string shape"
+        );
+        assert_eq!(
+            serde_json::to_value(DesktopActionError::launch(
+                "failed; cleanup could not confirm stop".into(),
+                vec!["reviewer".into(), "plan\u{1b}ner".into()]
+            ))
+            .unwrap(),
+            serde_json::json!({
+                "message": "failed; cleanup could not confirm stop",
+                "unconfirmedStops": ["reviewer", "planner"],
+            }),
+            "each role name goes through safe_message"
+        );
+    }
+
+    /// Issue #1350's review: `desktop_set_settings` rejects with a plain
+    /// string, as it always did, except for a save whose deck edits landed and
+    /// whose `desktop.toml` write did not — that one carries the settings as
+    /// they are on disk, for the webview to show.
+    #[test]
+    fn a_settings_rejection_is_a_string_unless_the_save_was_partial() {
+        assert_eq!(
+            serde_json::to_value(DesktopSettingsSaveError::from("disk full".to_string())).unwrap(),
+            serde_json::json!("disk full")
+        );
+        let written = crate::settings::DesktopSettings::default();
+        assert_eq!(
+            serde_json::to_value(DesktopSettingsSaveError::Partial(
+                DesktopPartialSettingsSave {
+                    message: "the deck list was saved".into(),
+                    written: written.clone(),
+                }
+            ))
+            .unwrap(),
+            serde_json::json!({
+                "message": "the deck list was saved",
+                "written": serde_json::to_value(&written).unwrap(),
+            })
+        );
+    }
+
     /// Scenario: the longest name the daemon will project is one this crate's
     /// own launch validation accepts. This is the consumer half of the limit
     /// reconciliation — the daemon's `MAX_PROJECTED_LAUNCH_NAME_BYTES` is now
     /// `agent_pty::DISPLAY_NAME_MAX_LEN`, so the offered set is the launchable
-    /// set and `validate_workflow_shape` cannot refuse a name the picker
+    /// set and `validate_orchestration_shape` cannot refuse a name the picker
     /// offered on length alone.
     #[test]
     fn the_longest_projected_name_passes_desktop_launch_validation() {
         use dot_agent_deck::project_resolve::MAX_PROJECTED_LAUNCH_NAME_BYTES;
 
         let at_ceiling = "n".repeat(MAX_PROJECTED_LAUNCH_NAME_BYTES);
-        let roles = vec![WorkflowRoleInput {
+        let roles = vec![OrchestrationRoleInput {
             role: at_ceiling.clone(),
             command: "claude".into(),
             start: true,
         }];
         assert!(
-            validate_workflow_shape(&at_ceiling, "/tmp/project", &roles, 32, 120).is_ok(),
-            "a workflow and role name at the daemon's projection ceiling must be launchable"
+            validate_orchestration_shape(&at_ceiling, "/tmp/project", &roles, 32, 120).is_ok(),
+            "an orchestration and role name at the daemon's projection ceiling must be launchable"
         );
     }
 
@@ -3060,5 +3843,82 @@ mod tests {
         });
 
         apply_settings_selection(&crate::settings::DesktopSettings::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1198 — the app-level experimental surfaces
+    // -----------------------------------------------------------------------
+
+    /// Serialises the tests that write the process-global `Features`. Under
+    /// nextest every test is its own process, so this only matters to a plain
+    /// `cargo test`, where they share one — the same shape as the root crate's
+    /// `tests/features.rs`. Nothing else in this crate's tests reads the flag.
+    static FEATURES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Puts back whatever `Features` a test found, even when it panics.
+    struct RestoreFeatures(dot_agent_deck::features::Features);
+
+    impl Drop for RestoreFeatures {
+        fn drop(&mut self) {
+            dot_agent_deck::features::set_for_test(self.0);
+        }
+    }
+
+    /// Every gated surface follows the one flag through its own wrapper: all
+    /// hidden while it is off — the shipped default — and all shown once it is
+    /// on, with no surface left behind in either direction.
+    #[test]
+    fn desktop_features_follow_the_experimental_flag() {
+        use dot_agent_deck::features::{self, Features};
+        let _lock = FEATURES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = RestoreFeatures(features::current());
+
+        features::set_for_test(Features::test_with(false));
+        assert_eq!(
+            DesktopFeatures::current(),
+            DesktopFeatures {
+                show_deck: false,
+                show_projects: false,
+                show_prompts: false,
+                show_orchestrations: false,
+                show_agent_profiles: false,
+            }
+        );
+
+        features::set_for_test(Features::test_with(true));
+        assert_eq!(
+            DesktopFeatures::current(),
+            DesktopFeatures {
+                show_deck: true,
+                show_projects: true,
+                show_prompts: true,
+                show_orchestrations: true,
+                show_agent_profiles: true,
+            }
+        );
+    }
+
+    /// The wire shape the webview's `DesktopFeaturesDto` reads: camelCase keys,
+    /// one per gated surface, and nothing else.
+    #[test]
+    fn desktop_features_serialise_in_camel_case() {
+        let value = serde_json::to_value(DesktopFeatures {
+            show_deck: true,
+            show_projects: false,
+            show_prompts: true,
+            show_orchestrations: false,
+            show_agent_profiles: true,
+        })
+        .expect("serialises");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "showDeck": true,
+                "showProjects": false,
+                "showPrompts": true,
+                "showOrchestrations": false,
+                "showAgentProfiles": true,
+            })
+        );
     }
 }

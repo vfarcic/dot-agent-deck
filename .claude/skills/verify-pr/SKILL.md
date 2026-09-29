@@ -60,7 +60,7 @@ Then read what the existing reviewers already found, per rule 8:
 gh api repos/{owner}/{repo}/pulls/<n>/comments --paginate
 ```
 
-That endpoint is the only place Greptile's P1/P2 findings live. The summary comment and the review state do not carry them, and a green `Greptile Review` check-run is **not** the review. Note which findings the author has already answered — do not re-litigate those, and do not pad your report by restating Greptile verbatim. Your job is what Greptile could not check: whether the thing actually works, and whether it obeys this repo's rules.
+That endpoint is the only place Greptile's P1/P2 findings live, and it carries Qodo's inline findings too (Qodo runs beside Greptile while it is evaluated — `docs/develop/governance.md`). The summary comment and the review state do not carry them, and a green `Greptile Review` check-run is **not** the review. Note which findings the author has already answered — do not re-litigate those, and do not pad your report by restating Greptile verbatim. Your job is what Greptile could not check: whether the thing actually works, and whether it obeys this repo's rules.
 
 ## Phase 1 — Isolate
 
@@ -260,8 +260,8 @@ UNVERIFIED. Nothing in CI covers it.>
 ## Nits
 <optional, no action needed.>
 
-## Already covered by Greptile
-<findings from the inline comments, and whether the author answered them. Do not duplicate them above.>
+## Already covered by Greptile / Qodo
+<findings from the inline comments, attributed to whichever app raised them, and whether the author answered them. Do not duplicate them above.>
 
 ## NOT verified
 <skipped real-agent tests; the rule 12 cross-version test if it was not run;

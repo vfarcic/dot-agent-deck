@@ -30,7 +30,7 @@
 //!      derives a path from its own environment.
 //!   2. `PrepareWorkflow` — the **daemon** loads one validated config snapshot,
 //!      composes the coordinator context through the shared composer and
-//!      publishes it at `<project>/.dot-agent-deck/orchestrator-context.md`.
+//!      publishes it at a unique file under `<project>/.dot-agent-deck`.
 //!      This is the path under test; the test never writes that file.
 //!   3. `StartAgent` — one role, spawned into the canonical path the daemon
 //!      returned. `crate::event::ProjectRole` deliberately carries only `name`
@@ -117,17 +117,6 @@ const LAUNCH_TASK: &str = "Do this yourself and do not delegate - no other agent
      numbered choices, or wait for further instructions - this IS the task and you already \
      have everything you need.";
 
-/// The single line delivered into the coordinator's PTY, reproduced verbatim
-/// from `orchestrator_context::orchestrator_prompt_line(true)` — the private
-/// helper every production launch path injects.
-///
-/// It is load-bearing that this line names the file and nothing else: it
-/// carries no task, no sentinel and no `ls`, so everything the coordinator does
-/// next it learned from the daemon's write.
-const COORDINATOR_PROMPT: &str = "Read .dot-agent-deck/orchestrator-context.md for your role, the available agents, the \
-     delegation protocol, and your task under `## Your task`. Then carry out that task, \
-     delegating to the agents listed there.";
-
 /// Scenario: Launch the real deck in a project whose single `context-handoff`
 /// orchestration declares one interactive Haiku Claude `coordinator` role, then
 /// drive the desktop's own sequence over the attach socket — `ResolveProject`
@@ -135,7 +124,7 @@ const COORDINATOR_PROMPT: &str = "Read .dot-agent-deck/orchestrator-context.md f
 /// so the DAEMON composes and publishes the coordinator context carrying a
 /// directive list-files task, then `StartAgent` to bring a real coordinator up
 /// in that canonical directory, then the production `WriteAndSubmit` RPC to type
-/// the one-line "read `.dot-agent-deck/orchestrator-context.md` and carry out
+/// the returned one-line "read `.dot-agent-deck/orchestrator-context-*.md` and carry out
 /// your task" pointer into its pane. Its pane is opened in the attached TUI so
 /// the live agent is visible while it works. HARD-ASSERT that the uniquely named
 /// fixture sentinel `context_proof_9d4f2a.txt` — which appears nowhere in the
@@ -170,7 +159,7 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
         // dir, which is the only spelling pair the daemon can produce here.
         .with_claude_trust_workdir()
         .launch_with_fixture("project-launch-real");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let socket = deck.attach_socket_path().to_path_buf();
     let events = deck.subscribe_events();
@@ -231,7 +220,7 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
     );
     let prepared = resp
         .workflow_prepared
-        .expect("a successful PrepareWorkflow must carry a PreparedWorkflow");
+        .expect("a successful PrepareWorkflow must carry a PreparedOrchestration");
 
     // Preconditions, not the claim — `project/launch/001` owns the publish
     // contract. They are here so a red run says WHICH half broke: the daemon
@@ -276,6 +265,7 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
             // Pi's native seed pull only; a claude coordinator is driven by the
             // guarded PTY delivery below.
             seed: None,
+            authoring_kind: None,
         },
     )
     .expect("StartAgent over the attach socket");
@@ -297,7 +287,7 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
     // Open the coordinator's pane in the already-attached TUI, so the live agent
     // is on screen (and on the cast) for the whole turn — the surface a user
     // actually watches.
-    deck.wait_for_absence("No active sessions");
+    deck.wait_for_absence("No active agents");
     deck.send_keys(b"1");
 
     // Nothing may be injected into a claude that is still painting its UI: bytes
@@ -319,7 +309,7 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
     let resp = common::write_and_submit_with_identity_on(
         &socket,
         PANE_ID,
-        COORDINATOR_PROMPT,
+        &prepared.prompt,
         &agent_id,
         Some(&session_id),
     )

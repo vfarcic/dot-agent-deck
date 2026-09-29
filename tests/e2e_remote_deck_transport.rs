@@ -521,6 +521,7 @@ fn start_stand_in(daemon: &DaemonProc, display_name: &str, pane_id: &str) {
             tab_membership: None,
             agent_type: None,
             seed: None,
+            authoring_kind: None,
         })
         .expect("StartAgent over the attach socket");
     assert!(

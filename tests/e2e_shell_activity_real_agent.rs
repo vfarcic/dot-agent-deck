@@ -106,7 +106,7 @@ const PANE_NAME_SUFFIX: &str = "shell-activity-005-haiku";
 const SENTINEL: &str = "shell-activity-005-sentinel-e4b7f1.txt";
 const SENTINEL_CONTENT: &str = "SHELL_ACTIVITY_005_OK";
 
-/// Scenario: launch a real interactive Haiku Claude agent through the normal Ctrl+N new-pane flow (per-folder trust pre-seeded, `--allowedTools Bash`), then type a directive prompt naming a uniquely-named sentinel fixture file that instructs the agent to run `ping -c 20 127.0.0.1 > /dev/null` as its one Bash tool call. While that ~20s foreground command is in flight, assert — over a `SubscribeEvents` connection, never against the rendered badge — that the daemon's shell-activity monitor synthesizes a `ShellBusy` broadcast event for the pane.
+/// Scenario: launch a real interactive Haiku Claude agent through the normal Ctrl+N new-pane flow (per-folder trust pre-seeded, `--allowedTools Bash`), then type a directive prompt naming a uniquely-named sentinel fixture file that instructs the agent to run `ping -c 20 127.0.0.1 > /dev/null` as its one Bash tool call, and confirm Claude Code accepted it (its `UserPromptSubmit` hook) so a lost prompt fails as that rather than as a missing tool call. While that ~20s foreground command is in flight, assert — over a `SubscribeEvents` connection, never against the rendered badge — that the daemon's shell-activity monitor synthesizes a `ShellBusy` broadcast event for the pane.
 #[spec("status/shell-activity/005")]
 #[test]
 fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
@@ -121,8 +121,8 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
     // generous bound here rather than widening the shared constant every
     // other harness test relies on.
     assert!(
-        deck.wait_for_grid_string_within("No active sessions", Duration::from_secs(30)),
-        "startup race: the deck never rendered \"No active sessions\" within 30s — this is the \
+        deck.wait_for_grid_string_within("No active agents", Duration::from_secs(30)),
+        "startup race: the deck never rendered \"No active agents\" within 30s — this is the \
          known loaded-machine startup flake (harness-side), not a badge or shell-activity \
          assertion:\n{}",
         deck.snapshot_grid()
@@ -152,7 +152,7 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(PANE_NAME_SUFFIX.as_bytes());
     deck.send_keys(b"\t");
@@ -188,8 +188,11 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
          not run any other command. After the tool call finishes, reply with only the exact \
          file contents and nothing else."
     );
-    deck.send_keys(prompt.as_bytes());
-    deck.send_keys(b"\r");
+    let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, SENTINEL);
+    eprintln!(
+        "shell-activity-005: prompt submitted (Thinking) at {:?}",
+        submitted.timestamp
+    );
 
     // Precondition: the real Bash tool call actually started. This is the
     // native ToolStart hook event, not a fabricated one.
@@ -274,7 +277,7 @@ const MEASURED_TOOL_START_TO_IDLE_SECS: u64 = 127;
 /// unreasonably long wait.
 const IDLE_WAIT_MARGIN_SECS: u64 = 30;
 
-/// Scenario: launch a real interactive Haiku Claude agent through the normal Ctrl+N new-pane flow, then send a directive prompt instructing it to run `ping -c 200 127.0.0.1 > <sentinel> 2>&1` as its one Bash tool call under default Bash settings (no `timeout` parameter, no `run_in_background`), reproducing the >120s-cap bug exactly. After the native `ToolStart` hook fires, wait for the real, native `Idle` event (mapped from Claude Code's own `Stop` hook, never fabricated) so a PASS can only mean the bug path was genuinely exercised — a run where Claude ends the capped call with `ToolEnd` and no `Stop` fails loudly with a `PRECONDITION NOT MET` message rather than silently passing. Once the real `Idle` lands, switch to the dashboard and assert the pane's rendered card badge still reads `Working`, and that a live process carrying the sentinel (and a live `ping` beneath it) is still running.
+/// Scenario: launch a real interactive Haiku Claude agent through the normal Ctrl+N new-pane flow, then send a directive prompt instructing it to run `ping -c 200 127.0.0.1 > <sentinel> 2>&1` as its one Bash tool call under default Bash settings (no `timeout` parameter, no `run_in_background`), reproducing the >120s-cap bug exactly, and confirm Claude Code accepted it (its `UserPromptSubmit` hook). After the native `ToolStart` hook fires, wait for the real, native `Idle` event (mapped from Claude Code's own `Stop` hook, never fabricated) so a PASS can only mean the bug path was genuinely exercised — a run where Claude ends the capped call with `ToolEnd` and no `Stop` fails loudly with a `PRECONDITION NOT MET` message rather than silently passing. Once the real `Idle` lands, switch to the dashboard and assert the pane's rendered card badge still reads `Working`, and that a live process carrying the sentinel (and a live `ping` beneath it) is still running.
 #[spec("status/shell-activity/006")]
 #[test]
 fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_working() {
@@ -289,8 +292,8 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     // generous bound here rather than widening the shared constant every
     // other harness test relies on.
     assert!(
-        deck.wait_for_grid_string_within("No active sessions", Duration::from_secs(30)),
-        "startup race: the deck never rendered \"No active sessions\" within 30s — this is the \
+        deck.wait_for_grid_string_within("No active agents", Duration::from_secs(30)),
+        "startup race: the deck never rendered \"No active agents\" within 30s — this is the \
          known loaded-machine startup flake (harness-side), not a badge or shell-activity \
          assertion:\n{}",
         deck.snapshot_grid()
@@ -314,7 +317,7 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(PANE_NAME_SUFFIX_006.as_bytes());
     deck.send_keys(b"\t");
@@ -348,15 +351,21 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
          -c {PING_COUNT_006} 127.0.0.1 > {SENTINEL_006} 2>&1. Do not run any other command and do \
          not alter this command in any way."
     );
-    deck.send_keys(prompt.as_bytes());
-    deck.send_keys(b"\r");
+    let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, SENTINEL_006);
+    eprintln!(
+        "shell-activity-006: prompt submitted (Thinking) at {:?}",
+        submitted.timestamp
+    );
 
     // Precondition: the real Bash tool call actually started, under default
     // settings — the native ToolStart hook event, not a fabricated one. A
     // timeout here is a harness flake (the model never issued the Bash tool
-    // call at all — only a SessionStart shows up in `observed events`), not a
-    // badge regression; the custom message says so explicitly so a red run
-    // here is never misread as BADGE WRONG.
+    // call at all), not a badge regression; the custom message says so
+    // explicitly so a red run here is never misread as BADGE WRONG. The prompt
+    // is known to have been submitted by this point (`submit_claude_prompt`
+    // above), so a timeout here is the model, not a lost prompt — before issue
+    // #701 the two were indistinguishable, with only a SessionStart in
+    // `observed events` either way.
     let tool_start = match events.try_wait_for(
         |event| {
             event.agent_id.as_deref() == Some(agent_id.as_str())
@@ -368,9 +377,9 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
         Some(ev) => ev,
         None => panic!(
             "PRECONDITION NOT MET: no ToolStart/Bash event observed for agent {agent_id:?} \
-             within 120s — the model never issued the Bash tool call at all. This is a harness \
-             flake (prompt adherence), NOT a badge regression: rerun rather than reading this as \
-             BADGE WRONG. Observed events: {:#?}",
+             within 120s of the prompt being submitted — the model never issued the Bash tool \
+             call at all. This is a harness flake (prompt adherence), NOT a badge regression: \
+             rerun rather than reading this as BADGE WRONG. Observed events: {:#?}",
             events.snapshot()
         ),
     };
@@ -525,8 +534,8 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     // generous bound here rather than widening the shared constant every
     // other harness test relies on.
     assert!(
-        deck.wait_for_grid_string_within("No active sessions", Duration::from_secs(30)),
-        "startup race: the deck never rendered \"No active sessions\" within 30s — this is the \
+        deck.wait_for_grid_string_within("No active agents", Duration::from_secs(30)),
+        "startup race: the deck never rendered \"No active agents\" within 30s — this is the \
          known loaded-machine startup flake (harness-side), not a badge or shell-activity \
          assertion:\n{}",
         deck.snapshot_grid()
@@ -548,7 +557,7 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
-    deck.wait_for_string("New Agent");
+    deck.wait_for_string("┌ New Agent");
     deck.send_keys(b"\t");
     deck.send_keys(PANE_NAME_SUFFIX_007.as_bytes());
     deck.send_keys(b"\t");

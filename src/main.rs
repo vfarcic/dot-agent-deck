@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use dot_agent_deck::bounded_read::read_task_input;
 use dot_agent_deck::build_version_handshake;
-use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
+use dot_agent_deck::config::DashboardConfig;
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_attach::ensure_external_daemon_or_die;
 use dot_agent_deck::daemon_client::{DaemonClient, LocalEndpoint};
@@ -111,9 +111,38 @@ enum Commands {
         /// Role name(s) to delegate to (repeatable)
         #[arg(long)]
         to: Vec<String>,
+        /// Dispatch even to a worker that still owes a work-done for an
+        /// earlier delegation. Without it the daemon refuses that worker and
+        /// says how many delegations it still owes. Use it when the earlier
+        /// task is abandoned and this one replaces it.
+        #[arg(long)]
+        supersede: bool,
     },
     /// Create a git worktree and start an isolated line of work inside it.
     /// Agent-callable, one step (PRD #220).
+    ///
+    /// Exit status when starting a unit: 0 means the daemon admitted the
+    /// request, or gave no answer this build can check (an older daemon, or
+    /// none within 5 seconds). It does not mean the worktree was created, that
+    /// the unit started, or that its task reached the agent: the daemon answers
+    /// before it does any of that work. Non-zero means the request did not get
+    /// that far: no daemon was reachable, the daemon refused it (the reason is
+    /// printed), or the command line itself was unusable.
+    ///
+    /// What happened arrives afterwards, typed into this pane: first the
+    /// daemon's reply to the dispatch, beginning `dispatch:`. A reply beginning
+    /// `dispatch: spawned isolated` names what was started and where; a reply
+    /// with any other opening is a failure and says why. A spawned unit has
+    /// still not been confirmed to have received its task. The report it sends
+    /// later, when it finishes, beginning `dispatch: a unit you dispatched has
+    /// completed`, is the first thing delivered to this pane that indicates it
+    /// did — an indication, not proof, since the deck does not tie that report
+    /// to the task's delivery.
+    ///
+    /// With --list-targets the exit status means something else: 0 means the
+    /// listing was printed, and non-zero means no listing could be trusted —
+    /// the daemon did not answer, or could not read this repo's config or this
+    /// pane's directory. The reason is printed.
     Dispatch {
         /// Short name for the dispatch unit (used for worktree naming).
         /// Omit it only with --list-targets.
@@ -270,7 +299,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ScheduleAction {
-    /// Add a new scheduled task.
+    /// Add a new schedule.
     Add {
         #[arg(long)]
         name: String,
@@ -311,8 +340,8 @@ enum ScheduleAction {
         #[arg(long)]
         query: Option<String>,
     },
-    /// Update fields of an existing task. Rename is forbidden — there is no
-    /// name-change flag; `name` selects the task to edit.
+    /// Update fields of an existing schedule. Rename is forbidden — there is no
+    /// name-change flag; `name` selects the schedule to edit.
     Update {
         #[arg(long)]
         name: String,
@@ -335,24 +364,24 @@ enum ScheduleAction {
         #[arg(long)]
         shape: Option<String>,
     },
-    /// Remove a task definition (does not kill an open tab for it).
+    /// Remove a schedule (does not kill an open tab for it).
     Remove {
         #[arg(long)]
         name: String,
     },
-    /// List scheduled tasks with their enabled/disabled state and next-fire.
+    /// List schedules with their enabled/disabled state and next-fire.
     List,
-    /// Enable a task.
+    /// Enable a schedule.
     Enable {
         #[arg(long)]
         name: String,
     },
-    /// Disable a task (keeps the definition; stops it firing).
+    /// Disable a schedule (keeps the definition; stops it firing).
     Disable {
         #[arg(long)]
         name: String,
     },
-    /// Fire a task now via the running daemon.
+    /// Fire a schedule now via the running daemon.
     RunNow {
         #[arg(long)]
         name: String,
@@ -764,50 +793,139 @@ fn send_signal_and_report_ack(json: &str, verb: &str, subject: &str) -> ExitCode
 ///   contract "non-zero ⇒ it did not land" would retry and dispatch those panes
 ///   a second time, arming two records for one pane. The message names both
 ///   sides so a retry can be aimed at just the roles that missed.
+///
+/// Issue #580 adds `busy` — roles refused because their worker still owes a
+/// `work-done` — under the same contract. When NOTHING was dispatched the daemon
+/// also sets `error`, so the first arm above reports it and fails. When some role
+/// WAS dispatched, a busy role is a partial miss exactly like an unresolved one:
+/// a warning, exit 0. And `superseded` — a `--supersede` that did replace an
+/// unanswered delegation — is reported rather than silent, but is not a miss.
 fn delegate_verdict(
     pane_id: &str,
     resp: &dot_agent_deck::event::DelegateResponse,
 ) -> DelegateVerdict {
+    let blocked_note = blocked_workers_note(resp);
     if let Some(error) = resp.error.as_deref() {
+        let mut message = format!("Error: delegate from pane {pane_id} failed: {error}");
+        if let Some(note) = blocked_note {
+            message.push('\n');
+            message.push_str(&note);
+        }
         return DelegateVerdict {
             failed: true,
-            message: Some(format!(
-                "Error: delegate from pane {pane_id} failed: {error}"
-            )),
+            message: Some(message),
         };
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(note) = blocked_note {
+        notes.push(note);
+    }
+    if !resp.superseded.is_empty() {
+        notes.push(format!(
+            "Note: dispatched to worker(s) that still owed a work-done for an earlier \
+             delegation: {}. That earlier task is not cancelled — its work-done, if it comes, is \
+             credited like any other.",
+            dot_agent_deck::state::describe_busy_workers(&resp.superseded)
+        ));
+    }
+    if !resp.busy.is_empty() {
+        let delivered = if resp.delivered.is_empty() {
+            String::new()
+        } else {
+            format!(" It WAS delivered to: {}.", resp.delivered.join(", "))
+        };
+        notes.push(format!(
+            "Warning: delegate from pane {pane_id} was NOT sent to worker(s) that still owe a \
+             work-done for an earlier delegation: {}.{delivered} {}",
+            dot_agent_deck::state::describe_busy_workers(&resp.busy),
+            dot_agent_deck::state::busy_worker_remedy()
+        ));
     }
     if resp.unresolved_roles.is_empty() {
         return DelegateVerdict {
-            failed: false,
-            message: None,
+            // A reply with `busy` and an empty `delivered` but no `error` is not
+            // one this daemon writes; if one arrives, nothing landed.
+            failed: resp.delivered.is_empty() && !resp.busy.is_empty(),
+            message: (!notes.is_empty()).then(|| notes.join("\n")),
         };
     }
     let unresolved = resp.unresolved_roles.join(", ");
-    // The three causes, stated as the three causes rather than as the one that
-    // happens to be most common.
+    // The four causes, stated as the four causes rather than as the one that
+    // happens to be most common. Issue #554 added the fourth: the daemon routes
+    // by the role name a pane was started with, so a role renamed in the toml
+    // after the orchestration started is present in the file and still reaches
+    // nobody — the first cause alone sent the user to a file that looked right.
     let causes = "(A role reaches no worker when it is absent from \
                   .dot-agent-deck.toml, when it is the delegating orchestrator \
-                  itself — an orchestrator cannot delegate to itself — or when \
-                  its worker pane has been closed.)";
+                  itself — an orchestrator cannot delegate to itself — when \
+                  its worker pane has been closed, or when the role was renamed \
+                  or added in .dot-agent-deck.toml after this orchestration \
+                  started — running panes keep the role names they were started \
+                  with until the orchestration is restarted.)";
     if resp.delivered.is_empty() {
-        return DelegateVerdict {
-            failed: true,
-            message: Some(format!(
+        notes.insert(
+            0,
+            format!(
                 "Error: delegate from pane {pane_id} reached no worker for role(s): \
                  {unresolved}. No role in this orchestration received it. {causes}"
-            )),
+            ),
+        );
+        return DelegateVerdict {
+            failed: true,
+            message: Some(notes.join("\n")),
         };
     }
-    DelegateVerdict {
-        failed: false,
-        message: Some(format!(
+    notes.insert(
+        0,
+        format!(
             "Warning: delegate from pane {pane_id} reached no worker for role(s): \
              {unresolved}. It WAS delivered to: {}. Retry only the roles that \
              missed — re-sending the whole delegate would dispatch the delivered \
              roles a second time. {causes}",
             resp.delivered.join(", ")
-        )),
+        ),
+    );
+    DelegateVerdict {
+        failed: false,
+        message: Some(notes.join("\n")),
     }
+}
+
+/// Issue #714: the warning `delegate` prints for
+/// [`dot_agent_deck::event::DelegateResponse::blocked`], split by what happened
+/// to each blocked role. Never a failure on its own: a blocked worker that was
+/// delivered to really has the task (a windowed limit may even have reset), so
+/// the exit code stays governed by the rules above. Fixed text plus role labels,
+/// ages and resets only — no error text, which is agent-controlled.
+fn blocked_workers_note(resp: &dot_agent_deck::event::DelegateResponse) -> Option<String> {
+    if resp.blocked.is_empty() {
+        return None;
+    }
+    let (busy, delivered): (Vec<_>, Vec<_>) = resp
+        .blocked
+        .iter()
+        .cloned()
+        .partition(|b| resp.busy.iter().any(|w| w.role == b.role));
+    let mut lines = Vec::new();
+    if !delivered.is_empty() {
+        lines.push(format!(
+            "Warning: worker(s) {} appear BLOCKED by a provider usage limit or credit pool. The task WAS \
+             delivered but will likely not be worked on while that lasts — if the worker's card \
+             still shows Blocked, reassign it to a role backed by a different provider or \
+             account, or restore the quota and re-delegate.",
+            dot_agent_deck::state::describe_blocked_workers(&delivered)
+        ));
+    }
+    if !busy.is_empty() {
+        lines.push(format!(
+            "Warning: busy worker(s) {} also appear BLOCKED by a provider usage limit or credit pool, so \
+             --supersede will likely not get the task worked on while that lasts — if the \
+             worker's card still shows Blocked, reassign it to a role backed by a different \
+             provider or account.",
+            dot_agent_deck::state::describe_blocked_workers(&busy)
+        ));
+    }
+    Some(lines.join("\n"))
 }
 
 fn main() -> ExitCode {
@@ -944,6 +1062,7 @@ fn main() -> ExitCode {
             task,
             task_file,
             to,
+            supersede,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -974,6 +1093,7 @@ fn main() -> ExitCode {
                 pane_id,
                 task,
                 to,
+                supersede,
                 timestamp: chrono::Utc::now(),
                 token: dot_agent_deck::hook_provenance::token_from_env(),
             };
@@ -1579,26 +1699,35 @@ fn main() -> ExitCode {
                 // otherwise. It honors `PI_CODING_AGENT_DIR` (else `~/.pi/agent`),
                 // so it lands where pi will look — see `orchestrator_ext`.
                 dot_agent_deck::orchestrator_ext::auto_materialize(&[]);
-                // PRD #20 §4.2.1: same precedent for Codex — install the deck's
-                // `hooks.json` into the active Codex home and record SCOPED,
-                // hash-pinned trust for exactly those entries, ONCE at daemon
-                // startup. Command-agnostic on purpose: the spawn seam can only
-                // detect a `codex` basename, so a launcher (`devbox run codex-big`,
-                // `run_codex.sh`) previously got no hooks at all. With the home
-                // prepared here, its hook events reach the pane through the
-                // inherited `DOT_AGENT_DECK_PANE_ID` regardless of launch method.
-                // Runs AFTER the login-shell PATH is applied so codex-presence is
-                // detected against the daemon's real PATH. Self-guards on codex
-                // being installed and a resolvable home; a no-op otherwise.
-                dot_agent_deck::codex_hooks_manage::auto_install_and_trust_at_startup();
-                // Same precedent for Devin, which is also a native-hooks agent:
-                // merge the deck's hooks into Devin's user config ONCE at daemon
-                // startup, command-agnostically, so a headless daemon and a
-                // launcher whose basename isn't `devin` are covered too. Runs
-                // AFTER the login-shell PATH is applied so devin-presence is
-                // detected against the daemon's real PATH. Self-guards on devin
-                // being on PATH and a resolvable config dir; a no-op otherwise.
-                dot_agent_deck::devin_hooks_manage::auto_install();
+                // Every shipped agent's startup auto-install, from the same
+                // registry loop `run_tui_session` runs — Claude Code's native
+                // hooks, the OpenCode plugin, Codex's `hooks.json` plus its
+                // SCOPED, hash-pinned trust (PRD #20 §4.2.1), and Devin's hooks.
+                // Each self-guards on its agent being present and is a no-op
+                // otherwise, and each runs AFTER the login-shell PATH is applied
+                // so presence is detected against the daemon's real PATH.
+                //
+                // Codex and Devin ran here explicitly because the spawn seam can
+                // only detect an agent by basename, so a launcher (`devbox run
+                // codex-big`) got no hooks unless the daemon installed them
+                // command-agnostically. Issue #1157 found the same gap one level
+                // up for Claude Code and OpenCode, which only the TUI installed:
+                // the packaged desktop app starts THIS subcommand from its
+                // bundled sidecar and never runs a TUI, so a desktop-only user
+                // got no Claude Code hooks and no OpenCode plugin at all, and
+                // therefore no hook-driven agent status. Running the whole
+                // registry here closes that, and keeps the daemon in step with
+                // the TUI when an agent is added. The TUI still runs the same
+                // loop; every installer is idempotent, and Codex and Devin have
+                // run in both processes since they were added here.
+                {
+                    use dot_agent_deck::agent_registry::ALL;
+                    for spec in ALL {
+                        if let Some(install) = spec.startup_auto_install {
+                            install();
+                        }
+                    }
+                }
                 run_daemon_serve_cli()
             }
             DaemonCmd::Hello => run_daemon_hello_cli(),
@@ -1881,16 +2010,35 @@ fn init_logging_from_env() {
 /// Running the same idempotent call here first puts the actionable message on
 /// their terminal instead.
 ///
-/// **It does not close the wedge, and must not be described as if it does.** A
-/// foreign uid can still take the predictable directory name before this host's
-/// first successful launch, and the deck then refuses to start until that entry
-/// is removed. What changed is that the refusal says so.
-async fn bootstrap_primary_daemon(endpoint: &LocalEndpoint) -> Result<(), String> {
-    if let Err(source) = dot_agent_deck::endpoint_resolve::ensure_endpoint_dir(endpoint.path()) {
-        return Err(format!(
-            "cannot prepare the endpoint directory for {}: {source}",
-            endpoint.path().display()
-        ));
+/// Issue #1173 then closed the wedge that preflight could only report: when
+/// another uid holds the per-uid directory's name,
+/// `endpoint_resolve::prepare_bind_endpoints` hands back the same socket name
+/// inside a relocated owner-only directory, and `endpoint` is **rewritten to
+/// it** — so the poll below waits where the daemon about to be spawned will
+/// bind, which runs the same call and reuses that directory. Every other
+/// preparation failure still stops here with the directory-naming message.
+async fn bootstrap_primary_daemon(endpoint: &mut LocalEndpoint) -> Result<(), String> {
+    let resolved = dot_agent_deck::platform::paths::ResolvedEndpoint::new(
+        endpoint.path().to_path_buf(),
+        endpoint.source(),
+    );
+    let prepared =
+        dot_agent_deck::endpoint_resolve::prepare_bind_endpoints(std::slice::from_ref(&resolved))
+            .await
+            .map(|mut paths| paths.pop().unwrap_or_else(|| endpoint.path().to_path_buf()));
+    match prepared {
+        Ok(bind_at) if bind_at != endpoint.path() => {
+            *endpoint = LocalEndpoint::from_resolved(
+                dot_agent_deck::platform::paths::ResolvedEndpoint::new(bind_at, endpoint.source()),
+            );
+        }
+        Ok(_) => {}
+        Err(source) => {
+            return Err(format!(
+                "cannot prepare the endpoint directory for {}: {source}",
+                endpoint.path().display()
+            ));
+        }
     }
     ensure_external_daemon_or_die(endpoint).await.map_err(|e| {
         format!(
@@ -1956,11 +2104,12 @@ async fn run_tui_session() -> ExitCode {
     // trust-checks any existing socket (uid + 0o600 + is-socket) before the
     // TUI's DaemonClient touches it. Skipped outright for a legacy endpoint,
     // which by construction already has a daemon answering on it.
-    if endpoint.is_primary()
-        && let Err(message) = bootstrap_primary_daemon(&endpoint).await
-    {
-        eprintln!("{message}");
-        return ExitCode::FAILURE;
+    if endpoint.is_primary() {
+        if let Err(message) = bootstrap_primary_daemon(&mut endpoint).await {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+        attach_path = endpoint.path().to_path_buf();
     }
     // PRD #103 Phase 2 / PRD #161 Part A: build-version handshake against
     // the running daemon. Runs unconditionally — including the
@@ -1980,7 +2129,10 @@ async fn run_tui_session() -> ExitCode {
     //     declines (`ProceedOnExisting`, keep the existing daemon — D4
     //     never-strand).
     //   - Agents + non-TTY: prints the recovery hint to stderr and exits
-    //     non-zero (the only non-zero-exit path).
+    //     non-zero.
+    // Issue #405: a daemon on another attach protocol is never attached to —
+    // a build-id match or a declined restart exits non-zero with a refusal
+    // instead (`ProtocolMismatch`); the restart arms above are unchanged.
     // Errors are already user-visible inside the helper, so we render no
     // further message here.
     let mut handshake = build_version_handshake::ensure_compatible_daemon_or_die(&endpoint).await;
@@ -2011,16 +2163,21 @@ async fn run_tui_session() -> ExitCode {
         endpoint = LocalEndpoint::from_resolved(
             dot_agent_deck::endpoint_resolve::primary_attach_endpoint(),
         );
-        attach_path = endpoint.path().to_path_buf();
-        if let Err(message) = bootstrap_primary_daemon(&endpoint).await {
-            eprintln!("after the legacy daemon went away: {message}");
+        if let Err(message) = bootstrap_primary_daemon(&mut endpoint).await {
+            eprintln!("after the discovered daemon went away: {message}");
             return ExitCode::FAILURE;
         }
+        attach_path = endpoint.path().to_path_buf();
         handshake = build_version_handshake::ensure_compatible_daemon_or_die(&endpoint).await;
     }
     let handshake_outcome = match handshake {
         Ok(outcome) => outcome,
-        Err(build_version_handshake::HandshakeError::MismatchAborted) => {
+        // Both already printed their message inside the helper; issue #405's
+        // protocol refusal left the daemon and its agents running.
+        Err(
+            build_version_handshake::HandshakeError::MismatchAborted
+            | build_version_handshake::HandshakeError::ProtocolMismatch { .. },
+        ) => {
             return ExitCode::FAILURE;
         }
         Err(e) => {
@@ -2049,11 +2206,11 @@ async fn run_tui_session() -> ExitCode {
         endpoint = LocalEndpoint::from_resolved(
             dot_agent_deck::endpoint_resolve::primary_attach_endpoint(),
         );
-        attach_path = endpoint.path().to_path_buf();
-        if let Err(message) = bootstrap_primary_daemon(&endpoint).await {
+        if let Err(message) = bootstrap_primary_daemon(&mut endpoint).await {
             eprintln!("after version-mismatch recovery: {message}");
             return ExitCode::FAILURE;
         }
+        attach_path = endpoint.path().to_path_buf();
     }
     // Test-only escape hatch (PRD #103 M4.2): integration tests in
     // tests/build_version_handshake.rs need to exercise the handshake
@@ -2500,7 +2657,9 @@ fn run_daemon_hello_cli() -> ExitCode {
 /// `Hello` exactly as it always did.
 #[tokio::main]
 async fn run_daemon_endpoint_cli() -> ExitCode {
-    let path = attach_socket_path();
+    // Issue #1173: the pure resolution, or a relocated endpoint a daemon of
+    // this build is answering at because the per-uid directory was taken.
+    let path = dot_agent_deck::endpoint_resolve::served_attach_endpoint().into_path();
     let shown = path.display();
 
     // The endpoint path can come from `DOT_AGENT_DECK_ATTACH_SOCKET` in the
@@ -2768,8 +2927,30 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // Issue #1121: the BIND side, so these are deliberately the pure
     // resolvers and not `endpoint_resolve`'s client ones — the primary
     // endpoint is the new spelling, never one the compatibility read chose.
-    let path = socket_path();
-    let attach_path = attach_socket_path();
+    //
+    // Issue #1173: …except that when another uid holds the per-uid fallback
+    // directory's name, both sockets go into a relocated owner-only sibling
+    // instead of the daemon refusing to start. On every other host this hands
+    // back the resolved addresses unchanged. Both in ONE call, so the two
+    // sockets can never be split across directories by a squatter removing
+    // their entry between two decisions. The launcher runs the same rule
+    // before it spawns us, so it polls where we are about to bind.
+    let prepared = dot_agent_deck::endpoint_resolve::prepare_bind_endpoints(&[
+        dot_agent_deck::platform::paths::resolve_socket_path(),
+        dot_agent_deck::platform::paths::resolve_attach_socket_path(),
+    ])
+    .await;
+    let (path, attach_path) = match prepared.as_deref() {
+        Ok([path, attach_path]) => (path.clone(), attach_path.clone()),
+        Ok(other) => {
+            eprintln!("Daemon error: expected two prepared endpoints, got {other:?}");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("Daemon error: cannot prepare the endpoints: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Issue #1211: and beside it, best-effort, the pre-#1121 spelling on the
     // fallback arm, so a client from before #1121 still finds this daemon and
@@ -2984,6 +3165,54 @@ mod tests {
             // always names `dispatch`.
             _ => panic!("expected the Dispatch subcommand"),
         }
+    }
+
+    /// Issue #530: `dispatch --help` states what the exit status asserts, and
+    /// quotes the two openings the caller is told to read the outcome from.
+    ///
+    /// The exit status is the provenance gate's acknowledgement — pinned by
+    /// `daemon::hook_ingestion_tests::a_dispatch_its_handler_rejects_is_still_acknowledged_as_accepted`
+    /// — so the help is where a caller learns that exit 0 does not mean a unit
+    /// started. Both quotes are checked against the values the daemon builds its
+    /// messages from, so rewording either message fails here rather than leaving
+    /// the help describing a reply nothing sends.
+    #[test]
+    fn dispatch_help_says_what_its_exit_status_asserts() {
+        let cli = Cli::command();
+        let dispatch = cli
+            .find_subcommand("dispatch")
+            .expect("the dispatch subcommand");
+        let help = dispatch
+            .get_long_about()
+            .expect("dispatch carries a long help")
+            .to_string();
+        // clap re-flows doc-comment text, so every quote is matched with its
+        // whitespace collapsed rather than byte for byte.
+        let flat: String = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        let completed_opening = "dispatch: a unit you dispatched has completed";
+        for (quote, why) in [
+            (
+                "Exit status when starting a unit: 0 means the daemon admitted the request",
+                "what exit 0 asserts",
+            ),
+            (
+                "does not mean the worktree was created",
+                "what exit 0 does NOT assert",
+            ),
+            (
+                dot_agent_deck::dispatch::SPAWNED_OPENING,
+                "the success reply's real opening",
+            ),
+            (completed_opening, "the completion report's opening"),
+        ] {
+            assert!(flat.contains(quote), "the help must state {why}:\n{help}");
+        }
+        let completed =
+            dot_agent_deck::dispatch_return::compose_completion_report("probe", "report", None);
+        assert!(
+            completed.starts_with(completed_opening),
+            "the completion report no longer opens the way the help quotes it: {completed}"
+        );
     }
 
     /// `--orchestration` REQUIRES its value, so it can never consume the unit name.
@@ -3335,10 +3564,12 @@ mod tests {
                 task,
                 task_file,
                 to,
+                supersede,
             }) => {
                 assert_eq!(task, None);
                 assert_eq!(task_file.as_deref(), Some("/tmp/t.txt"));
                 assert_eq!(to, vec!["coder".to_string()]);
+                assert!(!supersede, "--supersede is opt-in (issue #580)");
             }
             _ => panic!("expected `delegate`"),
         }
@@ -3418,6 +3649,148 @@ mod tests {
         }
     }
 
+    fn busy(role: &str, outstanding: u32) -> dot_agent_deck::event::BusyWorker {
+        dot_agent_deck::event::BusyWorker {
+            role: role.to_string(),
+            outstanding,
+            oldest_age_secs: 12 * 60,
+        }
+    }
+
+    use spec::spec;
+
+    fn blocked(
+        role: &str,
+        kind: dot_agent_deck::state::BlockedKind,
+    ) -> dot_agent_deck::event::BlockedWorker {
+        dot_agent_deck::event::BlockedWorker {
+            role: role.to_string(),
+            kind,
+            blocked_for_secs: 5 * 60,
+            resets_in_secs: None,
+        }
+    }
+
+    /// Scenario: Feed `delegate`'s verdict a daemon reply naming a blocked
+    /// worker that was delivered to, then one naming a blocked worker that was
+    /// refused as busy. The first warns that the task was delivered but will
+    /// likely not be worked on and still exits 0; the second names the busy
+    /// role as blocked so `--supersede` is not mistaken for a fix, with the
+    /// reset the provider gave. Neither carries any agent text.
+    #[spec("orchestration/delegate/038")]
+    #[test]
+    fn orchestration_delegate_038_verdict_reports_blocked_for_delivered_and_busy() {
+        use dot_agent_deck::state::BlockedKind;
+        let mut resp = reply(&["coder"], &[], None);
+        resp.blocked = vec![blocked("coder", BlockedKind::CreditsDepleted)];
+        let v = delegate_verdict("pane-1", &resp);
+        assert!(!v.failed, "the task WAS delivered: exit 0");
+        let msg = v.message.expect("a blocked worker must never be silent");
+        assert!(
+            msg.contains("appear BLOCKED by a provider usage limit or credit pool")
+                && msg.contains("[UNTRUSTED-ROLE-LABEL: coder :END-UNTRUSTED-ROLE-LABEL]")
+                && msg.contains("reported 5 minutes ago by the agent")
+                && msg.contains("credits do not reset on their own")
+                && msg.contains("The task WAS delivered"),
+            "{msg}"
+        );
+
+        // Busy AND blocked, nothing delivered: the routing failure, annotated.
+        let mut resp = reply(&[], &[], Some("this delegate was NOT sent"));
+        resp.busy = vec![busy("coder", 1)];
+        resp.blocked = vec![dot_agent_deck::event::BlockedWorker {
+            resets_in_secs: Some(90 * 60),
+            ..blocked("coder", BlockedKind::UsageLimit)
+        }];
+        let v = delegate_verdict("pane-1", &resp);
+        assert!(v.failed, "nothing was dispatched: non-zero");
+        let msg = v.message.expect("reported");
+        assert!(
+            msg.contains("NOT sent")
+                && msg.contains("busy worker(s)")
+                && msg.contains("also appear BLOCKED")
+                && msg.contains("--supersede will likely not get the task worked on")
+                && msg.contains("; resets in 1h 30m")
+                && !msg.contains("credits do not reset"),
+            "{msg}"
+        );
+
+        // Busy-and-blocked beside a delivered, healthy role: exit 0, both said.
+        let mut resp = reply(&["tester"], &[], None);
+        resp.busy = vec![busy("coder", 1)];
+        resp.blocked = vec![blocked("coder", BlockedKind::UsageLimit)];
+        let v = delegate_verdict("pane-1", &resp);
+        assert!(!v.failed);
+        let msg = v.message.expect("reported");
+        assert!(
+            msg.contains("also appear BLOCKED") && msg.contains("NOT sent"),
+            "{msg}"
+        );
+        assert!(!msg.contains("The task WAS delivered but"), "{msg}");
+
+        // The reply carries no pane text to leak, and an older daemon's reply
+        // (no `blocked` key) decodes to an empty list and prints nothing extra.
+        let old: DelegateResponse =
+            serde_json::from_str(r#"{"kind":"delegate","delivered":["coder"]}"#).unwrap();
+        assert!(old.blocked.is_empty());
+        assert!(delegate_verdict("pane-1", &old).message.is_none());
+    }
+
+    /// Issue #580: a busy worker beside a delivered one is a partial outcome.
+    /// Exit 0 — the delivered role really has the task, and a failure would
+    /// invite a retry that dispatches it twice — with a warning naming the busy
+    /// role, what it owes, and the remedy.
+    #[test]
+    fn delegate_verdict_warns_about_a_busy_worker_on_a_partial_delivery() {
+        let mut resp = reply(&["tester"], &[], None);
+        resp.busy = vec![busy("coder", 1)];
+        let v = delegate_verdict("pane-1", &resp);
+        assert!(!v.failed, "the tester was dispatched: exit 0");
+        let msg = v.message.expect("a busy worker must never be silent");
+        assert!(
+            msg.contains("NOT sent")
+                && msg.contains("[UNTRUSTED-ROLE-LABEL: coder :END-UNTRUSTED-ROLE-LABEL]")
+                && msg.contains("1 unanswered delegation,")
+                && msg.contains("12 minutes ago")
+                && msg.contains("It WAS delivered to: tester")
+                && msg.contains("--supersede"),
+            "the warning must name the busy role, its debt, the delivered roles and the \
+             remedy: {msg}"
+        );
+    }
+
+    /// Issue #580: when every worker was busy the daemon sets `error`, and the
+    /// verdict is the ordinary routing failure — non-zero, because nothing landed.
+    #[test]
+    fn delegate_verdict_fails_when_every_worker_was_busy() {
+        let mut resp = reply(&[], &[], Some("this delegate was NOT sent"));
+        resp.busy = vec![busy("coder", 2)];
+        let v = delegate_verdict("pane-1", &resp);
+        assert!(v.failed, "nothing was dispatched: non-zero");
+        assert!(v.message.expect("reported").contains("NOT sent"));
+
+        // Defense in depth: the same outcome without `error` is still a failure.
+        let mut resp = reply(&[], &[], None);
+        resp.busy = vec![busy("coder", 2)];
+        assert!(delegate_verdict("pane-1", &resp).failed);
+    }
+
+    /// Issue #580: a `--supersede` that replaced an unanswered delegation is
+    /// reported rather than silent — "at minimum reported as superseding" — but
+    /// it is a success: the task was dispatched as asked.
+    #[test]
+    fn delegate_verdict_reports_a_supersession_without_failing() {
+        let mut resp = reply(&["coder"], &[], None);
+        resp.superseded = vec![busy("coder", 1)];
+        let v = delegate_verdict("pane-1", &resp);
+        assert!(!v.failed);
+        let msg = v.message.expect("a supersession must be reported");
+        assert!(
+            msg.contains("still owed a work-done") && msg.contains("UNTRUSTED-ROLE-LABEL: coder"),
+            "the note must name the superseded worker: {msg}"
+        );
+    }
+
     #[test]
     fn delegate_verdict_reports_a_full_delivery_silently() {
         let v = delegate_verdict("pane-1", &reply(&["coder", "tester"], &[], None));
@@ -3445,15 +3818,21 @@ mod tests {
             msg.contains("ghost"),
             "the message must name the role that missed: {msg}"
         );
-        // The three causes, not the one that happens to be most common: the
+        // The four causes, not the one that happens to be most common: the
         // old message told the user to go check role names in the toml even
         // when the role was sitting there correctly and was simply the
-        // orchestrator itself, or had had its worker pane closed.
+        // orchestrator itself, or had had its worker pane closed — or, issue
+        // #554, had been renamed in the toml after the orchestration started,
+        // which leaves the file looking right while the daemon still routes by
+        // the old name.
         assert!(
             msg.contains(".dot-agent-deck.toml")
                 && msg.contains("orchestrator cannot delegate to itself")
-                && msg.contains("worker pane has been closed"),
-            "the message must state all three causes, not assert one: {msg}"
+                && msg.contains("worker pane has been closed")
+                && msg.contains(
+                    "renamed or added in .dot-agent-deck.toml after this orchestration started"
+                ),
+            "the message must state all four causes, not assert one: {msg}"
         );
     }
 

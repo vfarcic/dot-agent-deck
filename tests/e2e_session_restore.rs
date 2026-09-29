@@ -289,7 +289,7 @@ fn restore_001_no_flag_startup_restores_panes_from_snapshot() {
 
 /// Scenario: Launch the deck against a fresh (empty) daemon with NO snapshot on
 /// disk and NO `--continue` flag — the both-empty case. The deck must land on a
-/// clean empty dashboard ("No active sessions") with no restore warning, and
+/// clean empty dashboard ("No active agents") with no restore warning, and
 /// remain interactive (Ctrl+N opens the new-pane directory picker). This locks
 /// the post-Phase-2 invariant that making restore unconditional must still fall
 /// through cleanly when there is nothing to restore from either source.
@@ -312,7 +312,7 @@ fn restore_006_empty_daemon_and_no_snapshot_lands_on_clean_dashboard() {
         .launch_with_fixture("modes");
 
     // Empty daemon + empty snapshot → the empty-dashboard placeholder.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // No restore warning should be surfaced when there is nothing to restore.
     let grid = deck.snapshot_grid();
@@ -597,7 +597,9 @@ fn restore_010_zero_role_reresolved_orchestration_falls_back_without_panic() {
 /// default. Launch against a fresh (empty) daemon with NO flag. The saved start
 /// cursor must be HONORED: the replayed `orchestrator_prompt` must land on the
 /// role at the SAVED index (`coder`, index 1) and be recorded there, NOT on the
-/// config-default start role (`orchestrator`, index 0). RED today: the restore
+/// config-default start role (`orchestrator`, index 0) — and `daemon status`
+/// must mark that same saved role, and only it, as the orchestrator, so the
+/// pane holding the prompt is the pane allowed to delegate. RED today: the restore
 /// branch recomputes the start from the live config
 /// (`roles.iter().position(|r| r.start)`) and never reads `snap.start_role_index`,
 /// so the prompt is delivered to `orchestrator` and `coder` never receives it.
@@ -687,6 +689,186 @@ fn restore_011_saved_start_role_index_is_honored_over_config_default() {
         "the config-default start role (`orchestrator`, index 0) must NOT receive the prompt \
          when the saved cursor points elsewhere — but it did, at {orchestrator_record:?}."
     );
+
+    // Issue #523 review: the saved cursor is the tab's ONE orchestrator, so the
+    // pane the prompt went to is also the pane the daemon registered as allowed
+    // to `delegate` — `daemon status` marks `coder`, and only `coder`. Before,
+    // the daemon kept registering the config's `start = true` role while the
+    // prompt went to the saved one: a prompt on one pane, delegate rights on
+    // another.
+    let marked = common::wait_until(Duration::from_secs(10), || {
+        orchestrator_marked_roles(&deck) == vec!["coder (orchestrator)".to_string()]
+    });
+    assert!(
+        marked,
+        "the restored tab must seat exactly the saved role as its orchestrator;          `daemon status` marks: {:?}",
+        orchestrator_marked_roles(&deck)
+    );
+}
+
+/// Scenario: Restore the same drifted snapshot as `session/restore/011` (config
+/// seats `orchestrator`, the snapshot saved `coder`) into an external daemon, so
+/// the daemon registers `coder` as the orchestrator; detach-quit, then attach a
+/// FRESH deck with no saved session, which rebuilds the tab from the daemon's
+/// live panes. Stepping off the rebuilt tab and back onto it, with no
+/// remembered focus, must focus `coder`, the role the daemon lets delegate, not
+/// the config's `orchestrator`.
+#[spec("session/restore/021")]
+#[test]
+fn restore_021_reattach_seats_the_tab_where_the_daemon_registered_its_orchestrator() {
+    let project_dir = common::race_safe_tempdir();
+    let orchestrator_cmd = write_recorder_agent(project_dir.path(), "orchestrator");
+    let coder_cmd = write_recorder_agent(project_dir.path(), "coder");
+    write_orchestration_config(
+        project_dir.path(),
+        "tdd-cycle",
+        &[
+            ("orchestrator", orchestrator_cmd.as_str()),
+            ("coder", coder_cmd.as_str()),
+        ],
+        0, // the CONFIG seats `orchestrator`
+    );
+    let shared = common::race_safe_tempdir();
+    let session_file = shared.path().join("session.toml");
+    stage_orchestration_snapshot(
+        &session_file,
+        project_dir.path(),
+        "orchestrator",
+        &orchestrator_cmd,
+        &["orchestrator", "coder"],
+        1, // the SAVED cursor seats `coder`
+        "Build the feature end to end",
+        "tdd-cycle",
+        project_dir.path(),
+        &[1],
+        None,
+    );
+
+    let daemon = common::spawn_daemon_serve(None, "0");
+    let launch = |session: &Path| {
+        TuiDeck::builder()
+            .with_pty_size(160, 45)
+            .with_env(
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                daemon.attach_socket.to_string_lossy().to_string(),
+            )
+            .with_env(
+                "DOT_AGENT_DECK_SOCKET",
+                daemon.hook_socket.to_string_lossy().to_string(),
+            )
+            .with_env(
+                "DOT_AGENT_DECK_SESSION",
+                session.to_str().expect("session path is UTF-8"),
+            )
+            .launch_with_fixture("minimal")
+    };
+
+    // First deck: the daemon is empty, so the snapshot restore rebuilds the tab
+    // seated on the saved cursor — and the daemon registers `coder` for it.
+    let mut first = launch(&session_file);
+    assert!(
+        common::wait_for_file_substr_count(
+            &project_dir.path().join("record-coder.log"),
+            "Build the feature end to end",
+            1,
+            Duration::from_secs(15),
+        ),
+        "precondition: the restore must replay the prompt to the saved seat `coder`.\nGrid:\n{}",
+        first.snapshot_grid()
+    );
+    let seated_coder = |records: &[dot_agent_deck::agent_pty::AgentRecord]| {
+        let flagged: Vec<&str> = records
+            .iter()
+            .filter_map(|r| match &r.tab_membership {
+                Some(dot_agent_deck::agent_pty::TabMembership::Orchestration {
+                    role_name,
+                    is_start_role: true,
+                    ..
+                }) => Some(role_name.as_str()),
+                _ => None,
+            })
+            .collect();
+        flagged == vec!["coder"]
+    };
+    let records = daemon.wait_for_agent_count(2, Duration::from_secs(10));
+    assert!(
+        seated_coder(&records),
+        "precondition: the daemon must hold `coder` as the one orchestrator membership, or the \
+         reattach below cannot tell the daemon's seat from the config's; got {records:?}"
+    );
+
+    // Detach-quit: the daemon and both role agents survive. The restore leaves
+    // the deck in PaneInput, whose footer shows the Ctrl+D hint; wait for it to
+    // be DRAWN before sending Ctrl+D, or its absence below could be observed
+    // before the deck ever entered PaneInput, and Ctrl+C would then go to the
+    // recorder pane instead of opening the quit dialog (Qodo, PR #1388).
+    first.wait_for_string("[Command Mode Ctrl+D]");
+    first.send_keys(b"\x04"); // Ctrl+D -> command mode
+    first.wait_for_absence("[Command Mode Ctrl+D]");
+    first.send_keys(b"\x03"); // Ctrl+C -> quit-confirm modal
+    first.wait_for_string("Quit dot-agent-deck?");
+    first.send_keys(b"\r"); // Enter -> Detach (default)
+    assert_eq!(
+        first.wait_for_exit_within(Duration::from_secs(30)),
+        Some(true),
+        "the first deck must detach cleanly.\nGrid:\n{}",
+        first.snapshot_grid()
+    );
+    assert_eq!(
+        daemon
+            .wait_for_agent_count(2, Duration::from_secs(10))
+            .len(),
+        2
+    );
+
+    // Second deck: NO saved session (a path nothing wrote), so no remembered
+    // focus. PRD #111 lands a reattach on the first rebuilt orchestration tab
+    // with nothing focused, which the deck draws as card 0 whatever the seat —
+    // so the seat is observed where it decides focus: switching INTO the tab
+    // falls back to `role_pane_ids[start_role_index]`
+    // (`restore_focus_on_switch_in`), and `PaneLayout::Stacked` draws only the
+    // focused role's pane.
+    let second = launch(&shared.path().join("no-session.toml"));
+    second.wait_for_string("2 agent(s)");
+    second.send_bytes(b"\x1b[D"); // Left -> previous tab -> Dashboard
+    second.wait_until_grid("stepped off the rebuilt tab onto the Dashboard", |grid| {
+        common::role_pane_left_edge(grid, "coder").is_none()
+            && common::role_pane_left_edge(grid, "orchestrator").is_none()
+    });
+    second.send_bytes(b"\x1b[C"); // Right -> back onto the rebuilt tab
+    second.wait_until_grid(
+        "the reattached tab is focused on the daemon's seat `coder`, not the config's `orchestrator`",
+        |grid| {
+            common::role_pane_left_edge(grid, "coder").is_some()
+                && common::role_pane_left_edge(grid, "orchestrator").is_none()
+        },
+    );
+    drop(first);
+}
+
+/// The `role` labels `daemon status --json` marks `(orchestrator)` for this
+/// deck's agents.
+fn orchestrator_marked_roles(deck: &TuiDeck) -> Vec<String> {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["daemon", "status", "--json"])
+        .env("DOT_AGENT_DECK_ATTACH_SOCKET", deck.attach_socket_path())
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("HOME", deck.home_dir())
+        .current_dir(deck.workdir())
+        .output()
+        .expect("run daemon status --json");
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+    doc["agents"]
+        .as_array()
+        .map(|agents| {
+            agents
+                .iter()
+                .filter_map(|a| a["role"].as_str())
+                .filter(|r| r.contains("(orchestrator)"))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Scenario: Stage TWO directories — a legitimate saved working dir (no
@@ -979,7 +1161,7 @@ fn restore_015_flushed_warning_escapes_control_characters_in_pane_name() {
         .launch_with_fixture("minimal");
 
     // The only saved pane was skipped, so the deck lands on the empty dashboard.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Detach-quit: the clean teardown path that reaches the post-`restore()`
     // flush. A killed process never gets there, so the drain below is what
@@ -1132,7 +1314,7 @@ fn restore_016_reattach_restores_active_tab_and_focused_pane() {
     let session_file = shared.path().join("session.toml");
 
     let mut first = launch_deck_against(&daemon, &session_file);
-    first.wait_for_string("No active sessions");
+    first.wait_for_string("No active agents");
 
     // Open the orchestration. With no `[[modes]]` in the fixture the mode-chip
     // row is `[No mode] [Orch: reattach-orch] [schedule]`, so ONE Right selects
@@ -1217,7 +1399,7 @@ fn restore_016_reattach_restores_active_tab_and_focused_pane() {
     // Half 1 — the ACTIVE TAB. The remembered Dashboard is a real position, so
     // it wins over PRD #111's land-on-the-orchestration-tab default.
     //
-    // The header's `N/M session(s)` count is the precondition, not the claim:
+    // The header's `N/M agent(s)` count is the precondition, not the claim:
     // it says all three roles hydrated (M == 3) before anything is asserted
     // about which tab is highlighted. The Dashboard filters out panes that
     // belong to a mode/orchestration tab, so `0/3` is what a faithfully
@@ -1227,7 +1409,7 @@ fn restore_016_reattach_restores_active_tab_and_focused_pane() {
     assert!(
         common::wait_until(Duration::from_secs(15), || {
             let grid = second.snapshot_grid();
-            grid.contains("3 session(s)")
+            grid.contains("3 agent(s)")
                 && dashboard_tab_is_active(&second)
                 && focused_role_pane(&grid).is_none()
         }),
@@ -1322,21 +1504,21 @@ fn restore_019_cold_start_honours_the_remembered_tab_but_not_a_rebuilt_pane_id()
     // Read from the TAB STRIP (`Dashboard │ tdd-cycle [×]`) rather than from a
     // role card, because the role cards live on that tab and the Dashboard
     // filters out panes belonging to one — the same reason the restored
-    // overview here reads `0/3 session(s)`, which the predicate below also
+    // overview here reads `0/3 agent(s)`, which the predicate below also
     // requires so the count proves all three roles came back.
     deck.wait_for_string("tdd-cycle");
 
     assert!(
         common::wait_until(Duration::from_secs(15), || {
             let grid = deck.snapshot_grid();
-            grid.contains("3 session(s)")
+            grid.contains("3 agent(s)")
                 && dashboard_tab_is_active(&deck)
                 // No role pane is expanded: the Dashboard is what is drawn.
                 && common::role_pane_left_edge(&grid, "orchestrator").is_none()
                 && common::role_pane_left_edge(&grid, "coder").is_none()
                 // And the deck is in command mode, not the PaneInput the
                 // snapshot-restore block leaves behind.
-                && grid.contains("[New Pane Ctrl+N]")
+                && grid.contains("[New Agent Ctrl+N]")
                 && !grid.contains("[Command Mode Ctrl+D]")
         }),
         "a cold start must honour the remembered Dashboard, ignore the rebuilt pane id, and \

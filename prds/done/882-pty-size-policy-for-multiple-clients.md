@@ -22,7 +22,7 @@ Both land on `AttachRequest::Resize { id, rows, cols }` → `AgentPtyRegistry::r
 
 ### Why PRD #104's cost model needs re-pricing rather than reversing
 
-[PRD #104](../104-snapshot-replay-preserves-pty-dims.md) established one-PTY-one-size and the resize-time scrollback-ring clear, and its reasoning is written throughout in terms of "the previous TUI viewport size" — an occasional resize from a user changing their terminal window. It solved TUI-to-TUI reconnect and it solved it correctly.
+[PRD #104](104-snapshot-replay-preserves-pty-dims.md) established one-PTY-one-size and the resize-time scrollback-ring clear, and its reasoning is written throughout in terms of "the previous TUI viewport size" — an occasional resize from a user changing their terminal window. It solved TUI-to-TUI reconnect and it solved it correctly.
 
 **Two concurrent clients were not a case it considered.** Nothing in #104 was wrong; its premise changed. What follows re-prices the ring clear under policies where resizes are frequent, and leaves #104's conclusion standing under policies where they are not.
 

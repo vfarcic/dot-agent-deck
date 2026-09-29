@@ -210,10 +210,10 @@ fn spawn_005_pane_spawn_joins_the_already_open_orchestration_tab() {
         .impersonating_pane_signals()
         .with_pty_size(120, 40)
         .launch_with_fixture("pane-spawn-live");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_absence("┌ New Agent"); // form closed -> tab up, orchestrator focused
     deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode, orchestrator focused
 
     // Precondition: both configured roles spawned into ONE tab at open time.
@@ -322,10 +322,10 @@ fn drift_001_role_grown_via_pane_spawn_survives_session_capture() {
             session_file.to_str().expect("session path is UTF-8"),
         )
         .launch_with_fixture("pane-spawn-live");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
-    deck.wait_for_absence("New Agent");
+    deck.wait_for_absence("┌ New Agent");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     assert!(
         deck.wait_for_grid_string_within("coder", Duration::from_secs(10)),

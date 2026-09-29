@@ -38,7 +38,7 @@ use spec::spec;
 /// Leaves the deck with ≥2 tabs (Dashboard + the active Mode tab), so the tab
 /// strip's `Dashboard` header is rendered.
 fn open_mode_tab(deck: &TuiDeck) {
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     deck.send_bytes(b"\x0e"); // Ctrl+N → directory picker
     deck.wait_for_string("Select Directory");
     deck.send_bytes(b" "); // Space: choose current dir → new-pane form
@@ -108,15 +108,15 @@ fn render_001_enlarge_fills_new_width() {
 #[test]
 fn layout_001_toggle_layout_keeps_pane_intact() {
     // PRD #127: 200 cols so the Normal-mode bar renders the FULL labeled
-    // `[New Pane Ctrl+N]` (at the default 120 it collapses to `[Ctrl+N]`
-    // chips once the always-shown Scheduled Tasks button is included).
+    // `[New Agent Ctrl+N]` (at the default 120 it collapses to `[Ctrl+N]`
+    // chips once the always-shown Schedules button is included).
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
         .with_continue_session("rp", "sleep 600")
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_bytes(b"\x04"); // Ctrl+D → dashboard / Normal mode
-    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("[New Agent Ctrl+N]");
     // The restored No-agent pane's card body anchors the assertion.
     deck.wait_for_string("Launch an agent");
 
@@ -150,7 +150,7 @@ fn layout_002_pane_close_leaves_no_stale_fragment() {
     // close, and deliberately accept the safety confirmation.
     deck.send_bytes(b"\x04"); // Ctrl+D → command mode
     deck.send_bytes(b"\x17"); // Ctrl+W → arm close confirmation
-    deck.wait_for_string("Close this tab and all its panes?");
+    deck.wait_for_string("Close this tab and all its agents?");
     deck.send_bytes(b"\x1b[B"); // Down → select Close
     deck.send_bytes(b"\r"); // Enter → confirm close tab
 
@@ -165,7 +165,7 @@ fn layout_002_pane_close_leaves_no_stale_fragment() {
 /// switching the active view through the `render_mode_tab` path. After the
 /// transition settles the destination mode view must render cleanly — the tab
 /// strip's `Dashboard` header is present, and the dashboard-only empty-state
-/// line (`No active sessions`, never shown on a Mode tab) is NOT bleeding
+/// line (`No active agents`, never shown on a Mode tab) is NOT bleeding
 /// through from the source layout. Invariant guard: short-lived mode-switch
 /// artefacts are transient (the switch resizes panes via
 /// `resize_mode_tab_panes`), so this pins the "destination renders cleanly,
@@ -181,6 +181,6 @@ fn layout_003_mode_switch_renders_cleanly() {
     // Invariant: the Mode tab view is clean — tab strip present, no dashboard
     // empty-state line bleeding through from the pre-switch layout.
     deck.wait_until_grid("mode view renders without dashboard bleed-through", |g| {
-        g.contains("Dashboard") && !g.contains("No active sessions")
+        g.contains("Dashboard") && !g.contains("No active agents")
     });
 }

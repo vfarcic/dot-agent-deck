@@ -1,6 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 
-import { openOverview, showAllColumns, tableRegion } from "./support/overview";
+import { enterDeck, openOverview, showAllColumns, tableRegion } from "./support/overview";
 
 /**
  * Nothing pushes the page itself sideways — issue #836's "no horizontal
@@ -80,6 +80,7 @@ for (const viewport of VIEWPORTS) {
 
     test("the deck does not overflow the page either", async ({ page }) => {
       await page.goto("/?fixture=1&state=crowded");
+      await enterDeck(page);
       // State, not a timer: the rail is rendered once the shell has mounted.
       await expect(page.getByTestId("open-overview")).toBeVisible();
 

@@ -156,7 +156,9 @@ trait SshArgumentRules {
 }
 
 /// Describe one refused byte without letting it reach the reader's terminal.
-fn describe_byte(byte: u8) -> String {
+/// `pub(crate)` so [`crate::deck_list`]'s key-path check names a byte the same
+/// way every other field's refusal does.
+pub(crate) fn describe_byte(byte: u8) -> String {
     match byte {
         0 => "a NUL byte".to_string(),
         b if b.is_ascii_whitespace() => format!("ASCII whitespace (0x{b:02x})"),
@@ -2978,14 +2980,22 @@ mod tests {
     /// point: this constant is a *program*, its whole job is to answer with a
     /// path, and a string assertion would pass over a syntax error or an
     /// inverted `-S` test alike.
+    ///
+    /// `env_clear` for the same reason as [`run_probe_under`]: the snippet's
+    /// first rung runs whatever `dot-agent-deck` sits at `$HOME/.local/bin` or
+    /// on `PATH`, so an ambient one lets this machine's installed deck answer
+    /// instead of the fallback rungs these tests are about. Measured on a
+    /// developer box with a deck installed at `~/.local/bin`: the probe
+    /// printed nothing where a path was expected and four tests failed, while
+    /// CI, with no deck installed, stayed green.
     #[cfg(unix)]
     fn run_socket_probe(snippet: &str, env: &[(&str, &str)]) -> String {
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(snippet)
-            .env_remove("DOT_AGENT_DECK_ATTACH_SOCKET")
-            .env_remove("XDG_RUNTIME_DIR")
-            .env_remove("TMPDIR")
+            .env_clear()
+            // The fallback rungs call `id -u`.
+            .env("PATH", "/usr/bin:/bin")
             .envs(env.iter().copied())
             .output()
             .expect("run the discovery probe under /bin/sh");

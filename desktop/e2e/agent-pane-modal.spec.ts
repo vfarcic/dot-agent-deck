@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { enterDeck } from "./support/overview";
 
 /**
  * `aria-modal="true"` made true, in the only tier that can tell.
@@ -40,6 +41,7 @@ test.describe("the agent pane is a real modal", () => {
    */
   test("contains Tab inside the pane and gives the screen back on close", async ({ page }) => {
     await page.goto("/?fixture=1&state=fleet");
+    await enterDeck(page);
 
     const selector = page.getByTestId("deck-selector-toggle");
     await expect(selector).toBeVisible();

@@ -54,6 +54,7 @@ DENY_PATHS = (
     ".github/",
     "scripts/apply-branch-protection.sh",
     "greptile.json",
+    ".pr_agent.toml",
     "MAINTAINERS.md",
     "CLAUDE.md",
     "src/daemon_protocol.rs",
@@ -79,6 +80,7 @@ DENY_PRECEDENCE = (
     "scripts/apply-branch-protection.sh",
     "MAINTAINERS.md",
     "greptile.json",
+    ".pr_agent.toml",
     ".github/",
 )
 
@@ -471,6 +473,67 @@ def pr_changed_paths(repo, number):
     )
 
 
+# Issue #1270: who counts as an INDEPENDENT review of a pull request.
+#
+# Not this workflow (it is the actor being gated), not the pull request's own
+# author, and not a human pasting a verdict — the point is that some reviewer
+# other than the approver looked at this exact code. Today that is Qodo, with
+# Greptile alongside it while its credits last.
+#
+# Adding a name here widens what may satisfy the gate, so it is a list in code
+# rather than a repository variable: it shows up in a diff and is reviewed.
+INDEPENDENT_REVIEWERS = ("qodo-code-review[bot]", "greptile-apps[bot]")
+
+
+def independent_review_at(sha, comments, review_comments, reviews):
+    """Did an independent reviewer look at THIS head? (issue #1270)
+
+    Three shapes count, because the two products express it differently:
+
+      * a submitted review whose `commit_id` is the head — Greptile's shape;
+      * an inline review comment whose ORIGINAL_commit_id is the head — how a
+        finding arrives. `original_commit_id` and not `commit_id`: GitHub
+        RE-ANCHORS `commit_id` to the current head for a comment that still
+        applies, so an old finding reports today's SHA and would satisfy this
+        gate without its author having read one new line. Measured 2026-09-24
+        on #1235 — a Greptile comment created on the 22nd against `1540db0f`
+        reported `commit_id=e4596523`, the head pushed minutes earlier;
+      * an issue comment by such a reviewer whose body NAMES the head SHA —
+        Qodo's shape, because it edits one summary comment in place as new
+        commits land rather than posting a new one. Measured 2026-09-24 on
+        #1268: the comment's `created_at` sat two commits behind the head while
+        its body cited the head SHA, so `created_at` is not the freshness
+        signal and a timestamp comparison would read as stale.
+
+    Returns the reviewer's login, or None. Absence is not a defect — it means
+    nobody independent has read this head yet, which is a reason to withhold an
+    approval rather than to refuse the pull request.
+    """
+    if not sha:
+        return None
+    for review in reviews or ():
+        login = ((review.get("user") or {}).get("login")) or ""
+        # A PENDING review is a draft its author has not submitted. `pr_reviews`
+        # already carries the state, and counting an unsubmitted one would let
+        # unfinished evidence unlock an approval (Qodo on PR #1271).
+        if review.get("state") == "PENDING":
+            continue
+        if login in INDEPENDENT_REVIEWERS and review.get("commit_id") == sha:
+            return login
+    for comment in review_comments or ():
+        login = ((comment.get("user") or {}).get("login")) or ""
+        # `original_commit_id` is where the comment was WRITTEN; `commit_id`
+        # follows the head. See the docstring -- reading the latter makes this
+        # gate vacuous on any pull request that ever received an inline finding.
+        if login in INDEPENDENT_REVIEWERS and comment.get("original_commit_id") == sha:
+            return login
+    for comment in comments or ():
+        login = ((comment.get("user") or {}).get("login")) or ""
+        if login in INDEPENDENT_REVIEWERS and sha in (comment.get("body") or ""):
+            return login
+    return None
+
+
 def coverage_gap(verdicts, changed_paths):
     """Issue #1266: changed files no TRUSTED verdict claims to have deep-read.
 
@@ -547,11 +610,22 @@ def latest_verdict(repo, pr_number):
 
 # The marker every no-vote notice carries, so the job can recognise its own.
 #
-# Both notices (an INSUFFICIENT verdict, and a deny-listed pull request whose
-# auto-merge is armed) open with this, and both quote the short head SHA. Author
-# plus marker plus SHA is what makes a notice identifiable as ALREADY POSTED FOR
-# THIS HEAD, which is the whole question `already_noticed_at` answers.
+# Every notice opens with this and quotes the short head SHA -- an INSUFFICIENT
+# verdict, a deny-listed pull request whose auto-merge is armed, and since #1270
+# a head no independent review has read. Author plus marker plus SHA is what
+# makes a notice identifiable as ALREADY POSTED FOR THIS HEAD; the reason marker
+# below is what tells two of them apart, and `already_noticed_at` wants both.
 NO_VOTE_MARKER = "**No vote cast**"
+
+# Per-reason discriminators, so one no-vote notice cannot suppress another at
+# the same head (issue #1270; found by Qodo and Greptile on PR #1271). Every
+# no-vote branch owns one, each appears verbatim in its own notice body and in
+# no other, and `already_noticed_at` REQUIRES one -- a new branch that forgets
+# to mint a marker fails at the call rather than silently sharing another
+# branch's key, which is exactly how this defect arrived.
+NO_INDEPENDENT_REVIEW_MARKER = "No independent review covers this head"
+INSUFFICIENT_MARKER = "my verdict was `INSUFFICIENT`"
+AUTO_MERGE_ARMED_MARKER = "**Auto-merge is armed on this pull request.**"
 
 
 def already_reviewed_at(reviews, sha, app_login):
@@ -586,12 +660,17 @@ def already_reviewed_at(reviews, sha, app_login):
     )
 
 
-def already_noticed_at(comments, sha, app_login):
+def already_noticed_at(comments, sha, app_login, reason_marker):
     """True when `app_login` has already posted a no-vote notice for this head.
 
     The comment-only outcomes re-posted on the same cadence and for the same
     reason as the duplicate reviews, so they take the same key: author, marker,
     and the short SHA the notice itself quotes.
+
+    `reason_marker` is part of that key and is REQUIRED, because a notice is
+    identified by its reason as well as its head: an armed-auto-merge warning
+    and a no-independent-review notice are different instructions to the reader,
+    and neither may stand in for the other.
 
     Note which branch this must NOT suppress. The armed-auto-merge notice tells
     the reader to disarm auto-merge and re-run, so it has to stay re-runnable
@@ -609,6 +688,14 @@ def already_noticed_at(comments, sha, app_login):
         (comment.get("user") or {}).get("login") == app_login
         and NO_VOTE_MARKER in (comment.get("body") or "")
         and short in (comment.get("body") or "")
+        # `reason_marker` keys the notice by WHY no vote was cast. Without it two
+        # different reasons at one head collide: #1270's no-independent-review
+        # notice suppressed the armed-auto-merge warning that tells the
+        # maintainer to disarm, and the INSUFFICIENT notice, leaving a stale
+        # explanation in place and the reader with no instruction (Qodo and
+        # Greptile on PR #1271). It is required rather than defaulted: the
+        # collision came from a branch that did not pass one.
+        and reason_marker in (comment.get("body") or "")
         for comment in comments or ()
     )
 
@@ -629,9 +716,15 @@ def bot_rejection_is_stale(reviews, sha):
     no App credential and cannot ask who it is. That is sound here for a reason
     rather than by luck: a human's changes-requested must keep parking the pull
     request (it is someone else's homework, and re-deriving a verdict talks over
-    them mid-fix), and the only other bot reviewing here posts `COMMENTED` and
-    never `CHANGES_REQUESTED`. The vote job, which does know its own login, is
-    stricter still.
+    them mid-fix), and the other reviewing bots post `COMMENTED` rather than
+    `CHANGES_REQUESTED`. That last clause said "the only other bot" while there
+    were two -- Qodo joined Greptile on 2026-09-23 -- so it is worth having the
+    evidence rather than the quantifier: across the reviews on #1235, #1257,
+    #1259, #1265, #1268, #1271, #1274 and #1276 on 2026-09-24, Qodo and Greptile
+    posted 7 `COMMENTED` reviews each and no `CHANGES_REQUESTED` between them.
+    A third app that did reject would have its rejection treated as stale once
+    the head moved, which is the same bargain this function already strikes with
+    its own. The vote job, which does know its own login, is stricter still.
 
     Dismissed reviews are ignored: a dismissal has already released the pull
     request, so it is not what is holding it.
@@ -671,6 +764,23 @@ def pr_comments(repo, pr_number):
     return gh_json_paginated(
         "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
         "--jq", "[.[] | {body, user: {login: .user.login}}]",
+    )
+
+
+def pr_review_comments(repo, pr_number):
+    """Every INLINE review comment, paginated. Same paging reason as its siblings.
+
+    `original_commit_id` is what makes these useful to `independent_review_at`:
+    it is the commit the finding was WRITTEN against, so it answers "did
+    somebody independent look at THIS head" without parsing anyone's prose.
+
+    `commit_id` is fetched too, and is deliberately NOT that answer: GitHub
+    moves it to the current head for a comment that still applies, so it says
+    where a finding is displayed rather than what its author read.
+    """
+    return gh_json_paginated(
+        "api", f"repos/{repo}/pulls/{pr_number}/comments", "--paginate",
+        "--jq", "[.[] | {commit_id, original_commit_id, body, user: {login: .user.login}}]",
     )
 
 

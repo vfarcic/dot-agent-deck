@@ -3,6 +3,9 @@ sidebar_position: 7.4
 title: Remote Environments
 ---
 
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
 # Remote Environments
 
 A **remote environment** is a per-project host that runs the deck — the agents, and everything supervising them, live on the remote. Linux and Apple Silicon macOS are both validated end to end; a Mac needs two extra setup steps, listed in [Remote Environment Requirements](remote-requirements.md#macos-as-a-remote-host). Your laptop is just a terminal: `dot-agent-deck connect` opens an ssh session and runs the deck on the host, so your usual ssh config and keys apply. When you disconnect, the agents on the remote keep running.
@@ -15,6 +18,9 @@ For host prerequisites see [Remote Environment Requirements](remote-requirements
 
 ## Quick start
 
+<Tabs groupId="client">
+<TabItem value="tui" label="TUI">
+
 ```bash
 # 1. Register a remote (one-time per host).
 dot-agent-deck remote add my-vm user@host
@@ -23,7 +29,24 @@ dot-agent-deck remote add my-vm user@host
 dot-agent-deck connect my-vm
 ```
 
-`remote add` connects over ssh, installs `dot-agent-deck` to `~/.local/bin/dot-agent-deck` on the host, sets up the agent hooks, and records the remote in `~/.config/dot-agent-deck/remotes.toml`. `connect` then opens an ssh session and runs the deck there. Your local command stays in the foreground for as long as the session lasts and exits with the remote's exit code, so it behaves predictably in a script.
+`remote add` connects over ssh, installs `dot-agent-deck` to `~/.local/bin/dot-agent-deck` on the host, sets up the agent hooks, and adds the remote to your list of remotes. `connect` then opens an ssh session and runs the deck there. Your local command stays in the foreground for as long as the session lasts and exits with the remote's exit code, so it behaves predictably in a script.
+
+</TabItem>
+<TabItem value="desktop" label="Desktop">
+
+The desktop app reaches a daemon that is **already installed and running** on the host, over an ssh tunnel from your laptop; it installs nothing and starts nothing there, and most of this page's lifecycle (`connect`, stop versus detach, the upgrade nudge) is the TUI's.
+
+1. Install the deck on the host, most simply with `dot-agent-deck remote add my-vm user@host` from a machine with the CLI.
+2. Make sure a daemon is running on the host and stays up: keep agents running on it, or run `dot-agent-deck daemon serve` there with `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`, or under `systemd --user` or a LaunchAgent ([Requirements](remote-requirements.md#recommended-for-persistent-and-safe-use)).
+3. In the app, open **Settings → Daemons**, press **Add a daemon**, fill in **Host** (and **User**, **Port**, **Key file** or **Jump host** as needed), and press **Test connection**, which also finds the daemon's socket.
+4. Pick the daemon in the **Daemon** selector on the Dashboard, or **All daemons**.
+
+![Settings → Daemons with a remote daemon, build-box, chosen in the Daemon row beside All daemons and This machine, its Host filled in, the other fields showing their placeholders, and Test connection below, not yet pressed](/img/settings-daemons-desktop.png)
+
+[Desktop app → Daemons](desktop/daemons.md) has the fields, the test results and what they mean.
+
+</TabItem>
+</Tabs>
 
 Other registry commands:
 
@@ -53,6 +76,32 @@ dot-agent-deck remote add my-vm deck@198.51.100.10 \
   --key ~/.ssh/dot-agent-deck \
   --port 2222
 ```
+
+### Remote names
+
+A name is what you type after `connect`, so `remote add` requires a short one: letters (`a`–`z`, `A`–`Z`), digits, `.`, `-` and `_`, starting with a letter or digit, at most 64 characters. Names you registered before this rule keep working.
+
+## Shared with the desktop app
+
+The CLI and the desktop app share one list of remote decks. A remote you add with `remote add` shows up in the desktop app, and a deck you add in the desktop app shows up in `remote list` and opens with `connect <name>`. Either one can edit or remove any deck, and neither overwrites the other's changes: a remote you add in a terminal while the desktop app is open is kept when you next save in the app.
+
+The local deck is not part of this list; the desktop app always offers it. Removing a deck in the desktop app does the same as `remote remove`: it forgets the deck and leaves the host untouched.
+
+### Decks added in the desktop app
+
+The desktop app does not ask for a name. It names a deck after its host, such as `build.example.com`, and adds a number if that name is taken. Use that name with `connect`.
+
+`remote list` shows `unmanaged` as the version of such a deck, because `remote add` never installed `dot-agent-deck` on that host. Run `dot-agent-deck remote upgrade <name>` if you want the CLI to install and manage it.
+
+**`connect` does not use a jump host set in the desktop app yet.** If a deck is reachable only through a jump host, add a `ProxyJump` line for that host to your `~/.ssh/config`; `connect` runs your system `ssh`, which reads it.
+
+### Upgrading from an earlier desktop build
+
+Decks you added in an earlier desktop build move to the shared list the first time the new build starts. A deck you had also added with `remote add` is not listed twice, and the deck you had selected stays selected.
+
+### Mixing versions
+
+Keep the CLI and the desktop app at the same version on every machine where you use both. An older CLI that changes the list (`remote add`, `remote remove`, `remote upgrade`, or `connect` when a session ends) loses the desktop app's extra details for every deck: a remote deck the app had selected may fall back to the local deck, jump hosts have to be entered again, and **Test connection** has to run again. An older desktop build shows no remote decks at all once a newer one has moved them to the shared list.
 
 ## Lifecycle model
 
@@ -116,7 +165,7 @@ Reconnection is **bounded**, so a genuinely-gone remote surfaces an error instea
 
 The **first** connect gets a retry budget too, of the same size and shape. A probe that cannot reach the host prints `'<name>' not reachable yet — retrying…` to stderr and tries again after a backoff, up to five attempts — so a link that needs a moment to wake (a cold VM, a VPN still coming up, a laptop whose Wi-Fi has just associated) connects on its own instead of failing and leaving you to run the command a second time. The two budgets are **separate**: attempts spent getting connected are not taken out of the reconnects above, so a session that only came up on the last attempt still gets its full four if it later drops. It does not make a first-attempt failure impossible either: when the host really is unreachable, the retries are spent and you get the [Host unreachable](#host-unreachable) error below.
 
-Only a **dropped connection** triggers a reconnect. A clean quit or detach (exit 0), a `Ctrl-C` (exit 130), or a remote-side crash all end the session immediately — `connect` never reconnects into an intentional exit or a crashing TUI, and `last_connected` is recorded only on a clean exit, not on intermediate reconnects.
+Only a **dropped connection** triggers a reconnect. A clean quit or detach (exit 0), a `Ctrl-C` (exit 130), or a remote-side crash all end the session immediately — `connect` never reconnects into an intentional exit or a crashing TUI.
 
 The connection-check timings and the retry budget are sensible fixed defaults today; exposing them as configuration is a future improvement.
 
@@ -253,4 +302,4 @@ It is two steps and a second terminal, which is worse than pasting. It works on 
 
 - [Remote Environment Requirements](remote-requirements.md) — what a host must provide before you can register it.
 - [Remote Recipes](remote-recipes.md) — how to get a Linux or macOS host bootstrapped for `remote add`.
-- [Installation › Recycling the local daemon](installation.md#recycling-the-local-daemon) — `dot-agent-deck daemon stop` is the local counterpart for recycling the daemon on your laptop after a binary upgrade. The remote lifecycle described above (per-attach daemon, ssh session governs cleanup) is independent.
+- [Installation › Recycling the local daemon](installation.md#recycling-the-local-daemon) — `dot-agent-deck daemon stop` is the local counterpart for recycling the daemon on your laptop after a binary upgrade. It does not affect remote hosts, whose daemons are recycled as described in [What `y` actually does to the remote daemon](#what-y-actually-does-to-the-remote-daemon).

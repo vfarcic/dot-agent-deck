@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowDownToLine, BookOpenText, Copy, X } from "lucide-react";
 import type { AgentSession } from "../types";
 import { getTerminal, stripAnsi, terminalSnapshotText } from "../lib/terminalRegistry";
+import { blockedReasonText } from "../lib/blockedReason";
 
 /** How often the reader re-snapshots the live terminal buffer while open. */
 const REFRESH_MS = 700;
@@ -94,6 +95,8 @@ export function OutputReader({ agent, onClose }: OutputReaderProps) {
             <div>
               <strong>{agent.role}</strong>
               <span className={`status-label status-${agent.status}`}>{agent.status}</span>
+              {/* Issue #714: the reason, where the status is. */}
+              {agent.status === "blocked" && <span className="agent-blocked-reason">{blockedReasonText(agent.blocked)}</span>}
             </div>
           </div>
           <div className="reader-controls">

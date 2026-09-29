@@ -10,12 +10,12 @@ expression: text
         │  Global (works from any pane)                       Mode Tab (in-tab navigation)                    │         
         │                                                                                                     │         
         │  Ctrl+d             Toggle command / pane           j / Down           Focus next pane              │         
-        │  Ctrl+n             Create new pane                 k / Up             Focus previous pane          │         
+        │  Ctrl+n             Create new agent                k / Up             Focus previous pane          │         
         │  Alt+Shift+l        Toggle layout (stacked/tiled)   Enter           Enter PaneInput on selected     │         
         │  Ctrl+c             Quit                            Esc             Deselect side pane              │         
         │                                                     Mouse click     Focus pane                      │         
         │  Tab Navigation                                     Ctrl+click      Open hyperlink                  │         
-        │                                                     Ctrl+d             Return to Normal mode        │         
+        │                                                     Ctrl+d             Return to command mode       │         
         │  Tab / Right / l    Next tab                                                                        │         
         │  Shift+Tab / Left / h Prev tab                      New Agent Form                                  │         
         │  Ctrl+PgDn          Next tab                                                                        │         
@@ -25,17 +25,17 @@ expression: text
         │                                                     Esc             Cancel                          │         
         │  j / Down           Select next card                                                                │         
         │  k / Up             Select previous card            Directory Picker                                │         
-        │  1-9                Jump to pane N                                                                  │         
+        │  1-9                Jump to card N                                                                  │         
         │  Enter              Focus selected pane             j / Down        Select next                     │         
-        │  Ctrl+w             Close selected pane (confirms)  k / Up          Select previous                 │         
+        │  Ctrl+w             Close selected agent (confirms) k / Up          Select previous                 │         
         │  Ctrl+l             Toggle orch tab split ratio     l / Right / Enter   Enter directory             │         
         │  Ctrl+z             Zoom focused pane               h / Left / Bksp     Go up one level             │         
-        │  /                  Filter sessions                 Space           Confirm current directory       │         
+        │  /                  Filter agents                   Space           Confirm current directory       │         
         │  Esc                Clear filter                    /               Filter (case-insensitive)       │         
-        │  r                  Rename session                  Esc             Clear filter (twice = close)    │         
+        │  r                  Rename agent                    Esc             Clear filter (twice = close)    │         
         │  g                  Generate .dot-agent-deck.toml   q               Cancel                          │         
         │  y / n              Approve / deny permission                                                       │         
-        │  s                  Scheduled Tasks manager         Session                                         │         
+        │  s                  Schedules manager               Session                                         │         
         │  PageUp / PageDown  Scroll focused pane                                                             │         
         │  F1                 Toggle this help                Panes auto-saved continuously.                  │         
         │                                                     Restored automatically on launch.               │         

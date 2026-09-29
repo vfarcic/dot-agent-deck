@@ -475,6 +475,23 @@ fn dispatch_prompt(
     prompt
 }
 
+/// How the daemon's reply to a dispatch that STARTED something opens — the
+/// message typed into the caller's pane once the spawn returns. Every refusal
+/// or failure [`handle_dispatch`] reports opens `dispatch:` with anything else.
+///
+/// Issue #530: a constant because callers are taught to branch on it. The CLI's
+/// exit status is the provenance gate's acknowledgement, written before this
+/// handler runs, so this message is the first thing that says whether a unit
+/// exists at all — and `dispatch --help` and the dispatcher seed both quote it.
+/// Tests pin both quotes against this value, so rewording the reply cannot leave
+/// them teaching an opening nothing sends.
+///
+/// It says a unit was spawned, not that its task arrived: the prompt's first
+/// write can still be refused, and its confirmation runs in a detached task
+/// that can run for up to a minute after this message is sent (see
+/// [`crate::spawn::spawn`]).
+pub const SPAWNED_OPENING: &str = "dispatch: spawned isolated";
+
 pub async fn handle_dispatch(
     ctx: &DispatchContext,
     name: &str,
@@ -681,11 +698,11 @@ pub async fn handle_dispatch(
                 message: {
                     let opened = match &handle.kind {
                         SpawnKind::Orchestration { name: orch } => format!(
-                            "dispatch: spawned isolated orchestration '{orch}' for '{name}' in {}",
+                            "{SPAWNED_OPENING} orchestration '{orch}' for '{name}' in {}",
                             paths.worktree_dir.display()
                         ),
                         SpawnKind::SingleAgent => format!(
-                            "dispatch: spawned isolated agent for '{name}' in {}",
+                            "{SPAWNED_OPENING} agent for '{name}' in {}",
                             paths.worktree_dir.display()
                         ),
                     };
@@ -1450,7 +1467,7 @@ mod tests {
     /// A pure composer test rather than a spawned one: the single-agent prompt is
     /// delivered into a PTY and never written to disk, so there is no artefact to
     /// assert on the way the orchestration test asserts on
-    /// `orchestrator-context.md`. `dispatch/return/003` covers the same
+    /// `orchestrator-context-<id>.md`. `dispatch/return/003` covers the same
     /// instruction arriving at a real dispatched unit end to end.
     #[test]
     fn a_single_dispatch_prompt_tells_the_unit_to_report_when_it_finishes() {
@@ -1720,10 +1737,24 @@ mod tests {
             result.message
         );
 
-        let context = worktree.join(".dot-agent-deck/orchestrator-context.md");
+        // Issue #1233: the orchestration's own per-publish file, not the
+        // compatibility mirror beside it.
+        let context = std::fs::read_dir(worktree.join(".dot-agent-deck"))
+            .expect("list the dispatched worktree's .dot-agent-deck")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(crate::orchestrator_context::CONTEXT_FILE_PREFIX)
+                            && name.ends_with(".md")
+                    })
+            })
+            .expect("the dispatched orchestration must publish its own context file");
         let content = std::fs::read_to_string(&context).unwrap_or_else(|e| {
             panic!(
-                "the dispatched orchestration must get an orchestrator-context.md at {} \
+                "the dispatched orchestration must get a context file at {} \
                  (its absence is exactly why workers sat idle): {e}",
                 context.display()
             )

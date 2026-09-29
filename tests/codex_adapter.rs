@@ -35,44 +35,51 @@ fn codex_detect_001_registry_identity_is_complete() {
     );
 }
 
-/// Realistic `codex exec --json` lifecycle lines map to dashboard states. Both
-/// reasoning and command execution are active work, errors win, and turn
-/// completion makes the wrapped session idle without waiting for process exit.
+/// Issue #540: the Codex rule set classifies what the interactive `codex` TUI
+/// actually prints — ANSI redraw text, never a `"type":…` JSON record — and it
+/// reads every such line as activity and nothing else. In particular a redrawn
+/// reply that merely mentions "error" must not flip a working card to `Error`,
+/// which is the one thing that keeps this set distinct from `GENERIC`. And the
+/// `codex exec --json` records the set used to key on are activity too now:
+/// matching them was a classification path the spawned process never reached.
 #[test]
-fn codex_wrap_001_jsonl_output_maps_to_dashboard_states() {
+fn codex_wrap_001_codex_output_is_activity_only() {
     let cases = [
         (
-            r#"{"type":"turn.started"}"#,
-            DetectedEvent::Working,
-            "turn start",
+            "\u{1b}[2K\u{1b}[1G› Ask Codex to do anything",
+            "idle composer redraw",
         ),
         (
-            r#"{"type":"item.started","item":{"type":"reasoning","text":"Inspecting files"}}"#,
-            DetectedEvent::Working,
-            "reasoning",
+            "• Ran cargo test -- error handling passes",
+            "reply mentioning error",
         ),
         (
-            r#"{"type":"item.started","item":{"type":"command_execution","command":"ls"}}"#,
-            DetectedEvent::Working,
-            "tool execution",
-        ),
-        (
-            r#"{"type":"error","message":"model request failed"}"#,
-            DetectedEvent::Error,
-            "error",
+            "  └ error: could not compile `demo`",
+            "rendered tool output",
         ),
         (
             r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}"#,
-            DetectedEvent::Idle,
-            "turn completion",
+            "exec turn end",
+        ),
+        (
+            r#"{"type":"error","message":"model request failed"}"#,
+            "exec error record",
         ),
     ];
-
-    for (line, expected, label) in cases {
+    for (line, label) in cases {
         assert_eq!(
             classify_line_with(line, &CODEX),
-            Some(expected),
-            "Codex {label} line was misclassified: {line}"
+            Some(DetectedEvent::Working),
+            "Codex {label} line must classify as activity only: {line}"
         );
     }
+    assert_eq!(
+        classify_line_with("   ", &CODEX),
+        None,
+        "a blank line signals nothing"
+    );
+    assert!(
+        CODEX.error_markers.is_empty() && CODEX.idle_markers.is_empty(),
+        "the Codex set must not grow markers the interactive TUI never prints (issue #540)"
+    );
 }

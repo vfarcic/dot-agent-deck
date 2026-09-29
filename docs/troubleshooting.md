@@ -5,7 +5,11 @@ title: Troubleshooting
 
 # Troubleshooting
 
+Most of this page applies to both clients, the TUI and the [desktop app](desktop/index.md), because the problems live in the daemon or the agents they share. A section that applies to only one client says so under its heading. For a desktop app that shows **Daemon disconnected**, see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon).
+
 ## Shift+Enter Submits Instead of Inserting a Newline
+
+*Applies to the TUI.*
 
 Inside an embedded agent pane, **Shift+Enter** inserts a newline into the agent's draft and plain **Enter** submits it — the same behavior you get running the agent directly. This works with **no terminal configuration** on any terminal that implements the enhanced ("kitty") keyboard protocol, which the deck negotiates for you at startup.
 
@@ -19,7 +23,7 @@ If you already have `keybind = shift+enter=csi:13;2u` in `~/Library/Application 
 
 ## Hooks
 
-Hooks are **auto-installed on every startup** — most users never need to think about them. The CLI detects which agents are present and installs hooks accordingly:
+Hooks are **auto-installed on every startup** — most users never need to think about them. The deck detects which agents are present and installs hooks accordingly, both when the dashboard starts and when its background daemon starts:
 
 - **Claude Code** (`~/.claude/` detected) — writes entries into `~/.claude/settings.json` for hook types: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, PreCompact, SubagentStart, SubagentStop. Only the deck's own hook commands are touched; your `model`, `env`, `permissions` and every other setting survive byte-for-byte, and if you put one of your own hooks in the same rule object as the deck's, `hooks uninstall` removes only the deck's command and leaves yours (with its matcher) in place. The read-modify-write is serialized by an in-process mutex and published atomically (temp file + `rename`), so a crash mid-write never leaves a truncated file, and the file keeps its existing permissions (a settings file the deck creates itself is owner-only). A `settings.json` the deck cannot parse — one trailing comma is enough — is backed up to `settings.json.bak` and the install *or uninstall* errors out rather than clobbering it. A `settings.json` that is a **symlink** (a dotfiles arrangement) is refused for the same reason: the deck will neither replace your link with a regular file nor write through it to a path outside `~/.claude/`. Point it at a real file, or edit the linked file's hooks yourself.
 - **OpenCode** (`~/.opencode/` detected) — creates a JS plugin at `~/.opencode/plugin/dot-agent-deck/index.js` that forwards session, tool, and permission events.
@@ -27,6 +31,8 @@ Hooks are **auto-installed on every startup** — most users never need to think
 - **Devin** (`devin` found on `PATH`) — merges a `"hooks"` object into Devin's user config, whose commands shell `dot-agent-deck hook --agent devin`. The config is located the way Devin locates it: `$XDG_CONFIG_HOME/devin/config.json` when that variable is set, and `~/.config/devin/config.json` otherwise. Devin ships a Claude-Code-compatible hooks engine, so its native command hooks post the same stdin JSON shape Claude's do and ride the existing hook socket — no wrapper, no trust ceremony. Only the `"hooks"` key is touched; your `agent` (model), `permissions`, `mcpServers`, `theme_mode`, and every other setting survive byte-for-byte. The read-modify-write is serialized by an in-process mutex and published atomically (temp file + `rename`), so a crash mid-write never leaves a truncated config, and the file keeps its existing permissions (a config the deck creates itself is owner-only). Devin documents its config as JSON *with comment support*, which the deck's parser cannot edit in place: a config it cannot parse is backed up to `config.json.bak` and the install errors rather than clobbering it.
 
 Auto-install is idempotent and best-effort — if an agent directory is missing the step is silently skipped, and errors are logged without blocking startup.
+
+The daemon half is what covers the desktop app: the app never starts a dashboard, and the daemon it connects to installs the hooks whichever way that daemon was started (see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)), so a machine with the desktop app and no CLI installed gets the same hooks as one running the dashboard. When that daemon is the copy bundled in the app and there is no CLI install to point at, those hooks name the daemon bundled in the app, so moving or deleting the app leaves them pointing at nothing until the deck next starts and repairs them (below). The install runs when the daemon **starts**, so after upgrading the desktop app from a version that did not install these hooks, a daemon still running from before the upgrade keeps serving the app without them; they appear the next time the daemon starts.
 
 ### A hook fails with `not found` and names a path you never typed
 
@@ -58,6 +64,8 @@ If a Codex card still shows only coarse status with no tool or prompt detail, ch
 2. **Does your launcher re-export `CODEX_HOME`?** The deck pins the home it prepared onto the process it starts, but a script can override that before running `codex` — and the deck's hooks and trust records live in the *original* home. Drop the re-export, or point it at the same home the deck uses (`$CODEX_HOME`, else `~/.codex`).
 3. **Re-run the install manually** to see any error the silent startup step swallowed: `dot-agent-deck hooks install --agent codex`.
 4. **Approve them by hand as a fallback:** run Codex once and approve the deck's hooks in its interactive `/hooks` review. Codex remembers that trust for subsequent runs.
+
+While those hooks are not trusted — or if you switch the deck's `UserPromptSubmit` hook off in Codex's `/hooks` list — Codex also cannot tell the deck that it received an automatic prompt — a mode's seed, an orchestration role's first task, a dispatched unit's task. The deck then types such a prompt in **once** and does not retry it, rather than risk giving Codex the same task twice. If a Codex pane's automatic prompt sometimes goes missing, fixing the trust step above is also the fix for that.
 
 Trust is pinned to each hook's exact content, so it deliberately fails *closed*: if a definition changes underneath a trust record, Codex refuses to run it and the card falls back to coarse status rather than running something unreviewed. Re-running the install re-records trust for the new content.
 
@@ -122,6 +130,8 @@ If `command -v` finds the command in your login shell but a pane still can't spa
 After upgrading the `dot-agent-deck` binary, the new TUI can keep talking to a daemon that was spawned by the *previous* version. The wire format stays compatible, but newer features (delegate role maps, orchestration tab fields, and similar internal refactors) silently no-op because the older daemon doesn't know about the newer shape.
 
 This only happens when you are **deliberately** still on the older daemon. The common cause: you upgraded while agents were running, the launch prompt warned that restarting would stop them, and you **declined the restart to keep your agents** — which leaves the new TUI attached to the older daemon on purpose. (It can also happen with a very old, pre-handshake binary that attached without any version check.) With no agents running, the handshake restarts the daemon silently, so a fresh daemon at the new version is the normal outcome.
+
+When the upgrade changed the wire format itself — the attach protocol — declining does not leave you attached at all: the TUI refuses with `error: daemon speaks attach protocol vN, but this binary speaks vM` and exits, leaving the daemon and its agents running. See [Upgrading](installation.md#upgrading) for the two ways on from there.
 
 ### Symptom
 
@@ -236,6 +246,8 @@ There is no in-place recovery for a pane that is already orphaned — re-dispatc
 
 ## A pane says "disconnected" and ignores what you type
 
+*Applies to the TUI.*
+
 A pane whose title ends in `— disconnected` is no longer connected to an agent. Its last output stays on screen so you can read what happened, but the pane cannot accept input again — typing into it reports that it is disconnected rather than sending anything. Close the pane and start a new one; there is nothing to recover in place.
 
 The deck reaches this state only after it has already tried to reconnect and failed. When an agent goes away — a crash, an external `kill`, or a restart that never comes back — the deck looks the agent up again and re-attaches, which is what makes a normal respawn invisible to you. It gives up in two cases, and the status message tells you which:
@@ -287,7 +299,7 @@ So the daemon picks one size per agent, and **the app you used last picks it.** 
 
 A terminal can only report that it gained focus if it supports focus reporting — tmux does only with `set -g focus-events on` — so in one that does not, the TUI takes over on your first key press or click rather than the moment you switch to it.
 
-**Until an app claims focus, or when the app that did is not showing this agent, the smallest pane wins** — the smallest rows and the smallest columns among every client attached to the agent, so every client can draw the whole screen and the larger ones leave the remainder blank. That resolves itself when the smaller view goes away: close the other client, or scroll the tile out of view in the desktop app — the desktop attaches only to the terminals actually on screen — and the agent grows back to fit whoever is left, within a frame. Nothing needs restarting, and you do not need to resize anything by hand.
+**Until an app claims focus, or when the app that did is not showing this agent, the smallest pane wins** — the smallest rows and the smallest columns among every client attached to the agent, so every client can draw the whole screen and the larger ones leave the remainder blank. That resolves itself when the smaller view goes away: close the other client, or close the agent's pane in the desktop app (or, on its experimental Daemons screen, scroll the tile out of view) — the desktop attaches only to the terminals actually on screen — and the agent grows back to fit whoever is left, within a frame. Nothing needs restarting, and you do not need to resize anything by hand.
 
 **A TUI from an older release cannot take focus back.** It never tells the daemon it has focus, so while a current desktop app holds focus on an agent they both show, the older TUI shows that agent at the desktop's size and cuts it off wherever its own pane is smaller. Upgrading the TUI restores switching.
 
@@ -299,19 +311,21 @@ Also expected, and narrower than it looks.
 
 When an agent's size changes, the daemon drops the copy of that agent's output it keeps for **replay**. It has to: those bytes were drawn for the old grid, and replaying them into a differently-sized screen is what produces overlapping text and stray vertical strips down the right-hand edge. Keeping them would trade a missing history for a scrambled one.
 
-What this costs is precise, and **only a client that attaches or re-attaches after the size changed is affected**: it gets a correct live screen with no history behind it. A client that was already attached keeps its own scrollback and can still scroll it — the loss is not retroactive, so nothing disappears from a pane you are looking at. In practice you meet it by bringing a desktop tile back on screen after the agent's size changed, since showing a tile is what attaches it; a pane that respawns and a client that reconnects after a dropped link are in the same position, because both attach afresh.
+What this costs is precise, and **only a client that attaches or re-attaches after the size changed is affected**: it gets a correct live screen with no history behind it. A client that was already attached keeps its own scrollback and can still scroll it — the loss is not retroactive, so nothing disappears from a pane you are looking at. In practice you meet it by opening an agent's pane in the desktop app after the agent's size changed (or bringing a tile back on screen on its experimental Daemons screen), since showing a terminal is what attaches it; a pane that respawns and a client that reconnects after a dropped link are in the same position, because both attach afresh.
 
 Switching between the desktop app and a TUI that show the same agent changes its size too, when their panes differ, so switching drops the replay copy again. Switches that land within about a quarter of a second of each other are applied as a single size change rather than one each, so flipping back and forth quickly costs no more than a single switch does.
 
 The agent's own output fills the history back in as it keeps working.
 
-## The deck is missing cards — a role or session I know is running has no card
+## The deck is missing cards — a role or agent I know is running has no card
 
-Check the deck's title row first. If it reads something like `dot-agent-deck — 7 session(s)  (↓2)`, nothing is wrong with the agents: the count is right, and the `(↓2)` says two cards are below the bottom of the window. `(↑2)` means two are above it, and both appear together when you are scrolled into the middle. Move the selection with `j` / `k` (or the arrow keys) to bring them into view, or give the terminal a few more rows and they all fit again.
+*Applies to the TUI.*
 
-The deck fits as many cards as it can before it resorts to this. It picks the number of card columns and the card size together, widening the grid to a second or third column when that is what it takes to show every card, so the marker only appears on a window genuinely too small for the cards at any layout — a very short terminal, or a very large number of sessions.
+Check the deck's title row first. If it reads something like `dot-agent-deck — 7 agent(s)  (↓2)`, nothing is wrong with the agents: the count is right, and the `(↓2)` says two cards are below the bottom of the window. `(↑2)` means two are above it, and both appear together when you are scrolled into the middle. Move the selection with `j` / `k` (or the arrow keys) to bring them into view, or give the terminal a few more rows and they all fit again.
 
-If there is **no** marker and a card you expect is still absent, the count in the title is the thing to read next: it is the number of sessions the deck actually knows about, and `dot-agent-deck daemon status` lists what the daemon has. A role present in your `.dot-agent-deck.toml` but missing from both is one that never started — check its `command` (see [a bare command fails to spawn](#a-bare-command-like-claude-opencode-pi-codex-or-devin-fails-to-spawn)).
+The deck fits as many cards as it can before it resorts to this. It picks the number of card columns and the card size together, widening the grid to a second or third column when that is what it takes to show every card, so the marker only appears on a window genuinely too small for the cards at any layout — a very short terminal, or a very large number of agents.
+
+If there is **no** marker and a card you expect is still absent, the count in the title is the thing to read next: it is the number of agents the deck actually knows about, and `dot-agent-deck daemon status` lists what the daemon has. A role present in your `.dot-agent-deck.toml` but missing from both is one that never started — check its `command` (see [a bare command fails to spawn](#a-bare-command-like-claude-opencode-pi-codex-or-devin-fails-to-spawn)).
 
 ## Enabling Debug Logs
 

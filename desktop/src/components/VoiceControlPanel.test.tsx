@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "../data/fixture";
 import {
   DEFAULT_DESKTOP_SETTINGS,
+  fixtureDesktopFeatures,
   type DesktopSettingsDto,
   type VoiceResultDto,
   type VoiceStatusDto,
@@ -17,7 +18,12 @@ vi.mock("./TerminalViewport", () => ({
   ),
 }));
 
-import { DeckShell } from "../App";
+import { DeckShell as AppDeckShell } from "../App";
+
+/** Existing deck-specific voice cases enter the deck explicitly. */
+function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
+  return <AppDeckShell initialView={{ kind: "deck" }} {...props} />;
+}
 import {
   NOTHING_DISPATCHED,
   SCREEN_MOVED_ON,
@@ -98,6 +104,7 @@ function runtime(resolveVoice: ResolveVoice, voice: VoiceControls = voiceControl
   const settings = settingsStore();
   return {
     mode: "fixture",
+    desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
     snapshot,
     fleet: [snapshot],
     terminalData: {},
@@ -115,7 +122,7 @@ function runtime(resolveVoice: ResolveVoice, voice: VoiceControls = voiceControl
       deck: selection,
       state: "ssh_unavailable" as const,
       ok: false,
-      message: "No deck is reachable from this test runtime.",
+      message: "No daemon is reachable from this test runtime.",
       disclosureKnown: false,
       forwards: [],
       knownHosts: [],
@@ -208,7 +215,7 @@ const DISPATCH = {
   action: "open_overview",
   invoke: "openOverview",
   params: [],
-  sentence: "Opening the agent overview.",
+  sentence: "Opening the agent dashboard.",
 };
 
 const OPEN_SETTINGS_DISPATCH = {
@@ -229,8 +236,8 @@ const OUTCOMES: Array<{ name: string; utterance: string; outcome: VoiceResultDto
       kind: "unavailable",
       transcript: "show me every agent",
       action: "open_overview",
-      hint: "the agent overview opens from the deck",
-      sentence: "Not here — the agent overview opens from the deck.",
+      hint: "the agent overview opens from the daemon",
+      sentence: "Not here — the agent overview opens from the daemon.",
     },
   },
   {
@@ -357,7 +364,7 @@ describe("voice control panel", () => {
   });
 
   /**
-   * Scenario: render the deck with voice available and inspect the surface's
+   * Scenario: render the daemon with voice available and inspect the surface's
    * shape. The trigger and the report are the two cells of ONE row, and that row
    * is the single element the agent pane's inert walk is told to skip.
    */
@@ -599,7 +606,7 @@ describe("voice control panel", () => {
   });
 
   /** Scenario: a spoken settings command opens the ordinary overlay and its transient report confirms the action. */
-  it("opens a deck overlay through the shell voice dispatch", async () => {
+  it("opens a daemon overlay through the shell voice dispatch", async () => {
     vi.useFakeTimers();
     const voice = automaticVoice(heard("open settings"));
     const resolveVoice = resolver(result(OPEN_SETTINGS_DISPATCH));
@@ -613,21 +620,28 @@ describe("voice control panel", () => {
     expect(screen.queryByText(NOTHING_DISPATCHED)).not.toBeInTheDocument();
   });
 
-  /** Scenario: the same overlay command resolves where its host is absent. The report corrects it and nothing opens. */
-  it("reports an unavailable overlay dispatch from the overview without throwing", async () => {
+  /** Scenario: a stale resolver names a deck-only drawer action on the overview. The app reports that it cannot dispatch it without throwing or opening a drawer. */
+  it("reports an unavailable deck-only dispatch from the overview without throwing", async () => {
     vi.useFakeTimers();
-    const voice = automaticVoice(heard("open settings"));
-    const resolveVoice = resolver(result(OPEN_SETTINGS_DISPATCH));
+    const voice = automaticVoice(heard("show evidence drawer"));
+    const resolveVoice = resolver(result({
+      kind: "dispatch",
+      transcript: "show evidence drawer",
+      action: "show_evidence_drawer",
+      invoke: "toggleEvidenceDrawer",
+      params: [],
+      sentence: "Showing evidence drawer.",
+    }));
     render(<DeckShell runtime={runtime(resolveVoice, voice)} initialView={{ kind: "overview" }} />);
 
     await turnVoiceOn(voice);
     await completeAutomaticUtterance(voice);
 
     expect(screen.getByText(NOTHING_DISPATCHED)).toBeVisible();
-    expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("evidence-drawer")).not.toBeInTheDocument();
   });
 
-  /** Scenario: a voice command navigates to the overview, then its transient Undo returns to the prior deck view. */
+  /** Scenario: a voice command navigates to the overview, then its transient Undo returns to the prior daemon view. */
   it("undoes a dispatched navigation back to the previous view", async () => {
     vi.useFakeTimers();
     const voice = automaticVoice(heard("show me every agent"));

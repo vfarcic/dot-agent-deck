@@ -190,6 +190,7 @@ async fn start_agent(server: &Server, command: &str) -> String {
             tab_membership: None,
             agent_type: None,
             seed: None,
+            authoring_kind: None,
         },
     )
     .await;
@@ -212,6 +213,7 @@ async fn start_agent_for_pane(server: &Server, command: &str, pane_id: &str) -> 
             tab_membership: None,
             agent_type: Some(AgentType::Codex),
             seed: None,
+            authoring_kind: None,
         },
     )
     .await;
@@ -234,6 +236,7 @@ async fn start_plain_agent_for_pane(server: &Server, command: &str, pane_id: &st
             tab_membership: None,
             agent_type: None,
             seed: None,
+            authoring_kind: None,
         },
     )
     .await;
@@ -434,6 +437,7 @@ async fn start_agent_with_membership(server: &Server, membership: TabMembership)
             tab_membership: Some(membership),
             agent_type: None,
             seed: None,
+            authoring_kind: None,
         },
     )
     .await;
@@ -497,6 +501,7 @@ async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
             }),
             agent_type: None,
             seed: None,
+            authoring_kind: None,
         },
     )
     .await;
@@ -583,6 +588,7 @@ async fn start_agent_round_trips_explicit_rows_cols() {
         tab_membership: None,
         agent_type: None,
         seed: None,
+        authoring_kind: None,
     };
 
     // Wire round-trip: encode + decode via the same serde path the daemon
@@ -694,6 +700,7 @@ fn start_agent_round_trips_explicit_agent_type() {
         tab_membership: None,
         agent_type: Some(AgentType::ClaudeCode),
         seed: None,
+        authoring_kind: None,
     };
 
     let json = serde_json::to_string(&req).unwrap();
@@ -723,6 +730,7 @@ fn start_agent_round_trips_explicit_agent_type() {
         tab_membership: None,
         agent_type: Some(AgentType::OpenCode),
         seed: None,
+        authoring_kind: None,
     };
     let json_oc = serde_json::to_string(&req_oc).unwrap();
     let back_oc: AttachRequest = serde_json::from_str(&json_oc).unwrap();
@@ -997,6 +1005,7 @@ async fn start_agent_with_invalid_membership_name_is_rejected() {
                 tab_membership: Some(TabMembership::Mode { name: name.clone() }),
                 agent_type: None,
                 seed: None,
+                authoring_kind: None,
             },
         )
         .await;
@@ -1156,7 +1165,7 @@ async fn project_verbs_are_reachable_and_none_report_unimplemented() {
     );
     assert!(
         resp.workflow_prepared.is_none(),
-        "a refusal carries no PreparedWorkflow"
+        "a refusal carries no PreparedOrchestration"
     );
     let error = resp.error.unwrap_or_default();
     assert!(
@@ -1360,6 +1369,25 @@ command = "cat"
 description = "Implements the requested change"
 "#;
 
+fn published_context_files(project: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(project.join(".dot-agent-deck"))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("orchestrator-context"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Scenario: Resolve a project, change its config, and confirm stale preparation
+/// publishes no context; an omitted revision still permits a fresh launch.
+///
 /// PRD #819 M4: `ResolveProject` hands back a revision derived from the config
 /// bytes, `PrepareWorkflow` echoes it, and a revision that no longer matches the
 /// file on disk is refused — **before** anything is published.
@@ -1372,9 +1400,6 @@ description = "Implements the requested change"
 async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
     let server = start_server().await;
     let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
-    let context = project
-        .join(".dot-agent-deck")
-        .join("orchestrator-context.md");
 
     let resp = issue_json_request(
         &server,
@@ -1409,7 +1434,7 @@ async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
     assert!(!resp.ok, "a stale revision must be refused");
     assert!(
         resp.workflow_prepared.is_none(),
-        "a refused preparation carries no PreparedWorkflow"
+        "a refused preparation carries no PreparedOrchestration"
     );
     let error = resp.error.unwrap_or_default();
     assert!(
@@ -1417,9 +1442,8 @@ async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
         "expected the stable `{PROJECT_ERR_STALE_REVISION}` code, got {error:?}"
     );
     assert!(
-        !context.exists(),
-        "the revision check must run BEFORE the publish, but {} was written",
-        context.display()
+        published_context_files(&project).is_empty(),
+        "the revision check must run BEFORE any context publish"
     );
 
     // An ABSENT revision means "I have no expectation", not "any revision" — the
@@ -1440,9 +1464,15 @@ async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
         "a preparation that names no revision must still succeed: {:?}",
         resp.error
     );
-    assert!(context.is_file(), "and it must publish the context");
+    assert!(
+        !published_context_files(&project).is_empty(),
+        "and it must publish a context"
+    );
 }
 
+/// Scenario: Ask the daemon to prepare an unknown orchestration and confirm it
+/// publishes no context file and starts no role.
+///
 /// PRD #819 M4: a preparation that fails publishes nothing and starts nothing.
 ///
 /// The e2e (`project/launch/001`) pins the same claim through a real
@@ -1454,9 +1484,6 @@ async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
 async fn a_failed_preparation_publishes_nothing_and_starts_no_roles() {
     let server = start_server().await;
     let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
-    let context = project
-        .join(".dot-agent-deck")
-        .join("orchestrator-context.md");
 
     assert!(
         server.registry.agent_records().is_empty(),
@@ -1484,9 +1511,8 @@ async fn a_failed_preparation_publishes_nothing_and_starts_no_roles() {
         "the refusal must not enumerate the orchestrations the config declares: {error:?}"
     );
     assert!(
-        !context.exists(),
-        "a failed preparation must publish nothing, but {} was written",
-        context.display()
+        published_context_files(&project).is_empty(),
+        "a failed preparation must publish no context"
     );
     assert!(
         server.registry.agent_records().is_empty(),
@@ -1494,6 +1520,9 @@ async fn a_failed_preparation_publishes_nothing_and_starts_no_roles() {
     );
 }
 
+/// Scenario: Symlink the project's context directory elsewhere and confirm the
+/// daemon refuses preparation without publishing through the link.
+///
 /// PRD #819 M4: the publish's symlink refusal is reachable **through the verb**,
 /// not only through a direct call to the publish function.
 ///
@@ -1533,9 +1562,15 @@ async fn prepare_workflow_refuses_a_symlinked_context_directory() {
         "expected `{PROJECT_ERR_PUBLISH_FAILED}`, got {error:?}"
     );
     assert!(
-        !elsewhere.join("orchestrator-context.md").exists(),
-        "nothing may be written through the link, but {} exists",
-        elsewhere.join("orchestrator-context.md").display()
+        std::fs::read_dir(&elsewhere)
+            .expect("list the symlink target")
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("orchestrator-context")),
+        "nothing matching orchestrator-context* may be written through the link at {}",
+        elsewhere.display()
     );
     assert!(
         server.registry.agent_records().is_empty(),
@@ -1572,7 +1607,7 @@ enum PreVerbAttachRequest {
 /// role, and whether that role is the orchestration's start role.
 ///
 /// A real launch always sends one (`desktop/src-tauri/src/lib.rs`'s
-/// `workflow_start_options`), and since PRD #819's Greptile P1(a) fix the daemon
+/// `orchestration_start_options`), and since PRD #819's Greptile P1(a) fix the daemon
 /// compares it against the token's binding — so a payload carrying `None` here
 /// can no longer produce a spawn. The cases below that pass `None` are the ones
 /// refused before the identity check is reached: an unknown token, and a payload
@@ -1609,6 +1644,7 @@ fn prepared_start_payload(
         }),
         agent_type: None,
         seed: None,
+        use_configured_command: false,
     };
     match serde_json::to_value(&request).expect("a prepared start serializes") {
         serde_json::Value::Object(fields) => fields,
@@ -1860,6 +1896,9 @@ async fn a_prepared_start_refuses_an_unknown_token_and_spawns_on_a_live_one() {
         "a refused prepared start must not have spawned a pane"
     );
 
+    // Issue #1045: deliberately the LEGACY spelling — a desktop built before
+    // the rename still sends `prepare-workflow` and reads `workflow_prepared`,
+    // and the token it gets back must spawn exactly as the new op's does.
     let resp = issue_json_request(
         &server,
         serde_json::json!({
@@ -1871,7 +1910,13 @@ async fn a_prepared_start_refuses_an_unknown_token_and_spawns_on_a_live_one() {
     )
     .await;
     assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
-    let prepared = resp.workflow_prepared.expect("a PreparedWorkflow");
+    assert!(
+        resp.orchestration_prepared.is_none(),
+        "a legacy request is answered on the legacy field only"
+    );
+    let prepared = resp
+        .workflow_prepared
+        .expect("the legacy field carries the PreparedOrchestration");
 
     let resp = issue_json_request(
         &server,
@@ -1907,6 +1952,10 @@ async fn a_prepared_start_refuses_an_unknown_token_and_spawns_on_a_live_one() {
 /// this daemon issued and is seconds old, so a refusal carrying the wrong code
 /// would say the token was unknown — which would send an operator looking for a
 /// client bug instead of a replaced artifact.
+///
+/// Scenario: Prepare two launches in one project, replace the first launch's
+/// own context file, and start with its still-live token. The daemon refuses
+/// that token as stale while the second launch's token still starts roles.
 #[tokio::test]
 async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() {
     let server = start_server().await;
@@ -1919,7 +1968,7 @@ async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() 
             let resp = issue_json_request(
                 server,
                 serde_json::json!({
-                    "op": "prepare-workflow",
+                    "op": "prepare-orchestration",
                     "path": path,
                     "orchestration": "loop",
                     "task": task,
@@ -1927,17 +1976,23 @@ async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() 
             )
             .await;
             assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
-            resp.workflow_prepared.expect("a PreparedWorkflow")
+            resp.orchestration_prepared
+                .expect("a PreparedOrchestration")
         }
     };
 
     let first = prepare("Task A: the first client's brief.").await;
     let second = prepare("Task B: the second client's brief.").await;
     assert_ne!(first.token, second.token);
-    assert_eq!(
+    assert_ne!(
         first.context_path, second.context_path,
-        "both preparations name the same fixed path, which is the shape of the defect"
+        "each preparation must keep its own context path"
     );
+    let replacement = std::path::Path::new(&first.context_path).with_extension("replacement");
+    std::fs::write(&replacement, "This is no longer Task A.")
+        .expect("write a replacement context file");
+    std::fs::rename(&replacement, &first.context_path)
+        .expect("replace the first preparation's context file");
 
     let resp = issue_json_request(
         &server,
@@ -1967,7 +2022,7 @@ async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() 
         "a refused prepared start must not have spawned a pane"
     );
 
-    // The second preparation's token still spawns, which is what stops the
+    // The untouched second preparation's token still spawns, which stops the
     // assertions above from passing against a daemon that refuses every token.
     let resp = issue_json_request(
         &server,
@@ -2041,7 +2096,7 @@ async fn a_prepared_start_refuses_spawn_fields_from_another_project() {
             let resp = issue_json_request(
                 server,
                 serde_json::json!({
-                    "op": "prepare-workflow",
+                    "op": "prepare-orchestration",
                     "path": path,
                     "orchestration": "loop",
                     "task": task,
@@ -2049,7 +2104,8 @@ async fn a_prepared_start_refuses_spawn_fields_from_another_project() {
             )
             .await;
             assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
-            resp.workflow_prepared.expect("a PreparedWorkflow")
+            resp.orchestration_prepared
+                .expect("a PreparedOrchestration")
         }
     };
 
@@ -2212,7 +2268,7 @@ async fn the_client_routes_a_presented_token_onto_the_prepared_verb() {
     // that refuses to send anything at all: a real preparation's token spawns
     // through the same method, capability gate included.
     let prepared = client
-        .prepare_workflow(
+        .prepare_orchestration(
             project.to_str().expect("utf-8 project path"),
             "loop",
             "Mint a token to spawn with.",
@@ -2259,6 +2315,298 @@ async fn the_client_routes_a_presented_token_onto_the_prepared_verb() {
         .await
         .expect("a token-less start is byte-for-byte the ordinary `start-agent`");
     assert!(!id.is_empty());
+}
+
+/// PRD #1223 M6: a project whose roles are long-lived `sh` stand-ins with
+/// DECLARED agents, so the configured-command path's seed rule can be observed
+/// without a real agent. `pi_start` decides whether the start role is Pi.
+fn configured_role_project(pi_start: bool) -> String {
+    format!(
+        r#"
+[[orchestrations]]
+name = "loop"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "sh -c 'sleep 600'"
+agent = "{}"
+start = true
+
+[[orchestrations.roles]]
+name = "builder"
+command = "sh -c 'sleep 600'"
+agent = "pi"
+"#,
+        if pi_start { "pi" } else { "opencode" }
+    )
+}
+
+/// An opted-in prepared start for `role` of `configured_role_project`: no
+/// `command`, a pane id to key the seed by, and the flag.
+fn configured_role_payload(
+    token: &str,
+    project: &str,
+    role: &str,
+    is_start_role: bool,
+    pane_id: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut payload =
+        prepared_start_payload(token, Some(project), Some(("loop", role, is_start_role)));
+    payload.remove("command");
+    payload.insert(
+        "env".into(),
+        serde_json::json!([["DOT_AGENT_DECK_PANE_ID", pane_id]]),
+    );
+    payload.insert("use_configured_command".into(), serde_json::json!(true));
+    payload
+}
+
+async fn prepare_loop(
+    server: &Server,
+    project: &Path,
+) -> dot_agent_deck::event::PreparedOrchestration {
+    let resp = issue_json_request(
+        server,
+        serde_json::json!({
+            "op": "prepare-orchestration",
+            "path": project.to_str().unwrap(),
+            "orchestration": "loop",
+            "task": "",
+        }),
+    )
+    .await;
+    assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
+    resp.orchestration_prepared
+        .expect("a PreparedOrchestration")
+}
+
+/// PRD #1223 M6: an opted-in prepared start takes its command, agent type and
+/// seed from the role's config, so a request that ALSO supplies any one of them
+/// is refused in the ordinary shape and starts nothing — rather than being
+/// resolved by a precedence rule the caller would have to know. Each field is
+/// probed on its own, and the same request without it then starts, so the
+/// refusal is the conflict and not the preparation.
+#[tokio::test]
+async fn a_configured_prepared_start_refuses_a_supplied_command_agent_type_or_seed() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(&configured_role_project(false));
+    let prepared = prepare_loop(&server, &project).await;
+
+    for (field, value) in [
+        ("command", serde_json::json!("/bin/sh")),
+        ("agent_type", serde_json::json!("claude_code")),
+        (
+            "seed",
+            serde_json::json!("a seed the config did not choose"),
+        ),
+    ] {
+        let mut payload = configured_role_payload(
+            &prepared.token,
+            &prepared.path,
+            "builder",
+            false,
+            "configured-conflict",
+        );
+        payload.insert(field.into(), value);
+        let resp = issue_json_request(&server, serde_json::Value::Object(payload)).await;
+        assert!(!resp.ok, "{field} alongside the flag must be refused");
+        assert!(resp.id.is_none(), "{field}: a refused start reports no id");
+        assert!(
+            resp.error
+                .as_deref()
+                .is_some_and(|e| e.contains("use_configured_command")),
+            "{field}: the refusal is the flag's, in the ordinary shape: {:?}",
+            resp.error
+        );
+        assert!(
+            resp.error.as_deref().is_some_and(|e| !e.contains("  ")),
+            "{field}: the refusal reads with single spaces, not source indentation: {:?}",
+            resp.error
+        );
+        assert!(
+            server.registry.agent_records().is_empty(),
+            "{field}: a refused configured start must not have spawned a pane"
+        );
+    }
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(configured_role_payload(
+            &prepared.token,
+            &prepared.path,
+            "builder",
+            false,
+            "configured-control",
+        )),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "the same start without the conflicting field is served: {:?}",
+        resp.error
+    );
+    let record = server
+        .registry
+        .agent_records()
+        .into_iter()
+        .find(|record| Some(&record.id) == resp.id.as_ref())
+        .expect("the served start is listed");
+    assert_eq!(
+        record.display_name.as_deref(),
+        Some("builder"),
+        "an unnamed role pane takes the role's name"
+    );
+    assert_eq!(
+        record.agent_type,
+        Some(AgentType::Pi),
+        "the role's declared agent wins"
+    );
+    server.registry.close_agent(&record.id).unwrap();
+}
+
+/// PRD #1223 audit F7: an opted-in prepared start registers its role and seeds a
+/// Pi start role by the pane id, so one that carries no `DOT_AGENT_DECK_PANE_ID`,
+/// an invalid one, or two of them is refused in the ordinary shape and starts
+/// nothing — rather than spawning the configured command as an agent no
+/// orchestration knows and no prompt reaches. Each shape is probed on its own
+/// against the Pi START role (the one whose seed depends on the id), and the
+/// same start with exactly one valid id then starts, so the refusal is the pane
+/// id and not the preparation.
+#[tokio::test]
+async fn a_configured_prepared_start_refuses_a_missing_invalid_or_duplicated_pane_id() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(&configured_role_project(true));
+    let prepared = prepare_loop(&server, &project).await;
+
+    for (shape, env) in [
+        ("missing", serde_json::json!([])),
+        (
+            "invalid",
+            serde_json::json!([["DOT_AGENT_DECK_PANE_ID", "not a pane id!"]]),
+        ),
+        ("empty", serde_json::json!([["DOT_AGENT_DECK_PANE_ID", ""]])),
+        (
+            "duplicated",
+            serde_json::json!([
+                ["DOT_AGENT_DECK_PANE_ID", "configured-first"],
+                ["DOT_AGENT_DECK_PANE_ID", "configured-second"]
+            ]),
+        ),
+    ] {
+        let mut payload = configured_role_payload(
+            &prepared.token,
+            &prepared.path,
+            "planner",
+            true,
+            "configured-unused",
+        );
+        payload.insert("env".into(), env);
+        let resp = issue_json_request(&server, serde_json::Value::Object(payload)).await;
+        assert!(
+            !resp.ok,
+            "a {shape} pane id alongside the flag must be refused"
+        );
+        assert!(resp.id.is_none(), "{shape}: a refused start reports no id");
+        assert!(
+            resp.error.as_deref().is_some_and(|e| {
+                e.contains("use_configured_command")
+                    && e.contains("DOT_AGENT_DECK_PANE_ID")
+                    && e.ends_with("nothing was started")
+            }),
+            "{shape}: the refusal names the flag and the pane id, in the ordinary shape: {:?}",
+            resp.error
+        );
+        assert!(
+            server.registry.agent_records().is_empty(),
+            "{shape}: a refused configured start must not have spawned a pane"
+        );
+    }
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(configured_role_payload(
+            &prepared.token,
+            &prepared.path,
+            "planner",
+            true,
+            "configured-sole",
+        )),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "the same start with exactly one valid pane id is served: {:?}",
+        resp.error
+    );
+    let id = resp.id.expect("the served start's id");
+    server.registry.close_agent(&id).unwrap();
+}
+
+/// PRD #1223 M6: the TUI's PRD #201 rule, on the daemon — an opted-in start of
+/// the configured START role whose resolved type is Pi is seeded natively with
+/// the preparation's coordinator prompt (exactly the line the reply carried),
+/// while a Pi WORKER role and a non-Pi start role are not: the non-Pi start
+/// role's prompt stays the client's to deliver, as on the unflagged verb.
+#[tokio::test]
+async fn a_configured_prepared_start_seeds_only_a_pi_start_role_with_the_coordinator_prompt() {
+    let server = start_server().await;
+
+    for pi_start in [true, false] {
+        let (_dir, project) = mint_project(&configured_role_project(pi_start));
+        let prepared = prepare_loop(&server, &project).await;
+        assert!(!prepared.prompt.trim().is_empty());
+
+        let start_pane = format!("configured-start-{pi_start}");
+        let worker_pane = format!("configured-worker-{pi_start}");
+        let mut ids = Vec::new();
+        for (role, is_start, pane) in [
+            ("planner", true, start_pane.as_str()),
+            ("builder", false, worker_pane.as_str()),
+        ] {
+            let resp = issue_json_request(
+                &server,
+                serde_json::Value::Object(configured_role_payload(
+                    &prepared.token,
+                    &prepared.path,
+                    role,
+                    is_start,
+                    pane,
+                )),
+            )
+            .await;
+            assert!(resp.ok, "pi_start={pi_start} {role}: {:?}", resp.error);
+            ids.push(resp.id.expect("a served start reports its id"));
+        }
+
+        let expected_start_type = if pi_start {
+            AgentType::Pi
+        } else {
+            AgentType::OpenCode
+        };
+        assert_eq!(
+            server.registry.spawn_agent_type(&ids[0]),
+            Some(expected_start_type),
+            "pi_start={pi_start}: the start role runs as its declared agent"
+        );
+        assert_eq!(
+            server
+                .registry
+                .take_pending_seed_native_for(&start_pane, Some(&ids[0])),
+            pi_start.then(|| prepared.prompt.clone()),
+            "pi_start={pi_start}: only a Pi start role is seeded natively, with the \
+             preparation's own coordinator prompt"
+        );
+        assert_eq!(
+            server
+                .registry
+                .take_pending_seed_native_for(&worker_pane, Some(&ids[1])),
+            None,
+            "pi_start={pi_start}: a Pi worker role is never seeded — it is not the coordinator"
+        );
+        for id in ids {
+            server.registry.close_agent(&id).unwrap();
+        }
+    }
 }
 
 /// PRD #819 M2/M5: the `Hello` reply advertises each project verb explicitly,
@@ -2717,6 +3065,74 @@ fn pane_input_017_malformed_guard_identity_fails_closed() {
                     )) && !leaked
             }),
             "present-but-malformed guarded-send identity must fail closed and write no bytes; observations={observations:?}"
+        );
+    });
+}
+
+/// Scenario: Send a guarded write to a live, deliverable pane whose `delivery_id` is one byte over the daemon's cap. The daemon must refuse it with an error and write nothing, while the same request carrying an id exactly at the cap is delivered.
+#[spec("prompt/pane-input/039")]
+#[test]
+fn pane_input_039_oversized_delivery_id_is_refused_before_the_write() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build oversized-delivery-id runtime");
+    runtime.block_on(async {
+        let server = start_server().await;
+        let pane_id = "pane-oversized-delivery-id";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        server.state.write().await.register_pane(pane_id.to_string());
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let cap = dot_agent_deck::agent_pty::MAX_DELIVERY_ID_BYTES;
+
+        let oversized = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'OVERSIZED-DELIVERY-ID-LEAKED\n'",
+                "expected_agent_id": agent_id,
+                "delivery_id": "o".repeat(cap + 1)
+            }),
+        )
+        .await;
+        let (leaked, _) = observe_stream_input_outcome(
+            &mut attached,
+            b"OVERSIZED-DELIVERY-ID-LEAKED",
+            Duration::from_millis(750),
+        )
+        .await;
+
+        let at_cap = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'AT-CAP-DELIVERY-ID-DELIVERED\n'",
+                "expected_agent_id": agent_id,
+                "delivery_id": "c".repeat(cap)
+            }),
+        )
+        .await;
+        let delivered = stream_contains_within(
+            &mut attached,
+            b"AT-CAP-DELIVERY-ID-DELIVERED",
+            Duration::from_millis(750),
+        )
+        .await;
+        server.registry.close_agent(&agent_id).unwrap();
+
+        assert!(
+            !oversized.ok && oversized.send_result.is_none() && !leaked,
+            "an id over the cap must be refused and write nothing; ok={}, result={:?}, leaked={leaked}",
+            oversized.ok,
+            oversized.send_result
+        );
+        assert_eq!(
+            (at_cap.send_result, delivered),
+            (Some(SendResult::Applied), true),
+            "the control: the same request with an id at the cap is delivered"
         );
     });
 }
@@ -3870,6 +4286,7 @@ async fn start_agent_rejects_blank_command() {
             tab_membership: None,
             agent_type: None,
             seed: None,
+            authoring_kind: None,
         },
     )
     .await;

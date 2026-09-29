@@ -1,0 +1,59 @@
+# Qodo code review — run in parallel with Greptile (`greptile.json`) as an
+# evaluation of whether Qodo can replace it. docs/develop/governance.md, "The
+# automated reviewer", has the reasoning; the settings below keep Qodo from
+# disturbing what this repo's own tooling reads.
+#
+# Qodo reads this file from the default branch, so a change here takes effect
+# only for pull requests opened after it merges.
+# Reference: https://docs.qodo.ai/install-and-configure/configuration-overview/configuration-and-command-reference
+
+[github_app]
+# Review when the pull request is opened (or reopened, or marked ready)...
+pr_commands = ["/agentic_describe", "/agentic_review"]
+# ...and again on every push. Deliberately NOT Greptile's `triggerOnUpdates:
+# false`: that setting exists only to stretch Greptile's monthly quota, and Qodo
+# has no quota here. The cost is that a push can raise new inline threads, which
+# `required_review_thread_resolution` then blocks the merge on until answered.
+handle_push_trigger = true
+push_commands = ["/agentic_review"]
+# Review pull requests that a bot opens or pushes to (issue #1286). PR-Agent
+# skips any event whose sender is a bot by default: `ignore_bot_pr` (read here
+# first, then from `[github]`, where it defaults to true) and
+# `push_trigger_ignore_bot_commits` (default true). That left every Renovate PR
+# without an independent review, and priority 1 of .github/pr-review-rubric.md
+# requires one at the current head, so the approval workflow could only ever
+# return INSUFFICIENT on them. The second key matters as much as the first:
+# Renovate rebases its branches, and each rebase is a new head that needs its
+# own review.
+ignore_bot_pr = false
+push_trigger_ignore_bot_commits = false
+
+[qodo_describe_agent]
+# Never touch the PR body. Pull request bodies here carry verification evidence
+# (named tests, rule 12's cross-version record) that the agent reviewer reads,
+# so the summary goes in a comment of its own. This is Qodo's default; it is
+# pinned so a portal-side change cannot flip it.
+publish_mode = "comment"
+
+[review_agent]
+# A push re-review looks at what changed since the last review (default, pinned).
+enable_incremental_review = true
+# No "Qodo updated to latest commit" comment on every push; the updated review
+# comment and any new inline threads are the signal.
+persistent_comment_notification = false
+# Findings in the summary comment AND inline, so they land at
+# `pulls/<n>/comments` beside Greptile's, where every skill already reads them.
+comments_location_policy = "both"
+# Inline (thread-creating) findings only at medium severity and above; the
+# informational tier stays in the summary. Every inline comment is a thread
+# that blocks the merge until resolved, and two reviewers double that cost.
+inline_comments_severity_threshold = 2
+# A finding is advice to the author, not a commit Qodo writes. Default, pinned.
+enable_commitable_suggestions = false
+
+[pr_code_suggestions]
+# Do not auto-answer questions in PR comments. Nobody talks to Qodo on GitHub
+# here: the replies in review threads are written by coding agents answering
+# findings, and Qodo treating those as questions to it would add threads'
+# worth of noise that someone then has to resolve.
+enable_chat_in_code_suggestions = false

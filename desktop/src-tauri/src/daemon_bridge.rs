@@ -51,6 +51,12 @@ pub(crate) struct HandshakeInfo {
     /// Derived from what the `Hello` reply **advertised**, never from a version
     /// digit or a build stamp — see [`project_actions_reason`].
     pub(crate) project_actions_reason: Option<String>,
+    /// Why the New agent flow cannot start anything on this deck, or `None`
+    /// when it can (PRD #1223) — see [`new_agent_reason`].
+    pub(crate) new_agent_reason: Option<String>,
+    /// Whether the deck honours the directory browser's listing options
+    /// (issue #1240) — see [`listing_options`].
+    pub(crate) listing_options: bool,
 }
 
 /// An established link to one deck: the handshake that classified it, and a
@@ -96,7 +102,7 @@ impl TrustedDaemon {
                 .connection
                 .error
                 .clone()
-                .unwrap_or_else(|| "the deck is not protocol-compatible".into()))
+                .unwrap_or_else(|| "the daemon is not protocol-compatible".into()))
         }
     }
 
@@ -601,13 +607,13 @@ fn contract_refusal(response: &AttachResponse) -> Option<String> {
     let mut sides = Vec::new();
     if !peer_lacks.is_empty() {
         sides.push(format!(
-            "the deck is behind this app across {}",
+            "the daemon is behind this app across {}",
             named_breaks(&peer_lacks)
         ));
     }
     if !this_build_lacks.is_empty() {
         sides.push(format!(
-            "this app is behind the deck across {}",
+            "this app is behind the daemon across {}",
             named_breaks(&this_build_lacks)
         ));
     }
@@ -622,13 +628,19 @@ fn contract_refusal(response: &AttachResponse) -> Option<String> {
 /// The verbs the desktop's project-aware surfaces need (PRD #819 M6).
 ///
 /// All four, because the surface is one flow: list or resolve a project, prepare
-/// its workflow, start the prepared agent. A daemon advertising three of them
-/// can get a user as far as a launch that then fails, which is worse than
+/// its orchestration, start the prepared agent. A daemon advertising three of
+/// them can get a user as far as a launch that then fails, which is worse than
 /// saying so first.
+///
+/// The prepare verb is listed by its current spelling, but it is checked
+/// through `DaemonCapabilities::supports_prepare_orchestration`, which also
+/// accepts the legacy `prepare-workflow` a daemon built before #1045 advertises.
+/// No capability string reaches the sentence [`project_actions_reason`]
+/// composes, so no user is shown either spelling.
 const DESKTOP_PROJECT_CAPABILITIES: [&str; 4] = [
     dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS,
     dot_agent_deck::daemon_protocol::CAP_RESOLVE_PROJECT,
-    dot_agent_deck::daemon_protocol::CAP_PREPARE_WORKFLOW,
+    dot_agent_deck::daemon_protocol::CAP_PREPARE_ORCHESTRATION,
     dot_agent_deck::daemon_protocol::CAP_START_PREPARED_AGENT,
 ];
 
@@ -652,17 +664,59 @@ const DESKTOP_PROJECT_CAPABILITIES: [&str; 4] = [
 /// project verbs are missing is not a broken deck.
 fn project_actions_reason(response: &AttachResponse) -> Option<String> {
     let capabilities = dot_agent_deck::daemon_client::DaemonCapabilities::from_hello(response);
-    let missing: Vec<&str> = DESKTOP_PROJECT_CAPABILITIES
-        .into_iter()
-        .filter(|capability| !capabilities.supports(capability))
-        .collect();
-    if missing.is_empty() {
+    let all_advertised = DESKTOP_PROJECT_CAPABILITIES.into_iter().all(|capability| {
+        if capability == dot_agent_deck::daemon_protocol::CAP_PREPARE_ORCHESTRATION {
+            capabilities.supports_prepare_orchestration()
+        } else {
+            capabilities.supports(capability)
+        }
+    });
+    if all_advertised {
+        return None;
+    }
+    // The capability strings stay out of the sentence (issue #1045): a user is
+    // told what they cannot do and what still works, not which wire verbs are
+    // missing, which also keeps the legacy `prepare-workflow` off screen.
+    Some(
+        "This daemon cannot offer projects or activate orchestrations from here. Agents already running on it stay visible and usable."
+            .to_string(),
+    )
+}
+
+/// Why the desktop's New agent flow cannot start anything on this deck, or
+/// `None` when the deck advertises [`CAP_LIST_DIRECTORIES`] (PRD #1223).
+///
+/// The flow's directory step browses the deck's own filesystem, and since the
+/// typed-path field was removed that is the ONLY way to choose where an agent
+/// starts. A deck without the verb therefore has no directory step at all, so
+/// the deck step shows it disabled with this sentence rather than letting the
+/// user choose it into a dead end. Read from the same `Hello` capture as
+/// [`project_actions_reason`], for the same reason.
+///
+/// [`CAP_LIST_DIRECTORIES`]: dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES
+fn new_agent_reason(response: &AttachResponse) -> Option<String> {
+    let capabilities = dot_agent_deck::daemon_client::DaemonCapabilities::from_hello(response);
+    if capabilities.supports(dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES) {
         return None;
     }
     Some(format!(
-        "This deck does not advertise {}, so projects and workflows cannot be started from here. Agents already running on it stay visible and usable.",
-        missing.join(", ")
+        "This daemon does not advertise {}, so it cannot be browsed for a directory to start in. Create agents on it from the TUI on its host, or upgrade the daemon.",
+        dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES
     ))
+}
+
+/// Whether this deck advertises [`CAP_LIST_DIRECTORIES_OPTIONS`] (issue #1240),
+/// so the New agent flow's directory browser may offer its Show hidden control,
+/// list symlinked directories and send its filter to the deck. Read from the
+/// same `Hello` capture as [`new_agent_reason`]. `false` only narrows the
+/// browser to the PRD #1223 listing; the crate's client withholds the options
+/// from such a deck anyway, so this decides what the dialog OFFERS, not what
+/// is safe to send.
+///
+/// [`CAP_LIST_DIRECTORIES_OPTIONS`]: dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES_OPTIONS
+fn listing_options(response: &AttachResponse) -> bool {
+    dot_agent_deck::daemon_client::DaemonCapabilities::from_hello(response)
+        .supports(dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES_OPTIONS)
 }
 
 /// Whether the build-stamp comparison is being relaxed, and by what.
@@ -807,11 +861,11 @@ fn classify_handshake(
             response
                 .error
                 .clone()
-                .unwrap_or_else(|| "the deck rejected Hello".into()),
+                .unwrap_or_else(|| "the daemon rejected Hello".into()),
         )
     } else if server_protocol_version != Some(PROTOCOL_VERSION) {
         Some(format!(
-            "protocol mismatch: desktop expects {PROTOCOL_VERSION}, deck reports {}",
+            "protocol mismatch: desktop expects {PROTOCOL_VERSION}, daemon reports {}",
             server_protocol_version
                 .map(|version| version.to_string())
                 .unwrap_or_else(|| "no version".into())
@@ -825,7 +879,7 @@ fn classify_handshake(
         // rather than with a tag.
         build_stamp_mismatch_only = true;
         let builds = format!(
-            "Builds: desktop is {client_build}, deck is {}",
+            "Builds: desktop is {client_build}, daemon is {}",
             daemon_build_version.as_deref().unwrap_or("unreported")
         );
         // Whichever switch is armed, the mismatch is kept in `error` (not
@@ -841,12 +895,12 @@ fn classify_handshake(
             )),
             BuildMismatchAllowance::Refuse => {
                 let recovery = match running_agent_count {
-                    Some(0) => "No live agents are reported; use Replace deck to start the matching bundled build, or Connect anyway to keep this one.".into(),
+                    Some(0) => "No live agents are reported; use Replace daemon to start the matching bundled build, or Connect anyway to keep this one.".into(),
                     Some(count) => format!(
-                        "The deck reports {count} live agent{}; stop them individually before replacing the deck, or Connect anyway to keep this one.",
+                        "The daemon reports {count} live agent{}; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
                         if count == 1 { "" } else { "s" }
                     ),
-                    None => "The deck could not report its live-agent count, so automatic replacement is disabled; Connect anyway keeps this one.".into(),
+                    None => "The daemon could not report its live-agent count, so automatic replacement is disabled; Connect anyway keeps this one.".into(),
                 };
                 Some(format!("{contract}. {builds}. {recovery}"))
             }
@@ -877,6 +931,8 @@ fn classify_handshake(
             .ok
             .then(|| project_actions_reason(response))
             .flatten(),
+        new_agent_reason: response.ok.then(|| new_agent_reason(response)).flatten(),
+        listing_options: response.ok && listing_options(response),
     }
 }
 
@@ -929,6 +985,8 @@ fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> D
         running_agent_count: handshake.running_agent_count,
         build_stamp_mismatch_only: handshake.build_stamp_mismatch_only,
         project_actions_reason: handshake.project_actions_reason,
+        new_agent_reason: handshake.new_agent_reason,
+        listing_options: handshake.listing_options,
     }
 }
 
@@ -1005,7 +1063,7 @@ pub(crate) async fn bounded_reply<T, E: std::fmt::Display>(
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(safe_message(error.to_string())),
         Err(_) => Err(safe_message(format!(
-            "the deck took the connection but did not answer {what} within {}s",
+            "the daemon took the connection but did not answer {what} within {}s",
             DECK_REPLY_TIMEOUT.as_secs()
         ))),
     }
@@ -1072,7 +1130,7 @@ async fn establish(
         dot_agent_deck::platform::fsperm::verify_endpoint_trusted(local.path()).map_err(
             |reason| {
                 safe_message(format!(
-                    "refusing to connect to the deck at {}: {reason}",
+                    "refusing to connect to the daemon at {}: {reason}",
                     local.path().to_string_lossy()
                 ))
             },
@@ -1137,10 +1195,16 @@ async fn establish(
 /// [`crate::dto::DeckScope`] instead and hand its endpoint to
 /// [`DaemonLinks::trusted`] directly. `DesktopAction::StopAgent` is the site
 /// that proved the distinction matters; see `crate::stop_agent_action`.
+///
+/// **Refused under All Decks** (#1083), before any deck is contacted. Every
+/// caller acts on one deck — the project listing and resolve, the Runs
+/// screen's workflow launch, rename, submitted text — and All Decks resolves
+/// the selection to the local deck only because the plumbing needs an
+/// endpoint. Taking that as the target would launch on this machine's deck
+/// because the user chose every deck; see [`crate::dto::DeckScope::one_selected`].
 pub(crate) async fn trusted_daemon(links: &DaemonLinks) -> Result<Arc<TrustedDaemon>, String> {
-    links
-        .trusted(crate::dto::DeckScope::selected().endpoint())
-        .await
+    let scope = crate::dto::DeckScope::one_selected()?;
+    links.trusted(scope.endpoint()).await
 }
 
 /// The selected deck's snapshot. Same caveat as [`trusted_daemon`]: this is a
@@ -1201,6 +1265,7 @@ pub(crate) async fn snapshot_with(
             fleet: observed_fleet(),
             unconfigured: unconfigured_fleet(),
             observed: observed_fleet_decks(),
+            all_decks: crate::dto::all_decks_applied(),
         };
     }
 
@@ -1285,6 +1350,7 @@ fn connected_snapshot(
         fleet: observed_fleet(),
         unconfigured: unconfigured_fleet(),
         observed: observed_fleet_decks(),
+        all_decks: crate::dto::all_decks_applied(),
     }
 }
 
@@ -1591,7 +1657,7 @@ mod tests {
             .error
             .expect("a refusal says why");
         assert!(
-            error.contains("this app is behind the deck"),
+            error.contains("this app is behind the daemon"),
             "a deck ahead of the app must say so: {error}"
         );
 
@@ -1603,7 +1669,7 @@ mod tests {
         .error
         .expect("a refusal says why");
         assert!(
-            error.contains("the deck is behind this app"),
+            error.contains("the daemon is behind this app"),
             "a deck behind the app must say so: {error}"
         );
     }
@@ -1826,7 +1892,7 @@ mod tests {
         // rather than from `AttachResponse::with_capabilities()`, which
         // advertises whatever the LOCAL platform's daemon can do.
         // `DAEMON_CAPABILITIES` is deliberately shorter on Windows (PRD #819
-        // strikes `prepare-workflow` and `start-prepared-agent` there, for want
+        // strikes `prepare-orchestration` and `start-prepared-agent` there, for want
         // of a DACL implementation), so "the full set" and "everything the
         // desktop needs" are the same list on Unix and different lists on
         // Windows — and this test is about the second one. It failed on
@@ -1859,12 +1925,89 @@ mod tests {
         .project_actions_reason
         .expect("an unadvertised daemon withholds every verb");
         assert!(
-            reason.contains(dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS),
-            "the reason names what is missing: {reason}"
+            reason.contains("cannot offer projects or activate orchestrations"),
+            "the reason says what cannot be done: {reason}"
+        );
+        assert!(
+            !reason.contains(dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS),
+            "no wire verb is named to the user (issue #1045): {reason}"
         );
         assert!(
             reason.contains("stay visible and usable"),
             "a degraded deck is not a broken deck: {reason}"
+        );
+    }
+
+    /// PRD #1223 U1: a deck that does not advertise `list-directories` has no
+    /// directory step in the New agent flow now that the typed path is gone,
+    /// so its connection says why and the deck step disables it. A deck that
+    /// does advertise it has nothing to explain.
+    #[test]
+    fn a_deck_without_the_listing_verb_is_not_offered_to_the_new_agent_flow() {
+        let _guard = AllowanceGuard::acquire();
+        let mut listing = AttachResponse::hello(PROTOCOL_VERSION);
+        listing.capabilities = Some(vec![
+            dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES.to_string(),
+        ]);
+        assert_eq!(
+            classify_handshake(
+                &listing,
+                listing.build_version.as_deref().unwrap(),
+                BuildMismatchAllowance::Refuse,
+            )
+            .new_agent_reason,
+            None,
+        );
+
+        let bare = AttachResponse::hello(PROTOCOL_VERSION);
+        let reason = classify_handshake(
+            &bare,
+            bare.build_version.as_deref().unwrap(),
+            BuildMismatchAllowance::Refuse,
+        )
+        .new_agent_reason
+        .expect("an unadvertised daemon cannot be browsed");
+        assert!(
+            reason.contains(dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES),
+            "the reason names the missing verb: {reason}"
+        );
+        assert!(
+            !reason.to_lowercase().contains("type"),
+            "the reason must not send the user to a typed path that no longer exists: {reason}"
+        );
+    }
+
+    /// Issue #1240: the connection says whether the deck honours the
+    /// directory browser's listing options, from what its `Hello` advertised —
+    /// so a deck at the release before them is browsed exactly as before, and
+    /// a failed handshake offers nothing.
+    #[test]
+    fn the_connection_says_whether_the_deck_honours_listing_options() {
+        use dot_agent_deck::daemon_protocol::{CAP_LIST_DIRECTORIES, CAP_LIST_DIRECTORIES_OPTIONS};
+        let _guard = AllowanceGuard::acquire();
+        let classify = |capabilities: &[&str]| {
+            let mut hello = AttachResponse::hello(PROTOCOL_VERSION);
+            hello.capabilities = Some(capabilities.iter().map(|cap| cap.to_string()).collect());
+            classify_handshake(
+                &hello,
+                hello.build_version.as_deref().unwrap(),
+                BuildMismatchAllowance::Refuse,
+            )
+            .listing_options
+        };
+        assert!(classify(&[
+            CAP_LIST_DIRECTORIES,
+            CAP_LIST_DIRECTORIES_OPTIONS
+        ]));
+        assert!(!classify(&[CAP_LIST_DIRECTORIES]));
+        let bare = AttachResponse::hello(PROTOCOL_VERSION);
+        assert!(
+            !classify_handshake(
+                &bare,
+                bare.build_version.as_deref().unwrap(),
+                BuildMismatchAllowance::Refuse,
+            )
+            .listing_options
         );
     }
 
@@ -1890,8 +2033,12 @@ mod tests {
         .expect("three of four is not four");
 
         assert!(
-            reason.contains(dot_agent_deck::daemon_protocol::CAP_PREPARE_WORKFLOW),
-            "{reason}"
+            !reason.contains(dot_agent_deck::daemon_protocol::CAP_PREPARE_ORCHESTRATION),
+            "no capability string is shown (issue #1045): {reason}"
+        );
+        assert!(
+            !reason.contains(dot_agent_deck::daemon_protocol::CAP_PREPARE_WORKFLOW),
+            "the legacy capability string is never shown: {reason}"
         );
         assert!(
             !reason.contains(dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS),
@@ -1935,7 +2082,7 @@ mod tests {
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.unwrap();
         assert!(error.contains("contract mismatch"));
-        assert!(error.contains("use Replace deck"));
+        assert!(error.contains("use Replace daemon"));
     }
 
     #[test]
@@ -2773,6 +2920,8 @@ mod tests {
                     running_agent_count: Some(0),
                     build_stamp_mismatch_only: false,
                     project_actions_reason: None,
+                    new_agent_reason: None,
+                    listing_options: false,
                 },
             ),
             _transport: tokio::runtime::Runtime::new()
@@ -4493,6 +4642,1809 @@ mod tests {
         assert_eq!(
             held_tunnels, 1,
             "and its transport is not re-acquired either"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #1223 M3 — a deck-targeted plain-agent start, against two REAL
+    // daemons
+    //
+    // The two decks of an All Decks fleet cannot both be local: a settings
+    // document names the local deck and REMOTE rows, nothing else (see the
+    // membership test above). So the "other" deck is a remote row whose
+    // transport `EndpointTunnels::insert_route` points at a second production
+    // attach server — the forwarded socket an `ssh -L` would hand the client,
+    // with the ssh hop taken out. The local deck is the first server, reached
+    // through `DOT_AGENT_DECK_ATTACH_SOCKET` because no document can name it;
+    // that write is process-global, which is safe under nextest's
+    // process-per-test model and is the precedent `terminal::tests` set for
+    // the same reason.
+    // -----------------------------------------------------------------------
+
+    /// An All Decks document with one remote row, and the endpoint that row
+    /// resolves to.
+    #[cfg(unix)]
+    fn all_decks_with_one_remote_row(host: &str) -> (crate::settings::DesktopSettings, Endpoint) {
+        use crate::settings::{
+            DesktopSettings, EndpointId, EndpointSettings, RemoteEndpointSettings, Selection,
+        };
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+        let mut row = RemoteEndpointSettings::new(
+            EndpointId::parse("deck000000000001").expect("a valid id"),
+            Hostname::parse(host).expect("a valid host"),
+        );
+        row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+        let settings = DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![row],
+                selection: Selection::All,
+            }),
+            ..DesktopSettings::default()
+        };
+        let remote = settings
+            .connectable_endpoints()
+            .into_iter()
+            .nth(1)
+            .expect("the row is connectable");
+        (settings, remote)
+    }
+
+    /// Add a second remote row, `host`, to settings built by
+    /// [`all_decks_with_one_remote_row`], and return its endpoint.
+    #[cfg(unix)]
+    fn add_remote_row(settings: &mut crate::settings::DesktopSettings, host: &str) -> Endpoint {
+        use crate::settings::{EndpointId, RemoteEndpointSettings};
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+        let mut row = RemoteEndpointSettings::new(
+            EndpointId::parse("deck000000000002").expect("a valid id"),
+            Hostname::parse(host).expect("a valid host"),
+        );
+        row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+        settings
+            .endpoints
+            .as_mut()
+            .expect("built by all_decks_with_one_remote_row")
+            .remote
+            .push(row);
+        settings
+            .connectable_endpoints()
+            .into_iter()
+            .nth(2)
+            .expect("the second row is connectable")
+    }
+
+    /// Make `local` the app's local deck and apply `settings`, asserting the
+    /// fixture really selects All Decks with the local deck in force — the
+    /// state under which the old arm went to the wrong deck.
+    #[cfg(unix)]
+    fn apply_all_decks_over(local: &RealDeck, settings: &crate::settings::DesktopSettings) {
+        let socket = local
+            .endpoint
+            .as_local()
+            .expect("a RealDeck is local")
+            .path()
+            .to_path_buf();
+        // SAFETY: under nextest this test owns its process, so no other thread
+        // is reading the environment here. See the section comment above.
+        unsafe { std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket) };
+        crate::dto::apply_settings_selection(settings);
+        assert_eq!(
+            crate::dto::selected_endpoint().identity(),
+            local.endpoint.identity(),
+            "fixture: All Decks resolves to the local deck, which is the real daemon `local`"
+        );
+    }
+
+    /// A plain `cat` agent with a name no fixture agent carries, so where it
+    /// landed can be read off either registry without trusting ids, which both
+    /// daemons mint from their own counters.
+    #[cfg(unix)]
+    fn plain_start(name: &str) -> crate::StartAgentRequest {
+        crate::StartAgentRequest {
+            command: Some("cat".into()),
+            cwd: None,
+            display_name: Some(name.into()),
+            rows: Some(24),
+            cols: Some(80),
+            authoring_kind: None,
+        }
+    }
+
+    /// `(id, display name)` for every agent a real registry holds.
+    #[cfg(unix)]
+    fn named_records(deck: &RealDeck) -> Vec<(String, Option<String>)> {
+        deck.registry
+            .agent_records()
+            .into_iter()
+            .map(|record| (record.id, record.display_name))
+            .collect()
+    }
+
+    /// Scenario: two real daemons — the local deck and a remote row routed to
+    /// the second — are observed under **All Decks**, and each already runs
+    /// one agent. A plain-agent start aimed at the remote row's wire id lands
+    /// on that deck: its registry lists the new agent under the id the action
+    /// returned, with the requested name; the local deck's registry is exactly
+    /// what it was; and the direct refresh of the target lists the agent under
+    /// the target's own deck id.
+    ///
+    /// **What it fails against.** The `StartAgent` arm this replaced reached
+    /// its daemon through `trusted_daemon()`, and All Decks resolves to the
+    /// local deck (#1083) — so the agent landed on `local`, which is a real
+    /// daemon here and would list it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_aimed_at_another_deck_under_all_decks_lands_on_that_deck() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("m3-land-local");
+        let remote = RealDeck::start("m3-land-remote");
+        let local_agent = local.spawn_agent("pane-local");
+        let remote_agent = remote.spawn_agent("pane-remote");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+
+        let started =
+            crate::start_agent_action(&state, &remote_wire, plain_start("m3-started")).await;
+        let refreshed = match &started {
+            Ok(started) => crate::target_deck_snapshot(&state.daemon, &started.scope).await,
+            Err(_) => None,
+        };
+
+        // Read both registries and let go of the PTY children BEFORE asserting,
+        // so a failing run still cleans up.
+        let on_local = named_records(&local);
+        let on_remote = named_records(&remote);
+        local.shutdown();
+        remote.shutdown();
+
+        let started = started.expect("the targeted deck accepts the start");
+        assert_eq!(
+            started.scope.identity(),
+            remote_endpoint.identity(),
+            "the action captured the deck it was aimed at, not the selected one"
+        );
+        assert!(
+            on_remote.contains(&(started.agent_id.clone(), Some("m3-started".to_string()))),
+            "the targeted deck lists the new agent under the returned id: {on_remote:?}"
+        );
+        assert_eq!(
+            on_remote.len(),
+            2,
+            "the remote deck's own agent plus the new one"
+        );
+        assert!(on_remote.iter().any(|(id, _)| *id == remote_agent));
+        assert_eq!(
+            on_local,
+            vec![(local_agent, None)],
+            "the local deck — the one All Decks resolves to — gains nothing"
+        );
+
+        let refreshed = refreshed.expect("the fleet did not move, so the target is refreshed");
+        assert_eq!(refreshed.connection.status, ConnectionStatus::Connected);
+        assert_eq!(
+            refreshed.connection.deck_id, remote_wire,
+            "the direct refresh is the TARGET deck's snapshot, not the selected deck's"
+        );
+        assert!(
+            refreshed
+                .agents
+                .iter()
+                .any(|agent| agent.id == started.agent_id),
+            "and it already lists the new agent"
+        );
+    }
+
+    /// Scenario: the same two real daemons under **All Decks**. A start aimed
+    /// at a deck id the app has never observed is refused with
+    /// `DeckScope::resolve`'s error. The remote row is then removed from the
+    /// document — its deck leaves the fleet, the way a disconnected or deleted
+    /// deck does mid-flow — and a start aimed at its previously valid id is
+    /// refused the same way. Neither daemon gains an agent either time.
+    ///
+    /// **What it fails against.** Any fallback to the selection: under All
+    /// Decks that is the local deck, a real daemon here that would list the
+    /// agent. The removed deck's route is deliberately left in the tunnel map,
+    /// so a retarget to it would reach a live daemon too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_aimed_at_a_deck_the_app_is_not_observing_starts_nothing_anywhere() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("m3-refuse-local");
+        let remote = RealDeck::start("m3-refuse-remote");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+
+        let unknown =
+            crate::start_agent_action(&state, "deck-ffffffffffffffff", plain_start("m3-unknown"))
+                .await;
+
+        // The row goes; the local deck and All Decks stay.
+        let without_row = crate::settings::DesktopSettings {
+            endpoints: Some(crate::settings::EndpointSettings {
+                remote: Vec::new(),
+                selection: crate::settings::Selection::All,
+            }),
+            ..crate::settings::DesktopSettings::default()
+        };
+        apply_all_decks_over(&local, &without_row);
+        let departed =
+            crate::start_agent_action(&state, &remote_wire, plain_start("m3-departed")).await;
+
+        let on_local = named_records(&local);
+        let on_remote = named_records(&remote);
+        local.shutdown();
+        remote.shutdown();
+
+        for (case, outcome) in [("an unknown id", unknown), ("a departed deck", departed)] {
+            let error = match outcome {
+                Ok(started) => panic!(
+                    "{case}: a start must not resolve, yet agent {} started",
+                    started.agent_id
+                ),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains("that daemon is not one this app is observing"),
+                "{case}: refused with DeckScope::resolve's error, got: {error}"
+            );
+        }
+        assert!(
+            on_local.is_empty(),
+            "nothing fell back to the local deck: {on_local:?}"
+        );
+        assert!(
+            on_remote.is_empty(),
+            "and nothing was retargeted to the departed deck: {on_remote:?}"
+        );
+    }
+
+    /// A Runs-screen launch request that passes every shape check, so the
+    /// first thing it can fail on is reaching a deck.
+    #[cfg(unix)]
+    fn runs_launch(cwd: &std::path::Path) -> crate::ActivateOrchestrationRequest {
+        crate::ActivateOrchestrationRequest {
+            name: "review".into(),
+            display_title: None,
+            cwd: cwd.to_string_lossy().into_owned(),
+            task_prompt: "list the files".into(),
+            roles: vec![crate::dto::OrchestrationRoleInput {
+                role: "orchestrator".into(),
+                command: "cat".into(),
+                start: true,
+            }],
+            rows: Some(24),
+            cols: Some(80),
+            config_revision: None,
+        }
+    }
+
+    /// Issue #1044. Scenario: a Runs launch names its run with a terminal
+    /// escape, or with a bidi override that would reverse the tab's text. It
+    /// is refused with the New agent
+    /// launch's own sentence before any deck is contacted, so the name cannot
+    /// reach a tab it could not be drawn in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_runs_launch_with_an_unusable_run_name_is_refused_before_any_deck() {
+        let state = crate::terminal::DesktopState::default();
+        for title in ["run\u{1b}[2J", "deploy\u{202e}er"] {
+            let mut request = runs_launch(std::path::Path::new("/nonexistent-1044"));
+            request.display_title = Some(title.into());
+            let Err(refused) = crate::activate_orchestration_action(&state, request).await else {
+                panic!("a run name of {title:?} must be refused");
+            };
+            assert_eq!(
+                refused.message(),
+                "the run name is invalid, oversized, or contains control characters"
+            );
+        }
+        assert_eq!(state.daemon.handshake_count(), 0, "no deck was contacted");
+    }
+
+    /// Scenario (#1083): the local deck is a real daemon running one agent,
+    /// and **All Decks** is selected. A Runs-screen workflow launch is refused
+    /// with the "Select a deck" sentence, and so is the selected-deck link the
+    /// project listing and resolve use; the app performs no handshake and holds
+    /// no link, and the local deck's registry is exactly what it was. The
+    /// selected-deck snapshot it is still sent is marked `all_decks`. As a
+    /// control, the same launch with the local deck selected does reach that
+    /// daemon, which is what makes "no handshake" mean something, and its
+    /// snapshot is not marked.
+    ///
+    /// **What it fails against.** `trusted_daemon` resolving the selection
+    /// through `DeckScope::selected()`, where All Decks is the local deck: the
+    /// launch handshook with `local` and asked it to prepare, and the refusal
+    /// it came back with was the daemon's, not this one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_runs_launch_under_all_decks_never_reaches_the_local_deck() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("1083-all-local");
+        let local_agent = local.spawn_agent("pane-local");
+        let (settings, _remote) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+
+        let launched = crate::activate_orchestration_action(&state, runs_launch(&local.dir)).await;
+        let linked = trusted_daemon(&state.daemon).await.map(|_| ());
+        let handshakes_under_all = state.daemon.handshake_count();
+        let held_under_all = state.daemon.held().await;
+        let on_local = named_records(&local);
+        // Taken after the counts above, since a snapshot does contact the deck.
+        let snapshot_under_all = get_snapshot(&state.daemon).await;
+
+        let mut only_local = settings.clone();
+        only_local
+            .endpoints
+            .as_mut()
+            .expect("built with an [endpoints] section")
+            .selection = crate::settings::Selection::Local;
+        crate::dto::apply_settings_selection(&only_local);
+        let control = crate::activate_orchestration_action(&state, runs_launch(&local.dir)).await;
+        let handshakes_under_local = state.daemon.handshake_count();
+        let snapshot_under_local = get_snapshot(&state.daemon).await;
+        local.shutdown();
+
+        let Err(refused) = launched else {
+            panic!("a launch under All Decks is refused");
+        };
+        let refused = refused.message().to_string();
+        assert_eq!(refused, crate::dto::ALL_DECKS_NEEDS_ONE_DECK);
+        assert_eq!(
+            linked,
+            Err(crate::dto::ALL_DECKS_NEEDS_ONE_DECK.to_string()),
+            "the selected-deck link the project listing uses is refused too"
+        );
+        assert_eq!(
+            handshakes_under_all, 0,
+            "no deck was contacted under All Decks"
+        );
+        assert_eq!(held_under_all, 0, "and no link is held for one");
+        assert_eq!(
+            on_local,
+            vec![(local_agent, None)],
+            "the local deck — the one All Decks resolves to — gains nothing"
+        );
+        let Err(control) = control else {
+            panic!("the scratch dir is not a project, so the control launch is refused");
+        };
+        let control = control.message().to_string();
+        assert_ne!(
+            control,
+            crate::dto::ALL_DECKS_NEEDS_ONE_DECK,
+            "with the local deck selected the refusal is the deck's own"
+        );
+        assert!(
+            handshakes_under_local > 0,
+            "control: with the local deck selected the same launch reaches it"
+        );
+        assert!(
+            snapshot_under_all.all_decks,
+            "the local deck's snapshot under All Decks says so, so the webview does not render it"
+        );
+        assert_eq!(
+            snapshot_under_all.connection.status,
+            ConnectionStatus::Connected
+        );
+        assert!(!snapshot_under_local.all_decks);
+    }
+
+    /// The ids a real registry still lists as live.
+    #[cfg(unix)]
+    fn live_ids(deck: &RealDeck) -> Vec<String> {
+        deck.registry
+            .agent_records()
+            .into_iter()
+            .map(|record| record.id)
+            .collect()
+    }
+
+    /// Scenario (PRD #1223 U4): two real daemons under **All Decks**, each
+    /// running one agent — and, because each registry mints from its own
+    /// counter, both agents are id `1`. A stop aimed at the remote row's wire
+    /// id stops the REMOTE deck's agent and leaves the local deck's namesake
+    /// running. A stop aimed at a deck id the app has never observed is refused
+    /// with `DeckScope::resolve`'s error and stops nothing on either deck.
+    ///
+    /// **What it fails against.** `StopAgent` resolved `DeckScope::selected()`,
+    /// and All Decks resolves to the local deck (#1083) — so the local `1`
+    /// was stopped instead, and the agent the user started on the other deck
+    /// from the overview could not be stopped at all without switching.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_aimed_at_another_deck_under_all_decks_stops_that_decks_agent() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("u4-stop-local");
+        let remote = RealDeck::start("u4-stop-remote");
+        let local_agent = local.spawn_agent("pane-local");
+        let remote_agent = remote.spawn_agent("pane-remote");
+        assert_eq!(
+            local_agent, remote_agent,
+            "the two registries mint the same first id"
+        );
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+
+        let unknown =
+            crate::stop_agent_action(&state, "deck-ffffffffffffffff", &remote_agent).await;
+        let after_unknown = (live_ids(&local), live_ids(&remote));
+        let stopped = crate::stop_agent_action(&state, &remote_wire, &remote_agent).await;
+        let on_local = live_ids(&local);
+        let on_remote = live_ids(&remote);
+        local.shutdown();
+        remote.shutdown();
+
+        let error = unknown.expect_err("an unobserved deck id is refused");
+        assert!(
+            error.contains("that daemon is not one this app is observing"),
+            "refused with DeckScope::resolve's error, got: {error}"
+        );
+        assert_eq!(
+            after_unknown,
+            (vec![local_agent.clone()], vec![remote_agent.clone()]),
+            "the refused stop stopped nothing on either deck"
+        );
+        let scope = stopped.expect("the targeted deck accepts the stop");
+        assert_eq!(scope.identity(), remote_endpoint.identity());
+        assert!(
+            on_remote.is_empty(),
+            "the remote deck's agent is stopped: {on_remote:?}"
+        );
+        assert_eq!(
+            on_local,
+            vec![local_agent],
+            "the local deck's namesake — the one All Decks resolves to — keeps running"
+        );
+    }
+
+    /// Scenario (PRD #1223 U4): the remote deck runs two roles of one
+    /// orchestration and one unrelated agent, and the local deck one agent.
+    /// Closing the orchestration from the overview under **All Decks** stops
+    /// both roles on the remote deck, reports nothing unconfirmed, and leaves
+    /// the unrelated agent and the local deck alone. The same close aimed at
+    /// an unobserved deck id is refused with the resolve error and stops
+    /// nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closing_an_orchestration_stops_every_listed_role_on_its_deck() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("u4-close-local");
+        let remote = RealDeck::start("u4-close-remote");
+        let local_agent = local.spawn_agent("pane-local");
+        let planner = remote.spawn_agent("pane-planner");
+        let builder = remote.spawn_agent("pane-builder");
+        let bystander = remote.spawn_agent("pane-bystander");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+        let roles = vec![
+            crate::dto::StopOrchestrationRole {
+                agent_id: planner.clone(),
+                name: "planner".into(),
+            },
+            crate::dto::StopOrchestrationRole {
+                agent_id: builder.clone(),
+                name: "builder".into(),
+            },
+        ];
+
+        let (unknown_scope, unknown) =
+            crate::stop_orchestration_action(&state, "deck-ffffffffffffffff", &roles).await;
+        let after_unknown = live_ids(&remote).len();
+        let (scope, closed) = crate::stop_orchestration_action(&state, &remote_wire, &roles).await;
+        let on_local = live_ids(&local);
+        let on_remote = live_ids(&remote);
+        local.shutdown();
+        remote.shutdown();
+
+        assert!(unknown_scope.is_none());
+        let failure = unknown.expect_err("an unobserved deck id is refused");
+        assert!(
+            failure
+                .message
+                .contains("that daemon is not one this app is observing"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.unconfirmed_stops.is_empty(),
+            "nothing was asked, so nothing is unconfirmed"
+        );
+        assert_eq!(after_unknown, 3, "the refused close stopped nothing");
+        closed.expect("every role's stop is confirmed");
+        assert_eq!(
+            scope.expect("the deck resolved").identity(),
+            remote_endpoint.identity()
+        );
+        assert_eq!(
+            on_remote,
+            vec![bystander],
+            "both roles stopped, the unrelated agent did not"
+        );
+        assert_eq!(
+            on_local,
+            vec![local_agent],
+            "and the local deck is untouched"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #1223 M4 — the New agent dialog's two deck-targeted queries, against
+    // the same two-deck All Decks fleet the M3 start tests use.
+    // -----------------------------------------------------------------------
+
+    /// A deck from before PRD #1223: it answers `Hello` compatibly, advertising
+    /// every capability this build knows EXCEPT the two new queries, and
+    /// refuses any other request as an unknown variant — what an older
+    /// daemon's decoder does. It counts what it refused, so a test can assert
+    /// the desktop never sent a query the deck did not advertise.
+    ///
+    /// [`Self::withholding`] names a different set to leave out — M7's
+    /// `authoring-kind`, for a deck that lists directories and answers options
+    /// but cannot compose a seed.
+    ///
+    /// A plain `UnixListener` for `scripted_daemon`'s reason, and reached as a
+    /// REMOTE row: a local deck's inode must pass the owner-only trust check,
+    /// which a plain bind does not arrange, and a remote row's transport is the
+    /// forwarded socket `insert_route` names.
+    #[cfg(unix)]
+    struct OlderDeck {
+        dir: std::path::PathBuf,
+        socket: std::path::PathBuf,
+        refused: Arc<AtomicUsize>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl OlderDeck {
+        fn start(tag: &str) -> Self {
+            use dot_agent_deck::daemon_protocol::{CAP_LIST_DIRECTORIES, CAP_NEW_AGENT_OPTIONS};
+            Self::withholding(tag, &[CAP_LIST_DIRECTORIES, CAP_NEW_AGENT_OPTIONS])
+        }
+
+        fn withholding(tag: &str, withheld: &'static [&'static str]) -> Self {
+            use dot_agent_deck::daemon_protocol::{
+                DAEMON_CAPABILITIES, KIND_REQ, KIND_RESP, read_frame, write_frame,
+            };
+            let (dir, socket) = scratch_socket(tag);
+            let listener = tokio::net::UnixListener::bind(&socket).expect("bind the older deck");
+            let refused = Arc::new(AtomicUsize::new(0));
+            let server = {
+                let refused = Arc::clone(&refused);
+                tokio::spawn(async move {
+                    while let Ok((stream, _peer)) = listener.accept().await {
+                        let (mut reader, mut writer) = stream.into_split();
+                        let Ok(Some((KIND_REQ, payload))) = read_frame(&mut reader).await else {
+                            continue;
+                        };
+                        let request: serde_json::Value =
+                            serde_json::from_slice(&payload).unwrap_or_default();
+                        let response = if request["op"] == "hello" {
+                            let mut reply = AttachResponse::hello(PROTOCOL_VERSION)
+                                .with_running_agents(RunningAgentsSummary::default());
+                            reply.capabilities = Some(
+                                DAEMON_CAPABILITIES
+                                    .iter()
+                                    .filter(|cap| !withheld.contains(cap))
+                                    .map(|cap| (*cap).to_string())
+                                    .collect(),
+                            );
+                            reply
+                        } else {
+                            refused.fetch_add(1, Ordering::SeqCst);
+                            AttachResponse::err("malformed request: unknown variant")
+                        };
+                        let encoded = serde_json::to_vec(&response).expect("serialize the reply");
+                        let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
+                    }
+                })
+            };
+            Self {
+                dir,
+                socket,
+                refused,
+                server,
+            }
+        }
+
+        fn shutdown(self) {
+            self.server.abort();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A directory holding `alpha/` (ordinary), `beta/` (a project: it holds a
+    /// regular `.dot-agent-deck.toml`) and `.hidden/`, under `root`. Returns the
+    /// tree's canonical path, which is the spelling a daemon answers with.
+    #[cfg(unix)]
+    fn listing_tree(root: &std::path::Path) -> std::path::PathBuf {
+        let tree = root.join("tree");
+        for dir in ["alpha", "beta", ".hidden"] {
+            std::fs::create_dir_all(tree.join(dir)).expect("create a fixture directory");
+        }
+        std::fs::write(tree.join("beta").join(".dot-agent-deck.toml"), "")
+            .expect("mark beta as a project");
+        std::fs::canonicalize(&tree).expect("canonicalize the fixture tree")
+    }
+
+    /// Point the deck host's configuration at a test-owned `config.toml` — the
+    /// production `DOT_AGENT_DECK_CONFIG` seam the daemon's `new-agent-options`
+    /// reads — so the answer carries a `default_command` only this test wrote.
+    #[cfg(unix)]
+    fn configure_default_command(root: &std::path::Path, command: &str) {
+        let config = root.join("config.toml");
+        std::fs::write(&config, format!("default_command = {command:?}\n"))
+            .expect("write the deck's config");
+        // SAFETY: under nextest this test owns its process; see the M3 section.
+        unsafe { std::env::set_var("DOT_AGENT_DECK_CONFIG", &config) };
+    }
+
+    /// Scenario: two real daemons under **All Decks** — the local deck, which
+    /// the selection resolves to, and a remote row routed to the second. The
+    /// local daemon is then killed, so anything that reached it would fail.
+    /// The dialog's listing query aimed at the remote row's wire id answers
+    /// from that deck: the fixture tree's canonical path and parent, its two
+    /// visible subdirectories sorted, with the project marked and the hidden
+    /// directory skipped. Its options query answers with the `default_command`
+    /// the deck host's config names and the registry in order. A missing path
+    /// comes back as the daemon's own `unresolved` refusal, and an id the app
+    /// is not observing is refused by `DeckScope::resolve` for both queries.
+    ///
+    /// **What it fails against.** Any read of the selection: All Decks resolves
+    /// to the local deck, which answers nothing here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn new_agent_queries_aimed_at_another_deck_under_all_decks_answer_from_that_deck() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("m4-ask-local");
+        let remote = RealDeck::start("m4-ask-remote");
+        let tree = listing_tree(&remote.dir);
+        configure_default_command(&remote.dir, "remote-default --flag");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        local.kill_server();
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+        let local_wire = deck_wire_id(&local.endpoint);
+        let tree_text = tree.to_str().expect("a UTF-8 fixture path").to_string();
+
+        let listing = crate::list_directories_on(
+            &state,
+            &remote_wire,
+            Some(tree_text.clone()),
+            Default::default(),
+        )
+        .await;
+        let options = crate::new_agent_options_on(&state, &remote_wire).await;
+        let missing = crate::list_directories_on(
+            &state,
+            &remote_wire,
+            Some(format!("{tree_text}/no-such-directory")),
+            Default::default(),
+        )
+        .await;
+        let from_local =
+            crate::list_directories_on(&state, &local_wire, None, Default::default()).await;
+        let unknown_listing =
+            crate::list_directories_on(&state, "deck-ffffffffffffffff", None, Default::default())
+                .await;
+        let unknown_options = crate::new_agent_options_on(&state, "deck-ffffffffffffffff").await;
+
+        local.shutdown();
+        remote.shutdown();
+
+        match listing.expect("the targeted deck lists the directory") {
+            crate::dto::DesktopDirectoryListing::Listing {
+                path,
+                parent,
+                entries,
+                truncated,
+                ..
+            } => {
+                assert_eq!(path, tree_text, "the daemon's canonical spelling");
+                assert_eq!(
+                    parent.as_deref(),
+                    tree.parent().and_then(|parent| parent.to_str()),
+                    "the parent the daemon computed"
+                );
+                let seen: Vec<(String, String, bool)> = entries
+                    .into_iter()
+                    .map(|entry| (entry.display_name, entry.path, entry.is_project))
+                    .collect();
+                assert_eq!(
+                    seen,
+                    vec![
+                        ("alpha".to_string(), format!("{tree_text}/alpha"), false),
+                        ("beta".to_string(), format!("{tree_text}/beta"), true),
+                    ],
+                    "visible subdirectories only, sorted, the project marked"
+                );
+                assert!(!truncated);
+            }
+            other => panic!("the deck supports the verb, got {other:?}"),
+        }
+        match options.expect("the targeted deck answers its options") {
+            crate::dto::DesktopNewAgentOptions::Deck {
+                default_command,
+                agents,
+                authoring_kinds,
+                last_command,
+                ..
+            } => {
+                assert_eq!(default_command.as_deref(), Some("remote-default --flag"));
+                assert_eq!(
+                    agents
+                        .iter()
+                        .map(|agent| agent.id.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["claude", "opencode", "pi", "codex", "devin"],
+                    "the deck's own registry, in order"
+                );
+                assert!(!authoring_kinds.is_empty());
+                assert_eq!(last_command, None, "nothing was started from this app");
+            }
+            other => panic!("the deck supports the query, got {other:?}"),
+        }
+        let missing = missing.expect_err("a missing directory is refused");
+        assert!(
+            missing.contains("unresolved"),
+            "the daemon's own refusal code reaches the dialog: {missing}"
+        );
+        assert!(
+            from_local.is_err(),
+            "fixture: the local deck — where the selection points — answers nothing"
+        );
+        for (query, outcome) in [
+            ("listing", unknown_listing.map(|_| ())),
+            ("options", unknown_options.map(|_| ())),
+        ] {
+            let error = outcome.expect_err("an unobserved deck is refused");
+            assert!(
+                error.contains("that daemon is not one this app is observing"),
+                "{query}: refused with DeckScope::resolve's error, got: {error}"
+            );
+        }
+    }
+
+    /// Scenario: under **All Decks**, the remote row is a deck from before PRD
+    /// #1223 and the local deck is a current real daemon. A plain `cat` agent
+    /// is started on the local deck first. The listing query aimed at the older
+    /// deck answers "unsupported" — with no path and with a typed one — and so
+    /// does its options query, which carries this app's compiled registry and
+    /// no last command; the older deck receives no request it did not
+    /// advertise. The same two queries aimed at the local deck answer from it,
+    /// and its options carry `cat` as the last command.
+    ///
+    /// **What it fails against.** A query that reached the selected (local)
+    /// deck would answer "supported" for the older row; a last command kept
+    /// globally would show `cat` on the older deck too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn new_agent_queries_on_an_older_deck_answer_unsupported_and_send_nothing() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("m4-old-local");
+        let older = OlderDeck::start("m4-old-remote");
+        let tree = listing_tree(&local.dir);
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(&remote_endpoint, &older.socket)
+            .await;
+        let older_wire = deck_wire_id(&remote_endpoint);
+        let local_wire = deck_wire_id(&local.endpoint);
+
+        let started = crate::start_agent_action(&state, &local_wire, plain_start("m4-last")).await;
+        let listing =
+            crate::list_directories_on(&state, &older_wire, None, Default::default()).await;
+        let typed =
+            crate::list_directories_on(&state, &older_wire, Some("/".into()), Default::default())
+                .await;
+        let options = crate::new_agent_options_on(&state, &older_wire).await;
+        let local_listing = crate::list_directories_on(
+            &state,
+            &local_wire,
+            Some(tree.to_str().expect("UTF-8").to_string()),
+            Default::default(),
+        )
+        .await;
+        let local_options = crate::new_agent_options_on(&state, &local_wire).await;
+        let refused = older.refused.load(Ordering::SeqCst);
+
+        local.shutdown();
+        older.shutdown();
+
+        started.expect("fixture: the local deck accepts the start");
+        for (query, outcome) in [("no path", listing), ("a typed path", typed)] {
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(crate::dto::DesktopDirectoryListing::Unsupported)
+                ),
+                "{query}: an older deck's listing is unsupported, got {outcome:?}"
+            );
+        }
+        match options.expect("an older deck is not an error") {
+            crate::dto::DesktopNewAgentOptions::Unsupported {
+                desktop_agents,
+                last_command,
+            } => {
+                assert_eq!(
+                    desktop_agents
+                        .iter()
+                        .map(|agent| agent.id.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["claude", "opencode", "pi", "codex", "devin"],
+                    "this app's compiled registry is the fallback"
+                );
+                assert_eq!(
+                    last_command, None,
+                    "the local deck's last command is not this deck's"
+                );
+            }
+            other => panic!("the older deck does not advertise the query, got {other:?}"),
+        }
+        assert_eq!(
+            refused, 0,
+            "neither query was sent to a deck that did not advertise it"
+        );
+        assert!(
+            matches!(
+                local_listing,
+                Ok(crate::dto::DesktopDirectoryListing::Listing { .. })
+            ),
+            "the current deck lists: {local_listing:?}"
+        );
+        match local_options.expect("the local deck answers") {
+            crate::dto::DesktopNewAgentOptions::Deck { last_command, .. } => {
+                assert_eq!(last_command.as_deref(), Some("cat"));
+            }
+            other => panic!("the local deck supports the query, got {other:?}"),
+        }
+    }
+
+    /// Scenario: issue #1240's listing options, aimed under **All Decks** at a
+    /// remote row that is a current real daemon. Show hidden plus symlinks
+    /// lists the fixture's hidden directory and its symlink — by the link's
+    /// canonical target, marked — beside the ordinary two, and a filter keeps
+    /// only the names that match it, case-insensitively.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listing_options_are_honoured_by_a_deck_that_advertises_them() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("i1240-local");
+        let remote = RealDeck::start("i1240-remote");
+        let tree = listing_tree(&remote.dir);
+        let outside = remote.dir.join("outside");
+        std::fs::create_dir_all(&outside).expect("create the link's target");
+        let outside = std::fs::canonicalize(&outside).expect("canonicalize the link's target");
+        std::os::unix::fs::symlink(&outside, tree.join("link")).expect("create the symlink");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+        let tree_text = tree.to_str().expect("a UTF-8 fixture path").to_string();
+
+        let widened = crate::list_directories_on(
+            &state,
+            &remote_wire,
+            Some(tree_text.clone()),
+            crate::dto::DesktopListingOptions {
+                include_hidden: true,
+                include_symlinks: true,
+                filter: None,
+            },
+        )
+        .await;
+        let filtered = crate::list_directories_on(
+            &state,
+            &remote_wire,
+            Some(tree_text.clone()),
+            crate::dto::DesktopListingOptions {
+                filter: Some("ALP".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        local.shutdown();
+        remote.shutdown();
+
+        let entries = |listing: Result<crate::dto::DesktopDirectoryListing, String>| match listing
+            .expect("the current deck lists")
+        {
+            crate::dto::DesktopDirectoryListing::Listing { entries, .. } => entries
+                .into_iter()
+                .map(|entry| (entry.display_name, entry.path, entry.is_symlink))
+                .collect::<Vec<_>>(),
+            other => panic!("the current deck supports the verb, got {other:?}"),
+        };
+        assert_eq!(
+            entries(widened),
+            vec![
+                (".hidden".to_string(), format!("{tree_text}/.hidden"), false),
+                ("alpha".to_string(), format!("{tree_text}/alpha"), false),
+                ("beta".to_string(), format!("{tree_text}/beta"), false),
+                (
+                    "link".to_string(),
+                    outside.to_str().expect("UTF-8").to_string(),
+                    true
+                ),
+            ],
+            "hidden and symlinked directories, the link by its target"
+        );
+        assert_eq!(
+            entries(filtered),
+            vec![("alpha".to_string(), format!("{tree_text}/alpha"), false)],
+            "the deck applied the filter"
+        );
+    }
+
+    /// Scenario: under **All Decks**, the remote row is a deck from the release
+    /// before issue #1240 — it lists directories but does not advertise
+    /// `list-directories-options`. Listing options aimed at it are refused in
+    /// the dialog's own sentence, rather than read as a deck that cannot list
+    /// at all, and nothing reaches that deck, which would have dropped them and
+    /// answered an unfiltered listing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listing_options_are_not_sent_to_a_deck_that_does_not_advertise_them() {
+        use dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES_OPTIONS;
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("i1240-old-local");
+        let older = OlderDeck::withholding("i1240-old-remote", &[CAP_LIST_DIRECTORIES_OPTIONS]);
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(&remote_endpoint, &older.socket)
+            .await;
+        let older_wire = deck_wire_id(&remote_endpoint);
+
+        let mut outcomes = Vec::new();
+        for options in [
+            crate::dto::DesktopListingOptions {
+                include_hidden: true,
+                ..Default::default()
+            },
+            crate::dto::DesktopListingOptions {
+                include_symlinks: true,
+                ..Default::default()
+            },
+            crate::dto::DesktopListingOptions {
+                filter: Some("needle".into()),
+                ..Default::default()
+            },
+        ] {
+            outcomes.push(crate::list_directories_on(&state, &older_wire, None, options).await);
+        }
+        let refused = older.refused.load(Ordering::SeqCst);
+
+        local.shutdown();
+        older.shutdown();
+
+        for outcome in outcomes {
+            assert_eq!(
+                outcome.expect_err("options a deck cannot honour are refused"),
+                crate::LISTING_OPTIONS_UNSUPPORTED
+            );
+        }
+        assert_eq!(refused, 0, "nothing was sent to the older deck");
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #1223 M7 — a deck-targeted AUTHORING start, against the same two-deck
+    // All Decks fleet.
+    // -----------------------------------------------------------------------
+
+    /// An authoring start of `kind` in `cwd`, named `name`, running `cat` — a
+    /// resolved command, as the dialog sends one.
+    #[cfg(unix)]
+    fn authoring_start(
+        name: &str,
+        kind: dot_agent_deck::authoring_seeds::AuthoringKind,
+        cwd: &std::path::Path,
+    ) -> crate::StartAgentRequest {
+        crate::StartAgentRequest {
+            cwd: Some(cwd.to_str().expect("a UTF-8 fixture path").to_string()),
+            authoring_kind: Some(kind),
+            ..plain_start(name)
+        }
+    }
+
+    /// Scenario: two real daemons under **All Decks** — the local deck, which
+    /// the selection resolves to, and a remote row routed to the second. A
+    /// `schedule` authoring start aimed at the remote row's wire id lands on
+    /// that deck: its registry lists the agent under the returned id, with the
+    /// requested name, the directory the seed names, and a valid
+    /// `DOT_AGENT_DECK_PANE_ID` of the desktop's minting — the pane the deck
+    /// delivers the seed to. The local deck gains nothing, and the remote
+    /// deck's options now carry the command as its last one.
+    ///
+    /// **What it fails against.** A start that read the selection would land
+    /// on `local`, a real daemon here; one that sent no pane id would be
+    /// refused by the deck, which requires one for an authoring start.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_authoring_start_aimed_at_another_deck_under_all_decks_lands_there_with_a_pane_id() {
+        use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, is_valid_pane_id_env};
+        use dot_agent_deck::authoring_seeds::AuthoringKind;
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("m7-land-local");
+        let remote = RealDeck::start("m7-land-remote");
+        let workdir = listing_tree(&remote.dir);
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+
+        let started = crate::start_agent_action(
+            &state,
+            &remote_wire,
+            authoring_start("m7-schedule", AuthoringKind::Schedule, &workdir),
+        )
+        .await;
+        let options = crate::new_agent_options_on(&state, &remote_wire).await;
+
+        let on_local = named_records(&local);
+        let on_remote = remote.registry.agent_records();
+        local.shutdown();
+        remote.shutdown();
+
+        let started = started.expect("the targeted deck accepts the authoring start");
+        assert_eq!(started.scope.identity(), remote_endpoint.identity());
+        let record = on_remote
+            .iter()
+            .find(|record| record.id == started.agent_id)
+            .unwrap_or_else(|| panic!("the targeted deck lists agent {}", started.agent_id));
+        assert_eq!(record.display_name.as_deref(), Some("m7-schedule"));
+        assert_eq!(
+            record.cwd.as_deref(),
+            workdir.to_str(),
+            "the directory the seed names"
+        );
+        let pane_id = record
+            .pane_id_env
+            .as_deref()
+            .expect("an authoring agent carries the pane its seed is delivered to");
+        assert!(
+            is_valid_pane_id_env(pane_id) && pane_id.starts_with("desktop-"),
+            "{DOT_AGENT_DECK_PANE_ID} is the one the desktop minted: {pane_id}"
+        );
+        assert!(
+            on_local.is_empty(),
+            "the local deck — the one All Decks resolves to — gains nothing: {on_local:?}"
+        );
+        match options.expect("the remote deck answers its options") {
+            crate::dto::DesktopNewAgentOptions::Deck { last_command, .. } => {
+                assert_eq!(
+                    last_command.as_deref(),
+                    Some("cat"),
+                    "an authoring start records its command, as the TUI's does"
+                );
+            }
+            other => panic!("the deck supports the query, got {other:?}"),
+        }
+    }
+
+    /// Scenario: under **All Decks**, the remote row is a deck that lists
+    /// directories and answers options but predates daemon-composed authoring
+    /// seeds, and the local deck is a current real daemon. An authoring start
+    /// aimed at the older deck is refused with the unsupported sentence and the
+    /// deck receives nothing it did not advertise. An authoring start with no
+    /// command, and one with no directory, are refused before any deck is
+    /// asked; and one aimed at a deck the app is not observing is refused with
+    /// `DeckScope::resolve`'s error. The local deck gains no agent throughout.
+    ///
+    /// **What it fails against.** A start that sent the field anyway — the
+    /// older deck would count the request — or that fell back to the
+    /// selection, which would put an agent on `local`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_authoring_start_the_deck_cannot_serve_is_refused_and_sends_nothing() {
+        use dot_agent_deck::authoring_seeds::AuthoringKind;
+        use dot_agent_deck::daemon_protocol::CAP_AUTHORING_KIND;
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("m7-old-local");
+        let older = OlderDeck::withholding("m7-old-remote", &[CAP_AUTHORING_KIND]);
+        let workdir = listing_tree(&local.dir);
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(&remote_endpoint, &older.socket)
+            .await;
+        let older_wire = deck_wire_id(&remote_endpoint);
+        let local_wire = deck_wire_id(&local.endpoint);
+
+        let on_older = crate::start_agent_action(
+            &state,
+            &older_wire,
+            authoring_start("m7-older", AuthoringKind::Dispatcher, &workdir),
+        )
+        .await;
+        let no_command = crate::start_agent_action(
+            &state,
+            &local_wire,
+            crate::StartAgentRequest {
+                command: None,
+                ..authoring_start("m7-blank", AuthoringKind::Schedule, &workdir)
+            },
+        )
+        .await;
+        let no_cwd = crate::start_agent_action(
+            &state,
+            &local_wire,
+            crate::StartAgentRequest {
+                cwd: None,
+                ..authoring_start("m7-nowhere", AuthoringKind::Schedule, &workdir)
+            },
+        )
+        .await;
+        let unobserved = crate::start_agent_action(
+            &state,
+            "deck-ffffffffffffffff",
+            authoring_start("m7-unknown", AuthoringKind::Schedule, &workdir),
+        )
+        .await;
+        let refused = older.refused.load(Ordering::SeqCst);
+        let on_local = named_records(&local);
+
+        local.shutdown();
+        older.shutdown();
+
+        let unsupported = match on_older {
+            Ok(started) => panic!(
+                "the older deck cannot compose a seed, yet {} started",
+                started.agent_id
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            unsupported.contains("cannot start a `dispatcher` agent"),
+            "the unsupported outcome, named for the kind: {unsupported}"
+        );
+        assert_eq!(
+            refused, 0,
+            "nothing but the handshakes reached a deck that does not advertise `{CAP_AUTHORING_KIND}`"
+        );
+        for (case, outcome, expected) in [
+            ("no command", no_command, "default shell"),
+            ("no directory", no_cwd, "directory"),
+            (
+                "an unobserved deck",
+                unobserved,
+                "that daemon is not one this app is observing",
+            ),
+        ] {
+            match outcome {
+                Ok(started) => panic!("{case}: must be refused, yet {} started", started.agent_id),
+                Err(error) => assert!(error.contains(expected), "{case}: got {error}"),
+            }
+        }
+        assert!(
+            on_local.is_empty(),
+            "nothing reached the local deck: {on_local:?}"
+        );
+    }
+
+    /// Scenario (PRD #1223 audit D2): under **All Decks**, the remote row is a
+    /// deck from before the listing verb — the deck on which the dialog sends
+    /// the path the user typed — and the local deck is a current real daemon.
+    /// A plain start naming a relative directory (`repo`, `./repo`, `../repo`,
+    /// `~/repo`) is refused on either deck with the typed-path shape sentence,
+    /// and neither deck receives it: the older one counts no request and the
+    /// local one lists no agent. A plain start naming no directory is still
+    /// started, on the local deck, in that deck's default directory.
+    ///
+    /// **What it fails against.** The start before D2, whose only `cwd` check
+    /// was `is_valid_cwd`: `repo` passed it, so the older deck would count a
+    /// `start-agent` it cannot decode, and the local deck would start `cat` in
+    /// a directory relative to wherever its daemon was spawned from.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_relative_typed_directory_is_refused_before_any_deck_is_asked() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("d2-relative-local");
+        let older = OlderDeck::start("d2-relative-remote");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(&remote_endpoint, &older.socket)
+            .await;
+        let older_wire = deck_wire_id(&remote_endpoint);
+        let local_wire = deck_wire_id(&local.endpoint);
+
+        let mut relative = Vec::new();
+        for (deck, wire) in [("older", &older_wire), ("local", &local_wire)] {
+            for typed in ["repo", "./repo", "../repo", "~/repo"] {
+                let outcome = crate::start_agent_action(
+                    &state,
+                    wire,
+                    crate::StartAgentRequest {
+                        cwd: Some(typed.into()),
+                        ..plain_start("d2-relative")
+                    },
+                )
+                .await;
+                relative.push((deck, typed, outcome));
+            }
+        }
+        let default_directory =
+            crate::start_agent_action(&state, &local_wire, plain_start("d2-default")).await;
+        let refused = older.refused.load(Ordering::SeqCst);
+        let on_local = named_records(&local);
+
+        local.shutdown();
+        older.shutdown();
+
+        for (deck, typed, outcome) in relative {
+            match outcome {
+                Ok(started) => panic!(
+                    "{deck} deck: `{typed}` is relative, yet agent {} started",
+                    started.agent_id
+                ),
+                Err(error) => assert!(
+                    error.contains("enter an absolute directory path"),
+                    "{deck} deck, `{typed}`: refused with the typed-path shape sentence, got {error}"
+                ),
+            }
+        }
+        assert_eq!(
+            refused, 0,
+            "the older deck was sent no request beyond a handshake"
+        );
+        let started = default_directory.expect("a start naming no directory is still allowed");
+        assert_eq!(
+            on_local,
+            vec![(started.agent_id, Some("d2-default".to_string()))],
+            "the local deck started only the default-directory agent"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #1223 M6 — orchestrations from the New agent dialog
+    // -----------------------------------------------------------------------
+
+    /// A project under `root` whose one orchestration, `m6`, has a Pi start
+    /// role and an OpenCode worker — both DECLARED on `sh` stand-ins, so the
+    /// deck's use of the declaration is observable — and whose commands each
+    /// append a distinct line to `configured.log` in the project and then stay
+    /// alive. Returns the canonical project path.
+    #[cfg(unix)]
+    fn configured_orchestration_project(root: &std::path::Path) -> std::path::PathBuf {
+        let project = root.join("m6-project");
+        std::fs::create_dir_all(&project).expect("create the project");
+        std::fs::write(
+            project.join(".dot-agent-deck.toml"),
+            r#"
+[[orchestrations]]
+name = "m6"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "sh -c 'echo planner-configured >> configured.log; sleep 600'"
+agent = "pi"
+start = true
+
+[[orchestrations.roles]]
+name = "builder"
+command = "sh -c 'echo builder-configured >> configured.log; sleep 600'"
+agent = "opencode"
+"#,
+        )
+        .expect("write the project config");
+        std::fs::canonicalize(&project).expect("canonicalize the project")
+    }
+
+    /// PRD #1223 audit V4: the same project with the orchestration name
+    /// declared TWICE, each declaration role-bearing and each with its own
+    /// commands. Config validation only warns about this, and
+    /// `PrepareOrchestration` takes the first declaration.
+    #[cfg(unix)]
+    fn namesake_orchestration_project(root: &std::path::Path) -> std::path::PathBuf {
+        let project = root.join("v4-project");
+        std::fs::create_dir_all(&project).expect("create the project");
+        std::fs::write(
+            project.join(".dot-agent-deck.toml"),
+            r#"
+[[orchestrations]]
+name = "m6"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "sh -c 'echo first-planner >> configured.log; sleep 600'"
+start = true
+
+[[orchestrations]]
+name = "m6"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "sh -c 'echo second-planner >> configured.log; sleep 600'"
+start = true
+
+[[orchestrations]]
+name = "solo"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "sh -c 'echo solo-planner >> configured.log; sleep 600'"
+start = true
+"#,
+        )
+        .expect("write the project config");
+        std::fs::canonicalize(&project).expect("canonicalize the project")
+    }
+
+    #[cfg(unix)]
+    fn orchestration_start(
+        path: &str,
+        title: Option<&str>,
+        config_revision: Option<String>,
+    ) -> crate::StartOrchestrationRequest {
+        crate::StartOrchestrationRequest {
+            path: path.to_string(),
+            orchestration: "m6".into(),
+            display_title: title.map(str::to_string),
+            config_revision,
+            rows: Some(24),
+            cols: Some(80),
+        }
+    }
+
+    /// Scenario: two real daemons under **All Decks** — the local deck, which
+    /// the selection resolves to, and a remote row routed to the second, whose
+    /// filesystem holds a project with a two-role orchestration. The dialog's
+    /// orchestrations query aimed at the remote row answers that project's
+    /// orchestration (and an ordinary directory beside it is "not a project",
+    /// not an error); launching it there with a run title starts both roles ON
+    /// THAT DECK with the commands its config gives them — observed as the
+    /// lines they write — under the title, one shared orchestration id and
+    /// the declared agent types, and names the planner as the start role. The
+    /// Pi start role holds the preparation's coordinator prompt as its native
+    /// seed, which is how the TUI delivers to one. The local deck gains nothing.
+    ///
+    /// **What it fails against.** A launch that read the selection would land
+    /// on `local`; one that sent no `use_configured_command` would start the
+    /// deck's default shell, so neither line would appear; one that delivered
+    /// the prompt itself as well would leave nothing for the Pi pane to pull.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_orchestration_aimed_at_another_deck_under_all_decks_lands_there_with_its_configured_commands()
+     {
+        use dot_agent_deck::agent_pty::TabMembership;
+        use dot_agent_deck::event::AgentType;
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("m6-land-local");
+        let remote = RealDeck::start("m6-land-remote");
+        let project = configured_orchestration_project(&remote.dir);
+        let ordinary = listing_tree(&remote.dir).join("alpha");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+        let project_wire = project.to_str().expect("a UTF-8 path").to_string();
+
+        let offered = crate::new_agent_orchestrations_on(&state, &remote_wire, &project_wire).await;
+        let not_project = crate::new_agent_orchestrations_on(
+            &state,
+            &remote_wire,
+            ordinary.to_str().expect("a UTF-8 path"),
+        )
+        .await;
+        let revision = match &offered {
+            Ok(crate::dto::DesktopNewAgentOrchestrations::Project(project)) => {
+                project.config_revision.clone()
+            }
+            _ => None,
+        };
+        let started = crate::start_orchestration_action(
+            &state,
+            &remote_wire,
+            orchestration_start(&project_wire, Some("m6-project-orchestrator-1"), revision),
+        )
+        .await;
+        let log = project.join("configured.log");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count()
+            < 2
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let lines = std::fs::read_to_string(&log).unwrap_or_default();
+        let on_local = named_records(&local);
+        let on_remote = remote.registry.agent_records();
+        let planner_seed = started.as_ref().ok().and_then(|started| {
+            let pane = on_remote
+                .iter()
+                .find(|record| record.id == started.start_agent_id)?
+                .pane_id_env
+                .clone()?;
+            remote
+                .registry
+                .take_pending_seed_native_for(&pane, Some(&started.start_agent_id))
+        });
+        local.shutdown();
+        remote.shutdown();
+
+        match offered.expect("the remote deck answers the orchestrations query") {
+            crate::dto::DesktopNewAgentOrchestrations::Project(resolved) => {
+                assert_eq!(resolved.path, project_wire);
+                let names: Vec<&str> = resolved
+                    .orchestrations
+                    .iter()
+                    .map(|orchestration| orchestration.name.as_str())
+                    .collect();
+                assert_eq!(names, ["m6"]);
+            }
+            other => panic!("the project resolves on its deck, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                not_project,
+                Ok(crate::dto::DesktopNewAgentOrchestrations::NotProject)
+            ),
+            "an ordinary directory is an answer, not an error: {not_project:?}"
+        );
+        let started = started.expect("the targeted deck launches the orchestration");
+        assert_eq!(started.scope.identity(), remote_endpoint.identity());
+        assert_eq!(started.agent_ids.len(), 2);
+        assert!(
+            lines.lines().any(|line| line == "planner-configured")
+                && lines.lines().any(|line| line == "builder-configured"),
+            "both roles ran the commands their config gives them: {lines:?}"
+        );
+        let mut orchestration_ids = std::collections::HashSet::new();
+        for (role, agent_type, is_start) in [
+            ("planner", AgentType::Pi, true),
+            ("builder", AgentType::OpenCode, false),
+        ] {
+            let record = on_remote
+                .iter()
+                .find(|record| record.display_name.as_deref() == Some(role))
+                .unwrap_or_else(|| panic!("the targeted deck lists {role}: {on_remote:?}"));
+            assert!(started.agent_ids.contains(&record.id));
+            assert_eq!(
+                record.agent_type,
+                Some(agent_type),
+                "{role}: declared agent"
+            );
+            assert_eq!(record.id == started.start_agent_id, is_start, "{role}");
+            match record.tab_membership.as_ref() {
+                Some(TabMembership::Orchestration {
+                    name,
+                    role_name,
+                    is_start_role,
+                    display_title,
+                    orchestration_id,
+                    ..
+                }) => {
+                    assert_eq!(name, "m6");
+                    assert_eq!(role_name, role);
+                    assert_eq!(*is_start_role, is_start);
+                    assert_eq!(display_title.as_deref(), Some("m6-project-orchestrator-1"));
+                    orchestration_ids.insert(orchestration_id.clone());
+                }
+                other => panic!("{role}: an orchestration membership, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            orchestration_ids.len(),
+            1,
+            "one orchestration id for the run"
+        );
+        assert!(
+            planner_seed
+                .as_deref()
+                .is_some_and(|seed| seed.contains("orchestrator-context")),
+            "the Pi start role holds the deck-composed coordinator prompt: {planner_seed:?}"
+        );
+        assert!(
+            on_local.is_empty(),
+            "the local deck — the one All Decks resolves to — gains nothing: {on_local:?}"
+        );
+    }
+
+    /// Scenario (PRD #1223 audit V4): a real deck whose project declares the
+    /// orchestration name `m6` twice, each declaration with roles and its own
+    /// command. A launch naming it is refused at the action boundary with the
+    /// dialog's reason, the deck starts nothing, and — the half the dialog's
+    /// disabled chips cannot give — NO preparation runs, so no coordinator
+    /// context is published over whatever else the project holds. The uniquely
+    /// named `solo` in the same project still launches, so the check refuses
+    /// the ambiguity and not the project.
+    ///
+    /// **What it fails against.** Without the check the launch reaches
+    /// `PrepareOrchestration`, which takes the FIRST declaration: the context file
+    /// appears and `first-planner` runs under a name the user could equally
+    /// have meant for the second.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_namesake_orchestration_is_refused_before_anything_is_prepared() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("v4-namesake");
+        let project = namesake_orchestration_project(&local.dir);
+        let project_wire = project.to_str().expect("a UTF-8 path").to_string();
+        let (settings, _unused_remote) = all_decks_with_one_remote_row("v4-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        let local_wire = deck_wire_id(&local.endpoint);
+
+        let offered = crate::new_agent_orchestrations_on(&state, &local_wire, &project_wire).await;
+        let refused = crate::start_orchestration_action(
+            &state,
+            &local_wire,
+            orchestration_start(&project_wire, Some("v4-project-orchestrator-1"), None),
+        )
+        .await;
+        let after_refusal = named_records(&local);
+        // Issue #1233: a publish writes its own `orchestrator-context-<id>.md`
+        // and refreshes the fixed-name mirror, so any entry matching the prefix
+        // is a publish.
+        let context_dir = project.join(".dot-agent-deck");
+        let published = || {
+            std::fs::read_dir(&context_dir).is_ok_and(|entries| {
+                entries.filter_map(Result::ok).any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("orchestrator-context")
+                })
+            })
+        };
+        let published_after_refusal = published();
+        let solo = crate::start_orchestration_action(
+            &state,
+            &local_wire,
+            crate::StartOrchestrationRequest {
+                path: project_wire.clone(),
+                orchestration: "solo".into(),
+                display_title: Some("v4-project-orchestrator-2".into()),
+                config_revision: None,
+                rows: Some(24),
+                cols: Some(80),
+            },
+        )
+        .await;
+        // Read before the shutdown, which takes the deck's scratch tree — and
+        // the project inside it — with it.
+        let published_after_solo = published();
+        local.shutdown();
+
+        match offered.expect("the deck answers the orchestrations query") {
+            crate::dto::DesktopNewAgentOrchestrations::Project(resolved) => {
+                let names: Vec<&str> = resolved
+                    .orchestrations
+                    .iter()
+                    .map(|orchestration| orchestration.name.as_str())
+                    .collect();
+                assert_eq!(
+                    names,
+                    ["m6", "m6", "solo"],
+                    "the deck lists both declarations; the desktop is what refuses the ambiguity"
+                );
+            }
+            other => panic!("the project resolves on its deck, got {other:?}"),
+        }
+        match refused {
+            Ok(started) => panic!(
+                "a namesake orchestration must not launch, yet {} started",
+                started.start_agent_id
+            ),
+            Err(error) => assert_eq!(
+                error.message(),
+                "This project defines more than one orchestration named m6; rename one to launch \
+                 it here. Nothing was started."
+            ),
+        }
+        assert!(
+            after_refusal.is_empty(),
+            "the refused launch started nothing: {after_refusal:?}"
+        );
+        assert!(
+            !published_after_refusal,
+            "the refused launch did not reach PrepareOrchestration, so it published no orchestrator context"
+        );
+        let solo =
+            solo.expect("the uniquely named orchestration in the same project still launches");
+        assert_eq!(solo.agent_ids.len(), 1);
+        assert!(
+            published_after_solo,
+            "the launch that WAS prepared published its orchestrator context"
+        );
+    }
+
+    /// Scenario: under **All Decks**, one remote row is a deck that offers the
+    /// project verbs but predates `prepared-role-command`, and a second offers
+    /// no prepare verb at all; the local deck is a current real daemon.
+    /// The orchestrations query answers each older deck `unsupported` with its
+    /// reason — the missing configured-command start, and the connection's own
+    /// `projectActionsReason` — and a launch aimed at the first is refused with
+    /// the same sentence. Neither deck receives a single request beyond the
+    /// handshake: no `ResolveProject`, and no `PrepareOrchestration` publishing a
+    /// context nothing could read. A query and a launch aimed at a deck the
+    /// app is not observing are refused with `DeckScope::resolve`'s error, and
+    /// the local deck gains nothing throughout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_orchestration_the_deck_cannot_start_is_withheld_and_sends_nothing() {
+        use dot_agent_deck::daemon_protocol::{
+            CAP_PREPARE_ORCHESTRATION, CAP_PREPARE_WORKFLOW, CAP_PREPARED_ROLE_COMMAND,
+            CAP_START_PREPARED_AGENT,
+        };
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("m6-old-local");
+        let older = OlderDeck::withholding("m6-old-remote", &[CAP_PREPARED_ROLE_COMMAND]);
+        let oldest = OlderDeck::withholding(
+            "m6-oldest-remote",
+            &[
+                CAP_PREPARE_ORCHESTRATION,
+                CAP_PREPARE_WORKFLOW,
+                CAP_START_PREPARED_AGENT,
+                CAP_PREPARED_ROLE_COMMAND,
+            ],
+        );
+        let project = configured_orchestration_project(&local.dir);
+        let project_wire = project.to_str().expect("a UTF-8 path").to_string();
+        let (mut settings, older_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
+        let oldest_endpoint = add_remote_row(&mut settings, "oldest-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(&older_endpoint, &older.socket)
+            .await;
+        state
+            .tunnels
+            .insert_route(&oldest_endpoint, &oldest.socket)
+            .await;
+        let older_wire = deck_wire_id(&older_endpoint);
+        let oldest_wire = deck_wire_id(&oldest_endpoint);
+
+        let older_query =
+            crate::new_agent_orchestrations_on(&state, &older_wire, &project_wire).await;
+        let oldest_query =
+            crate::new_agent_orchestrations_on(&state, &oldest_wire, &project_wire).await;
+        let older_launch = crate::start_orchestration_action(
+            &state,
+            &older_wire,
+            orchestration_start(&project_wire, Some("run"), None),
+        )
+        .await;
+        let unobserved_query =
+            crate::new_agent_orchestrations_on(&state, "deck-ffffffffffffffff", &project_wire)
+                .await;
+        let unobserved_launch = crate::start_orchestration_action(
+            &state,
+            "deck-ffffffffffffffff",
+            orchestration_start(&project_wire, Some("run"), None),
+        )
+        .await;
+        let refused = older.refused.load(Ordering::SeqCst) + oldest.refused.load(Ordering::SeqCst);
+        let on_local = named_records(&local);
+        local.shutdown();
+        older.shutdown();
+        oldest.shutdown();
+
+        match older_query.expect("an older deck answers, it does not fail") {
+            crate::dto::DesktopNewAgentOrchestrations::Unsupported { reason } => {
+                assert_eq!(reason, crate::CONFIGURED_ROLE_COMMAND_UNSUPPORTED);
+            }
+            other => panic!("the deck cannot start configured roles, got {other:?}"),
+        }
+        match oldest_query.expect("an older deck answers, it does not fail") {
+            crate::dto::DesktopNewAgentOrchestrations::Unsupported { reason } => {
+                assert!(
+                    reason.contains("cannot offer projects or activate orchestrations")
+                        && !reason.contains(CAP_PREPARE_ORCHESTRATION),
+                    "the connection's projectActionsReason: {reason}"
+                );
+            }
+            other => panic!("the deck has no project verbs, got {other:?}"),
+        }
+        match older_launch {
+            Ok(started) => panic!(
+                "the older deck cannot start configured roles, yet {} started",
+                started.start_agent_id
+            ),
+            Err(error) => assert_eq!(error.message(), crate::CONFIGURED_ROLE_COMMAND_UNSUPPORTED),
+        }
+        assert_eq!(
+            refused, 0,
+            "nothing but handshakes reached a deck that cannot launch from this flow"
+        );
+        for (case, error) in [
+            ("query", unobserved_query.err()),
+            (
+                "launch",
+                unobserved_launch
+                    .err()
+                    .map(|error| error.message().to_string()),
+            ),
+        ] {
+            assert!(
+                error.as_deref().is_some_and(
+                    |error| error.contains("that daemon is not one this app is observing")
+                ),
+                "{case}: an unobserved deck is refused with the resolve error: {error:?}"
+            );
+        }
+        assert!(
+            on_local.is_empty(),
+            "nothing reached the local deck: {on_local:?}"
         );
     }
 }

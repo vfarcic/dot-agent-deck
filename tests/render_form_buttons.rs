@@ -43,7 +43,7 @@ fn form_001_renders_mode_chips_and_submit_cancel() {
 
     // Existing form chrome still present (affordances are additive).
     assert!(
-        buf.contains("New Agent"),
+        buf.contains("┌ New Agent"),
         "form must still render its title, got:\n{buf}"
     );
     assert!(

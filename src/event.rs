@@ -28,6 +28,15 @@ pub enum EventType {
     /// gone, i.e. the previously-running foreground command has finished. See
     /// [`ShellBusy`](Self::ShellBusy).
     ShellIdle,
+    /// Issue #714: the agent's provider refused it for an exhausted usage limit
+    /// or credit pool. Reported by a producer from a structured signal — the
+    /// Claude Code `StopFailure` hook, OpenCode's `session.error` fields — or by
+    /// the daemon's Codex rollout tailer (`crate::codex_rollout_tail`). Its
+    /// kind, reset time and display detail ride the `quota_blocked_*` metadata
+    /// keys in [`crate::quota_block`], which the daemon normalises on arrival
+    /// and strips from every other event type. An older reader decodes it as
+    /// [`EventType::Unknown`], a no-op.
+    QuotaBlocked,
     /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
     /// forward-compat catch-all for a future/unknown `event_type` string on
     /// the wire, so a build newer than THIS one can add further variants
@@ -476,6 +485,90 @@ pub const ORCHESTRATION_ORPHANED_METADATA_KEY: &str = "orchestration_orphaned";
 /// becomes a channel for text the daemon did not author.
 pub const ORCHESTRATION_ORPHANED_METADATA_VALUE: &str = "1";
 
+/// `AgentEvent.metadata` key marking a `SessionEnd` the DAEMON authored to say
+/// "this pane's agent was stopped and the pane is gone" (PRD #1223).
+///
+/// The removal half of the live-surface broadcast. `StopAgent` removed an agent
+/// from the registry and told only the client that sent it, so a TUI already
+/// attached when the DESKTOP stopped an agent kept its card — and, for an
+/// orchestration, its now-empty tab — indefinitely
+/// (`newagent/visibility/003` / `004`). The daemon now announces every
+/// successful `StopAgent` that gave the pane up
+/// ([`crate::spawn::surface_attach_stopped_agent`]), and an attached TUI applies
+/// the same cleanup a native close performs
+/// ([`crate::state::AppState::apply_daemon_pane_closed`]).
+///
+/// **Daemon-authoritative**, like [`ORCHESTRATION_ORPHANED_METADATA_KEY`]: the
+/// event is broadcast straight onto the fan-out and never ingested, and
+/// `ingest_event` REMOVES the key from every inbound hook event, so a producer on
+/// the unauthenticated same-uid hook socket cannot make a TUI drop a live pane.
+///
+/// Additive on the wire in both directions, so no
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump: an older TUI reads it as
+/// an ordinary `SessionEnd` for the pane's placeholder key, which restores the
+/// same placeholder it removes (today's stale card, unchanged), and the desktop
+/// reads any `SessionEnd` as "refetch the agent list now".
+pub const DAEMON_PANE_CLOSED_METADATA_KEY: &str = "daemon_pane_closed";
+
+/// The [`DAEMON_PANE_CLOSED_METADATA_KEY`] value meaning "yes". Fixed for the
+/// same reason as [`ORCHESTRATION_ORPHANED_METADATA_VALUE`].
+pub const DAEMON_PANE_CLOSED_METADATA_VALUE: &str = "1";
+
+/// `AgentEvent.metadata` key carrying the DAEMON's verdict on which generation
+/// of its pane a frame comes from (issue #320) — see [`GenerationVerdict`].
+///
+/// The daemon's `AgentPtyRegistry` knows each pane's current generation: the
+/// spawn reserving it, else the record no successor has taken it from. An
+/// attached TUI has no registry, so before this it ordered a takeover by the
+/// only evidence a frame carries — its type and its PRODUCER-supplied
+/// timestamp — and a late `SessionStart`, or a late frame stamped newer, from
+/// the OUTGOING generation retired the live card. The daemon now asks its
+/// registry in `ingest_event` and stamps the answer here, before the fan-out,
+/// so both sides order generations by the registry and neither by a clock.
+///
+/// **Daemon-authoritative**, like [`ORCHESTRATION_ORPHANED_METADATA_KEY`]:
+/// `ingest_event` REMOVES any incoming value before deciding. Absent when the
+/// frame names no pane or no agent id, when the registry holds no generation
+/// for the pane or has never published the frame's agent on it, and when it
+/// cannot answer — and absent on every frame an OLDER daemon relays, which a
+/// consumer reads exactly as it did before this key existed.
+///
+/// Additive on the wire in both directions, so no
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump: an older TUI ignores the
+/// key and keeps the timestamp rule it always had.
+pub const PANE_GENERATION_METADATA_KEY: &str = "pane_generation";
+
+/// The [`PANE_GENERATION_METADATA_KEY`] value for [`GenerationVerdict::Current`].
+pub const PANE_GENERATION_CURRENT: &str = "current";
+
+/// The [`PANE_GENERATION_METADATA_KEY`] value for [`GenerationVerdict::Displaced`].
+pub const PANE_GENERATION_DISPLACED: &str = "displaced";
+
+/// Issue #320: the daemon registry's answer to "is the generation this frame
+/// names its pane's CURRENT one?", for a frame naming both a pane and an agent
+/// id on a pane the registry holds a generation for. See
+/// [`PANE_GENERATION_METADATA_KEY`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationVerdict {
+    /// The frame's agent id is the pane's current generation.
+    Current,
+    /// The frame's agent id is a generation the registry itself published on
+    /// this pane earlier, and a different one is current now: it has been
+    /// replaced. An id the registry never published on the pane gets no
+    /// verdict at all rather than this one.
+    Displaced,
+}
+
+impl GenerationVerdict {
+    /// The fixed metadata value for this verdict.
+    pub fn metadata_value(self) -> &'static str {
+        match self {
+            GenerationVerdict::Current => PANE_GENERATION_CURRENT,
+            GenerationVerdict::Displaced => PANE_GENERATION_DISPLACED,
+        }
+    }
+}
+
 /// `AgentEvent.metadata` key declaring WHERE a `SessionStart` came from (PRD
 /// #225 M3). The wrapper adapter is the only INTENDED producer, with one of the
 /// three values [`WRAPPER_FORK_SESSION_START_ORIGIN`] /
@@ -662,6 +755,84 @@ pub const CLEAR_SESSION_START_METADATA_KEY: &str = "session_start_source";
 /// was caused by the user running `/clear`".
 pub const CLEAR_SESSION_START_METADATA_VALUE: &str = "clear";
 
+/// Issue #714: `AgentEvent.metadata` key `dot-agent-deck wrap` stamps on every
+/// event its stdout line classifier emits (value
+/// [`WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE`]).
+///
+/// That classifier reads EVERY non-blank line as `Working` (→ `Thinking`),
+/// including Codex's own rendering of a provider's quota error and its idle
+/// redraws, so an event it emits proves the child printed something, not that it
+/// did any work. A `Blocked` card must not be cleared by it: without the mark,
+/// [`crate::quota_block::is_work_evidence`] would count those events and lift a
+/// rollout-reported Codex block the moment Codex drew the error. Marked rather
+/// than inferred so nothing else about those events changes. Forging the key can
+/// only make an event count for LESS as work evidence — it can keep a `Blocked`
+/// card blocked until the agent's next genuine work hook — so it is not, and
+/// must not be treated as, an authentication marker.
+pub const WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY: &str = "wrapper_output_classified";
+
+/// The [`WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`] value.
+pub const WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE: &str = "1";
+
+/// Issue #559: `AgentEvent.metadata` key `dot-agent-deck wrap` stamps on EVERY
+/// event it emits — the fork-time and interface `SessionStart`s, each classified
+/// line, the exit-time `Idle`/`Error` — when it knows the wrapped agent's own
+/// submitted-prompt channel is not wired (value
+/// [`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE`]).
+///
+/// The wrapper never reports a submitted prompt itself: its emitter hardcodes
+/// `user_prompt: None`. A wrapped Codex pane's prompt reports come from Codex's
+/// NATIVE `UserPromptSubmit` hook, which runs only once the wrapper has recorded
+/// trust for it and while the user has not switched it off in Codex's `/hooks`
+/// browser (`crate::wrap`'s `codex_spawn_prep`). That step is best-effort,
+/// and it fails on an ordinary launcher configuration — `codex` reachable only
+/// inside `devbox run codex-big`, so the wrapper's own `codex app-server` is
+/// `NotFound`. The pane's only producer is then the wrapper, whose events still
+/// declare `AgentType::Codex`, and a type-derived capability answer arms
+/// re-submission against a channel that can never confirm: a prompt that WAS
+/// delivered is typed in again.
+///
+/// Read by [`AgentEvent::reports_submitted_prompt`] and by
+/// [`crate::state::SessionState::prompt_reports_unavailable`], and it can only
+/// REMOVE standing. Any value counts, so a forged or garbled key makes an event
+/// count for less, never for more — the worst a forgery does is make a pane
+/// write its automatic prompt once instead of retrying it. It is not, and must
+/// not be treated as, an authentication marker: its ABSENCE proves nothing, and
+/// an event without it is answered from its type exactly as before.
+pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY: &str =
+    "wrapper_prompt_reports_unavailable";
+
+/// The [`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`] value the wrapper
+/// writes. Readers accept any value; see the key's docs.
+pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE: &str = "1";
+
+/// Issue #1354: the [`AgentEvent::metadata`] key naming the SUBAGENT an event
+/// came from, when the agent's hook payload says it came from one.
+///
+/// Claude Code stamps an `agent_id` on its hook input "only when the hook
+/// fires from within a subagent … Absent for the main thread, even in --agent
+/// sessions" (the schema description in 2.1.283), and Codex does the same for
+/// a thread-spawned subagent (`thread_spawn_subagent_hook_context` in
+/// `codex-rs/core/src/hook_runtime.rs`). Both keep the PARENT's `session_id`
+/// on those hooks, so without this key a subagent's tool call is
+/// indistinguishable from the main thread's and drives the one card both
+/// share — which is how a background agent's `PreToolUse` after the turn's
+/// `Stop` left a card on Working for fifteen hours. See the `ToolStart` arm of
+/// `crate::state::AppState::apply_event` for what the key changes.
+///
+/// A distinct name, not `agent_id`, because [`AgentEvent::agent_id`] already
+/// means something else entirely: the deck's own id for the spawned agent
+/// process (`DOT_AGENT_DECK_AGENT_ID`).
+///
+/// Additive on the wire in both directions, like
+/// [`CLEAR_SESSION_START_METADATA_KEY`]: it rides the free-form `metadata`
+/// map, an older daemon ignores it (and keeps today's behaviour), and an older
+/// hook CLI never sets it, so no
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump is needed. Nor is it a
+/// privilege: an event carrying it can only be kept from moving a card's
+/// status, never granted anything a plain event is not.
+pub const SUBAGENT_ID_METADATA_KEY: &str = "subagent_id";
+
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
 /// This versions the **payload shape of a single `AgentEvent` record** — the
@@ -826,6 +997,15 @@ impl AgentEvent {
             .is_some_and(|origin| origin == WRAPPER_FORK_SESSION_START_ORIGIN)
     }
 
+    /// Issue #1354: did the agent's hook say this event came from a subagent
+    /// (see [`SUBAGENT_ID_METADATA_KEY`])? `false` for every event without the
+    /// key — the main thread, an older hook CLI, and every agent whose hook
+    /// payload has no such field — so the absent-key default is today's
+    /// behaviour.
+    pub fn is_from_subagent(&self) -> bool {
+        self.metadata.contains_key(SUBAGENT_ID_METADATA_KEY)
+    }
+
     /// Issue #684: was this `SessionStart` authored by the DAEMON to draw a
     /// spawned pane's card (see [`CARD_SURFACE_SESSION_START_ORIGIN`])?
     ///
@@ -839,6 +1019,19 @@ impl AgentEvent {
             .is_some_and(|origin| origin == CARD_SURFACE_SESSION_START_ORIGIN)
     }
 
+    /// PRD #1223: is this the daemon's pane-closed `SessionEnd` (see
+    /// [`DAEMON_PANE_CLOSED_METADATA_KEY`])? Requires the event type and a pane
+    /// id as well as the marker, so a malformed frame is never read as a
+    /// removal of nothing in particular.
+    pub fn is_daemon_pane_closed(&self) -> bool {
+        self.event_type == EventType::SessionEnd
+            && self.pane_id.is_some()
+            && self
+                .metadata
+                .get(DAEMON_PANE_CLOSED_METADATA_KEY)
+                .is_some_and(|v| v == DAEMON_PANE_CLOSED_METADATA_VALUE)
+    }
+
     /// Issue #770: does this event carry the daemon's ORPHANED-ROLE marker (see
     /// [`ORCHESTRATION_ORPHANED_METADATA_KEY`])? `false` for every event
     /// without it, which is every event an older daemon relays and every event
@@ -847,6 +1040,18 @@ impl AgentEvent {
         self.metadata
             .get(ORCHESTRATION_ORPHANED_METADATA_KEY)
             .is_some_and(|v| v == ORCHESTRATION_ORPHANED_METADATA_VALUE)
+    }
+
+    /// Issue #320: the daemon's generation verdict for this frame (see
+    /// [`PANE_GENERATION_METADATA_KEY`]). `None` for every frame without one,
+    /// which includes every frame an older daemon relays; an unrecognised value
+    /// is also `None`, never a guess.
+    pub fn pane_generation_verdict(&self) -> Option<GenerationVerdict> {
+        match self.metadata.get(PANE_GENERATION_METADATA_KEY)?.as_str() {
+            PANE_GENERATION_CURRENT => Some(GenerationVerdict::Current),
+            PANE_GENERATION_DISPLACED => Some(GenerationVerdict::Displaced),
+            _ => None,
+        }
     }
 
     /// Issue #243: does this event carry the wrapper's INTERFACE-READY origin
@@ -916,14 +1121,63 @@ impl AgentEvent {
         self.is_wrapper_fork_session_start() || self.is_wrapper_interface_session_start()
     }
 
+    /// Issue #714: is this the daemon's `Idle` that lifts a `Blocked` card whose
+    /// agent a pane restart replaced
+    /// ([`crate::quota_block::QUOTA_BLOCKED_LIFTED_METADATA_KEY`])? The hook loop
+    /// strips the key from every producer frame, so only the daemon sends it.
+    pub fn is_quota_block_lift(&self) -> bool {
+        self.event_type == EventType::Idle
+            && self
+                .metadata
+                .get(crate::quota_block::QUOTA_BLOCKED_LIFTED_METADATA_KEY)
+                .is_some_and(|v| v == crate::quota_block::QUOTA_BLOCKED_LIFTED_BY_PANE_RESTART)
+    }
+
+    /// Issue #714: was this event emitted by `dot-agent-deck wrap`'s stdout line
+    /// classifier (see [`WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`])?
+    pub fn is_wrapper_output_classified(&self) -> bool {
+        self.metadata
+            .get(WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY)
+            .is_some_and(|v| v == WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE)
+    }
+
+    /// Issue #559: did this event's producer declare that no submitted-prompt
+    /// report will come from it (see
+    /// [`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`])? Presence of the
+    /// key, whatever its value, because the answer can only withdraw standing.
+    pub fn declares_prompt_reports_unavailable(&self) -> bool {
+        self.metadata
+            .contains_key(WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY)
+    }
+
+    /// Issue #559: can the producer of THIS event report a submitted prompt —
+    /// [`crate::prompt_delivery::agent_reports_submitted_prompt`] for its
+    /// declared type, withdrawn when the event itself declares that it cannot
+    /// ([`Self::declares_prompt_reports_unavailable`]).
+    ///
+    /// Every daemon-side capability read goes through this rather than through
+    /// the type, because the type is what a wrapper declares on behalf of the
+    /// agent it hosts and says nothing about whether that agent's reporting
+    /// channel exists.
+    pub fn reports_submitted_prompt(&self) -> bool {
+        crate::prompt_delivery::agent_reports_submitted_prompt(&self.agent_type)
+            && !self.declares_prompt_reports_unavailable()
+    }
+
     /// Issue #424 D4: was this event SYNTHESIZED BY THE DAEMON rather than
     /// produced by the pane's agent?
     ///
     /// The daemon emits events of its own through the same pipeline real hook
     /// events take: [`EventType::ShellBusy`]/[`EventType::ShellIdle`] from the
     /// shell-activity monitor (PRD #370/#386), the delivery-notice
-    /// [`EventType::Error`] (issue #424), and the card-surfacing `SessionStart`
-    /// (issue #684, [`CARD_SURFACE_SESSION_START_ORIGIN`]).
+    /// [`EventType::Error`] (issue #424), the card-surfacing `SessionStart`
+    /// (issue #684, [`CARD_SURFACE_SESSION_START_ORIGIN`]), and the Codex
+    /// rollout tailer's [`EventType::QuotaBlocked`] (issue #714), marked with
+    /// [`crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY`], which the hook
+    /// loop strips from every producer frame, and the `Idle` that lifts a
+    /// replaced agent's block after a pane restart
+    /// ([`Self::is_quota_block_lift`]). A producer's own `QuotaBlocked` (Claude
+    /// Code, OpenCode) is the agent reporting, and is not synthetic.
     ///
     /// The first two carry the pane's registry `agent_id` because that is how
     /// they land on the right card — the card-surfacing start is the exception and
@@ -945,7 +1199,14 @@ impl AgentEvent {
     pub fn is_daemon_synthetic(&self) -> bool {
         matches!(self.event_type, EventType::ShellBusy | EventType::ShellIdle)
             || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
+            || self
+                .metadata
+                .contains_key(crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY)
+            || self
+                .metadata
+                .contains_key(crate::quota_block::QUOTA_BLOCKED_LIFTED_METADATA_KEY)
             || self.is_card_surface_session_start()
+            || self.is_daemon_pane_closed()
     }
 }
 
@@ -1443,7 +1704,7 @@ pub struct KnownProject {
 pub struct ResolvedProject {
     /// The daemon-canonical path this resolved to, which may differ from the
     /// spelling the caller sent (an alias or a symlink resolves elsewhere).
-    /// This is the string a later `PrepareWorkflow` and `StartAgent` must use.
+    /// This is the string a later `PrepareOrchestration` and `StartAgent` must use.
     pub path: String,
     #[serde(default)]
     pub orchestrations: Vec<ProjectOrchestration>,
@@ -1451,7 +1712,7 @@ pub struct ResolvedProject {
     /// resolution was computed from.
     ///
     /// The client echoes it back on
-    /// [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`], and a
+    /// [`crate::daemon_protocol::AttachRequest::PrepareOrchestration`], and a
     /// mismatch is refused — which is what closes the window between the
     /// picker's resolve and the launch's write. Derived from the config
     /// **content** as read (see
@@ -1485,7 +1746,7 @@ pub struct ProjectOrchestration {
 /// One role of a [`ProjectOrchestration`].
 ///
 /// `name` and `start` are the complete set the desktop reads
-/// (`order_workflow_roles` in `desktop/src-tauri/src/lib.rs`). The rest of
+/// (`order_orchestration_roles` in `desktop/src-tauri/src/lib.rs`). The rest of
 /// `OrchestrationRoleConfig` — `command`, `description`, `prompt_template`,
 /// `agent`, `clear` — is consumed only inside
 /// [`crate::orchestrator_context::prepare_orchestrator_prompt`], which moves
@@ -1499,10 +1760,14 @@ pub struct ProjectRole {
     pub start: bool,
 }
 
-/// PRD #819 M2: the daemon's reply to [`crate::daemon_protocol::AttachRequest::PrepareWorkflow`].
+/// PRD #819 M2: the daemon's reply to
+/// [`crate::daemon_protocol::AttachRequest::PrepareOrchestration`] (and to its
+/// legacy spelling, `PrepareWorkflow` — the struct is the same for both; only
+/// the response field it rides on differs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PreparedWorkflow {
-    /// Where the coordinator context was published, daemon-side.
+pub struct PreparedOrchestration {
+    /// Where the orchestrator context was published, daemon-side. Since issue
+    /// #1233 a file of this preparation's own, never rewritten by a later one.
     pub context_path: String,
     /// PRD #819 M6: the daemon-**canonical** project directory this preparation
     /// resolved to — the same string [`ResolvedProject::path`] carries, restated
@@ -1539,16 +1804,21 @@ pub struct PreparedWorkflow {
     pub token: String,
     #[serde(default)]
     pub roles: Vec<ProjectRole>,
-    /// PRD #819 M6: the one-liner to inject into the coordinator's PTY, as
+    /// PRD #819 M6: the one-liner to inject into the orchestrator's PTY, as
     /// composed by
     /// [`crate::orchestrator_context::prepare_orchestrator_context`].
     ///
     /// It is here because the client that spawns the roles has to deliver it and
-    /// **may not compose it itself**: the line names
-    /// `.dot-agent-deck/orchestrator-context.md`, which is project-state
-    /// knowledge this PRD moves daemon-side, and it varies with whether the
-    /// preparation carried a task. A client that built its own copy would be
-    /// holding a second, driftable spelling of a file only the daemon wrote.
+    /// **may not compose it itself**: the line names the context file this
+    /// preparation published, which is project-state knowledge this PRD moves
+    /// daemon-side, and it varies with whether the preparation carried a task.
+    /// Since issue #1233 that file is unique to the preparation
+    /// (`.dot-agent-deck/orchestrator-context-<32 hex>.md`, the file
+    /// [`Self::context_path`] names); an older daemon names the fixed
+    /// `.dot-agent-deck/orchestrator-context.md`. A client that built its own
+    /// copy would be holding a second, driftable spelling of a file only the
+    /// daemon wrote — and, against a current daemon, would point the coordinator
+    /// at the shared compatibility mirror rather than at its own brief.
     ///
     /// Additive on a response type, exactly like
     /// [`ResolvedProject::config_revision`]: `#[serde(default)]`, so an older
@@ -1618,8 +1888,78 @@ pub struct DelegateResponse {
     #[serde(default)]
     pub unresolved_roles: Vec<String>,
     /// Set when the delegate could not be routed at all.
+    ///
+    /// Issue #580: also set when EVERY resolved role was refused as
+    /// [`Self::busy`] and nothing was dispatched, carrying the same explanation
+    /// the CLI prints. That is what makes the refusal loud on a CLI that predates
+    /// `busy`: it reads `error`, and without it would see an empty `delivered`,
+    /// an empty `unresolved_roles` and no error — a clean success.
     #[serde(default)]
     pub error: Option<String>,
+    /// Issue #580: roles NOT dispatched because their worker still owes a
+    /// `work-done` for an earlier delegation, and the caller did not pass
+    /// `--supersede`. The daemon reads that from its commission ledger, not from
+    /// the worker's status. A role listed here is absent from `delivered`.
+    ///
+    /// Additive on the hook socket, like every field of this reply: an older
+    /// daemon never writes it, and an older CLI ignores it. The behaviour behind
+    /// it is not additive — a delegate that used to be dispatched is now refused —
+    /// which is `changelog.d/580.breaking.md`.
+    #[serde(default)]
+    pub busy: Vec<BusyWorker>,
+    /// Issue #580: roles that WERE dispatched while their worker still owed a
+    /// `work-done` — the supersession, reported instead of silent. Either the
+    /// caller passed `--supersede`, or what was owed had been delegated by an
+    /// orchestrator agent since replaced in its pane, which the successor is
+    /// not refused over. A role listed here is also in `delivered`.
+    #[serde(default)]
+    pub superseded: Vec<BusyWorker>,
+    /// Issue #714: resolved roles whose worker's card reads `Blocked` — its
+    /// agent reported a provider usage-limit or credit error — whether the role
+    /// was delivered or refused as [`Self::busy`]. A warning, never a refusal:
+    /// the status is reported by the agent's own hooks or session log, which —
+    /// like every hook-reported status — is not an input this daemon may
+    /// authorize on (#601, #696), and a windowed limit may already have reset.
+    ///
+    /// Carries fixed data only — role, kind, age, reset — and never the text,
+    /// which is agent-controlled and would land in the orchestrator's tool
+    /// output. Additive on the hook socket like every field of this reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked: Vec<BlockedWorker>,
+}
+
+/// Issue #714: one delegate target whose worker appears blocked by a provider
+/// usage limit. See [`DelegateResponse::blocked`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedWorker {
+    /// The `--to` role the worker pane is registered for.
+    pub role: String,
+    /// Which limit the agent reported.
+    pub kind: crate::quota_block::BlockedKind,
+    /// Whole seconds since the agent reported the block.
+    #[serde(default)]
+    pub blocked_for_secs: u64,
+    /// Whole seconds until the provider said the limit resets, when it said
+    /// and that moment is still ahead. Additive optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_in_secs: Option<u64>,
+}
+
+/// Issue #580: one worker that still owed a `work-done` when a delegate named
+/// it. See [`DelegateResponse::busy`] and [`DelegateResponse::superseded`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusyWorker {
+    /// The `--to` role the worker pane is registered for.
+    pub role: String,
+    /// Delegations to this worker that no `work-done` had been credited to,
+    /// before this delegate.
+    #[serde(default)]
+    pub outstanding: u32,
+    /// Age, in whole seconds, of the oldest of those delegations the daemon
+    /// still tracks individually. Each expires on its own a fixed time after it
+    /// was issued (issue #590), so this also says how long the refusal can last.
+    #[serde(default)]
+    pub oldest_age_secs: u64,
 }
 
 /// The value [`DelegateResponse::kind`] carries on every reply this daemon
@@ -1635,6 +1975,9 @@ impl Default for DelegateResponse {
             delivered: Vec::new(),
             unresolved_roles: Vec::new(),
             error: None,
+            busy: Vec::new(),
+            superseded: Vec::new(),
+            blocked: Vec::new(),
         }
     }
 }
@@ -1671,6 +2014,15 @@ pub struct DelegateSignal {
     /// `changelog.d/1077.breaking.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Issue #580: dispatch even to a worker that still owes a `work-done` for
+    /// an earlier delegation (`delegate --supersede`). Without it the daemon
+    /// refuses that worker and reports it in [`DelegateResponse::busy`].
+    ///
+    /// Skipped when false, so a plain delegate serializes exactly as it did
+    /// before this field existed. An older daemon ignores the key — and delivers
+    /// regardless, which is what `--supersede` asks for anyway.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supersede: bool,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -2389,6 +2741,7 @@ mod tests {
             pane_id: "pane-1".into(),
             task: "Implement login".into(),
             to: vec!["coder".into()],
+            supersede: false,
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -2759,6 +3112,7 @@ mod tests {
                 pane_id: "p".into(),
                 task: "t".into(),
                 to: vec!["worker".into()],
+                supersede: false,
                 timestamp: ts,
                 token: None,
             }),

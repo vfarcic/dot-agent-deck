@@ -528,7 +528,33 @@ mod tests {
         /// Connections already sitting in the accept queue. Held so they are
         /// not closed, and so the queue stays full for the whole test.
         _queued: Vec<UnixStream>,
+        /// The receivers of filling connects that were slow to answer but
+        /// turned out not to be parked (issue #1137). Held so a connect that
+        /// completes late still has somewhere to deliver its stream, instead of
+        /// the send failing and the stream closing — which would drop a queued
+        /// connection and could leave the queue short of full.
+        _late: Vec<mpsc::Receiver<io::Result<UnixStream>>>,
         behaviour: QueueFull,
+    }
+
+    /// One non-blocking `connect(2)` to `path`, the probe
+    /// [`SaturatedListener::new`] uses to tell a full queue from a slow thread.
+    ///
+    /// A non-blocking socket never parks: against a full queue Linux answers
+    /// `EAGAIN` (`WouldBlock`) and the BSDs `ECONNREFUSED`, and against a queue
+    /// with room the connect completes on the spot, because an `AF_UNIX`
+    /// connect has no handshake to wait for.
+    fn nonblocking_connect(path: &std::path::Path) -> io::Result<UnixStream> {
+        let stream = cloexec_stream_socket()?;
+        stream.set_nonblocking(true)?;
+        let (addr, len) = sockaddr_un(path)?;
+        // SAFETY: `addr`/`len` describe a well-formed `sockaddr_un` that
+        // outlives the call, and the fd is the socket `stream` owns.
+        let rc = unsafe { libc::connect(stream.as_raw_fd(), std::ptr::addr_of!(addr).cast(), len) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(stream)
     }
 
     impl SaturatedListener {
@@ -562,7 +588,16 @@ mod tests {
             // its own thread because on Linux the one that finds the queue full
             // parks: that parked connect is the bug under test, and it stays
             // parked until the process exits, which is harmless.
+            //
+            // Silence alone is NOT read as "full" (issue #1137): a filling
+            // thread starved for longer than the wait against a queue that
+            // still had room would otherwise be classified `Parks`, leaving a
+            // listener that is not saturated and a connect under test that
+            // simply succeeds. So a timeout is confirmed with a non-blocking
+            // probe, which cannot park, and filling resumes if the probe gets
+            // in.
             let mut queued = Vec::new();
+            let mut late = Vec::new();
             for _ in 0..64 {
                 let probe = path.clone();
                 let (tx, rx) = mpsc::channel();
@@ -575,13 +610,27 @@ mod tests {
                         continue;
                     }
                     Ok(Err(_)) => QueueFull::Refuses,
-                    Err(_) => QueueFull::Parks,
+                    Err(_) => match nonblocking_connect(&path) {
+                        Ok(stream) => {
+                            // The queue had room, so the silence was a slow
+                            // thread rather than a parked connect.
+                            queued.push(stream);
+                            late.push(rx);
+                            continue;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => QueueFull::Parks,
+                        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                            QueueFull::Refuses
+                        }
+                        Err(e) => panic!("probe connect to the filling listener: {e}"),
+                    },
                 };
                 return Self {
                     _dir: dir,
                     path,
                     listener,
                     _queued: queued,
+                    _late: late,
                     behaviour,
                 };
             }
@@ -708,6 +757,27 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "the successful connect must land inside the budget, took {elapsed:?}"
         );
+    }
+
+    /// Issue #1137: the probe that confirms a saturated queue must tell the two
+    /// states apart — it gets in while the queue has room, and it reports the
+    /// platform's queue-full answer once it has none. If it could not, the
+    /// fill loop would either stop early (the bug) or never stop.
+    #[test]
+    fn the_saturation_probe_tells_a_full_queue_from_one_with_room() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("roomy.sock");
+        let _roomy = UnixListener::bind(&path).expect("bind a listener with room");
+        nonblocking_connect(&path).expect("a queue with room must admit the probe");
+
+        let saturated = SaturatedListener::new();
+        let err = nonblocking_connect(&saturated.path)
+            .expect_err("a full queue must not admit the probe");
+        let expected = match saturated.behaviour {
+            QueueFull::Parks => io::ErrorKind::WouldBlock,
+            QueueFull::Refuses => io::ErrorKind::ConnectionRefused,
+        };
+        assert_eq!(err.kind(), expected, "{err:?}");
     }
 
     /// The retry loop must not swallow a FINAL answer. A socket inode with no

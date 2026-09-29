@@ -102,7 +102,7 @@ pub const DESKTOP_BOUNDARY_RULE: &str = "client-side project resolution in the d
      against a filesystem (PRD #819). This is a regression TRIPWIRE, not enforcement and not a \
      security boundary: the desktop path-depends on the whole root crate, so a wrapper with an \
      innocuous name bypasses it. Ask the daemon (list-projects / resolve-project / \
-     prepare-workflow) instead of reading the project here";
+     prepare-orchestration) instead of reading the project here";
 
 /// The **positive** boundary: root-crate modules the production desktop may
 /// reach across.
@@ -114,13 +114,67 @@ pub const DESKTOP_BOUNDARY_RULE: &str = "client-side project resolution in the d
 const ALLOWED_ROOT_MODULES: &[&str] = &[
     "agent_pty",
     "agent_registry",
+    // PRD #1223 M7, argued rather than added quietly. The desktop names ONE
+    // item here, `AuthoringKind` — the closed wire enum `StartAgent`'s
+    // `authoring_kind` carries — because `DaemonClient::start_authoring_agent`
+    // takes it, and because decoding the webview's kind straight into it is
+    // what makes an unknown kind a decode error rather than a plain start with
+    // no seed. A desktop-side copy of the enum would be a second list to keep
+    // in step with the daemon's.
+    //
+    // The module's seed text and `compose_*_seed` functions are NOT something
+    // the desktop calls: the daemon composes and delivers the seed (PRD #1223's
+    // "the seeds move to the daemon"), so a desktop call to them would be the
+    // drift #1043 describes even though it crosses none of this rule's lines.
+    // Checked against those lines: the module resolves no project, reads no
+    // file at all, names no FORBIDDEN_SYMBOL or project-state literal, and
+    // contains no `std::env::current_dir` — all zero for it.
+    "authoring_seeds",
     "build_id",
     "config",
     "daemon_attach",
     "daemon_client",
     "daemon_protocol",
     "daemon_stop",
+    // Issue #1350, argued rather than added quietly. `deck_list` reads and
+    // edits `remotes.toml`, the user's list of WHICH daemons to connect to —
+    // the CLI's `connect` registry, which the desktop now shares as its deck
+    // list. That list is the client's by definition: it names the daemons, so
+    // no daemon can be asked for it, and a daemon holding it would have to be
+    // reached before the client knew where it was. It is not a project either:
+    // the file is a per-user config file resolved from the user's config
+    // directory (or `DOT_AGENT_DECK_REMOTES`), never from a project directory.
+    //
+    // CLAUDE.md rule 18 and #1350 put the format in ONE library in the root
+    // crate so the two clients cannot drift; a desktop-side copy of it would be
+    // the second list this rule's neighbours exist to prevent. Checked against
+    // this rule's lines: the module resolves no project, reads no project state
+    // file, names no FORBIDDEN_SYMBOL or project-state literal, and contains no
+    // `std::env::current_dir` — all zero for it.
+    "deck_list",
     "event",
+    // Issue #1198, argued rather than added quietly. The desktop names two
+    // things here: the five `show_desktop_*` wrappers, one per surface the
+    // app hides behind the `experimental` flag (CLAUDE.md rule 9 puts every
+    // gate behind a wrapper in this module, so a desktop-side copy of the
+    // flag read would be the second list the rule exists to prevent), and
+    // `init_from_process_env`, which resolves the flag for this process.
+    //
+    // That entry point is the one the desktop may call, and it crosses none
+    // of this rule's lines: it reads `DOT_AGENT_DECK_EXPERIMENTAL` and the
+    // file `DOT_AGENT_DECK_FEATURES_CONFIG` names outright, takes no project
+    // directory, walks nowhere and never calls `std::env::current_dir`.
+    //
+    // The module ITSELF is not that clean, and saying so is the point of
+    // arguing the entry: `init_and_watch` — the TUI's and the daemon's entry
+    // point — resolves the flag against a project directory its caller walked
+    // to, and a desktop call to it would be the client-side project read PRD
+    // #819 removed. The first commit that wired the desktop did exactly that
+    // (with a `current_dir` walk, which the `cwd-fallback` finding caught).
+    // With this entry allowlisted, a desktop call to `init_and_watch` is the
+    // "root-crate wrapper with an innocuous name" residual this file's header
+    // already admits: nothing here would catch it.
+    "features",
     "platform",
     "prompt_delivery",
     // PRD #741 M6, argued rather than added quietly. The desktop's settings
@@ -266,9 +320,10 @@ impl Finding {
 /// and `prepare_orchestrator_prompt` calls behind them, the
 /// `.dot-agent-deck.toml` and `orchestrator-context.md` literals they spelled,
 /// and `desktop_project_cwd()`'s `std::env::current_dir` guess. M6 replaced the
-/// pair with the daemon's `prepare-workflow` verb and deleted the function, so
-/// every one of them matched nothing and the forcing function below took the
-/// check red until they went with it — which is exactly what it is for.
+/// pair with the daemon's `prepare-workflow` verb (since #1045
+/// `prepare-orchestration`) and deleted the function, so every one of them
+/// matched nothing and the forcing function below took the check red until they
+/// went with it — which is exactly what it is for.
 ///
 /// **Keep it empty.** A new entry is a new client-side project read being
 /// excused rather than fixed, and the excuse outlives whoever wrote it. If a
@@ -557,7 +612,7 @@ impl<'ast> Visit<'ast> for Scan {
     fn visit_attribute(&mut self, _node: &'ast syn::Attribute) {}
 }
 
-fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {
+pub(crate) fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {
     Some(match item {
         syn::Item::Const(i) => &i.attrs,
         syn::Item::Enum(i) => &i.attrs,
@@ -578,7 +633,7 @@ fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {
     })
 }
 
-fn impl_item_attrs(item: &syn::ImplItem) -> Option<&[syn::Attribute]> {
+pub(crate) fn impl_item_attrs(item: &syn::ImplItem) -> Option<&[syn::Attribute]> {
     Some(match item {
         syn::ImplItem::Const(i) => &i.attrs,
         syn::ImplItem::Fn(i) => &i.attrs,
@@ -602,7 +657,7 @@ fn impl_item_attrs(item: &syn::ImplItem) -> Option<&[syn::Attribute]> {
 /// PRODUCTION block as test-only and silently dropped it from the scan — the
 /// exact fail-open direction this module's docs promise to avoid. Only a bare
 /// `test` **path** counts now; a string literal's contents never do.
-fn cfg_selects_test_only(attrs: &[syn::Attribute]) -> bool {
+pub(crate) fn cfg_selects_test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         if !attr.path().is_ident("cfg") {
             return false;

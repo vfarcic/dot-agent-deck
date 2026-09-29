@@ -118,25 +118,41 @@ pub static GENERIC: RuleSet = RuleSet {
     idle_markers: &[],
 };
 
-/// PRD #20 M7 — the Codex (`codex exec --json`) rule set.
+/// The Codex rule set: every non-blank line is activity, and nothing else.
 ///
-/// Codex emits one compact JSON object per line on stdout (JSONL). Rather than
-/// wait for process-exit quiescence like the generic set, we key card state off
-/// the record's `type` discriminator: a `turn.completed` record ends the turn
-/// (Idle) while the process is still alive, an `error` record is a failure, and
-/// every other record (`turn.started`, `item.started` reasoning /
-/// `command_execution`, …) is active work via the generic non-blank fallback.
-/// Markers match the compact `"type":"…"` discriminator specifically so
-/// incidental occurrences of the word "error" inside reasoning/command text
-/// never flip the card. Selected by [`ruleset_for`] when the resolved agent is
-/// [`AgentType::Codex`]; no change to [`classify_line_with`] or the runtime.
+/// **It deliberately recognises no error and no idle line, and that is the
+/// whole of its content** (issue #540). What the wrapper spawns for Codex is
+/// the interactive `codex` TUI ([`wrap_launch_command`]), and that process
+/// paints ANSI redraws: issue #540's direct PTY captures of a 12 s idle boot and
+/// of a full submit-and-respond turn contained no `"type":…` JSON record at all. This set
+/// used to match the `"type":"error"` / `"type":"turn.completed"` markers of
+/// `codex exec --json` — a mode the deck never selects itself — so it read as a
+/// working classification path while matching nothing the pane's process ever
+/// printed, and every line fell through to `Working` exactly as it does now.
+///
+/// It is still its own set rather than [`GENERIC`], because [`GENERIC`]'s word
+/// markers would be WRONG here: the TUI redraws the conversation, so a reply or
+/// a command that merely mentions "error" would flip a working Codex card to
+/// `Error`. What a wrapped Codex card shows beyond "printed something" comes
+/// from elsewhere — tool, prompt, turn-end and error detail from Codex's native
+/// hooks (`crate::codex_hooks_manage`), a quota block from its rollout log
+/// (`crate::codex_rollout_tail`), and `Idle`/`Error` at process exit from this
+/// wrapper's reap loop. Matching the TUI's rendered text instead was rejected:
+/// it is fragile against reflow and redraw, and every such line would still
+/// only ever prove output, which is why the events it produces are marked
+/// (`crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`) and prove nothing
+/// about a submitted prompt (issue #559).
+///
+/// A user who configures `codex exec --json` as a pane command gets the same
+/// rules: its `turn.completed` / `error` records read as activity, and the card
+/// settles when the process exits, which for `exec` follows its final record.
 pub static CODEX: RuleSet = RuleSet {
-    error_markers: &["\"type\":\"error\""],
-    idle_markers: &["\"type\":\"turn.completed\""],
+    error_markers: &[],
+    idle_markers: &[],
 };
 
 /// Select the line-classification [`RuleSet`] for a resolved agent type. Codex
-/// gets its JSONL-aware [`CODEX`] rules; every other (or unknown) agent falls
+/// gets its activity-only [`CODEX`] rules; every other (or unknown) agent falls
 /// back to the agent-agnostic [`GENERIC`] rules. This is the M7 seam that keeps
 /// per-agent patterns as data — a new agent adds a `RuleSet` and an arm here,
 /// not new runtime control flow.
@@ -207,11 +223,10 @@ impl Detector {
         self.observe_detected(classify_line_with(line, self.rules))
     }
 
-    /// Debounce an already-classified event. The JSON-aware Codex path
-    /// ([`classify_codex_line`]) classifies the line itself and feeds the
-    /// result here so it shares the same one-event-per-state-change debouncing
-    /// as the generic substring path. `None` (blank / unclassifiable line)
-    /// never changes state.
+    /// Debounce an already-classified event, so a caller that classifies a line
+    /// itself shares the same one-event-per-state-change debouncing as
+    /// [`Self::observe`]. `None` (blank / unclassifiable line) never changes
+    /// state.
     pub fn observe_detected(&mut self, detected: Option<DetectedEvent>) -> Option<DetectedEvent> {
         let detected = detected?;
         if self.last == Some(detected) {
@@ -221,33 +236,6 @@ impl Detector {
             Some(detected)
         }
     }
-}
-
-/// PRD #20 finding #11: classify one line of Codex output. Codex emits JSONL
-/// (`codex exec --json` writes one compact JSON object per line) and the
-/// interactive `codex` TUI mixes JSON events with plain redraw text. Parse the
-/// top-level `type` discriminator with `serde_json` (robust to insignificant
-/// whitespace and field reordering, unlike a raw substring match), mapping:
-/// `turn.completed` → `Idle`, `turn.failed` / `error` → `Error`, and every
-/// other record (`turn.started`, `item.started` reasoning / command execution,
-/// …) → `Working`. A non-JSON line (the interactive channel's plain text)
-/// falls back to the substring [`CODEX`] rules, so bare `codex` still surfaces
-/// activity instead of staying stuck until process exit.
-pub fn classify_codex_line(line: &str) -> Option<DetectedEvent> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
-        && let Some(kind) = value.get("type").and_then(|t| t.as_str())
-    {
-        return Some(match kind {
-            "turn.completed" | "task.completed" => DetectedEvent::Idle,
-            "turn.failed" | "task.failed" | "error" => DetectedEvent::Error,
-            _ => DetectedEvent::Working,
-        });
-    }
-    classify_line_with(trimmed, &CODEX)
 }
 
 impl Default for Detector {
@@ -272,6 +260,12 @@ struct Emitter {
     /// — the session is `history-only`. Stamped on the card so a wrapped Codex
     /// pane renders view-only and refuses live input (M4).
     live_target: LiveTarget,
+    /// Issue #559: stamp
+    /// [`crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`] on every
+    /// event, because this wrapper could not get the hooks that would report a
+    /// submitted prompt trusted for the agent it hosts. Decided once, before the first emit, by
+    /// [`codex_spawn_prep`]; see [`CodexSpawnPrep::prompt_reports_unavailable`].
+    prompt_reports_unavailable: bool,
 }
 
 impl Emitter {
@@ -357,7 +351,20 @@ impl Emitter {
     /// Issue #243 audit F3: build the [`AgentEvent`] without sending it, so a
     /// caller that must not block on the daemon can do the (cheap, pure) build on
     /// its own thread and hand only the serialized line to a sender.
-    fn build_event(&self, event_type: EventType, metadata: HashMap<String, String>) -> AgentEvent {
+    fn build_event(
+        &self,
+        event_type: EventType,
+        mut metadata: HashMap<String, String>,
+    ) -> AgentEvent {
+        // Issue #559: here, the one funnel every emit shares, so no event this
+        // wrapper sends — the fork-time start included, which is what surfaces
+        // the card before anything else — can reach the deck without it.
+        if self.prompt_reports_unavailable {
+            metadata.insert(
+                crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE.to_string(),
+            );
+        }
         AgentEvent {
             session_id: self.session_id.clone(),
             agent_type: self.agent_type.clone(),
@@ -468,16 +475,17 @@ fn tee<R: Read, W: Write>(mut reader: R, mut writer: W, mut on_line: impl FnMut(
 /// type) are returned unchanged.
 pub fn wrap_launch_command(command: &str, agent_type: &AgentType) -> String {
     let spec = crate::agent_registry::spec(agent_type);
-    if spec.strategy != Some(crate::agent_registry::IntegrationStrategy::Wrapper)
-        || is_wrap_invocation(command)
-    {
+    if spec.strategy != Some(crate::agent_registry::IntegrationStrategy::Wrapper) {
+        return command.to_string();
+    }
+    let deck = deck_binary_for_wrap();
+    if is_wrap_invocation(command, &deck) {
         return command.to_string();
     }
     // Prefer the registry detection basename (the stable `--agent` alias the
     // wrapper resolves back through `detect_from_basename`); fall back to the
     // label only if an entry somehow ships without one.
     let name = spec.detect_basenames.first().copied().unwrap_or(spec.label);
-    let deck = deck_binary_for_wrap();
     format!("{deck} wrap --agent {name} -- {command}")
 }
 
@@ -505,24 +513,7 @@ pub const DOT_AGENT_DECK_WRAP_BIN: &str = "DOT_AGENT_DECK_WRAP_BIN";
 ///
 /// Same rationale (and the same fix) as [`crate::daemon_attach`] locating the
 /// daemon via `current_exe` rather than `$PATH`.
-///
-/// Falls back to the bare name when the resolved path is unusable, so behaviour
-/// only ever improves on what `$PATH` would have found:
-/// - a test-harness executable — those live in `target/<profile>/deps/`, so a
-///   sibling `dot-agent-deck` one level up is preferred when present, which is
-///   what lets in-process tests drive the build they just compiled;
-/// - a path that no longer exists: Linux reports a replaced binary as
-///   `<path> (deleted)`, routine while rebuilding during development;
-/// - a path containing whitespace, which the shell would re-split (nothing
-///   quotes this command string).
 fn deck_binary_for_wrap() -> String {
-    const BARE: &str = "dot-agent-deck";
-    fn usable(path: &std::path::Path) -> Option<String> {
-        let text = path.to_str()?;
-        (path.file_name()? == BARE && !text.chars().any(char::is_whitespace) && path.is_file())
-            .then(|| text.to_string())
-    }
-
     // Explicit override, consulted first. Resolving the co-located build is what
     // makes the suite honest, but it also takes away the one seam a test had for
     // observing the rewrite: planting a fake `dot-agent-deck` on `$PATH`. This is
@@ -534,40 +525,150 @@ fn deck_binary_for_wrap() -> String {
     {
         return explicit;
     }
+    resolve_deck_binary_for_wrap(std::env::current_exe())
+}
 
-    let Ok(exe) = std::env::current_exe() else {
-        return BARE.to_string();
+/// Pure seam behind [`deck_binary_for_wrap`], with `current_exe()` injected so a
+/// build under a non-default file name is testable without renaming the test
+/// binary.
+///
+/// Issue #533: this used to gate the running executable on its file name being
+/// the literal `dot-agent-deck`. That rejected a renamed build's OWN executable
+/// (a release asset run as downloaded, `dot-agent-deck-linux-amd64`; any
+/// `dot-agent-deck.exe` on Windows), which then fell through to a co-located
+/// `dot-agent-deck` — a different build — or to a bare name `$PATH` resolves.
+/// The executable is now taken by whatever name it has, the way
+/// [`crate::platform::paths::binary_name`] takes it.
+///
+/// The name check was standing in for "is this process the deck binary", and
+/// in production it always is: the callers of [`wrap_launch_command`] are the
+/// daemon's spawn seam (`agent_pty`) and the TUI (`ui`), both subcommands of
+/// the one `dot-agent-deck` binary. The process that is NOT the deck is a cargo
+/// test harness, and that is now recognised by cargo's own signature for one:
+/// it lives in a `deps` directory (`target/<profile>/deps/`) AND its file stem
+/// ends in cargo's `-<16 hex digits>` metadata hash (`dot_agent_deck-3f…`).
+/// Both are required, so a real deck that merely sits in a directory called
+/// `deps` still names itself.
+///
+/// Falls back when the running executable is unusable, so behaviour only ever
+/// improves on what `$PATH` would have found:
+/// - a test-harness executable — those live in `target/<profile>/deps/`, so a
+///   sibling `dot-agent-deck` one level up is preferred when present, which is
+///   what lets in-process tests drive the build they just compiled;
+/// - a path that no longer exists: Linux reports a replaced binary as
+///   `<path> (deleted)`, routine while rebuilding during development;
+/// - a path the shell would not read back as the same file — nothing quotes
+///   this command string, so it is rejected rather than quoted, the posture
+///   [`crate::platform::paths::binary_name`] takes for the same reason. The
+///   file name must pass `is_safe_binary_name` (ASCII alphanumerics plus
+///   `-_.+`, no leading `-`), and every character of the path must be in
+///   [`is_shell_inert_path_char`]'s allowlist, which excludes whitespace,
+///   quotes, `$`, backticks, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `*`, `?`,
+///   `[`, `#`, `!`, and `~` except in a Windows path. Before issue #533 the file name was pinned to
+///   `dot-agent-deck` and only whitespace was checked; accepting a renamed
+///   build's own file name is what made the allowlist necessary.
+///
+/// The sibling looked for is the package's own file name
+/// ([`crate::platform::paths::durable_binary_file_name`], `.exe` on Windows),
+/// because that is what cargo names the bin target it builds next to its tests.
+fn resolve_deck_binary_for_wrap(current_exe: std::io::Result<std::path::PathBuf>) -> String {
+    use crate::platform::paths::{DEFAULT_BINARY_NAME, durable_binary_file_name};
+    fn usable(path: &std::path::Path) -> Option<String> {
+        let text = path.to_str()?;
+        let name = path.file_name()?.to_str()?;
+        (crate::platform::paths::is_safe_binary_name(name)
+            && text
+                .chars()
+                .all(|c| is_shell_inert_path_char(c, cfg!(windows)))
+            && path.is_file())
+        .then(|| text.to_string())
+    }
+    fn in_deps_dir(dir: &std::path::Path) -> bool {
+        dir.file_name() == Some(std::ffi::OsStr::new("deps"))
+    }
+    fn has_cargo_hash_suffix(exe: &std::path::Path) -> bool {
+        exe.file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.rsplit_once('-'))
+            .is_some_and(|(_, hash)| {
+                hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+    }
+
+    let Ok(exe) = current_exe else {
+        return DEFAULT_BINARY_NAME.to_string();
     };
-    if let Some(found) = usable(&exe) {
+    let Some(dir) = exe.parent() else {
+        return DEFAULT_BINARY_NAME.to_string();
+    };
+    let is_test_harness = in_deps_dir(dir) && has_cargo_hash_suffix(&exe);
+    if !is_test_harness && let Some(found) = usable(&exe) {
         return found;
     }
-    let Some(dir) = exe.parent() else {
-        return BARE.to_string();
-    };
-    usable(&dir.join(BARE))
+    let sibling = durable_binary_file_name();
+    usable(&dir.join(&sibling))
         .or_else(|| {
-            (dir.file_name() == Some(std::ffi::OsStr::new("deps")))
-                .then(|| dir.parent().map(|up| up.join(BARE)))
+            in_deps_dir(dir)
+                .then(|| dir.parent().map(|up| up.join(&sibling)))
                 .flatten()
                 .as_deref()
                 .and_then(usable)
         })
-        .unwrap_or_else(|| BARE.to_string())
+        .unwrap_or_else(|| DEFAULT_BINARY_NAME.to_string())
 }
 
-/// Whether `command` is already a `dot-agent-deck wrap …` invocation — the
-/// idempotency guard for [`wrap_launch_command`]. Tolerant of a leading path on
-/// the binary (`/usr/local/bin/dot-agent-deck wrap …`).
-fn is_wrap_invocation(command: &str) -> bool {
+/// Whether `c` can appear UNQUOTED in the wrapper's command word and still be
+/// read back by the spawning shell as itself: ASCII alphanumerics plus
+/// `/ . _ - + = : @ % ,` — the set `platform::paths::shell_quote_if_needed`
+/// leaves unquoted — and, only when `windows_host`, the `\` separator, which a
+/// POSIX shell would instead consume as an escape, and `~`, which every 8.3
+/// short name carries (`C:\Users\RUNNER~1\…`, the GitHub runner's own temp
+/// directory) and which a POSIX shell could tilde-expand at the start of a
+/// relative path. A parameter rather than a `#[cfg]` so both dialects are
+/// unit-testable from any host.
+fn is_shell_inert_path_char(c: char, windows_host: bool) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '/' | '.' | '_' | '-' | '+' | '=' | ':' | '@' | '%' | ',')
+        || (windows_host && matches!(c, '\\' | '~'))
+}
+
+/// Whether `command` is already a `wrap` invocation of a deck — the idempotency
+/// guard for [`wrap_launch_command`]. `deck` is the program the rewrite would
+/// name ([`deck_binary_for_wrap`]'s result). Tolerant of a leading path on the
+/// binary (`/usr/local/bin/dot-agent-deck wrap …`).
+///
+/// Issue #533: the program's file name used to be compared against the literal
+/// `dot-agent-deck` only. That held while [`deck_binary_for_wrap`] could name
+/// nothing else; now that a renamed build names itself, a literal-only guard
+/// would miss the invocation the build had itself produced and wrap it a second
+/// time. The file name of `deck` is therefore accepted too, alongside the
+/// package name (with and without the platform's executable suffix), which a
+/// command from a default-named build carries.
+///
+/// This guard can only know the names of the build it runs in, which is why
+/// the TUI's new-pane path no longer pre-wraps a command it hands to the daemon
+/// (`ui.rs`, the `StartAgent` spawn): a renamed TUI's rewrite reaching a daemon
+/// of a different build would not be recognised there. The daemon wraps it
+/// instead, naming its own binary. What remains is a command that already
+/// carries some OTHER renamed build's `wrap` invocation — typed or configured
+/// that way by hand — which is not recognised and gets a second wrapper.
+fn is_wrap_invocation(command: &str, deck: &str) -> bool {
+    use crate::platform::paths::{DEFAULT_BINARY_NAME, durable_binary_file_name};
+    let file_name = |program: &str| -> Option<String> {
+        Some(
+            std::path::Path::new(program)
+                .file_name()?
+                .to_str()?
+                .to_string(),
+        )
+    };
     let mut tokens = command.split_whitespace();
     match (tokens.next(), tokens.next()) {
-        (Some(program), Some(subcommand)) => {
-            std::path::Path::new(program)
-                .file_name()
-                .and_then(|s| s.to_str())
-                == Some("dot-agent-deck")
-                && subcommand == "wrap"
-        }
+        (Some(program), Some("wrap")) => file_name(program).is_some_and(|name| {
+            name == DEFAULT_BINARY_NAME
+                || name == durable_binary_file_name()
+                || file_name(deck).as_deref() == Some(name.as_str())
+        }),
         _ => false,
     }
 }
@@ -713,6 +814,33 @@ struct CodexSpawnPrep {
     /// `CODEX_HOME` to set explicitly on the spawned child's environment (finding
     /// #2). `None` when this invocation installs no Codex hooks / resolves no home.
     pinned_home: Option<std::path::PathBuf>,
+    /// Issue #559: this wrapper hosts a Codex whose native hooks it could not get
+    /// TRUSTED in this spawn, so no submitted-prompt report can be counted on —
+    /// Codex runs none of the deck's hooks until they are trusted, and
+    /// `UserPromptSubmit` is one of them. The wrapper's own
+    /// events cannot stand in: they never carry a prompt. Every event is then
+    /// marked ([`Emitter::prompt_reports_unavailable`]) so the deck stops reading
+    /// "this pane is Codex" as "this pane can confirm a delivery".
+    ///
+    /// `true` for a Codex identity whenever the trust step did not trust the
+    /// deck's own `UserPromptSubmit` hook with the user's toggle on
+    /// ([`crate::codex_hooks_manage::TrustOutcome::reports_prompts`]): the step
+    /// was skipped (no pane and a non-`codex` program), the install produced
+    /// nothing to trust, `codex app-server` could not be run — the ordinary
+    /// `devbox run codex-big` host, where `codex` exists only inside the
+    /// launcher — it recorded nothing, or it recorded only OTHER hooks, or the
+    /// user has switched the prompt hook off in Codex's `/hooks` browser.
+    ///
+    /// **It reports what THIS spawn could establish, and can be wrong in the
+    /// safe direction.** A trust record an earlier `hooks install` wrote from a
+    /// shell that could reach `codex` still makes Codex run the hooks, and this
+    /// spawn cannot see that without the very app-server it failed to reach. The
+    /// cost of that case is a delivery that is written once and not retried —
+    /// the pre-#548 behaviour — rather than one retyped into a pane that took it. `false` for every
+    /// other identity: the wrapper installs nothing for them and so knows
+    /// nothing about their channels, and the deck keeps answering those from
+    /// the type as it always has.
+    prompt_reports_unavailable: bool,
 }
 
 /// PRD #20 W1 spawn wiring. Decides, for this wrap invocation, whether to install
@@ -758,6 +886,7 @@ fn codex_spawn_prep(
     // path it installed with, and that value is what reaches the trust write
     // below (issue #730).
     let mut installed_binary = None;
+    let mut prompt_hook_live = false;
     let pinned_home = if installs_hooks {
         installed_binary = crate::codex_hooks_manage::auto_install();
         crate::codex_hooks_manage::active_codex_home()
@@ -784,22 +913,30 @@ fn codex_spawn_prep(
             // the only thing that would have refuted it was logged below the
             // level anyone runs. One line per Codex spawn, on a path that
             // already writes one when it fails.
-            Ok(outcome) if outcome.trusted() > 0 => tracing::info!(
-                count = outcome.trusted(),
-                "codex: recorded scoped trust for deck hooks"
-            ),
+            Ok(outcome) if outcome.trusted() > 0 => {
+                prompt_hook_live = outcome.reports_prompts();
+                tracing::info!(
+                    count = outcome.trusted(),
+                    prompt_hook_live,
+                    "codex: recorded scoped trust for deck hooks"
+                )
+            }
             Ok(outcome) => tracing::debug!(
                 count = outcome.trusted(),
                 "codex: recorded scoped trust for deck hooks"
             ),
             Err(e) => tracing::warn!(
                 "codex: could not record scoped hook trust ({e}); deck events degrade to stdout \
-                 classification"
+                 classification, and this pane's automatic prompts are written once and not \
+                 retried, since the deck cannot tell whether one arrived"
             ),
         }
     }
 
-    CodexSpawnPrep { pinned_home }
+    CodexSpawnPrep {
+        pinned_home,
+        prompt_reports_unavailable: codex_identity && !prompt_hook_live,
+    }
 }
 
 /// PRD #20 R20-002: the last catchable termination signal delivered to the
@@ -1032,6 +1169,14 @@ fn inject_lifetime_tag(cmd: &mut StdCommand) -> Option<crate::lifetime_tag::Life
 ///
 /// It is itself bounded by deadline + grace and holds no descriptor, so it can
 /// never become the leak it exists to prevent.
+///
+/// **It is forked after `spawn` returns, so there is a window with no reaper.**
+/// The child is already running by then, and a wrapper `SIGKILL`ed before this
+/// fork completes leaves nothing holding the deadline. On the PTY path the
+/// inner master's hangup still ends the child; on the pipe path the child sees
+/// at most an EOF on its stdin, which ends only a child that reads it.
+/// The window is one scheduling gap wide rather than zero, and issue #963 is a
+/// test that used to land its `SIGKILL` inside it under CI load.
 ///
 /// **Telling a reaper apart from the leak it hunts.** It is a `fork` of this
 /// wrapper, so it keeps the wrapper's argv and shows up in `ps` looking like a
@@ -1931,21 +2076,21 @@ impl<W: Write> Write for ActivityWriter<W> {
 /// resulting card event, if the state changed. Shared by every wrap tee (the PTY
 /// master pump and the redirected-descriptor pipe pumps) so one coherent session
 /// state drives the card.
-fn classify_and_emit(
-    line: &str,
-    detector: &Arc<Mutex<Detector>>,
-    emitter: &Emitter,
-    is_codex: bool,
-) {
+fn classify_and_emit(line: &str, detector: &Arc<Mutex<Detector>>, emitter: &Emitter) {
     let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
-    let ev = if is_codex {
-        det.observe_detected(classify_codex_line(line))
-    } else {
-        det.observe(line)
-    };
+    let ev = det.observe(line);
     drop(det);
     if let Some(ev) = ev {
-        emitter.emit(ev.event_type());
+        // Issue #714: marked, because this classifier calls every printed line
+        // `Working` — a provider's quota-error line included — so what it emits
+        // proves output, not work, and must not clear a Blocked card. See
+        // `WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`.
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
+        );
+        emitter.emit_with_metadata(ev.event_type(), metadata);
     }
 }
 
@@ -2030,15 +2175,6 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
         }
     };
 
-    let emitter = Arc::new(Emitter {
-        agent_type,
-        session_id,
-        pane_id,
-        agent_id,
-        cwd,
-        live_target,
-    });
-
     // PRD #20 W1: install the deck's native Codex hooks into the active
     // CODEX_HOME (for a `codex` program OR a deck-spawned Codex-identity launcher)
     // and record SCOPED, hash-pinned trust for exactly those hooks so Codex runs
@@ -2047,8 +2183,22 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     // PRD #20 Greptile finding #2: the returned `pinned_home` is set explicitly
     // on the spawned child so the home the deck installed into and trusted is
     // exactly the home Codex loads.
-    let CodexSpawnPrep { pinned_home } =
-        codex_spawn_prep(program, &emitter.agent_type, emitter.pane_id.as_deref());
+    // Issue #559: before the emitter exists, because its outcome decides what
+    // every event — the first one included — says about prompt reports.
+    let CodexSpawnPrep {
+        pinned_home,
+        prompt_reports_unavailable,
+    } = codex_spawn_prep(program, &agent_type, pane_id.as_deref());
+
+    let emitter = Arc::new(Emitter {
+        agent_type,
+        session_id,
+        pane_id,
+        agent_id,
+        cwd,
+        live_target,
+        prompt_reports_unavailable,
+    });
 
     // R20-012 / finding #11: genuine per-descriptor routing. Detect the
     // tty-or-redirected nature of EACH standard descriptor independently. If any
@@ -2203,7 +2353,9 @@ fn run_wrap_pty(
     // The session has begun — surface the card immediately. PRD #225 M3: this is
     // a CARD-SURFACING signal, not a readiness signal (the child may still be
     // `devbox`/a shell for seconds before the agent TUI exists), so it carries
-    // the wrapper-fork origin marker.
+    // the wrapper-fork origin marker. Keep it AFTER `arm_child_group_backstop`:
+    // `tests/wrap_io.rs`'s stranded-child probe reads it as proof the reaper is
+    // forked before it SIGKILLs this wrapper (issue #963).
     emitter.emit_fork_session_start();
 
     // Raw-mode the outer terminal ONLY when stdin is itself a terminal, so
@@ -2213,9 +2365,8 @@ fn run_wrap_pty(
 
     // One shared detector across every tee so the card reflects a single
     // coherent session state. PRD #20 M7: the rule set is keyed off the resolved
-    // agent type; Codex uses JSON-aware classification, any other command keeps
-    // the generic fallback. Recover from a poisoned mutex instead of panicking.
-    let is_codex = emitter.agent_type == AgentType::Codex;
+    // agent type ([`ruleset_for`]). Recover from a poisoned mutex instead of
+    // panicking.
     let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
         &emitter.agent_type,
     ))));
@@ -2256,7 +2407,7 @@ fn run_wrap_pty(
                     watch,
                 },
                 |line| {
-                    classify_and_emit(line, &detector, &emitter, is_codex);
+                    classify_and_emit(line, &detector, &emitter);
                 },
             );
             output_done.store(true, Ordering::SeqCst);
@@ -2266,26 +2417,10 @@ fn run_wrap_pty(
     };
 
     // Redirected output descriptors: tee each pipe to the matching real fd.
-    let out_pipe_thread = pipe_out.map(|r| {
-        spawn_pipe_tee(
-            r,
-            libc::STDOUT_FILENO,
-            emitter,
-            &detector,
-            is_codex,
-            Some(&interface),
-        )
-    });
-    let err_pipe_thread = pipe_err.map(|r| {
-        spawn_pipe_tee(
-            r,
-            libc::STDERR_FILENO,
-            emitter,
-            &detector,
-            is_codex,
-            Some(&interface),
-        )
-    });
+    let out_pipe_thread = pipe_out
+        .map(|r| spawn_pipe_tee(r, libc::STDOUT_FILENO, emitter, &detector, Some(&interface)));
+    let err_pipe_thread = pipe_err
+        .map(|r| spawn_pipe_tee(r, libc::STDERR_FILENO, emitter, &detector, Some(&interface)));
 
     // Input pump (outer stdin → inner master when stdin is a terminal, else →
     // the child's stdin pipe). Detached: on child exit the main loop returns and
@@ -2504,6 +2639,7 @@ fn run_wrap_pipe(
 
     // PRD #225 M3: same fork-time card-surfacing event as the PTY path, and the
     // same marker — it says "a session exists", not "the agent is ready".
+    // After the arm above for the same reason as there (issue #963).
     emitter.emit_fork_session_start();
 
     let child_stdout = child.stdout.take().expect("piped child stdout");
@@ -2512,27 +2648,12 @@ fn run_wrap_pipe(
 
     // One shared detector across both output streams so the card reflects a
     // single coherent state (mirrors the PTY path).
-    let is_codex = emitter.agent_type == AgentType::Codex;
     let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
         &emitter.agent_type,
     ))));
 
-    let out_thread = spawn_pipe_tee(
-        child_stdout,
-        libc::STDOUT_FILENO,
-        emitter,
-        &detector,
-        is_codex,
-        None,
-    );
-    let err_thread = spawn_pipe_tee(
-        child_stderr,
-        libc::STDERR_FILENO,
-        emitter,
-        &detector,
-        is_codex,
-        None,
-    );
+    let out_thread = spawn_pipe_tee(child_stdout, libc::STDOUT_FILENO, emitter, &detector, None);
+    let err_thread = spawn_pipe_tee(child_stderr, libc::STDERR_FILENO, emitter, &detector, None);
 
     // Input pump (outer stdin → child stdin, verbatim). On EOF/close of our
     // stdin, dropping `child_stdin` closes it so an EOF-sensitive child finishes.
@@ -2609,7 +2730,6 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
     out_fd: RawFd,
     emitter: &Arc<Emitter>,
     detector: &Arc<Mutex<Detector>>,
-    is_codex: bool,
     interface: Option<&Arc<InterfaceWatch>>,
 ) -> std::thread::JoinHandle<()> {
     let emitter = Arc::clone(emitter);
@@ -2628,11 +2748,11 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
                 watch,
             },
             |line| {
-                classify_and_emit(line, &detector, &emitter, is_codex);
+                classify_and_emit(line, &detector, &emitter);
             },
         ),
         None => tee(reader, FdWriter(out_fd), |line| {
-            classify_and_emit(line, &detector, &emitter, is_codex);
+            classify_and_emit(line, &detector, &emitter);
         }),
     })
 }
@@ -2873,11 +2993,15 @@ mod tests {
         let (program, rest) = rewritten
             .split_once(' ')
             .expect("rewritten command has a program and arguments");
-        assert_eq!(
-            std::path::Path::new(program)
-                .file_name()
-                .and_then(|n| n.to_str()),
-            Some("dot-agent-deck"),
+        // The co-located build carries the platform's executable suffix; the
+        // bare `$PATH` fallback does not.
+        let name = std::path::Path::new(program)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string);
+        assert!(
+            name.as_deref() == Some(crate::platform::paths::DEFAULT_BINARY_NAME)
+                || name == Some(crate::platform::paths::durable_binary_file_name()),
             "the rewrite must name a dot-agent-deck binary; got {rewritten:?}"
         );
         assert_eq!(rest, "wrap --agent codex -- codex");
@@ -2891,14 +3015,15 @@ mod tests {
     fn wrap_launch_command_names_this_build_not_path() {
         let rewritten = wrap_launch_command("codex", &AgentType::Codex);
         let program = rewritten.split_once(' ').expect("program present").0;
+        let sibling_name = crate::platform::paths::durable_binary_file_name();
         let sibling = std::env::current_exe().ok().and_then(|exe| {
             let dir = exe.parent()?;
-            let direct = dir.join("dot-agent-deck");
+            let direct = dir.join(&sibling_name);
             if direct.is_file() {
                 return Some(direct);
             }
             (dir.file_name() == Some(std::ffi::OsStr::new("deps")))
-                .then(|| dir.parent().map(|up| up.join("dot-agent-deck")))
+                .then(|| dir.parent().map(|up| up.join(&sibling_name)))
                 .flatten()
                 .filter(|p| p.is_file())
         });
@@ -2955,13 +3080,180 @@ mod tests {
     /// or without a leading path) and rejects anything else.
     #[test]
     fn is_wrap_invocation_matches_only_wrap() {
+        let deck = "dot-agent-deck";
         assert!(is_wrap_invocation(
-            "dot-agent-deck wrap --agent codex -- codex"
+            "dot-agent-deck wrap --agent codex -- codex",
+            deck
         ));
-        assert!(is_wrap_invocation("/opt/bin/dot-agent-deck wrap -- codex"));
-        assert!(!is_wrap_invocation("codex"));
-        assert!(!is_wrap_invocation("dot-agent-deck daemon serve"));
-        assert!(!is_wrap_invocation(""));
+        assert!(is_wrap_invocation(
+            "/opt/bin/dot-agent-deck wrap -- codex",
+            deck
+        ));
+        assert!(!is_wrap_invocation("codex", deck));
+        assert!(!is_wrap_invocation("dot-agent-deck daemon serve", deck));
+        assert!(!is_wrap_invocation("", deck));
+    }
+
+    /// Issue #533: a build under a non-default file name names ITSELF as the
+    /// wrapper. It used to be rejected by name and lose to a co-located
+    /// `dot-agent-deck` — a different build — planted here to prove it.
+    #[test]
+    fn resolve_deck_binary_for_wrap_takes_a_renamed_build_itself() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let renamed = root.path().join("dot-agent-deck-linux-amd64");
+        std::fs::write(&renamed, b"").expect("seed renamed build");
+        std::fs::write(
+            root.path()
+                .join(crate::platform::paths::durable_binary_file_name()),
+            b"",
+        )
+        .expect("seed co-located default-named build");
+
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(renamed.clone())),
+            renamed.to_str().expect("tempdir path is UTF-8"),
+            "a renamed build must name its own executable, not a sibling build"
+        );
+    }
+
+    /// Nothing quotes the wrapper's command word, so a renamed executable (or
+    /// a directory above it) the shell would reinterpret is refused, never
+    /// quoted: the resolution falls back as it does for any unusable path.
+    ///
+    /// Unix-only because several of these names (`"`, `|`) cannot be created on
+    /// Windows at all; the Windows dialect of the allowlist is covered by
+    /// `is_shell_inert_path_char_admits_backslash_and_tilde_only_for_windows`.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_deck_binary_for_wrap_refuses_shell_syntax_in_the_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let hostile_names = [
+            "deck$(touch pwned)",
+            "deck`id`",
+            "deck;id",
+            "deck'q",
+            "deck\"q",
+            "deck&id",
+            "deck|id",
+            "deck (1)",
+            "-deck",
+        ];
+        for name in hostile_names {
+            let exe = root.path().join(name);
+            std::fs::write(&exe, b"").expect("seed hostile build");
+            assert_eq!(
+                resolve_deck_binary_for_wrap(Ok(exe)),
+                crate::platform::paths::DEFAULT_BINARY_NAME,
+                "{name:?} must not reach the unquoted command word"
+            );
+        }
+
+        // A hostile DIRECTORY is refused too, including for a default-named
+        // build — the sibling lookup shares the directory, so it falls back to
+        // the bare name rather than to a sibling.
+        let dir = root.path().join("d$(id)");
+        std::fs::create_dir(&dir).expect("hostile dir");
+        let exe = dir.join(crate::platform::paths::durable_binary_file_name());
+        std::fs::write(&exe, b"").expect("seed build in hostile dir");
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(exe)),
+            crate::platform::paths::DEFAULT_BINARY_NAME
+        );
+    }
+
+    #[test]
+    fn is_shell_inert_path_char_admits_backslash_and_tilde_only_for_windows() {
+        assert!(is_shell_inert_path_char('\\', true));
+        assert!(!is_shell_inert_path_char('\\', false));
+        // 8.3 short names (`RUNNER~1`) are ordinary Windows paths.
+        assert!(is_shell_inert_path_char('~', true));
+        assert!(!is_shell_inert_path_char('~', false));
+        for c in ['/', '.', '_', '-', '+', ':', 'a', 'Z', '0'] {
+            assert!(is_shell_inert_path_char(c, false), "{c:?}");
+        }
+        for c in [
+            ' ', '$', '`', ';', '\'', '"', '&', '|', '(', ')', '*', '#', '!',
+        ] {
+            assert!(!is_shell_inert_path_char(c, false), "{c:?}");
+            assert!(!is_shell_inert_path_char(c, true), "{c:?}");
+        }
+    }
+
+    /// A real deck that merely sits in a directory named `deps` is not a test
+    /// harness: without cargo's `-<16 hex>` hash on its stem it names itself.
+    #[test]
+    fn resolve_deck_binary_for_wrap_takes_a_renamed_build_in_a_deps_dir() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let deps = root.path().join("deps");
+        std::fs::create_dir(&deps).expect("deps dir");
+        let renamed = deps.join("dot-agent-deck-linux-amd64");
+        std::fs::write(&renamed, b"").expect("seed renamed build");
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(renamed.clone())),
+            renamed.to_str().expect("tempdir path is UTF-8")
+        );
+    }
+
+    /// The name check #533 removed was what kept a cargo test harness from
+    /// naming itself as the wrapper. It still cannot: an executable inside a
+    /// `deps` directory is passed over for the build one level up, whatever its
+    /// name — including one that happens to look like a deck.
+    #[test]
+    fn resolve_deck_binary_for_wrap_passes_over_a_test_harness() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let profile = root.path().join("target").join("debug");
+        let deps = profile.join("deps");
+        std::fs::create_dir_all(&deps).expect("deps dir");
+        let harness = deps.join("dot_agent_deck-0123456789abcdef");
+        std::fs::write(&harness, b"").expect("seed harness");
+        let built = profile.join(crate::platform::paths::durable_binary_file_name());
+
+        // No build beside the harness yet: the bare name, never the harness.
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(harness.clone())),
+            crate::platform::paths::DEFAULT_BINARY_NAME
+        );
+
+        std::fs::write(&built, b"").expect("seed built deck");
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(harness)),
+            built.to_str().expect("tempdir path is UTF-8")
+        );
+    }
+
+    /// Issue #533: a renamed build recognises the `wrap` invocation it produced
+    /// itself, so re-applying the rewrite does not stack a second wrapper. The
+    /// rewrite and the
+    /// guard are driven through the same resolved program, exactly as
+    /// [`wrap_launch_command`] drives them.
+    #[test]
+    fn is_wrap_invocation_recognises_a_renamed_build() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let renamed = root.path().join("deck-beta");
+        std::fs::write(&renamed, b"").expect("seed renamed build");
+        let deck = resolve_deck_binary_for_wrap(Ok(renamed));
+
+        let wrapped = format!("{deck} wrap --agent codex -- codex");
+        assert!(
+            is_wrap_invocation(&wrapped, &deck),
+            "a renamed build must recognise its own wrap invocation: {wrapped:?}"
+        );
+        // Also by bare name, as a saved command from that build would carry it.
+        assert!(is_wrap_invocation(
+            "deck-beta wrap --agent codex -- codex",
+            &deck
+        ));
+        // A default-named build's saved command is still recognised.
+        assert!(is_wrap_invocation(
+            "dot-agent-deck wrap --agent codex -- codex",
+            &deck
+        ));
+        // And recognising the renamed build does not widen to other programs.
+        assert!(!is_wrap_invocation(
+            "other wrap --agent codex -- codex",
+            &deck
+        ));
+        assert!(!is_wrap_invocation("deck-beta daemon serve", &deck));
     }
 
     // PRD #20 finding #12 targeted coverage for the edges the subprocess harness

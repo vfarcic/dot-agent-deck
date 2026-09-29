@@ -70,7 +70,7 @@ fn save_001_new_pane_state_change_writes_snapshot() {
             session_file.to_str().expect("session path is UTF-8"),
         )
         .launch_with_fixture("modes");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Precondition: a fresh launch (no `--continue`, restore not yet wired)
     // must not have written any snapshot yet — the RED signal below is purely
@@ -116,7 +116,7 @@ fn save_002_detach_path_writes_snapshot() {
             session_file.to_str().expect("session path is UTF-8"),
         )
         .launch_with_fixture("modes");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Two dashboard panes present → a real workspace to detach from.
     spawn_plain_pane(&deck, "sleep 600");
@@ -124,7 +124,7 @@ fn save_002_detach_path_writes_snapshot() {
 
     // Detach to Normal mode and confirm both panes registered as cards.
     deck.send_keys(b"\x04"); // Ctrl+D → Normal mode / Dashboard
-    deck.wait_for_string("2 session(s)");
+    deck.wait_for_string("2 agent(s)");
 
     // Arm the dashboard selection so Ctrl+W has a concrete card to close
     // (PRD #113: the destructive close is a no-op on an unarmed dashboard).
@@ -139,10 +139,10 @@ fn save_002_detach_path_writes_snapshot() {
     // Detach path: request the selected pane's close, then deliberately accept
     // the safety confirmation. One card remains, so the workspace is non-empty.
     deck.send_keys(b"\x17"); // Ctrl+W → arm close confirmation
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     deck.send_keys(b"\x1b[B"); // Down → select Close
     deck.send_keys(b"\r"); // Enter → confirm close selected pane
-    deck.wait_for_string("1 session(s)"); // close took effect
+    deck.wait_for_string("1 agent(s)"); // close took effect
 
     // The detach must have flushed a fresh snapshot reflecting the surviving
     // workspace. RED today: Ctrl+W writes no snapshot (only clean teardown
@@ -197,7 +197,7 @@ fn save_004_orchestration_tab_capture_writes_orchestration_metadata() {
             session_file.to_str().expect("session path is UTF-8"),
         )
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Open the orchestration tab; its two `cat` role panes render as deck cards.
     open_orchestration(&deck);

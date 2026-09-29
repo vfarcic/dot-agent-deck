@@ -1,5 +1,5 @@
 import type { VoiceCommandDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
-import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DeckSnapshot, EvidenceItem, WorkflowStage } from "../types";
+import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, WorkflowStage } from "../types";
 
 /**
  * The fixture's stand-in for a deck identity — used as BOTH `deckId` and
@@ -43,7 +43,7 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet";
 
 export const DEFAULT_PROFILES: AgentProfile[] = [
   {
@@ -176,14 +176,14 @@ const evidence: EvidenceItem[] = [
     at: "14:37:09",
     command: "pnpm test -- bridge",
     exitCode: 1,
-    reason: "A failed transition returns to the owning role with precise evidence, not a pasted transcript.",
+    reason: "A failed transition returns to the owning role with precise events, not a pasted transcript.",
     acknowledged: true,
   },
   {
     id: "ev-plan",
     verdict: "PASS",
     title: "Implementation contract accepted",
-    summary: "The plan limits this milestone to the daemon client, terminal deck, agent profiles, and observable loop.",
+    summary: "The plan limits this milestone to the daemon client, terminal grid, agent profiles, and observable loop.",
     from: "Planner",
     to: "Builder",
     at: "14:32:44",
@@ -218,7 +218,7 @@ const agents: AgentSession[] = [
     diff: [],
     checks: [{ id: "plan-contract", name: "Acceptance contract", status: "passed", duration: "0.2s" }],
     handoffIds: ["ev-plan"],
-    artifacts: [{ id: "prd", name: "Desktop GUI PRD", kind: "file", path: "prds/176-desktop-gui.md" }],
+    artifacts: [{ id: "prd", name: "Desktop GUI PRD", kind: "file", path: "prds/done/176-desktop-gui.md" }],
   },
   {
     id: "builder",
@@ -242,7 +242,7 @@ const agents: AgentSession[] = [
     cols: 110,
     activeTool: "cargo check",
     toolCount: 18,
-    transcript: "\u001b[2m14:34:02\u001b[0m  added desktop workspace scaffold\r\n\u001b[2m14:36:41\u001b[0m  wired daemon snapshot + terminal events\r\n\u001b[31mFAIL\u001b[0m  bridge test: listener disposed twice\r\n\u001b[33mRETRY 2/3\u001b[0m  isolating failed subscription case\r\n\u001b[2m14:40:58\u001b[0m  fixed idempotent detach cleanup\r\n\u001b[32mPASS\u001b[0m  24 tests · 0 warnings\r\n\r\nWaiting for reviewer evidence…\r\n",
+    transcript: "\u001b[2m14:34:02\u001b[0m  added desktop workspace scaffold\r\n\u001b[2m14:36:41\u001b[0m  wired daemon snapshot + terminal events\r\n\u001b[31mFAIL\u001b[0m  bridge test: listener disposed twice\r\n\u001b[33mRETRY 2/3\u001b[0m  isolating failed subscription case\r\n\u001b[2m14:40:58\u001b[0m  fixed idempotent detach cleanup\r\n\u001b[32mPASS\u001b[0m  24 tests · 0 warnings\r\n\r\nWaiting for reviewer events…\r\n",
     diff: ["+ desktop/src/App.tsx", "+ desktop/src/lib/bridge.ts", "+ desktop/src/styles.css", "~ Cargo.toml"],
     checks: [
       { id: "typecheck", name: "TypeScript", status: "passed", duration: "2.1s", command: "pnpm tsc" },
@@ -250,7 +250,7 @@ const agents: AgentSession[] = [
       { id: "rust", name: "Rust check", status: "passed", duration: "8.4s", command: "cargo check" },
     ],
     handoffIds: ["ev-fix", "ev-pass"],
-    artifacts: [{ id: "cast", name: "Control deck smoke run", kind: "recording", path: ".dot-agent-deck/recordings/gui.cast" }],
+    artifacts: [{ id: "cast", name: "Control room smoke run", kind: "recording", path: ".dot-agent-deck/recordings/gui.cast" }],
   },
   {
     id: "reviewer",
@@ -261,7 +261,7 @@ const agents: AgentSession[] = [
     cli: "codex",
     model: "gpt-5.6-sol",
     status: "running",
-    task: "Audit terminal lifecycle, unsafe actions, and evidence integrity.",
+    task: "Audit terminal lifecycle, unsafe actions, and event integrity.",
     cwd: "/dev/active/dot-agent-deck-gui",
     attempt: 1,
     duration: "02:26",
@@ -378,7 +378,7 @@ function crowdedAgent(seed: CrowdedSeed): AgentSession {
     task: seed.lastUserPrompt
       ?? (seed.activeTool
         ? `Active tool: ${seed.activeTool}${seed.activeToolDetail ? ` · ${seed.activeToolDetail}` : ""}`
-        : "Task metadata unavailable from the deck"),
+        : "Task metadata unavailable from the daemon"),
     cwd: seed.cwd,
     // No attempt: live mode reports none, and the crowded scenario is meant to
     // be a faithful preview of a real daemon (PRD #745 M8).
@@ -413,6 +413,196 @@ function crowdedAgent(seed: CrowdedSeed): AgentSession {
   };
 }
 
+/** What the preview was asked to start — `start_agent`'s fields plus the id the fixture deck minted. */
+export interface FixtureStartedAgent {
+  id: string;
+  daemonId: string;
+  displayName?: string;
+  command?: string;
+  cwd?: string;
+  rows?: number;
+  cols?: number;
+}
+
+/**
+ * The agent a fixture deck gains when the preview starts one (PRD #1223 M3).
+ *
+ * Shaped the way `agentFromDto` shapes a freshly spawned LIVE agent, by the
+ * convention {@link crowdedAgent} set: an agent that has emitted no hook event
+ * yet is `running` (the crate maps a record with no hook state to `running`),
+ * every field the daemon does not report carries live mode's placeholder, and
+ * there is no tool, prompt or activity to show. The CLI is the command's first
+ * word and absent when no command was given — the daemon then starts its
+ * default shell and names no binary, and absence is the honest rendering.
+ */
+export function createFixtureStartedAgent(started: FixtureStartedAgent): AgentSession {
+  const cli = started.command?.trim().split(/\s+/)[0] || undefined;
+  const role = cli ? cli.charAt(0).toUpperCase() + cli.slice(1) : "Agent";
+  return {
+    id: started.id,
+    daemonId: started.daemonId,
+    role,
+    displayName: started.displayName || role,
+    cli,
+    model: "Unavailable",
+    status: "running",
+    task: "Task metadata unavailable from the daemon",
+    cwd: started.cwd,
+    duration: "—",
+    tokens: 0,
+    cost: 0,
+    contextPercent: 0,
+    worktree: "Unavailable",
+    writeLease: "unknown",
+    spawnedAtMs: Date.now(),
+    rows: started.rows ?? 24,
+    cols: started.cols ?? 80,
+    toolCount: 0,
+    transcript: "",
+    diff: [],
+    checks: [],
+    handoffIds: [],
+    artifacts: [],
+    tab: { kind: "dashboard" },
+    inOrchestration: false,
+    isStartRole: false,
+  };
+}
+
+/**
+ * The next id a fixture deck mints: the lowest positive integer none of its
+ * agents already uses. A daemon mints per-daemon monotonic integers, so two
+ * decks answering the same id is the ordinary case the preview must show too.
+ */
+export function nextFixtureAgentId(agents: readonly AgentSession[]): string {
+  let next = 1;
+  while (agents.some((agent) => agent.id === String(next))) next += 1;
+  return String(next);
+}
+
+/**
+ * PRD #1223 M4 — each connected fixture deck's home directory, which is where
+ * the New agent dialog's directory step opens on it.
+ *
+ * Different per deck on purpose: a preview that listed the wrong deck's tree
+ * would show the wrong home, where two identical trees would hide it.
+ */
+export const FIXTURE_HOMES: Readonly<Record<string, string>> = {
+  [FIXTURE_DAEMON_ID]: "/home/dev",
+  [FIXTURE_REMOTE_DAEMON_ID]: "/home/build",
+};
+
+/** One directory of a fixture deck's tree, shaped the way a deck lists one. */
+export interface FixtureDirectory {
+  path: string;
+  parent?: string;
+  entries: DeckDirectoryEntry[];
+}
+
+/**
+ * The filesystem a fixture deck lists, rooted at `/`: a home holding a project
+ * directory (it carries the marker) and an ordinary one, and a directory one
+ * level deeper inside the ordinary one — enough to browse into, confirm a
+ * directory with no subdirectories, and go back up through every parent.
+ *
+ * Issue #1240: `scratch/notes` also holds a hidden directory (`.drafts`) and a
+ * symlink (`latest`, leading to `demo-project`), which a deck lists only when
+ * asked — so by default `notes` still has no subdirectories.
+ *
+ * Every path here is the fixture DECK's answer, the way a daemon answers with
+ * its own canonical spelling. The dialog never builds one of these itself.
+ */
+export function fixtureDirectoryTree(home: string): Map<string, FixtureDirectory> {
+  const user = home.split("/").filter(Boolean).at(-1) ?? "dev";
+  const entry = (path: string, isProject = false): DeckDirectoryEntry => ({ path, displayName: path.split("/").at(-1) ?? path, isProject });
+  const tree: FixtureDirectory[] = [
+    { path: "/", entries: [entry("/home")] },
+    { path: "/home", parent: "/", entries: [entry(`/home/${user}`)] },
+    { path: home, parent: "/home", entries: [entry(`${home}/demo-project`, true), entry(`${home}/scratch`)] },
+    { path: `${home}/demo-project`, parent: home, entries: [] },
+    { path: `${home}/scratch`, parent: home, entries: [entry(`${home}/scratch/notes`), entry(`${home}/scratch/twin-project`, true)] },
+    { path: `${home}/scratch/notes`, parent: `${home}/scratch`, entries: [entry(`${home}/scratch/notes/.drafts`), { path: `${home}/demo-project`, displayName: "latest", isProject: true, isSymlink: true }] },
+    { path: `${home}/scratch/notes/.drafts`, parent: `${home}/scratch/notes`, entries: [] },
+    { path: `${home}/scratch/twin-project`, parent: `${home}/scratch`, entries: [] },
+  ];
+  return new Map(tree.map((directory) => [directory.path, directory]));
+}
+
+/**
+ * PRD #1223 M6 — the orchestrations a fixture deck's `demo-project` defines, as
+ * that deck's `ResolveProject` answers them: one, `demo-loop`, whose
+ * `planner` starts the run and whose `builder` works for it.
+ *
+ * `scratch/twin-project` is the audit F2 case: it defines `twin-loop` TWICE —
+ * which a real config may, since validation only warns — and `solo-loop` once,
+ * so the preview shows namesakes disabled beside an orchestration that can be
+ * chosen. Every other directory in {@link fixtureDirectoryTree} is an ordinary
+ * one.
+ */
+export function fixtureProjectOrchestrations(home: string, path: string): DaemonOrchestration[] | undefined {
+  if (path === `${home}/scratch/twin-project`) {
+    const single = (name: string, role: string): DaemonOrchestration => ({ name, displayName: name, default: false, roles: [{ name: role, displayName: role, start: true }] });
+    return [single("twin-loop", "planner"), single("solo-loop", "planner"), single("twin-loop", "builder")];
+  }
+  if (path !== `${home}/demo-project`) return undefined;
+  return [
+    {
+      name: "demo-loop",
+      displayName: "demo-loop",
+      default: true,
+      roles: [
+        { name: "planner", displayName: "planner", start: true },
+        { name: "builder", displayName: "builder", start: false },
+      ],
+    },
+  ];
+}
+
+/**
+ * The commands `demo-loop`'s roles are configured with on a fixture deck — the
+ * deck's own config, which never crosses the wire. The fixture deck starts each
+ * role with its command the way a live deck does for a launch from the New
+ * agent dialog, so the preview's role panes are labelled by what they run.
+ */
+export const FIXTURE_ROLE_COMMANDS: Readonly<Record<string, string>> = {
+  planner: "claude",
+  builder: "codex",
+};
+
+/**
+ * The agent registry a fixture deck reports, shaped as `new-agent-options`
+ * reports the real one: each entry's first basename as the id, its label, its
+ * default command, in registry order. The fixture has no Rust to ask, so this
+ * is preview data — a live deck answers with its own build's list, and an
+ * older live deck's fallback comes from this app's Rust build, never from here.
+ */
+export function fixtureAgentRegistry(): NewAgentOption[] {
+  return [
+    { id: "claude", displayName: "ClaudeCode", defaultCommand: "claude" },
+    { id: "opencode", displayName: "OpenCode", defaultCommand: "opencode" },
+    { id: "pi", displayName: "Pi", defaultCommand: "pi" },
+    { id: "codex", displayName: "Codex", defaultCommand: "codex" },
+    { id: "devin", displayName: "Devin", defaultCommand: "devin" },
+  ];
+}
+
+/**
+ * The `default_command` each fixture deck's host configures, if any. The remote
+ * deck has one and the local deck does not, so the preview shows both halves
+ * of the Command prefill order.
+ */
+export const FIXTURE_DEFAULT_COMMANDS: Readonly<Record<string, string>> = {
+  [FIXTURE_REMOTE_DAEMON_ID]: "claude",
+};
+
+/**
+ * The fixture decks whose own experimental flag is on (PRD #1223 M7). The
+ * remote deck's is and the local deck's is not, so the preview shows the
+ * `schedule: issues` chip on one deck and withholds it on the other — the flag
+ * is the deck's, not this app's.
+ */
+export const FIXTURE_EXPERIMENTAL_DECKS: ReadonlySet<string> = new Set([FIXTURE_REMOTE_DAEMON_ID]);
+
 function orchestrationTab(orchestrationId: string, name: string, displayTitle: string, roleName: string, roleIndex: number, isStartRole = false, cwd?: string): AgentTab {
   return { kind: "orchestration", orchestrationId, name, displayTitle, roleName, roleIndex, isStartRole, cwd };
 }
@@ -439,27 +629,107 @@ const PRD_CWD = "/home/dev/code/dot-agent-deck-dispatch-prd-745";
  * right rather than one accident of declaration order.
  */
 const crowdedAgents: AgentSession[] = [
-  crowdedAgent({ id: "2", displayName: "coder", role: "Coder", cli: "claude", status: "running", cwd: PRD_CWD, toolCount: 132, upForMinutes: 41, quietForMinutes: 0, activeTool: "edit", activeToolDetail: "desktop/src/components/AgentOverview.tsx", writeLease: "write", lastUserPrompt: "Surface the honest fields and stop presenting attempt and branch as facts.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "coder", 1, false, PRD_CWD) }),
+  crowdedAgent({ id: "2", displayName: "coder", role: "Coder", cli: "claude", status: "running", cwd: PRD_CWD, toolCount: 132, upForMinutes: 41, quietForMinutes: 0, activeTool: "edit", activeToolDetail: "desktop/src/components/AgentOverview.tsx", writeLease: "write", lastUserPrompt: "Surface the honest fields and stop presenting attempt and branch as facts.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "coder", 1, false, PRD_CWD) }),
   crowdedAgent({ id: "7", displayName: "writer", role: "Writer", cli: "claude", status: "running", cwd: DECK_CWD, toolCount: 19, upForMinutes: 96, quietForMinutes: 2, activeTool: "write", activeToolDetail: "docs/develop/desktop-gui.md", writeLease: "write", lastUserPrompt: "Document the overview screen and the demand-driven attach model.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "writer", 0, false, DECK_CWD) }),
   // No prompt and no lease: a pane the daemon adopted but that has emitted no
   // prompt event yet. Both columns stay blank, which is the case the screen has
   // to look right for.
   crowdedAgent({ id: "13", displayName: "Scratch shell", role: "Codex", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 2, tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "1", displayName: "orchestrator", role: "Orchestrator", cli: "claude", status: "running", cwd: PRD_CWD, toolCount: 47, upForMinutes: 194, quietForMinutes: 0, activeTool: "read", activeToolDetail: "prds/745-desktop-agent-overview-landing-screen.md", writeLease: "write", lastUserPrompt: "Run PRD 745 to done: delegate each milestone and verify the gates yourself.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "orchestrator", 0, true, PRD_CWD) }),
+  crowdedAgent({ id: "1", displayName: "orchestrator", role: "Orchestrator", cli: "claude", status: "running", cwd: PRD_CWD, toolCount: 47, upForMinutes: 194, quietForMinutes: 0, activeTool: "read", activeToolDetail: "prds/done/745-desktop-agent-overview-landing-screen.md", writeLease: "write", lastUserPrompt: "Run PRD 745 to done: delegate each milestone and verify the gates yourself.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "orchestrator", 0, true, PRD_CWD) }),
   // History-only: a wrapped session the deck can replay but cannot type into.
   crowdedAgent({ id: "11", displayName: "Second opinion", role: "Open code", cli: "opencode", status: "running", cwd: DECK_CWD, toolCount: 33, upForMinutes: 12, quietForMinutes: 1, activeTool: "read", activeToolDetail: "src/state.rs", writeLease: "read", lastUserPrompt: "Read the daemon state module and tell me which fields never reach the desktop.", tab: { kind: "mode", name: "review" } }),
-  crowdedAgent({ id: "5", displayName: "docs", role: "Docs", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 0, upForMinutes: 58, quietForMinutes: 34, writeLease: "write", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "docs", 4, false, PRD_CWD) }),
+  crowdedAgent({ id: "5", displayName: "docs", role: "Docs", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 0, upForMinutes: 58, quietForMinutes: 34, writeLease: "write", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "docs", 4, false, PRD_CWD) }),
   crowdedAgent({ id: "9", displayName: "orchestrator", role: "Orchestrator", cli: "claude", status: "waiting", cwd: DECK_CWD, toolCount: 12, upForMinutes: 213, quietForMinutes: 8, writeLease: "write", lastUserPrompt: "Refresh the docs set for the release and hand each page to a reviewer.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "orchestrator", 2, true, DECK_CWD) }),
-  crowdedAgent({ id: "4", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "running", cwd: PRD_CWD, toolCount: 24, upForMinutes: 47, quietForMinutes: 3, activeTool: "grep", activeToolDetail: "attachAgents", writeLease: "write", lastUserPrompt: "Audit the attach path: prove the overview opens no socket, report findings only.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "reviewer", 3, false, PRD_CWD) }),
+  crowdedAgent({ id: "4", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "running", cwd: PRD_CWD, toolCount: 24, upForMinutes: 47, quietForMinutes: 3, activeTool: "grep", activeToolDetail: "attachAgents", writeLease: "write", lastUserPrompt: "Audit the attach path: prove the overview opens no socket, report findings only.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "reviewer", 3, false, PRD_CWD) }),
   crowdedAgent({ id: "14", displayName: "Changelog sweep", role: "Claude code", cli: "claude", status: "running", cwd: DECK_CWD, toolCount: 15, upForMinutes: 3, quietForMinutes: 0, activeTool: "bash", activeToolDetail: "git log --oneline -20", writeLease: "write", lastUserPrompt: "Collect every changelog fragment merged since the last tag and group them.", tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "6", displayName: "release", role: "Release", cli: "claude", status: "failed", cwd: PRD_CWD, toolCount: 8, upForMinutes: 88, quietForMinutes: 71, activeTool: "bash", activeToolDetail: "cargo test-fast", writeLease: "write", lastUserPrompt: "Cut the release once the fast tier is green.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "release", 5, false, PRD_CWD) }),
-  crowdedAgent({ id: "3", displayName: "tester", role: "Tester", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 61, upForMinutes: 33, quietForMinutes: 17, writeLease: "write", lastUserPrompt: "Write the failing test first, then hand it back without fixing it.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "tester", 2, false, PRD_CWD) }),
+  crowdedAgent({ id: "6", displayName: "release", role: "Release", cli: "claude", status: "failed", cwd: PRD_CWD, toolCount: 8, upForMinutes: 88, quietForMinutes: 71, activeTool: "bash", activeToolDetail: "cargo test-fast", writeLease: "write", lastUserPrompt: "Cut the release once the fast tier is green.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "release", 5, false, PRD_CWD) }),
+  crowdedAgent({ id: "3", displayName: "tester", role: "Tester", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 61, upForMinutes: 33, quietForMinutes: 17, writeLease: "write", lastUserPrompt: "Write the failing test first, then hand it back without fixing it.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent dashboard", "tester", 2, false, PRD_CWD) }),
   crowdedAgent({ id: "10", displayName: "publisher", role: "Publisher", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 0, tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "publisher", 3, false, DECK_CWD) }),
   // View-only: the daemon knows the session but holds nothing it can write to.
   crowdedAgent({ id: "15", displayName: "pi-extension spike", role: "Pi", cli: "pi", status: "waiting", cwd: `${DECK_CWD}/pi-extension`, toolCount: 0, quietForMinutes: 2760, writeLease: "none", tab: { kind: "dashboard" } }),
   crowdedAgent({ id: "8", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 5, upForMinutes: 168, quietForMinutes: 128, writeLease: "write", lastUserPrompt: "Review the docs refresh for accuracy against the current CLI flags.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "reviewer", 1, false, DECK_CWD) }),
   crowdedAgent({ id: "12", displayName: "Security pass", role: "Claude code", cli: "claude", status: "waiting", cwd: DECK_CWD, toolCount: 7, upForMinutes: 27, quietForMinutes: 9, tab: { kind: "mode", name: "review" } }),
 ];
+
+/**
+ * The `?fixture=1&state=docs` scenario: the four agents the TUI half of the
+ * docs screenshots opens in dashboard panes and describes with synthetic hook
+ * events (`DASHBOARD_AGENTS` in `tests/e2e_docs_screenshots.rs`, issue #1322), so the
+ * TUI and desktop images of the `dashboard` scenario depict ONE state. Names,
+ * agent types, directory, prompts, tools and ages are the TUI's; each status is
+ * what live mode maps the TUI's hook state to (`DAEMON_STATUS` in
+ * `lib/bridge.ts`), which folds the TUI's Idle and Needs Input into `waiting`
+ * and its Working into `running`. Keep the two lists in step when either moves.
+ *
+ * Separate from `agents` on purpose: the `connected` scenario is what the unit
+ * and snapshot tests are written against, and a docs image must not be able to
+ * move them.
+ */
+const DOCS_CWD = "/home/dev/storefront";
+/*
+ * Each docs agent's uptime in minutes: `up_for_minutes` of the same-named agent
+ * in `DASHBOARD_AGENTS` (`tests/e2e_docs_screenshots.rs`), which stamps that
+ * agent's `session_start` this far back. The TUI capture's status events are
+ * stamped seconds before the capture (`quiet_for_secs`, the cards' `Last:`
+ * labels: a TUI card's last activity cannot read older than its pane, and the
+ * capture opens the panes), so every docs agent's last activity here is
+ * `DOCS_QUIET_MINUTES` — under a minute, which the overview reads as `just now`.
+ * The depicted state is one fleet: agents up for hours, each active seconds
+ * ago. Change a value here and in the test together.
+ */
+const DOCS_UP_MINUTES = {
+  plan: 135,
+  impl: 65,
+  review: 70,
+  verify: 80,
+} as const;
+const DOCS_QUIET_MINUTES = 0;
+/**
+ * What the docs `agent-pane` screenshot shows in the open agent's terminal.
+ * The browser fixture has no PTY, so the pane shows the transcript the
+ * terminal writes on mount; without one the image is a blank terminal. Fixed
+ * text only: no timestamps, pids or host paths, so the capture is stable.
+ */
+const DOCS_IMPL_TRANSCRIPT = [
+  "\u001b[1m›\u001b[0m Add the retry action to the checkout view.",
+  "",
+  "\u001b[36m•\u001b[0m Read src/components/CheckoutView.tsx",
+  "\u001b[36m•\u001b[0m Read src/api/payments.ts",
+  "\u001b[36m•\u001b[0m Edit src/components/RetryPayment.tsx",
+  "    \u001b[32m+ export function RetryPayment({ onRetry, pending }: RetryPaymentProps) {\u001b[0m",
+  "    \u001b[32m+   return <button disabled={pending} onClick={onRetry}>Retry payment</button>;\u001b[0m",
+  "    \u001b[32m+ }\u001b[0m",
+  "\u001b[36m•\u001b[0m Ran npm test -- checkout",
+  "    \u001b[32mPASS\u001b[0m  src/components/RetryPayment.test.tsx (3 tests)",
+  "",
+  "The retry button renders and disables itself while a payment is pending.",
+  "Next: wire it into CheckoutView and cover the failed-payment path.",
+  "",
+].join("\r\n");
+const docsAgents: AgentSession[] = [
+  crowdedAgent({ id: "1", displayName: "Plan / architecture", role: "Claude code", cli: "claude", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.plan, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Map the checkout flow and propose a retry design.", tab: { kind: "dashboard" } }),
+  { ...crowdedAgent({ id: "2", displayName: "Desktop implementation", role: "Codex", cli: "codex", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.impl, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Edit", activeToolDetail: "src/components/RetryPayment.tsx", lastUserPrompt: "Add the retry action to the checkout view.", tab: { kind: "dashboard" } }), transcript: DOCS_IMPL_TRANSCRIPT },
+  crowdedAgent({ id: "3", displayName: "Contract review", role: "Claude code", cli: "claude", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.review, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Bash", activeToolDetail: "cargo test checkout_retry", lastUserPrompt: "Check the payment API for breaking changes.", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "4", displayName: "User-path verification", role: "Open code", cli: "opencode", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.verify, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Walk the checkout path and report failures.", tab: { kind: "dashboard" } }),
+];
+
+/** Two answering daemons with synthetic projects and no demo-run paths. */
+function docsFleet(): DeckSnapshot[] {
+  const local = createFixtureSnapshot("docs");
+  const remote: DeckSnapshot = {
+    ...createFixtureSnapshot("docs"),
+    runId: "run_docs_service",
+    repo: "service-api",
+    worktree: "/home/dev/service-api",
+    connection: { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+    agents: [
+      crowdedAgent({ id: "1", displayName: "API implementation", role: "Codex", cli: "codex", status: "running", cwd: "/home/dev/service-api", toolCount: 2, upForMinutes: 44, quietForMinutes: 0, activeTool: "Edit", activeToolDetail: "src/routes.rs", lastUserPrompt: "Add the checkout endpoint.", tab: { kind: "dashboard" } }),
+      crowdedAgent({ id: "2", displayName: "API review", role: "Claude code", cli: "claude", status: "waiting", cwd: "/home/dev/service-api", toolCount: 0, upForMinutes: 19, quietForMinutes: 0, lastUserPrompt: "Review the endpoint contract.", tab: { kind: "dashboard" } }),
+    ].map((agent) => ({ ...agent, daemonId: FIXTURE_REMOTE_DAEMON_ID })),
+    totalNodes: 2,
+  };
+  return [local, remote];
+}
 
 /**
  * `empty` means CONNECTED WITH ZERO AGENTS — the first-run experience — and
@@ -527,7 +797,7 @@ const remoteAgents: AgentSession[] = [
     displayName: "Scratch shell",
     role: "Claude code",
     status: "failed",
-    task: "Task metadata unavailable from the deck",
+    task: "Task metadata unavailable from the daemon",
     cwd: "/home/dev/code/scratch",
     transcript: "",
     handoffIds: [],
@@ -613,17 +883,18 @@ function fleetDeck(
  * this milestone changes. `fleet` is the one that needs the array to exist.
  */
 export function createFixtureFleet(state: FixtureState = "connected"): DeckSnapshot[] {
+  if (state === "docs-fleet") return docsFleet();
   if (state !== "fleet") return [createFixtureSnapshot(state)];
   return [
     fleetDeck(
       FIXTURE_DAEMON_ID,
-      { status: "connected", deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: "Deck responding", deckKind: "local" },
+      { status: "connected", deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: "Daemon responding", deckKind: "local" },
       agents,
       "/home/dev/code/dot-agent-deck-gui",
     ),
     fleetDeck(
       FIXTURE_REMOTE_DAEMON_ID,
-      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Deck responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
       remoteAgents,
       "/home/dev/code/dot-agent-deck",
     ),
@@ -643,7 +914,7 @@ export function createFixtureFleet(state: FixtureState = "connected"): DeckSnaps
     */
     fleetDeck(
       FIXTURE_UNREACHABLE_DAEMON_ID,
-      { status: "disconnected", deckId: FIXTURE_UNREACHABLE_DAEMON_ID, socketPath: FIXTURE_UNREACHABLE_DAEMON_ID, message: "No deck is listening on the configured socket.", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      { status: "disconnected", deckId: FIXTURE_UNREACHABLE_DAEMON_ID, socketPath: FIXTURE_UNREACHABLE_DAEMON_ID, message: "No daemon is listening on the configured socket.", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
       staleAgents,
       "/home/dev/code/dot-agent-deck",
     ),
@@ -677,37 +948,40 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
   // `fleet` is a THREE-deck scenario and has no single snapshot, so a caller
   // asking for one gets the deck the single-deck screens are on — never the
   // disconnected fall-through an unlisted state would otherwise land in.
-  if (state === "fleet") return createFixtureFleet(state)[0];
-  const connected = state === "connected" || state === "crowded" || state === "empty";
+  if (state === "fleet" || state === "docs-fleet") return createFixtureFleet(state)[0];
+  const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs";
   const connection = connected
-    ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Deck responding · no agents running" : "Deck responding" }
+    ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding" }
     : state === "error"
-      ? { status: "error" as const, message: "Protocol handshake failed. Desktop expects v6; deck reported v5." }
-      : { status: "disconnected" as const, message: "No deck is listening on the configured socket." };
+      ? { status: "error" as const, message: "Protocol handshake failed. Desktop expects v6; daemon reported v5." }
+      : { status: "disconnected" as const, message: "No daemon is listening on the configured socket." };
 
-  const fleet = state === "empty" ? [] : state === "crowded" ? crowdedAgents : agents;
+  const fleet = state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : agents;
+  // The docs scenario carries only what its screenshots show, so nothing from
+  // the demo run (its worktree, stages, handoffs, evidence) leaks into one.
+  const docs = state === "docs";
 
   return {
     runId: "run_7f24a",
     repo: "dot-agent-deck",
     branch: "codex/visual-control-deck",
-    worktree: "/dev/active/dot-agent-deck-gui",
+    worktree: docs ? DOCS_CWD : "/dev/active/dot-agent-deck-gui",
     connection,
-    health: state === "connected" || state === "crowded" ? "healthy" : state === "error" ? "failed" : "idle",
+    health: state === "connected" || state === "crowded" || docs ? "healthy" : state === "error" ? "failed" : "idle",
     elapsed: "16:42",
     spend: 2.57,
     currentNode: 4,
     totalNodes: 6,
     currentAttempt: 1,
     paused: false,
-    stages: state === "empty" ? [] : stages.map((stage) => ({ ...stage })),
+    stages: state === "empty" || docs ? [] : stages.map((stage) => ({ ...stage })),
     agents: fleet.map((agent) => ({ ...agent })),
-    handoffs: [
-      { id: "dlg-demo-3", toRole: "Reviewer", orchestration: "dot-agent-deck", taskPreview: "Review the terminal lifecycle change; report findings only.", status: "dispatched", respawned: true, at: "14:41:22" },
+    handoffs: docs ? [] : [
+      { id: "dlg-demo-3", toRole: "Reviewer", orchestration: "dot-agent-deck", taskPreview: "Review the terminal lifecycle change; report findings only.", status: "delegated", respawned: true, at: "14:41:22" },
       { id: "dlg-demo-2", toRole: "Builder", orchestration: "dot-agent-deck", taskPreview: "Implement the Tauri client as a second daemon surface.", status: "done", respawned: true, at: "14:40:58" },
       { id: "dlg-demo-1", toRole: "Tester", orchestration: "dot-agent-deck", taskPreview: "Write the failing bridge test for listener disposal.", status: "failed", respawned: false, reason: "worker respawn failed: command not found", at: "14:33:07" },
     ],
-    evidence: state === "empty" ? [] : evidence.map((item) => ({ ...item })),
+    evidence: state === "empty" || docs ? [] : evidence.map((item) => ({ ...item })),
     profiles: DEFAULT_PROFILES.map((profile) => ({ ...profile })),
   };
 }
@@ -797,17 +1071,26 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["show me every agent", "show me all the agents", "show me everything"],
     action: "open_overview",
     invoke: "openOverview",
-    screens: ["deck"],
-    unavailableHint: "the agent overview opens from the deck",
-    report: "Opening the agent overview.",
+    screens: ["deck", "overview"],
+    unavailableHint: "the agent dashboard opens from the rail once the agent's pane is closed",
+    report: "Opening the agent dashboard.",
   },
   {
-    phrases: ["go back to the deck", "back to the deck", "show me the terminals"],
+    phrases: ["open daemons", "go back to the daemons", "back to the daemons", "go back to the deck", "back to the deck", "show me the terminals"],
     action: "open_deck",
     invoke: "openDeck",
-    screens: ["overview"],
-    unavailableHint: "returning to the deck works from the agent overview",
-    report: "Back to the deck.",
+    screens: ["deck", "overview"],
+    unavailableHint: "the Daemons screen opens from the rail once the agent's pane is closed",
+    report: "Back to the Daemons screen.",
+  },
+  {
+    // Both screens, because the one rail offers Settings on both (#1197).
+    phrases: ["open settings", "settings", "open the settings"],
+    action: "open_settings",
+    invoke: "openSettings",
+    screens: ["deck", "overview"],
+    unavailableHint: "settings open from the rail once the agent's pane is closed",
+    report: "Opening settings.",
   },
   {
     // The VIEW, never the terminal pane — the same line `commands.toml` draws at
@@ -882,7 +1165,7 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     action: "submit_prompt",
     invoke: "submitAgentPrompt",
     screens: ["agent"],
-    unavailableHint: "sending a prompt needs an agent's pane open",
+    unavailableHint: "sending a prompt needs an agent's pane open — open one first",
     report: "Sent.",
   },
 ];

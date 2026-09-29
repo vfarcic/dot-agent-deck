@@ -2,6 +2,7 @@
 name = "xtask-docs"
 version = "0.0.0"
 edition = "2024"
+rust-version.workspace = true
 publish = false
 
 # PRD #77 Decision 30: paired test docs for every `#[spec]` test.

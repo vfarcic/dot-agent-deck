@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { enterDeck } from "./support/overview";
 
 const SETTINGS_KEY = "dot-agent-deck.desktop-settings";
 
@@ -13,6 +14,7 @@ async function openWithSpeech(page: Page) {
     }));
   }, SETTINGS_KEY);
   await page.goto("/?fixture=1&state=connected");
+  await enterDeck(page);
 }
 
 function voiceButton(page: Page) {
@@ -68,7 +70,7 @@ test.describe("voice control through the browser fixture", () => {
 
     await trigger.click();
 
-    await expect(page.getByText("Opening the agent overview.")).toBeVisible();
+    await expect(page.getByText("Opening the agent dashboard.")).toBeVisible();
     await expect(page.getByTestId("overview-table-region")).toBeVisible();
     await expect(trigger).toHaveText(/voice\s+on/i);
     await expect(trigger).toHaveAttribute("aria-pressed", "true");
@@ -115,7 +117,7 @@ test.describe("the voice row is reserved space", () => {
   }
 
   /**
-   * Scenario: open Planner's pane over the deck, so the agent is enlarged to the
+   * Scenario: open Planner's pane over the daemon, so the agent is enlarged to the
    * whole window, and measure the voice row underneath it. The row sits on the
    * window's bottom edge from the rail's right edge across, the pane's content
    * stops above it, a click at the row's centre reaches the row rather than the
@@ -160,7 +162,7 @@ test.describe("the voice row is reserved space", () => {
     await openWithSpeech(page);
     await voiceButton(page).click();
 
-    await expect(page.getByText("Opening the agent overview.")).toBeVisible();
+    await expect(page.getByText("Opening the agent dashboard.")).toBeVisible();
     const undo = page.getByRole("button", { name: "Undo" });
     await expect(undo).toBeVisible();
     // The real question about a control: can it be clicked. `trial` runs every

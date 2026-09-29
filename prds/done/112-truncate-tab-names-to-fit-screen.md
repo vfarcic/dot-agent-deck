@@ -88,4 +88,4 @@ Recompute on every frame — the inputs (terminal width, tab list, tab names) ar
 - `src/ui.rs:4914-4945` — tab bar layout and `Tabs` widget rendering
 - `src/ui.rs:4924-4928` — current `Line` construction with `" {l} "` padding
 - `src/ui.rs:4944` — divider character `│`
-- `prds/78-tab-level-status-indicators.md` — related work that also affects tab label width
+- `prds/done/78-tab-level-status-indicators.md` — related work that also affects tab label width

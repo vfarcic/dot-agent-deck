@@ -364,7 +364,7 @@ fn key_forwarding_002_enhanced_keyboard_protocol_pushed_and_popped() {
     //
     // `mut` for `wait_for_exit_within` below, which reaps the child.
     let mut deck = TuiDeck::launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // --- The push (Gap 1). The harness's `answer_terminal_queries` replies to
     // the `ESC[?u` / `ESC[c` probe, so `supports_keyboard_enhancement()` returns

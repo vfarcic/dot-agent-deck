@@ -28,6 +28,7 @@ import type {
   TerminalFeed,
 } from "../types";
 import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } from "../lib/terminalInput";
+import { blockedReasonText } from "../lib/blockedReason";
 import { OutputReader } from "./OutputReader";
 import { TerminalViewport } from "./TerminalViewport";
 
@@ -35,7 +36,7 @@ const tabs: { id: PanelTab; label: string; icon: typeof SquareTerminal }[] = [
   { id: "terminal", label: "Terminal", icon: SquareTerminal },
   { id: "diff", label: "Diff", icon: GitCompareArrows },
   { id: "checks", label: "Checks", icon: ShieldCheck },
-  { id: "handoffs", label: "Handoffs", icon: Handshake },
+  { id: "handoffs", label: "Delegations", icon: Handshake },
   { id: "artifacts", label: "Artifacts", icon: Box },
 ];
 
@@ -300,7 +301,7 @@ export function AgentTile({
           <div>
             <div className="agent-title-line">
               <h2>{agent.role}</h2>
-              {agent.isStartRole && <span className="coordinator-badge" title="Orchestration start role">COORDINATOR</span>}
+              {agent.isStartRole && <span className="coordinator-badge" title="Orchestration start role">ORCHESTRATOR</span>}
               {/*
                 Issue #1143 — a held record's status is a past reading, so it is
                 worded as one, and the live colour goes with it because a teal
@@ -345,6 +346,11 @@ export function AgentTile({
                 )}
               </p>
             )}
+            {/* Issue #714: say WHY the agent is blocked, beside the status it
+                explains. Not on a held record: that status is a past reading. */}
+            {agent.status === "blocked" && !held && (
+              <p className="agent-blocked-reason" data-testid={`blocked-reason-${agent.id}`}>{blockedReasonText(agent.blocked)}</p>
+            )}
           </div>
         </div>
         {/*
@@ -353,7 +359,7 @@ export function AgentTile({
           printed `ATT 01` as if the daemon tracked retries; it tracks none.
         */}
         <div className="agent-header-actions">
-          <div className="agent-attempt" title={agent.attempt === undefined ? "No attempt count is reported by the deck" : "Current attempt"}>
+          <div className="agent-attempt" title={agent.attempt === undefined ? "No attempt count is reported by the daemon" : "Current attempt"}>
             <span>ATT</span>
             <strong>{agent.attempt === undefined ? "—" : agent.attempt.toString().padStart(2, "0")}</strong>
           </div>
@@ -377,8 +383,8 @@ export function AgentTile({
           {onClose && (
             <button
               className="agent-pane-control"
-              aria-label={`Close ${agent.role} agent`}
-              title={`Close ${agent.displayName} and go back`}
+              aria-label="Back to dashboard"
+              title="Back to dashboard"
               onMouseDown={(event) => event.stopPropagation()}
               onClick={onClose}
             ><X size={14} /></button>
@@ -472,7 +478,7 @@ export function AgentTile({
                    cells label theirs, because an ISO string alone in a tooltip
                    says nothing about what it is the time OF. Absent where
                    there is no held record to date. */
-                title={noTerminal.noticeTitle && `Last reported by the deck at: ${noTerminal.noticeTitle}`}
+                title={noTerminal.noticeTitle && `Last reported by the daemon at: ${noTerminal.noticeTitle}`}
               >
                 <Unplug size={15} aria-hidden="true" />
                 <span>{noTerminal.notice}</span>
@@ -512,7 +518,7 @@ export function AgentTile({
         {tab === "diff" && (
           <div className="text-panel diff-panel">
             <div className="panel-caption"><FileCode2 size={14} /> Changed files</div>
-            {agent.diff.length ? agent.diff.map((line) => <code key={line}>{line}</code>) : <EmptyPanel label={fixture ? "No changes in this agent's lease" : "Diff data is not exposed by the deck"} />}
+            {agent.diff.length ? agent.diff.map((line) => <code key={line}>{line}</code>) : <EmptyPanel label={fixture ? "No changes in this agent's lease" : "Diff data is not exposed by the daemon"} />}
           </div>
         )}
         {tab === "checks" && (
@@ -523,7 +529,7 @@ export function AgentTile({
                 <div><strong>{check.name}</strong><span>{check.command ?? "Pending command"}</span></div>
                 <small>{check.duration ?? check.status}</small>
               </div>
-            )) : <EmptyPanel label={fixture ? "No checks attached" : "Check results are not exposed by the deck"} />}
+            )) : <EmptyPanel label={fixture ? "No checks attached" : "Check results are not exposed by the daemon"} />}
           </div>
         )}
         {tab === "handoffs" && (
@@ -533,14 +539,14 @@ export function AgentTile({
                 <span className={`verdict verdict-${item.verdict.toLowerCase()}`}>{item.verdict}</span>
                 <div><strong>{item.title}</strong><small>{item.from} → {item.to}</small></div>
               </button>
-            )) : <EmptyPanel label={fixture ? "No handoff evidence yet" : "Structured handoffs are not exposed by the deck"} />}
+            )) : <EmptyPanel label={fixture ? "No delegation events yet" : "Structured delegations are not exposed by the daemon"} />}
           </div>
         )}
         {tab === "artifacts" && (
           <div className="text-panel artifact-panel">
             {agent.artifacts.length ? agent.artifacts.map((artifact) => (
               <div key={artifact.id}><Box size={14} /><span><strong>{artifact.name}</strong><code>{artifact.path}</code></span></div>
-            )) : <EmptyPanel label={fixture ? "No artifacts produced" : "Artifacts are not exposed by the deck"} />}
+            )) : <EmptyPanel label={fixture ? "No artifacts produced" : "Artifacts are not exposed by the daemon"} />}
           </div>
         )}
       </div>

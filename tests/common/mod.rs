@@ -33,6 +33,12 @@
 /// (`tests/agent_event.rs`, `tests/orchestration_delegate.rs`).
 pub mod synthetic_agent;
 
+/// Issue #701: a machine-wide load reading taken over each test process's own
+/// window and appended to every panic the harness's hook renders, so a failure
+/// caused by a starved machine labels itself instead of looking identical to a
+/// regression. The module header has the signals and what they do not prove.
+pub(crate) mod load_context;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -99,6 +105,17 @@ pub const WRAP_TEST_MAX_LIFETIME_SECS: &str = "120";
 /// yet" cannot be mistaken for "the child produced the wrong thing", which is
 /// precisely what a 2 s ceiling did on a 16-core box at load average 44.
 pub const CHILD_BOOT_BASE: Duration = Duration::from_secs(8);
+
+/// Issue #701: base ceiling, before [`load_scaled`], on the whole of
+/// [`TuiDeck::submit_claude_prompt`] — the typed prompt reaching the screen
+/// and then Claude Code's `UserPromptSubmit` hook firing, under one deadline. On a healthy run the
+/// hook lands a few seconds before `ToolStart`, and every wait here returns the
+/// instant it holds, so the ceiling is paid only by a prompt that was lost.
+pub const CLAUDE_PROMPT_SUBMIT_BASE: Duration = Duration::from_secs(20);
+
+/// Issue #701: how long [`TuiDeck::submit_claude_prompt`] waits for the hook
+/// after one Enter before pressing it again.
+pub const CLAUDE_SUBMIT_RETRY: Duration = Duration::from_secs(3);
 
 /// Issue #709: the 1-minute load average per CPU, or `None` where this platform
 /// does not publish one cheaply.
@@ -363,6 +380,7 @@ pub struct TuiDeckBuilder {
     claude_trust_paths: Vec<String>,
     claude_trust_workdir: bool,
     suppress_success_recording: bool,
+    suppress_agent_credentials: bool,
     launch_subdir: Option<PathBuf>,
 }
 
@@ -566,6 +584,19 @@ impl TuiDeckBuilder {
         self
     }
 
+    /// Launch with no agent credential in the deck's environment: every
+    /// variable in [`AGENT_CREDENTIAL_ENV`] is removed after every other layer,
+    /// `with_env` included, so the ambient `ANTHROPIC_API_KEY` [`INHERIT_PASS`]
+    /// would otherwise carry across `env_clear` never reaches the deck, the
+    /// daemon it lazy-spawns, or anything that daemon spawns. For a scenario
+    /// that runs no real agent and so has no use for one — issue #1322's docs
+    /// screenshots, whose frames are written out as HTML and PNGs. Opt-in: the
+    /// default launch is unchanged.
+    pub fn without_agent_credentials(mut self) -> Self {
+        self.suppress_agent_credentials = true;
+        self
+    }
+
     // NOTE (PRD #201): a `with_pi_extension()` builder that pre-staged the
     // bundled Pi extension into the per-test HOME was removed. Because `TuiDeck`
     // drives the REAL binary, its lazy-spawned daemon runs the `daemon serve`
@@ -651,6 +682,12 @@ pub struct TuiDeck {
     /// are scrubbed immediately before they are written so an agent or provider
     /// that echoes a credential cannot persist it in `full-stream.cast`.
     recording_redactions: Vec<String>,
+    /// The lazy-spawned daemon's `<state_dir>/daemon.log`, which receives its
+    /// stdout and stderr — including every `StderrNotifier` dispatch outcome
+    /// (issue #692). The state dir sits inside `tempdir`, so without the dump in
+    /// [`TuiDeck::dump_recordings`] a failing test deleted the one line that says
+    /// why. `None` when a test's `with_env` removed the state-dir pin.
+    daemon_log_path: Option<PathBuf>,
 }
 
 /// Observable terminal-cell styling from the outer vt100 screen driven by the
@@ -788,6 +825,7 @@ impl TuiDeck {
             claude_trust_paths: Vec::new(),
             claude_trust_workdir: false,
             suppress_success_recording: false,
+            suppress_agent_credentials: false,
             launch_subdir: None,
         }
     }
@@ -1180,6 +1218,16 @@ impl TuiDeck {
         for (k, v) in builder.extra_env {
             final_env.insert(k, v);
         }
+        if builder.suppress_agent_credentials {
+            for k in AGENT_CREDENTIAL_ENV {
+                final_env.remove(k);
+            }
+        }
+        // Read AFTER the `with_env` layer, so a test that moves the state dir
+        // still gets its own daemon's log dumped rather than a missing path.
+        let daemon_log_path = final_env
+            .get("DOT_AGENT_DECK_STATE_DIR")
+            .map(|dir| PathBuf::from(dir).join("daemon.log"));
         for (k, v) in final_env {
             cmd.env(k, v);
         }
@@ -1291,6 +1339,7 @@ impl TuiDeck {
             rows: builder.rows,
             record_on_success,
             recording_redactions,
+            daemon_log_path,
         })
     }
 
@@ -1358,6 +1407,36 @@ impl TuiDeck {
                 );
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Issue #1322: wait until `capture` returns `Some` for the outer vt100
+    /// screen, and return what it returned. `capture` runs under the parser
+    /// lock, so the frame it inspects is the frame it captures — a blink or a
+    /// redraw cannot land between deciding the screen is ready and reading it,
+    /// which [`Self::wait_until_grid`] followed by a separate read cannot
+    /// promise. Panics after the harness timeout, naming `what`.
+    pub fn capture_screen_when<R>(
+        &self,
+        what: &str,
+        capture: impl Fn(&vt100::Screen) -> Option<R>,
+    ) -> R {
+        install_credential_redaction();
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            {
+                let parser = self.parser.lock().unwrap();
+                if let Some(captured) = capture(parser.screen()) {
+                    return captured;
+                }
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "did not reach screen state {what:?} within {WAIT_TIMEOUT:?}.\nFinal grid:\n{}",
+                    self.snapshot_grid()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -1797,6 +1876,166 @@ impl TuiDeck {
         EventSub::open(&self.attach_socket).expect("open SubscribeEvents stream")
     }
 
+    /// Issue #701: type `prompt` into a real interactive Claude Code pane that
+    /// has painted `? for shortcuts`, submit it, and return the `Thinking`
+    /// event (Claude Code's `UserPromptSubmit` hook) that proves it landed.
+    ///
+    /// **Why Enter is its own step, retried on the outcome.** Sent in one burst
+    /// with the text, the `\r` can reach Claude Code inside the same read as the
+    /// tail of the prompt, and is then taken as part of a paste — a newline in
+    /// the input rather than a submit. Measured on `shell_activity_005` under 48
+    /// busy-loops on 16 CPUs: 3 of 3 runs ended with the whole prompt sitting
+    /// unsubmitted in the input box, nothing but `SessionStart` in the event
+    /// stream, and a 120 s `ToolStart` timeout that read as the model declining
+    /// to use Bash. So this waits until `probe` — a space-free substring of
+    /// `prompt`, so line wrapping cannot split it — is on screen and followed by
+    /// the prompt's last word before the first Enter, and the same load then passed 3 of 3 with that first Enter
+    /// submitting every time. Enter is repeated until the hook fires as a
+    /// backstop for a `\r` that still lands inside the burst; a repeat on an
+    /// input that already submitted lands on an empty prompt.
+    /// `e2e_codex_wrapper.rs` retries Codex's Enter on the same outcome-based
+    /// reasoning.
+    ///
+    /// Only a `Thinking` event that carries prompt text and arrives AFTER the
+    /// prompt is typed counts, so an earlier turn on the same agent — or a
+    /// prompt-less `Thinking` such as `PostCompact`'s — cannot satisfy it, and
+    /// its reported prompt must match what was typed. On failure the panic starts with
+    /// `PROMPT NOT DELIVERED` or `PROMPT PARTIALLY DELIVERED` and names which
+    /// step failed,
+    /// so a lost prompt is never read as a regression in what the calling test
+    /// asserts about the agent's behaviour.
+    #[cfg(unix)]
+    pub fn submit_claude_prompt(
+        &self,
+        events: &EventSub,
+        agent_id: &str,
+        prompt: &str,
+        probe: &str,
+    ) -> dot_agent_deck::event::AgentEvent {
+        assert!(
+            prompt.contains(probe) && !probe.contains(char::is_whitespace) && !probe.is_empty(),
+            "submit_claude_prompt: the probe {probe:?} must be a non-empty, space-free \
+             substring of the prompt"
+        );
+        let tail = prompt
+            .split_whitespace()
+            .last()
+            .expect("submit_claude_prompt: an empty prompt");
+        // Only a `Thinking` that carries prompt text is a submission. Claude
+        // Code's `UserPromptSubmit` always reports the prompt; the other hooks
+        // mapped to `Thinking` (`PostCompact`, for one) report none, and must
+        // not be read as "our prompt landed" (PR #1408 review).
+        let is_submit = |e: &dot_agent_deck::event::AgentEvent| {
+            e.agent_id.as_deref() == Some(agent_id)
+                && e.event_type == dot_agent_deck::event::EventType::Thinking
+                && e.user_prompt.is_some()
+        };
+        let before = events.snapshot().iter().filter(|e| is_submit(e)).count();
+        self.send_keys(prompt.as_bytes());
+        // ONE deadline for both halves, so the helper reports its own failure
+        // well inside a test's nextest kill window instead of being killed
+        // between two back-to-back ceilings.
+        let budget = load_scaled(CLAUDE_PROMPT_SUBMIT_BASE);
+        let deadline = Instant::now() + budget;
+        // The probe proves the text up to it rendered; the prompt's LAST word
+        // appearing after it proves the rest did. Word-wrap moves a whole word
+        // to the next row rather than splitting it, so a space-free token is
+        // matchable on one row.
+        let typed = || {
+            let grid = self.snapshot_grid();
+            let Some(at) = grid.find(probe) else {
+                return false;
+            };
+            let after = &grid[at + probe.len()..];
+            probe.ends_with(tail) || after.contains(tail)
+        };
+        while !typed() {
+            if Instant::now() >= deadline {
+                panic!(
+                    "PROMPT NOT DELIVERED: the typed prompt never finished rendering in Claude \
+                     Code's input — no {probe:?} followed by its last word {tail:?} within \
+                     {budget:?} — so nothing after this point was exercised.\nFinal grid:\n{}",
+                    self.snapshot_grid()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The hook reports the submitted text truncated to 200 bytes, so the
+        // match catches a prefix submitted short of that and a garbled one; a
+        // longer prefix is what the tail wait above exists to prevent. The
+        // report is passed unchanged: the matcher already ignores exactly the
+        // trailing `\n`/`\r`/space/tab a `\r`-taken-as-newline would leave, and
+        // no wider (a trailing NBSP stays significant) (PR #1408 review).
+        let is_ours = |e: &dot_agent_deck::event::AgentEvent| {
+            e.user_prompt.as_deref().is_some_and(|reported| {
+                dot_agent_deck::prompt_delivery::prompt_submission_matches(prompt, reported)
+            })
+        };
+        // Submissions reported since typing began. The FIRST one carrying THIS
+        // prompt is the answer, rather than the first by position: an earlier
+        // turn's event delivered late — after the count above, before the
+        // keystrokes — then cannot stand in for ours, and cannot fail the
+        // helper either, because its text does not match (PR #1408 review).
+        let since_typing = || -> Vec<dot_agent_deck::event::AgentEvent> {
+            events
+                .snapshot()
+                .into_iter()
+                .filter(|e| is_submit(e))
+                .skip(before)
+                .collect()
+        };
+        let mut enters = 0_usize;
+        loop {
+            self.send_keys(b"\r");
+            enters += 1;
+            let attempt_end = (Instant::now() + CLAUDE_SUBMIT_RETRY).min(deadline);
+            while Instant::now() < attempt_end {
+                if let Some(ev) = since_typing().into_iter().find(|e| is_ours(e)) {
+                    if enters > 1 {
+                        eprintln!(
+                            "[harness] submit_claude_prompt: Claude Code accepted the prompt \
+                             only after Enter #{enters}"
+                        );
+                    }
+                    return ev;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if Instant::now() >= deadline {
+                let others: Vec<String> = since_typing()
+                    .into_iter()
+                    .filter_map(|e| e.user_prompt)
+                    .collect();
+                if !others.is_empty() {
+                    panic!(
+                        "PROMPT PARTIALLY DELIVERED: within {budget:?} Claude Code submitted \
+                         {others:?}, none of which is the prompt the test typed ({prompt:?}), \
+                         so what the agent does next is not evidence about the calling test's \
+                         assertions.\nFinal grid:\n{}",
+                        self.snapshot_grid()
+                    );
+                }
+                panic!(
+                    "PROMPT NOT DELIVERED: the prompt is on screen but {enters} Enter(s) within \
+                     {budget:?} of typing it produced no UserPromptSubmit (Thinking) event for \
+                     agent {agent_id:?}. The keystrokes never became a submitted prompt, so \
+                     nothing after this point was exercised — this is not a regression in what \
+                     the calling test asserts; the load context below says whether the machine \
+                     was starved at the time.\nObserved events: {:#?}\nFinal grid:\n{}",
+                    events.snapshot(),
+                    self.snapshot_grid()
+                );
+            }
+        }
+    }
+
+    /// The spawned deck's process id, when the PTY backend reports one. For a
+    /// test that inspects what the process was launched with, such as issue
+    /// #1322's check that a credential-free launch really is one.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
     /// Returns the deck's per-test hook socket path. Synthetic-event
     /// L2 tests connect to this directly to inject hook payloads.
     pub fn hook_socket_path(&self) -> &Path {
@@ -2212,6 +2451,30 @@ impl Drop for TuiDeck {
     }
 }
 
+/// How much of a failed run's `daemon.log` [`eprint_daemon_log_tail`] echoes.
+const DAEMON_LOG_TAIL_LINES: usize = 40;
+
+/// Echo the tail of an already-redacted daemon log to stderr (issue #692).
+///
+/// The dumped file is enough on a developer machine, but CI uploads nextest's
+/// JUnit report and not the recordings directory, and the report carries the
+/// test's captured stderr — so this is what puts a dispatch failure's reason in
+/// front of whoever reads a red `e2e-deterministic` run. Bounded, because a
+/// chatty daemon must not bury the assertion that failed.
+fn eprint_daemon_log_tail(redacted: &[u8], where_the_rest_is: &str) {
+    let text = String::from_utf8_lossy(redacted);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(DAEMON_LOG_TAIL_LINES);
+    eprintln!(
+        "[tui-harness] daemon.log (last {} of {} lines; {where_the_rest_is}):",
+        lines.len() - start,
+        lines.len(),
+    );
+    for line in &lines[start..] {
+        eprintln!("[daemon.log] {line}");
+    }
+}
+
 /// Best-effort: regenerate the paired `.md` for the currently-running
 /// test. Looks up the test by its Rust thread-name (which is the fn
 /// name in cargo test), maps that to a spec id via the discovered
@@ -2322,6 +2585,32 @@ impl TuiDeck {
             let bytes = std::fs::read(&fixture_src)?;
             let redacted = redact_known_credentials_bytes(&bytes, &redactions);
             atomic_write(&dir.join("fixture.toml"), &redacted)?;
+        }
+
+        // daemon.log — issue #692. The detached daemon's stdout+stderr, which is
+        // where every dispatch outcome's reason lands (`StderrNotifier`); the
+        // tracing log carries nothing for the dispatch prologue, so this is the
+        // only record of why a dispatch test saw no agents. It lives in the
+        // per-test tempdir and is deleted with it, so it is copied out here.
+        // Absent when the run never spawned a daemon (or reused an external
+        // one), which is not an error. Redacted like every other artifact,
+        // because the daemon echoes `gh`'s stderr verbatim.
+        if let Some(src) = self.daemon_log_path.as_deref() {
+            match std::fs::read(src) {
+                Ok(bytes) => {
+                    let redacted = redact_known_credentials_bytes(&bytes, &redactions);
+                    atomic_write(&dir.join("daemon.log"), &redacted)?;
+                    if outcome == RecordingOutcome::Failed {
+                        let copy = dir.join("daemon.log");
+                        eprint_daemon_log_tail(
+                            &redacted,
+                            &format!("full copy at {}", copy.display()),
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
 
         // provenance.json — issue #808. Written LAST on purpose: the adapter
@@ -3572,6 +3861,8 @@ pub fn install_credential_redaction() {
             store.append(&mut ambient);
             normalise_redactions(&mut store);
         }
+        // Issue #701: the baseline the panic-time load report is measured from.
+        load_context::arm();
         std::panic::set_hook(Box::new(|info| {
             let payload = panic_payload_text(info.payload());
             let location = info
@@ -3583,6 +3874,9 @@ pub fn install_credential_redaction() {
                 .unwrap_or("<unnamed>")
                 .to_string();
             let mut rendered = format_redacted_panic(&thread, &location, &payload);
+            // Issue #701: machine-wide numbers only, nothing a test rendered, so
+            // it carries no credential and needs no redaction pass.
+            rendered.push_str(&load_context::failure_report());
             // Same shape the default hook produces, so a failure still reads
             // the way a contributor expects. A backtrace carries symbol names
             // rather than data, but it is redacted too — free, and one less
@@ -4278,12 +4572,13 @@ pub fn current_test_recordings_dir() -> PathBuf {
 /// will publish the cast, so removing it before the cast means a discard that
 /// panics partway has already made whatever survives unpublishable. The dump
 /// writes it LAST for the mirror-image reason.
-const RECORDING_ARTIFACTS: [&str; 5] = [
+const RECORDING_ARTIFACTS: [&str; 6] = [
     "provenance.json",
     "final-grid.txt",
     "final-grid.svg",
     "full-stream.cast",
     "fixture.toml",
+    "daemon.log",
 ];
 
 /// Schema version of the `provenance.json` sidecar (issue #808).
@@ -4691,6 +4986,11 @@ pub const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 /// the deck lazy-spawns the daemon that spawns the agent. The reasoning for each
 /// entry is at the use site.
 pub(crate) const INHERIT_PASS: [&str; 2] = ["PATH", ANTHROPIC_API_KEY_ENV];
+
+/// The agent credential variables [`TuiDeckBuilder::without_agent_credentials`]
+/// keeps out of a deck's environment: the one [`INHERIT_PASS`] carries across
+/// `env_clear`, and the OpenAI key a `with_env` could add back.
+pub(crate) const AGENT_CREDENTIAL_ENV: [&str; 2] = [ANTHROPIC_API_KEY_ENV, OPENAI_API_KEY_ENV];
 
 /// The ambient OpenAI API key, or `None` when unset, empty or whitespace-only.
 /// Same trim rule and same secret discipline as [`anthropic_api_key`]: returned
@@ -8563,6 +8863,11 @@ pub(crate) fn temp_space_problem(path: &Path) -> Option<String> {
 pub(crate) fn harness_temp_root() -> &'static Path {
     HARNESS_TEMP_ROOT
         .get_or_init(|| {
+            // Issue #701: this is the choke point every harness temp dir passes
+            // through, including headless tests that never obtain a grid, so it
+            // is where the panic hook — and with it the load baseline — gets
+            // installed for them. Idempotent; a no-op when already installed.
+            install_credential_redaction();
             let choice = harness_temp_base();
             for warning in &choice.warnings {
                 eprintln!("[harness] WARNING: {warning}");
@@ -8764,6 +9069,20 @@ impl Drop for DaemonProc {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Issue #692: the captured stderr is where the scheduler reports WHY a
+        // dispatch failed, and it lives in `_tempdir`, which is removed right
+        // after this. On a failing test, echo its tail so the reason survives
+        // into nextest's output (and CI's JUnit report) instead of going with
+        // the tempdir.
+        if std::thread::panicking()
+            && let Ok(bytes) = std::fs::read(&self.stderr_path)
+        {
+            let redacted = redact_credentials_for_output(&String::from_utf8_lossy(&bytes));
+            eprint_daemon_log_tail(
+                redacted.as_bytes(),
+                "the file itself is removed with the test's tempdir",
+            );
+        }
     }
 }
 
@@ -9117,8 +9436,8 @@ impl DaemonProc {
         want: usize,
         timeout: Duration,
     ) -> bool {
-        use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, KIND_STREAM_OUT};
-        use std::io::{Read, Write};
+        use dot_agent_deck::daemon_protocol::KIND_REQ;
+        use std::io::Write;
 
         let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&self.attach_socket) else {
             return false;
@@ -9144,37 +9463,7 @@ impl DaemonProc {
         }
         let _ = stream.flush();
 
-        let mut acc: Vec<u8> = Vec::new();
-        let needle_bytes = needle.as_bytes();
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            let mut fh = [0u8; 5];
-            match stream.read_exact(&mut fh) {
-                Ok(()) => {}
-                Err(ref e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    continue;
-                }
-                Err(_) => return false,
-            }
-            let kind = fh[0];
-            let len = u32::from_be_bytes([fh[1], fh[2], fh[3], fh[4]]) as usize;
-            let mut body = vec![0u8; len];
-            if len > 0 && read_exact_with_deadline(&mut stream, &mut body, deadline).is_err() {
-                return false;
-            }
-            if kind == KIND_STREAM_OUT {
-                acc.extend_from_slice(&body);
-                if count_occurrences(&acc, needle_bytes) >= want {
-                    return true;
-                }
-            } else if kind == KIND_RESP {
-                continue;
-            }
-        }
-        false
+        read_attach_stream_until(&mut stream, needle, want, Instant::now() + timeout)
     }
 
     /// Simulate a user keystroke into a pane: attach to `agent_id` and send one
@@ -9218,9 +9507,24 @@ impl DaemonProc {
             return false;
         }
         let _ = stream.flush();
-        // Hold the connection open briefly so the daemon drains the STREAM_IN
-        // before the socket closes (defensive; the kernel buffers regardless).
-        std::thread::sleep(Duration::from_millis(50));
+        // Hold the connection until the daemon has provably reached its input
+        // loop, rather than for a fixed 50 ms (issue #1137). The kernel buffers
+        // the inbound STREAM_IN either way, but the daemon writes the
+        // `AttachStream` OK and the scrollback snapshot BEFORE it starts reading
+        // input, and a write to a socket we have already closed fails with
+        // `EPIPE` — which ends the handler with the keystroke still unread. Any
+        // STREAM_OUT carrying the echo proves both writes landed: the snapshot
+        // is written before live output starts, and an echo already in the
+        // replayed scrollback is equally past that point. From there the input
+        // loop reads the buffered frame before it can observe our EOF.
+        if !read_attach_stream_until(
+            &mut stream,
+            input,
+            1,
+            Instant::now() + Duration::from_secs(5),
+        ) {
+            return false;
+        }
         drop(stream);
         // Confirm the keystroke reached the PTY (and was timestamped) by
         // observing its echo on a fresh attach.
@@ -9527,6 +9831,61 @@ fn read_framed(
         }
     }
     Ok(Some((kind, body)))
+}
+
+/// Read an attach stream's frames until `needle` has appeared at least `want`
+/// (non-overlapping) times in its cumulative STREAM_OUT, or `deadline` passes.
+///
+/// The frame loop [`DaemonProc::attach_and_wait_for_occurrences`] and
+/// [`DaemonProc::send_pane_input`] share, the second so that it can hold its
+/// own connection open until the daemon has provably reached the input loop
+/// (issue #1137). A `KIND_RESP` answered `ok: false` returns `false` at once:
+/// the daemon sends no stream after refusing an attach, so waiting out the
+/// deadline could not change the answer.
+#[cfg(unix)]
+#[allow(dead_code)]
+fn read_attach_stream_until(
+    stream: &mut std::os::unix::net::UnixStream,
+    needle: &str,
+    want: usize,
+    deadline: Instant,
+) -> bool {
+    use dot_agent_deck::daemon_protocol::{KIND_RESP, KIND_STREAM_OUT};
+
+    let mut acc: Vec<u8> = Vec::new();
+    let needle_bytes = needle.as_bytes();
+    while Instant::now() < deadline {
+        // Through `read_exact_with_deadline`, which keeps what it has already
+        // read across a socket read timeout. A bare `read_exact` retried after
+        // `WouldBlock` discards a partially filled header, and the next read
+        // then takes the header's tail for a new one (raised by Qodo on PR
+        // #1304). Its `TimedOut` at the deadline ends the wait like any other
+        // error: the deadline is this loop's own.
+        let mut fh = [0u8; 5];
+        if read_exact_with_deadline(stream, &mut fh, deadline).is_err() {
+            return false;
+        }
+        let kind = fh[0];
+        let len = u32::from_be_bytes([fh[1], fh[2], fh[3], fh[4]]) as usize;
+        let mut body = vec![0u8; len];
+        if len > 0 && read_exact_with_deadline(stream, &mut body, deadline).is_err() {
+            return false;
+        }
+        if kind == KIND_STREAM_OUT {
+            acc.extend_from_slice(&body);
+            if count_occurrences(&acc, needle_bytes) >= want {
+                return true;
+            }
+        } else if kind == KIND_RESP {
+            let refused =
+                serde_json::from_slice::<dot_agent_deck::daemon_protocol::AttachResponse>(&body)
+                    .is_ok_and(|resp| !resp.ok);
+            if refused {
+                return false;
+            }
+        }
+    }
+    false
 }
 
 /// Count non-overlapping occurrences of `needle` in `hay`.
@@ -10103,6 +10462,84 @@ pub fn write_late_announcing_agent(
              \x20 printf 'received|%s\\n' \"$line\" >> \"$log\"\n\
              \x20 {json_escape}\n\
              \x20 {submitted}\
+             done\n",
+            prologue = late_announce_prologue(log_name, announce_after_secs),
+            json_escape = LATE_ANNOUNCE_JSON_ESCAPE,
+        ),
+    )
+}
+
+/// [`write_late_announcing_agent`] with Claude Code's bracketed-paste submit
+/// shape: all lines between `ESC[200~` and `ESC[201~` become one
+/// `UserPromptSubmit` event instead of one event per line.
+///
+/// This is opt-in because existing callers deliberately exercise the older
+/// line-at-a-time stand-in. The authoring seeds use it because the deck writes
+/// each multi-line seed as one bracketed paste and real Claude Code reports
+/// that paste as one turn. The fixture accepts the marker both with its leading
+/// ESC byte and in the `[200~` / `[201~` form observed after the fixture PTY's
+/// input processing. It logs each marker-free line as `received|…`, then logs
+/// `submitted|paste` after the single hook invocation so callers can reconstruct
+/// the exact submitted text without weakening duplicate-delivery assertions.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn write_late_announcing_paste_agent(
+    dir: &Path,
+    log_name: &str,
+    announce_after_secs: u64,
+) -> PathBuf {
+    let genuine_start = late_announce_hook(
+        r#"{"hook_event_name":"SessionStart","session_id":"genuine-%s"}"#,
+        "\"$DOT_AGENT_DECK_PANE_ID\"",
+        98,
+    );
+    let submitted = late_announce_hook(
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"genuine-%s","prompt":"%s"}"#,
+        "\"$DOT_AGENT_DECK_PANE_ID\" \"$json_prompt\"",
+        99,
+    );
+    write_late_announcing_script(
+        dir,
+        &format!(
+            "{prologue}\
+             {genuine_start}\
+             paste_open=$(printf '\\033[200~')\n\
+             paste_close=$(printf '\\033[201~')\n\
+             in_paste=0\n\
+             json_prompt=''\n\
+             separator=''\n\
+             while IFS= read -r line; do\n\
+             \x20 if [ \"$in_paste\" -eq 0 ]; then\n\
+             \x20\x20 case \"$line\" in\n\
+             \x20\x20\x20 \"$paste_open\"*) line=${{line#\"$paste_open\"}}; in_paste=1 ;;\n\
+             \x20\x20\x20 \"[200~\"*) line=${{line#\"[200~\"}}; in_paste=1 ;;\n\
+             \x20\x20 esac\n\
+             \x20 fi\n\
+             \x20 paste_done=0\n\
+             \x20 if [ \"$in_paste\" -eq 1 ]; then\n\
+             \x20\x20 case \"$line\" in\n\
+             \x20\x20\x20 *\"$paste_close\") line=${{line%\"$paste_close\"}}; paste_done=1 ;;\n\
+             \x20\x20\x20 *\"[201~\") line=${{line%\"[201~\"}}; paste_done=1 ;;\n\
+             \x20\x20 esac\n\
+             \x20 fi\n\
+             \x20 printf 'received|%s\\n' \"$line\" >> \"$log\"\n\
+             \x20 {json_escape}\n\
+             \x20 if [ \"$in_paste\" -eq 1 ]; then\n\
+             \x20\x20 json_prompt=\"${{json_prompt}}${{separator}}${{json_line}}\"\n\
+             \x20\x20 separator='\\n'\n\
+             \x20\x20 if [ \"$paste_done\" -eq 1 ]; then\n\
+             \x20\x20\x20 {submitted}\
+             \x20\x20\x20 printf 'submitted|paste\\n' >> \"$log\"\n\
+             \x20\x20\x20 in_paste=0\n\
+             \x20\x20\x20 json_prompt=''\n\
+             \x20\x20\x20 separator=''\n\
+             \x20\x20 fi\n\
+             \x20 else\n\
+             \x20\x20 json_prompt=$json_line\n\
+             \x20\x20 {submitted}\
+             \x20\x20 printf 'submitted|line\\n' >> \"$log\"\n\
+             \x20\x20 json_prompt=''\n\
+             \x20 fi\n\
              done\n",
             prologue = late_announce_prologue(log_name, announce_after_secs),
             json_escape = LATE_ANNOUNCE_JSON_ESCAPE,

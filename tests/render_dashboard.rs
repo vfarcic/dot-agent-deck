@@ -13,7 +13,8 @@ use dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN;
 use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
 use dot_agent_deck::pane::RenameOutcome;
 use dot_agent_deck::state::{
-    ActiveTool, AppState, DashboardStats, SessionSnapshot, SessionState, SessionStatus,
+    ActiveTool, AppState, BlockedKind, BlockedReason, DashboardStats, SessionSnapshot,
+    SessionState, SessionStatus,
 };
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
@@ -30,6 +31,15 @@ use ratatui::style::{Color, Modifier};
 use ratatui::widgets::Widget;
 use spec::spec;
 use unicode_width::UnicodeWidthStr;
+
+/// Issue #413: the instant every card fixture in this file is built against
+/// and rendered at. The card seams take `now` instead of reading the clock, so
+/// a card's `Last:` field is a pure function of the fixture's own timestamps —
+/// a fixed calendar instant cannot drift as the test ages, and no delay between
+/// building a fixture and drawing it can move a snapshot.
+fn render_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_767_225_600, 0).expect("a valid fixed instant")
+}
 
 /// Stringify the rendered buffer — one line per row, with cells joined
 /// into the symbol layer. `insta` then captures this representation, so
@@ -63,34 +73,24 @@ fn pane_004_card_title_row() {
     // doesn't need its own fn — keeping the test body
     // self-contained also reads as cleaner generated `.md` Steps).
     //
-    // Both timestamps derive from one current instant so the fixture keeps a
-    // compact `0s` elapsed value; a fixed calendar instant previously drifted
-    // into a large hour count as the test aged (M3 fix).
-    //
-    // `last_activity` is nudged 30s into the *future* of that instant rather
-    // than left equal to it (issue #350). The bottom border's `Last:` field is
-    // computed by `format_elapsed` (src/ui.rs) from `Utc::now()` at *render*
-    // time, not at fixture-build time, so `last_activity == now` put the
-    // rendered value exactly on the `0s`/`1s` boundary — any scheduling delay
-    // between building the fixture and rendering (routine under parallel test
-    // load) tipped this snapshot to `Last: 1s`. A *past* offset would only
-    // shrink the margin further; nudging forward instead relies on
-    // `format_elapsed`'s existing clamp of a negative delta to zero
-    // (`delta.num_seconds().max(0)`), so the value holds at `0s` for any
-    // render within 30s. No production change is needed — the clamp already
-    // handles this shape of input, and the committed snapshot is unchanged.
-    let now = chrono::Utc::now();
+    // Both timestamps are the instant the card is rendered at, so the bottom
+    // border reads `Last: 0s`. Issue #413: that instant is `render_now()`, handed
+    // to the seam rather than read from the clock at render time, so the value
+    // is `0s` however long the render takes — the 30s forward nudge #350 used to
+    // bound the race is gone with the race.
+    let now = render_now();
     let session = SessionState {
         session_id: "sess-abc123".to_string(),
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/example-project".to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Read".to_string(),
             detail: Some("src/main.rs".to_string()),
         }),
         started_at: now,
-        last_activity: now + chrono::Duration::seconds(30),
+        last_activity: now,
         recent_events: VecDeque::new(),
         tool_count: 7,
         last_user_prompt: Some("fix the login bug".to_string()),
@@ -100,6 +100,7 @@ fn pane_004_card_title_row() {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     };
     // The 80-cell buffer leaves ample room for the full bottom-border stats
     // title. Height comes from the density tier itself so the snapshot's
@@ -112,8 +113,9 @@ fn pane_004_card_title_row() {
         Some("example-coder"),
         Some(1),
         density,
-        0,     // animation tick
-        false, // not selected
+        0,            // animation tick
+        render_now(), // render instant
+        false,        // not selected
         width,
         height,
     );
@@ -122,14 +124,15 @@ fn pane_004_card_title_row() {
 
 /// Build a live card fixture whose stable values make the card-stats layout
 /// assertions readable: one hour since activity, fourteen tools, one prompt,
-/// and one active Read tool. The hour form remains `1h` for 60 seconds of drift.
+/// and one active Read tool, measured against `render_now()` (issue #413).
 fn card_stats_session(cwd: &str) -> SessionState {
-    let now = chrono::Utc::now();
+    let now = render_now();
     SessionState {
         session_id: "sess-card-stats".to_string(),
         agent_type: AgentType::ClaudeCode,
         cwd: Some(cwd.to_string()),
         status: SessionStatus::Thinking,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Read".to_string(),
             detail: Some("src/ui.rs".to_string()),
@@ -145,6 +148,7 @@ fn card_stats_session(cwd: &str) -> SessionState {
         display_name: Some("api-svc".to_string()),
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     }
 }
 
@@ -165,6 +169,7 @@ fn pane_006_card_fields_and_full_width_ellipsized_dir() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         width,
         density.rendered_height(),
@@ -197,6 +202,7 @@ fn pane_006_card_fields_and_full_width_ellipsized_dir() {
         Some(1),
         CardDensityKind::Compact,
         0,
+        render_now(),
         false,
         14,
         CardDensityKind::Compact.rendered_height(),
@@ -222,6 +228,7 @@ fn card_stats_001_wide_card_places_full_stats_in_bottom_right_border() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         width,
         density.rendered_height(),
@@ -268,7 +275,11 @@ fn card_stats_001_wide_card_places_full_stats_in_bottom_right_border() {
 #[spec("session/live/016")]
 #[test]
 fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
-    let quiet_for_an_hour = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp_millis();
+    // The real clock, not `render_now()`: hydration mints the placeholder card
+    // with its own `Utc::now()`, which this test cannot inject. Issue #413: it is
+    // read ONCE, and the snapshot's hour is counted back from it.
+    let now = chrono::Utc::now();
+    let quiet_for_an_hour = (now - chrono::Duration::hours(1)).timestamp_millis();
     let bottom_border_after_reconnect = |last_activity_ms: Option<i64>| {
         let snapshot = SessionSnapshot {
             status: SessionStatus::Idle,
@@ -279,6 +290,7 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
             last_user_prompt: Some("move the stats into the border".to_string()),
             live_target: None,
             last_activity_ms,
+            blocked: None,
         };
         let mut state = AppState::default();
         state.register_pane("pane-reconnect".to_string());
@@ -300,6 +312,7 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
             Some(1),
             density,
             0,
+            now,
             false,
             80,
             density.rendered_height(),
@@ -330,9 +343,12 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
             .nth(1)
             .and_then(|rest| rest.split("  Tools: ").next())
             .unwrap_or_else(|| panic!("{case}: the full stats label must render:\n{bottom}"));
-        // The seconds form, not a pinned `0s`: `format_elapsed` reads the clock
-        // at render time, so a loaded box can tip a just-minted card to `1s`
-        // (issue #350).
+        // The seconds form, not a pinned `0s`. The render itself reads no clock
+        // (issue #413), and in the ordinary case the placeholder is minted after
+        // `now` was read and clamps to `0s`. But the placeholder's instant comes
+        // from hydration's own `Utc::now()`, which this test cannot inject, so a
+        // backwards wall-clock step between the two reads would show as a few
+        // seconds.
         assert!(
             elapsed.ends_with('s')
                 && elapsed[..elapsed.len() - 1]
@@ -358,6 +374,7 @@ fn card_stats_002_narrow_card_degrades_label_without_overrunning_corners() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         width,
         density.rendered_height(),
@@ -401,6 +418,7 @@ fn card_stats_003_old_sixty_column_boundary_is_structurally_inert() {
             Some(1),
             density,
             0,
+            render_now(),
             false,
             width,
             density.rendered_height(),
@@ -559,14 +577,15 @@ fn buffer_to_color_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// `theme/contrast/001` and `theme/guard/001` drive these same seams; the
 /// label is only used to point assertion failures at the offending surface.
 fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
-    // Representative mix so every status segment renders, 140 cells wide so the
-    // whole bar fits without truncation (mirrors the prior contrast fixtures).
+    // Representative status mix, 140 cells wide so the bar fits without
+    // truncation (mirrors the prior contrast fixtures).
     let stats = DashboardStats {
         active: 6,
         working: 1,
         thinking: 1,
         waiting: 1,
         errors: 1,
+        blocked: 0,
         idle: 1,
         compacting: 1,
         total_tools: 42,
@@ -590,12 +609,13 @@ fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
 /// explicitly: `UiMode::Normal` — command mode, where the keyboard drives the deck
 /// and the accent renders at full strength.
 fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
-    let now = chrono::Utc::now();
+    let now = render_now();
     let placeholder = SessionState {
         session_id: String::new(),
         agent_type: AgentType::None,
         cwd: None,
         status: SessionStatus::Idle,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -608,6 +628,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     };
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
@@ -618,6 +639,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         None,
         density,
         0,
+        render_now(),
         selected,
         UiMode::Normal,
         width,
@@ -775,14 +797,15 @@ fn pane_007_pi_card_shows_pi_identity() {
     // default — it is NOT gated behind the experimental flag — so this test
     // touches no flag and expects the Pi identity to render unconditionally.
     //
-    // A current activity time keeps the compact bottom-border elapsed value
-    // small; this identity test does not assert its exact value.
-    let now = chrono::Utc::now();
+    // Activity at the render instant keeps the compact bottom-border elapsed
+    // value small; this identity test does not assert its exact value.
+    let now = render_now();
     let session = SessionState {
         session_id: "orch-01".to_string(),
         agent_type: AgentType::Pi,
         cwd: Some("/home/dev/workspace".to_string()),
         status: SessionStatus::Thinking,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -797,6 +820,7 @@ fn pane_007_pi_card_shows_pi_identity() {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -806,8 +830,9 @@ fn pane_007_pi_card_shows_pi_identity() {
         None, // no display name
         Some(1),
         density,
-        0,     // animation tick
-        false, // not selected
+        0,            // animation tick
+        render_now(), // render instant
+        false,        // not selected
         width,
         height,
     );
@@ -835,26 +860,21 @@ fn pane_007_pi_card_shows_pi_identity() {
 #[spec("dashboard/pane/008")]
 #[test]
 fn pane_008_codex_card_shows_colored_identity_badge() {
-    // `last_activity` is nudged 30s into the future of `now` (issue #350). This
-    // fixture feeds *both* snapshots below — the immediate one, and
+    // This fixture feeds *both* snapshots below — the immediate one, and
     // `pane_008_named_agent_badges` via `session.clone()` in the loop further
-    // down — so by the time the second one renders, real wall-clock time has
-    // already been spent on the first snapshot's assertions and comparisons.
-    // `format_elapsed` (src/ui.rs) reads `Utc::now()` at render time, so
-    // `last_activity == now` raced the `0s`/`1s` boundary, and the widened
-    // window is why the *second* snapshot is the one that flaked first. The
-    // forward nudge relies on `format_elapsed`'s existing clamp of a negative
-    // delta to zero (`delta.num_seconds().max(0)`): both renders stay at `0s`
-    // for 30s. Committed snapshots are unchanged.
-    let now = chrono::Utc::now();
+    // down. Issue #413: both render at `render_now()`, the fixture's own
+    // instant, so both read `Last: 0s` however much time the first snapshot's
+    // assertions spend before the second renders.
+    let now = render_now();
     let session = SessionState {
         session_id: "wrapped-01".to_string(),
         agent_type: AgentType::Codex,
         cwd: Some("/home/dev/workspace".to_string()),
         status: SessionStatus::Thinking,
+        blocked: None,
         active_tool: None,
         started_at: now,
-        last_activity: now + chrono::Duration::seconds(30),
+        last_activity: now,
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: Some("inspect the repository".to_string()),
@@ -864,11 +884,22 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
     let height = density.rendered_height();
-    let buffer = render_card_to_buffer(&session, None, Some(1), density, 0, false, width, height);
+    let buffer = render_card_to_buffer(
+        &session,
+        None,
+        Some(1),
+        density,
+        0,
+        render_now(),
+        false,
+        width,
+        height,
+    );
     let text = buffer_to_text(&buffer);
     assert!(
         text.contains("Codex"),
@@ -909,6 +940,7 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
             Some(1),
             density,
             0,
+            render_now(),
             false,
             width,
             height,
@@ -952,7 +984,8 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
 /// draws into the last row of the left dashboard column whenever panes are open.
 /// The bar must spend that width on the status counts and the `tools` total, with
 /// no per-agent-type breakdown: the breakdown used to consume ~30 columns here and
-/// silently clip the `tools` total off the right edge.
+/// silently clip the `tools` total off the right edge. A second render with a
+/// waiting agent must call that status "needs input" in the visible bar.
 #[spec("dashboard/stats/001")]
 #[test]
 fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
@@ -998,6 +1031,17 @@ fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
         "the stats bar must not spend its width on a per-agent-type breakdown \
          (every card already carries a registry-colored type badge):\n{rendered}"
     );
+
+    let waiting_stats = DashboardStats {
+        active: 1,
+        waiting: 1,
+        ..DashboardStats::default()
+    };
+    let waiting_bar = buffer_to_text(&render_stats_bar_to_buffer(&waiting_stats, None, 80, 1));
+    assert!(
+        waiting_bar.contains("1 needs input"),
+        "waiting agent must be labeled like its card in the stats bar:\n{waiting_bar}"
+    );
 }
 
 /// Scenario: Apply otherwise-identical live and history-only Codex session
@@ -1039,6 +1083,7 @@ fn pane_009_history_only_card_marks_and_dims_input_affordance() {
         None,
         density,
         0,
+        render_now(),
         width,
     );
     let text = buffer_to_text(&buffer);
@@ -1077,12 +1122,13 @@ fn pane_009_history_only_card_marks_and_dims_input_affordance() {
 /// role. Its current activity time keeps the compact border value small; these
 /// tests inspect only the border color, never the body.
 fn palette_session(status: SessionStatus) -> SessionState {
-    let now = chrono::Utc::now();
+    let now = render_now();
     SessionState {
         session_id: "sess-palette".to_string(),
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/example-project".to_string()),
         status,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -1095,6 +1141,122 @@ fn palette_session(status: SessionStatus) -> SessionState {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
+    }
+}
+
+/// Scenario: Render a dashboard card whose agent is blocked because its credits
+/// are depleted, then render a stats bar with one blocked agent. The card must
+/// show a Blocked badge and credit reason, and both surfaces must use the error colour.
+#[spec("status/badge/002")]
+#[test]
+fn status_badge_002_blocked_card_snapshot() {
+    let mut session = palette_session(SessionStatus::Blocked);
+    session.blocked = Some(BlockedReason {
+        kind: BlockedKind::CreditsDepleted,
+        detected_at_ms: render_now().timestamp_millis(),
+        detail: Some("structured provider error: credits depleted".to_string()),
+        resets_at_ms: None,
+    });
+    let density = CardDensityKind::Normal;
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("quota-worker"),
+        Some(1),
+        density,
+        0,
+        render_now(),
+        false,
+        80,
+        density.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("Blocked"),
+        "missing Blocked badge:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Credits"),
+        "missing credits reason:\n{rendered}"
+    );
+    assert_eq!(border_style_at_mid(&buffer).0, Color::Red);
+    insta::assert_snapshot!(rendered);
+
+    let stats = DashboardStats {
+        blocked: 1,
+        ..DashboardStats::default()
+    };
+    let stats_buffer = render_stats_bar_to_buffer(&stats, None, 80, 1);
+    let stats_text = buffer_to_text(&stats_buffer);
+    let blocked_byte = stats_text
+        .find("1 blocked")
+        .unwrap_or_else(|| panic!("missing blocked stats segment:\n{stats_text}"));
+    let blocked_x = stats_text[..blocked_byte].chars().count() as u16;
+    for x in blocked_x..blocked_x + "1 blocked".len() as u16 {
+        assert_eq!(
+            stats_buffer[(x, 0)].fg,
+            Color::Red,
+            "blocked stats segment must use the error colour:\n{}",
+            buffer_to_color_text(&stats_buffer)
+        );
+    }
+}
+
+/// Scenario: Render a Blocked card whose provider supplies a reset two hours
+/// and ten minutes after the fixed render clock. The card tells the user when
+/// the usage limit resets, and a reset at either extreme of the range still
+/// renders the reason, with no countdown.
+#[spec("status/badge/003")]
+#[test]
+fn status_badge_003_blocked_card_shows_reset() {
+    let mut session = palette_session(SessionStatus::Blocked);
+    session.blocked = Some(BlockedReason {
+        kind: BlockedKind::UsageLimit,
+        detected_at_ms: render_now().timestamp_millis(),
+        detail: None,
+        resets_at_ms: Some(
+            (render_now() + chrono::Duration::hours(2) + chrono::Duration::minutes(10))
+                .timestamp_millis(),
+        ),
+    });
+    let density = CardDensityKind::Normal;
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("quota-worker"),
+        Some(1),
+        density,
+        0,
+        render_now(),
+        false,
+        80,
+        density.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("resets in 2h 10m"),
+        "the blocked card omitted its provider reset:\n{rendered}"
+    );
+
+    // A reset no provider could have sent — the extremes a malformed snapshot
+    // can carry — still renders the card, with the reason and no countdown.
+    for extreme in [i64::MIN, i64::MAX] {
+        session.blocked.as_mut().unwrap().resets_at_ms = Some(extreme);
+        let buffer = render_card_to_buffer(
+            &session,
+            Some("quota-worker"),
+            Some(1),
+            density,
+            0,
+            render_now(),
+            false,
+            80,
+            density.rendered_height(),
+        );
+        let rendered = buffer_to_text(&buffer);
+        assert!(
+            rendered.contains("Usage limit") && !rendered.contains("resets in"),
+            "reset {extreme} must render the reason without a countdown:\n{rendered}"
+        );
     }
 }
 
@@ -1122,8 +1284,9 @@ fn card_border_at_mid(status: SessionStatus) -> (Color, Modifier) {
         Some("example-agent"),
         Some(1),
         density,
-        0,     // animation tick
-        false, // not selected
+        0,            // animation tick
+        render_now(), // render instant
+        false,        // not selected
         width,
         height,
     );
@@ -1192,10 +1355,10 @@ fn border_glyph_at_mid(buffer: &ratatui::buffer::Buffer) -> String {
     buffer[(0, y)].symbol().to_string()
 }
 
-/// The six status roles in the centralized palette and the named-ANSI color each
+/// The seven status values in the centralized palette and the named-ANSI color each
 /// must resolve to (PRD #155 locked plan): working=Green, thinking=Blue,
-/// compacting=Blue (shares the thinking role), waiting=Magenta, error=Red,
-/// idle=DarkGray. The single source of truth shared by the deck-card (T1) and
+/// compacting=Blue (shares the thinking role), waiting=Magenta, error and
+/// blocked=Red, idle=DarkGray. The single source of truth shared by the deck-card (T1) and
 /// embedded-pane (T2) assertions.
 ///
 /// Waiting left Yellow in issue #579: yellow measured 1.70:1 against a white
@@ -1205,7 +1368,7 @@ fn border_glyph_at_mid(buffer: &ratatui::buffer::Buffer) -> String {
 /// clears AA on a light *and* a dark terminal. `theme/contrast/002` asserts the
 /// ratios; these tests keep asserting identity, which is what makes the two
 /// complementary rather than redundant.
-fn status_role_colors() -> [(SessionStatus, Color); 6] {
+fn status_role_colors() -> [(SessionStatus, Color); 7] {
     [
         (SessionStatus::Working, Color::Green),
         (SessionStatus::Thinking, Color::Blue),
@@ -1216,15 +1379,16 @@ fn status_role_colors() -> [(SessionStatus, Color); 6] {
         (SessionStatus::Compacting, Color::Blue),
         (SessionStatus::WaitingForInput, Color::Magenta),
         (SessionStatus::Error, Color::Red),
+        (SessionStatus::Blocked, Color::Red),
         (SessionStatus::Idle, Color::DarkGray),
     ]
 }
 
-/// Scenario: Render a deck card for each of the six agent statuses
-/// (working/thinking/compacting/waiting/error/idle), none selected or focused,
+/// Scenario: Render a deck card for each of the seven agent statuses
+/// (working/thinking/compacting/waiting/error/blocked/idle), none selected or focused,
 /// and assert the card's border color is the matching centralized status role —
 /// working=Green, thinking=Blue, compacting=Blue (it shares the thinking role),
-/// waiting=Magenta, error=Red, idle=DarkGray. Also assert each status border is a
+/// waiting=Magenta, error/blocked=Red, idle=DarkGray. Also assert each status border is a
 /// status role and never an accent role (Reset=selected, Cyan=focused), so a
 /// status can never collide with selection/focus. This pins PRD #155 Option A:
 /// the deck-card border encodes status via the centralized palette roles.
@@ -1255,8 +1419,8 @@ fn palette_001_deck_card_border_is_status_role() {
     }
 }
 
-/// Scenario: For each of the six agent statuses
-/// (working/thinking/compacting/waiting/error/idle), render the deck card AND an
+/// Scenario: For each of the seven agent statuses
+/// (working/thinking/compacting/waiting/error/blocked/idle), render the deck card AND an
 /// embedded pane (neither selected nor focused) and assert the pane's border
 /// color is the SAME as the deck card's for that status — and that both equal the
 /// palette status role color. This is the consistency criterion: a given state
@@ -1301,8 +1465,9 @@ fn palette_003_selected_card_border_is_terminal_fg_thick_marker() {
         Some("example-agent"),
         Some(1),
         density,
-        0,    // animation tick
-        true, // SELECTED
+        0,            // animation tick
+        render_now(), // render instant
+        true,         // SELECTED
         UiMode::Normal,
         width,
         height,
@@ -1509,6 +1674,7 @@ fn palette_006_selection_is_visible_at_every_status() {
                     Some(1),
                     density,
                     0,
+                    render_now(),
                     selected,
                     mode,
                     width,
@@ -1755,29 +1921,22 @@ fn pane_005_highlight_follows_selected_session_id() {
     // point the selection at the 2nd, so a regression that ignored the
     // stable id (highlighting card 0) would visibly diff the snapshot.
     //
-    // All sessions share one current activity time, keeping their compact
-    // bottom-border elapsed values identical in the snapshot.
-    //
-    // That time is nudged 30s into the future (issue #350): `format_elapsed`
-    // (src/ui.rs) reads `Utc::now()` at render time, so seeding it to exactly
-    // `now` left every card on the `0s`/`1s` boundary — and this test renders
-    // several cards in sequence, so the later ones sat furthest from the
-    // instant the fixture was built. The forward nudge relies on
-    // `format_elapsed`'s existing clamp of a negative delta to zero
-    // (`delta.num_seconds().max(0)`), holding every card at `0s` for 30s.
-    // Committed snapshot is unchanged.
-    let now = chrono::Utc::now();
+    // All sessions share one activity time, which is also the instant the
+    // cards are rendered at (`render_now()`, issue #413), so every card's
+    // bottom border reads `Last: 0s` in the snapshot.
+    let now = render_now();
     let make = |sid: &str, pane: &str, name: &str, cwd: &str| SessionState {
         session_id: sid.to_string(),
         agent_type: AgentType::ClaudeCode,
         cwd: Some(cwd.to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Read".to_string(),
             detail: Some("src/main.rs".to_string()),
         }),
         started_at: now,
-        last_activity: now + chrono::Duration::seconds(30),
+        last_activity: now,
         recent_events: VecDeque::new(),
         tool_count: 3,
         last_user_prompt: Some("do the thing".to_string()),
@@ -1787,6 +1946,7 @@ fn pane_005_highlight_follows_selected_session_id() {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     };
     let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
     let s2 = make("sess-beta", "pane-2", "2", "/home/dev/beta");
@@ -1825,7 +1985,8 @@ fn pane_005_highlight_follows_selected_session_id() {
         // `Some(idx)` paints the highlight on that card.
         Some(selected_index),
         CardDensityKind::Normal,
-        0, // animation tick
+        0,            // animation tick
+        render_now(), // render instant
         80,
     );
     insta::assert_snapshot!(buffer_to_text(&buffer));
@@ -1894,7 +2055,14 @@ fn pane_010_untagged_event_keeps_one_card_on_the_pane() {
     );
 
     let cards: [(&SessionState, Option<&str>); 1] = [(on_pane[0], Some("worker"))];
-    let buffer = render_dashboard_cards_to_buffer(&cards, Some(0), CardDensityKind::Normal, 0, 80);
+    let buffer = render_dashboard_cards_to_buffer(
+        &cards,
+        Some(0),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        80,
+    );
     let rendered = buffer_to_text(&buffer);
     // The status badge is per-card, so counting it counts cards — and keeps the
     // assertion readable without committing another snapshot file.
@@ -1917,7 +2085,7 @@ fn pane_010_untagged_event_keeps_one_card_on_the_pane() {
 /// these tests inspect only blank/non-blank rows, so its exact value is
 /// irrelevant.
 fn filled_session() -> SessionState {
-    let now = chrono::Utc::now();
+    let now = render_now();
     let mut events: VecDeque<AgentEvent> = VecDeque::new();
     for prompt in ["first prompt", "second prompt", "third prompt"] {
         events.push_back(AgentEvent {
@@ -1964,6 +2132,7 @@ fn filled_session() -> SessionState {
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/example-project".to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Bash".to_string(),
             detail: Some("cargo test".to_string()),
@@ -1979,6 +2148,7 @@ fn filled_session() -> SessionState {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     }
 }
 
@@ -2043,8 +2213,9 @@ fn density_004_no_trailing_blank_rows() {
             Some("example-coder"),
             Some(1),
             density,
-            0,     // animation tick
-            false, // not selected
+            0,            // animation tick
+            render_now(), // render instant
+            false,        // not selected
             width,
             height,
         );
@@ -2067,7 +2238,7 @@ fn filled_idle_session() -> SessionState {
     SessionState {
         status: SessionStatus::Idle,
         active_tool: None,
-        last_activity: chrono::Utc::now() - chrono::Duration::hours(1),
+        last_activity: render_now() - chrono::Duration::hours(1),
         display_name: Some("example-coder".to_string()),
         ..filled_session()
     }
@@ -2100,6 +2271,7 @@ fn density_005_spacious_idle_shows_flashing_dot_over_card_content() {
             Some(1),
             density,
             tick,
+            render_now(),
             false, // not selected
             width,
             density.rendered_height(),
@@ -2228,7 +2400,7 @@ fn layout_001_seven_decks_fit_single_column() {
         names.iter().map(|n| (&session, Some(n.as_str()))).collect();
     // PRD #113: `selected` is `Option<usize>`; this capacity test highlights
     // nothing, so pass `None` (the old out-of-range `usize::MAX` sentinel).
-    let buffer = render_dashboard_cards_to_buffer(&cards, None, density, 0, 64);
+    let buffer = render_dashboard_cards_to_buffer(&cards, None, density, 0, render_now(), 64);
     let text = buffer_to_text(&buffer);
     assert!(
         text.contains("deck-7"),
@@ -2352,6 +2524,7 @@ fn pane_011_multibyte_session_id_renders_the_whole_deck() {
         Some(0),
         CardDensityKind::Normal,
         0,
+        render_now(),
         80,
     ));
 
@@ -2388,6 +2561,7 @@ fn pane_011_multibyte_session_id_renders_the_whole_deck() {
                 Some(1),
                 CardDensityKind::Normal,
                 0,
+                render_now(),
                 false,
                 80,
                 CardDensityKind::Normal.rendered_height(),
@@ -2536,7 +2710,7 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
         (&overlong, None),
         (&healthy_b, None),
     ];
-    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 80, 40);
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 80, 40);
     let rendered = buffer_to_text(&buffer);
 
     // One status badge per card, so counting badges counts surviving cards.
@@ -2623,7 +2797,7 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
         (&overlong, None),
         (&healthy_b, None),
     ];
-    let (buffer, _) = render_card_grid_to_buffer(&renamed, Some(0), 0, 80, 40);
+    let (buffer, _) = render_card_grid_to_buffer(&renamed, Some(0), 0, render_now(), 80, 40);
     let rendered = buffer_to_text(&buffer);
     assert!(
         rendered.contains("example-beta"),
@@ -2686,7 +2860,7 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
         (&overlong, pane_names.get("3").map(String::as_str)),
         (&healthy_b, None),
     ];
-    let (buffer, _) = render_card_grid_to_buffer(&restored, Some(0), 0, 80, 40);
+    let (buffer, _) = render_card_grid_to_buffer(&restored, Some(0), 0, render_now(), 80, 40);
     let rendered = buffer_to_text(&buffer);
     assert!(
         rendered.contains("example-beta"),
@@ -2713,15 +2887,16 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
 #[spec("dashboard/pane/013")]
 #[test]
 fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
-    let now = chrono::Utc::now();
+    let now = render_now();
     let mut session = SessionState {
         session_id: "declared-agent".to_string(),
         agent_type: AgentType::None,
         cwd: Some("/home/dev/workspace".to_string()),
         status: SessionStatus::Idle,
+        blocked: None,
         active_tool: None,
         started_at: now,
-        last_activity: now + chrono::Duration::seconds(30),
+        last_activity: now,
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: None,
@@ -2731,6 +2906,7 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         display_name: Some("reviewer".to_string()),
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     };
     let density = CardDensityKind::Normal;
     let render = |session: &SessionState, declared_agent_type: Option<&AgentType>| {
@@ -2740,6 +2916,7 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
             Some(1),
             density,
             0,
+            render_now(),
             false,
             UiMode::Normal,
             declared_agent_type,
@@ -2890,7 +3067,7 @@ fn pane_014_hostile_tool_text_cannot_corrupt_the_card() {
         (&overlong, Some("example-overlong")),
         (&healthy_b, Some("example-gamma")),
     ];
-    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 80, 40);
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 80, 40);
     let rendered = buffer_to_text(&buffer);
 
     // One status badge per card, so counting badges counts surviving cards.
@@ -2956,8 +3133,9 @@ fn pane_015_wide_title_is_ellipsized_within_the_column_budget() {
         Some("项目目录管理"),
         Some(1),
         density,
-        0,     // animation tick
-        false, // not selected
+        0,            // animation tick
+        render_now(), // render instant
+        false,        // not selected
         WIDTH,
         density.rendered_height(),
     ));
@@ -2996,6 +3174,7 @@ fn pane_015_wide_title_is_ellipsized_within_the_column_budget() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         WIDTH,
         density.rendered_height(),
@@ -3019,6 +3198,7 @@ fn pane_015_wide_title_is_ellipsized_within_the_column_budget() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         WIDTH,
         density.rendered_height(),
@@ -3049,20 +3229,19 @@ const REPORTED_ROLES: [&str; 7] = [
     "documenter",
 ];
 
-/// One live role card. `last_activity` is nudged 30s into the future for the
-/// reason `pane_004_card_title_row` documents: `Last:` is computed from
-/// `Utc::now()` at render time, so an equal timestamp sits on the `0s`/`1s`
-/// boundary and tips snapshots under parallel test load.
+/// One live role card, active at `render_now()` — the instant the grid is
+/// rendered at — so its bottom border reads `Last: 0s` (issue #413).
 fn role_session(index: usize, role: &str) -> SessionState {
-    let now = chrono::Utc::now();
+    let now = render_now();
     SessionState {
         session_id: format!("sess-role-{index:02}"),
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/dot-agent-deck".to_string()),
         status: SessionStatus::Idle,
+        blocked: None,
         active_tool: None,
         started_at: now,
-        last_activity: now + chrono::Duration::seconds(30),
+        last_activity: now,
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: None,
@@ -3072,6 +3251,7 @@ fn role_session(index: usize, role: &str) -> SessionState {
         display_name: Some(role.to_string()),
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     }
 }
 
@@ -3128,7 +3308,7 @@ fn grid_001_short_deck_still_paints_every_role() {
     // `orchestrator … releaser`, dropping `researcher` and `documenter`. Two
     // columns need only 7.div_ceil(2) * 5 = 20 rows, and 90 columns is two cards
     // of 45 — comfortably past MIN_CARD_W.
-    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 27);
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 90, 27);
     let rendered = buffer_to_text(&buffer);
 
     for role in REPORTED_ROLES {
@@ -3153,7 +3333,7 @@ fn grid_001_short_deck_still_paints_every_role() {
     // Control: the same seven roles on a deck tall enough that one column always
     // fitted them. If this one failed too, the fixture — not the height — would
     // be what the assertion above is really measuring.
-    let (tall_buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 60);
+    let (tall_buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 90, 60);
     let tall = buffer_to_text(&tall_buffer);
     for role in REPORTED_ROLES {
         assert!(
@@ -3206,7 +3386,8 @@ fn grid_002_nav_columns_match_the_drawn_grid() {
 
     for (count, width, height, what) in cases {
         let cards = as_cards(&sessions[..count]);
-        let (buffer, probe) = render_card_grid_to_buffer(&cards, Some(0), 0, width, height);
+        let (buffer, probe) =
+            render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), width, height);
         let rendered = buffer_to_text(&buffer);
         assert_eq!(
             probe.nav_columns,
@@ -3231,7 +3412,7 @@ fn grid_003_unavoidable_overflow_is_signalled() {
 
     // 12 rows less title and stats bar leaves 10: two Compact cards. Two columns
     // would need 7.div_ceil(2) * 5 = 20, so no layout 90 columns allows fits.
-    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 12);
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 90, 12);
     let rendered = buffer_to_text(&buffer);
     let title = rendered.lines().next().expect("a rendered title row");
 
@@ -3246,7 +3427,7 @@ fn grid_003_unavoidable_overflow_is_signalled() {
         "a sliced grid must count the cards it is not showing in its title:\n{title}"
     );
     assert!(
-        title.contains("7 session(s)"),
+        title.contains("7 agent(s)"),
         "the title must still name the full role count:\n{title}"
     );
     assert_eq!(
@@ -3258,7 +3439,7 @@ fn grid_003_unavoidable_overflow_is_signalled() {
     insta::assert_snapshot!(rendered);
 
     // Scrolled to the bottom: the marker must flip to counting what is above.
-    let (scrolled, _) = render_card_grid_to_buffer(&cards, Some(6), 0, 90, 12);
+    let (scrolled, _) = render_card_grid_to_buffer(&cards, Some(6), 0, render_now(), 90, 12);
     let scrolled_title = buffer_to_text(&scrolled)
         .lines()
         .next()

@@ -32,6 +32,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+thread_local! {
+    // Mutation checks feed the existing guards a changed in-memory workflow.
+    // Each nextest test runs in its own process, and this also isolates them
+    // if the module is run under the standard test harness.
+    static WORKFLOW_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -41,6 +48,9 @@ fn repo_root() -> PathBuf {
 }
 
 fn workflow() -> String {
+    if let Some(text) = WORKFLOW_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return text;
+    }
     let path = repo_root().join(".github/workflows/release.yml");
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
@@ -107,6 +117,1109 @@ fn needs(block: &str) -> Vec<String> {
         .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Code lines alone, so prose about a safety property cannot satisfy it or
+/// falsely make another job appear to hold a signing secret.
+fn code(block: &str) -> String {
+    block
+        .lines()
+        .map(code_before_comment)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The signing job belongs between the uncredentialed bundle matrix and the
+/// publisher. `finalize` must continue to create the CLI release independently.
+#[test]
+fn desktop_sign_is_between_bundle_and_publish_off_the_cli_path() {
+    let all = jobs(&workflow());
+    let sign_needs = needs(&code(job(&all, "desktop-sign")));
+    let publish_needs = needs(&code(job(&all, "desktop-publish")));
+    let finalize_needs = needs(&code(job(&all, "finalize")));
+
+    assert!(
+        sign_needs.contains(&"desktop-bundle".to_string()),
+        "`desktop-sign` must need `desktop-bundle`, got {sign_needs:?}"
+    );
+    assert!(
+        publish_needs.contains(&"desktop-sign".to_string()),
+        "`desktop-publish` must need `desktop-sign`, got {publish_needs:?}"
+    );
+    for name in [
+        "desktop-bundle",
+        "desktop-sign",
+        "desktop-publish",
+        "attest",
+    ] {
+        assert!(
+            !finalize_needs.contains(&name.to_string()),
+            "`finalize` must not need `{name}`, got {finalize_needs:?}"
+        );
+    }
+}
+
+/// The runner that receives a Developer ID private key must never execute a
+/// checkout of the release repository.
+#[test]
+fn desktop_sign_does_not_check_out_repository_code() {
+    let all = jobs(&workflow());
+    assert!(
+        !checks_out(&code(job(&all, "desktop-sign"))),
+        "`desktop-sign` must download artifacts without `actions/checkout`"
+    );
+}
+
+/// A code-line mention outside the signing job makes a secret available to a
+/// runner that may execute third-party build code. Comments are deliberately
+/// ignored because they can describe the very isolation being guarded here.
+#[test]
+fn apple_signing_secrets_are_named_only_in_desktop_sign() {
+    let workflow = workflow();
+    let all = jobs(&workflow);
+    let sign = code(job(&all, "desktop-sign"));
+    let outside = code(&workflow.replacen(job(&all, "desktop-sign"), "", 1));
+    for secret in [
+        "APPLE_CERTIFICATE",
+        "APPLE_CERTIFICATE_PASSWORD",
+        "APPLE_API_KEY",
+        "APPLE_API_ISSUER",
+        "APPLE_API_KEY_PATH",
+    ] {
+        assert!(
+            sign.contains(secret),
+            "`desktop-sign` does not name `{secret}`"
+        );
+        assert!(
+            !outside.contains(secret),
+            "`{secret}` appears on a code line outside `desktop-sign`"
+        );
+    }
+}
+
+/// Environment-scoped secrets should be readable by the one signing job.
+#[test]
+fn desktop_sign_declares_the_signing_environment() {
+    let all = jobs(&workflow());
+    let sign = code(job(&all, "desktop-sign"));
+    let direct = sign
+        .lines()
+        .any(|l| l.trim() == "environment: desktop-signing");
+    let mapping = sign.contains("environment:\n      name: desktop-signing")
+        || sign.contains("environment:\n        name: desktop-signing");
+    assert!(
+        direct || mapping,
+        "`desktop-sign` must declare `environment: desktop-signing` (or a mapping with that name)"
+    );
+}
+
+/// Upload-artifact flattens file modes, so the macOS app must cross the job
+/// boundary inside a ditto archive that the signing job restores.
+#[test]
+fn desktop_app_crosses_the_artifact_boundary_in_a_ditto_archive() {
+    let all = jobs(&workflow());
+    let bundle = code(job(&all, "desktop-bundle"));
+    let sign = code(job(&all, "desktop-sign"));
+    let archive = bundle
+        .lines()
+        .find(|l| l.contains("ditto -c -k --sequesterRsrc --keepParent"));
+    assert!(
+        archive.is_some_and(|l| l.contains(".app") && l.contains(".zip")),
+        "the macOS bundle leg must archive its `.app` as a `.zip` with `ditto -c -k --sequesterRsrc --keepParent`"
+    );
+    assert!(
+        sign.lines()
+            .any(|l| l.contains("ditto -x -k") && l.contains(".zip")),
+        "`desktop-sign` must restore the zipped app with `ditto -x -k`"
+    );
+}
+
+/// Tauri's WebView needs JIT under hardened runtime. The entitlement can be
+/// inlined in the job or carried as a repository plist named by that job.
+#[test]
+fn desktop_codesign_uses_runtime_and_jit_entitlements() {
+    let all = jobs(&workflow());
+    let sign = code(job(&all, "desktop-sign"));
+    assert!(
+        sign.contains("codesign")
+            && sign.contains("--options runtime")
+            && sign.contains("--entitlements"),
+        "`desktop-sign` must codesign with `--options runtime` and `--entitlements`"
+    );
+    let inline_jit = sign.contains("com.apple.security.cs.allow-jit");
+    let referenced_jit = [
+        "desktop/src-tauri/Entitlements.plist",
+        "desktop/src-tauri/entitlements.plist",
+    ]
+    .into_iter()
+    .filter(|path| sign.contains(path))
+    .any(|path| {
+        fs::read_to_string(repo_root().join(path))
+            .is_ok_and(|plist| plist.contains("com.apple.security.cs.allow-jit"))
+    });
+    assert!(
+        inline_jit || referenced_jit,
+        "the entitlements used by `desktop-sign` must contain `com.apple.security.cs.allow-jit` inline or in its referenced plist"
+    );
+}
+
+/// An expired certificate is present but unusable; checking only whether the
+/// secret is empty would allow a broken release to reach codesign.
+/// Scenario: The signing job checks both the one-day failure threshold and the
+/// thirty-day warning threshold before it signs an app.
+#[test]
+fn desktop_sign_checks_certificate_expiry() {
+    let all = jobs(&workflow());
+    let sign = code(job(&all, "desktop-sign"));
+    assert!(
+        sign.contains("openssl x509")
+            && sign.contains("-enddate")
+            && sign.contains("-checkend 86400")
+            && sign.contains("-checkend 2592000"),
+        "`desktop-sign` must inspect the certificate end date and check both one-day and thirty-day expiry thresholds with `openssl x509 -checkend`"
+    );
+}
+
+/// Scenario: The signing runner validates the downloaded app archive before
+/// the unpack step can write any of its members to disk.
+#[test]
+fn desktop_sign_validates_archive_before_unpacking() {
+    let all = jobs(&workflow());
+    let sign = job(&all, "desktop-sign");
+    let validate = named_step(sign, "Validate the app archive before extracting it");
+    let unpack = named_step(sign, "Unpack the app");
+    assert!(
+        sign.find(validate).unwrap() < sign.find(unpack).unwrap(),
+        "archive validation must precede unpacking"
+    );
+    assert!(
+        code(validate).contains("python3 - \"$APP_ARCHIVE\"")
+            && code(unpack).contains("ditto -x -k"),
+        "the validator must check APP_ARCHIVE before ditto extracts it"
+    );
+}
+
+/// Scenario: The Apple intermediate download stays on HTTPS, and the signing
+/// runner checks its pinned SHA-256 before importing it into the keychain.
+#[test]
+fn desktop_sign_pins_apple_intermediate_before_import() {
+    let all = jobs(&workflow());
+    let step = code(named_step(
+        job(&all, "desktop-sign"),
+        "Import the certificate into a throwaway keychain",
+    ));
+    let curl = step
+        .lines()
+        .find(|line| line.trim_start().starts_with("curl ") && line.contains("DeveloperIDG2CA.cer"))
+        .expect("Apple intermediate download");
+    assert!(
+        curl.contains("--proto '=https'") && curl.contains("--proto-redir '=https'"),
+        "Apple intermediate curl must restrict both initial and redirect protocols to HTTPS"
+    );
+    let pin = step
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("G2_SHA256="))
+        .expect("Apple intermediate digest pin");
+    assert!(
+        pin.len() == 64 && pin.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Apple intermediate pin must be a SHA-256 digest"
+    );
+    let hash = step
+        .find("got=$(shasum -a 256")
+        .expect("digest calculation");
+    let compare = step
+        .find("if [ \"$got\" != \"$G2_SHA256\" ]; then")
+        .expect("digest comparison");
+    let failure = step[compare..]
+        .find("exit 1")
+        .expect("digest mismatch fails")
+        + compare;
+    let import = step
+        .find("security import \"$RUNNER_TEMP/DeveloperIDG2CA.cer\"")
+        .expect("intermediate import");
+    assert!(
+        hash < compare && compare < failure && failure < import,
+        "the intermediate must be hashed and rejected on mismatch before security import"
+    );
+}
+
+/// The two notarization steps each call this script instead of `notarytool
+/// submit --wait`, which fails the job on one timed-out status request.
+const NOTARY_POLLER_CALLS: [(&str, &str); 2] = [
+    (
+        "Notarize and staple the app",
+        "bash \"$RUNNER_TEMP/notarize.sh\" \"$RUNNER_TEMP/app-for-notary.zip\" \"the app\"",
+    ),
+    (
+        "Sign, notarize and staple the disk image",
+        "bash \"$RUNNER_TEMP/notarize.sh\" \"$DMG\" \"the disk image\"",
+    ),
+];
+
+/// Issue #1325: `--wait` turned one timed-out status poll into a failed
+/// release while Apple was still processing, and later accepted, the upload.
+/// Scenario: Neither notarization step waits inside notarytool; both submit
+/// through the poller, which is written before either runs, and that poller
+/// polls with `notarytool info` rather than waiting.
+#[test]
+fn desktop_sign_polls_notarization_instead_of_waiting() {
+    let all = jobs(&workflow());
+    let sign = job(&all, "desktop-sign");
+    assert!(
+        !code(sign).contains("--wait"),
+        "`desktop-sign` must not run `notarytool submit --wait`: one failed status poll ends it (issue #1325)"
+    );
+    let poller = named_step(sign, "Write the notarization poller");
+    let poller_code = code(poller);
+    assert!(
+        poller_code.contains("xcrun notarytool submit")
+            && poller_code.contains("xcrun notarytool info")
+            && poller_code.contains("> \"$RUNNER_TEMP/notarize.sh\""),
+        "the poller step must write a script that submits and then polls with `notarytool info`"
+    );
+    for (name, call) in NOTARY_POLLER_CALLS {
+        let step = named_step(sign, name);
+        assert!(
+            code(step).lines().any(|line| line.trim() == call),
+            "`{name}` must notarize through the poller: {call}"
+        );
+        assert!(
+            sign.find(poller).unwrap() < sign.find(step).unwrap(),
+            "the poller must be written before `{name}` runs"
+        );
+    }
+}
+
+/// Scenario: Every third-party action executed beside the signing key is held
+/// for manual review by the final matching Renovate rule.
+#[test]
+fn desktop_sign_actions_are_held_for_manual_review() {
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repo_root().join("renovate.json")).expect("read renovate.json"),
+    )
+    .expect("parse renovate.json");
+    let rule = config["packageRules"]
+        .as_array()
+        .and_then(|rules| rules.last())
+        .expect("last Renovate package rule");
+    let contains = |field: &str, value: &str| {
+        rule[field]
+            .as_array()
+            .is_some_and(|values| values.iter().any(|item| item.as_str() == Some(value)))
+    };
+    assert!(
+        contains("matchManagers", "github-actions")
+            && contains("matchFileNames", ".github/workflows/release.yml")
+            && rule["automerge"] == false
+            && rule["groupName"].is_null()
+            && contains("labels", "manual-review"),
+        "the last Renovate rule must hold release workflow actions for manual review"
+    );
+    let all = jobs(&workflow());
+    let sign = job(&all, "desktop-sign");
+    let actions: Vec<&str> = sign
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- uses: "))
+        .filter_map(|reference| reference.split_once('@').map(|(name, _)| name))
+        .collect();
+    assert!(!actions.is_empty(), "desktop-sign must name its actions");
+    for action in actions {
+        assert!(
+            contains("matchPackageNames", action),
+            "desktop-sign action {action} is missing from the manual-review rule"
+        );
+    }
+}
+
+/// The quarantine bypass and unsigned macOS wording belong only to an
+/// unsigned macOS artifact. The note must read the signing job's actual output.
+#[test]
+fn desktop_note_offers_quarantine_bypass_only_when_unsigned() {
+    let all = jobs(&workflow());
+    let sign = code(job(&all, "desktop-sign"));
+    let note = note_step(job(&all, "desktop-publish"));
+    assert!(
+        sign.contains("signed:"),
+        "`desktop-sign` must expose a `signed` job output"
+    );
+    assert!(
+        note.contains("SIGNED: ${{ needs.desktop-sign.outputs.signed }}"),
+        "the release-note step must read `needs.desktop-sign.outputs.signed` into `SIGNED`"
+    );
+    let condition = note.find("if [ \"$SIGNED\" = \"false\" ]; then").unwrap_or_else(|| {
+        panic!("the release-note step must open an unsigned-only branch with `if [ \"$SIGNED\" = \"false\" ]; then`")
+    });
+    let branch = note[condition..]
+        .split("\n          fi")
+        .next()
+        .unwrap_or_default();
+    assert!(
+        branch.contains("xattr -dr com.apple.quarantine") && branch.contains("unsigned"),
+        "the unsigned-only branch must contain both the quarantine workaround and unsigned macOS wording"
+    );
+}
+
+/// Replace one known line in the real workflow, failing if the workflow has
+/// changed enough that the mutation no longer represents the intended edit.
+fn replace_once(text: &str, from: &str, to: &str) -> String {
+    assert!(text.contains(from), "mutation target absent: {from}");
+    text.replacen(from, to, 1)
+}
+
+/// Scenario: Each signing guard rejects the specific unsafe workflow edit it
+/// protects against. A comment naming a secret remains harmless because it
+/// gives no job access to that secret.
+#[test]
+fn desktop_sign_guards_reject_unsafe_workflow_mutations() {
+    let original = workflow();
+    let xattr_line = original
+        .lines()
+        .find(|line| line.contains("xattr -dr com.apple.quarantine"))
+        .expect("unsigned note contains xattr");
+    let without_xattr = replace_once(&original, &format!("{xattr_line}\n"), "");
+    let xattr_outside = replace_once(
+        &without_xattr,
+        "            } >> \"$NOTE\"\n          fi\n",
+        &format!("            }} >> \"$NOTE\"\n          fi\n{xattr_line} >> \"$NOTE\"\n"),
+    );
+    let archive_line = original
+        .lines()
+        .find(|line| line.contains("ditto -c -k --sequesterRsrc --keepParent"))
+        .expect("macOS app archive command");
+    let all = jobs(&original);
+    let sign = job(&all, "desktop-sign");
+    let validator = named_step(sign, "Validate the app archive before extracting it");
+
+    let cases = [
+        (
+            "secret in desktop-bundle",
+            replace_once(
+                &original,
+                "  desktop-bundle:\n",
+                "  desktop-bundle:\n    env:\n      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}\n",
+            ),
+            Some("apple_signing_secrets_are_named_only_in_desktop_sign"),
+        ),
+        (
+            "secret name in a bundle comment",
+            replace_once(
+                &original,
+                "  desktop-bundle:\n",
+                "  desktop-bundle:\n    # APPLE_CERTIFICATE stays in desktop-sign only.\n",
+            ),
+            None,
+        ),
+        (
+            "checkout in desktop-sign",
+            replace_once(
+                &original,
+                "  desktop-sign:\n",
+                "  desktop-sign:\n    steps:\n      - uses: actions/checkout@pinned\n",
+            ),
+            Some("desktop_sign_does_not_check_out_repository_code"),
+        ),
+        (
+            "missing signing environment",
+            replace_once(&original, "    environment: desktop-signing\n", ""),
+            Some("desktop_sign_declares_the_signing_environment"),
+        ),
+        (
+            "publisher does not need signer",
+            replace_once(
+                &original,
+                "    needs: [prepare, finalize, desktop-bundle, desktop-sign]",
+                "    needs: [prepare, finalize, desktop-bundle]",
+            ),
+            Some("desktop_sign_is_between_bundle_and_publish_off_the_cli_path"),
+        ),
+        (
+            "finalize needs signer",
+            replace_once(
+                &original,
+                "    needs: [prepare, build]",
+                "    needs: [prepare, build, desktop-sign]",
+            ),
+            Some("desktop_sign_is_between_bundle_and_publish_off_the_cli_path"),
+        ),
+        (
+            "missing hardened runtime",
+            original.replace("--options runtime", ""),
+            Some("desktop_codesign_uses_runtime_and_jit_entitlements"),
+        ),
+        (
+            "missing JIT entitlement",
+            original.replace(
+                "com.apple.security.cs.allow-jit",
+                "com.apple.security.cs.no-jit",
+            ),
+            Some("desktop_codesign_uses_runtime_and_jit_entitlements"),
+        ),
+        (
+            "raw app artifact",
+            replace_once(
+                &original,
+                archive_line,
+                "          cp -R \"$APP\" dist-desktop-app/Agent-Deck.app",
+            ),
+            Some("desktop_app_crosses_the_artifact_boundary_in_a_ditto_archive"),
+        ),
+        (
+            "missing one-day certificate check",
+            replace_once(&original, "-checkend 86400", ""),
+            Some("desktop_sign_checks_certificate_expiry"),
+        ),
+        (
+            "missing thirty-day certificate check",
+            replace_once(&original, "-checkend 2592000", ""),
+            Some("desktop_sign_checks_certificate_expiry"),
+        ),
+        (
+            "missing archive validator",
+            replace_once(&original, validator, ""),
+            Some("desktop_sign_validates_archive_before_unpacking"),
+        ),
+        (
+            "redirect protocol unrestricted",
+            replace_once(
+                &original,
+                "--proto-redir '=https' -fsSL --retry 3",
+                "-fsSL --retry 3",
+            ),
+            Some("desktop_sign_pins_apple_intermediate_before_import"),
+        ),
+        (
+            "missing intermediate digest comparison",
+            replace_once(
+                &original,
+                "if [ \"$got\" != \"$G2_SHA256\" ]; then",
+                "if false; then",
+            ),
+            Some("desktop_sign_pins_apple_intermediate_before_import"),
+        ),
+        (
+            "new unreviewed signing action",
+            replace_once(
+                &original,
+                "  desktop-sign:\n",
+                "  desktop-sign:\n    steps:\n      - uses: actions/cache@pinned\n",
+            ),
+            Some("desktop_sign_actions_are_held_for_manual_review"),
+        ),
+        (
+            "quarantine workaround outside unsigned branch",
+            xattr_outside,
+            Some("desktop_note_offers_quarantine_bypass_only_when_unsigned"),
+        ),
+        (
+            "disk image notarization waits again",
+            replace_once(
+                &original,
+                NOTARY_POLLER_CALLS[1].1,
+                "xcrun notarytool submit \"$DMG\" --wait --timeout 75m --output-format json",
+            ),
+            Some("desktop_sign_polls_notarization_instead_of_waiting"),
+        ),
+        (
+            "app notarization bypasses the poller",
+            replace_once(
+                &original,
+                NOTARY_POLLER_CALLS[0].1,
+                "xcrun notarytool submit \"$RUNNER_TEMP/app-for-notary.zip\" --output-format json",
+            ),
+            Some("desktop_sign_polls_notarization_instead_of_waiting"),
+        ),
+    ];
+
+    let guards: [(&str, fn()); 12] = [
+        (
+            "desktop_sign_is_between_bundle_and_publish_off_the_cli_path",
+            desktop_sign_is_between_bundle_and_publish_off_the_cli_path,
+        ),
+        (
+            "desktop_sign_does_not_check_out_repository_code",
+            desktop_sign_does_not_check_out_repository_code,
+        ),
+        (
+            "apple_signing_secrets_are_named_only_in_desktop_sign",
+            apple_signing_secrets_are_named_only_in_desktop_sign,
+        ),
+        (
+            "desktop_sign_declares_the_signing_environment",
+            desktop_sign_declares_the_signing_environment,
+        ),
+        (
+            "desktop_app_crosses_the_artifact_boundary_in_a_ditto_archive",
+            desktop_app_crosses_the_artifact_boundary_in_a_ditto_archive,
+        ),
+        (
+            "desktop_codesign_uses_runtime_and_jit_entitlements",
+            desktop_codesign_uses_runtime_and_jit_entitlements,
+        ),
+        (
+            "desktop_sign_checks_certificate_expiry",
+            desktop_sign_checks_certificate_expiry,
+        ),
+        (
+            "desktop_note_offers_quarantine_bypass_only_when_unsigned",
+            desktop_note_offers_quarantine_bypass_only_when_unsigned,
+        ),
+        (
+            "desktop_sign_validates_archive_before_unpacking",
+            desktop_sign_validates_archive_before_unpacking,
+        ),
+        (
+            "desktop_sign_pins_apple_intermediate_before_import",
+            desktop_sign_pins_apple_intermediate_before_import,
+        ),
+        (
+            "desktop_sign_actions_are_held_for_manual_review",
+            desktop_sign_actions_are_held_for_manual_review,
+        ),
+        (
+            "desktop_sign_polls_notarization_instead_of_waiting",
+            desktop_sign_polls_notarization_instead_of_waiting,
+        ),
+    ];
+    for (label, mutated, expected) in cases {
+        WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(mutated));
+        let failed: Vec<&str> = guards
+            .iter()
+            .filter_map(|(name, guard)| std::panic::catch_unwind(guard).is_err().then_some(*name))
+            .collect();
+        WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        let mut expected = expected.into_iter().collect::<Vec<_>>();
+        if label == "checkout in desktop-sign" {
+            expected.push("desktop_sign_actions_are_held_for_manual_review");
+        }
+        assert_eq!(failed, expected, "{label}");
+    }
+}
+
+/// Return the complete named step, including its run block, from a job.
+fn named_step<'a>(block: &'a str, name: &str) -> &'a str {
+    let header = format!("      - name: {name}\n");
+    let start = block
+        .find(&header)
+        .unwrap_or_else(|| panic!("missing step: {name}"));
+    let rest = &block[start + header.len()..];
+    let end = rest
+        .find("\n      - ")
+        .map_or(block.len(), |pos| start + header.len() + pos + 1);
+    &block[start..end]
+}
+
+/// Lift an actual shell body out of the workflow so runtime tests cannot
+/// pass against a copy that differs from the release step.
+// These runtime fixtures execute macOS Bash steps with a Unix-only PATH.
+// Windows can find the unusable WSL bash stub, so keep the fixtures on Unix.
+#[cfg(unix)]
+fn step_script(name: &str) -> String {
+    let all = jobs(&workflow());
+    let sign = job(&all, "desktop-sign");
+    let step = named_step(sign, name);
+    let mut lines = step.lines();
+    let run = lines
+        .find(|line| line.trim() == "run: |")
+        .unwrap_or_else(|| panic!("{name} has no run block"));
+    let indent = run.len() - run.trim_start().len();
+    lines
+        .take_while(|line| line.trim().is_empty() || line.len() - line.trim_start().len() > indent)
+        .map(|line| {
+            line.strip_prefix(" ".repeat(indent + 2).as_str())
+                .unwrap_or(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(unix)]
+fn signing_classifier_script() -> String {
+    let script = step_script("Classify the signing credentials");
+    assert!(script.contains("mode=signed") && script.contains("mode=unsigned"));
+    script
+}
+
+/// Scenario: The release workflow's credential classifier chooses unsigned
+/// only when all five values are absent and signed only when all are present.
+/// Partial and empty credentials fail without printing values or executing a
+/// shell command embedded in a value.
+#[cfg(unix)]
+#[test]
+fn desktop_sign_classifier_handles_real_shell_inputs() {
+    use std::process::Command;
+    if Command::new("bash").arg("--version").output().is_err() {
+        println!("SKIP: bash is unavailable");
+        return;
+    }
+    let script = signing_classifier_script();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output_path = dir.path().join("github-output");
+    let names = [
+        "APPLE_CERTIFICATE",
+        "APPLE_CERTIFICATE_PASSWORD",
+        "APPLE_API_KEY",
+        "APPLE_API_ISSUER",
+        "APPLE_API_KEY_PATH",
+    ];
+    let values = [
+        "certificate-marker-48c1",
+        "password-marker-c88a",
+        "api-key-marker-750f",
+        "issuer-marker-e344",
+        "api-path-marker-a059",
+    ];
+    let run = |provided: &[(&str, &str)]| {
+        let _ = fs::remove_file(&output_path);
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("GITHUB_OUTPUT", &output_path);
+        for &(name, value) in provided {
+            cmd.env(name, value);
+        }
+        let result = cmd.output().expect("run classifier with bash");
+        let written = fs::read_to_string(&output_path).unwrap_or_default();
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        (result.status, written, log)
+    };
+
+    let (status, written, _) = run(&[]);
+    assert!(status.success(), "all absent should choose unsigned");
+    assert_eq!(written, "mode=unsigned\n");
+
+    let all = names.into_iter().zip(values).collect::<Vec<_>>();
+    let (status, written, _) = run(&all);
+    assert!(status.success(), "all present should choose signed");
+    assert_eq!(written, "mode=signed\n");
+
+    for (missing, name) in names.iter().enumerate() {
+        let partial = all
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pair)| (index != missing).then_some(*pair))
+            .collect::<Vec<_>>();
+        let (status, written, log) = run(&partial);
+        assert!(!status.success(), "missing {name} should fail");
+        assert!(written.is_empty(), "partial input must not select a mode");
+        for value in values {
+            assert!(
+                !log.contains(value) && !written.contains(value),
+                "the error for missing {} exposed a credential value",
+                name
+            );
+        }
+    }
+
+    let mut empty = all.clone();
+    empty[0].1 = "";
+    let (status, written, log) = run(&empty);
+    assert!(!status.success(), "a set-but-empty value should fail");
+    assert!(
+        written.is_empty(),
+        "empty credential must not select a mode"
+    );
+    for value in values {
+        assert!(
+            !log.contains(value),
+            "empty-value error exposed a credential value"
+        );
+    }
+
+    let marker = dir.path().join("unexpected-command-execution");
+    let injection = format!("$(touch {})", marker.display());
+    let mut injected = all.clone();
+    injected[0].1 = &injection;
+    let (status, written, _) = run(&injected);
+    assert!(
+        status.success(),
+        "a nonempty literal value should count as present"
+    );
+    assert_eq!(written, "mode=signed\n");
+    assert!(
+        !marker.exists(),
+        "classifier executed a command inside a value"
+    );
+}
+
+/// Scenario: The release workflow's real archive validator accepts ordinary,
+/// framework-style and AppleDouble app zips. It rejects metadata for another
+/// app, disguised AppleDouble directories, symlinks inside metadata, and unsafe paths, links, modes or archives.
+#[cfg(unix)]
+#[test]
+fn desktop_sign_archive_validator_handles_real_zip_inputs() {
+    use std::process::Command;
+    for tool in ["bash", "python3"] {
+        if Command::new(tool).arg("--version").output().is_err() {
+            println!("SKIP: {tool} is unavailable");
+            return;
+        }
+    }
+    let script = step_script("Validate the app archive before extracting it");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let make_zips = r#"
+import pathlib, stat, sys, zipfile
+root = pathlib.Path(sys.argv[1])
+app = 'Agent Deck.app/'
+base = app + 'Contents/'
+
+def add(z, name, data=b'', mode=None):
+    info = zipfile.ZipInfo(name)
+    info.create_system = 3
+    if mode is not None:
+        info.external_attr = mode << 16
+    z.writestr(info, data)
+
+def zip_case(name, extra):
+    with zipfile.ZipFile(root / (name + '.zip'), 'w') as z:
+        add(z, base + 'MacOS/Agent Deck', b'bin', stat.S_IFREG | 0o755)
+        extra(z)
+
+zip_case('benign', lambda z: None)
+def framework(z):
+    prefix = base + 'Frameworks/Widget.framework/Versions/'
+    add(z, prefix + 'A/Widget', b'framework', stat.S_IFREG | 0o644)
+    add(z, prefix + 'Current', b'A', stat.S_IFLNK | 0o777)
+    add(z, base + 'Frameworks/Widget.framework/Widget', b'Versions/Current/Widget', stat.S_IFLNK | 0o777)
+zip_case('framework', framework)
+zip_case('appledouble-nested', lambda z: add(z, '__MACOSX/Agent Deck.app/Contents/._Info.plist', b'metadata'))
+zip_case('appledouble-app-root', lambda z: add(z, '__MACOSX/._Agent Deck.app', b'metadata'))
+zip_case('appledouble-app-root-dir', lambda z: add(z, '__MACOSX/._Agent Deck.app/', mode=stat.S_IFDIR | 0o755))
+zip_case('appledouble-app-root-child', lambda z: add(z, '__MACOSX/._Agent Deck.app/x', b'x'))
+zip_case('appledouble-other-root', lambda z: add(z, '__MACOSX/._Other.app', b'metadata'))
+zip_case('macosx-other-app', lambda z: add(z, '__MACOSX/Other.app/x', b'x'))
+zip_case('macosx-symlink', lambda z: add(z, '__MACOSX/Agent Deck.app/Contents/._Alias', b'Info.plist', stat.S_IFLNK | 0o777))
+zip_case('dotdot', lambda z: add(z, app + '../escape', b'x'))
+zip_case('absolute', lambda z: add(z, '/etc/x', b'x'))
+zip_case('second-top', lambda z: add(z, 'Other.app/Contents/x', b'x'))
+zip_case('absolute-link', lambda z: add(z, base + 'bad-link', b'/etc', stat.S_IFLNK | 0o777))
+def escaping_chain(z):
+    add(z, base + 'first', b'second', stat.S_IFLNK | 0o777)
+    add(z, base + 'second', b'../../../outside', stat.S_IFLNK | 0o777)
+zip_case('escaping-chain', escaping_chain)
+def beneath_link(z):
+    add(z, base + 'pivot', b'MacOS', stat.S_IFLNK | 0o777)
+    add(z, base + 'pivot/evil', b'x')
+zip_case('beneath-link', beneath_link)
+def duplicate(z):
+    add(z, base + 'Readme', b'a')
+    add(z, base + 'README', b'b')
+zip_case('casefold-duplicate', duplicate)
+zip_case('fifo', lambda z: add(z, base + 'pipe', b'', stat.S_IFIFO | 0o644))
+(root / 'nonzip.zip').write_bytes(b'not a zip file')
+"#;
+    let generated = Command::new("python3")
+        .arg("-c")
+        .arg(make_zips)
+        .arg(dir.path())
+        .output()
+        .expect("generate zip fixtures");
+    assert!(
+        generated.status.success(),
+        "zip fixture generation failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+
+    let cases = [
+        ("benign", true),
+        ("framework", true),
+        ("appledouble-nested", true),
+        ("appledouble-app-root", true),
+        ("appledouble-app-root-dir", false),
+        ("appledouble-app-root-child", false),
+        ("appledouble-other-root", false),
+        ("macosx-other-app", false),
+        ("macosx-symlink", false),
+        ("dotdot", false),
+        ("absolute", false),
+        ("second-top", false),
+        ("absolute-link", false),
+        ("escaping-chain", false),
+        ("beneath-link", false),
+        ("casefold-duplicate", false),
+        ("fifo", false),
+        ("nonzip", false),
+    ];
+    for (name, accepted) in cases {
+        let result = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("APP_ARCHIVE", dir.path().join(format!("{name}.zip")))
+            .output()
+            .expect("run archive validator");
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            result.status.success(),
+            accepted,
+            "{name}: unexpected exit status {:?}; log:\n{log}",
+            result.status.code()
+        );
+        let marker = if accepted {
+            "app archive OK:"
+        } else {
+            "::error::"
+        };
+        assert!(
+            log.contains(marker),
+            "{name}: missing {marker:?}; log:\n{log}"
+        );
+    }
+}
+
+/// The submission id the stubbed `xcrun` hands back from `notarytool submit`.
+#[cfg(unix)]
+const STUB_SUBMISSION_ID: &str = "9d0a17b7-6528-4123-92d0-f0f8e4391817";
+
+/// Stands in for `xcrun notarytool` on a Linux host. Each `info` call answers
+/// with the next line of `responses` (the last line repeats): `timeout` fails
+/// the request the way run 36209188544's did, `garbage` exits 0 with output
+/// that is not JSON, and anything else is reported as the status.
+#[cfg(unix)]
+const STUB_XCRUN: &str = r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_DIR/calls"
+[ "$1" = notarytool ] || exit 64
+case "$2" in
+  submit)
+    case "$(cat "$STUB_DIR/submit")" in
+      ok) printf '{"id":"%s","message":"Successfully uploaded file"}\n' "$STUB_ID" ;;
+      no-id) printf '{"message":"Successfully uploaded file"}\n' ;;
+      *) echo 'Error: upload failed' >&2; exit 1 ;;
+    esac
+    ;;
+  info)
+    n=$(( $(cat "$STUB_DIR/polls" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$STUB_DIR/polls"
+    line=$(sed -n "${n}p" "$STUB_DIR/responses")
+    [ -n "$line" ] || line=$(tail -n 1 "$STUB_DIR/responses")
+    case "$line" in
+      timeout)
+        echo 'Error: Error Domain=NSURLErrorDomain Code=-1001 "The request timed out."' >&2
+        exit 69
+        ;;
+      garbage) echo 'not json' ;;
+      *) printf '{"id":"%s","status":"%s"}\n' "$3" "$line" ;;
+    esac
+    ;;
+  log) echo "notary log for $3" ;;
+  *) exit 64 ;;
+esac
+"#;
+
+#[cfg(unix)]
+struct NotaryRun {
+    ok: bool,
+    log: String,
+    calls: Vec<String>,
+}
+
+/// Write the real poller with the workflow's own step, then run it against the
+/// stubbed `xcrun`, the way both notarization steps call it. `None` when bash
+/// or python3 cannot run here.
+#[cfg(unix)]
+fn run_notarization(submit: &str, responses: &[&str], deadline_secs: u32) -> Option<NotaryRun> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let usable = Command::new("bash")
+        .args(["-c", "command -v python3"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !usable {
+        return None;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner_temp = dir.path().join("runner-temp");
+    let stub_dir = dir.path().join("stub");
+    let bin = dir.path().join("bin");
+    for d in [&runner_temp, &stub_dir, &bin] {
+        fs::create_dir_all(d).expect("create fixture directory");
+    }
+    let written = Command::new("bash")
+        .arg("-c")
+        .arg(step_script("Write the notarization poller"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("RUNNER_TEMP", &runner_temp)
+        .output()
+        .expect("run the poller-writing step");
+    assert!(
+        written.status.success(),
+        "writing the poller failed: {}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+    let xcrun = bin.join("xcrun");
+    fs::write(&xcrun, STUB_XCRUN).expect("write stub xcrun");
+    fs::set_permissions(&xcrun, fs::Permissions::from_mode(0o755)).expect("chmod stub xcrun");
+    fs::write(stub_dir.join("submit"), submit).expect("seed submit outcome");
+    fs::write(stub_dir.join("responses"), responses.join("\n") + "\n").expect("seed responses");
+    let out = Command::new("bash")
+        .arg(runner_temp.join("notarize.sh"))
+        .arg(dir.path().join("app-for-notary.zip"))
+        .arg("the app")
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("RUNNER_TEMP", &runner_temp)
+        .env("STUB_DIR", &stub_dir)
+        .env("STUB_ID", STUB_SUBMISSION_ID)
+        .env("APPLE_API_KEY", "key-id-marker-51d0")
+        .env("APPLE_API_ISSUER", "issuer-marker-0c7e")
+        .env("NOTARY_POLL_SECS", "0")
+        .env("NOTARY_DEADLINE_SECS", deadline_secs.to_string())
+        .output()
+        .expect("run the poller");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !log.contains("key-id-marker-51d0") && !log.contains("issuer-marker-0c7e"),
+        "the poller printed a credential value:\n{log}"
+    );
+    let calls = fs::read_to_string(stub_dir.join("calls"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    Some(NotaryRun {
+        ok: out.status.success(),
+        log,
+        calls,
+    })
+}
+
+#[cfg(unix)]
+fn count_calls(run: &NotaryRun, verb: &str) -> usize {
+    let prefix = format!("notarytool {verb} ");
+    run.calls.iter().filter(|c| c.starts_with(&prefix)).count()
+}
+
+/// Scenario: The real notarization poller, run against a stubbed xcrun, keeps
+/// polling through a timed-out request and an unparseable answer and passes
+/// once Apple reports Accepted. Invalid and Rejected fail with the notary log,
+/// no verdict by the deadline fails naming the submission, and a failed upload
+/// fails without polling.
+#[cfg(unix)]
+#[test]
+fn desktop_sign_notarization_poller_retries_until_a_verdict() {
+    let Some(run) = run_notarization(
+        "ok",
+        &["timeout", "In Progress", "garbage", "Accepted"],
+        600,
+    ) else {
+        println!("SKIP: bash or python3 is unavailable");
+        return;
+    };
+    assert!(
+        run.ok,
+        "transient failures then Accepted must pass:\n{}",
+        run.log
+    );
+    assert_eq!(count_calls(&run, "submit"), 1, "{:?}", run.calls);
+    assert_eq!(count_calls(&run, "info"), 4, "{:?}", run.calls);
+    assert_eq!(count_calls(&run, "log"), 0, "{:?}", run.calls);
+    assert!(
+        run.calls.iter().all(|c| !c.contains("--wait")),
+        "{:?}",
+        run.calls
+    );
+    assert!(
+        run.calls
+            .iter()
+            .filter(|c| c.starts_with("notarytool info "))
+            .all(|c| c.starts_with(&format!("notarytool info {STUB_SUBMISSION_ID} "))),
+        "every poll must ask about the submitted id: {:?}",
+        run.calls
+    );
+    assert!(!run.log.contains("::error::"), "{}", run.log);
+
+    for verdict in ["Invalid", "Rejected"] {
+        let run = run_notarization("ok", &["timeout", verdict], 600).expect("tools checked above");
+        assert!(!run.ok, "{verdict} must fail:\n{}", run.log);
+        assert!(
+            run.log.contains(&format!("returned status '{verdict}'"))
+                && run.log.contains(STUB_SUBMISSION_ID)
+                && run
+                    .log
+                    .contains(&format!("notary log for {STUB_SUBMISSION_ID}")),
+            "{verdict} must name the submission and print its notary log:\n{}",
+            run.log
+        );
+        assert_eq!(count_calls(&run, "info"), 2, "{:?}", run.calls);
+    }
+
+    let run = run_notarization("ok", &["In Progress"], 0).expect("tools checked above");
+    assert!(
+        !run.ok,
+        "no verdict by the deadline must fail:\n{}",
+        run.log
+    );
+    assert!(
+        run.log.contains("::error::no notarization verdict")
+            && run
+                .log
+                .contains(&format!("xcrun notarytool info {STUB_SUBMISSION_ID}")),
+        "the deadline failure must name the submission and how to check it:\n{}",
+        run.log
+    );
+    assert_eq!(count_calls(&run, "log"), 0, "{:?}", run.calls);
+
+    for submit in ["fail", "no-id"] {
+        let run = run_notarization(submit, &["Accepted"], 600).expect("tools checked above");
+        assert!(!run.ok, "submit outcome {submit} must fail:\n{}", run.log);
+        assert!(run.log.contains("::error::"), "{}", run.log);
+        assert_eq!(
+            count_calls(&run, "info"),
+            0,
+            "{submit}: nothing to poll without a submission id: {:?}",
+            run.calls
+        );
+    }
+}
+
+/// Scenario: A workflow whose poller treats a failed status request as a
+/// verdict, the pre-#1325 behaviour, fails the retry test above.
+#[cfg(unix)]
+#[test]
+fn desktop_sign_notarization_poller_mutation_without_retry_is_caught() {
+    let original = workflow();
+    let mutated = replace_once(
+        &original,
+        "              status=$(field \"$work/info.json\" status)\n            fi\n",
+        "              status=$(field \"$work/info.json\" status)\n            else\n              exit 1\n            fi\n",
+    );
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(mutated));
+    let run = run_notarization("ok", &["timeout", "Accepted"], 600);
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    let Some(run) = run else {
+        println!("SKIP: bash or python3 is unavailable");
+        return;
+    };
+    assert!(
+        !run.ok,
+        "a poller that stops on a failed request must not pass the transient-failure case:\n{}",
+        run.log
+    );
+    let control =
+        run_notarization("ok", &["timeout", "Accepted"], 600).expect("tools checked above");
+    assert!(
+        control.ok,
+        "the unmutated poller must pass:\n{}",
+        control.log
+    );
 }
 
 #[test]
@@ -432,6 +1545,216 @@ fn note_step(block: &str) -> String {
         .map(code_before_comment)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Scenario: Re-running either desktop producer replaces its earlier artifact
+/// instead of failing when the same artifact name already exists in the run.
+#[test]
+fn desktop_uploads_replace_artifacts_on_rerun() {
+    let all = jobs(&workflow());
+    for name in ["desktop-bundle", "desktop-sign"] {
+        let uploads: Vec<String> = steps(job(&all, name))
+            .into_iter()
+            .map(|step| step_code(&step))
+            .filter(|step| step.contains("actions/upload-artifact@"))
+            .collect();
+        assert!(
+            !uploads.is_empty(),
+            "{name} has no artifact uploads to guard"
+        );
+        for upload in uploads {
+            assert!(
+                upload.lines().any(|line| line.trim() == "overwrite: true"),
+                "{name} upload must set `overwrite: true`: {upload}"
+            );
+        }
+    }
+}
+
+/// Scenario: A desktop publish retry rewrites its bounded alpha note instead
+/// of leaving the previous attempt's signing and platform claims in the body.
+#[test]
+fn desktop_note_is_replaced_on_every_run() {
+    let all = jobs(&workflow());
+    let note = note_step(job(&all, "desktop-publish"));
+    assert!(
+        !note.lines().any(|line| line.contains("exit 0")),
+        "the note step must not exit early when an alpha marker is present"
+    );
+    for line in [
+        "MARKER=\"<!-- desktop-alpha -->\"",
+        "END_MARKER=\"<!-- /desktop-alpha -->\"",
+        "printf \"%s\\n\" \"$MARKER\"",
+        "printf \"\\n%s\\n\" \"$END_MARKER\"",
+    ] {
+        assert!(note.contains(line), "the note step must write `{line}`");
+    }
+}
+
+/// Scenario: Removing an upload overwrite or restoring the marker's early
+/// exit makes the corresponding release workflow guard fail.
+#[test]
+fn desktop_rerun_guards_reject_workflow_mutations() {
+    let original = workflow();
+    let sign = job(&jobs(&original), "desktop-sign").to_string();
+    let sign_upload = steps(&sign)
+        .into_iter()
+        .find(|step| step.contains("actions/upload-artifact@"))
+        .expect("desktop-sign upload");
+    let without_overwrite = replace_once(&sign_upload, "          overwrite: true", "");
+    let missing_overwrite = replace_once(&original, &sign_upload, &without_overwrite);
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(missing_overwrite));
+    let upload_failed =
+        std::panic::catch_unwind(desktop_uploads_replace_artifacts_on_rerun).is_err();
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    assert!(
+        upload_failed,
+        "removing desktop-sign overwrite was accepted"
+    );
+
+    let early_exit = replace_once(
+        &original,
+        "          END_MARKER=\"<!-- /desktop-alpha -->\"",
+        "          END_MARKER=\"<!-- /desktop-alpha -->\"\n          case *\"$MARKER\"*) exit 0 ;;",
+    );
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(early_exit));
+    let note_failed = std::panic::catch_unwind(desktop_note_is_replaced_on_every_run).is_err();
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    assert!(note_failed, "restoring the marker early exit was accepted");
+}
+
+#[cfg(unix)]
+fn desktop_note_splice_script() -> String {
+    let all = jobs(&workflow());
+    let step = named_step(
+        job(&all, "desktop-publish"),
+        "Note the unsigned alpha, or the signed macOS build, in the release body",
+    );
+    let mut lines = step.lines().skip_while(|line| !line.contains("<<'SPLICE'"));
+    assert!(
+        lines.next().is_some(),
+        "the desktop note has no SPLICE heredoc"
+    );
+    let body: Vec<&str> = lines.take_while(|line| line.trim() != "SPLICE").collect();
+    assert!(!body.is_empty(), "the SPLICE heredoc is empty");
+    let indent = body
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .expect("nonempty SPLICE heredoc");
+    body.iter()
+        .map(|line| &line[indent..])
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(unix)]
+fn run_desktop_note_splice(body: &str) -> (String, String) {
+    use std::process::Command;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let body_path = dir.path().join("body.md");
+    let prefix_path = dir.path().join("prefix.md");
+    let suffix_path = dir.path().join("suffix.md");
+    let script_path = dir.path().join("splice.py");
+    fs::write(&body_path, body).expect("write release body");
+    fs::write(&script_path, desktop_note_splice_script()).expect("write extracted SPLICE");
+    let output = Command::new("python3")
+        .arg(&script_path)
+        .arg(&body_path)
+        .arg("<!-- desktop-alpha -->")
+        .arg("<!-- /desktop-alpha -->")
+        .arg(&prefix_path)
+        .arg(&suffix_path)
+        .output()
+        .expect("run SPLICE under python3");
+    assert!(
+        output.status.success(),
+        "SPLICE exited {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        fs::read_to_string(&prefix_path).expect("read SPLICE prefix"),
+        fs::read_to_string(&suffix_path).expect("read SPLICE suffix"),
+    )
+}
+
+/// Scenario: The release workflow's actual Python splice preserves changelog
+/// text (including trailing spaces) and human suffixes (including indented code)
+/// while replacing alpha notes. An inline quoted marker stays in the changelog,
+/// and a second run preserves both sides byte for byte.
+#[cfg(unix)]
+#[test]
+fn desktop_note_splice_replaces_old_notes_and_is_idempotent() {
+    use std::process::Command;
+    if Command::new("python3").arg("--version").output().is_err() {
+        println!("SKIP: the desktop note splice test needs `python3` on PATH");
+        return;
+    }
+    const START: &str = "<!-- desktop-alpha -->";
+    const END: &str = "<!-- /desktop-alpha -->";
+    let changelog = "# Release notes\nA changelog entry with exact punctuation.";
+    let suffix = "A human addendum with exact punctuation.";
+    let quoted = "# Release notes\nThe changelog quotes `<!-- desktop-alpha -->` inline.";
+    let spaced_prefix = "# Release notes\nA changelog line with trailing spaces.   ";
+    let indented_suffix = "    command --flag\n    continued  ";
+    let cases = [
+        ("changelog only", changelog.to_string(), changelog, ""),
+        (
+            "legacy note",
+            format!("{changelog}\n\n{START}\nold unsigned note"),
+            changelog,
+            "",
+        ),
+        (
+            "bounded note with suffix",
+            format!("{changelog}\n\n{START}\nold unsigned note\n{END}\n\n{suffix}\n"),
+            changelog,
+            suffix,
+        ),
+        (
+            "indented suffix and spaced prefix",
+            format!(
+                "{spaced_prefix}\n \t\n{START}\nold unsigned note\n{END}\n \t\n\n{indented_suffix}\n \t\n"
+            ),
+            spaced_prefix,
+            indented_suffix,
+        ),
+        ("inline quote", quoted.to_string(), quoted, ""),
+    ];
+    for (label, body, expected_prefix, expected_suffix) in cases {
+        let (prefix, kept_suffix) = run_desktop_note_splice(&body);
+        assert_eq!(
+            (prefix.as_str(), kept_suffix.as_str()),
+            (expected_prefix, expected_suffix),
+            "{label}: surrounding text changed"
+        );
+        let mut rendered = format!("{prefix}\n\n{START}\nnew signed note\n{END}\n");
+        if !kept_suffix.is_empty() {
+            rendered.push_str(&format!("\n{kept_suffix}\n"));
+        }
+        assert_eq!(
+            rendered.lines().filter(|line| *line == START).count(),
+            1,
+            "{label}: START line count"
+        );
+        assert_eq!(
+            rendered.lines().filter(|line| *line == END).count(),
+            1,
+            "{label}: END line count"
+        );
+        assert!(
+            !rendered.contains("old unsigned note"),
+            "{label}: stale note"
+        );
+        let (again_prefix, again_suffix) = run_desktop_note_splice(&rendered);
+        assert_eq!(again_prefix, prefix, "{label}: second run changed prefix");
+        assert_eq!(
+            again_suffix, kept_suffix,
+            "{label}: second run changed suffix"
+        );
+    }
 }
 
 /// The release-body note is the only installation instruction this project

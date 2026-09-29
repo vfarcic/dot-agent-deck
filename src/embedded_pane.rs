@@ -1482,7 +1482,7 @@ impl EmbeddedPaneController {
     /// Reconnect to every daemon-side agent on TUI bootstrap (PRD #76
     /// M2.x). The agents the user spawned in a previous session are
     /// still alive in the daemon; without this step the dashboard would
-    /// show "No active sessions" even though the daemon owns live PTYs.
+    /// show "No active agents" even though the daemon owns live PTYs.
     ///
     /// For each id returned by `list_agents`, builds a fresh
     /// `StreamBackend` and opens an `AttachStream` (no `start-agent` —
@@ -2292,10 +2292,10 @@ fn classify_stop(
 /// Kept in one place so every arm that cannot verify a close words it
 /// identically and a test can pin the behaviour rather than N copies of a
 /// format string. `reason` is the middle clause — what stopped us from
-/// verifying — and reads directly after "Closed pane N but".
+/// verifying — and reads directly after "Closed agent N but".
 fn unverified_close_warning(pane_id_env: &str, reason: &str) -> String {
     format!(
-        "Closed pane {pane_id_env} but {reason} — an agent may still be running unattended; \
+        "Closed agent {pane_id_env} but {reason} — an agent may still be running unattended; \
          restart the deck to reattach it, or stop the daemon"
     )
 }
@@ -3764,6 +3764,15 @@ impl PaneController for EmbeddedPaneController {
         panes
             .get(pane_id)
             .map(|p| p.backend.agent_id.lock().unwrap().clone())
+    }
+
+    fn forget_pane(&self, pane_id: &str) -> bool {
+        // Dropping the pane drops its `StreamBackend`, which aborts the I/O
+        // task and closes the socket — including a reattach loop the stop's
+        // STREAM_END started, which would otherwise poll for a replacement
+        // agent that is not coming.
+        let removed = self.panes.lock().unwrap().remove(pane_id);
+        removed.is_some()
     }
 
     fn create_pane_with_options(

@@ -44,7 +44,9 @@ const EVENT_TITLES: Record<string, string> = {
   permission_request: "Permission requested",
   idle: "Idle",
   error: "Agent reported an error",
-  delegation_dispatched: "Delegation dispatched",
+  // Issue #714: the agent reported its provider refusing it for a quota.
+  quota_blocked: "Provider usage limit reached",
+  delegation_dispatched: "Delegated",
   delegation_delivered: "Task delivered to worker",
   delegation_failed: "Delegation FAILED",
   worker_respawned: "Worker respawned for delegation",
@@ -67,7 +69,7 @@ function text(value: unknown): string | undefined {
 }
 
 function verdictFor(eventType: string): Verdict {
-  if (eventType === "error" || eventType === "delegation_failed") return "ERROR";
+  if (eventType === "error" || eventType === "delegation_failed" || eventType === "quota_blocked") return "ERROR";
   if (HUMAN_EVENTS.has(eventType)) return "HUMAN";
   if (eventType === "work_done_received") return "PASS";
   return "INFO";
@@ -92,6 +94,11 @@ function clockFor(timestamp: unknown): string {
 }
 
 function summaryFor(event: DaemonHookEvent, eventType: string): string {
+  // Issue #714: fixed text, and the agent's own error message is left out:
+  // the tile carries it, sanitised, beside the status it explains.
+  if (eventType === "quota_blocked") {
+    return "The agent reported that its provider refused it for a usage limit or credit pool; its work will not progress until the quota is restored or the task is reassigned.";
+  }
   const tool = text(event.tool_name);
   const detail = text(event.tool_detail);
   if (tool) return detail ? `${tool} · ${detail}` : tool;
@@ -140,7 +147,7 @@ export function mapDaemonEvent(payload: unknown, sequence: number, resolveAgent?
       from: workDone ? (metadata.from_role || agent?.role || "worker") : "orchestrator",
       to: workDone ? "orchestrator" : (metadata.to_role || ""),
       at: clockFor(event.timestamp),
-      reason: sessionId ? `Delegation ${sessionId}` : "Deck handoff event",
+      reason: sessionId ? `Delegation ${sessionId}` : "Daemon delegation event",
       acknowledged: false,
       agentId: agent?.id ?? agentId,
     };
@@ -154,7 +161,7 @@ export function mapDaemonEvent(payload: unknown, sequence: number, resolveAgent?
     from: agent?.role ?? agentId ?? paneId ?? sessionId ?? "Unattributed agent",
     to: "",
     at: clockFor(event.timestamp),
-    reason: "Live hook event from the deck event stream.",
+    reason: "Live hook event from the daemon event stream.",
     acknowledged: false,
     agentId: agent?.id ?? agentId,
   };
@@ -188,7 +195,7 @@ export function applyHandoffEvent(edges: HandoffEdge[], payload: unknown): Hando
       toRole: metadata.to_role || "unknown role",
       orchestration: metadata.orchestration || undefined,
       taskPreview: metadata.task_preview || undefined,
-      status: "dispatched",
+      status: "delegated",
       respawned: false,
       at,
     };

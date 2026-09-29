@@ -1,6 +1,29 @@
 /**
- * Make everything that is not the agent pane genuinely inert while it is open,
- * and put focus inside it (PRD #1105's security audit).
+ * Make everything that is not the open dialog genuinely inert while it is open,
+ * put focus inside it, and give focus back to the opener on close (PRD #1105's
+ * security audit).
+ *
+ * # Two callers, one mechanism
+ *
+ * Written for the agent pane, which is what the notes below argue from, and
+ * since PRD #1223 also used by `NewAgentDialog` — the other surface here that
+ * declares `role="dialog" aria-modal="true"` over a base screen that stays
+ * mounted, and had the same false claim for the same reason. Reusing it rather
+ * than writing a second trap is deliberate: a per-dialog Tab-cycling handler
+ * would contain the keyboard and leave the background CLICKABLE, and the two
+ * implementations would then disagree about what "modal" means on a screen that
+ * can show both.
+ *
+ * **The other dialogs here are NOT fenced, and saying so is the honest version
+ * of "a repo-wide convention".** `ConfirmDialog`, `SettingsSheet`,
+ * `OutputReader`, `ConfigurationPanels`'s four sheets and `App`'s command
+ * palette and shortcut guide each declare `aria-modal="true"` over the same
+ * mounted background and each call nothing here, so the claim is as untrue for
+ * them as it was for the pane. They are left alone deliberately — the two
+ * surfaces wired up are the ones whose PRDs came with the audit that found
+ * this — rather than because they are exempt. `VoiceControlPanel` is the one
+ * that is exempt: it omits `aria-modal` on purpose (see its own note), so it
+ * claims nothing it does not do.
  *
  * # Why `aria-modal` alone was a false claim
  *
@@ -116,6 +139,18 @@ const VOICE_PEER_SELECTOR = `[data-modal-peer="${VOICE_PEER_PROPS["data-modal-pe
 
 export function useInertBackground<T extends HTMLElement>(open: boolean) {
   const ref = useRef<T>(null);
+  /** What had focus when this opened, so that closing can give it back. */
+  const opener = useRef<Element | null>(null);
+
+  /**
+   * Captured FIRST — before the walk below, on the same commit, moves focus
+   * inside. An effect declared after it would read a control of the dialog's
+   * own and "restore" focus to an element that is about to be unmounted.
+   */
+  useEffect(() => {
+    if (open) opener.current = document.activeElement;
+  }, [open]);
+
   useEffect(() => {
     const node = ref.current;
     if (!open || !node) return;
@@ -150,5 +185,38 @@ export function useInertBackground<T extends HTMLElement>(open: boolean) {
       for (const element of marked) element.removeAttribute("inert");
     };
   });
+
+  /**
+   * Focus containment's third half: give it back on close.
+   *
+   * The walk above takes focus off whatever opened this and puts it inside,
+   * which is what makes the dialog behave like one — and left the user nowhere
+   * on the way out. Closing with `Escape` from a dialog that had moved focus
+   * inside leaves it on `<body>`, so the next Tab starts from the top of the
+   * document rather than from the control just left: the maximise button of
+   * the tile whose pane was open, or the overview's own New agent button.
+   *
+   * **Declared LAST, so that its cleanup runs after the un-marking one.**
+   * React runs a commit's cleanups in the order their effects were declared,
+   * and `focus()` on an element still carrying `inert` is a no-op — restoring
+   * before the walk's cleanup has un-marked the background would silently
+   * leave focus on `<body>`, which is exactly the state this exists to fix.
+   *
+   * `isConnected` rather than a bare call: a close that also unmounts the
+   * opener is ordinary — a tile retired while its pane was open — and focusing
+   * a detached element moves focus to `<body>` in some engines, undoing the
+   * fallback a later dialog on the same commit may have just made. `<body>` is
+   * excluded for the same reason it is in the walk: it is where focus already
+   * is, not somewhere to put it.
+   */
+  useEffect(() => {
+    if (!open) return;
+    return () => {
+      const element = opener.current;
+      opener.current = null;
+      if (element instanceof HTMLElement && element !== document.body && element.isConnected) element.focus();
+    };
+  }, [open]);
+
   return ref;
 }
