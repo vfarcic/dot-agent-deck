@@ -50,7 +50,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
 use tracing::{info, warn};
 
-use crate::agent_pty::{AgentPtyRegistry, GuardedSend, GuardedSendDetail, SubmitGate};
+use crate::agent_pty::{AgentPtyRegistry, GuardedSend, GuardedSendDetail};
 use crate::config_validation::escape_id_for_log;
 use crate::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
 use crate::state::OrchestrationIdentity;
@@ -1687,14 +1687,10 @@ async fn redeliver(
     // repeat of bytes still in the box, and the first write's were released on
     // `Applied`.
     //
-    // Issue #1243: unlike the first write, a retype does NOT hold its CR until
-    // the pointer renders. It is only ever typed over a screen that showed no
-    // pointer, which is most often a pane that does not echo at all, and there
-    // the gate would hold the writer for its whole bound on every attempt. The
-    // loss the gate prevents needs an agent too busy to finish a paste within
-    // `SUBMIT_DELAY`; a worker that has sat idle through a retry wait is not
-    // one (0 of 20 lost against an idle Claude Code composer under the same
-    // load that lost 3 of 30 first writes).
+    // Issue #1243: a retype holds its CR until the pointer renders, like the
+    // first write and every other submit. It lands in a worker that may be as
+    // busy as the one that lost the first write's Enter; a pane that does not
+    // echo pays the gate's bound on each retype.
     //
     // The geometry epoch is read BEFORE the write, as the dispatch reads the
     // first write's: a resize during this write's `SUBMIT_DELAY` then counts.
@@ -1757,7 +1753,6 @@ async fn redeliver(
             },
             std::time::Instant::now(),
             &mut dispatch_hold,
-            SubmitGate::Delay,
             || {},
         )
         .await

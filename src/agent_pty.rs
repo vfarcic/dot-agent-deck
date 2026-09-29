@@ -2288,7 +2288,10 @@ pub enum GuardedSendDetail {
 /// before the gate existed.
 #[derive(Debug, Clone, Copy)]
 enum FirstWrite {
-    Immediate,
+    /// Write at once. `deadline` bounds what the write does before its first
+    /// byte — queueing on the writer and `revalidate` — exactly as
+    /// [`FirstWrite::Defer`]'s does; `None` is no bound.
+    Immediate { deadline: Option<Instant> },
     /// Wait while a draft is pending, within the cap measured from `started`.
     Defer {
         started: Instant,
@@ -5607,12 +5610,23 @@ enum SubmitMode {
 
 /// Issue #1243: what holds a submitted write's CR back. Ignored for a notice,
 /// which has no CR.
+///
+/// Every production submit takes [`Self::Echo`]: every one of them is the deck
+/// typing into an agent that may be too busy to finish a paste within
+/// [`SUBMIT_DELAY`]. A payload the watch cannot follow — see
+/// [`crate::submit_echo::echo_token`] — keeps the fixed delay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubmitGate {
-    /// [`SUBMIT_DELAY`] after the payload, as before #1243.
+enum SubmitGate {
+    /// [`SUBMIT_DELAY`] after the payload, as before #1243. A test seam for
+    /// the pre-#1243 shape, and the value a notice passes.
     Delay,
-    /// Until the payload renders, bounded; see
-    /// [`AgentPtyRegistry::write_and_submit_guarded_after_echo`].
+    /// Until the payload renders on the agent's screen, bounded by
+    /// [`crate::submit_echo::SUBMIT_ECHO_BOUND`], never sooner than
+    /// [`SUBMIT_DELAY`]. A CR written while a starved agent is still inside its
+    /// paste window is taken as a newline, and the text sits unsubmitted. A
+    /// pane that does not echo what is typed pays the whole bound, with the
+    /// writer held. Claude Code, Codex and OpenCode show what is typed in their
+    /// composer; Devin and Pi were not measured.
     Echo,
 }
 
@@ -9003,7 +9017,10 @@ impl AgentPtyRegistry {
     ///    SAME live, non-exited agent, and `revalidate()` (the caller's
     ///    liveness/session recheck against `AppState`) must still hold — else
     ///    [`GuardedSend::Stale`]/[`GuardedSend::WrongSession`] with NO bytes written.
-    /// 5. Write payload → `SUBMIT_DELAY` → CR, all under the held writer.
+    /// 5. Write payload → CR, all under the held writer. Issue #1243: the CR
+    ///    waits until the payload renders on the agent's screen, bounded by
+    ///    [`crate::submit_echo::SUBMIT_ECHO_BOUND`] and never sooner than
+    ///    `SUBMIT_DELAY`; see [`SubmitGate::Echo`].
     ///
     /// PRD #20 Greptile (paneless guarded send): a daemon-side agent that carries
     /// no pane maps to the `<no-pane>` sentinel and can never be resolved by pane
@@ -9062,10 +9079,79 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
+            SubmitGate::Echo,
+            expected_agent_id,
+            revalidate,
+            FirstWrite::Immediate { deadline: None },
+            None,
+            || {},
+        )
+        .await
+        .map(|sent| sent.detail)
+    }
+
+    /// [`Self::write_and_submit_guarded_detailed`] with a deadline on what the
+    /// write does before its first byte — queueing on the writer and
+    /// `revalidate` — returning [`AgentPtyError::DeadlineElapsed`] with nothing
+    /// written once it passes. Once the payload has started the write runs to
+    /// its CR and reports its real outcome, as
+    /// [`Self::write_and_submit_guarded_first_write_within`] does.
+    ///
+    /// Issue #1243: for a caller that would otherwise wrap the write in a
+    /// timeout of its own. The CR can wait up to
+    /// [`crate::submit_echo::SUBMIT_ECHO_BOUND`] for the payload to render, and
+    /// a timeout that fired in that wait would drop the write with the payload
+    /// in the box, unsubmitted and with no #424 record that it is there.
+    pub async fn write_and_submit_guarded_detailed_within<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: &str,
+        revalidate: impl FnOnce() -> Fut,
+        deadline: Instant,
+    ) -> Result<GuardedSendDetail, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        self.write_guarded(
+            pane_id,
+            text,
+            SubmitMode::Submit,
+            SubmitGate::Echo,
+            expected_agent_id,
+            revalidate,
+            FirstWrite::Immediate {
+                deadline: Some(deadline),
+            },
+            None,
+            || {},
+        )
+        .await
+        .map(|sent| sent.detail)
+    }
+
+    /// Issue #1243 test seam: [`Self::write_and_submit_guarded_detailed`] with
+    /// the pre-#1243 fixed [`SUBMIT_DELAY`] before the CR, so a test can show
+    /// the paste-window loss the echo gate prevents.
+    #[cfg(test)]
+    pub(crate) async fn write_and_submit_guarded_fixed_delay<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: &str,
+        revalidate: impl FnOnce() -> Fut,
+    ) -> Result<GuardedSendDetail, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        self.write_guarded(
+            pane_id,
+            text,
+            SubmitMode::Submit,
             SubmitGate::Delay,
             expected_agent_id,
             revalidate,
-            FirstWrite::Immediate,
+            FirstWrite::Immediate { deadline: None },
             None,
             || {},
         )
@@ -9148,7 +9234,7 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
-            SubmitGate::Delay,
+            SubmitGate::Echo,
             expected_agent_id,
             revalidate,
             FirstWrite::Defer {
@@ -9170,9 +9256,8 @@ impl AgentPtyRegistry {
     /// reached during the wait; call [`PaneDispatchHold::resume`] before
     /// acting on the outcome.
     ///
-    /// Issue #1243: `gate` decides what holds the CR back once the write goes
-    /// in. The delegate pointer passes [`SubmitGate::Echo`], so it is deferred
-    /// behind the worker's draft FIRST and only then echo-gated: the watch is
+    /// Issue #1243: deferred behind the worker's draft FIRST and only then
+    /// echo-gated, like every submit ([`SubmitGate::Echo`]): the watch is
     /// subscribed under the writer on the pass that writes, after the wait.
     ///
     /// Issue #1383 × #544: `before_payload` runs under the writer on the pass
@@ -9190,7 +9275,6 @@ impl AgentPtyRegistry {
         revalidate: impl FnOnce() -> Fut,
         started: Instant,
         hold: &mut PaneDispatchHold,
-        gate: SubmitGate,
         before_payload: impl FnOnce(),
     ) -> Result<FirstWriteSend, AgentPtyError>
     where
@@ -9200,7 +9284,7 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
-            gate,
+            SubmitGate::Echo,
             expected_agent_id,
             revalidate,
             FirstWrite::Defer {
@@ -9239,7 +9323,7 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
-            SubmitGate::Delay,
+            SubmitGate::Echo,
             expected_agent_id,
             revalidate,
             FirstWrite::Defer {
@@ -9289,7 +9373,7 @@ impl AgentPtyRegistry {
             pane_id,
             text,
             SubmitMode::Submit,
-            SubmitGate::Delay,
+            SubmitGate::Echo,
             expected_agent_id,
             revalidate,
             FirstWrite::Defer {
@@ -9365,46 +9449,12 @@ impl AgentPtyRegistry {
             SubmitGate::Delay,
             expected_agent_id,
             revalidate,
-            FirstWrite::Immediate,
+            FirstWrite::Immediate { deadline: None },
             None,
             || {},
         )
         .await
         .map(|sent| sent.detail.outcome())
-    }
-
-    /// Issue #1243: [`Self::write_and_submit_guarded_detailed`], with the CR held
-    /// until the payload's last word is on the agent's screen (bounded by
-    /// [`crate::submit_echo::SUBMIT_ECHO_BOUND`], never sooner than
-    /// [`SUBMIT_DELAY`]). A CR written while a starved agent is still inside
-    /// its paste window is taken as a newline, and the text sits unsubmitted.
-    ///
-    /// For the delegate task pointer. A pane that does not echo what is typed
-    /// pays the whole bound with the writer held, which is why this is not the
-    /// default; see [`crate::submit_echo`].
-    pub async fn write_and_submit_guarded_after_echo<Fut>(
-        &self,
-        pane_id: &str,
-        text: &str,
-        expected_agent_id: &str,
-        revalidate: impl FnOnce() -> Fut,
-    ) -> Result<GuardedSendDetail, AgentPtyError>
-    where
-        Fut: std::future::Future<Output = bool>,
-    {
-        self.write_guarded(
-            pane_id,
-            text,
-            SubmitMode::Submit,
-            SubmitGate::Echo,
-            expected_agent_id,
-            revalidate,
-            FirstWrite::Immediate,
-            None,
-            || {},
-        )
-        .await
-        .map(|sent| sent.detail)
     }
 
     /// Issue #1243: subscribe to `agent_id`'s output for an echo-gated submit of
@@ -9510,7 +9560,7 @@ impl AgentPtyRegistry {
         // Issue #544: see [`Self::write_and_submit_guarded_first_write_within`].
         let write_deadline = match first_write {
             FirstWrite::Defer { deadline, .. } => deadline,
-            FirstWrite::Immediate => None,
+            FirstWrite::Immediate { deadline } => deadline,
         };
         let within = |deferred: Duration| write_deadline.map(|at| at + deferred);
         let gate = match first_write {
@@ -19869,6 +19919,85 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
+    /// Issue #1243: the immediate entry's deadline bounds what happens before
+    /// the first byte and nothing after it. Queued behind a held writer, the
+    /// write gives up at the deadline with nothing written. Into a pane that
+    /// does not echo, the CR waits out the echo gate's whole bound, well past
+    /// the deadline, and is still written: a timeout around the write would
+    /// have dropped it there, leaving the payload in the box unsubmitted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detailed_within_bounds_only_the_time_before_the_first_byte() {
+        const PANE: &str = "issue-1243-detailed-within";
+        const TEXT: &str = "Read the task file. ECHO-GATE-SENTINEL";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sink = dir.path().join("sink");
+        let command = format!("stty raw -echo; exec cat > '{}'", sink.display());
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&command),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        // Let `stty` take effect before anything is typed.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let target = registry.writer_target_for_pane(PANE).expect("target");
+        let held = target.writer.lock().await;
+        let queued = tokio::time::timeout(
+            Duration::from_secs(5),
+            registry.write_and_submit_guarded_detailed_within(
+                PANE,
+                TEXT,
+                &agent,
+                || async { true },
+                Instant::now() + Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("the deadline bounds a write queued on the writer");
+        assert!(
+            matches!(queued, Err(AgentPtyError::DeadlineElapsed)),
+            "queued on a held writer past the deadline: {queued:?}"
+        );
+        drop(held);
+
+        let started = Instant::now();
+        let sent = registry
+            .write_and_submit_guarded_detailed_within(
+                PANE,
+                TEXT,
+                &agent,
+                || async { true },
+                started + Duration::from_millis(300),
+            )
+            .await
+            .expect("a write under way is not dropped at its deadline");
+        assert_eq!(sent, GuardedSendDetail::Outcome(GuardedSend::Applied));
+        assert!(
+            started.elapsed() >= crate::submit_echo::SUBMIT_ECHO_BOUND,
+            "precondition: the CR waited out the echo bound on a pane that does not echo; \
+             took {:?}",
+            started.elapsed()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let expected = format!("{TEXT}\r");
+        loop {
+            let got = std::fs::read_to_string(&sink).unwrap_or_default();
+            if got == expected {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pane received {got:?}, not the payload and its CR once"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        registry.shutdown_all();
+    }
+
     /// Issue #544 (PR #1398 re-review): a first write's deadline bounds only
     /// what happens BEFORE its first byte. Once the payload is in the pane the
     /// write runs to completion — its `SUBMIT_DELAY` and CR included — and is
@@ -20251,7 +20380,7 @@ mod spawn_tests {
             let reg = Arc::clone(&reg);
             let id = id.clone();
             async move {
-                reg.write_and_submit_guarded_after_echo(
+                reg.write_and_submit_guarded_detailed(
                     PANE,
                     "Read .dot-agent-deck/closed-during-echo-watch.md",
                     &id,
@@ -20306,7 +20435,7 @@ mod spawn_tests {
             let reg = Arc::clone(&reg);
             let original = original.clone();
             async move {
-                reg.write_and_submit_guarded_after_echo(
+                reg.write_and_submit_guarded_detailed(
                     PANE,
                     &format!("Read {MARKER}"),
                     &original,

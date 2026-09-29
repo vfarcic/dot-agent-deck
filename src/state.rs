@@ -8835,7 +8835,6 @@ async fn dispatch_one_owned(
                 },
                 std::time::Instant::now(),
                 &mut dispatch_hold,
-                crate::agent_pty::SubmitGate::Echo,
                 {
                     let write_sample = Arc::clone(&write_sample);
                     let sample_registry = Arc::clone(&registry);

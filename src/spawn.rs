@@ -1802,11 +1802,16 @@ enum GuardedOutcome {
 /// that immediately follows it in the same task — sub-millisecond, and closable
 /// only by threading the daemon's `AppState` into the spawn primitive.
 ///
-/// The whole call is bounded by the shared `deadline` (B9). A wedged PTY can
-/// still block inside the synchronous `write_all` under the writer mutex — that
-/// is pre-existing behaviour of every write on this path and is tracked as a
-/// follow-up, not fixed here — but the timeout does bound the far more common
-/// case of waiting behind another writer.
+/// The shared `deadline` (B9) bounds everything before the first byte, above
+/// all waiting behind another writer. A wedged PTY can still block inside the
+/// synchronous `write_all` under the writer mutex — that is pre-existing
+/// behaviour of every write on this path and is tracked as a follow-up, not
+/// fixed here.
+///
+/// Issue #1243: the bound is enforced inside the write rather than by a timeout
+/// around it. Once the payload is in, the CR waits for it to render on the
+/// agent's screen, and a timeout that fired during that wait would drop the
+/// write with the payload in the box, unsubmitted and unrecorded.
 async fn guarded_submit(
     registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
@@ -1817,14 +1822,19 @@ async fn guarded_submit(
     let closing = Arc::clone(registry);
     // Issue #424 H5: the DETAILED form, because this is the path that owes the
     // user a terminal report and cannot produce one from a flattened `Stale`.
-    let send =
-        registry.write_and_submit_guarded_detailed(pane_id, prompt, agent_id, || async move {
-            !closing.is_pane_closing(pane_id)
-        });
-    match tokio::time::timeout(remaining_before(deadline), send).await {
-        Err(_) => GuardedOutcome::Refused("deadline elapsed while writing"),
-        Ok(Err(e)) => GuardedOutcome::Failed(e),
-        Ok(Ok(detail)) => classify_guarded_detail(detail),
+    let send = registry.write_and_submit_guarded_detailed_within(
+        pane_id,
+        prompt,
+        agent_id,
+        || async move { !closing.is_pane_closing(pane_id) },
+        deadline,
+    );
+    match send.await {
+        Err(AgentPtyError::DeadlineElapsed) => {
+            GuardedOutcome::Refused("deadline elapsed while writing")
+        }
+        Err(e) => GuardedOutcome::Failed(e),
+        Ok(detail) => classify_guarded_detail(detail),
     }
 }
 
