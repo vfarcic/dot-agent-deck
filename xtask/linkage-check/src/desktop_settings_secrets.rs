@@ -132,7 +132,7 @@ const DESKTOP_SRC: &str = "desktop/src";
 /// layer. That is why `Option<String>` and `Vec<String>` still have no way in —
 /// they resolve to `String`, which is absent — and why there is no row for each
 /// container shape.
-const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 26] = [
+const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 27] = [
     (
         "u32",
         FieldKind::Scalar,
@@ -230,6 +230,16 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 26] = [
          digit. Too narrow for a PEM block, a base64 blob with padding, or \
          anything with whitespace. It names a deck the user typed into a shell \
          as `connect <name>`, and reaches no authentication surface as text",
+    ),
+    // Issue #1426's review: what a row carries instead of a stored name the
+    // rule refuses, so a stale rename can be told from a fresh one.
+    (
+        "NameDigest",
+        FieldKind::Scalar,
+        "a newtype over String whose deserializer accepts exactly 16 lowercase \
+         hex digits — the FNV-1a hash of a stored deck name — and nothing else. \
+         No text is representable beyond those 64 bits: it fingerprints a name \
+         without carrying it, and reaches no authentication surface",
     ),
     // PRD #741 M6: the endpoint list's own identity and selection tokens.
     (
@@ -501,7 +511,7 @@ const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
 /// name scan on this side would repeat the mistake #827 is about: `endpoint:
 /// string` passes any name check and is a free-text field. A diff here is the
 /// review prompt.
-const PINNED_TS_FIELDS: [(&str, &str, &str); 26] = [
+const PINNED_TS_FIELDS: [(&str, &str, &str); 27] = [
     ("DesktopSettingsDto", "version", "number"),
     (
         "DesktopSettingsDto",
@@ -537,6 +547,9 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 26] = [
     // (`DeckName`) on the Rust side. `null` is a row whose stored name is not
     // a usable deck name.
     ("RemoteEndpointDto", "name?", "string | null"),
+    // Issue #1426's review: a fingerprint of a stored name the rule refuses
+    // (`NameDigest`, 16 hex digits) — carried back on a rename, never shown.
+    ("RemoteEndpointDto", "name_digest?", "string"),
     ("RemoteEndpointDto", "port", "number"),
     ("RemoteEndpointDto", "socket?", "string"),
     ("RemoteEndpointDto", "user?", "string"),

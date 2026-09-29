@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dot_agent_deck::deck_list::{self, DeckName, DeckRef, RenameDeckError};
+use dot_agent_deck::deck_list::{self, DeckName, DeckRef, NameDigest, RenameDeckError};
 use dot_agent_deck::remote::{RemoteConfigError, RemoteEntry, RemotesFile};
 use dot_agent_deck::remote_tunnel::{
     HostAlias, Hostname, KeyPath, RemoteSocketPath, SshPort, SshUser,
@@ -99,8 +99,13 @@ pub fn row_from_entry(entry: &RemoteEntry) -> Result<RemoteEndpointSettings, Str
             .transpose()
             .map_err(|error| invalid("jump_host", &error))?,
         // A name written before the slug rule is not refused: the deck is
-        // still shown, by its address, and can be renamed (issue #1426).
+        // still shown, by its address, and can be renamed (issue #1426). The
+        // row then carries the name's digest, never the name, so a rename can
+        // tell that name from another refused one written since.
         name: DeckName::parse(&entry.name).ok(),
+        name_digest: DeckName::parse(&entry.name)
+            .is_err()
+            .then(|| NameDigest::of(&entry.name)),
         port: SshPort::parse(entry.port).map_err(|error| invalid("port", &error))?,
         socket: entry
             .socket
@@ -277,6 +282,7 @@ fn base_address(row: &RemoteEndpointSettings) -> (String, Option<String>, u16) {
 pub fn edits(base: &[RemoteEndpointSettings], next: &[RemoteEndpointSettings]) -> Vec<DeckEdit> {
     let unnamed = |row: &RemoteEndpointSettings| RemoteEndpointSettings {
         name: None,
+        name_digest: None,
         ..row.clone()
     };
     let mut out = Vec::new();
@@ -412,8 +418,11 @@ pub fn apply(path: &Path, edits: &[DeckEdit]) -> Result<(), ApplyError> {
 /// carries the name the window showed — so a rename made elsewhere since the
 /// window loaded is not silently replaced either. Otherwise it is
 /// [`RenameDeckError::Changed`] and nothing is written. `deck.name` is `None`
-/// for a row whose stored name the rule refuses, and such a row matches it
-/// while its name is still one the rule refuses.
+/// for a row whose stored name the rule refuses; such a row carries that
+/// name's [`NameDigest`] instead, and matches while the stored name still has
+/// that digest — not merely while it is still *a* name the rule refuses, which
+/// would let a stale window replace another refused name written since (issue
+/// #1426's review). A `None` name with no digest matches nothing.
 pub fn rename(
     path: &Path,
     deck: &RemoteEndpointSettings,
@@ -421,7 +430,10 @@ pub fn rename(
 ) -> Result<(), RenameDeckError> {
     deck_list::rename(path, DeckRef::Id(deck.id.as_str()), name, |entry| {
         deck_list::address_key(entry) == base_address(deck)
-            && DeckName::parse(&entry.name).ok() == deck.name
+            && match &deck.name {
+                Some(name) => entry.name == name.as_str(),
+                None => deck.name_digest.as_ref() == Some(&NameDigest::of(&entry.name)),
+            }
     })
     .map(drop)
 }
@@ -1518,6 +1530,45 @@ mod tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, shown.id, "the same id");
         assert_eq!(after[0].name.as_ref().map(DeckName::as_str), Some("legacy"));
+    }
+
+    /// Scenario: a row with an `id` of its own is called `my deck`, a name
+    /// the rule refuses, so the window shows it by its address. Elsewhere its
+    /// name changes to `other deck` — also refused — keeping the id and the
+    /// address. Renaming from the stale window is refused and writes nothing:
+    /// "both names are refused" is not "it is the name the window showed".
+    #[test]
+    fn a_stale_rename_does_not_replace_another_refused_name() {
+        let with_id = CLI_ROW
+            .replace("\"prod\"", "\"my deck\"")
+            .replace("type = ", "id = \"deck-1\"\ntype = ");
+        let (_dir, path) = registry(&with_id);
+        let shown = load_rows(&path).unwrap().remove(0);
+        assert_eq!(shown.id.as_str(), "deck-1");
+        assert_eq!(shown.name, None, "shown by its address");
+        assert_eq!(shown.name_digest, Some(NameDigest::of("my deck")));
+
+        let renamed_elsewhere = with_id.replace("\"my deck\"", "\"other deck\"");
+        std::fs::write(&path, &renamed_elsewhere).unwrap();
+        let now = load_rows(&path).unwrap().remove(0);
+        assert_eq!(
+            (&now.id, base_address(&now)),
+            (&shown.id, base_address(&shown))
+        );
+
+        let error = rename(&path, &shown, "legacy").unwrap_err();
+
+        assert!(matches!(error, RenameDeckError::Changed), "{error:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), renamed_elsewhere);
+        rename(&path, &now, "legacy").unwrap();
+        assert_eq!(
+            load_rows(&path).unwrap()[0]
+                .name
+                .as_ref()
+                .map(DeckName::as_str),
+            Some("legacy"),
+            "the row as it is now renames"
+        );
     }
 
     #[test]

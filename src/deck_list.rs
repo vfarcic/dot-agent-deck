@@ -244,6 +244,50 @@ impl<'de> serde::Deserialize<'de> for DeckName {
     }
 }
 
+/// A fingerprint of a stored deck name — 16 lowercase hex digits of the name's
+/// FNV-1a hash, the one a derived `h-…` id is made of.
+///
+/// For a client that must tell two stored names apart **without holding
+/// either** (issue #1426's review): the desktop does not carry a name
+/// [`DeckName`] refuses, since it renders only validated slugs, yet a rename
+/// from a stale window has to notice that such a name changed on disk to
+/// another name the rule also refuses. Two different names reading the same
+/// here is a 64-bit collision — possible, and the price of carrying no text.
+///
+/// Its `Deserialize` refuses anything but 16 lowercase hex digits, so a value
+/// that crossed a serde boundary carries no text of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(transparent)]
+pub struct NameDigest(String);
+
+impl NameDigest {
+    /// The digest of the stored name `name`.
+    pub fn of(name: &str) -> Self {
+        Self(format!("{:016x}", fnv1a(name.as_bytes())))
+    }
+
+    /// `raw` as a digest, or `None` when it is not 16 lowercase hex digits.
+    pub fn parse(raw: &str) -> Option<Self> {
+        (raw.len() == 16
+            && raw
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .then(|| Self(raw.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for NameDigest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw)
+            .ok_or_else(|| serde::de::Error::custom("a name digest is 16 lowercase hex digits"))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
@@ -1943,6 +1987,29 @@ added_at = "2026-01-01T00:00:00+00:00"
                 "{bad:?}"
             );
         }
+    }
+
+    /// Issue #1426's review: the digest tells two refused names apart, matches
+    /// the hash a derived `h-…` id is made of, and nothing but 16 lowercase
+    /// hex digits deserializes as one.
+    #[test]
+    fn a_name_digest_tells_names_apart_and_carries_no_text() {
+        let digest = NameDigest::of("my deck");
+        assert_ne!(digest, NameDigest::of("other deck"));
+        assert_eq!(format!("h-{}", digest.as_str()), derived_id("my deck"));
+        assert_eq!(NameDigest::parse(digest.as_str()), Some(digest.clone()));
+        for bad in [
+            "",
+            "my deck",
+            "0123456789ABCDEF",
+            "0123456789abcdef0",
+            "0123456789abcdeg",
+        ] {
+            assert_eq!(NameDigest::parse(bad), None, "{bad:?}");
+        }
+        let json = serde_json::to_string(&digest).unwrap();
+        assert_eq!(serde_json::from_str::<NameDigest>(&json).unwrap(), digest);
+        assert!(serde_json::from_str::<NameDigest>("\"my deck\"").is_err());
     }
 
     #[test]

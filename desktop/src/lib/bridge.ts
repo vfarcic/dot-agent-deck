@@ -489,6 +489,14 @@ export interface RemoteEndpointDto {
   identity?: string;
   jump?: string;
   name?: string | null;
+  /**
+   * When `name` is `null` because the stored name is not a usable deck name:
+   * a fingerprint of that stored name (16 hex digits), never the name itself
+   * (issue #1426's review). Not for display. It rides back on a rename so the
+   * crate can tell the name this window showed from another unusable name
+   * written since, and refuse a stale rename.
+   */
+  name_digest?: string;
   port: number;
   /**
    * The deck's attach socket path **on the remote host**. Optional because it
@@ -1279,6 +1287,7 @@ function normalizeRemoteEndpoint(value: unknown): RemoteEndpointDto | undefined 
     identity: optional("identity"),
     jump: optional("jump"),
     name,
+    name_digest: optional("name_digest"),
     port: typeof record.port === "number" && Number.isInteger(record.port) && record.port > 0 && record.port <= 65535 ? record.port : DEFAULT_SSH_PORT,
     socket: optional("socket"),
     user: optional("user"),

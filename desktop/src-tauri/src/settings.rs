@@ -195,7 +195,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dot_agent_deck::daemon_client::{Endpoint, RemoteEndpoint};
-use dot_agent_deck::deck_list::DeckName;
+use dot_agent_deck::deck_list::{DeckName, NameDigest};
 use dot_agent_deck::platform::fsperm;
 use dot_agent_deck::platform::paths::config_dir;
 // PRD #741 M6: the validating ssh-argument newtypes ARE this section's schema.
@@ -1655,6 +1655,23 @@ pub struct RemoteEndpointSettings {
     /// change it, so a stale window cannot rename a deck back.
     #[serde(default)]
     pub name: Option<DeckName>,
+    /// A fingerprint of the stored name when [`Self::name`] is `None` because
+    /// the rule refuses it (issue #1426's review) — never the name itself.
+    ///
+    /// A rename checks that the row on disk still carries the name the window
+    /// showed. For a refused name the window holds no name to compare, and
+    /// "both refused" would let a stale window replace a *different* refused
+    /// name written since — so the row carries this [`NameDigest`] instead,
+    /// and [`crate::decks::rename`] compares it with the stored name under the
+    /// registry's lock. It is hex, so there is nothing in it to render; the
+    /// webview carries it back on a rename and never shows it.
+    ///
+    /// Derived on load from `remotes.toml`, which never stores it — the
+    /// desktop has not written a remote row to this document since #1350.
+    /// Plain `#[serde(default)]` like its siblings rather than skipped when
+    /// `None`: a serde skip would hide it from the settings-secret sweep.
+    #[serde(default)]
+    pub name_digest: Option<NameDigest>,
     /// The ssh port.
     ///
     /// An [`SshPort`] rather than a `u16` (PRD #741, Greptile P2 on #1035): a
@@ -1731,6 +1748,7 @@ impl RemoteEndpointSettings {
             identity: None,
             jump: None,
             name: None,
+            name_digest: None,
             port: default_ssh_port(),
             socket: None,
             user: None,
@@ -2400,7 +2418,7 @@ impl SaveFailure {
         Self {
             error: SettingsWriteError {
                 detail: format!("the deck list {}: {error}", remotes.display()),
-                public: format!("{error} The daemon was not added; choose another name."),
+                public: format!("{error} It was not added; choose another name."),
             },
             decks_saved: false,
             conflict: true,
@@ -8094,6 +8112,7 @@ forms it is.";
                     identity: Some(KeyPath::parse("~/.ssh/id_ed25519").unwrap()),
                     jump: Some(HostAlias::parse("bastion").unwrap()),
                     name: Some(DeckName::parse("build-box").unwrap()),
+                    name_digest: Some(NameDigest::of("build box")),
                     port: SshPort::parse(2222).unwrap(),
                     socket: Some(
                         RemoteSocketPath::parse("/run/user/1000/dot-agent-deck-attach.sock")
@@ -9008,6 +9027,7 @@ id = \"deck1\"
 identity = \"~/.ssh/id_ed25519\"
 jump = \"bastion\"
 name = \"build-box\"
+name_digest = \"d355f793f70ab0f6\"
 port = 2222
 socket = \"/run/user/1000/dot-agent-deck-attach.sock\"
 user = \"dev\"
@@ -10352,7 +10372,7 @@ level = 1.0
         assert!(!failure.decks_saved());
         assert_eq!(
             failure.public(),
-            "A deck named 'lab' already exists. The daemon was not added; choose another name."
+            "A deck named 'lab' already exists. It was not added; choose another name."
         );
         assert_eq!(std::fs::read_to_string(&remotes).unwrap(), taken);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), document_before);

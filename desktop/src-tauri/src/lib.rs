@@ -5616,7 +5616,8 @@ mod tests {
         // webview's `REMOTE_ADDRESS_FIELDS` names — so a field added to the
         // row without one here reddens this rather than slipping past the
         // rebind guard. The name is not part of the address: a rename keeps
-        // the deck the token names (issue #1426).
+        // the deck the token names (issue #1426) — nor is `name_digest`, which
+        // only fingerprints a stored name the rule refuses.
         let keys = |value: serde_json::Value| {
             let mut keys: Vec<String> = value
                 .as_object()
@@ -5636,7 +5637,7 @@ mod tests {
             jump: Some("j".to_string()),
         };
         let mut row_fields = keys(serde_json::to_value(&endpoints.remote[0]).expect("serializes"));
-        row_fields.retain(|field| field != "id" && field != "name");
+        row_fields.retain(|field| !["id", "name", "name_digest"].contains(&field.as_str()));
         assert_eq!(
             keys(serde_json::to_value(&every_field).expect("serializes")),
             row_fields
