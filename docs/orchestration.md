@@ -716,6 +716,10 @@ A report is also labelled unsolicited, and no file is written, when:
 
 When `.dot-agent-deck/work-done-<role>.md` cannot be written (for example, the `.dot-agent-deck` directory cannot be created), the orchestrator is told the file is unavailable and gets the worker's report in the message instead, as a single line without its Markdown formatting.
 
+### The report went to a different file than `work-done-<role>.md`
+
+If a file the deck did not write is already at `.dot-agent-deck/work-done-<role>.md` — usually because the worker saved its own report there — the deck leaves that file exactly as it is, saves the report to a new file in the same `.dot-agent-deck` directory, and tells the orchestrator both where the report is and that the existing file was left alone, since it may hold more of the worker's report. To avoid this, have workers save their reports under another name; the reporting instructions the deck gives them already suggest one.
+
 ### Prompt template is not being applied
 
 Edits to `.dot-agent-deck.toml` apply to the next task without restarting the pane. Check that the role's `name` matches the `--to` argument exactly, and that the config file is at the project root.

@@ -442,3 +442,125 @@ fn work_done_009_cut_report_names_its_saved_full_copy_in_the_attached_tui() {
         deck.snapshot_grid()
     );
 }
+
+/// Issue #331: the words the daemon uses when a commissioned report could not
+/// be filed at the role-keyed path because a file it did not write was there.
+const DIVERTED_NEEDLE: &str = "a file the deck did not write was already there";
+
+/// Run the real CLI from `pane_env`'s pane against the deck's own daemon and
+/// require it to exit 0.
+fn run_cli(deck: &TuiDeck, pane_env: &str, args: &[&str]) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(args)
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", pane_env)
+        .env("HOME", deck.home_dir())
+        .current_dir(deck.workdir())
+        .output()
+        .expect("run the real `dot-agent-deck` CLI");
+    assert!(
+        output.status.success(),
+        "`{args:?}` exited {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Scenario: Launch the real TUI and its lazy daemon, open the two-role `orch-deck` fixture, and run the REAL `dot-agent-deck delegate` from the orchestrator's pane. The worker then writes its report to `.dot-agent-deck/work-done-worker.md` — the deck's own summary path — and hands that very file to the REAL `work-done --task-file`, spelled `./.dot-agent-deck/../.dot-agent-deck/work-done-worker.md`. The file must survive byte for byte, and the orchestrator's pane must visibly say the report was saved elsewhere, naming a file that holds it between the untrusted-report markers.
+#[spec("orchestration/work-done/012")]
+#[test]
+fn work_done_012_task_file_at_the_summary_path_survives_in_the_attached_tui() {
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .with_pty_size(120, 40)
+        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
+        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
+        .launch_with_fixture("orch-deck");
+    deck.wait_for_string("No active agents");
+    open_orchestration(&deck);
+    deck.wait_for_string(WORKER_ROLE);
+    let (worker_pane, orchestrator_agent) = orchestration_ids(&deck);
+    let orchestrator_pane = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.id == orchestrator_agent)
+        .and_then(|record| record.pane_id_env)
+        .expect("the orchestrator's pane id");
+
+    // A commission, so this completion is solicited and takes the file path.
+    run_cli(
+        &deck,
+        &orchestrator_pane,
+        &[
+            "delegate",
+            "--to",
+            WORKER_ROLE,
+            "--task",
+            "Review the change.",
+        ],
+    );
+
+    let dir = deck.workdir().join(".dot-agent-deck");
+    let summary_path = dir.join(format!("work-done-{WORKER_ROLE}.md"));
+    let report = "# Review\n\n- BLOCKER: e2e-task-file-is-the-summary-path-6d0e\n- BLOCKER two\n";
+    std::fs::create_dir_all(&dir).expect("the coordination directory");
+    std::fs::write(&summary_path, report).expect("the worker writes its report");
+    run_cli(
+        &deck,
+        &worker_pane,
+        &[
+            "work-done",
+            "--task-file",
+            &format!("./.dot-agent-deck/../.dot-agent-deck/work-done-{WORKER_ROLE}.md"),
+        ],
+    );
+
+    let wrote = common::wait_until(Duration::from_secs(20), || {
+        squeeze(&orchestrator_pty(&deck, &orchestrator_agent)).contains(&squeeze(DIVERTED_NEEDLE))
+    });
+    let pty = orchestrator_pty(&deck, &orchestrator_agent);
+    assert_eq!(
+        std::fs::read_to_string(&summary_path).expect("the worker's file survives"),
+        report,
+        "the daemon overwrote the file `work-done --task-file` was handed (#331)\n\
+         Orchestrator PTY:\n{pty}"
+    );
+    assert!(
+        wrote,
+        "the orchestrator was never told the report went elsewhere\nOrchestrator PTY:\n{pty}"
+    );
+    let named = named_report_path(&pty, &dir)
+        .unwrap_or_else(|| panic!("the feedback names no saved report under {dir:?}\nPTY:\n{pty}"));
+    let saved = std::fs::read_to_string(&named)
+        .unwrap_or_else(|error| panic!("read the named report file {named:?}: {error}"));
+    let lines: Vec<&str> = saved.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some(REPORT_FRAME_NEEDLE),
+        "{saved:?}"
+    );
+    assert_eq!(
+        lines.last().copied(),
+        Some(":END-UNTRUSTED-WORKER-REPORT]"),
+        "{saved:?}"
+    );
+    assert!(saved.contains(report), "{saved:?}");
+
+    assert!(
+        wait_for_pane_string(
+            &deck,
+            DIVERTED_NEEDLE,
+            common::load_scaled(Duration::from_secs(20))
+        ),
+        "the diverted-report notice reached the orchestrator's PTY but never became visible in \
+         the rendered orchestration surface\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    // Sound as a single read: the wait above proved this write finished painting.
+    assert!(
+        !pane_contains(&deck, POINTER_NEEDLE),
+        "the orchestrator was pointed at the worker's file as if the deck had written this \
+         report there\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
