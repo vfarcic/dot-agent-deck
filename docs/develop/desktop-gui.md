@@ -799,32 +799,55 @@ The browser tier does answer the geometry questions it can: `desktop/e2e/agent-p
 
 Issue [#1422](https://github.com/vfarcic/dot-agent-deck/issues/1422). The agent's terminal is xterm.js, and xterm.js encodes keys itself (`Keyboard.ts` in `@xterm/xterm@6.0.0`), so the bytes an agent receives from the desktop are xterm.js's, not the TUI's `keyevent_to_bytes` (`src/ui.rs`). For almost every key the two agree. `desktop/src/lib/terminalKeys.ts` holds the exceptions and nothing else, and `TerminalViewport.tsx` installs it with `attachCustomKeyEventHandler` — the terminal's one key hook. A key the module does not name is left to xterm.js, so an app shortcut or a key xterm.js already sends correctly is untouched. The replacement goes through `terminal.input(…, true)`, which fires `onData`, so a translated key passes the same input gates (`disableStdin`, the `readOnly` guard) as any other; the handler also claims the key the way xterm.js claims one it sends (`preventDefault` plus `stopPropagation`), so it neither types into the helper textarea nor reaches the app's window-level listeners.
 
-**What changed.** xterm.js sends a bare CR for Enter whatever Shift or Ctrl is held — the byte that submits — so Shift+Enter and Ctrl+Enter were indistinguishable from Enter. They now send the TUI's CSI u form, `ESC[13;<m>u` with `m = 1 + (Shift 1 | Alt 2 | Ctrl 4)`. xterm.js also sent nothing at all for Ctrl+/, where xterm, GNOME Terminal and the TUI send US (0x1f); it now sends 0x1f. Cmd/Super chords, keys pressed while an input method is composing, and keys pressed with AltGr (`getModifierState("AltGraph")`) are never claimed, because Windows reports AltGr as Ctrl+Alt and AltGr+Enter would otherwise go out as Ctrl+Alt+Enter; Ctrl+/ additionally requires Alt to be up.
+**What changed.** Two kinds of exception.
 
-**Measured, not read off the source.** Each row below is what `onData` received for a real key press in Playwright's Chromium and WebKit (the fixture deck, 2026-09-29), after this change. The two engines agreed on every row. A — in the TUI column means that row was not compared.
+- **TUI parity.** xterm.js sends a bare CR for Enter whatever Shift or Ctrl is held — the byte that submits — so Shift+Enter and Ctrl+Enter were indistinguishable from Enter. They now send the TUI's CSI u form, `ESC[13;<m>u` with `m = 1 + (Shift 1 | Alt 2 | Ctrl 4)`. xterm.js also sent nothing at all for Ctrl+/, where xterm, GNOME Terminal and the TUI send US (0x1f); it now sends 0x1f.
+- **The platform's line-editing and paste keys.** xterm.js sends nothing for macOS's Cmd+Left/Right, sends Cmd+Backspace as a one-character DEL, sends Ctrl+Backspace as BS (a one-character delete in every agent, below), sends Ctrl+Delete and Option+Delete as `ESC[3;<m>~` (which two agents do not read as a word delete), and sends Windows' Ctrl+V as ^V and cancels it, so nothing pastes. Those now send readline's bytes — Ctrl+A, Ctrl+E, Ctrl+U, Ctrl+W (ETB) and `ESC d` — which each of the five supported agents was measured to act on (below). Windows' Ctrl+V is left to the webview's own paste (below).
 
-| Key | Desktop sends | TUI sends | Note |
-| --- | --- | --- | --- |
-| Enter | CR | CR | |
-| Shift+Enter | `ESC[13;2u` | `ESC[13;2u` | was CR before #1422 |
-| Ctrl+Enter | `ESC[13;5u` | `ESC[13;5u` | was CR before #1422 |
-| Alt+Enter | `ESC CR` | `ESC CR` | |
-| Cmd/Super+Enter | CR | CR | left to xterm.js |
-| Escape, Tab, Shift+Tab | `ESC`, HT, `ESC[Z` | same | |
-| Backspace / Alt+Backspace | DEL / `ESC DEL` | same | |
-| Ctrl+Backspace | BS (0x08) | BS, or DEL on a terminal speaking the kitty keyboard protocol | xterm.js matches xterm and GNOME Terminal; not changed |
-| Ctrl+letter (C, D, J, K, L, O, R, T, U, V, W, Z) | C0 byte | same | |
-| Ctrl+/ | US (0x1f) | US | xterm.js sent nothing before #1422 |
-| Ctrl+Space | NUL | NUL | |
-| Alt+letter | `ESC` letter | same | on macOS, Option types a character instead (`macOptionIsMeta` is off, as in Terminal.app by default) |
-| Shift+Up, Ctrl+Left | `ESC[1;2A`, `ESC[1;5D` | same | |
-| Alt+Left | `ESC[1;3D` | `ESC ESC[D` | both are common encodings of Alt+Left; not changed |
-| Home, End, PageUp, Delete | `ESC[H`, `ESC[F`, `ESC[5~`, `ESC[3~` | same | |
-| Shift+PageUp / Shift+PageDown | nothing | — | scrolls xterm.js's own scrollback |
-| Ctrl+Shift+C, Ctrl+Shift+V | nothing | — | left to the webview; copy is [#1403](https://github.com/vfarcic/dot-agent-deck/issues/1403) |
-| Cmd+K | nothing | — | opens the command palette. Ctrl+K goes to the agent as 0x0b while a terminal has focus, so it does not |
+Keys pressed while an input method is composing, and keys pressed with AltGr (`getModifierState("AltGraph")`), are never claimed, because Windows reports AltGr as Ctrl+Alt and AltGr+Enter would otherwise go out as Ctrl+Alt+Enter. Every editing chord must be the bare chord — Cmd+Shift+Left or Ctrl+Alt+Backspace is left to xterm.js. The only Cmd/Super chords claimed are macOS's Cmd+Left, Cmd+Right and Cmd+Backspace; every other one stays with the app and the OS.
 
-**What each agent does with the modified Enters is the agent's binding, and they differ.** Measured on this machine on 2026-09-29 by injecting the bytes into each agent in a private tmux server and reading its input box (typing, never submitting — except where the table says a chord submitted):
+**The platform is the webview's.** `keyPlatform()` reads `navigator` — `userAgentData.platform`, then `platform`, and the user agent only when neither is reported — once per terminal. It is never the daemon's host: a Mac attached to a Linux daemon still types Cmd+Left. The most specific report wins rather than any that matches, because Playwright's WebKit reports `platform: "Linux x86_64"` behind a Safari-on-Mac user agent, and the browser spec below caught a first version that let the user agent win. The distribution's WebKitGTK 2.52.6 reports `Linux x86_64` and an `X11; Ubuntu; Linux x86_64` user agent, measured in a bare WebKitGTK window on 2026-09-29. Super+Left on Linux and Windows is the window manager's and is never read as Cmd+Left; Ctrl+Backspace on macOS keeps xterm.js's BS, since it is not a macOS editing key.
+
+**Paste is the webview's.** The paste keys are Cmd+V on macOS, Ctrl+V or Ctrl+Shift+V on Windows, and Ctrl+Shift+V on Linux — what Terminal.app, Windows Terminal and GNOME Terminal paste with. For each of them the handler returns `false`, so xterm.js does not encode the key, but it does not cancel the event, so the webview runs its own paste into xterm.js's helper textarea and xterm.js's `paste` listener sends the text (bracketed, when the agent enabled bracketed paste). Ctrl+V on macOS and Linux is not a paste key there and still reaches the agent as ^V, which Claude Code, for one, reads as "paste an image". Only Windows' Ctrl+V needed the change; xterm.js already left the others alone. A bare WebKitGTK 2.52.6 window, driven with synthesized GDK key events, fired `paste` on an uncancelled Ctrl+V, Ctrl+Shift+V and Shift+Insert alike, so Linux's chord pastes in the webview this app ships on. Whether WKWebView pastes on an uncancelled ⌘V, and WebView2 on Ctrl+V, was not observed.
+
+**Measured, not read off the source.** Each row below is what `onData` received for a real key press in Playwright's Chromium and WebKit (the fixture deck, 2026-09-29), after this change, with the page reporting the platform named. The two engines agreed on every row. A — in the TUI column means that row was not compared; in the TUI these chords are the outer terminal's to encode.
+
+| Key | Platform | Desktop sends | TUI sends | Note |
+| --- | --- | --- | --- | --- |
+| Enter | all | CR | CR | |
+| Shift+Enter | all | `ESC[13;2u` | `ESC[13;2u` | was CR before #1422 |
+| Ctrl+Enter | all | `ESC[13;5u` | `ESC[13;5u` | was CR before #1422 |
+| Alt+Enter | all | `ESC CR` | `ESC CR` | |
+| Cmd/Super+Enter | all | CR | CR | left to xterm.js |
+| Escape, Tab, Shift+Tab | all | `ESC`, HT, `ESC[Z` | same | |
+| Backspace / Alt+Backspace | all | DEL / `ESC DEL` | same | Alt+Backspace is macOS's Option+Backspace |
+| Cmd+Left / Cmd+Right | macOS | SOH (0x01) / ENQ (0x05) | — | xterm.js sent nothing before #1422 |
+| Cmd+Backspace | macOS | NAK (0x15) | — | was DEL before #1422 |
+| Option+Delete | macOS | `ESC d` | — | was `ESC[3;3~` before #1422 |
+| Option+Left / Option+Right | macOS | `ESC[1;3D` / `ESC[1;3C` | — | left to xterm.js |
+| Ctrl+Backspace | Windows, Linux | ETB (0x17) | BS, or DEL on a terminal speaking the kitty keyboard protocol | was BS before #1422 |
+| Ctrl+Backspace | macOS | BS (0x08) | — | left to xterm.js |
+| Ctrl+Delete | Windows, Linux | `ESC d` | — | was `ESC[3;5~` before #1422 |
+| Home / End | all | `ESC[H` / `ESC[F` (`ESC OH` / `ESC OF` in application cursor mode) | same | |
+| Ctrl+Left / Ctrl+Right | all | `ESC[1;5D` / `ESC[1;5C` | same | |
+| Ctrl+letter (C, D, J, K, L, O, R, T, U, W, Z) | all | C0 byte | same | |
+| Ctrl+V | macOS, Linux | SYN (0x16) | same | |
+| Ctrl+V | Windows | nothing; the webview pastes | — | was SYN, with the paste cancelled, before #1422 |
+| Ctrl+Shift+V | Windows, Linux | nothing; the webview pastes | — | |
+| Cmd+V | macOS | nothing, and not cancelled | — | the paste itself is not observable on a Linux host |
+| Ctrl+/ | all | US (0x1f) | US | xterm.js sent nothing before #1422 |
+| Ctrl+Space | all | NUL | NUL | |
+| Alt+letter | all | `ESC` letter | same | on macOS, Option types a character instead (`macOptionIsMeta` is off, as in Terminal.app by default) |
+| Shift+Up | all | `ESC[1;2A` | same | |
+| Alt+Left | Windows, Linux | `ESC[1;3D` | `ESC ESC[D` | both are common encodings of Alt+Left; not changed |
+| Delete, PageUp | all | `ESC[3~`, `ESC[5~` | same | |
+| Shift+PageUp / Shift+PageDown | all | nothing | — | scrolls xterm.js's own scrollback |
+| Ctrl+Shift+C, Cmd+C | all | nothing | — | not claimed here; copy is [#1403](https://github.com/vfarcic/dot-agent-deck/issues/1403) |
+| Cmd+K | all | nothing | — | opens the command palette. Ctrl+K goes to the agent as 0x0b while a terminal has focus, so it does not |
+
+**What each agent does with those bytes is the agent's line editor, and they differ.** Measured on this machine on 2026-09-29 by injecting the bytes into each agent in a private tmux server and reading its input box. The method: type the draft `alpha beta gamma` (never a CR), move the cursor to where the case needs it, send one sequence with `tmux send-keys -H`, then type a marker `X` so the screen shows where the cursor landed. Send one sequence per key press, as a real key arrives: a burst of forty `ESC[C` with no gap between them made Claude Code type `[C` literally.
+
+First, the modified Enters:
 
 | Agent (version) | `ESC[13;2u` (Shift+Enter) | `ESC[13;5u` (Ctrl+Enter) | LF (Ctrl+J) |
 | --- | --- | --- | --- |
@@ -836,9 +859,27 @@ Issue [#1422](https://github.com/vfarcic/dot-agent-deck/issues/1422). The agent'
 
 CR submits in all of them. So the fix forwards Ctrl+Enter faithfully rather than mapping it to a newline: that is what the TUI and a terminal speaking the kitty keyboard protocol send, and it is the only choice that lets Claude Code's `chat:sendNow` work at all. Mapping it to LF would have made it a newline everywhere, which is what Windows Terminal before 1.25 did (Claude Code's own changelog names that case), at the cost of parity with the TUI and of every agent's own Ctrl+Enter binding. Shift+Enter and Ctrl+J are the newline chords that work in every supported agent, and the user docs say so.
 
-**What tests it.** `desktop/src/components/TerminalViewport.keys.test.tsx` runs the real xterm.js in jsdom (only the WebGL and fit addons are stubbed) and asserts the bytes for each key above that matters, that a translated key is claimed rather than bubbling, that Cmd/Super chords still bubble to the app, and that a read-only terminal sends nothing. `desktop/src/lib/terminalKeys.test.ts` covers the pure classification. `desktop/e2e/agent-terminal-input.spec.ts`'s "forwards modified Enter as the TUI does" presses the chords with each engine's own key events. None of these runs WebKitGTK, WKWebView or WebView2, and none reaches a real agent; the agent table above is a manual measurement and goes stale as agents change their bindings.
+Then line editing (Claude Code 2.1.285, the other four at the versions above). **Bold** marks the bytes the desktop sends.
 
-**For [#1403](https://github.com/vfarcic/dot-agent-deck/issues/1403).** A copy gesture has to be decided per key press — Ctrl+C is a copy only while there is a selection, and the agent's interrupt otherwise — so it belongs in the same `attachCustomKeyEventHandler` callback, ahead of `agentKeySequence`, rather than in a second handler: xterm.js keeps exactly one.
+| Bytes | Sent by | Claude Code | Codex | OpenCode | Pi | Devin |
+| --- | --- | --- | --- | --- | --- | --- |
+| **SOH**, `ESC[H`, `ESC OH` | Cmd+Left; Home | start of line | start of line | start of line | start of line | start of line |
+| **ENQ**, `ESC[F`, `ESC OF` | Cmd+Right; End | end of line | end of line | end of line | end of line | end of line |
+| `ESC b`, **`ESC[1;3D`**, **`ESC[1;5D`** | Option+Left; Ctrl+Left | word left | word left | word left | word left | word left |
+| `ESC f`, **`ESC[1;3C`**, **`ESC[1;5C`** | Option+Right; Ctrl+Right | end of word | end of word | **start of next word** | end of word | end of word |
+| **NAK** | Cmd+Backspace | delete to line start | delete to line start | delete to line start | delete to line start | delete to line start |
+| **ETB**, **`ESC DEL`**, `ESC BS` | Ctrl+Backspace; Option+Backspace | delete previous word | delete previous word | delete previous word | delete previous word | delete previous word |
+| BS | xterm.js's Ctrl+Backspace | **one character** | one character | one character | one character | one character |
+| `ESC[127;5u` | kitty's Ctrl+Backspace | delete previous word | delete previous word | delete previous word | **nothing** | delete previous word |
+| **`ESC d`** | Option+Delete; Ctrl+Delete | delete next word | delete next word | delete next word and the space | delete next word | delete next word and the space |
+| `ESC[3;5~` | xterm.js's Ctrl+Delete | **one character** | delete next word | delete next word and the space | **nothing** | delete next word and the space |
+| `ESC[3;3~` | xterm.js's Option+Delete | **everything after the cursor** | delete next word | delete next word and the space | delete next word | delete next word and the space |
+
+In a two-line draft (the second line started with `ESC[13;2u`), SOH, ENQ and NAK all act on the cursor's line only, in all five agents — which is what Cmd+Left, Cmd+Right and Cmd+Backspace mean on macOS. The table goes stale when an agent changes its line editor; rerun the method above rather than trusting it.
+
+**What tests it.** `desktop/src/components/TerminalViewport.keys.test.tsx` runs the real xterm.js in jsdom (only the WebGL and fit addons are stubbed) and asserts the bytes for each key above that matters, per platform with `navigator.platform` stubbed, that the paste keys send nothing and are not cancelled, that a pasted text reaches the agent, that a translated key is claimed rather than bubbling, that Cmd/Super chords still bubble to the app, and that a read-only terminal sends nothing. `desktop/src/lib/terminalKeys.test.ts` covers the pure classification, including the platform detection. `desktop/e2e/agent-terminal-input.spec.ts` presses the chords with each engine's own key events with the page reporting macOS, Windows or Linux, and performs a real clipboard paste for the Windows and Linux paste keys. None of these runs WebKitGTK, WKWebView or WebView2, and none reaches a real agent; the agent tables above are a manual measurement, and the WebKitGTK paste and `navigator` readings came from a bare WebKitGTK window, not the Tauri app.
+
+**For [#1403](https://github.com/vfarcic/dot-agent-deck/issues/1403).** Copy is not handled here. Its PR, #1440, claims Ctrl+Shift+C and Cmd+C in a capture-phase `keydown` listener on the terminal's wrapper, which runs before xterm.js and this handler see the key, so the two do not compete for xterm.js's one custom handler. What keeps them compatible is that neither table here claims either copy chord; `terminalKeys.test.ts` asserts that on all three platforms.
 
 ## The New agent flow
 

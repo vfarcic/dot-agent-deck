@@ -3,7 +3,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import type { SendResult, TerminalBuffer, TerminalFeed } from "../types";
-import { agentKeySequence } from "../lib/terminalKeys";
+import { agentKeySequence, keyPlatform, leavesPasteToWebview } from "../lib/terminalKeys";
 import { registerRefit, registerTerminal, unregisterRefit, unregisterTerminal } from "../lib/terminalRegistry";
 
 interface TerminalViewportProps {
@@ -213,15 +213,25 @@ export function TerminalViewport({
     });
     // Issue #1422 — the keys xterm would encode differently from the TUI
     // (Ctrl+Enter and Shift+Enter above all: xterm sends the submitting CR for
-    // both). `terminal.input` routes the replacement through
+    // both), or in a form the agents do not act on (the platform's editing
+    // chords, such as Cmd+Left). `terminal.input` routes the replacement through
     // `onData`, so it passes the same input gates as a key xterm sent itself.
     //
-    // This is the one key hook on the terminal, so any other key the app needs
-    // to claim from it belongs here too — issue #1403's copy gesture, which has
-    // to decide per keypress (a selection present or not) whether Ctrl+C is a
-    // copy or the agent's interrupt, is the one known to be coming.
+    // Copy is not handled here, and this handler claims neither copy chord:
+    // issue #1403's Ctrl+Shift+C / Cmd+C (its PR #1440) is a capture-phase
+    // listener on the wrapper, which sees the key before xterm or this
+    // handler does. Keep Ctrl+Shift+C and Cmd+C out of both tables below.
+    //
+    // The platform is the webview's (what `navigator` reports), read once per
+    // terminal: it decides which chords are the user's editing and paste keys.
+    const platform = keyPlatform();
     terminal.attachCustomKeyEventHandler((event) => {
-      const sequence = agentKeySequence(event);
+      // The platform's paste key: keep xterm from encoding it (on Windows it
+      // would send Ctrl+V as ^V and cancel the paste) and leave the event
+      // uncancelled, so the webview pastes into xterm's textarea and xterm's
+      // own paste handling sends the text to the agent.
+      if (leavesPasteToWebview(event, platform)) return false;
+      const sequence = agentKeySequence(event, platform);
       if (sequence === undefined) return true;
       // Claim the key the way xterm claims one it sends: no newline typed into
       // its helper textarea, and no bubbling to the app's window shortcuts.

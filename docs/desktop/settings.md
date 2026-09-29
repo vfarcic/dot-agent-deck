@@ -53,3 +53,22 @@ The desktop app has a few keyboard shortcuts of its own. None of the TUI's [keyb
 While you are typing in an agent's terminal, your keys go to the agent the way they do in the TUI, so the agent's own shortcuts work: `Escape`, `Tab`, `Shift+Tab`, the arrow keys and `Ctrl` with a letter all reach it. `Ctrl+C` interrupts the agent, and `Escape` goes to the agent rather than closing the pane, so use **Back to dashboard** to leave. The zoom keys stay with the app.
 
 To start a new line without sending the message, press `Shift+Enter` or `Ctrl+J`; both work in every supported agent. `Ctrl+Enter` reaches the agent as `Ctrl+Enter`, and what it does is up to the agent, as it is in the TUI. See [Shift+Enter or Ctrl+Enter sends the message](../troubleshooting.md#shiftenter-or-ctrlenter-sends-the-message) for what each agent does with it.
+
+#### Editing and pasting in an agent's prompt
+
+The agent's prompt answers to your platform's usual text-editing shortcuts, in every supported agent:
+
+| To | macOS | Windows | Linux |
+| --- | --- | --- | --- |
+| Go to the start / end of the line | `⌘←` / `⌘→` | `Home` / `End` | `Home` / `End` |
+| Move one word left / right | `⌥←` / `⌥→` | `Ctrl+←` / `Ctrl+→` | `Ctrl+←` / `Ctrl+→` |
+| Delete to the start of the line | `⌘⌫` | | |
+| Delete the previous word | `⌥⌫` | `Ctrl+Backspace` | `Ctrl+Backspace` |
+| Delete the next word | `⌥⌦` (`fn+⌥⌫` on a laptop keyboard) | `Ctrl+Delete` | `Ctrl+Delete` |
+| Paste | `⌘V` | `Ctrl+V` or `Ctrl+Shift+V` | `Ctrl+Shift+V` |
+
+The app follows the computer you are typing on, not the machine the agent runs on: on a Mac connected to a Linux daemon, `⌘←` still goes to the start of the line. "Line" means the line the cursor is on, so in a message of several lines these keys stay on that line.
+
+Agents differ in small ways. Moving a word right in OpenCode lands on the start of the next word, where the other agents stop at the end of the current one, and deleting the next word in OpenCode and Devin also removes the space after it.
+
+`Ctrl+V` pastes only on Windows. On macOS and Linux it goes to the agent, which may have its own use for it — Claude Code, for one, pastes an image with it.

@@ -31,6 +31,16 @@ If you already have `keybind = shift+enter=csi:13;2u` in `~/Library/Application 
 - **Your terminal does not implement the enhanced keyboard protocol.** Bind the keystroke to the CSI u encoding yourself if your terminal supports custom keybinds — in Ghostty that is the `keybind = shift+enter=csi:13;2u` line above. The deck forwards the modifier faithfully either way.
 - **Your deck is out of date.** Upgrade; no configuration change is needed after that.
 
+## An Editing Shortcut Does Nothing in an Agent's Prompt
+
+*Applies to the desktop app.*
+
+In the desktop app, an agent's prompt answers to your platform's usual editing shortcuts: `⌘←`, `⌘→`, `⌥←`, `⌥→`, `⌘⌫`, `⌥⌫`, `⌥⌦` and `⌘V` on macOS, and `Home`, `End`, `Ctrl+←`, `Ctrl+→`, `Ctrl+Backspace`, `Ctrl+Delete` and the paste key (`Ctrl+V` on Windows, `Ctrl+Shift+V` on Linux) on Windows and Linux. [Editing and pasting in an agent's prompt](desktop/settings.md#editing-and-pasting-in-an-agents-prompt) has the full table. If one of them does nothing, or deletes a single character instead of a word:
+
+- **Your desktop app is out of date.** Earlier versions sent nothing for `⌘←` and `⌘→`, deleted one character for `⌘⌫` and `Ctrl+Backspace`, and typed `Ctrl+V` into the agent on Windows instead of pasting. Upgrade.
+- **The shortcut is another platform's.** The app uses the shortcuts of the computer you are typing on, so `Ctrl+Backspace` on a Mac, or `⌘←` on Linux, keeps its ordinary meaning rather than becoming the other platform's shortcut.
+- **You are in the TUI.** In the TUI, your terminal decides what these keys send; set them up in your terminal's own settings.
+
 ## Hooks
 
 Hooks are **auto-installed on every startup** — most users never need to think about them. The deck detects which agents are present and installs hooks accordingly, both when the dashboard starts and when its background daemon starts:
