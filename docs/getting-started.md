@@ -48,24 +48,40 @@ The desktop app is an **alpha** and a separate download, for Apple silicon Macs 
 #### macOS (Apple silicon)
 
 1. Download `dot-agent-deck-desktop-alpha-macos-arm64.dmg` from the [latest release](https://github.com/vfarcic/dot-agent-deck/releases/latest).
-2. Open the `.dmg` and drag **Agent Deck** to **Applications**.
-3. Launch **Agent Deck** from Applications. macOS should ask only to confirm opening an app downloaded from the internet.
+2. Check that it was built by this project's release workflow, and do not install it if the check fails ([Installation → Verify the download](installation.md#verify-the-download) says what a pass looks like):
 
-#### Linux (amd64)
+   ```bash
+   gh attestation verify dot-agent-deck-desktop-alpha-macos-arm64.dmg \
+     --repo vfarcic/dot-agent-deck \
+     --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml
+   ```
+
+3. Open the `.dmg` and drag **Agent Deck** to **Applications**.
+4. Launch **Agent Deck** from Applications. macOS should ask only to confirm opening an app downloaded from the internet. If it reports the app as damaged or from an unidentified developer instead, read that release's notes and follow [Installation → Desktop app → macOS](installation.md#macos): a release can ship an unsigned `.dmg`.
+
+#### Linux (amd64, Debian and Ubuntu)
+
+On Linux the desktop app ships only as a `.deb` package, which installs with `apt` on Debian, Ubuntu and other distributions that use it.
 
 ```bash
 # 1. Download the package
 curl -fsSL -o dot-agent-deck-desktop-alpha-linux-amd64.deb \
   https://github.com/vfarcic/dot-agent-deck/releases/latest/download/dot-agent-deck-desktop-alpha-linux-amd64.deb
 
-# 2. Install it; apt also pulls in the libraries it needs
+# 2. Check that it was built by this project's release workflow.
+#    If this does not report a verified attestation, stop: do not install it.
+gh attestation verify dot-agent-deck-desktop-alpha-linux-amd64.deb \
+  --repo vfarcic/dot-agent-deck \
+  --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml
+
+# 3. Install it; apt also pulls in the libraries it needs
 sudo apt install ./dot-agent-deck-desktop-alpha-linux-amd64.deb
 
-# 3. Launch it, or pick Agent Deck from your application menu
+# 4. Launch it, or pick Agent Deck from your application menu
 dot-agent-deck-desktop
 ```
 
-[Installation → Desktop app](installation.md#desktop-app) shows how to verify the download before installing it, what to do if macOS warns about the app, and how to keep the app and the daemon on the same release.
+The check needs the [GitHub CLI](https://cli.github.com/) (`gh`). [Installation → Desktop app](installation.md#desktop-app) has the rest: signing, what to do if the app will not open, and keeping the app and the daemon on the same release.
 
 ### Windows
 
