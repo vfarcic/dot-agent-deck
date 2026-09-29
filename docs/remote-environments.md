@@ -29,7 +29,7 @@ dot-agent-deck remote add my-vm user@host
 dot-agent-deck connect my-vm
 ```
 
-`remote add` connects over ssh, installs `dot-agent-deck` to `~/.local/bin/dot-agent-deck` on the host, sets up the agent hooks, and adds the remote to your list of remotes. `connect` then opens an ssh session and runs the deck there. Your local command stays in the foreground for as long as the session lasts and exits with the remote's exit code, so it behaves predictably in a script.
+`remote add` connects over ssh, installs `dot-agent-deck` to `~/.local/bin/dot-agent-deck` on the host, sets up the agent hooks, and adds the remote to your list of remotes. If the host already has the deck installed with [Homebrew](installation.md#homebrew-macos--linux), `remote add` uses that install instead of downloading a second copy (see [Hosts where Homebrew installed the deck](#hosts-where-homebrew-installed-the-deck)). `connect` then opens an ssh session and runs the deck there. Your local command stays in the foreground for as long as the session lasts and exits with the remote's exit code, so it behaves predictably in a script.
 
 </TabItem>
 <TabItem value="desktop" label="Desktop">
@@ -53,7 +53,7 @@ Other registry commands:
 ```bash
 dot-agent-deck remote list                 # show configured remotes
 dot-agent-deck remote doctor my-vm         # diagnose ssh, the install, and any forwards (read-only)
-dot-agent-deck remote upgrade my-vm        # reinstall the binary at the local client's version
+dot-agent-deck remote upgrade my-vm        # reinstall the binary at the local client's version (brew upgrade on a Homebrew host)
 dot-agent-deck remote remove my-vm         # forget the registry entry (host untouched)
 ```
 
@@ -67,7 +67,7 @@ dot-agent-deck remote remove my-vm         # forget the registry entry (host unt
 | `--port` | `22` | ssh port. |
 | `--key` | _none_ | Path to an ssh identity file. Forwarded to ssh as `-i`. Omit to use ssh's default key search. |
 | `--version` | client version | Daemon binary version to install on the remote. Usually leave unset. |
-| `--no-install` | `false` | Skip the binary push; pre-flight requires `~/.local/bin/dot-agent-deck` on the remote with a matching version. |
+| `--no-install` | `false` | Skip the binary push; pre-flight requires `~/.local/bin/dot-agent-deck` on the remote with a matching version. On a Homebrew host nothing is pushed either way, and the Homebrew install must report the matching version instead. |
 
 Example with a non-default identity file and port:
 
@@ -76,6 +76,20 @@ dot-agent-deck remote add my-vm deck@198.51.100.10 \
   --key ~/.ssh/dot-agent-deck \
   --port 2222
 ```
+
+### Hosts where Homebrew installed the deck
+
+`remote add` and `remote upgrade` first check how the deck is installed on the host. When a Homebrew formula owns it — `brew list --formula dot-agent-deck` succeeds, with `brew` found on the host's `PATH` or under `/opt/homebrew`, `/usr/local` or `/home/linuxbrew/.linuxbrew` — the deck works with that install and never writes to `~/.local/bin`:
+
+- `remote add` registers the Homebrew install as it is. If its version differs from `--version`, it says so and records the version the host actually runs.
+- `remote upgrade` runs `brew upgrade dot-agent-deck` on the host. Homebrew installs its tap's latest release and cannot install a chosen one, so the version that landed is what gets recorded, and if it differs from `--version` the command tells you.
+- The registry entry records the install method and the Homebrew binary's path (for example `/opt/homebrew/bin/dot-agent-deck`), `connect` and `remote doctor` run that binary, and it is the one that runs `hooks install` on the host.
+
+If a host has **both** a Homebrew install and a copy at `~/.local/bin/dot-agent-deck` — which is what `remote upgrade` from a release older than this left behind on a Homebrew host — the command names both and uses the Homebrew one. It does not delete the other copy. Remove it yourself — the message prints the exact `ssh … 'rm ~/.local/bin/dot-agent-deck'` line, with the remote's port and identity file — because a `dot-agent-deck` client older than this still runs it on `connect`.
+
+Entries registered before this existed record no install method. They keep running `~/.local/bin/dot-agent-deck` until the next `remote upgrade`, which detects the install and records it. A `dot-agent-deck` client older than this always runs `~/.local/bin/dot-agent-deck`, so it cannot `connect` to a host whose only install is Homebrew's. It also drops the recorded method if it rewrites `remotes.toml`, and the next `remote upgrade` from a current client records it again.
+
+The recorded install belongs to the host it was found on. If you change a deck's host, user or port — which you do in the desktop app's **Settings → Daemons**, since the CLI has no command that edits them — the deck forgets the install method and binary path, and runs `~/.local/bin/dot-agent-deck` again until the next `remote upgrade` detects what the new host has. Changing only the key file or the jump host keeps them.
 
 ### Remote names
 
@@ -234,7 +248,7 @@ Both causes produce the *same* bytes from ssh, so the client genuinely cannot te
 
 ### Remote binary missing
 
-Symptom: ssh worked, but `dot-agent-deck` wasn't found at `~/.local/bin/dot-agent-deck` on the remote (or what's at that path isn't a real `dot-agent-deck` build).
+Symptom: ssh worked, but `dot-agent-deck` wasn't found at the path the registry records for the remote — `~/.local/bin/dot-agent-deck` unless the host's deck is [installed with Homebrew](#hosts-where-homebrew-installed-the-deck) — or what's at that path isn't a real `dot-agent-deck` build.
 
 ```
 Remote 'my-vm' is reachable but `dot-agent-deck` was not found at ~/.local/bin/dot-agent-deck. Run `dot-agent-deck remote upgrade my-vm` to (re)install.
@@ -242,7 +256,7 @@ Remote 'my-vm' is reachable but `dot-agent-deck` was not found at ~/.local/bin/d
 
 What to do:
 
-- Run `dot-agent-deck remote upgrade my-vm` to reinstall the binary at your local client's version. This re-runs the install flow that `remote add` did originally.
+- Run `dot-agent-deck remote upgrade my-vm` to reinstall the binary at your local client's version. This re-runs the install flow that `remote add` did originally, and it also records a Homebrew install on a host that has one.
 - If the upgrade fails, the install path itself is broken — check that the remote user has write access to `~/.local/bin/`.
 
 ### Empty dashboard on first connect

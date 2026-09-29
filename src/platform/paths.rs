@@ -575,6 +575,37 @@ pub fn durable_binary_path_with(
         return Ok(path);
     }
 
+    // Step 1b (issue #1372): an installed NAME for the running binary — the
+    // `~/.local/bin` entry or a `$PATH` entry that resolves to the same file.
+    // This is how a package manager's link is recognised when `current_exe()`
+    // has already been resolved through it: on Linux `/proc/self/exe` names a
+    // Homebrew deck's `Cellar/<version>` keg, never `<prefix>/bin`, so step 1
+    // misses it and step 2a would pin a *different* binary that happens to sit
+    // at `~/.local/bin` — on a remote with both installs, a stale copy. Same
+    // candidates and the same checks as 2a and 2b, in the same order, so the
+    // only answer this can change is one where 2a or 2b would have named a
+    // file that is not the one running. Skipped for a running build artifact,
+    // so a link into `target/` never outranks a real install (issue #1140).
+    if let Ok(running) = std::fs::canonicalize(&absolute)
+        && !is_build_artifact_path(&running)
+    {
+        let path_candidates = path_value
+            .into_iter()
+            .flat_map(std::env::split_paths)
+            .filter(|dir| !is_untrustworthy_path_entry(dir))
+            .map(|dir| dir.join(&name));
+        for candidate in std::iter::once(installed.clone()).chain(path_candidates) {
+            if !is_build_artifact_path(&candidate)
+                && is_executable_file(&candidate)
+                && write_mode_is_owner_only(&candidate)
+                && std::fs::canonicalize(&candidate).is_ok_and(|c| c == running)
+                && let Some(path) = durable_path_string(&candidate)
+            {
+                return Ok(path);
+            }
+        }
+    }
+
     // `write_mode_is_owner_only` is step 2a's and 2b's, never step 1's — see
     // that function, and issue #732 for the checks deliberately left out of it.
     if !is_build_artifact_path(&installed)
@@ -3813,6 +3844,52 @@ mod tests {
             assert_durable(&resolved),
             installed_dir.join(&name).to_str().expect("path is UTF-8"),
             "the PATH fallback must skip relative and build-artifact entries"
+        );
+    }
+
+    /// Issue #1372: a Homebrew deck on Linux runs as its `Cellar` keg — the
+    /// kernel resolves `<prefix>/bin/dot-agent-deck` for `/proc/self/exe` — so
+    /// step 1 does not recognise it, and step 2a used to pin whatever sat at
+    /// `~/.local/bin`: on a remote with both installs, the stale copy that
+    /// `remote upgrade` itself used to leave there. The install that IS the
+    /// running binary must win, under its stable `<prefix>/bin` name.
+    #[cfg(unix)]
+    #[test]
+    fn durable_binary_path_prefers_the_path_install_that_is_the_running_binary() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+
+        let keg = dir
+            .path()
+            .join("linuxbrew/Cellar/dot-agent-deck/0.43.0/bin")
+            .join(&name);
+        write_stub_executable(&keg);
+        let brew_bin = dir.path().join("linuxbrew/bin");
+        std::fs::create_dir_all(&brew_bin).expect("create brew bin");
+        std::os::unix::fs::symlink(&keg, brew_bin.join(&name)).expect("link the keg");
+        let stale = home.join(".local").join("bin").join(&name);
+        write_stub_executable(&stale);
+
+        let path_value =
+            std::env::join_paths([brew_bin.clone(), PathBuf::from("/usr/bin")]).expect("PATH");
+        let resolved =
+            durable_binary_path_with(Ok(keg.clone()), &home, Some(path_value.as_os_str()));
+
+        assert_eq!(
+            assert_durable(&resolved),
+            brew_bin.join(&name).to_str().expect("path is UTF-8"),
+            "the running binary's own install must outrank a different ~/.local/bin copy"
+        );
+
+        // Control: when the `~/.local/bin` entry IS the running binary (a link
+        // to it), it is still the answer — the unchanged step-2a behaviour.
+        std::fs::remove_file(&stale).expect("remove the stale copy");
+        std::os::unix::fs::symlink(&keg, &stale).expect("link ~/.local/bin to the keg");
+        let resolved = durable_binary_path_with(Ok(keg), &home, Some(path_value.as_os_str()));
+        assert_eq!(
+            assert_durable(&resolved),
+            stale.to_str().expect("path is UTF-8"),
         );
     }
 

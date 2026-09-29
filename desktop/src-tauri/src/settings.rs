@@ -10054,6 +10054,8 @@ level = 1.0
                 user: None,
                 jump_host: None,
                 socket: None,
+                install: None,
+                binary: None,
             },
         )
         .unwrap();
