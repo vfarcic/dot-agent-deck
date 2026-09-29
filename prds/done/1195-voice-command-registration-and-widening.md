@@ -1,9 +1,9 @@
 # PRD #1195: Make registering a voice command unforgettable, then widen the set
 
-**Status**: In progress — written 2026-09-26 from issue #1195's body, on branch `agent/dispatch-issue-1195`.
+**Status**: Complete (2026-09-29) — implemented in PR #1340 (merged 2026-09-27) and released in v0.43.0; the credentialed phrase fixtures were run locally by the maintainer. Deferred D1–D3 remain open. Written 2026-09-26 from issue #1195's body, on branch `agent/dispatch-issue-1195`.
 **Priority**: Medium
 **Created**: 2026-09-26
-**Depends on**: [PRD #802](done/802-desktop-voice-control.md) (desktop voice control, shipped — the command table, `VOICE_ACTIONS`, and linkage-check rule 13 all come from it).
+**Depends on**: [PRD #802](802-desktop-voice-control.md) (desktop voice control, shipped — the command table, `VOICE_ACTIONS`, and linkage-check rule 13 all come from it).
 
 ## Problem Statement
 
@@ -93,7 +93,7 @@ Per #802's "what rule 4 means here": the blocking desktop tier is Rust unit test
 - [x] **M2 — The registration guard.** Setter ownership plus shell-state classification (see Technical Approach), in `xtask/linkage-check`, with planted-bad-input tests for each assertion. Docs for "adding a control" updated in `docs/develop/desktop-gui.md`.
 - [x] **M3 — `switch_deck` on the existing `deck_ref` kind.** Registry entry, drop-down re-routed through it, table row, the selector's decks in the resolution set, pinned-by-value test updates, phrase fixtures. (Written as "`switch_deck` and the `deck_ref` kind" — `deck_ref` came from PRD #1223; see the M3 Work Log entry.)
 - [x] **M4 — Revisit the `no_voice` overlays individually.** Projects, prompts, agent profiles, workflow order: row or restated reason, each recorded. (All four keep `no_voice` with restated reasons; two drafted rows are deferred as D3 — see the M4 Work Log entry.)
-- [ ] **M5 — Docs, fixtures run, changelog.** `docs/develop/desktop-gui.md` updated; credentialed phrase fixtures run locally and named in the PR; `changelog.d/1195.feature.md`. Docs and changelog are done (M5 Work Log entry); **the credentialed fixture run is pending** and will be recorded when it lands, which is what this box is left unticked for.
+- [x] **M5 — Docs, fixtures run, changelog.** `docs/develop/desktop-gui.md` updated; credentialed phrase fixtures run locally and named in the PR; `changelog.d/1195.feature.md`. Docs and changelog are done (M5 Work Log entry); the credentialed fixture run was done locally by the maintainer (2026-09-29 Work Log entry).
 
 **Deferred.**
 
@@ -265,3 +265,7 @@ Two blockers, each fixed test first.
 **Chosen: carry the cause.** `VoiceOutcome::ParamUnresolved` gains `nothing_matched: bool`, set only by `Unmet::NoMatch`, and the rewrite requires it; every other cause keeps its own sentence. The field is `#[serde(skip)]`, so the serialized outcome the webview reads is unchanged — desktop-internal only, no wire or contract change. Rejected: re-running `switch_target` inside the rewrite to infer the cause, which duplicates the resolution and silently diverges the day `resolve_param` does more around it.
 
 **Tests.** Written first, through `resolve_declared_utterance` with the 257-row section: `oversized_selector_section_keeps_a_contrast_refusal_its_own_sentence` (quotes “avoid” and "say just the deck you want", no "Deck selector") and `oversized_selector_section_keeps_a_not_said_refusal_its_own_sentence` ("switch deck to the build box" answered with "staging box" → "I did not catch which deck", no quoted model value) were both RED with the selector sentence; `oversized_selector_section_refuses_a_switch_beyond_it_honestly` stays GREEN for the plain no-match.
+
+### 2026-09-29 — Closed
+
+The maintainer ran the credentialed phrase fixtures (`tests/voice_phrase_fixtures.rs`, which need `OPENAI_API_KEY`) locally, completing M5. PR #1340 merged on 2026-09-27 and the change shipped in v0.43.0. Issue #1195 is closed; D1–D3 stay deferred as recorded above.
