@@ -709,6 +709,7 @@ mod tests {
         deck_list::update(&path, DeckRef::Name("prod"), |entry| {
             entry.version = "0.43.0".to_string();
             entry.socket = Some("/run/user/1000/other.sock".to_string());
+            record_homebrew_install(entry);
         })
         .unwrap();
 
@@ -732,6 +733,54 @@ mod tests {
         assert_eq!(entry.version, "0.43.0");
         assert_eq!(entry.jump_host.as_deref(), Some("bastion"));
         assert_eq!(entry.host, "dev@build.example.com");
+        assert_eq!(
+            entry.remote_binary(),
+            HOMEBREW_BINARY,
+            "an edit that leaves the endpoint alone keeps the recorded install"
+        );
+    }
+
+    const HOMEBREW_BINARY: &str = "/opt/homebrew/bin/dot-agent-deck";
+
+    /// What `remote upgrade` records on a deck Homebrew installed (#1372).
+    fn record_homebrew_install(entry: &mut RemoteEntry) {
+        entry.install = Some(dot_agent_deck::remote::INSTALL_HOMEBREW.to_string());
+        entry.binary = Some(HOMEBREW_BINARY.to_string().try_into().unwrap());
+    }
+
+    /// PR #1373's review: the recorded install belongs to the machine it was
+    /// detected on. A desktop edit that points the deck at another host or
+    /// login used to keep it, so `connect` and `remote doctor` ran the old
+    /// host's Homebrew path on the new one and reported the binary missing.
+    #[test]
+    fn an_edit_that_moves_the_deck_forgets_the_old_hosts_install() {
+        for (what, edit) in [
+            (
+                "host",
+                (|row: &mut RemoteEndpointSettings| {
+                    row.host = Hostname::parse("other.example.com").unwrap()
+                }) as fn(&mut RemoteEndpointSettings),
+            ),
+            ("login", |row| {
+                row.user = Some(SshUser::parse("ops").unwrap())
+            }),
+            ("port", |row| row.port = SshPort::DEFAULT),
+        ] {
+            let (_dir, path) = registry(CLI_ROW);
+            deck_list::update(&path, DeckRef::Name("prod"), record_homebrew_install).unwrap();
+            let before = load_rows(&path).unwrap().remove(0);
+            let mut after = before.clone();
+            edit(&mut after);
+            apply(&path, &[DeckEdit::Update { before, after }]).unwrap();
+
+            let entry = &RemotesFile::load(&path).unwrap().remotes[0];
+            assert_eq!(
+                entry.remote_binary(),
+                dot_agent_deck::remote::REMOTE_INSTALL_PATH,
+                "a {what} change still runs the old host's binary"
+            );
+            assert_eq!(entry.install, None, "{what}");
+        }
     }
 
     /// Issue #1350's review: a CLI deck with no `id` answers to one derived

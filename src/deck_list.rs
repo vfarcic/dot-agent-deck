@@ -321,6 +321,36 @@ pub fn address_key(entry: &RemoteEntry) -> (String, Option<String>, u16) {
     )
 }
 
+/// Clear `after`'s recorded install (`install` and `binary`, issue #1372) when
+/// the edit moves the row to another endpoint — its [`address_key`] differs
+/// from `before`'s — and does not record a new install itself.
+///
+/// What `remote upgrade` records is a fact about the machine it probed: a
+/// Homebrew prefix is per host, and per login too (a Linuxbrew prefix can sit
+/// under one user's home). Kept across a move, it has `connect` and `remote
+/// doctor` run the old host's path on the new one and report the binary
+/// missing (PR #1373's review). Cleared, the row falls back to
+/// [`crate::remote::REMOTE_INSTALL_PATH`], the contract for any row with no
+/// recorded install, until the next `remote upgrade` detects what is there.
+///
+/// The port counts, because [`address_key`] is this module's one definition
+/// of "the same deck" and a different port routinely *is* a different machine
+/// (a forwarded port, a container's sshd). When it is the same machine, the
+/// cost is one `remote upgrade` to re-detect; keeping a stale path costs a
+/// deck that cannot connect with nothing saying why. The jump host and key do
+/// not count: they change the route or the credential, not the destination.
+///
+/// Applied in [`DeckDocument::replace`], which every edit of an existing row
+/// goes through — the CLI's [`update`] and the desktop's saves and migration
+/// alike — so no writer can move a row and keep its install.
+pub fn forget_install_if_moved(before: &RemoteEntry, after: &mut RemoteEntry) {
+    let records_new_install = after.install != before.install || after.binary != before.binary;
+    if address_key(before) != address_key(after) && !records_new_install {
+        after.install = None;
+        after.binary = None;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Addresses
 // ---------------------------------------------------------------------------
@@ -745,6 +775,9 @@ impl DeckDocument {
     /// The address fields `entry` changes are checked with
     /// [`validate_deck_address`]; one it leaves as it was is not, so a row
     /// written before that rule can still be edited in every other field.
+    ///
+    /// An edit that moves the row to another endpoint drops its recorded
+    /// install ([`forget_install_if_moved`]).
     pub fn replace(&mut self, index: usize, entry: &RemoteEntry) -> Result<(), RemoteConfigError> {
         let path = self.path.clone();
         let before = self
@@ -754,8 +787,10 @@ impl DeckDocument {
             .ok_or_else(|| unwritable(&path, "no such row"))?;
         validate_changed_address(Some(&before), entry)
             .map_err(|source| self.invalid_address(source))?;
+        let mut entry = entry.clone();
+        forget_install_if_moved(&before, &mut entry);
         let old = entry_table(&before, &path)?;
-        let new = entry_table(entry, &path)?;
+        let new = entry_table(&entry, &path)?;
         let row = self
             .rows_mut()
             .get_mut(index)
@@ -906,6 +941,8 @@ pub fn update(
         };
         let mut entry = entries[index].clone();
         f(&mut entry);
+        // What `replace` will write, so the row returned is the row on disk.
+        forget_install_if_moved(&entries[index], &mut entry);
         if entry != entries[index] {
             document.replace(index, &entry)?;
         }
@@ -1272,6 +1309,54 @@ mod tests {
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("jump_host"), "{written}");
         assert!(written.contains("socket ="), "{written}");
+    }
+
+    /// PR #1373's review: `install`/`binary` describe the machine `remote
+    /// upgrade` probed, so an edit that moves the row elsewhere drops them —
+    /// in the row returned as well as the row written — and one that leaves
+    /// the endpoint alone, or records a new install with the move, keeps what
+    /// it has.
+    #[test]
+    fn an_edit_that_moves_the_deck_forgets_the_recorded_install() {
+        let homebrew = |row: &mut RemoteEntry| {
+            row.install = Some(crate::remote::INSTALL_HOMEBREW.to_string());
+            row.binary = Some(
+                "/opt/homebrew/bin/dot-agent-deck"
+                    .to_string()
+                    .try_into()
+                    .unwrap(),
+            );
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remotes.toml");
+        add(&path, entry("box", "me@box.example")).unwrap();
+        update(&path, DeckRef::Name("box"), homebrew).unwrap();
+
+        let kept = update(&path, DeckRef::Name("box"), |row| {
+            row.host = "me@BOX.example".to_string();
+            row.key = Some("~/.ssh/other".to_string());
+            row.jump_host = Some("bastion".to_string());
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(kept.install.as_deref(), Some("homebrew"), "same endpoint");
+
+        let moved = update(&path, DeckRef::Name("box"), |row| {
+            row.host = "me@elsewhere.example".to_string();
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!((&moved.install, &moved.binary), (&None, &None));
+        assert_eq!(RemotesFile::load(&path).unwrap().remotes[0], moved);
+
+        let reinstalled = update(&path, DeckRef::Name("box"), |row| {
+            row.port = 2222;
+            homebrew(row);
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(reinstalled.install.as_deref(), Some("homebrew"));
+        assert_eq!(RemotesFile::load(&path).unwrap().remotes[0], reinstalled);
     }
 
     #[test]

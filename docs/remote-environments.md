@@ -88,6 +88,9 @@ dot-agent-deck remote add my-vm deck@198.51.100.10 \
 If a host has **both** a Homebrew install and a copy at `~/.local/bin/dot-agent-deck` — which is what `remote upgrade` from a release older than this left behind on a Homebrew host — the command names both and uses the Homebrew one. It does not delete the other copy. Remove it yourself — the message prints the exact `ssh … 'rm ~/.local/bin/dot-agent-deck'` line, with the remote's port and identity file — because a `dot-agent-deck` client older than this still runs it on `connect`.
 
 Entries registered before this existed record no install method. They keep running `~/.local/bin/dot-agent-deck` until the next `remote upgrade`, which detects the install and records it. A `dot-agent-deck` client older than this always runs `~/.local/bin/dot-agent-deck`, so it cannot `connect` to a host whose only install is Homebrew's. It also drops the recorded method if it rewrites `remotes.toml`, and the next `remote upgrade` from a current client records it again.
+
+The recorded install belongs to the host it was found on. If you change a deck's host, user or port — which you do in the desktop app's **Settings → Daemons**, since the CLI has no command that edits them — the deck forgets the install method and binary path, and runs `~/.local/bin/dot-agent-deck` again until the next `remote upgrade` detects what the new host has. Changing only the key file or the jump host keeps them.
+
 ### Remote names
 
 A name is what you type after `connect`, so `remote add` requires a short one: letters (`a`–`z`, `A`–`Z`), digits, `.`, `-` and `_`, starting with a letter or digit, at most 64 characters. Names you registered before this rule keep working.
