@@ -3891,6 +3891,13 @@ without depending on the config struct API.
 - **Does not assert:** the daemon dispatch path (`src/spawn.rs`) itself producing that seeded shape at spawn (covered by unit tests in `src/orchestrator_context.rs`: `reassert_preserves_an_existing_dispatched_task`, `reassert_with_no_prior_task_reproduces_no_task_behavior`, `reassert_with_no_existing_file_falls_back_to_no_task`); the equivalent guard on the `/clear` re-arm site, which shares the same `reassert_orchestrator_prompt` helper and is therefore covered by the same unit tests rather than a second, near-identical L2 case.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `001`/`004`/`005`/`006`).
 
+##### orchestration/remit/008 — A hydrated start-role tab re-arms from its own unique context file.
+- **Layer:** L2 lane 1 (real-binary PTY TUI attached after a headless daemon starts a prepared orchestration).
+- **Agent:** synthetic shell start role and `cat` worker; no credential.
+- **Asserts:** two preparations in one project leave the fixed-path mirror holding the later brief. After the earlier start-role pane is hydrated into a fresh TUI, its compaction publishes a new context containing only the earlier brief.
+- **Does not assert:** a real agent or the `/clear` trigger, which shares the re-arm helper with compaction.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`).
+
 #### orchestration/layout
 
 ##### orchestration/layout/001 — Seven decks fit the single-column orchestration card area without scrolling (PRD #147).
@@ -6410,7 +6417,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### project/launch/006 — A later preparation cannot replace an already started launch's coordinator context.
 - **Layer:** L2 lane 1 (headless daemon over its attach socket).
 - **Agent:** two synthetic `cat` roles for launch A; no credential.
-- **Asserts:** after preparing and starting every role of A, preparation B in the same project gets a different unique context path. The file named by A's returned coordinator prompt still contains ALPHA and excludes BRAVO.
+- **Asserts:** after preparing and starting every role of A, preparation B in the same project gets a different unique context path. The file named by A's returned coordinator prompt still contains ALPHA and excludes BRAVO. The daemon's ListAgents record for A's start role carries A's unique path, while its worker record omits that field.
 - **Does not assert:** a real coordinator reading the file or TUI rendering.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
 
@@ -6419,6 +6426,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none. No credential.
 - **Asserts:** after `ResolveProject` observes one `loop`, adding a second role-bearing `loop` makes revisionless `PrepareWorkflow` return `ambiguous-orchestration` with no binding and no `orchestrator-context*` file. Supplying the old revision returns `stale-revision`, also without publication.
 - **Does not assert:** desktop preflight behavior or selection of either duplicate.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
+
+##### project/launch/008 — Ending one orchestration removes only its unique context file.
+- **Layer:** L2 lane 1 (headless daemon over its attach socket).
+- **Agent:** two synthetic `cat` start roles in separate live instances of the same project; no credential.
+- **Asserts:** after both prepared instances start, stopping the first instance's only pane removes its unique context file within a bounded wait. The second instance remains live with its file intact, and the fixed-path compatibility mirror remains.
+- **Does not assert:** TUI rendering or cleanup of a preparation that never started.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
 
 
