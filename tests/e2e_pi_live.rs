@@ -695,7 +695,7 @@ fn pi_live_003_extension_shells_the_spawning_deck_not_the_path() {
 
     skip_unless!(check_pi_installed());
 
-    let decoy_root = tempfile::tempdir().expect("create decoy dir");
+    let decoy_root = common::harness_tempdir().expect("create decoy dir");
     let decoy_bin = decoy_root.path().join("bin");
     std::fs::create_dir_all(&decoy_bin).expect("create decoy bin dir");
     let decoy_log = decoy_root.path().join("decoy-invocations.log");
