@@ -390,9 +390,10 @@ pub struct CommandRow {
     /// The row that answers the same words where this one cannot run — the
     /// `unavailable_redirects` column (PRD #1223, D3; named `unavailable_opens`
     /// while its only use opened something). A pick of this row that is not
-    /// callable dispatches that row instead, with no params, when it is
-    /// callable and grounded by the same words. Two rows use it, and they are
-    /// each other's targets across the New agent dialog's one boundary:
+    /// callable dispatches that row instead when it is callable and grounded by
+    /// the same words — with no params, or, for a target that requires one,
+    /// with the pick's own. Three rows use it, across the New agent dialog's
+    /// one boundary:
     ///
     /// - `start_new_agent` → `open_new_agent`: a bare "start it" with the
     ///   dialog closed was answered with the start row in every measured run,
@@ -404,11 +405,17 @@ pub struct CommandRow {
     ///   through its OWN grounding — a start word in the transcript — which is
     ///   what lets it start without a confirmation at all, so the redirect adds
     ///   no path to a start that saying "start it" did not already have.
+    /// - `switch_deck` → `choose_deck` (#1260): with the dialog open, "use the
+    ///   build box deck" was answered with the app's Daemon selector, which the
+    ///   dialog blocks, in 13 of 15 measured runs. The dialog's own Daemon
+    ///   field takes the same `deck` and answers the same words, so the pick is
+    ///   resolved as that row's — against the decks a new agent can start on.
     ///
-    /// The two can never chain: each redirects only where its target is
-    /// callable, and their requirements are exact complements. The parser holds
-    /// the target to existing, being another row, and taking no required param
-    /// ([`TableError::UnknownUnavailableRedirect`]).
+    /// None can chain: each redirects only where its target is callable, the
+    /// first two's requirements are exact complements, and `choose_deck`
+    /// redirects nowhere. The parser holds the target to existing, being
+    /// another row, and taking no required param or exactly the redirecting
+    /// row's params by name and kind ([`TableError::UnknownUnavailableRedirect`]).
     pub unavailable_redirects: Option<String>,
 }
 
@@ -848,9 +855,25 @@ impl CommandTable {
             let Some(target) = row.unavailable_redirects.as_deref() else {
                 continue;
             };
+            // Dispatched with no params, or — when it requires one — with the
+            // pick's own, so it must take none or exactly the same.
+            let same_params = |candidate: &CommandRow| {
+                let shape = |row: &CommandRow| {
+                    let mut shape: Vec<(String, ParamKind)> = row
+                        .params
+                        .iter()
+                        .map(|param| (param.name.clone(), param.kind))
+                        .collect();
+                    shape.sort_by(|a, b| a.0.cmp(&b.0));
+                    shape
+                };
+                shape(candidate) == shape(row)
+            };
             let valid = target != row.id
                 && commands.iter().any(|candidate| {
-                    candidate.id == target && candidate.params.iter().all(|param| param.optional)
+                    candidate.id == target
+                        && (candidate.params.iter().all(|param| param.optional)
+                            || same_params(candidate))
                 });
             if !valid {
                 return Err(TableError::UnknownUnavailableRedirect {
@@ -1015,7 +1038,8 @@ pub enum TableError {
     /// or that also declares `heard_as_whole_while`.
     MisplacedGroundingAlso { id: String },
     /// An `unavailable_redirects` naming no row, the row itself, or a row with a
-    /// required param — none of which a redirect with no params can dispatch.
+    /// required param whose params differ from the redirecting row's — none of
+    /// which a redirect can dispatch with no params or with the pick's own.
     UnknownUnavailableRedirect { id: String, target: String },
 }
 
@@ -1125,7 +1149,7 @@ impl fmt::Display for TableError {
             ),
             TableError::UnknownUnavailableRedirect { id, target } => write!(
                 f,
-                "command `{id}`'s `unavailable_redirects` names `{target}`, which is not another row that takes no required param"
+                "command `{id}`'s `unavailable_redirects` names `{target}`, which is not another row that takes no required param or exactly its own params"
             ),
         }
     }
@@ -2591,7 +2615,8 @@ mod tests {
     /// The rows whose unavailable pick dispatches another row instead (PRD
     /// #1223, D3), pinned: a start with the New agent dialog closed opens it,
     /// an opener picked with the dialog open presses its Start when the words
-    /// ask to start, and nothing else redirects.
+    /// ask to start, a Daemon-selector switch picked with it open chooses the
+    /// dialog's daemon (#1260), and nothing else redirects.
     #[test]
     fn voice_table_redirecting_rows_are_the_deliberate_set() {
         let redirecting: Vec<(&str, &str)> = super::table()
@@ -2606,6 +2631,7 @@ mod tests {
         assert_eq!(
             redirecting,
             vec![
+                ("switch_deck", "choose_deck"),
                 ("open_new_agent", "start_new_agent"),
                 ("start_new_agent", "open_new_agent"),
             ]
@@ -2622,6 +2648,28 @@ mod tests {
             assert_ne!(
                 open.callable(Screen::Overview, None, declared),
                 start.callable(Screen::Overview, None, declared),
+                "{declared:?}"
+            );
+        }
+        // The switch hands its deck to the dialog's field, which takes exactly
+        // that param and redirects nowhere, so the two cannot chain; and on the
+        // overview one of them is always the row that can run.
+        let switch = table.row("switch_deck").expect("present");
+        let choose = table.row("choose_deck").expect("present");
+        assert_eq!(switch.requires, vec![Requirement::NewAgentDialogClosed]);
+        assert_eq!(choose.requires, vec![Requirement::NewAgentDialog]);
+        assert_eq!(choose.unavailable_redirects, None);
+        let shape = |row: &CommandRow| {
+            row.params
+                .iter()
+                .map(|param| (param.name.clone(), param.kind, param.optional))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(switch), shape(choose));
+        for declared in [None, Some(&dialog), Some(&form())] {
+            assert_ne!(
+                switch.callable(Screen::Overview, None, declared),
+                choose.callable(Screen::Overview, None, declared),
                 "{declared:?}"
             );
         }
@@ -2666,12 +2714,26 @@ mod tests {
                 "{bad}"
             );
         }
-        // A target with a required param cannot be dispatched with none.
-        let needs_param = one_row().replace("id = \"open_agent\"", "id = \"second\"");
-        assert!(matches!(
-            CommandTable::parse(&first_opens("second", &needs_param)),
-            Err(TableError::UnknownUnavailableRedirect { .. })
-        ));
+        // A target with a required param takes the pick's own params (#1260),
+        // so it must declare exactly those: the same name and kind parses...
+        let same_param = one_row().replace("id = \"open_agent\"", "id = \"second\"");
+        assert!(CommandTable::parse(&first_opens("second", &same_param)).is_ok());
+        // ...and a required param the pick does not carry, or carries as
+        // another kind, cannot be dispatched.
+        for other in [
+            format!(
+                "{same_param}\n\n  [[commands.params]]\n  name = \"extra\"\n  kind = \"agent_ref\""
+            ),
+            same_param.replace("kind = \"agent_ref\"", "kind = \"deck_ref\""),
+        ] {
+            assert!(
+                matches!(
+                    CommandTable::parse(&first_opens("second", &other)),
+                    Err(TableError::UnknownUnavailableRedirect { .. })
+                ),
+                "{other}"
+            );
+        }
     }
 
     /// The rows that need a SECOND list heard beside `heard_as` (PRD #1223,

@@ -84,7 +84,9 @@ pub const DICTATION_OPENERS: [&str; 4] = ["type", "write", "say", "dictate"];
 /// defeats *"send it"* identically. Submitting is the last thing that happens
 /// to a prompt, so a half-finished instruction delivered to an agent is
 /// unrecoverable. Whole-utterance equality means only an utterance that IS one
-/// of these phrases submits anything.
+/// of these phrases submits anything. The one allowance is an edge politeness
+/// word — *"okay, send it please"* — stripped exactly as `submit_prompt`'s
+/// `heard_as_whole` grounding strips it, and never a word that carries content.
 ///
 /// The cost is stated rather than hidden: these six phrases are the words a
 /// user cannot dictate *alone*. *"type end"* types `end`; a bare *"end"*

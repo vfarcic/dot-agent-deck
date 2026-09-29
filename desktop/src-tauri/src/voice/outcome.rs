@@ -44,7 +44,7 @@ use serde::Serialize;
 
 use super::dictation::{
     DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS, SUBMIT_PHRASES,
-    VOICE_OFF_PHRASES, opening_with, strip_opening, whole_utterance_is,
+    VOICE_OFF_PHRASES, opening_with, strip_opening,
 };
 use super::resolver::{IntentError, IntentRequest, IntentResolver};
 use super::schema::{
@@ -75,6 +75,9 @@ const DICTATE_ROW: &str = "dictate_to_agent";
 const DICTATE_PARAM: &str = "prefix";
 /// The row a whole-utterance submit phrase dispatches.
 const SUBMIT_ROW: &str = "submit_prompt";
+/// The row a plain close over the New agent dialog dispatches — the one row
+/// whose grounding depends on the dialog (closing audit H1).
+const CLOSE_ROW: &str = "close";
 /// The rows the dictation mode's own phrases dispatch (PRD #1260), and the one
 /// that turns voice off from inside it.
 const DICTATION_ON_ROW: &str = "dictation_on";
@@ -698,29 +701,46 @@ pub async fn handle_utterance_with_dictation(
     // with the dialog closed, or `go_to_parent` at a root, is refused here with
     // the row's own hint rather than dispatched into a dialog that cannot take
     // it.
-    if !row.callable(screen, directories, new_agent) {
+    let row = if row.callable(screen, directories, new_agent) {
+        row
+    } else {
         // A row whose words another row answers here (`unavailable_redirects`,
         // PRD #1223 D3): "start it" with the New agent dialog closed opens the
         // dialog rather than being told to say "new agent" first, and "Start
         // agent" with it OPEN — read as the opener — presses its Start. Only
         // when the target can run here and the user's words ground it by its
         // OWN vocabulary, so a redirect reaches nothing those words could not
-        // reach directly. The parser holds the target to taking no required
-        // param, so it is dispatched with none — which is why a pick carrying
-        // a value is not redirected: "start an agent on local" over an open
-        // dialog names a deck the form may not show, and starting the form
-        // would drop what the user asked for.
-        let carries_a_value = answer.params.values().any(|value| !value.trim().is_empty());
-        if let Some(target) = row
+        // reach directly.
+        let Some(target) = row
             .unavailable_redirects
             .as_deref()
             .and_then(|id| table.row(id))
             .filter(|target| {
-                !carries_a_value
-                    && target.callable(screen, directories, new_agent)
+                target.callable(screen, directories, new_agent)
+                    && !hidden_by_flag(target, show_deck)
                     && action_grounded(target, transcript.text(), directories, new_agent)
             })
-        {
+        else {
+            return finish(VoiceOutcome::unavailable(transcript, row));
+        };
+        // A target that takes the pick's own params (the parser holds it to
+        // exactly the same names and kinds) is resolved from the model's
+        // values as if it had been picked: `switch_deck` answered over an open
+        // New agent dialog is the dialog's Daemon field, `choose_deck`, with
+        // the same deck — the model's tie-break between the two was measured
+        // losing 13 times in 15 (#1260), and the requirement, not a sentence
+        // in either description, is what should decide it.
+        if target.params.iter().any(|param| !param.optional) {
+            target
+        } else {
+            // Otherwise the target is dispatched with no params — which is why
+            // a pick carrying a value is not redirected: "start an agent on
+            // local" over an open dialog names a deck the form may not show,
+            // and starting the form would drop what the user asked for.
+            let carries_a_value = answer.params.values().any(|value| !value.trim().is_empty());
+            if carries_a_value {
+                return finish(VoiceOutcome::unavailable(transcript, row));
+            }
             return finish(VoiceOutcome::Dispatch {
                 sentence: report(target, &[]),
                 transcript,
@@ -729,8 +749,7 @@ pub async fn handle_utterance_with_dictation(
                 params: Vec::new(),
             });
         }
-        return finish(VoiceOutcome::unavailable(transcript, row));
-    }
+    };
     if withheld && needs_labels(row) {
         return finish(VoiceOutcome::labels_withheld(transcript, row));
     }
@@ -1552,7 +1571,7 @@ fn resolve_param(
         ParamKind::DeckRef if !for_new_agent => {
             switch_target(spoken, transcript, decks).map(|(id, label)| param(id, label))
         }
-        ParamKind::DeckRef => match resolve_deck_ref(spoken, decks) {
+        ParamKind::DeckRef => match resolve_new_agent_deck_ref(spoken, decks) {
             DeckRefMatch::One { id, label } => {
                 // Reached only for the New agent dialog: the guard above
                 // took every other `deck_ref`.
@@ -1629,7 +1648,7 @@ fn resolve_param(
     }
 }
 
-/// The two things this app answers without asking a model, and the boundary of
+/// The things this app answers without asking a model, and the boundary of
 /// what a fast path is allowed to decide (PRD #802 D6, rebuilt).
 ///
 /// # Why there is a fast path at all, and why it is NOT the vocabulary
@@ -1646,9 +1665,15 @@ fn resolve_param(
 /// # What it decides
 ///
 /// 1. **A submit phrase**, matched by equality against the whole normalised
-///    utterance. Never a prefix or a suffix test — see [`SUBMIT_PHRASES`] for
+///    utterance less an edge politeness word — the comparison `heard_as_whole`
+///    grounding makes, so *"okay, send it please"* is answered here as *"send
+///    it"* is. Never a prefix or a suffix test — see [`SUBMIT_PHRASES`] for
 ///    the false positive that rules out, and why it is unrecoverable.
-/// 2. **A dictation opener**, matched as whole words at the front. What is
+/// 2. **A close said on its own over the New agent dialog** — one of the
+///    whole utterances `close` declares for the dialog, by the same
+///    comparison. There the row answers to nothing else, so the utterance has
+///    one answer and a model's tie-break could only get it wrong.
+/// 3. **A dictation opener**, matched as whole words at the front. What is
 ///    typed is the remainder of **the transcript**, taken verbatim; this path
 ///    involves no model and therefore has nothing to verify, which is the one
 ///    respect in which it is simpler than the fallback rather than merely
@@ -1714,7 +1739,29 @@ fn local_intercept(
         }
     }
 
-    if whole_utterance_is(transcript.text(), &SUBMIT_PHRASES)
+    // Less an edge politeness word, as `heard_as_whole` grounding and the
+    // dictation mode compare: "okay, send it please" is the same request as
+    // "send it", and answering it here decides it without a model on every
+    // screen — dispatched on the agent's, and refused with the row's hint on
+    // the others, where the model's pick between that refusal and the no-match
+    // escape was a coin toss (measured 22 of 30).
+    // A plain close over the New agent dialog (#1260). While the dialog is
+    // open `close` is grounded by its whole-utterance list and nothing else
+    // (`heard_as_whole_while`), so an utterance that IS one of those phrases
+    // has exactly one answer, and asking the model it was a coin toss: it read
+    // "Close new agent", the dialog's X button, as `discard_new_agent` about
+    // one time in fifteen, which grounding then refused. Only the list the
+    // table declares for the dialog — never `close`'s token grounding, which
+    // stays the model's to answer everywhere else.
+    if let Some(row) = table.row(CLOSE_ROW)
+        && let (ActionGrounding::HeardAsWhole(phrases), Some(_)) =
+            row.grounding_for(directories, new_agent)
+        && said_whole(transcript.text(), phrases.iter().map(String::as_str))
+    {
+        return Some(dispatch(row, Vec::new()));
+    }
+
+    if said_whole(transcript.text(), SUBMIT_PHRASES)
         && let Some(row) = table.row(SUBMIT_ROW)
     {
         return Some(dispatch(row, Vec::new()));
@@ -2461,6 +2508,32 @@ pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
     deck_ref_match(&hits)
 }
 
+/// "the remote daemon" — a deck referred to by what KIND it is rather than by
+/// a word of its name — for the New agent dialog, where it means the one
+/// remote deck a new agent can start on (#1260).
+///
+/// The instructions tell the model to answer such a reference with the listed
+/// name, and the list it is shown is exactly the eligible decks; after #1045
+/// the default model answered "new agent on the remote deck" with the user's
+/// own words in every measured run instead, which named no deck. This is that
+/// same rule decided here, over the same list: consulted only once
+/// [`resolve_deck_ref`] has found nothing — so a host that really is called
+/// `remote` still wins — and only for a reference that is "remote" and
+/// category words. Several eligible remote decks are asked about; none is no
+/// match. Not used for [`SWITCH_DECK_ROW`], whose reference must name its deck
+/// ([`switch_target`]).
+fn resolve_new_agent_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
+    let matched = resolve_deck_ref(spoken, decks);
+    if matched != DeckRefMatch::None || deck_reference(spoken) != "remote" {
+        return matched;
+    }
+    let remotes: Vec<&VoiceDeck> = decks
+        .iter()
+        .filter(|deck| !deck.local && deck.eligible())
+        .collect();
+    deck_ref_match(&remotes)
+}
+
 fn deck_ref_match(hits: &[&VoiceDeck]) -> DeckRefMatch {
     match hits.len() {
         0 => DeckRefMatch::None,
@@ -3191,10 +3264,6 @@ mod tests {
     use crate::voice::table::table;
 
     use crate::voice::fixtures::{agent, role_agent};
-
-    /// A row whose grounding depends on the New agent dialog (closing audit
-    /// H1).
-    const CLOSE_ROW: &str = "close";
 
     /// A row's first whole-utterance phrase over the New agent dialog, when it
     /// has a grounding that depends on it.
@@ -7215,6 +7284,43 @@ mod tests {
         }
     }
 
+    /// Scenario: on the agent dashboard and on the Daemons screen, with no
+    /// agent's pane open, the user says "okay, send it please". It is answered
+    /// with no model call — refused with the row's own hint, which names what
+    /// to open first — rather than left to the model's pick between that
+    /// refusal and "no matching action", which it made either way (#1260,
+    /// measured 22 of 30).
+    #[tokio::test]
+    async fn voice_outcome_a_polite_submit_with_no_pane_open_is_refused_locally() {
+        for screen in [Screen::Overview, Screen::Deck] {
+            for said in ["okay, send it please", "send it", "yes, submit"] {
+                let resolver = CountingResolver::default();
+                let answer = handle_utterance(
+                    &resolver,
+                    table(),
+                    screen,
+                    &fleet(),
+                    &[],
+                    None,
+                    None,
+                    Transcript::new(said),
+                )
+                .await;
+                assert!(
+                    matches!(&answer.outcome, VoiceOutcome::Unavailable { action, .. } if action == SUBMIT_ROW),
+                    "{screen:?} {said}: {:?}",
+                    answer.outcome
+                );
+                assert_eq!(
+                    answer.outcome.sentence(),
+                    "Not here — sending a prompt needs an agent's pane open — open one first."
+                );
+                assert_eq!(resolver.calls(), 0, "{screen:?} {said}");
+                assert_eq!(answer.resolve_ms, None);
+            }
+        }
+    }
+
     /// Scenario: the user says "send it", "submit" or "go ahead" and nothing
     /// else — with the transcriber's own casing and punctuation, and an edge
     /// "okay" or "please" — and the prompt is sent, through the local fast
@@ -7222,8 +7328,16 @@ mod tests {
     /// where it is not.
     #[tokio::test]
     async fn voice_outcome_a_whole_submit_utterance_still_submits_on_both_paths() {
-        // The fast path: no model call at all.
-        for said in ["send it", "Submit.", "Send it!", "press enter"] {
+        // The fast path: no model call at all — an edge politeness word
+        // included, stripped exactly as the row's own grounding strips it.
+        for said in [
+            "send it",
+            "Submit.",
+            "Send it!",
+            "press enter",
+            "okay, send it please",
+            "please just send it now",
+        ] {
             let resolver = CountingResolver::default();
             let answer = handle_utterance(
                 &resolver,
@@ -7247,7 +7361,6 @@ mod tests {
         for said in [
             "go ahead",
             "Go ahead.",
-            "okay, send it please",
             "yes, go ahead",
             "submit it now",
             "That is the end.",
@@ -7371,6 +7484,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Scenario: with the New agent dialog open, the user says "Close new
+    /// agent" — the accessible name of its X button — or "cancel". The dialog
+    /// closes with no model call at all (#1260): the model once read the
+    /// button's name as Discard, which grounding refused. With the dialog
+    /// closed, the same words still go to the model.
+    #[tokio::test]
+    async fn voice_outcome_a_plain_close_over_the_new_agent_dialog_is_decided_locally() {
+        for declared in [VoiceNewAgent { form: None }, new_agent_form()] {
+            for said in [
+                "Close new agent",
+                "okay, cancel",
+                "close the new agent dialog",
+            ] {
+                let resolver = CountingResolver::default();
+                let answer = handle_utterance(
+                    &resolver,
+                    table(),
+                    Screen::Overview,
+                    &fleet(),
+                    &decks(),
+                    None,
+                    Some(&declared),
+                    Transcript::new(said),
+                )
+                .await;
+                assert!(
+                    matches!(&answer.outcome, VoiceOutcome::Dispatch { action, invoke, .. }
+                        if action == CLOSE_ROW && invoke == "closeTopmost"),
+                    "{said}: {:?}",
+                    answer.outcome
+                );
+                assert_eq!(resolver.calls(), 0, "{said}");
+            }
+        }
+        let resolver = CountingResolver::default();
+        handle_utterance(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            &decks(),
+            None,
+            None,
+            Transcript::new("close"),
+        )
+        .await;
+        assert_eq!(resolver.calls(), 1, "no dialog, no local close");
     }
 
     /// Scenario: with no New agent dialog declared, `close` keeps its token
@@ -8190,6 +8352,186 @@ mod tests {
         );
     }
 
+    /// Scenario: the New agent dialog is open and the user says "use the build
+    /// box deck", "switch to the local deck" or "deck build box" — and the
+    /// model answers with the app's Daemon selector, `switch_deck`, which the
+    /// dialog blocks. The pick is the dialog's own Daemon field, with the same
+    /// deck (#1260): `choose_deck` dispatches, resolved and reported exactly
+    /// as if it had been picked. Words without "deck" or "daemon" do not
+    /// ground the field and keep the selector's hint; a switch that names no
+    /// deck is asked which.
+    #[tokio::test]
+    async fn voice_outcome_a_switch_picked_over_the_open_dialog_chooses_its_daemon() {
+        for declared in [VoiceNewAgent { form: None }, new_agent_form()] {
+            for (said, spoken, id, label) in [
+                (
+                    "use the build box deck",
+                    "build box",
+                    "deck-build",
+                    "deploy@build-box.example.com:2222",
+                ),
+                (
+                    "switch to the local deck",
+                    "local",
+                    "deck-local",
+                    "Local deck",
+                ),
+                (
+                    "deck build box",
+                    "build box",
+                    "deck-build",
+                    "deploy@build-box.example.com:2222",
+                ),
+            ] {
+                let outcome = heard_as_user_said(
+                    said,
+                    IntentAnswer::new("switch_deck").with_param("deck", spoken),
+                    Screen::Overview,
+                    &fleet(),
+                    Some(&declared),
+                )
+                .await;
+                let VoiceOutcome::Dispatch {
+                    action,
+                    invoke,
+                    params,
+                    sentence,
+                    ..
+                } = &outcome
+                else {
+                    panic!("{said}: expected a dispatch, got {outcome:?}");
+                };
+                assert_eq!(action, "choose_deck", "{said}");
+                assert_eq!(invoke, "chooseNewAgentDeck", "{said}");
+                assert_eq!(params.len(), 1, "{said}");
+                assert_eq!(params[0].kind, ParamKind::DeckRef);
+                assert_eq!(params[0].value, id, "{said}");
+                assert_eq!(sentence, &format!("Daemon: {label}."), "{said}");
+            }
+        }
+        let form = new_agent_form();
+        let not_about_a_deck = heard_as_user_said(
+            "switch to the build box",
+            IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+            Screen::Overview,
+            &fleet(),
+            Some(&form),
+        )
+        .await;
+        assert!(
+            matches!(&not_about_a_deck, VoiceOutcome::Unavailable { action, .. } if action == "switch_deck"),
+            "{not_about_a_deck:?}"
+        );
+        let which = heard_as_user_said(
+            "switch deck",
+            IntentAnswer::new("switch_deck"),
+            Screen::Overview,
+            &fleet(),
+            Some(&form),
+        )
+        .await;
+        assert!(
+            matches!(&which, VoiceOutcome::ParamMissing { action, .. } if action == "choose_deck"),
+            "{which:?}"
+        );
+        // With the dialog closed the switch is the switch, as before.
+        let closed = heard_as_user_said(
+            "switch deck to the build box",
+            IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+            Screen::Overview,
+            &fleet(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&closed, VoiceOutcome::Dispatch { action, .. } if action == "switch_deck"),
+            "{closed:?}"
+        );
+    }
+
+    /// Scenario: the user says "new agent on the remote deck", and the model
+    /// hands back "remote deck" rather than a deck's name. With one remote
+    /// deck a new agent can start on — the other shown disabled — that deck
+    /// is preselected and named (#1260). With two such remotes the user is
+    /// told which it could be and none is preselected; `choose_deck` asks the
+    /// same way. A host literally called `remote` is still that host.
+    #[tokio::test]
+    async fn voice_outcome_the_remote_deck_is_the_one_remote_a_new_agent_can_start_on() {
+        let run = |decks: Vec<VoiceDeck>,
+                   answer: IntentAnswer,
+                   new_agent: Option<VoiceNewAgent>| async move {
+            let said = "new agent on the remote deck";
+            let resolver = StubResolver::new().answering(said, answer);
+            handle_utterance(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                &decks,
+                None,
+                new_agent.as_ref(),
+                Transcript::new(said),
+            )
+            .await
+            .outcome
+        };
+        let resolved_deck = |outcome: &VoiceOutcome| match outcome {
+            VoiceOutcome::Dispatch { params, .. } => params
+                .iter()
+                .find(|param| param.kind == ParamKind::DeckRef)
+                .map(|param| param.value.clone()),
+            _ => None,
+        };
+        let open = || IntentAnswer::new("open_new_agent").with_param("deck", "remote deck");
+        let one_eligible = vec![
+            deck("deck-local", "Local daemon", true),
+            deck("deck-build", "deploy@build-box", false),
+            unavailable_deck("deck-stale", "ci@stale-box", false, "Not connected."),
+        ];
+        let outcome = run(one_eligible, open(), None).await;
+        assert_eq!(
+            resolved_deck(&outcome).as_deref(),
+            Some("deck-build"),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            outcome.sentence(),
+            "Opening the New agent dialog. Preselected daemon: deploy@build-box."
+        );
+
+        let two_eligible = run(decks(), open(), None).await;
+        assert_eq!(resolved_deck(&two_eligible), None, "{two_eligible:?}");
+        assert!(
+            two_eligible
+                .sentence()
+                .contains("deploy@build-box.example.com:2222")
+                && two_eligible.sentence().contains("ci@build-farm"),
+            "{two_eligible:?}"
+        );
+        let choose = run(
+            decks(),
+            IntentAnswer::new("choose_deck").with_param("deck", "remote deck"),
+            Some(VoiceNewAgent { form: None }),
+        )
+        .await;
+        assert!(
+            matches!(&choose, VoiceOutcome::ParamAmbiguous { action, .. } if action == "choose_deck"),
+            "{choose:?}"
+        );
+
+        let named_remote = vec![
+            deck("deck-local", "Local daemon", true),
+            deck("deck-build", "deploy@build-box", false),
+            deck("deck-remote", "ops@remote", false),
+        ];
+        let host = run(named_remote, open(), None).await;
+        assert_eq!(
+            resolved_deck(&host).as_deref(),
+            Some("deck-remote"),
+            "{host:?}"
+        );
+    }
+
     /// Scenario: over the open dialog the user says something that is not
     /// about a deck — "use this directory", "use claude", "open docs", "call
     /// it billing worker" — while an observed name steers the model to
@@ -8663,7 +9005,9 @@ mod tests {
     /// button's accessible name; the form is thrown away. Said inside another
     /// request — "name it discard worker" — with the model steered to discard,
     /// it is refused, because Discard cannot be taken back. And "cancel" never
-    /// grounds it: that is `close`, which keeps the form as a draft.
+    /// grounds it: that is `close`, which keeps the form as a draft — decided
+    /// without the model since #1260, so a model steered to discard is never
+    /// asked.
     #[tokio::test]
     async fn voice_outcome_discard_needs_the_whole_utterance() {
         let form = new_agent_form();
@@ -8682,12 +9026,7 @@ mod tests {
                 "{said}: {outcome:?}"
             );
         }
-        for said in [
-            "name it discard worker",
-            "cancel",
-            "never mind",
-            "discard it and start over",
-        ] {
+        for said in ["name it discard worker", "discard it and start over"] {
             let outcome = heard_as_user_said(
                 said,
                 IntentAnswer::new("discard_new_agent"),
@@ -8698,6 +9037,21 @@ mod tests {
             .await;
             assert!(
                 matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == "discard_new_agent"),
+                "{said}: {outcome:?}"
+            );
+        }
+        for said in ["cancel", "never mind"] {
+            let outcome = heard_as_user_said(
+                said,
+                IntentAnswer::new("discard_new_agent"),
+                Screen::Overview,
+                &fleet(),
+                Some(&form),
+            )
+            .await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, invoke, .. }
+                    if action == CLOSE_ROW && invoke == "closeTopmost"),
                 "{said}: {outcome:?}"
             );
         }

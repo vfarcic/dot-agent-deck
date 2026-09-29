@@ -371,7 +371,15 @@ heard_as    = ["settings", "preferences", "options", "configuration", "api key"]
 # bar, and while it is open a request that names a deck means the dialog's own
 # Deck field, which is `choose_deck`. Both descriptions say so, but the
 # precondition is what makes it hold rather than a tie the model breaks — the
-# fixture `choose-new-agent-deck-not-switch` is the guard on it.
+# fixture `choose-new-agent-deck-not-switch` is the guard on it. **And
+# `unavailable_redirects = "choose_deck"` is what makes the words still land**
+# (#1260): after #1045 gave this description a "deck means THIS one too"
+# sentence, the model answered "use the build box deck", "switch to the local
+# deck" and even "deck build box" over the open dialog with THIS row in 13 of
+# 15 measured runs, and the requirement then refused it. The dialog's Daemon
+# field takes the same `deck`, so such a pick is resolved as `choose_deck`'s,
+# against the decks a new agent can start on — no sentence in either
+# description has to win the tie-break.
 #
 # **`deck_ref`, the kind PRD #1223 added for the New agent flow — not a new
 # one.** What differs is the SET it resolves against and what a disabled deck
@@ -422,6 +430,7 @@ report      = "Showing {deck}."
 asks_to     = "switch daemon"
 try_saying  = "switch daemon to {deck}"
 heard_as    = ["switch", "daemon", "deck", "change", "select", "choose"]
+unavailable_redirects = "choose_deck"
 
   [[commands.params]]
   name = "deck"
