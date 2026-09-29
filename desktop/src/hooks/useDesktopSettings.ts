@@ -10,6 +10,7 @@
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "../lib/bridge";
+import { PartialSettingsSaveError } from "../lib/settingsError";
 import type { DeckRuntimeState } from "../types";
 
 export interface DesktopSettingsState {
@@ -231,6 +232,21 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
           if (newest.current === ticket) setSettings(written);
         })
         .catch((cause: unknown) => {
+          // Issue #1350's review: the deck edits reached the shared deck list
+          // and `desktop.toml` did not — or the deck list changed outside the
+          // app, so nothing was written and this window's list is stale.
+          // Unlike a failure that leaves the screen's copy valid,
+          // the screen is replaced with what is now on disk — the saved decks
+          // and the unsaved rest as it was — so it shows reality rather than a
+          // mix no file holds. That document is the base from here on, so the
+          // edit is not carried: the next save diffs against what is on screen.
+          if (cause instanceof PartialSettingsSaveError) {
+            carried.current = undefined;
+            if (newest.current !== ticket) return;
+            setSettings(cause.written);
+            setSaveFailure(cause.message);
+            return;
+          }
           // The edit did not reach the file, so the next save must carry it —
           // superseded or not, which is exactly the case where it would
           // otherwise be lost. See `carried`.

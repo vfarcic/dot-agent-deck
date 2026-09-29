@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
+  "packages": [
+    "git@latest",
+    "gh@latest",
+    "jq@latest",
+    "curl@latest",
+    "rsync@latest",
+    "unzip@latest",
+    "mosh@latest",
+    "xvfb-run@latest",
+    "go@latest",
+    "uv@latest",
+    "rustup@latest",
+    "cargo-audit@latest",
+    "cargo-cross@latest",
+    "rust-analyzer@latest",
+    "kcl@latest"
+  ]
+}

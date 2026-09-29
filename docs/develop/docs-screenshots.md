@@ -23,6 +23,23 @@ cargo docs-screenshots --out ../scratch/shots          # anywhere else, e.g. to 
 
 Each image is named `<scenario>-<client>.png`, so the `dashboard` scenario produces `docs/img/dashboard-tui.png` and `docs/img/dashboard-desktop.png`. The command prints every file it wrote and fails if an expected one is missing.
 
+## Registered scenes
+
+| Scenario | Clients | Screen |
+| --- | --- | --- |
+| `dashboard` | TUI, desktop | Four agents in mixed states. |
+| `dashboard-empty` | TUI, desktop | First-run empty state. |
+| `dashboard-fleet` | desktop | Agent dashboard with six agents across two connected daemons. |
+| `new-agent` | TUI, desktop | New Agent form with a project directory chosen. |
+| `orchestration` | TUI, desktop | Activated `demo-loop` with planner and builder roles. |
+| `agent-pane` | desktop | Agent pane over the Dashboard, showing a fixed implementation transcript. |
+| `settings-daemons` | desktop | Daemons settings with one configured remote. The browser fixture cannot produce a successful Test connection result. |
+| `settings-voice` | desktop | Voice settings. |
+| `schedules` | TUI | Schedules manager with one disabled task, keeping the next-fire field stable. |
+| `help` | TUI | The `?` keyboard shortcut overlay. |
+
+The docs-only fleet fixture lives in `desktop/src/data/fixture.ts` and is selected by `/?fixture=1&state=docs-fleet`.
+
 It runs two stages:
 
 1. **TUI capture.** `cargo nextest run --features e2e --test e2e_docs_screenshots --run-ignored only` with an exact filter for the selected scenarios. Each capture drives the real binary in the L2 PTY harness (`tests/common/mod.rs`), inside the harness's isolated sandbox: its own `HOME`, sockets, state dir and lazily spawned daemon, so it never attaches to your running deck. It launches the deck with `without_agent_credentials()`, so no agent credential is in its environment even when one is ambient on your machine (on Linux the capture reads `/proc/<pid>/environ` back to prove it), puts the scene on screen with stand-in commands in real panes and synthetic hook events (no real agent), then writes the vt100 frame, every cell with its character, colours and attributes, as `<scenario>-tui.html` under this invocation's own directory, `target/docs-screenshots/run-<pid>/tui-html/`. That directory is created empty (a leftover from a dead run that had the same pid is cleared first), so a stale HTML file is never rasterized, and the whole `run-<pid>/` directory is removed when the command exits, whether it succeeded or failed. A run that is killed, `Ctrl+C` included, leaves its directory behind; nothing reuses it except a later run that happens to get the same pid, which clears it.
@@ -88,6 +105,7 @@ TUI:
 - Synthetic hook events are sent one at a time, each confirmed on screen before the next, because the daemon handles each hook connection on its own task and would otherwise apply them in no fixed order. Card order and state are then the same every run.
 - The panes run stand-ins that print fixed transcripts, so a pane's content is the same on every run. `dashboard` focuses the pane it shows explicitly rather than relying on which pane was opened last.
 - The TUI's clock cannot be frozen from outside the binary, and a card's `Last:` age cannot read older than its pane, so `dashboard`'s ages are seconds and every status event is stamped on a whole second, after the last pane opened: at a chosen capture second minus the agent's age. Every label then rolls over at the same instant, and during the capture second they read exactly the agents' ages. The readiness check names those labels, so the frame is taken inside that second and never outside it. Until then the stamps are in the future and the cards read `Last: 0s`; the wait is the largest age plus about two seconds, sampled from one clock reading that also dates each agent's `session_start`. An attempt that misses the second, because staging ran past it or because no frame inside it had every status dot lit, is retried by building the **whole scene again in a fresh sandbox**, up to `DASHBOARD_ATTEMPTS` (3) times; the last attempt does not give up early and fails with the harness's timeout panic and the final grid. An attempt counts as missed once the wall clock reaches the capture second plus two, leaving a frame drawn late in the second time to arrive. It does not re-stamp the existing cards, because the events that move a card's `Last:` also add to what the card shows: a second `tool_start` draws a second tool line, and a second event carrying the prompt a second prompt line, so a re-stamped scene would not be the same image. Measured on 2026-09-26 with the first attempt forced to miss: the second attempt wrote HTML byte-identical to an unforced run's.
+- `orchestration` uses the same pane-addressed hook events, whole-second ages and fresh-sandbox retry for its planner and builder cards. Its capture second is 18 seconds after staging so the activation banner's 15-second lifetime has expired; the readiness check requires both working cards, their prompts and tools, exact `Last: 2s` and `Last: 3s` labels, and no activation banner or `No agent` placeholders.
 - Idle and waiting cards blink their status dot by drawing a space in its place. Nothing else on the dashboard draws a `●` (the transcripts are written without one), so the readiness check requires exactly one per agent, which means every dot is lit; because it runs against the frame that is written, the image never shows half a blink.
 - The command-mode banner over the focused pane (`COMMAND MODE — Ctrl+D to type`) clears on its own after a moment, and the readiness check requires it gone. The pane stays dimmed, as command mode draws it.
 - The hardware cursor is not drawn.

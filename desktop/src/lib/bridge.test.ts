@@ -1206,6 +1206,47 @@ describe("FixtureDeckBridge scenarios", () => {
   });
 
   /**
+   * Scenario (PRD #1321): the docs fleet preview is reachable from
+   * `?state=docs-fleet` and shows two answering decks, each agent carrying
+   * the id of the deck it is listed under, with only `/home/dev` paths.
+   */
+  it("reaches the two-deck docs fleet from ?state=docs-fleet", async () => {
+    window.history.replaceState({}, "", "/?fixture=1&state=docs-fleet");
+    const { createDeckBridge } = await import("./bridge");
+
+    const fleet = await createDeckBridge("fixture").connect();
+
+    expect(fleet).toHaveLength(2);
+    for (const deck of fleet) {
+      expect(deck.connection.status).toBe("connected");
+      expect(deck.agents.length).toBeGreaterThan(0);
+      for (const agent of deck.agents) {
+        expect(agent.daemonId).toBe(deck.connection.deckId);
+        expect(agent.cwd?.startsWith("/home/dev/")).toBe(true);
+      }
+    }
+    expect(new Set(fleet.map((deck) => deck.connection.deckId)).size).toBe(2);
+  });
+
+  /**
+   * Scenario (PRD #1321): the docs scenario's running implementation agent
+   * carries a fixed transcript, so its open pane shows an agent at work rather
+   * than a blank terminal — and the text has no clock time in it.
+   */
+  it("gives the docs implementation agent a fixed, timestamp-free transcript", async () => {
+    window.history.replaceState({}, "", "/?fixture=1&state=docs");
+    const { createDeckBridge } = await import("./bridge");
+
+    const [view] = await createDeckBridge("fixture").connect();
+    const agent = view.agents.find((candidate) => candidate.displayName === "Desktop implementation")!;
+
+    expect(agent.transcript).toContain("RetryPayment");
+    expect(agent.transcript).not.toMatch(/\d{1,2}:\d{2}/);
+    const [again] = await createDeckBridge("fixture").connect();
+    expect(again.agents.find((candidate) => candidate.displayName === "Desktop implementation")!.transcript).toBe(agent.transcript);
+  });
+
+  /**
    * Scenario (PRD #1223 M3): in the three-deck fleet preview, start a plain
    * agent on the REMOTE deck, which is not the selected one. The result
    * carries the id that daemon minted; the fleet the bridge emits lists the new
@@ -2807,6 +2848,35 @@ describe("desktop settings (PRD 803)", () => {
     // the same defaults; it now knows they are a fallback.
     await expect(bridge.getSettings()).rejects.toThrow("Permission denied");
     await expect(bridge.saveSettings(DEFAULT_DESKTOP_SETTINGS)).rejects.toThrow("Permission denied");
+    await bridge.dispose();
+  });
+
+  /**
+   * Issue #1350's review: a save whose deck edits landed and whose
+   * `desktop.toml` write did not rejects with `{ message, written }`. The
+   * bridge turns that into a `PartialSettingsSaveError` carrying the
+   * normalised on-disk settings; a plain string rejection passes untouched.
+   */
+  it("turns a partial settings save into a typed error carrying what is on disk", async () => {
+    const { TauriDeckBridge, DEFAULT_DESKTOP_SETTINGS } = await import("./bridge");
+    const { PartialSettingsSaveError } = await import("./settingsError");
+    const onDisk = { ...DEFAULT_DESKTOP_SETTINGS, appearance: { mode: "light" } };
+    let partial = true;
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_set_settings") {
+        if (partial) throw { message: "The deck list changes were saved, but the other settings were not", written: onDisk };
+        throw "disk full";
+      }
+      return { ok: true };
+    });
+    const bridge = new TauriDeckBridge();
+    const rejection = await bridge.saveSettings(DEFAULT_DESKTOP_SETTINGS).catch((cause: unknown) => cause);
+    expect(rejection).toBeInstanceOf(PartialSettingsSaveError);
+    expect((rejection as InstanceType<typeof PartialSettingsSaveError>).message).toContain("deck list changes were saved");
+    expect((rejection as InstanceType<typeof PartialSettingsSaveError>).written.appearance.mode).toBe("light");
+
+    partial = false;
+    await expect(bridge.saveSettings(DEFAULT_DESKTOP_SETTINGS)).rejects.toBe("disk full");
     await bridge.dispose();
   });
 

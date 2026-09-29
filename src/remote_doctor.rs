@@ -75,8 +75,8 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::connect::{
-    REMOTE_INSTALL_PATH, RemoteConnectError, lookup_remote, probe_remote_protocol,
-    probe_remote_version, probe_timeout_secs,
+    RemoteConnectError, lookup_remote, probe_remote_protocol, probe_remote_version,
+    probe_timeout_secs,
 };
 use crate::remote::{SshExecutor, SshTarget, SystemSshExecutor, run_local_bounded};
 use crate::untrusted_text::escape_control_and_bidi;
@@ -1785,7 +1785,12 @@ struct Observations {
 /// skipped when the version probe already showed the binary is not answering,
 /// and the remote-side probes are skipped when ssh could not open a session at
 /// all.
-fn observe(executor: &dyn SshExecutor, target: &SshTarget, name: &str) -> Observations {
+fn observe(
+    executor: &dyn SshExecutor,
+    target: &SshTarget,
+    name: &str,
+    install_path: &str,
+) -> Observations {
     let mut inputs = DoctorInputs::default();
     let mut ssh_detail = None;
     let mut ssh_config_unreadable = None;
@@ -1798,7 +1803,7 @@ fn observe(executor: &dyn SshExecutor, target: &SshTarget, name: &str) -> Observ
         Err(reason) => ssh_config_unreadable = Some(reason),
     }
 
-    match probe_remote_version(executor, target, name, REMOTE_INSTALL_PATH) {
+    match probe_remote_version(executor, target, name, install_path) {
         Ok(_) => {
             inputs.host_reachable = Some(true);
             inputs.remote_binary_present = Some(true);
@@ -1842,7 +1847,7 @@ fn observe(executor: &dyn SshExecutor, target: &SshTarget, name: &str) -> Observ
 
     if inputs.remote_binary_present == Some(true) {
         inputs.protocol_compatible =
-            match probe_remote_protocol(executor, target, name, REMOTE_INSTALL_PATH) {
+            match probe_remote_protocol(executor, target, name, install_path) {
                 Ok(_) => Some(true),
                 Err(RemoteConnectError::RemoteHandshakeUnsupported { .. }) => Some(false),
                 Err(_) => None,
@@ -2102,7 +2107,7 @@ pub fn run_doctor(
     // ordinary executor would make every probe apply the user's `Host` block,
     // so the doctor would create the forwards it is here to inspect.
     let executor = SystemSshExecutor::for_observation(probe_timeout_secs());
-    let observations = observe(&executor, &target, name);
+    let observations = observe(&executor, &target, name, entry.remote_binary());
     let mut checks = classify(&observations.inputs);
     if let Some(reason) = &observations.ssh_config_unreadable {
         mark_ssh_config_unreadable(&mut checks, reason);

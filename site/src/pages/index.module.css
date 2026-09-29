@@ -144,8 +144,9 @@
  * The pill WRAPS at every width instead of scrolling sideways. It used to wrap
  * only at 560px and below and scroll above it, which was fine for the hero's
  * `brew tap ...` (471px in the box at every desktop width) and wrong for the
- * desktop section's `gh attestation verify ...`: 1105px of content in a 932px
- * box from 1120px up, so it rendered cut at "/.github/wo" and the rest was
+ * download check's `gh attestation verify ...`, which then sat in a separate
+ * desktop-app band: 1105px of content in a 932px box from 1120px up, so it
+ * rendered cut at "/.github/wo" and the rest was
  * reachable only by scrolling inside the pill. That is the command this page
  * gives a reader for checking a download before they open it -- for the
  * unsigned `.deb`, the only check anybody makes -- so the whole of it has to
@@ -161,8 +162,9 @@
  * still breaks inside itself, and `overflow-wrap` stays for exactly that: the
  * 52-character signer-workflow path does it at 300-552px and again at
  * 561-576px, where the alternative is overflow rather than a tidier break.
- * (Those two bands are split by the 560px block below, which trades the
- * section's desktop padding for phone padding and hands the pill 23px back.)
+ * (Those widths were measured in the old desktop-app band, whose own padding
+ * set the pill's width; since PRD #1321 moved the check into the install
+ * section, the exact break points differ, and the reasoning does not.)
  *
  * `align-items: baseline` sits the `$` on the first line's baseline rather
  * than centring it against a two-line block, and the sigil's `line-height: 1`
@@ -208,9 +210,32 @@
   padding: 1rem 1rem 3.5rem;
 }
 
-.device {
+/*
+ * The hero is one window per client, side by side (PRD #1321). The column
+ * widths come from `index.js` as `--hero-columns`, each in proportion to its
+ * frame's aspect ratio, so the two windows stand the same height without
+ * cropping either. A custom property rather than an inline
+ * `grid-template-columns`, so the narrow-screen rule below can still
+ * override it and stack them.
+ */
+.showcasePair {
   max-width: 1180px;
   margin: 0 auto;
+  display: grid;
+  grid-template-columns: var(--hero-columns, repeat(2, minmax(0, 1fr)));
+  gap: 1.25rem;
+  align-items: start;
+}
+
+@media (max-width: 996px) {
+  .showcasePair {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.device {
+  min-width: 0;
+  margin: 0;
   border: 1px solid var(--c-line);
   border-radius: 12px;
   overflow: hidden;
@@ -237,6 +262,15 @@
   margin-left: 0.75rem;
   font-size: 0.75rem;
   color: var(--c-dim);
+}
+
+.deviceLabel {
+  margin-left: auto;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--c-teal);
 }
 
 .deviceImage {
@@ -348,44 +382,27 @@
   gap: 4.5rem;
 }
 
-.storyRow,
-.storyRowFlip {
-  display: grid;
-  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
-  gap: 2.5rem;
-  align-items: center;
-}
-
 /*
- * `order` alone would hand the figure the NARROW column, so the flipped rows
- * showed a visibly smaller screenshot. Mirror the track sizes too.
+ * Each step is text over its frames rather than text beside one frame
+ * (PRD #1321). The home page shows BOTH clients at once instead of asking the
+ * reader to pick one, so a step carries up to two frames, and two frames only
+ * fit side by side at a readable size when they have the whole row: at the
+ * story's 1120px each gets about 540px, close to the 602.6px the single frame
+ * had in the old two-column row. Side by side beside the text they would have
+ * shared that 602.6px column and dropped to under 300px each, where neither the
+ * terminal's text nor the dashboard's rows can be read.
+ *
+ * The text keeps a reading measure and sits at the row's left edge, over the
+ * first frame, so the eye runs text -> TUI frame -> desktop frame in one pass.
  */
-.storyRowFlip {
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+.storyRow {
+  display: flex;
+  flex-direction: column;
+  gap: 1.75rem;
 }
 
-/*
- * A step that carries no frame. No step uses this today — row 04 (dispatching)
- * did until `dispatch.webp` landed — and it is kept because `shot` stays
- * optional in `landing-content.js`: a row written before its capture is taken
- * points at no filename rather than shipping a broken image on a live page,
- * and stands on its own — centred, at a readable measure, reading as a beat
- * of the story rather than as half of a two-column row with the picture
- * missing. Adding `shot:` to the step restores the ordinary two-column row
- * with no change here.
- */
-.storyRowSolo {
-  max-width: 44rem;
-  margin: 0 auto;
-  text-align: center;
-}
-
-.storyRowFlip .storyText {
-  order: 2;
-}
-
-.storyRowFlip .storyFigure {
-  order: 1;
+.storyText {
+  max-width: 46rem;
 }
 
 .storyStep {
@@ -412,9 +429,42 @@
   margin: 0;
 }
 
+/*
+ * The frames. Two columns of equal width; `align-items: start` because the
+ * two clients' frames have different shapes (the terminal UI's real captures
+ * run from 1.30 to 1.78 wide-to-tall, the desktop app's generated frames are
+ * all 1.60), and stretching them to one height would letterbox one inside its
+ * border. A step with a single frame -- row 04, which has no desktop frame --
+ * takes one column's width, centred, so it is the same size as a frame in the
+ * rows above it rather than a frame twice as large.
+ */
+.storyFigures {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.5rem;
+  align-items: start;
+}
+
+.storyFiguresSingle {
+  grid-template-columns: minmax(0, 1fr);
+  max-width: calc((100% - 1.5rem) / 2);
+  width: 100%;
+  margin: 0 auto;
+}
+
 .storyFigure {
   margin: 0;
   min-width: 0;
+}
+
+.storyFigureLabel {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--c-teal);
+  margin-bottom: 0.5rem;
 }
 
 .storyFigure img {
@@ -433,55 +483,17 @@
 }
 
 /*
- * A frame markedly taller than its neighbours, flagged `tall` in
- * `landing-content.js`. Two of the four rows carry it: row 02's
- * `busy-deck-real.webp` is 2554x1936 (1.32) and row 04's `dispatch.webp` is
- * 2550x1964 (1.30), against 1.74 for row 01 and 1.78 for row 03, so at the
- * column's full width either stands about a third taller than those two and
- * the row reads as out of step with the ones above and below it.
- *
- * Capping the WIDTH is what absorbs that without touching the image. Every
- * story figure gets the same 1.15fr column (the flipped rows mirror the track
- * sizes, so they are not narrower), which makes the comparison a single
- * division: at 78% row 02 stands 0.78/1.32 = 0.59 column-widths tall and row
- * 04 stands 0.78/1.30 = 0.60, against row 01's 1/1.74 = 0.58 and row 03's
- * 1/1.78 = 0.56 -- close enough that both read in step with them. Against the
- * column's 602.6px that is 356 and 362 beside 347 and 339. The border still
- * hugs the frame, which a `max-height` with `object-fit: contain` would not --
- * that letterboxes inside the border instead. Cropping to 16:9 was the other
- * option and is worse than either: it would cut off exactly the edges each
- * frame is carried for, row 02's six sidebar cards and footer counts, row 04's
- * two directory paths.
- *
- * TWO capped rows out of four is worth a note, because it is the point where
- * a correction starts becoming the house style. The two do not sit adjacent
- * -- row 03's uncapped 16:9 is between them -- but both land on `.storyRowFlip`
- * (rows at odd indices flip), so both inset frames sit in the LEFT column with
- * their own whitespace either side of the image. At 0.59 against 0.60 they are
- * the same height to the eye, which reads as a pair of matching figures rather
- * than as two separate compromises. It was left alone deliberately: the
- * alternative is a different cap for one of the two, which is a design
- * decision about the house shape and not a tweak to make here.
- *
- * Only above the breakpoint. Once the row collapses to a single column there
- * is nothing left for the frame to be out of step with, and a capped one would
- * just be a needlessly small one.
- *
- * The cap is on the IMG and not on the figure, so above the breakpoint these
- * two captions run the full 602.6px column while their frame is inset 66.3px
- * on each side -- the caption starts to the LEFT of the image it describes,
- * where rows 01 and 03 have the two flush. That was measured and KEPT rather
- * than missed: carrying the same 78% onto `.storyFigureTall` (or onto its
- * `figcaption`) aligns them, and costs captions of 6-7 lines instead of five,
- * under the shorter of the two frames. Neither reading is clearly better, so
- * this is the one left in place; do not "fix" it without weighing the caption
- * length it buys.
+ * Below the site's desktop breakpoint two half-width frames get too small to
+ * read, so they stack, each at the full width, in the same order: terminal UI
+ * first, then the desktop app. The single frame of row 04 goes full width too.
  */
-@media (min-width: 997px) {
-  .storyFigureTall img {
-    max-width: 78%;
-    margin-left: auto;
-    margin-right: auto;
+@media (max-width: 996px) {
+  .storyFigures {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .storyFiguresSingle {
+    max-width: none;
   }
 }
 
@@ -537,6 +549,59 @@
   font-size: 0.95rem;
 }
 
+/* ---------- two clients ---------- */
+
+.clients {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 4rem 1rem 1rem;
+}
+
+.clientsIntro {
+  color: var(--c-dim);
+  max-width: 62ch;
+  margin: 0 0 1.75rem;
+}
+
+.clientGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.25rem;
+}
+
+.clientCard {
+  border: 1px solid var(--c-line);
+  border-radius: 12px;
+  padding: 1.25rem 1.4rem 1.4rem;
+  background: var(--c-bg-alt);
+}
+
+.clientCard img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--c-line);
+  border-radius: 8px;
+}
+
+.clientCard h3 {
+  font-size: 1.15rem;
+  font-weight: 700;
+  margin: 1rem 0 0.5rem;
+  letter-spacing: -0.02em;
+}
+
+.clientCard p {
+  color: var(--c-dim);
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.clientCard .clientLink {
+  margin: 0.9rem 0 0;
+  font-weight: 600;
+}
+
 /* ---------- principles ---------- */
 
 .principles {
@@ -576,100 +641,6 @@
   color: var(--c-dim);
   margin: 0;
   font-size: 0.95rem;
-}
-
-/* ---------- desktop ---------- */
-
-.desktop {
-  padding: 4rem 1rem;
-}
-
-.desktopInner {
-  max-width: 1000px;
-  margin: 0 auto;
-  border: 1px solid var(--c-line);
-  border-radius: 16px;
-  padding: 2.5rem 2rem;
-  background:
-    radial-gradient(circle at 15% 0%, var(--c-amber-soft), transparent 60%),
-    var(--c-bg-alt);
-}
-
-.alphaBadge {
-  display: inline-block;
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--c-amber);
-  border: 1px solid var(--c-amber);
-  border-radius: 999px;
-  padding: 0.15rem 0.7rem;
-  margin-bottom: 1rem;
-}
-
-.desktopLede {
-  color: var(--c-dim);
-  max-width: 60ch;
-  margin: 0 0 2rem;
-}
-
-.desktopGrid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 1.5rem;
-}
-
-.desktopCaveat h3 {
-  font-size: 0.98rem;
-  font-weight: 700;
-  margin: 0 0 0.4rem;
-}
-
-.desktopCaveat p {
-  font-size: 0.88rem;
-  color: var(--c-dim);
-  margin: 0;
-}
-
-.desktopFiles {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  margin: 2rem 0 1.5rem;
-}
-
-.desktopFiles code {
-  font-size: 0.72rem;
-  background: var(--c-bg);
-  border: 1px solid var(--c-line);
-  border-radius: 5px;
-  padding: 0.2rem 0.5rem;
-  word-break: break-all;
-}
-
-.desktopProvenance {
-  font-size: 0.88rem;
-  color: var(--c-dim);
-  max-width: 62ch;
-  margin: 0;
-}
-
-/*
- * The scope caveat sits UNDER the command, not above it: it says what the line
- * the reader just met does not reach (the two checksums manifests), which only
- * means anything once they have seen the command.
- */
-.desktopProvenanceScope {
-  font-size: 0.82rem;
-  color: var(--c-dim);
-  max-width: 62ch;
-  margin: 0.75rem 0 0;
-}
-
-.desktopLink {
-  margin: 1.5rem 0 0;
-  font-weight: 600;
 }
 
 /* ---------- platforms and install routes ---------- */
@@ -785,6 +756,47 @@
   font-weight: 600;
 }
 
+/*
+ * The desktop app's route lists its two release assets rather than one
+ * command, so each gets its own chip, wrapping as the column narrows, and the
+ * route ends in a link to the install steps instead of a command to copy.
+ */
+.routeFiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.routeLink {
+  display: block;
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+/*
+ * The download check sits under both columns because it covers every asset
+ * a release publishes, the CLI's binaries as well as the desktop app's
+ * packages. The scope note sits UNDER the command: it says what the command
+ * does not reach, which only means anything once the reader has seen it.
+ */
+.verify {
+  margin-top: 2.5rem;
+}
+
+.verifyNote,
+.verifyScope {
+  font-size: 0.88rem;
+  color: var(--c-dim);
+  max-width: 62ch;
+  margin: 0;
+}
+
+.verifyScope {
+  font-size: 0.82rem;
+  margin-top: 0.75rem;
+}
+
 /* ---------- close ---------- */
 
 .close {
@@ -892,13 +904,15 @@
 
 .platformStatus a,
 .installMore a,
-.desktopLink a {
+.routeLink a,
+.clientLink a {
   color: var(--c-teal);
 }
 
 .platformStatus a:hover,
 .installMore a:hover,
-.desktopLink a:hover {
+.routeLink a:hover,
+.clientLink a:hover {
   color: var(--c-teal);
   text-decoration: underline;
 }
@@ -943,19 +957,12 @@
 /* ---------- narrow ---------- */
 
 @media (max-width: 996px) {
-  .storyRow,
-  .storyRowFlip {
-    grid-template-columns: minmax(0, 1fr);
+  .storyRow {
     gap: 1.5rem;
   }
 
-  .storyRowFlip .storyText,
-  .storyRowFlip .storyFigure {
-    order: initial;
-  }
-
-  .desktopGrid,
   .principleGrid,
+  .clientGrid,
   .installCols {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -972,10 +979,6 @@
 @media (max-width: 560px) {
   .hero {
     padding-top: 3rem;
-  }
-
-  .desktopInner {
-    padding: 1.75rem 1.25rem;
   }
 
   .ctaPrimary,

@@ -3,7 +3,7 @@
 /** @type {import('@docusaurus/types').Config} */
 const config = {
   title: 'Agent Deck',
-  tagline: 'A terminal dashboard for running multiple AI coding agents in parallel',
+  tagline: 'A dashboard for running multiple AI coding agents in parallel, in your terminal or a desktop app',
   favicon: 'img/favicon.ico',
 
   url: 'https://agent-deck.devopstoolkit.ai',

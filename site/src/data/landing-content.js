@@ -28,9 +28,11 @@
  * 4. Scheduling -- cron-fired tabs, run by the daemon whether or not the deck
  *    is open (`docs/scheduled-tasks.md`, `schedule`).
  *
- * Remote environments and the desktop app are real but secondary -- they are
- * about WHERE the deck runs, not what it does -- and they keep the bands they
- * already had.
+ * Remote environments are real but secondary -- they are about WHERE the deck
+ * runs, not what it does -- and keep the band they already had. The desktop
+ * app is not secondary any more: since PRD #1321 the page presents both
+ * clients from the top, and its install detail sits with the CLI's. Workspace modes were removed (issue #1199), so they are
+ * gone from the marketing surface entirely.
  *
  * The four-step story arc was rebuilt on that basis. The old ending, "walk
  * away", was a PROPERTY of the product rather than a step in the arc, and its
@@ -166,13 +168,54 @@ export const product = {
   binary: 'dot-agent-deck',
   owner: 'DevOps Toolkit',
   tagline:
-    'A terminal dashboard for running, orchestrating and dispatching AI coding agents in parallel',
+    'A dashboard for running, orchestrating and dispatching AI coding agents in parallel — in your terminal, or in a desktop app',
   shortDefinition:
-    'A single binary that runs your AI coding agents as panes in one terminal, tracks what each of them is doing in real time, and starts new work for you — a team under one orchestrator, an isolated unit in its own copy of the repo, or a task that fires on a schedule.',
+    'Runs your AI coding agents under one background daemon, shows what each of them is doing in real time — in a terminal UI or in a desktop app, both watching the same agents — and starts new work for you: a team under one orchestrator, an isolated unit in its own copy of the repo, or a task that fires on a schedule.',
   license: 'MIT',
   repo: 'https://github.com/vfarcic/dot-agent-deck',
   issues: 'https://github.com/vfarcic/dot-agent-deck/issues',
   releases: 'https://github.com/vfarcic/dot-agent-deck/releases/latest',
+};
+
+/**
+ * The two clients (PRD #1321 M5). Both are clients of the same daemon, which
+ * is what the section says first, because it is the fact a reader needs to
+ * choose: nothing is lost by picking one, since an agent started in either
+ * shows up in the other.
+ *
+ * Every claim is checked against the code. The TUI "attaches to one daemon at
+ * a time" (`Endpoint`, `src/daemon_client.rs`); the desktop app holds several
+ * (`desktop/src-tauri/src/daemon_bridge.rs`, one link per deck) and has voice
+ * control, which the TUI does not. "Starts no daemon of its own" is the
+ * flag-off app: `connect()` bootstraps with `startIfMissing: false`
+ * (`desktop/src/lib/bridge.ts`), and the controls that start one are on the
+ * experimental deck screen. The screenshots are `cargo docs-screenshots`
+ * output (the `dashboard` scenario), one per client, of the same scene.
+ */
+export const clients = {
+  heading: 'Two clients, one daemon',
+  intro:
+    'The agents run under a small background daemon, not inside a window. The terminal UI and the desktop app are two ways of looking at it, so an agent you start in one shows up in the other, and closing either leaves the agents running.',
+  items: [
+    {
+      title: 'Terminal UI',
+      body: 'The dot-agent-deck binary, in the terminal you already use: agent cards beside their live panes, keyboard first, with workspace modes, the Schedules manager and remote hosts over ssh. It attaches to one daemon at a time.',
+      shot: {
+        src: '/img/dashboard-tui.png',
+        alt: 'The terminal UI with four agent cards on the left, each showing its status, directory and last prompt, and the focused agent’s terminal pane on the right',
+      },
+      link: {label: 'Get started with the terminal UI →', to: '/docs/getting-started'},
+    },
+    {
+      title: 'Desktop app (alpha)',
+      body: 'A native window for macOS on Apple Silicon and Linux amd64: one dashboard over several daemons at once — this machine and remote ones — with each agent’s terminal a click away, and voice control. It connects to a running daemon and starts none of its own.',
+      shot: {
+        src: '/img/dashboard-desktop.png',
+        alt: 'The desktop app’s dashboard with four agents in one daemon section, each row showing its status, name and uptime',
+      },
+      link: {label: 'Read about the desktop app →', to: '/docs/desktop'},
+    },
+  ],
 };
 
 /**
@@ -199,14 +242,14 @@ export const product = {
  *   attaches to one daemon at a time (`Endpoint` in `src/daemon_client.rs` is
  *   a single `Local`/`Remote` choice, not a map), so "one place holds ... a
  *   deck running on another machine" would be true only of the desktop app,
- *   which holds many at once and has its own band further down the page.
+ *   which holds many at once, as the two-clients section says.
  */
 export const why = {
   heading: 'Why Agent Deck',
   paragraphs: [
     "Running one AI agent at a time, you're still a software engineer who happens to use AI. Running many at the same time, you stop being one. You become a project manager supervising a team, a tech lead unblocking them, an architect designing the approach, a product manager deciding what to build.",
     "The agents do the work — writing the code, running the tests, watching the pipelines, answering the review comments. Your job is everything around it — defining the work up front, supervising it in flight, and validating that the right thing got built. None of this is new. It's the same craft people have practiced for decades. The team just looks different.",
-    'Agent Deck is the tool that lets you do that without losing your mind. One place holds all of it — a lone agent, a team working under an orchestrator, a unit off in its own copy of the repo — and every one of them is a card or a tab you can open, watch and type into. Keyboard-driven, in the terminal you already use, with the agent client you already know.',
+    'Agent Deck is the tool that lets you do that without losing your mind. One place holds all of it — a lone agent, a team working under an orchestrator, a unit off in its own copy of the repo — and every one of them is something you can open, watch and type into, in the terminal you already use or in a desktop window beside it, with the agent client you already know.',
   ],
 };
 
@@ -220,9 +263,9 @@ export const why = {
  */
 export const principles = [
   {
-    title: 'Runs in your terminal',
+    title: 'Your terminal, or a window',
     description:
-      'Ghostty, iTerm2, Alacritty, Kitty, WezTerm — whatever you already configured. Agent Deck is a guest in it, not a replacement, and there is no multiplexer to set up underneath.',
+      'The terminal UI runs in Ghostty, iTerm2, Alacritty, Kitty, WezTerm — whatever you already configured — as a guest, not a replacement, with no multiplexer to set up underneath. The desktop app is a native window over the same agents, so you can use either, or both at once.',
   },
   {
     title: 'Uses your agent client',
@@ -232,12 +275,12 @@ export const principles = [
   {
     title: 'Closing the window does not stop the work',
     description:
-      'Detach the deck and the agents carry on without you; open it again and you rejoin the same sessions, mid-run. The same holds over ssh — a deck running on another machine stays running when you disconnect.',
+      'Detach the terminal UI or quit the desktop app, and the agents carry on without you; open either again and you rejoin the same agents, mid-run. The same holds over ssh — agents running on another machine stay running when you disconnect.',
   },
   {
-    title: 'Keyboard first',
+    title: 'Keyboard, pointer or voice',
     description:
-      'Every action is one or two keystrokes away, because managing a team of agents has to fit in muscle memory. The mouse still works when you want it: a button bar along the bottom names each command and the key it answers to.',
+      'In the terminal UI every action is one or two keystrokes away, because managing a team of agents has to fit in muscle memory, and a button bar along the bottom names each command and the key it answers to. The desktop app is built for the pointer, with a few keys of its own, and it can be driven by voice: open screens, start a new agent, and type into one.',
   },
 ];
 
@@ -283,8 +326,9 @@ export const agentsNote =
   'Any other command still runs in a pane — it just gets no live status tracking. Adapters for Gemini CLI and Aider are designed and open, not shipped.';
 
 /**
- * Mirrors the Platform Support table in `docs/installation.md`, with one
- * deliberate divergence: that table links the Windows-native tracking issue
+ * Mirrors the Platform Support table in `docs/installation.md`, including its
+ * Desktop app row (the first three rows are the terminal UI and the daemon,
+ * which the CLI carries on every platform), with one deliberate divergence: that table links the Windows-native tracking issue
  * and this one does not. See correction 3 at the top of this file before
  * "restoring parity" by adding the link back.
  */
@@ -305,6 +349,12 @@ export const platforms = [
     platform: 'Windows via WSL',
     detail: 'runs as Linux',
     status: 'Supported',
+    supported: true,
+  },
+  {
+    platform: 'Desktop app',
+    detail: 'macOS on Apple Silicon and Linux amd64',
+    status: 'Alpha',
     supported: true,
   },
   {
@@ -338,55 +388,37 @@ export const installRoutes = [
     detail: 'Rust 1.85 or newer, edition 2024',
     code: 'cargo build --release',
   },
+  {
+    name: 'Desktop app (alpha)',
+    detail: 'Outside the CLI’s support expectations, from the releases page. A release can ship without one or both desktop packages, so check the assets on the release you open; the CLI ships even when they do not. The app connects to a daemon that is already running and starts none of its own: on Linux the .deb installs the dot-agent-deck CLI alongside the app, and on macOS install the CLI too, or start the daemon from the copy inside the app bundle, as the install steps describe. Each release’s notes say whether its .dmg is signed and notarized; the .deb is unsigned, so check it as below before installing it.',
+    code: null,
+    files: [
+      'dot-agent-deck-desktop-alpha-macos-arm64.dmg',
+      'dot-agent-deck-desktop-alpha-linux-amd64.deb',
+    ],
+    link: {label: 'How to install the desktop app →', to: '/docs/installation#desktop-app'},
+  },
 ];
 
 /**
- * The desktop GUI. Every claim here is checked -- see the note at the top of
- * this file. "Alpha" is load-bearing and is not softened. The signing caveat
- * says what v0.42.0 carries -- a signed, notarized `.dmg` and an unsigned
- * `.deb` -- and sends the reader to the release notes for any other release,
- * because the workflow does not guarantee every release is signed (item 1).
- *
- * `intro` and the Windows caveat used to explain themselves in daemon and
- * sidecar terms. Both now say the same thing in what the reader can see: the
- * terminal deck shows one machine's agents at a time and the app shows
- * several, and there is no Windows build of the deck for an app to carry.
+ * The download check, for everything the install section offers (PRD #1321).
+ * It used to live in a separate band that introduced the desktop app late in
+ * the page ("There is a desktop app too. It is an alpha."), which stopped
+ * making sense once the page presented both clients from the top. What that
+ * band carried was install detail -- the two desktop assets, signing, the
+ * missing Windows bundle, and this check -- so the assets and the signing
+ * line moved into the desktop app's install route, the missing Windows build
+ * is the platform list's last row, and the check sits under both columns,
+ * because it covers every asset the release publishes, the CLI's included.
+ * The signing claims follow the note at the top of this file (item 1): each
+ * release's notes say whether its own .dmg is signed.
  */
-export const desktop = {
-  heading: 'There is a desktop app too. It is an alpha.',
-  intro:
-    'The terminal deck shows you one machine’s agents at a time. The desktop app is a native window that holds several at once — the agents on your laptop and the ones on a remote box, side by side. It rides along with a release rather than gating it, so check the assets on the release you open: the CLI ships even when a desktop bundle does not.',
-  artifacts: [
-    {
-      platform: 'macOS',
-      arch: 'Apple Silicon',
-      file: 'dot-agent-deck-desktop-alpha-macos-arm64.dmg',
-    },
-    {
-      platform: 'Linux',
-      arch: 'x86_64',
-      file: 'dot-agent-deck-desktop-alpha-linux-amd64.deb',
-    },
-  ],
-  caveats: [
-    {
-      title: 'Alpha, and labelled that way',
-      body: 'It ships outside the support expectations of the CLI. The terminal deck is the product; this is an early preview of a second way in.',
-    },
-    {
-      title: 'v0.42.0: signed for macOS, not for Linux',
-      body: 'The .dmg on v0.42.0 is signed with the project’s Apple Developer ID and notarized by Apple, so macOS should ask only to confirm opening an app downloaded from the internet. Each release’s notes say whether its own macOS build is signed; if yours is and macOS calls the app damaged or from an unidentified developer, do not override that — report it. The .deb is unsigned, and dpkg -i verifies no package signature, so on Linux the provenance command below is the only check anybody makes. Run it first on either platform.',
-    },
-    {
-      title: 'No Windows bundle',
-      body: 'There is no native Windows build of Agent Deck itself yet, so there is nothing for a desktop bundle to carry. Windows via WSL runs the terminal deck today.',
-    },
-  ],
-  provenanceNote:
-    'Every asset the release workflow uploads — the binaries, the desktop packages, and both checksums manifests — carries build provenance: proof that this exact file came out of this repository’s release workflow, and a record of the commit it was built from. Run it on what you downloaded before you open it.',
-  provenanceCommand:
+export const verify = {
+  heading: 'Check what you downloaded',
+  note: 'Every asset the release workflow uploads — the binaries, the desktop packages, and both checksums manifests — carries build provenance: proof that this exact file came out of this repository’s release workflow, and a record of the commit it was built from. Run it on what you downloaded before you open it.',
+  command:
     'gh attestation verify <file> --repo vfarcic/dot-agent-deck --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml',
-  provenanceScope:
+  scope:
     'The manifests matter most here: the list of hashes you would check everything else against is exactly the file worth swapping, so it is vouched for by the same proof rather than trusted on its own. The one thing not covered is GitHub’s own “Source code” archives — GitHub synthesizes those from the tag rather than the workflow uploading them.',
 };
 
@@ -399,31 +431,16 @@ export const desktop = {
  * describes what is IN the frame rather than what the row argues, so a
  * recapture that changes what a frame shows is a one-file correction.
  *
- * `tall` is an OPTIONAL layout flag on an entry, read by `index.js`. It says
- * "this frame is far enough from the others' shape that the row falls out of
- * step with its neighbours", and the measure is how tall the frame stands, in
- * multiples of the figure column's own width, when the story is at its 1120px
- * maximum. Rows 01 and 03 set the house shape at 0.58 and 0.56.
- *
- * `tall` means "much closer to 4:3 than the 16:9 the other rows carry", and
- * TWO rows now carry it. `busy-deck-real.webp` is 2554x1936 and
- * `dispatch.webp` is 2550x1964, so at the column's full width they stand 0.76
- * and 0.77 -- about a third taller than rows 01 and 03. The flag caps their
- * width above the two-column breakpoint instead of cropping them, which brings
- * them to 0.59 and 0.60. Cropping would cut off exactly the edges each frame
- * is carried for: row 02's sidebar cards and footer counts, row 04's two
- * directory paths. `index.module.css` carries the division and the note on
- * what two capped rows out of four look like together.
- *
- * There WAS a `wide` flag, for the opposite deviation, and it left with the
- * frame that needed it. The old `dispatch.webp` was a 1946x482 band (4.04)
- * that no width cap could fix -- capping a width only makes a frame shorter,
- * and that one was already short -- so the flag stacked its row instead, text
- * over a full-measure frame. The maintainer's own capture replaced it at 1.30
- * and left nothing flagged `wide`, so the flag, its branch in `index.js` and
- * `.storyRowWide` went with it rather than sitting in the tree as a dead
- * option. `.storyRowSolo` stayed: the figure-less case is still genuinely
- * optional, and its own comment says so.
+ * There WERE two layout flags on these entries, `tall` and `wide`, and both
+ * left when the story stopped alternating text and one frame side by side
+ * (PRD #1321). They existed to keep a two-column row in step with its
+ * neighbours: `wide` stacked a row whose frame was a 4.04 band, and `tall`
+ * capped the width of the two near-4:3 frames, `busy-deck-real.webp` and
+ * `dispatch.webp`, so they stood no taller than the 16:9 rows. Each step now
+ * puts its text over the terminal UI's and the desktop app's frames side by
+ * side, each frame at half the story's width and the top edges aligned, so a
+ * taller frame no longer pushes a row out of step with anything, and neither
+ * flag has a job left.
  *
  * What changed, frame by frame:
  *
@@ -492,11 +509,6 @@ export const desktop = {
  *   The sidebar's single card (`Prmt: Why is 450 red?`) and the pane's token
  *   counter are both incidental to what the row argues, so neither the alt nor
  *   the caption reaches for them.
- *
- *   It carries `tall` where the old frame carried `wide`: 2550x1964 is 1.30, a
- *   hair squarer than row 02's 1.32, against the old band's 4.04. See the
- *   flag's own note above for the arithmetic, and `index.module.css` for what
- *   the cap does to the row.
  * - `reattach.png` leaves the page with the "walk away" row it illustrated.
  *   The maintainer's verdict on that frame was "I'm not sure I understand" it,
  *   and the diagnosis is that the idea has no moment to photograph: detaching
@@ -520,12 +532,29 @@ export const desktop = {
  * `grep -rn 'orchestration-config' docs/ site/` returns nothing.
  */
 export const screenshots = {
+  /*
+   * The hero is a PAIR since PRD #1321, one frame per client, shown side by
+   * side at the same height. `aspect` is each frame's width over its height;
+   * the page sizes the two columns in that ratio, which is what makes their
+   * heights match without cropping either. Both frames are the maintainer's
+   * own captures of the SAME orchestration, dot-agent-deck-dispatch-issue-544,
+   * taken for this slot at close to the same shape (1.31 and 1.21), so each
+   * window gets about half the width and stays readable. They replaced a 3:1
+   * terminal UI band (`orchestration-coder.png`) that, beside any desktop
+   * frame at equal height, left the desktop window too narrow to read.
+   */
   hero: {
-    src: '/img/orchestration-coder.png',
-    alt: 'Agent Deck’s split view — a sidebar of orchestrator, coder and reviewer cards with only the coder marked Working, beside the coder’s own pane running a grep, an edit to src/email/order_confirmation.rs, and cargo test order_confirmation',
-    caption:
-      'A coder pane working on what the orchestrator just delegated to it.',
+    src: '/img/orchestration-tui-home.png',
+    aspect: 2536 / 1942,
+    alt: 'Agent Deck’s terminal UI on the dot-agent-deck-dispatch-issue-544 orchestration tab — six role cards down the left, orchestrator, coder, reviewer, auditor, tester and release, run by Claude Code, Pi, OpenCode and Codex, with tester Working and the rest Idle, beside the orchestrator’s pane showing its report on the pull request it prepared, over a footer reading 15 active, 4 working, 1 thinking, 10 idle',
   },
+  heroDesktop: {
+    src: '/img/orchestration-desktop-home.png',
+    aspect: 2482 / 2044,
+    alt: 'The desktop app’s Agent dashboard across all daemons — 43 agents over 3 daemons — with a remote daemon’s standalone agents above two six-role orchestrations: the first lists 01 orchestrator, marked ORCHESTRATOR, then coder, reviewer, auditor, tester and release, one running and five waiting, each with its uptime',
+  },
+  heroCaption:
+    'The same six-role orchestration in both clients. In the terminal UI its roles are cards beside the orchestrator’s pane, Claude Code, Pi, OpenCode and Codex side by side; in the desktop app they are a group on a dashboard that spans every daemon, with the orchestrator marked.',
   newPane: {
     src: '/img/orchestration-new-deck.png',
     alt: 'The New Agent form — Dir /tmp/storefront, a Mode row offering No mode, Orch: review-team, schedule and dispatcher, Agent on auto, Name storefront, Command claude, and Submit and Cancel buttons',
@@ -534,7 +563,6 @@ export const screenshots = {
   },
   deck: {
     src: '/img/busy-deck-real.webp',
-    tall: true,
     alt: 'A deck with the Dashboard and four orchestration tabs along the top and six agent cards down the sidebar — ClaudeCode, Pi, OpenCode and Codex filling the orchestrator, coder, reviewer, auditor, tester and release roles, two marked Working and the rest Idle — the cards all laid out the same way, with the directory, the last prompt, the command last run, the time since the last activity and a tool count, over a footer reading 23 active, 2 working, 1 thinking, 20 idle',
     caption:
       'Four different agent clients — Claude Code, Pi, OpenCode and Codex — running side by side under one orchestrator, and the deck reads all of them the same way: the same card, the same live status, whichever client is behind it. The header counts the six sessions in view out of the deck’s 25; the footer counts every agent it is holding: 23 active, 2 working, 1 thinking, 20 idle.',
@@ -547,10 +575,34 @@ export const screenshots = {
   },
   dispatch: {
     src: '/img/dispatch.webp',
-    tall: true,
     alt: 'A deck with the Dashboard and three mixed · dot-agent-deck… orchestration tabs along the top, and a dispatcher pane reading “Confirmed — both units are now up:” over voice-control → /home/vfarcic/code/dot-agent-deck-dispatch-voice-control (#802) and product-website → /home/vfarcic/code/dot-agent-deck-dispatch-product-website (#1021), then “Both cut from main at d7bbbd39, each a 6-role mixed orchestration.” A yellow arrow drawn onto the screenshot points down at the request below that, which asks for three dispatched agents or teams at a time and a stop at twenty in total; the reply reads it back as a standing loop with eighteen still to dispatch. The footer counts 17 active agents, 1 working and 1 thinking',
     caption:
       'Two units up from one dispatcher pane, and neither of them is a single agent — each is a whole 6-role orchestration, in its own copy of the repository, both cut from main at the same commit. The yellow arrow marks the ask that follows: keep three running at a time, start a fresh one whenever a slot frees, stop at twenty — which the pane reads back as eighteen still to go.',
+  },
+  /*
+   * The desktop app's frames for the story rows. Unlike the terminal UI's
+   * frames above, which are captures of real decks at work, these come from
+   * `cargo docs-screenshots` (docs/develop/docs-screenshots.md) and show the
+   * app's fixture data, so a recapture after a UI change is one command. The
+   * alt text and captions are written against the committed frames.
+   */
+  newAgentDesktop: {
+    src: '/img/new-agent-desktop.png',
+    alt: 'The desktop app’s New agent dialog over the Agent dashboard — daemon Local daemon, directory /home/dev/demo-project, a Mode row offering No mode, Orch: demo-loop, schedule and dispatcher, Name demo-project, an empty Command field, and Discard and Create agent buttons',
+    caption:
+      'The desktop app’s New agent dialog makes the same choice, after asking which daemon to start the agent on. demo-loop is not built in: it is the orchestration this directory defines.',
+  },
+  deckDesktop: {
+    src: '/img/dashboard-fleet-desktop.png',
+    alt: 'The desktop app’s Agent dashboard showing All daemons: a Local daemon section with four standalone agents and a dev@build-box section with two, each row showing its status, running or waiting, its name and its uptime, under counters reading 6 agents, 3 running, 3 waiting and daemons 2/2',
+    caption:
+      'Two daemons on one dashboard, this machine and a remote build box, each in its own section with its own New agent button.',
+  },
+  parallelDesktop: {
+    src: '/img/orchestration-desktop.png',
+    alt: 'The desktop app’s Agent dashboard with a demo-loop orchestration group below the standalone agents: 01 planner, marked ORCHESTRATOR, and 02 builder, both running, with a Close button on the group’s header',
+    caption:
+      'In the desktop app an orchestration is a group: its roles in order, the one you message marked ORCHESTRATOR, and one Close for all of them.',
   },
 };
 
@@ -558,7 +610,7 @@ export const audience = {
   heading: 'Who this is for',
   forYou: [
     'You already run more than one coding agent at a time, and you are losing track of what each one is doing.',
-    'You have a terminal you have spent years configuring, and you are not moving into someone else’s app to get a dashboard.',
+    'You would rather keep your own tools than move into someone else’s IDE to get a dashboard: the terminal you have spent years configuring, or a plain desktop window beside it.',
     'You want one agent to plan the work and hand pieces of it to others, with somewhere to watch that happen.',
   ],
   notYou:
@@ -566,49 +618,61 @@ export const audience = {
 };
 
 /**
- * The four story rows. Each step names the `screenshots` entry it carries, so
- * the page joins copy to frame BY NAME -- `step.shot` -- rather than by lining
- * two arrays up positionally. Reordering the steps or inserting one therefore
- * carries each row's image, alt text and caption with it; the positional form
- * mispaired them silently, which is what `bc6f0abe` had to repair by hand.
- * `screenshots` is declared above, so a typo here is `undefined` and the first
- * property read fails the build rather than rendering the wrong frame.
+ * The four story rows. Each step names the `screenshots` entries it carries,
+ * so the page joins copy to frame BY NAME -- `step.shots.tui` and
+ * `step.shots.desktop` -- rather than by lining two arrays up positionally.
+ * Reordering the steps or inserting one therefore carries each row's images,
+ * alt text and captions with it; the positional form mispaired them silently,
+ * which is what `bc6f0abe` had to repair by hand. `screenshots` is declared
+ * above, so a typo here is `undefined` and the first property read fails the
+ * build rather than rendering the wrong frame.
  *
- * `shot` is OPTIONAL. A step without one renders as a single centred column
- * rather than as half a two-column row with the picture missing. Every step
- * carries one today; the branch is kept for the next row written before its
- * frame is taken, which is how row 04 shipped while `dispatch.webp` was being
- * captured.
+ * The copy is written for BOTH clients (PRD #1321): each capability here lives
+ * in the daemon, so the terminal UI and the desktop app both have it, and where
+ * the two present it differently -- a card or a row, a tab or a group -- the
+ * body names both. Both clients' frames are shown at once, side by side under
+ * the text, each labelled with its client: the home page deliberately does not
+ * make the reader pick one, which is what the docs' TUI | Desktop tabs do.
+ *
+ * `shots` is OPTIONAL, and so is either half of it. A step with no frame at
+ * all is text alone. A step with one client's frame shows it alone, centred at
+ * the width a frame has in the other rows; row 04 is that case, because the
+ * dispatcher's work is a conversation in an agent's pane and the desktop
+ * fixture has no dispatcher transcript to capture, so its `desktopNote` is
+ * added to the terminal UI frame's caption to say what the desktop app does
+ * there instead.
  *
  * The arc is an escalation, and each rung is a shipped feature rather than a
- * restatement of the one before it: one pane, then many of them visible at
+ * restatement of the one before it: one agent, then many of them visible at
  * once, then one agent running the others, then whole new lines of work
  * starting in their own copies of the repo without you setting any of it up.
  */
 export const workflow = [
   {
     step: '01',
-    title: 'Open a pane',
-    body: 'Ctrl+n, pick a directory, and choose what starts there. A single agent on the command you give it. A full multi-agent orchestration, in its own tab. A dispatcher you can ask for isolated work. Or a scheduled task, written here and fired later by the deck itself.',
-    shot: screenshots.newPane,
+    title: 'Start an agent',
+    body: 'Pick a directory and choose what starts there: Ctrl+n in the terminal UI, New agent in the desktop app. A single agent on the command you give it. A full multi-agent orchestration, every role at once. A dispatcher you can ask for isolated work. Or a scheduled task, written here and fired later by the deck itself.',
+    shots: {tui: screenshots.newPane, desktop: screenshots.newAgentDesktop},
   },
   {
     step: '02',
     title: 'Watch every one of them',
-    body: 'Every pane gets a card: what it is doing right now, the tool it is running, its directory, its last prompt. Live, with nothing for you to wire up. The more agents you run, the tighter the cards get — the deck would rather shrink them than make you go looking for one.',
-    shot: screenshots.deck,
+    body: 'Every agent shows up live, with what it is doing right now, the tool it is running, its directory and its last prompt, and nothing for you to wire up. In the terminal UI each one gets a card, and the cards get tighter the more agents you run, because the deck would rather shrink them than make you go looking for one. In the desktop app each one gets a row with the columns you choose, and one dashboard can hold the agents of several daemons, on this machine and on remote ones.',
+    shots: {tui: screenshots.deck, desktop: screenshots.deckDesktop},
   },
   {
     step: '03',
     title: 'Let one agent run the others',
-    body: 'Define the roles your project needs — orchestrator, coder, reviewer, release — and one agent hands each piece of work to the right one. Every worker starts fresh, with only the context it was given, and you watch the hand-offs land in the other panes. If a worker goes quiet, the deck tells the orchestrator, so a stalled run does not sit there unnoticed.',
-    shot: screenshots.parallel,
+    body: 'Define the roles your project needs — orchestrator, coder, reviewer, release — and one agent hands each piece of work to the right one. Every worker starts fresh, with only the context it was given, and you watch the hand-offs land: across the orchestration’s tab in the terminal UI, down its group in the desktop app. If a worker goes quiet, the deck tells the orchestrator, so a stalled run does not sit there unnoticed.',
+    shots: {tui: screenshots.parallel, desktop: screenshots.parallelDesktop},
   },
   {
     step: '04',
     title: 'Send work off on its own',
-    body: 'Ask a dispatcher pane for something — “work on the search bug” — and it makes a separate copy of your repository and puts an agent, or a whole orchestration, to work inside it. It works in that copy rather than in your working tree, so start as many as you like and carry on with what you were doing. Each unit arrives on the deck as a card or a tab, and reports back when it is done.',
-    shot: screenshots.dispatch,
+    body: 'Ask a dispatcher for something — “work on the search bug” — and it makes a separate copy of your repository and puts an agent, or a whole orchestration, to work inside it. It works in that copy rather than in your working tree, so start as many as you like and carry on with what you were doing. Each unit arrives on the deck, as a card or a tab in the terminal UI and as a row or a group in the desktop app, and reports back when it is done.',
+    shots: {tui: screenshots.dispatch},
+    desktopNote:
+      'In the desktop app a dispatcher is an agent like any other: you talk to it in its pane, and the units it starts appear on the dashboard.',
   },
 ];
 
@@ -620,4 +684,5 @@ export const docLinks = {
   configuration: '/docs/configuration',
   keyboard: '/docs/keyboard-shortcuts',
   remote: '/docs/remote-environments',
+  desktop: '/docs/desktop',
 };

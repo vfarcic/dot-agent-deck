@@ -435,6 +435,37 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// cached handshake rather than a fresh one. No existing field changed
 /// meaning: a request that sets none of them is answered as before.
 ///
+/// **Issue #1233 contributes no bump for giving each preparation its own
+/// coordinator-context file.** Nothing on the wire moved:
+/// [`crate::event::PreparedOrchestration`]'s `context_path` and `prompt` keep
+/// their shape and their documented meaning — where this preparation's context
+/// was published, and the line that points the coordinator at it — and only the
+/// file name they carry changed, from the fixed `orchestrator-context.md` to
+/// `orchestrator-context-<32 hex>.md`. A desktop of either age delivers the
+/// `prompt` it is handed verbatim. The pairing that could have regressed is an
+/// older TUI re-arming a daemon-published orchestration after compaction, which
+/// reads the task back from the fixed name; the daemon still refreshes that name
+/// as a compatibility mirror, so that pairing keeps exactly its pre-#1233
+/// behaviour. Every pairing is today's behaviour or better, so no
+/// [`CONTRACT_BREAKS`] entry and no `.breaking.md` for this half of the issue.
+/// Retiring the mirror is follow-up #1395, and is the point at which that
+/// pairing has to be argued again.
+///
+/// Its second half, refusing an ambiguous orchestration name with
+/// [`PROJECT_ERR_AMBIGUOUS_ORCHESTRATION`], moves no wire either — a new error
+/// code on an existing refusal channel — but it IS a semantic break, the
+/// #555/#580 shape, and is declared as `1233-prepare-refuses-ambiguous-orchestration`
+/// in [`CONTRACT_BREAKS`] with `changelog.d/1233.breaking.md`.
+///
+/// Its third half, the daemon-owned preparation deadline, is a new capability
+/// string ([`CAP_PREPARE_DEADLINE`]) and a new error code
+/// ([`PROJECT_ERR_PREPARATION_EXPIRED`]) with no field and no variant, so it
+/// moves no version either. It is read as a transient refusal of the
+/// [`PROJECT_ERR_BUSY`] class rather than a change to what a valid request
+/// means, so it has no [`CONTRACT_BREAKS`] entry. The only client that acts on
+/// the capability is the desktop, which bounds its preparation call against a
+/// deck naming it and keeps waiting an older one out.
+///
 /// # Where this constant is enforced
 ///
 /// **Two call sites refuse on it, and both require exact equality**
@@ -560,6 +591,33 @@ pub const CAP_PREPARE_ORCHESTRATION: &str = "prepare-orchestration";
 /// Retire it together with [`AttachRequest::PrepareWorkflow`] and
 /// [`AttachResponse::workflow_prepared`]; the three are one legacy surface.
 pub const CAP_PREPARE_WORKFLOW: &str = "prepare-workflow";
+
+/// Capability string for issue #1233 item 4: this daemon bounds
+/// [`AttachRequest::PrepareOrchestration`] (both spellings) at
+/// [`crate::project_resolve::PREPARE_DEADLINE`].
+///
+/// Names a BEHAVIOUR rather than a verb or a field, and what it promises is
+/// exactly three things: the preparation is answered at that deadline at the
+/// latest — or just past it, when the work committed first, with nothing
+/// blocking between that commit and the answer — including when a blocking
+/// filesystem call behind it stalls (the call keeps its thread; the answer does
+/// not wait for it); a preparation that expires is refused with
+/// [`PROJECT_ERR_PREPARATION_EXPIRED`], leaves no live token, writes no mirror,
+/// and withdraws any context file it published, best effort — one still
+/// running at the deadline does so at its next deadline check; and every
+/// preparation publishes a file of its own, so even one answered late cannot
+/// replace a retry's (the fixed-name mirror binds nothing: this daemon never
+/// lets the earlier publish's mirror write land over the retry's, but a TUI or
+/// `dispatch` mirroring into the same project from its own process can still
+/// leave it with their bytes). Together those are what make a CLIENT-side bound on
+/// the call safe:
+/// the desktop wraps its preparation in its per-call timeout only against a
+/// daemon that names this, and keeps waiting an older one out. Nothing on the
+/// wire depends on it, so an older daemon simply does not name it.
+///
+/// **Unix-only**, beside [`CAP_PREPARE_ORCHESTRATION`]: it qualifies a verb
+/// this build refuses on other platforms.
+pub const CAP_PREPARE_DEADLINE: &str = "prepare-deadline";
 
 /// Capability string for [`AttachRequest::StartPreparedAgent`].
 ///
@@ -753,7 +811,9 @@ fn invalid_client_id_message() -> String {
 /// same reason: none of their dispatch arms is `#[cfg]`-gated — and so is issue
 /// #1240's [`CAP_LIST_DIRECTORIES_OPTIONS`], a field of the first.
 /// [`CAP_PREPARED_ROLE_COMMAND`] is on the Unix list only, beside
-/// [`CAP_START_PREPARED_AGENT`] — it names a field of that verb.
+/// [`CAP_START_PREPARED_AGENT`] — it names a field of that verb — and so is
+/// issue #1233's [`CAP_PREPARE_DEADLINE`], which qualifies
+/// [`CAP_PREPARE_ORCHESTRATION`].
 #[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
@@ -768,6 +828,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_AUTHORING_KIND,
     CAP_PREPARED_ROLE_COMMAND,
     CAP_LIST_DIRECTORIES_OPTIONS,
+    CAP_PREPARE_DEADLINE,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -931,6 +992,23 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // new build, which is exactly the older-daemon pairing this list exists to
     // name.
     "708-worker-failure-reports-submitted",
+    // Issue #1233, at 10 without moving it -- the #555/#580 shape. A
+    // `PrepareOrchestration` naming an orchestration the project declares more
+    // than once, with roles each time, used to prepare the FIRST declaration; a
+    // newer daemon refuses it with `PROJECT_ERR_AMBIGUOUS_ORCHESTRATION` before
+    // publishing anything or issuing a token. The request and the refusal
+    // channel are unchanged on the wire. What changed is which preparations are
+    // refused, which a version number cannot express.
+    "1233-prepare-refuses-ambiguous-orchestration",
+    // Issue #1337, at 10 without moving it -- #708's shape, applied to the
+    // sibling #708 missed. The daemon's "respawn failed" report into an
+    // orchestrator's pane, for a `clear = true` respawn that could not start a
+    // replacement at all, used to be written with an LF and left unsubmitted; a
+    // newer daemon SUBMITS it as a turn, and it no longer interpolates the
+    // config-supplied role name. Nothing on the wire moved: the change is what an
+    // existing delivery MEANS -- inert text becomes model input -- and it takes
+    // effect when the daemon starts on the new build.
+    "1337-respawn-failure-report-submitted",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -1067,6 +1145,33 @@ pub const PROJECT_ERR_STALE_REVISION: &str = "stale-revision";
 /// available orchestration: that is config content for a path the caller may
 /// merely have pasted.
 pub const PROJECT_ERR_NO_ORCHESTRATION: &str = "no-such-orchestration";
+
+/// Issue #1233: the project resolved, but defines **more than one**
+/// role-bearing orchestration under the requested name, so there is no single
+/// one to prepare.
+///
+/// A daemon before #1233 prepared the first declaration instead, which is why
+/// this is declared as a contract break (`1233-prepare-refuses-ambiguous-orchestration`
+/// in [`CONTRACT_BREAKS`]): a request an older daemon accepted is now refused.
+/// It is refused before anything is published or any token issued, and a
+/// roleless duplicate does not count
+/// ([`crate::project_resolve::find_orchestration`]). Checked after
+/// [`PROJECT_ERR_STALE_REVISION`], so a caller holding a stale revision is told
+/// to resolve again first.
+pub const PROJECT_ERR_AMBIGUOUS_ORCHESTRATION: &str = "ambiguous-orchestration";
+
+/// Issue #1233 item 4: the daemon did not finish a
+/// [`AttachRequest::PrepareOrchestration`] within
+/// [`crate::project_resolve::PREPARE_DEADLINE`], so nothing it prepared can be
+/// launched: no token stays live (one minted before the last deadline check is
+/// revoked), and a context file it published is withdrawn, best effort.
+///
+/// **Retryable**, and about the daemon's load rather than the request, the
+/// [`PROJECT_ERR_BUSY`] class: the same request sent again can be answered
+/// normally once the daemon's project permits free up. Not a contract break — a request
+/// the daemon would have prepared is not now refused for what it asks, only
+/// for how long the daemon took — so it has no [`CONTRACT_BREAKS`] entry.
+pub const PROJECT_ERR_PREPARATION_EXPIRED: &str = "preparation-expired";
 
 /// PRD #819 M4: the project and the orchestration resolved, but the
 /// orchestrator context could not be published.
@@ -3767,6 +3872,12 @@ async fn handle_connection(
             // not the launch it approved (`preparation-mismatch`).
             let mut configured_role: Option<(crate::project_resolve::PreparedRoleConfig, String)> =
                 None;
+            // Issue #1233 item 2: the project directory the check below verified,
+            // HELD OPEN from the verification until `spawn_agent_in` returns, so
+            // the child starts in the object that was checked rather than in
+            // whatever the pathname names by the time the PTY forks.
+            #[cfg(unix)]
+            let mut prepared_dir: Option<crate::project_resolve::VerifiedProjectDir> = None;
             if let Some(token) = prepared_token.as_deref() {
                 let Some(binding) = crate::prep_token::binding(token) else {
                     write_resp(
@@ -3812,8 +3923,12 @@ async fn handle_connection(
                 })
                 .await;
                 let refusal = match outcome {
-                    Ok(Ok(role)) => {
-                        configured_role = Some((role, coordinator_prompt));
+                    Ok(Ok(verified)) => {
+                        #[cfg(unix)]
+                        {
+                            prepared_dir = Some(verified.project_dir);
+                        }
+                        configured_role = Some((verified.role, coordinator_prompt));
                         None
                     }
                     Ok(Err(refusal)) => {
@@ -4040,7 +4155,19 @@ async fn handle_connection(
                 tab_membership,
                 agent_type,
             };
-            match registry.spawn_agent(opts) {
+            #[cfg(unix)]
+            let spawned = match prepared_dir.as_ref() {
+                Some(dir) => registry.spawn_agent_in(opts, dir),
+                None => registry.spawn_agent(opts),
+            };
+            #[cfg(not(unix))]
+            let spawned = registry.spawn_agent(opts);
+            // The child has entered its directory (or the spawn failed), so the
+            // held descriptor has done its job; it is `CLOEXEC` and never reached
+            // the agent.
+            #[cfg(unix)]
+            drop(prepared_dir);
+            match spawned {
                 Ok(id) => {
                     // PRD #1223 M7: deliver the authoring seed through the path
                     // this agent already has, never a new one (#528). A Pi pane
@@ -4218,7 +4345,22 @@ async fn handle_connection(
                             .await
                             .release_orchestration_title_claim(identity);
                     }
-                    write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?
+                    // Issue #1233 item 2: the verified directory moved between the
+                    // check and the fork. That is a staleness finding like every
+                    // other, so it gets the same one wire sentence and its cause
+                    // stays in this log.
+                    let message = match &e {
+                        crate::agent_pty::AgentPtyError::PreparedDirChanged(detail) => {
+                            warn!(
+                                reason = %detail,
+                                "start-prepared-agent refused: the prepared project directory \
+                                 changed before the spawn"
+                            );
+                            crate::project_resolve::stale_preparation_refusal()
+                        }
+                        _ => e.to_string(),
+                    };
+                    write_resp(&mut stream, &AttachResponse::err(message)).await?
                 }
             }
         }
@@ -4986,24 +5128,81 @@ async fn handle_connection(
                     // in-memory state and it is what decides whether a refusal
                     // carries the detailed diagnostic.
                     let seeds = project_candidates(&registry, &state, &scheduler).await;
-                    // One `run_bounded` call, so the whole resolve → read →
+                    // One bounded call, so the whole resolve → read →
                     // compose → publish sequence runs on ONE blocking thread
                     // under ONE permit. Splitting it would mean acquiring a
                     // second permit from inside work that already holds one,
                     // which is the shape that deadlocks a bounded pool.
-                    match crate::project_resolve::run_bounded(move || {
-                        crate::project_resolve::prepare_orchestration_for_wire(
+                    //
+                    // Issue #1233 item 4: under a deadline the daemon owns
+                    // (`CAP_PREPARE_DEADLINE`), taken HERE so the permit wait
+                    // counts against it, and handed to the work so a publish
+                    // that finishes late is withdrawn rather than answered.
+                    //
+                    // Its audit: the ANSWER is bounded, not only the permit
+                    // wait — a work still running and uncommitted at the
+                    // deadline is answered as expired, and the shared latch
+                    // makes it withdraw itself by its last gate — and the
+                    // compatibility mirror runs
+                    // after the answer has gone, only for a preparation that
+                    // committed to one.
+                    let deadline =
+                        tokio::time::Instant::now() + crate::project_resolve::PREPARE_DEADLINE;
+                    let work_deadline = deadline.into_std();
+                    match crate::project_resolve::run_bounded_answer(deadline, move |latch| {
+                        match crate::project_resolve::prepare_orchestration_before(
                             &path,
                             &orchestration,
                             &task,
                             config_revision.as_deref(),
                             &seeds,
-                        )
+                            Some(work_deadline),
+                            &std::time::Instant::now,
+                            Some(latch),
+                        ) {
+                            Ok(prepared) => {
+                                // Runs after the reply on this blocking thread, so
+                                // two preparations' mirror writes can finish in
+                                // either order; `mirror_into`'s ordering guard keeps
+                                // the earlier publish from landing over the later.
+                                //
+                                // Accepted residual of that order (Qodo, PR #1407):
+                                // a reader of the fixed `orchestrator-context.md`
+                                // that acts the instant the reply arrives can still
+                                // read the PREVIOUS mirror until this write lands
+                                // (or keep it, if the write fails). Writing it first
+                                // would let a stalled write hold the reply past the
+                                // deadline. The authoritative context is the
+                                // per-preparation file the prompt names; the mirror
+                                // serves only compatibility readers — see
+                                // `PendingMirror`.
+                                let (answer, mirror) = prepared.into_parts();
+                                let after: crate::project_resolve::AfterReply =
+                                    Box::new(move || mirror.write());
+                                (Ok(answer), Some(after))
+                            }
+                            Err(refusal) => (Err(refusal), None),
+                        }
                     })
                     .await
                     {
-                        Ok(Ok(prepared)) => AttachResponse::prepared(prepared, spelling),
-                        Ok(Err(refusal)) => AttachResponse::err(refusal),
+                        Ok(Ok(Ok(prepared))) => AttachResponse::prepared(prepared, spelling),
+                        Ok(Ok(Err(refusal))) => AttachResponse::err(refusal),
+                        Ok(Err(expired)) => {
+                            match expired {
+                                crate::project_resolve::Expired::NoPermit => warn!(
+                                    "prepare-orchestration refused: no project permit freed up \
+                                     before its deadline"
+                                ),
+                                crate::project_resolve::Expired::Abandoned => warn!(
+                                    "prepare-orchestration refused: its work was still running at \
+                                     its deadline; it withdraws itself when it finishes"
+                                ),
+                            }
+                            AttachResponse::err(
+                                crate::project_resolve::preparation_expired_refusal(),
+                            )
+                        }
                         Err(e) => {
                             warn!(reason = %e, "prepare-orchestration could not complete");
                             AttachResponse::err(format!(
@@ -8996,6 +9195,22 @@ mod tests {
         );
     }
 
+    /// Issue #1233 item 4 — `prepare-deadline` is advertised exactly where the
+    /// prepare verb it qualifies is (Unix), and nowhere else.
+    #[test]
+    fn prepare_deadline_is_advertised_exactly_where_the_prepare_verb_is() {
+        assert_eq!(CAP_PREPARE_DEADLINE, "prepare-deadline");
+        assert_eq!(
+            DAEMON_CAPABILITIES.contains(&CAP_PREPARE_DEADLINE),
+            DAEMON_CAPABILITIES.contains(&CAP_PREPARE_ORCHESTRATION),
+            "the behaviour is advertised exactly where its verb is"
+        );
+        assert_eq!(
+            DAEMON_CAPABILITIES.contains(&CAP_PREPARE_DEADLINE),
+            cfg!(unix)
+        );
+    }
+
     /// PRD #1223 M6 — `prepared-role-command` is advertised exactly where the
     /// verb it modifies is (Unix), and `use_configured_command` is OMITTED when
     /// false, so every prepared start that does not opt in keeps the exact wire
@@ -9175,14 +9390,18 @@ mod tests {
     /// Issue #1045: a preparation to put on the wire in the tests below.
     fn sample_prepared() -> crate::event::PreparedOrchestration {
         crate::event::PreparedOrchestration {
-            context_path: "/p/.dot-agent-deck/orchestrator-context.md".into(),
+            context_path:
+                "/p/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md".into(),
             path: "/p".into(),
             token: "prep-1".into(),
             roles: vec![crate::event::ProjectRole {
                 name: "orchestrator".into(),
                 start: true,
             }],
-            prompt: "Read .dot-agent-deck/orchestrator-context.md for your role.".into(),
+            prompt:
+                "Read .dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md \
+                     for your role."
+                    .into(),
         }
     }
 

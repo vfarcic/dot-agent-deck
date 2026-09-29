@@ -19,6 +19,7 @@ pub mod daemon_client;
 pub mod daemon_protocol;
 pub mod daemon_status;
 pub mod daemon_stop;
+pub mod deck_list;
 pub mod devin_hooks_manage;
 // PRD #1223 M1: the daemon's one-level, bounded directory listing that backs
 // the desktop's new-agent directory step.

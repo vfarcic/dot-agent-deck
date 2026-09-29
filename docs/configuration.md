@@ -5,6 +5,8 @@ title: Configuration
 
 # Configuration
 
+This page covers the configuration both clients share: the daemon's settings and your project's `.dot-agent-deck.toml`. The desktop app also has its own settings file, `desktop.toml`; see [Desktop app settings](#desktop-app-settings).
+
 ## Default Command
 
 ```bash
@@ -18,6 +20,8 @@ dot-agent-deck config get default_command
 `default_command` is the agent command pre-filled in the **New Agent** form's Command field and the value that seeds the **schedule-authoring** agent. Both the New Agent form and the Schedules **Add/Edit** flow use the same form — you type the command directly into the **Command** field (it accepts `claude`, `opencode`, `pi`, `codex`, `devin`, a path, or any command), pre-filled from `default_command`. If `default_command` is unset, the schedule-authoring agent falls back to `claude`.
 
 When `default_command` is **unset or empty**, the New Agent form's Command field is instead pre-filled with your **last command** — the most recent command you launched from the New Agent form, in any mode (schedule / issue-dispatch authoring included). This value is global, persists across deck restarts, and is only ever pre-filled into the editable field (never auto-run), so you can edit or clear it before you submit. On a fresh install — where you have never launched a command from the form — the field starts blank. An explicit `default_command` always takes precedence over this last-command fallback.
+
+The desktop app's **New agent** pre-fills its **Command** the same way, from the `default_command` or last command of the daemon you chose it for. A Command you empty starts the daemon's default shell for a plain agent, and `default_command` (falling back to `claude`) for the **schedule** and **dispatcher** chips.
 
 ## Default Directory
 
@@ -142,3 +146,7 @@ dot-agent-deck watch --interval 2 "kubectl get pods"
 ```
 
 The command clears the screen between executions and shows output as it is produced. Press `Ctrl+C` to stop.
+
+## Desktop app settings
+
+The desktop app keeps its own settings (appearance, zoom, voice, and the remote daemons you added) in `~/.config/dot-agent-deck/desktop.toml`, beside the TUI's files; `DOT_AGENT_DECK_DESKTOP_CONFIG` points it elsewhere. It shares no settings file with the TUI. See [Desktop app → Settings](desktop/settings.md#the-settings-file).
