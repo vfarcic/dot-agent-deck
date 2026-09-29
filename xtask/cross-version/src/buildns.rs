@@ -428,7 +428,12 @@ pub const LINK_POOL_NOTE: &str = "linker pool: the link gate (`scripts/link-gate
      links and nothing else. The build was **not** gated against other builds on the host, and \
      the machine-wide pool was never bound into it";
 
-fn base_shape(host: &Host, tc: &Toolchain, cwd: &Path, target: Option<&Path>) -> Shape {
+fn base_shape(
+    host: &Host,
+    tc: &Toolchain,
+    cwd: &Path,
+    target: Option<&Path>,
+) -> Result<Shape, String> {
     let mut tmpfs = vec![
         (PathBuf::from("/tmp"), TMP_BYTES),
         (PathBuf::from("/var/tmp"), SMALL_BYTES),
@@ -452,16 +457,28 @@ fn base_shape(host: &Host, tc: &Toolchain, cwd: &Path, target: Option<&Path>) ->
         }
     }
     // The toolchain is bound back read-only when any mask hides it — the home,
-    // an outside Cargo home, or a host-only dir such as `/var/lib/docker`.
-    if host
+    // an outside Cargo home, or a host-only dir such as `/var/lib/docker`. A
+    // toolchain that IS a mask's root is refused: binding it would replace
+    // that private mount with the host directory.
+    let masks: Vec<&PathBuf> = host
         .home
         .iter()
         .chain(tmpfs.iter().map(|(p, _)| p))
-        .any(|m| tc.sysroot.starts_with(m))
-    {
+        .collect();
+    if let Some(m) = masks.iter().find(|m| tc.sysroot == ***m) {
+        return Err(format!(
+            "refusing the build namespace: the toolchain's sysroot {} is the root of a path the \
+             namespace masks with a private tmpfs, and binding it back would replace that mask \
+             with the host directory ({} itself). Run from a shell whose `rustc` resolves to a \
+             toolchain beneath it, such as a rustup toolchain",
+            tc.sysroot.display(),
+            m.display()
+        ));
+    }
+    if masks.iter().any(|m| tc.sysroot.starts_with(m)) {
         ro.push(tc.sysroot.clone());
     }
-    Shape {
+    Ok(Shape {
         home: host.home.clone(),
         tmpfs,
         ro,
@@ -470,7 +487,7 @@ fn base_shape(host: &Host, tc: &Toolchain, cwd: &Path, target: Option<&Path>) ->
         nulled_sockets: Vec::new(),
         cwd: cwd.to_path_buf(),
         env: env_for(tc, host.home.as_deref(), target),
-    }
+    })
 }
 
 /// Cover every host socket the shape leaves visible.
@@ -547,7 +564,7 @@ pub fn build_plan(
             }
         }
     }
-    let mut shape = base_shape(host, tc, clone, Some(target));
+    let mut shape = base_shape(host, tc, clone, Some(target))?;
     shape.ro.push(clone.to_path_buf());
     shape.rw.push(target.to_path_buf());
     for sub in ["registry", "git"] {
@@ -571,17 +588,22 @@ pub fn build_plan(
 /// The namespace the build-time gate's `cargo metadata --no-deps` runs in: the
 /// merge-base's extracted tree read-only as the working directory, no target
 /// dir, and no registry — `--no-deps --offline` reads neither.
-pub fn metadata_plan(host: &Host, tc: &Toolchain, tree: &Path, sockets: Vec<PathBuf>) -> ProbePlan {
-    let mut shape = base_shape(host, tc, tree, None);
+pub fn metadata_plan(
+    host: &Host,
+    tc: &Toolchain,
+    tree: &Path,
+    sockets: Vec<PathBuf>,
+) -> Result<ProbePlan, String> {
+    let mut shape = base_shape(host, tc, tree, None)?;
     shape.ro.push(tree.to_path_buf());
     cover_sockets(&mut shape, &sockets);
-    probe_plan(
+    Ok(probe_plan(
         "the build-time gate's `cargo metadata`",
         host,
         shape,
         vec![tree.to_path_buf()],
         sockets,
-    )
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1458,6 +1480,27 @@ mod tests {
         assert!(!p.shape.ro.contains(&PathBuf::from("/opt/rust/stable")));
     }
 
+    #[test]
+    fn a_sysroot_that_is_a_mask_root_is_refused_rather_than_bound_over_it() {
+        for root in ["/tmp", "/run", "/var/lib/docker", "/usr/share", "/home/op"] {
+            let mut t = tc();
+            t.sysroot = root.into();
+            let e = build_plan(
+                &host(),
+                &t,
+                Path::new("/home/op/code/xver-src"),
+                Path::new("/home/op/code/xver-target"),
+                Path::new("/nonexistent-fetch-home"),
+                vec![],
+            )
+            .unwrap_err();
+            assert!(e.contains("replace that mask"), "{root}: {e}");
+            let e =
+                metadata_plan(&host(), &t, Path::new("/home/op/code/runs/x"), vec![]).unwrap_err();
+            assert!(e.contains("replace that mask"), "{root}: {e}");
+        }
+    }
+
     /// Container mounts as the build namespace sees them (issue #1413): the
     /// copied host `/run` (21) with a netns mount in it, an overlay in the
     /// copied root, the namespace's own masks over both, and the read-write
@@ -1723,7 +1766,8 @@ mod tests {
             &tc(),
             Path::new("/home/op/code/runs/.xver-merge-base-x"),
             vec![],
-        );
+        )
+        .expect("plan");
         assert!(p.shape.rw.is_empty());
         assert!(p.shape.ro_at.is_empty());
         assert!(

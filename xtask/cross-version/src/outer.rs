@@ -962,7 +962,7 @@ fn new_binary(
     let (cmp, changes) = {
         let notes = std::cell::RefCell::new(Vec::new());
         let metadata = |dir: &Path, args: &[String]| -> Result<Vec<u8>, String> {
-            let plan = buildns::metadata_plan(&host, &tc, dir, buildns::host_sockets()?);
+            let plan = buildns::metadata_plan(&host, &tc, dir, buildns::host_sockets()?)?;
             let mut cmd = vec![tc.cargo.display().to_string()];
             cmd.extend(args.iter().cloned());
             let run = buildns::run(&plan, &host.harness, &cmd)?;
