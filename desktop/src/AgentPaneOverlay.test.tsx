@@ -1,10 +1,11 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentTileProps } from "./components/AgentTile";
+import { OVERVIEW_CLOCK_TICK_MS } from "./components/AgentOverview";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, mapDesktopSnapshot, type DesktopSettingsDto } from "./lib/bridge";
-import type { DeckActionResult, DeckRuntimeState } from "./types";
+import type { AgentTarget, DeckActionResult, DeckRuntimeState } from "./types";
 
 /**
  * Two spies, because the property PRD #1105 M3 needs is about BUILDS and the
@@ -384,13 +385,51 @@ describe("agent details behind the experimental flag", () => {
   });
 
   /**
+   * Scenario: open a deck of three live agents and let four minutes pass. All
+   * three TIME readings count on ONE shared interval rather than one per tile,
+   * and leaving the deck stops it.
+   */
+  it("counts every tile's TIME on one shared clock that stops with the deck", () => {
+    vi.useFakeTimers();
+    const started = vi.spyOn(window, "setInterval");
+    const stopped = vi.spyOn(window, "clearInterval");
+    try {
+      vi.setSystemTime(new Date("2026-09-29T09:00:00.000Z").getTime());
+      const spawnedAtMs = Date.now() - 60_000;
+      const snapshot = mapDesktopSnapshot({
+        connection: { status: "connected", deckId: "deck-000000000000dec1", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
+        agents: ["7", "8", "9"].map((id) => ({ id, displayName: `Coder ${id}`, cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "working", toolCount: 0, spawnedAtMs, tab: { kind: "dashboard" as const } })),
+        protocolVersion: 8,
+        source: "daemon",
+      });
+      const { container, unmount } = render(<DeckShell runtime={runtime({ mode: "live", snapshot, fleet: [snapshot] })} />);
+      const times = () => Array.from(container.querySelectorAll(".agent-instruments > div:first-child strong"), (cell) => cell.textContent);
+      const tileTicks = () => started.mock.calls.filter(([, ms]) => ms === OVERVIEW_CLOCK_TICK_MS);
+
+      expect(times()).toEqual(["1m", "1m", "1m"]);
+      expect(tileTicks()).toHaveLength(1);
+
+      act(() => { vi.advanceTimersByTime(4 * 60_000); });
+      expect(times()).toEqual(["5m", "5m", "5m"]);
+      expect(tileTicks()).toHaveLength(1);
+
+      const interval = started.mock.results[started.mock.calls.indexOf(tileTicks()[0])]?.value;
+      unmount();
+      expect(stopped).toHaveBeenCalledWith(interval);
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
+  });
+
+  /**
    * Scenario: pick Planner's Diff tab on the deck, then render the same deck
    * with the agent details hidden. Planner shows its terminal with the
    * Terminal tab selected rather than a Diff panel no tab selects, and the
    * deck declares Planner's terminal as shown again.
    */
   it("falls back to the terminal for an agent whose stored tab is hidden", () => {
-    const setShownTerminals = vi.fn(async () => undefined);
+    const setShownTerminals = vi.fn(async (_targets: AgentTarget[]) => undefined);
     const { rerender } = render(<DeckShell runtime={runtime({ setShownTerminals })} />);
     const tile = () => screen.getByTestId("agent-tile-planner");
     fireEvent.click(within(tile()).getByRole("tab", { name: "Diff" }));

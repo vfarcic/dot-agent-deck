@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import {
   AlertTriangle,
   BookOpenText,
@@ -30,7 +30,7 @@ import type {
 import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } from "../lib/terminalInput";
 import { blockedReasonText } from "../lib/blockedReason";
 import { displayUptime } from "../lib/displayText";
-import { useOverviewClock } from "./AgentOverview";
+import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
 import { OutputReader } from "./OutputReader";
 import { TerminalViewport } from "./TerminalViewport";
 
@@ -53,6 +53,53 @@ const tabs: { id: PanelTab; label: string; icon: typeof SquareTerminal }[] = [
  */
 export function shownPanelTab(tab: PanelTab, showDetails: boolean): PanelTab {
   return showDetails ? tab : "terminal";
+}
+
+/**
+ * Issue #1400 — ONE clock for every tile's TIME reading, however many tiles
+ * subscribe, rather than a `useOverviewClock` per tile: nine tiles would be nine
+ * intervals and nine visibility listeners ticking the same instant. Lifting a
+ * clock into the deck instead would repaint the whole deck on every tick; a
+ * subscription repaints only the tiles that read it. Same tick and the same
+ * visibility rule as the overview's clock — paused while the document is
+ * hidden, re-read the moment it is visible again.
+ */
+const tileClock = (() => {
+  let now = Date.now();
+  let timer: number | undefined;
+  const listeners = new Set<() => void>();
+  const read = () => { now = Date.now(); listeners.forEach((listener) => listener()); };
+  const start = () => { if (timer === undefined) timer = window.setInterval(read, OVERVIEW_CLOCK_TICK_MS); };
+  const stop = () => { if (timer !== undefined) { window.clearInterval(timer); timer = undefined; } };
+  const onVisibilityChange = () => {
+    if (document.visibilityState === "hidden") { stop(); return; }
+    read();
+    start();
+  };
+  return {
+    subscribe(listener: () => void) {
+      if (listeners.size === 0) {
+        now = Date.now();
+        if (document.visibilityState !== "hidden") start();
+        document.addEventListener("visibilitychange", onVisibilityChange);
+      }
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+        if (listeners.size > 0) return;
+        stop();
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      };
+    },
+    now: () => now,
+  };
+})();
+
+const noSubscription = () => () => undefined;
+
+/** The shared tile clock, subscribed only while `ticking` — a tile with no uptime to count does not repaint on the tick. */
+function useTileClock(ticking: boolean): number {
+  return useSyncExternalStore(ticking ? tileClock.subscribe : noSubscription, tileClock.now);
 }
 
 export interface AgentTileProps {
@@ -275,11 +322,12 @@ export function AgentTile({
      wording cannot disagree about the same record. */
   const held = recordFreshness === "held";
   /* Issue #1400 — TIME is the agent's uptime since the daemon spawned it, on
-     the overview's clock so it keeps counting between daemon events. A held
+     the shared tile clock so it keeps counting between daemon events. A held
      record's process may be gone, so it claims no running span; nor does a
      record with no spawn instant, which keeps `duration`'s own reading. */
-  const now = useOverviewClock();
-  const uptime = held ? undefined : displayUptime(agent.spawnedAtMs, now);
+  const counting = !held && agent.spawnedAtMs !== undefined;
+  const now = useTileClock(counting);
+  const uptime = counting ? displayUptime(agent.spawnedAtMs, now) : undefined;
   /**
    * The Reader is suppressed at overlay presentation (M1 difference 4, above)
    * AND whenever any pane is open over this screen (see `panePresent`). The
