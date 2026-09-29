@@ -1,0 +1,11 @@
+[[orchestrations]]
+name = "demo-loop"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "sh -c 'printf \"Planning the checkout retry flow\\n\"; exec sleep 600'"
+start = true
+
+[[orchestrations.roles]]
+name = "builder"
+command = "sh -c 'printf \"Ready to implement the checkout plan\\n\"; exec sleep 600'"

@@ -88,6 +88,18 @@ fn received(deck: &TuiDeck, role: &str) -> String {
     std::fs::read_to_string(deck.workdir().join(format!("{role}.in"))).unwrap_or_default()
 }
 
+/// The first complete `orchestrator-context-<32 hex>.md` name in `text` — the
+/// per-tab context file a delivered pointer names (issue #1233).
+fn context_file_named(text: &str) -> Option<String> {
+    const PREFIX: &str = "orchestrator-context-";
+    text.match_indices(PREFIX).find_map(|(at, _)| {
+        let rest = &text[at + PREFIX.len()..];
+        let hex = rest.get(..32)?;
+        (hex.bytes().all(|b| b.is_ascii_hexdigit()) && rest[32..].starts_with(".md"))
+            .then(|| format!("{PREFIX}{hex}.md"))
+    })
+}
+
 /// Run the real `delegate` CLI as `from`'s pane. The test process is not that
 /// pane, hence `impersonating_pane_signals` on the deck.
 fn delegate_from(deck: &TuiDeck, from: &str, to: &str, task: &str) -> Output {
@@ -197,11 +209,16 @@ fn tabs_orchestration_001_ctrl_n_tab_seats_one_orchestrator() {
 
         // Orchestrator prompt: the pointer to the context file lands in the
         // orchestrator's pane. A `cat` stand-in never reports SessionStart, so
-        // this waits out the delivery fallback.
-        let pointer = "orchestrator-context.md";
+        // this waits out the delivery fallback. Each tab's context is its own
+        // `orchestrator-context-<32 hex>.md` (issue #1233), so the prefix is
+        // what is waited for and the file read is the one the pointer names.
+        let pointer = "orchestrator-context-";
         assert!(
-            common::wait_until(Duration::from_secs(45), || received(&deck, "orchestrator")
-                .contains(pointer)),
+            common::wait_until(Duration::from_secs(45), || context_file_named(&received(
+                &deck,
+                "orchestrator"
+            ))
+            .is_some()),
             "[{case}] the orchestrator prompt should be delivered into `orchestrator`'s pane.\n\
              orchestrator received:\n{}\ncoder received:\n{}",
             received(&deck, "orchestrator"),
@@ -214,12 +231,10 @@ fn tabs_orchestration_001_ctrl_n_tab_seats_one_orchestrator() {
         );
         // What the pointer points at: the orchestrator's own template, and
         // `coder` — not the orchestrator itself — offered as the team.
-        let context = std::fs::read_to_string(
-            deck.workdir()
-                .join(".dot-agent-deck")
-                .join("orchestrator-context.md"),
-        )
-        .expect("orchestrator context file");
+        let named = context_file_named(&received(&deck, "orchestrator"))
+            .expect("the pointer names a context file");
+        let context = std::fs::read_to_string(deck.workdir().join(".dot-agent-deck").join(&named))
+            .unwrap_or_else(|e| panic!("[{case}] read the pointed-at {named}: {e}"));
         assert!(
             context.contains("SEAT-TEMPLATE-SENTINEL"),
             "[{case}] the context should open with the orchestrator's prompt_template:\n{context}"

@@ -139,6 +139,38 @@ fn wire_path(path: &Path) -> String {
         .to_string()
 }
 
+fn unique_context_path(project: &Path, reported: &str) -> PathBuf {
+    let path = PathBuf::from(reported);
+    assert_eq!(
+        path.parent(),
+        Some(project.join(".dot-agent-deck").as_path())
+    );
+    let name = path.file_name().unwrap().to_str().unwrap();
+    let id = name
+        .strip_prefix("orchestrator-context-")
+        .and_then(|name| name.strip_suffix(".md"))
+        .unwrap_or_else(|| panic!("expected a unique context file, got {name}"));
+    assert_eq!(id.len(), 32, "context id must be 32 hex digits");
+    assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    path
+}
+
+fn published_context_files(project: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(project.join(".dot-agent-deck"))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("orchestrator-context"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Send a JSON request through the attach protocol without constructing an
 /// `AttachRequest`. `project/launch/005` must compile before its additive
 /// `use_configured_command` field exists in the typed request enum, so that one
@@ -493,7 +525,7 @@ fn project_resolve_002_the_enumeration_is_the_daemons_cwd_and_not_the_clients() 
 
 /// Scenario: Start a headless daemon and ask it to prepare a workflow against a
 /// real project, then check both halves of the answer — the coordinator context
-/// is published at `<project>/.dot-agent-deck/orchestrator-context.md` carrying
+/// is published at a unique context path under `<project>/.dot-agent-deck` carrying
 /// the configured prompt template, the worker's description, the task and the
 /// `## Task precedence` statement but NOT the unattended notice (this verb's
 /// caller is the desktop's launch panel, where the person who typed the task is
@@ -544,14 +576,7 @@ fn project_launch_001_publishes_the_context_and_a_failed_preparation_starts_no_r
         .workflow_prepared
         .expect("a successful PrepareWorkflow must carry a PreparedOrchestration");
 
-    let expected_context = project
-        .join(".dot-agent-deck")
-        .join("orchestrator-context.md");
-    assert_eq!(
-        Path::new(&prepared.context_path),
-        expected_context,
-        "the reply must name the file the agent will actually read"
-    );
+    let expected_context = unique_context_path(&project, &prepared.context_path);
     assert!(
         expected_context.is_file(),
         "the coordinator context must already exist at {} when PrepareWorkflow reports success — \
@@ -614,9 +639,6 @@ fn project_launch_001_publishes_the_context_and_a_failed_preparation_starts_no_r
     );
 
     // --- the preparation that must fail: nothing published, nothing started.
-    let doomed_context = doomed
-        .join(".dot-agent-deck")
-        .join("orchestrator-context.md");
     let resp = daemon
         .send_attach_request(&AttachRequest::PrepareWorkflow {
             path: wire_path(&doomed),
@@ -640,9 +662,9 @@ fn project_launch_001_publishes_the_context_and_a_failed_preparation_starts_no_r
          not from the verb having no implementation behind it: {error:?}"
     );
     assert!(
-        !doomed_context.exists(),
-        "a failed preparation must publish nothing, but {} was written",
-        doomed_context.display()
+        published_context_files(&doomed).is_empty(),
+        "a failed preparation must publish nothing under {}",
+        doomed.display()
     );
     let records = daemon.agent_records();
     let started: Vec<Option<String>> = records.iter().map(|r| r.display_name.clone()).collect();
@@ -739,16 +761,7 @@ fn project_launch_002_the_canonical_path_resolve_returns_is_the_string_the_launc
         .workflow_prepared
         .expect("a successful PrepareWorkflow must carry a PreparedOrchestration");
 
-    let expected_context = project
-        .join(".dot-agent-deck")
-        .join("orchestrator-context.md");
-    assert_eq!(
-        Path::new(&prepared.context_path),
-        expected_context,
-        "the launch must publish under the canonical project directory the resolve named — a \
-         context reported through the {} spelling is how the listing and the spawn drift apart",
-        alias.display()
-    );
+    let expected_context = unique_context_path(&project, &prepared.context_path);
     assert!(
         expected_context.is_file(),
         "the coordinator context must exist at {}",
@@ -1197,5 +1210,166 @@ fn project_launch_005_prepared_roles_use_their_daemon_configured_commands() {
          configured role records: {role_observations:?}\n\
          explicit-command conflict response: {conflict_response}; started nothing: \
          {conflict_started_nothing}"
+    );
+}
+
+/// Scenario: Start both roles of launch A through the daemon, then prepare B in
+/// the same project. The file named by A's coordinator prompt still holds A's task.
+#[spec("project/launch/006")]
+#[test]
+fn project_launch_006_a_later_prepare_does_not_replace_a_started_launchs_context() {
+    let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
+    let workspace = common::harness_tempdir().expect("mint the project sandbox");
+    let project = canonical(&make_dir(
+        workspace.path(),
+        "interleaved-project",
+        Some(NAMED_PROJECT_TOML),
+    ));
+    let project_wire = wire_path(&project);
+    let prepare = |task: &str| {
+        let reply = daemon
+            .send_attach_request(&AttachRequest::PrepareWorkflow {
+                path: project_wire.clone(),
+                orchestration: "loop".into(),
+                task: task.into(),
+                config_revision: None,
+            })
+            .expect("PrepareWorkflow over the attach socket");
+        assert!(reply.ok, "preparation for {task} failed: {:?}", reply.error);
+        reply
+            .workflow_prepared
+            .expect("successful preparation carries a binding")
+    };
+    let a = prepare("ALPHA");
+    for (role_index, role) in a.roles.iter().enumerate() {
+        let reply = daemon
+            .send_attach_request(&AttachRequest::StartPreparedAgent {
+                prep_token: a.token.clone(),
+                command: Some("cat".into()),
+                cwd: Some(project_wire.clone()),
+                rows: 24,
+                cols: 80,
+                env: vec![(
+                    "DOT_AGENT_DECK_PANE_ID".into(),
+                    format!("launch-006-{role_index}"),
+                )],
+                display_name: Some(role.name.clone()),
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: "loop".into(),
+                    role_index,
+                    role_name: role.name.clone(),
+                    is_start_role: role.start,
+                    orchestration_cwd: Some(project_wire.clone()),
+                    display_title: Some("Launch A".into()),
+                    orchestration_id: Some("project-launch-006-a".into()),
+                }),
+                agent_type: None,
+                seed: None,
+                use_configured_command: false,
+            })
+            .expect("StartPreparedAgent over the attach socket");
+        assert!(
+            reply.ok,
+            "A's role {:?} failed to start: {:?}",
+            role.name, reply.error
+        );
+    }
+    let b = prepare("BRAVO");
+    let pointer = a
+        .prompt
+        .split_whitespace()
+        .nth(1)
+        .expect("A's prompt names a file");
+    let a_path = project.join(pointer);
+    let content = std::fs::read_to_string(&a_path).expect("read A's prompted context");
+    assert!(
+        content.contains("ALPHA"),
+        "A's context lost its task at {}",
+        a_path.display()
+    );
+    assert!(
+        !content.contains("BRAVO"),
+        "B replaced A's context at {}",
+        a_path.display()
+    );
+    let reported_a = unique_context_path(&project, &a.context_path);
+    let b_path = unique_context_path(&project, &b.context_path);
+    assert_eq!(
+        a_path, reported_a,
+        "A's prompt must name its own published file"
+    );
+    assert_ne!(a_path, b_path, "each preparation needs its own file");
+}
+
+/// Scenario: Resolve a single `loop`, add another role-bearing `loop`, then
+/// prepare without a revision. The daemon refuses ambiguity before publication;
+/// a caller supplying the old revision still receives the stale-revision error.
+#[spec("project/launch/007")]
+#[test]
+fn project_launch_007_duplicate_name_is_refused_without_revision_or_publication() {
+    let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
+    let workspace = common::harness_tempdir().expect("mint the project sandbox");
+    let project = canonical(&make_dir(
+        workspace.path(),
+        "ambiguous-project",
+        Some(NAMED_PROJECT_TOML),
+    ));
+    let resolved = daemon
+        .send_attach_request(&AttachRequest::ResolveProject {
+            path: wire_path(&project),
+        })
+        .expect("ResolveProject over the attach socket");
+    assert!(
+        resolved.ok,
+        "initial project resolve failed: {:?}",
+        resolved.error
+    );
+    let revision = resolved
+        .project
+        .expect("resolved project")
+        .config_revision
+        .expect("config revision");
+    std::fs::write(
+        project.join(".dot-agent-deck.toml"),
+        format!("{NAMED_PROJECT_TOML}\n{NAMED_PROJECT_TOML}"),
+    )
+    .expect("append a second role-bearing loop");
+    let prepare = |config_revision| {
+        daemon
+            .send_attach_request(&AttachRequest::PrepareWorkflow {
+                path: wire_path(&project),
+                orchestration: "loop".into(),
+                task: "must not publish".into(),
+                config_revision,
+            })
+            .expect("PrepareWorkflow over the attach socket")
+    };
+    let ambiguous = prepare(None);
+    assert!(
+        !ambiguous.ok && ambiguous.workflow_prepared.is_none(),
+        "ambiguous preparation must return no binding: {ambiguous:?}"
+    );
+    let error = ambiguous.error.unwrap_or_default();
+    assert!(
+        error.starts_with("ambiguous-orchestration"),
+        "expected ambiguous-orchestration, got {error:?}"
+    );
+    assert!(
+        published_context_files(&project).is_empty(),
+        "ambiguous preparation published a context"
+    );
+    let stale = prepare(Some(revision));
+    assert!(
+        !stale.ok && stale.workflow_prepared.is_none(),
+        "stale revision must return no binding: {stale:?}"
+    );
+    let error = stale.error.unwrap_or_default();
+    assert!(
+        error.starts_with("stale-revision"),
+        "stale revision must take precedence, got {error:?}"
+    );
+    assert!(
+        published_context_files(&project).is_empty(),
+        "refused preparations published a context"
     );
 }

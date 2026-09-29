@@ -7,6 +7,8 @@ title: Workspace Modes
 
 Modes are config-driven workspaces that pair an AI agent with live command output in side panes. Each mode activation creates a new tab — a self-contained workspace with the agent pane on the left (50%) and side panes stacked on the right (50%). Modes are defined per-project in a `.dot-agent-deck.toml` file at the project root.
 
+Modes are a TUI feature. The desktop app cannot start a mode: its **New agent** offers no chips for `[[modes]]`. It does show the agents of a mode tab started from the TUI, as one **MODE TAB** group on its [Dashboard](desktop/dashboard.md).
+
 Besides the modes you define here, the **Mode** field also offers built-in options: `schedule` for authoring a [schedule](scheduled-tasks.md), and `dispatcher` for starting work in an isolated copy of the repo — see [Dispatcher Mode](dispatcher-mode.md).
 
 ![A mode tab in action — agent pane on the left, with live Git status, kubectl pods, and kubectl events stacked on the right](/img/modes.png)

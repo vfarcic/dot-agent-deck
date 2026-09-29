@@ -621,10 +621,19 @@ fn start_orchestration_from_desktop(daemon: &DaemonProc, project_path: &str) {
         ORCHESTRATION_ROLES.len(),
         "the fixture must prepare the same three roles as the TUI control"
     );
+    let context_path = Path::new(&prepared.context_path);
     assert_eq!(
-        Path::new(&prepared.context_path),
-        Path::new(project_path).join(".dot-agent-deck/orchestrator-context.md"),
+        context_path.parent(),
+        Some(Path::new(project_path).join(".dot-agent-deck").as_path()),
         "the daemon publishes the coordinator context inside the project the roles start in"
+    );
+    assert!(
+        context_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("orchestrator-context-"),
+        "the prepared context must have a per-preparation filename"
     );
 
     for (role_index, role) in prepared.roles.iter().enumerate() {
