@@ -343,6 +343,43 @@ On Windows the default is `dot-agent-deck.log` in the system temp directory — 
 
 The log file captures session events, hook activity, session restoration, and any errors logged by the daemon. Attach the relevant excerpt when filing an issue. See [Configuration › Environment Variables](configuration.md#environment-variables) for the full list of variables.
 
+**The daemon reads the variable only when it starts.** When you launch the TUI and no daemon is running, the daemon it starts gets `DOT_AGENT_DECK_LOG` from your command, and the TUI and the daemon both write to the same file. When a daemon is already running, only the TUI's own lines appear, because that daemon was started without the variable. Restart the daemon so the next launch starts a new one with logging on:
+
+```bash
+dot-agent-deck daemon restart
+DOT_AGENT_DECK_LOG=1 dot-agent-deck
+```
+
+`daemon restart` refuses while agents are running; see [Recycling the local daemon](installation.md#recycling-the-local-daemon).
+
+You may also find a `daemon.log` in `~/.local/state/dot-agent-deck/` (on Windows, `%LOCALAPPDATA%\dot-agent-deck`). It is not the debug log: it holds only what a daemon running in the background prints when something fails badly, such as a crash, and it stays empty otherwise. Attach it as well if it has anything in it.
+
+### With the desktop app
+
+The desktop app writes no log file of its own. The log to collect is the **daemon's**, and the daemon has to be started with `DOT_AGENT_DECK_LOG` set. Restarting only the app does not turn the log on, because the app does not restart the daemon. The desktop app is built for macOS (Apple Silicon) and Linux (amd64). There is no Windows build.
+
+The app connects to a daemon you started (see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)), so start that daemon with logging on:
+
+1. If a daemon is already running, stop it. `dot-agent-deck daemon stop` refuses while agents are running, so finish or close them first.
+2. Start a daemon with the variable set, in a terminal:
+
+   ```bash
+   DOT_AGENT_DECK_LOG=1 dot-agent-deck daemon serve
+   ```
+
+   On macOS with no CLI installed, use the app's own copy:
+
+   ```bash
+   DOT_AGENT_DECK_LOG=1 "/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck" daemon serve
+   ```
+
+   Starting the TUI instead works too: `DOT_AGENT_DECK_LOG=1 dot-agent-deck`.
+3. Press **Reconnect** in the app.
+
+The log lands at `/tmp/dot-agent-deck.log` on both macOS and Linux, or at the path you gave the variable. For a [remote daemon](desktop/daemons.md), start it on its host the same way, and the log is on that host. `RUST_LOG` (below) goes on the same command. For example, `RUST_LOG=dot_agent_deck=debug DOT_AGENT_DECK_LOG=1 dot-agent-deck daemon serve`.
+
+With the `experimental` flag on, the app can start a daemon itself, using **Start daemon** or **Replace daemon**. That daemon gets the variables only when the app itself was launched with them. On Linux, that means starting the app from a terminal, for example `DOT_AGENT_DECK_LOG=1 dot-agent-deck-desktop`. An app opened from the macOS Dock or Finder, or from a Linux application menu, does not get variables exported in your shell profile, so a daemon it starts has no log. In that case, start the daemon yourself as above.
+
 ### Turning the verbosity up
 
 The log is written at `info` for the deck itself and `error` for its dependencies. `RUST_LOG` overrides that, using the standard [`tracing` filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html):

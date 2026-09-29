@@ -12,6 +12,8 @@ The desktop app is an **alpha**. Its downloads are labelled `desktop-alpha` and 
 
 The desktop app connects to a daemon; it does not start one. If no daemon is running on this machine, the Dashboard shows **Daemon disconnected** and a **Reconnect** button. Start a daemon with the TUI (`dot-agent-deck`) or with `dot-agent-deck daemon serve`, then press **Reconnect**. [Installation → How the desktop app gets a daemon](../installation.md#how-the-desktop-app-gets-a-daemon) has the details, including how long a daemon with no clients and no agents stays up.
 
+To collect a log for a bug report, start that daemon with logging turned on. The app itself writes no log. See [Troubleshooting → With the desktop app](../troubleshooting.md#with-the-desktop-app).
+
 ## What the app shows
 
 The navigation rail on the left has two entries:
