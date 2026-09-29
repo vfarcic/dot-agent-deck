@@ -46,14 +46,14 @@ The loop also ends on an `ack` for the current id, a `work-done` from the pane, 
 
 ## The `ack` command
 
-`dot-agent-deck ack <id>` sends an `AckSignal` over the hook socket, carrying the pane capability token like every other `DaemonMessage` verb ([hook provenance](hook-provenance.md)). The daemon answers at the gate with a `SignalAck`, and `handle_delivery_ack` resolves one of four outcomes (`AckOutcome`):
+`dot-agent-deck ack <id>` sends an `AckSignal` over the hook socket, carrying the pane capability token like every other `DaemonMessage` verb ([hook provenance](hook-provenance.md)). The daemon answers at the gate with a `SignalAck`, and `handle_delivery_ack` resolves one of four outcomes (`AckOutcome`). It matches the sender against the pending delivery's worker by the agent id the provenance gate resolved from the token, not by the `agent_id` the payload carries, so an older worker generation still holding a valid token for the same pane is told apart from the current one. The payload's `agent_id` (`DOT_AGENT_DECK_AGENT_ID`, which the daemon injects into every agent it spawns) counts only for an ack the gate admitted without attesting it, and an ack with neither identity never stops a retry:
 
 | outcome | meaning | CLI output |
 |---|---|---|
 | `Stopped` | the pane's pending delivery; the retry stops and the silent-worker watch armed for the same delivery is cancelled | "Acknowledged" |
 | `AlreadyAcknowledged` | the pane's last acknowledged delivery, acknowledged again; a no-op | "Acknowledged" |
 | `NotPending` | the pane's current delivery with no retry pending — the loop already ended (usually because a turn began, which a real agent reports before the `ack` it runs as a tool) or was never armed (retry off, agent type not retried, a Pi seed delivery) | "Acknowledged" |
-| `Unknown` | not the pane's current delivery — mistyped, an earlier delegation's, or one presented by another agent on the pane while its retry is pending; the retry keeps running. A malformed id is refused by the CLI before it sends anything, and by the daemon if one arrives anyway (logged only as a length) | "no delivery under that id for this pane … it may send the task pointer again", on stderr |
+| `Unknown` | not the pane's current delivery — mistyped, an earlier delegation's, or one presented by another agent on the pane, or by a sender with no identity, while its retry is pending; the retry keeps running. A malformed id is refused by the CLI before it sends anything, and by the daemon if one arrives anyway (logged only as a length) | "no delivery under that id for this pane … it may send the task pointer again", on stderr |
 
 The CLI **exits 0 in every case** (`ack_report` in `src/main.rs`). Anything that is not a matched reply — a malformed id, no managed pane, an unreachable deck, no answer, a refusal, a reply this build does not understand — prints "Could not confirm receipt with the deck (…); this is harmless — carry on with your task." on stderr. A worker told to acknowledge first must never be derailed from its task by a failed acknowledgement. An ack is a claim that the worker read its task file, not a receipt for the work.
 
@@ -78,7 +78,7 @@ The loop skips a re-send entirely if someone has typed into the pane since the d
 
 - Default `20000,40000,80000` (`DEFAULT_RETRY_SCHEDULE_MS`): re-sends at 20 s, 60 s and 140 s, exhausted at 220 s.
 - Each entry is clamped to `MIN_RETRY_WAIT`..`MAX_RETRY_WAIT` (100 ms to 5 minutes); at most `MAX_RETRY_ENTRIES` (8) are read, so a pasted list cannot turn one delegation into an unbounded stream; a list that does not parse falls back to the default; `0`, empty or whitespace turns the re-send off and restores the single write.
-- A genuine `SessionStart` after the write, or a busy dispatch lock, can stretch any wait. The went-quiet report therefore waits for the loop's real end rather than for the nominal span, is suppressed if the loop ended on proof or on a lagged or closed event stream (`silence_retry_end_proves_delivery`), and otherwise quotes how many re-sends there were ("The deck re-sent the task pointer into the same process N times and none of them produced an event."). With that report switched off (`DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS=0`), the loop logs exhaustion itself.
+- A genuine `SessionStart` after the write, or a busy dispatch lock, can stretch any wait. The went-quiet report therefore waits for the loop's real end rather than for the nominal span, is suppressed if the loop ended on proof or on a lagged or closed event stream (`silence_retry_end_proves_delivery`), and otherwise says what the re-sends did ("The deck tried N more times to get the task into the same process (pressed Enter E times, typed the pointer again K times) and none of them produced an event."). An attempt is counted once it writes its probe; E counts every bare Enter, the probe's and any second Enter, and K every retype (`RedeliveryCounts`). With that report switched off (`DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS=0`), the loop logs exhaustion itself.
 
 ## Which workers are retried, and which are retyped
 

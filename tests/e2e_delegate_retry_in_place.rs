@@ -468,7 +468,7 @@ fn delegate_042_exhaustion_reports_three_retries_without_respawn() {
     let text = orchestrator_text(&deck);
     assert!(
         text.contains(&common::squeeze_wrapped_text(
-            "re-sent the task pointer into the same process 3 times"
+            "tried 3 more times to get the task into the same process"
         )),
         "silence notice omitted the three in-place retries; pane={text:?}; grid:\n{}",
         deck.snapshot_grid()

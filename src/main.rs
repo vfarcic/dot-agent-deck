@@ -707,6 +707,12 @@ fn parse_delegate_reply(line: &str) -> Option<dot_agent_deck::event::DelegateRes
 /// `accepted: false` — a refusal invented out of a line that is not an ack.
 /// Filtering on the marker is what keeps an unrecognised daemon reported as
 /// success rather than as a failure the sender did not have.
+fn parse_signal_ack(line: &str) -> Option<dot_agent_deck::event::SignalAck> {
+    serde_json::from_str::<dot_agent_deck::event::SignalAck>(line)
+        .ok()
+        .filter(|a| a.is_signal_ack())
+}
+
 /// Issue #1383: what `ack` got back, including the two cases it decides without
 /// asking the daemon.
 enum AckReply {
@@ -783,12 +789,6 @@ fn ack_report(reply: &AckReply) -> (AckStream, String) {
             None => not_confirmed("the deck's reply was not one this build understands"),
         },
     }
-}
-
-fn parse_signal_ack(line: &str) -> Option<dot_agent_deck::event::SignalAck> {
-    serde_json::from_str::<dot_agent_deck::event::SignalAck>(line)
-        .ok()
-        .filter(|a| a.is_signal_ack())
 }
 
 /// Send one fire-and-forget hook-socket signal — `work-done` or `dispatch` —

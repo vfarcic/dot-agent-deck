@@ -4395,16 +4395,18 @@ fn delegate_no_event_window(
 /// `npm run` launcher, and the learned badge is set from an incoming hook event,
 /// which is precisely what is missing.
 ///
-/// Issue #1383: `redeliveries` is how many times the in-place retry re-sent the
-/// pointer for this delivery. When that is non-zero the report says so,
-/// because "the pointer may never have reached it" reads differently once the
-/// deck has already tried again in the same process — the next step is the
-/// orchestrator's, not another wait. Only the wording changes; delivery, the
-/// identity gate and the fenced pane capture are the silence report's own.
+/// Issue #1383: `redeliveries` is what the in-place retry wrote for this
+/// delivery. When it tried at all the report says so, because "the pointer may
+/// never have reached it" reads differently once the deck has already tried
+/// again in the same process — the next step is the orchestrator's, not another
+/// wait. It says what each attempt did (Qodo, PR #1414): most press Enter on
+/// what is already there rather than send the pointer again. Only the wording
+/// changes; delivery, the identity gate and the fenced pane capture are the
+/// silence report's own.
 fn compose_delegate_silence_notice(
     window: std::time::Duration,
     pane_text: Option<&str>,
-    redeliveries: u32,
+    redeliveries: crate::delegate_retry::RedeliveryTally,
 ) -> String {
     let window = if window < std::time::Duration::from_secs(1) {
         format!("{} ms", window.as_millis())
@@ -4425,11 +4427,17 @@ fn compose_delegate_silence_notice(
     };
     // One spelling for every count, "1 times" included: the sentence is the
     // documented, greppable form of this report.
-    let retried = match redeliveries {
+    let crate::delegate_retry::RedeliveryTally {
+        attempts,
+        enters,
+        retypes,
+    } = redeliveries;
+    let retried = match attempts {
         0 => String::new(),
         n => format!(
-            " The deck re-sent the task pointer into the same process {n} times and none of them \
-             produced an event."
+            " The deck tried {n} more times to get the task into the same process (pressed Enter \
+             {enters} times, typed the pointer again {retypes} times) and none of them produced \
+             an event."
         ),
     };
     compose_delegate_prompt(&format!(
@@ -4862,10 +4870,10 @@ struct SilenceWatch {
     window: std::time::Duration,
     /// The only place the report is allowed to be written.
     target: SilenceReportTarget,
-    /// Issue #1383: the in-place retry's count of re-deliveries, set by the
-    /// dispatch when one is armed for this delivery, so the report can say how
-    /// many there were. `None` when no retry runs.
-    redeliveries: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// Issue #1383: the in-place retry's counts, set by the dispatch when one
+    /// is armed for this delivery, so the report can say what it tried. `None`
+    /// when no retry runs.
+    redeliveries: Option<Arc<crate::delegate_retry::RedeliveryCounts>>,
     /// Issue #1383: resolves when the in-place retry for this delivery ends.
     /// Once the window has passed in silence the report waits for it, so it is
     /// never written while a re-delivery is still pending and the count it
@@ -5070,7 +5078,9 @@ fn arm_delegate_silence_watch(
         let notice = compose_delegate_silence_notice(
             window,
             pane_text.as_deref(),
-            redeliveries.map_or(0, |count| count.load(std::sync::atomic::Ordering::SeqCst)),
+            redeliveries
+                .map(|counts| counts.tally())
+                .unwrap_or_default(),
         );
         let revalidate_registry = Arc::clone(&registry);
         let revalidate_pane = orchestrator_pane_id.clone();
@@ -8984,7 +8994,7 @@ async fn dispatch_one_owned(
     // Only over an `Applied` first write, the same line #1031 draws: an
     // `Ambiguous` write may have left a PREFIX of the pointer in the composer, and
     // a retype would submit that prefix and the pointer as one turn.
-    let redeliveries = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let redeliveries = Arc::new(crate::delegate_retry::RedeliveryCounts::default());
     let mut retry_done = None;
     if let Some((armed_retry, retry_rx)) = pending_retry {
         let retry_seq = armed_retry.seq;
@@ -17702,8 +17712,11 @@ mod tests {
     /// frame it as bracketed paste (#187).
     #[test]
     fn compose_delegate_silence_notice_carries_no_untrusted_interpolation() {
-        let notice =
-            compose_delegate_silence_notice(std::time::Duration::from_millis(600), None, 0);
+        let notice = compose_delegate_silence_notice(
+            std::time::Duration::from_millis(600),
+            None,
+            Default::default(),
+        );
 
         assert!(
             !notice.contains('\n'),
@@ -17719,8 +17732,12 @@ mod tests {
         );
         // A sub-second window reads in milliseconds; a longer one in human units.
         assert!(
-            compose_delegate_silence_notice(std::time::Duration::from_secs(30), None, 0)
-                .contains("within 30 seconds"),
+            compose_delegate_silence_notice(
+                std::time::Duration::from_secs(30),
+                None,
+                Default::default()
+            )
+            .contains("within 30 seconds"),
             "a whole-second window must not be rendered as milliseconds"
         );
     }
@@ -17734,13 +17751,22 @@ mod tests {
     #[test]
     fn compose_delegate_silence_notice_states_the_redelivery_count() {
         let window = std::time::Duration::from_secs(30);
-        let plain = compose_delegate_silence_notice(window, None, 0);
-        assert!(!plain.contains("re-sent"), "{plain}");
-        let retried = compose_delegate_silence_notice(window, None, 3);
+        let plain = compose_delegate_silence_notice(window, None, Default::default());
+        assert!(!plain.contains("more times"), "{plain}");
+        let retried = compose_delegate_silence_notice(
+            window,
+            None,
+            crate::delegate_retry::RedeliveryTally {
+                attempts: 3,
+                enters: 4,
+                retypes: 2,
+            },
+        );
         assert!(
             retried.contains(
-                "The deck re-sent the task pointer into the same process 3 times and none of \
-                 them produced an event."
+                "The deck tried 3 more times to get the task into the same process (pressed \
+                 Enter 4 times, typed the pointer again 2 times) and none of them produced an \
+                 event."
             ),
             "{retried}"
         );
@@ -17751,8 +17777,11 @@ mod tests {
     fn compose_delegate_silence_notice_reports_the_pane_instead_of_asserting_a_cause() {
         let fenced = quote_untrusted_pane_text(&["Ask the agent to do anything".to_string()])
             .expect("a non-empty pane line quotes");
-        let reported =
-            compose_delegate_silence_notice(std::time::Duration::from_secs(30), Some(&fenced), 0);
+        let reported = compose_delegate_silence_notice(
+            std::time::Duration::from_secs(30),
+            Some(&fenced),
+            Default::default(),
+        );
 
         assert!(
             !reported.contains('\n'),
@@ -17774,7 +17803,11 @@ mod tests {
             "with the pane's screen in hand the notice must stop asserting a cause: {reported:?}"
         );
 
-        let blank = compose_delegate_silence_notice(std::time::Duration::from_secs(30), None, 0);
+        let blank = compose_delegate_silence_notice(
+            std::time::Duration::from_secs(30),
+            None,
+            Default::default(),
+        );
         assert!(
             blank.contains("rendered nothing at all"),
             "a pane with no screen to report must say so: {blank:?}"
@@ -18183,6 +18216,7 @@ mod tests {
                 agent_id: Some(worker.clone()),
                 token: None,
             },
+            None,
         );
         assert!(!registry.pending_deliveries().is_pending(WORKER_PANE));
         drop(writer);
@@ -18217,7 +18251,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn delegate_silence_report_waits_for_a_postponed_retry_and_quotes_its_final_count() {
-        use std::sync::atomic::{AtomicU32, Ordering};
         const ORCH_PANE: &str = "postponed-retry-orch";
         const WORKER_PANE: &str = "postponed-retry-worker";
         const ID: &str = "d-1383cafe";
@@ -18273,7 +18306,7 @@ mod tests {
             POINTER,
             Some(crate::agent_pty::GuardedSend::Applied),
         );
-        let redeliveries = Arc::new(AtomicU32::new(0));
+        let redeliveries = Arc::new(crate::delegate_retry::RedeliveryCounts::default());
         let (done_tx, done_rx) = oneshot::channel();
         let retry = crate::delegate_retry::spawn(crate::delegate_retry::DeliveryRetry {
             registry: registry.clone(),
@@ -18327,7 +18360,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(450)).await;
         assert_eq!(
-            redeliveries.load(Ordering::SeqCst),
+            redeliveries.attempts(),
             0,
             "precondition: the SessionStart held the re-delivery"
         );
@@ -18344,8 +18377,8 @@ mod tests {
                 .expect("the retry loop does not panic"),
             crate::delegate_retry::RetryEnd::Exhausted
         );
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 1);
-        let counted = "re-sent the task pointer into the same process 1 times";
+        assert_eq!(redeliveries.attempts(), 1);
+        let counted = "tried 1 more times to get the task into the same process";
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !orch_screen().contains(counted) {
             assert!(
@@ -18550,8 +18583,11 @@ mod tests {
         const UNSETTLED_PANE: &str = "silence-report-unsettled-orchestrator";
 
         let registry = Arc::new(AgentPtyRegistry::new());
-        let report =
-            compose_delegate_silence_notice(std::time::Duration::from_millis(600), None, 0);
+        let report = compose_delegate_silence_notice(
+            std::time::Duration::from_millis(600),
+            None,
+            Default::default(),
+        );
 
         let spawn_orchestrator = |pane: &str| {
             registry
@@ -18702,8 +18738,11 @@ mod tests {
         const APPLIED_PANE: &str = "silence-report-applied-orchestrator";
 
         let registry = Arc::new(AgentPtyRegistry::new());
-        let report =
-            compose_delegate_silence_notice(std::time::Duration::from_millis(600), None, 0);
+        let report = compose_delegate_silence_notice(
+            std::time::Duration::from_millis(600),
+            None,
+            Default::default(),
+        );
         assert!(
             !is_exactly_drainable(&report),
             "the premise of this whole test: the production silence report carries a non-ASCII \

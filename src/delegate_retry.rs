@@ -680,10 +680,12 @@ impl PendingDeliveries {
 
     /// Acknowledge `delivery_id` on `pane_id`.
     ///
-    /// Matches only the pane's CURRENT delivery, and, when the caller presents
-    /// an agent id, only that delivery's worker — an older generation's ack
-    /// cannot stop a newer generation's loop. Idempotent. The outcome is what
-    /// the `ack` CLI reports to the worker; see [`AckOutcome::matched`].
+    /// Matches only the pane's CURRENT delivery, and only that delivery's
+    /// worker — an older generation's ack cannot stop a newer generation's
+    /// loop. `agent_id` is who sent the ack; `None` means the sender could not
+    /// be identified, and never matches a pending record (Qodo, #1414), so the
+    /// retry keeps running. Idempotent. The outcome is what the `ack` CLI
+    /// reports to the worker; see [`AckOutcome::matched`].
     pub fn acknowledge(
         &self,
         pane_id: &str,
@@ -693,7 +695,7 @@ impl PendingDeliveries {
         let mut inner = self.inner.lock().unwrap();
         let matches = inner.records.get(pane_id).is_some_and(|record| {
             record.delivery_id == delivery_id
-                && agent_id.is_none_or(|agent| agent == record.worker_agent_id)
+                && agent_id.is_some_and(|agent| agent == record.worker_agent_id)
         });
         if matches {
             let record = inner
@@ -707,8 +709,9 @@ impl PendingDeliveries {
                 silence_seq: record.silence_seq,
             };
         }
-        // Still pending under this id, but presented by another agent: the
-        // retry keeps running, so it must not read as recorded.
+        // Still pending under this id, but presented by another agent or by
+        // one that could not be identified: the retry keeps running, so it
+        // must not read as recorded.
         if inner.records.contains_key(pane_id) {
             return AckOutcome::Unknown;
         }
@@ -842,9 +845,9 @@ pub(crate) struct DeliveryRetry {
     /// The exact pointer the first write typed.
     pub pointer: String,
     pub orchestration: Option<OrchestrationIdentity>,
-    /// Re-deliveries that were written, shared with the silent-worker report so
-    /// it can say how many there were.
-    pub redeliveries: Arc<AtomicU32>,
+    /// What the re-deliveries wrote, shared with the silent-worker report so
+    /// it can say what was tried.
+    pub redeliveries: Arc<RedeliveryCounts>,
     /// Whether a silent-worker report will cover exhaustion. When it will not,
     /// the loop logs exhaustion itself.
     pub silence_report_armed: bool,
@@ -952,6 +955,43 @@ impl Watch {
     }
 }
 
+/// Issue #1383: what the in-place retry wrote for one delivery, counted where
+/// the bytes went out. An attempt is not a re-send of the pointer: each begins
+/// with a bare Enter, and only some go on to type the pointer again, so the
+/// silent-worker report quotes the two apart (Qodo, PR #1414).
+#[derive(Debug, Default)]
+pub struct RedeliveryCounts {
+    attempts: AtomicU32,
+    enters: AtomicU32,
+    retypes: AtomicU32,
+}
+
+/// One reading of [`RedeliveryCounts`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RedeliveryTally {
+    /// Re-delivery attempts that wrote anything.
+    pub attempts: u32,
+    /// Bare Enters written: each attempt's probe, and any second Enter.
+    pub enters: u32,
+    /// Times the pointer itself was typed again and submitted.
+    pub retypes: u32,
+}
+
+impl RedeliveryCounts {
+    /// Re-delivery attempts that wrote anything.
+    pub fn attempts(&self) -> u32 {
+        self.attempts.load(Ordering::SeqCst)
+    }
+
+    pub fn tally(&self) -> RedeliveryTally {
+        RedeliveryTally {
+            attempts: self.attempts(),
+            enters: self.enters.load(Ordering::SeqCst),
+            retypes: self.retypes.load(Ordering::SeqCst),
+        }
+    }
+}
+
 /// The loop body. See the module docs.
 pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
     let DeliveryRetry {
@@ -1013,6 +1053,7 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
         pointer: &pointer,
         orchestration: orchestration.as_ref(),
         total_attempts,
+        counts: &redeliveries,
     };
 
     let end = 'outer: {
@@ -1037,7 +1078,7 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
                 match redeliver(&redeliver_ctx, Phase::Probe, attempt, &mut pointer_epoch).await {
                     Attempt::Written(composer) => {
                         last_classification = Some(composer);
-                        redeliveries.fetch_add(1, Ordering::SeqCst);
+                        redeliveries.attempts.fetch_add(1, Ordering::SeqCst);
                         composer
                     }
                     // The probe never declines: it writes its Enter whatever the screen shows.
@@ -1118,7 +1159,7 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
             pane_id = %escape_id_for_log(&pane_id),
             role = %escape_id_for_log(&role),
             delivery_id = %delivery_id,
-            redeliveries = redeliveries.load(Ordering::SeqCst),
+            redeliveries = ?redeliveries.tally(),
             last_classification = ?last_classification,
             "delegate retry: every scheduled re-delivery went out and the worker produced no \
              event and no ack; the task may never have reached it. The worker is not respawned"
@@ -1127,7 +1168,7 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
             pane_id = %escape_id_for_log(&pane_id),
             role = %escape_id_for_log(&role),
             delivery_id = %delivery_id,
-            redeliveries = redeliveries.load(Ordering::SeqCst),
+            redeliveries = ?redeliveries.tally(),
             last_classification = ?last_classification,
             "delegate retry: schedule exhausted; the silent-worker report covers it"
         ),
@@ -1135,7 +1176,7 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
             pane_id = %escape_id_for_log(&pane_id),
             role = %escape_id_for_log(&role),
             delivery_id = %delivery_id,
-            redeliveries = redeliveries.load(Ordering::SeqCst),
+            redeliveries = ?redeliveries.tally(),
             end = ?other,
             "delegate retry: stopped"
         ),
@@ -1225,6 +1266,7 @@ struct RedeliverCtx<'a> {
     pointer: &'a str,
     orchestration: Option<&'a OrchestrationIdentity>,
     total_attempts: usize,
+    counts: &'a RedeliveryCounts,
 }
 
 async fn redeliver(
@@ -1244,6 +1286,7 @@ async fn redeliver(
         pointer,
         orchestration,
         total_attempts,
+        counts,
     } = *ctx;
     // The dispatch lock, then the generation check: a newer delegation that took
     // the lock first has already superseded this record, so an old pointer can
@@ -1268,18 +1311,38 @@ async fn redeliver(
         );
         return Attempt::Skipped;
     }
-    let composer = match registry.snapshot_with_pty_size(worker_agent_id) {
-        Ok((bytes, rows, cols)) => read_composer(
-            &bytes,
-            rows,
-            cols,
-            delivery_id,
-            pointer
-                .rsplit_once(delivery_id)
-                .map_or("", |(_, after_id)| after_id),
-            registry.geometry_changes_of(worker_agent_id) != *pointer_epoch,
-        ),
-        Err(_) => return Attempt::Stop(RetryEnd::AgentExited),
+    // Off the async worker: the snapshot takes the registry's synchronous mutex
+    // and copies the scrollback, and the parse behind the cell cap is CPU work
+    // (Qodo, #1414; the same move as #1347's). Still under the dispatch lock, so
+    // no newer delegation's write can land between this read and the one below.
+    let resized_since_write = registry.geometry_changes_of(worker_agent_id) != *pointer_epoch;
+    let snapshot_registry = Arc::clone(registry);
+    let snapshot_agent = worker_agent_id.to_string();
+    let snapshot_id = delivery_id.to_string();
+    let after_id = pointer
+        .rsplit_once(delivery_id)
+        .map_or("", |(_, after_id)| after_id)
+        .to_string();
+    let read = tokio::task::spawn_blocking(move || {
+        snapshot_registry
+            .snapshot_with_pty_size(&snapshot_agent)
+            .map(|(bytes, rows, cols)| {
+                read_composer(
+                    &bytes,
+                    rows,
+                    cols,
+                    &snapshot_id,
+                    &after_id,
+                    resized_since_write,
+                )
+            })
+    })
+    .await;
+    let composer = match read {
+        Ok(Ok(composer)) => composer,
+        Ok(Err(_)) => return Attempt::Stop(RetryEnd::AgentExited),
+        // The blocking task panicked: nothing was read, so nothing is known.
+        Err(_) => Composer::Unreadable,
     };
     // Only the SECOND Enter is scoped to the input box (auditor M2 / reviewer
     // LOW-1). The probe is the same bare Enter whatever the screen shows:
@@ -1444,7 +1507,10 @@ async fn redeliver(
         .await;
     match outcome {
         Ok(GuardedSendDetail::Outcome(GuardedSend::Applied)) => {
-            if !text.is_empty() {
+            if text.is_empty() {
+                counts.enters.fetch_add(1, Ordering::SeqCst);
+            } else {
+                counts.retypes.fetch_add(1, Ordering::SeqCst);
                 crate::state::settle_one_shot_payload_record(
                     registry,
                     pane_id,
@@ -2133,6 +2199,11 @@ mod tests {
             AckOutcome::Unknown,
             "an older generation's ack must not stop this generation's loop"
         );
+        assert_eq!(
+            store.acknowledge("p1", "d-11111111", None),
+            AckOutcome::Unknown,
+            "an ack whose sender could not be identified must not stop the loop"
+        );
         assert!(store.is_current("p1", armed.seq));
     }
 
@@ -2176,7 +2247,7 @@ mod tests {
         let _old = store.arm("p1", "d-11111111", "a1", Some(3), RetypePolicy::Allowed);
         let _newer = store.arm("p1", "d-22222222", "a1", Some(4), RetypePolicy::Allowed);
         assert_eq!(
-            store.acknowledge("p1", "d-22222222", None),
+            store.acknowledge("p1", "d-22222222", Some("a1")),
             AckOutcome::Stopped {
                 silence_seq: Some(4)
             }
@@ -2318,7 +2389,7 @@ while chunk := os.read(0, 4096):
         async fn deliver_and_retry(
             &self,
             schedule: &str,
-        ) -> (tokio::task::JoinHandle<RetryEnd>, Arc<AtomicU32>) {
+        ) -> (tokio::task::JoinHandle<RetryEnd>, Arc<RedeliveryCounts>) {
             self.deliver_and_retry_with(schedule, RetypePolicy::Allowed)
                 .await
         }
@@ -2327,7 +2398,7 @@ while chunk := os.read(0, 4096):
             &self,
             schedule: &str,
             retype: RetypePolicy,
-        ) -> (tokio::task::JoinHandle<RetryEnd>, Arc<AtomicU32>) {
+        ) -> (tokio::task::JoinHandle<RetryEnd>, Arc<RedeliveryCounts>) {
             let event_rx = self.tx.subscribe();
             let armed =
                 self.registry
@@ -2347,7 +2418,7 @@ while chunk := os.read(0, 4096):
                 POINTER,
                 Some(GuardedSend::Applied),
             );
-            let redeliveries = Arc::new(AtomicU32::new(0));
+            let redeliveries = Arc::new(RedeliveryCounts::default());
             let handle = spawn(DeliveryRetry {
                 registry: Arc::clone(&self.registry),
                 event_rx,
@@ -2410,7 +2481,15 @@ while chunk := os.read(0, 4096):
         let fx = Fixture::start("retry-retype", false).await;
         let (handle, redeliveries) = fx.deliver_and_retry("150,150").await;
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            redeliveries.tally(),
+            RedeliveryTally {
+                attempts: 2,
+                enters: 2,
+                retypes: 2
+            },
+            "what the went-quiet report quotes must be what was written"
+        );
         // The first write, then per re-delivery an unanswered Enter (an empty
         // line) and the retyped pointer.
         let lines = fx.received_lines(5).await;
@@ -2439,7 +2518,7 @@ while chunk := os.read(0, 4096):
             .deliver_and_retry_with("150,150", RetypePolicy::Never)
             .await;
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
+        assert_eq!(redeliveries.attempts(), 2);
         fx.received_lines(3).await;
         // Past the loop's end, so a late copy would be in the sink too.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2469,7 +2548,7 @@ while chunk := os.read(0, 4096):
             .deliver_and_retry_with("150,150", RetypePolicy::Never)
             .await;
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
+        assert_eq!(redeliveries.attempts(), 2);
         tokio::time::sleep(Duration::from_millis(200)).await;
         let raw = std::fs::read_to_string(&fx.sink).unwrap_or_default();
         assert_eq!(raw, format!("{POINTER}\r\r\r\r\r"));
@@ -2514,7 +2593,15 @@ while chunk := os.read(0, 4096):
         };
         let (handle, redeliveries) = fx.deliver_and_retry("150,150").await;
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            redeliveries.tally(),
+            RedeliveryTally {
+                attempts: 2,
+                enters: 4,
+                retypes: 0
+            },
+            "an Enter-only re-delivery must not be counted as a re-send of the pointer"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
         let raw = std::fs::read_to_string(&fx.sink).unwrap_or_default();
         // Issue #1243: per re-delivery, the probe and, with the pointer still
@@ -2536,7 +2623,7 @@ while chunk := os.read(0, 4096):
         let fx = Fixture::start("retry-history", true).await;
         let (handle, redeliveries) = fx.deliver_and_retry("150,150").await;
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
+        assert_eq!(redeliveries.attempts(), 2);
         // Past the loop's end, so a late fourth line would be in the sink too.
         tokio::time::sleep(Duration::from_millis(200)).await;
         let lines = fx.received_lines(3).await;
@@ -2567,7 +2654,7 @@ while chunk := os.read(0, 4096):
         // retype step half a second after its probe, well after the clear.
         let (handle, redeliveries) = fx.deliver_and_retry("200,1000").await;
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
+        assert_eq!(redeliveries.attempts(), 2);
         tokio::time::sleep(Duration::from_millis(200)).await;
         let lines = fx.received_lines(3).await;
         assert_eq!(
@@ -2618,7 +2705,7 @@ while chunk := os.read(0, 4096):
         .await;
         let (handle, redeliveries) = fx.deliver_and_retry("1000").await;
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(redeliveries.attempts(), 1);
         tokio::time::sleep(Duration::from_millis(200)).await;
         let raw = std::fs::read_to_string(&fx.sink).unwrap_or_default();
         assert_eq!(
@@ -2658,7 +2745,7 @@ while chunk := os.read(0, 4096):
             .send(fx.event(EventType::Thinking, &fx.agent))
             .unwrap();
         assert_eq!(end_of(handle).await, RetryEnd::Received);
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(redeliveries.attempts(), 1);
         tokio::time::sleep(Duration::from_millis(200)).await;
         let raw = std::fs::read_to_string(&fx.sink).unwrap_or_default();
         assert_eq!(
@@ -2691,7 +2778,7 @@ while chunk := os.read(0, 4096):
         );
         drop(writer);
         assert_eq!(end_of(handle).await, RetryEnd::Cancelled);
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 0);
+        assert_eq!(redeliveries.attempts(), 0);
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             std::fs::read_to_string(&fx.sink).unwrap_or_default(),
@@ -2710,7 +2797,7 @@ while chunk := os.read(0, 4096):
             .send(fx.event(EventType::Thinking, &fx.agent))
             .unwrap();
         assert_eq!(end_of(handle).await, RetryEnd::Received);
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 0);
+        assert_eq!(redeliveries.attempts(), 0);
         assert!(!fx.registry.pending_deliveries().is_pending(&fx.pane));
         fx.stop();
     }
@@ -2725,7 +2812,7 @@ while chunk := os.read(0, 4096):
             .unwrap();
         fx.tx.send(fx.event(EventType::Idle, &fx.agent)).unwrap();
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(redeliveries.attempts(), 1);
         fx.stop();
     }
 
@@ -2741,7 +2828,7 @@ while chunk := os.read(0, 4096):
             AckOutcome::Stopped { .. }
         ));
         assert_eq!(end_of(handle).await, RetryEnd::Cancelled);
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 0);
+        assert_eq!(redeliveries.attempts(), 0);
         fx.stop();
     }
 
@@ -2763,7 +2850,7 @@ while chunk := os.read(0, 4096):
         tokio::time::sleep(Duration::from_millis(20)).await;
         fx.registry.note_user_input(&fx.pane);
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 0);
+        assert_eq!(redeliveries.attempts(), 0);
         let lines = fx.received_lines(1).await;
         assert_eq!(
             lines.iter().filter(|l| l.as_str() == POINTER).count(),
@@ -2780,7 +2867,7 @@ while chunk := os.read(0, 4096):
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(fx.registry.pending_deliveries().supersede(&fx.pane));
         assert_eq!(end_of(handle).await, RetryEnd::Cancelled);
-        assert_eq!(redeliveries.load(Ordering::SeqCst), 0);
+        assert_eq!(redeliveries.attempts(), 0);
         fx.stop();
     }
 }
