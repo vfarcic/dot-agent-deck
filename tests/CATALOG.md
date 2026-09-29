@@ -4542,10 +4542,10 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** exact separators between pages.
 - **Platform coverage:** mac+linux.
 
-##### cli/docs/005 — Relative Markdown links stay within published pages and resolve to headings.
+##### cli/docs/005 — Relative inline and reference Markdown links stay within published pages and resolve to headings.
 - **Layer:** L2 (repository Markdown check in the e2e-gated CLI docs test file).
 - **Agent:** none.
-- **Asserts:** each relative `.md` link from a manifest page resolves against its containing directory to another manifest slug, and each linked anchor matches a GitHub-style heading slug in the target page.
+- **Asserts:** each relative `.md` inline link or reference definition outside code fences in a manifest page resolves against its containing directory to another manifest slug, and each linked anchor matches a GitHub-style heading slug in the target page.
 - **Does not assert:** external URLs or image links.
 - **Platform coverage:** mac+linux.
 

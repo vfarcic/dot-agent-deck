@@ -252,9 +252,9 @@ fn resolved_slug(source: &str, relative: &str) -> String {
     parts.join("/").trim_end_matches(".md").to_string()
 }
 
-/// Scenario: Read every published Markdown page and follow its relative page
-/// links and heading anchors as a reader of the CLI output would. Each target
-/// remains in the manifest and each anchor names a GitHub-style heading.
+/// Scenario: Read every published Markdown page and follow its inline links and
+/// reference definitions outside code fences as a reader of the CLI output would.
+/// Each relative page target remains in the manifest and each anchor names a heading.
 #[spec("cli/docs/005")]
 #[test]
 fn docs_005_relative_markdown_links_resolve_to_published_headings() {
@@ -265,6 +265,10 @@ fn docs_005_relative_markdown_links_resolve_to_published_headings() {
         .map(|page| page.slug.as_str())
         .collect();
     let link = Regex::new(r"\]\(([^)\s]+)(?:\s+[^)]*)?\)").expect("valid link regex");
+    let reference = Regex::new(
+        r#"^ {0,3}\[([^\[\]]+)\]:[ \t]*(?:<([^<>]+)>|([^\s]+))(?:[ \t]+(?:"[^"]*"|'[^']*'|\([^)]*\)))?[ \t]*$"#,
+    )
+    .expect("valid reference definition regex");
     let mut pages = HashMap::new();
     for page in &manifest.page {
         let markdown = String::from_utf8(page_bytes(&page.slug))
@@ -283,8 +287,22 @@ fn docs_005_relative_markdown_links_resolve_to_published_headings() {
             if in_fence {
                 continue;
             }
-            for capture in link.captures_iter(line_text) {
-                let destination = &capture[1];
+            let mut destinations: Vec<_> = link
+                .captures_iter(line_text)
+                .map(|capture| capture.get(1).expect("inline target").as_str())
+                .collect();
+            if let Some(capture) = reference.captures(line_text)
+                && !capture[1].starts_with('^')
+            {
+                destinations.push(
+                    capture
+                        .get(2)
+                        .or_else(|| capture.get(3))
+                        .expect("reference target")
+                        .as_str(),
+                );
+            }
+            for destination in destinations {
                 let (path, anchor) = destination.split_once('#').unwrap_or((destination, ""));
                 if !(path.ends_with(".md") || path.is_empty() && !anchor.is_empty()) {
                     continue;
