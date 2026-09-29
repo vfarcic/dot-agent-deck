@@ -350,6 +350,7 @@ fn launch_retry_fixture_for_agent(
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
         .with_pty_size(120, 40)
+        .with_env("DOT_AGENT_DECK_LOG", "retry-loop.log")
         .with_env("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "200")
         .with_env("DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS", schedule)
         .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", silence_window)
@@ -437,11 +438,27 @@ fn orchestrator_text(deck: &TuiDeck) -> String {
         .unwrap_or_default()
 }
 
-fn wait_past_retry_schedule() {
-    let start = std::time::Instant::now();
-    assert!(common::wait_until(Duration::from_secs(6), || start
+fn wait_for_retry_loop_end(work: &std::path::Path) {
+    let log_path = work.join("retry-loop.log");
+    assert!(
+        common::wait_until(Duration::from_secs(30), || {
+            std::fs::read_to_string(&log_path).is_ok_and(|log| {
+                log.lines().any(|line| {
+                    line.contains(
+                        "delegate retry: schedule exhausted; the silent-worker report covers it",
+                    ) || line.contains("delegate retry: every scheduled re-delivery went out")
+                        || line.contains("delegate retry: stopped")
+                })
+            })
+        }),
+        "retry loop did not log a terminal outcome; daemon log:\n{}",
+        std::fs::read_to_string(&log_path).unwrap_or_default()
+    );
+    // Let the daemon log flush and any final PTY bytes reach the worker log.
+    let settle = std::time::Instant::now();
+    assert!(common::wait_until(Duration::from_secs(1), || settle
         .elapsed()
-        >= Duration::from_secs(5)));
+        >= Duration::from_millis(200)));
 }
 
 /// Scenario: Delegate through the attached TUI to a known-agent stand-in that
@@ -513,7 +530,7 @@ fn delegate_044_visible_composer_retries_submit_only() {
         "accepted task did not render in attached worker pane; grid:\n{}",
         deck.snapshot_grid()
     );
-    wait_past_retry_schedule();
+    wait_for_retry_loop_end(&work);
     let raw = std::fs::read(&raw_path).expect("worker raw-byte log");
     assert_eq!(
         pointer_count(&raw),
@@ -585,7 +602,7 @@ fn ready_composer_lost_submit(agent: &str) {
         "submitted task did not render in the worker pane; grid:\n{}",
         deck.snapshot_grid()
     );
-    wait_past_retry_schedule();
+    wait_for_retry_loop_end(&work);
     let raw = std::fs::read(&raw_path).expect("worker raw-byte log");
     assert_eq!(pointer_count(&raw), 1, "pointer was typed twice: {raw:?}");
     let timeline = std::fs::read_to_string(work.join("worker-input-timeline.log"))
@@ -662,7 +679,7 @@ fn delegate_045_ack_stops_retries_and_silence_notice() {
     assert_eq!(fields[2], "True", "task-file ack header missing: {ack:?}");
     assert_eq!(fields[3], "0", "first ack failed: {ack:?}");
     assert_eq!(fields[4], "0", "repeated ack must be idempotent: {ack:?}");
-    wait_past_retry_schedule();
+    wait_for_retry_loop_end(&work);
     let raw = std::fs::read(work.join("worker-raw.log")).expect("worker raw-byte log");
     assert_eq!(
         pointer_count(&raw),
