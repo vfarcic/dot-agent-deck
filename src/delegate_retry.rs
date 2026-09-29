@@ -109,7 +109,9 @@ impl RetrySchedule {
     /// * a comma-separated list of integers: one entry per re-delivery, each
     ///   clamped to `[`[`MIN_RETRY_WAIT`]`, `[`MAX_RETRY_WAIT`]`]`, at most
     ///   [`MAX_RETRY_ENTRIES`] read;
-    /// * anything else: the default, with one `warn!`.
+    /// * anything else among the entries that are read: the default, with one
+    ///   `warn!`. Entries past [`MAX_RETRY_ENTRIES`] are not read, so a
+    ///   malformed one there does not discard the valid ones before it.
     pub fn parse(raw: Option<&str>) -> Self {
         let Some(raw) = raw else {
             return Self::default_schedule();
@@ -120,14 +122,8 @@ impl RetrySchedule {
         }
         let mut waits = Vec::new();
         for entry in trimmed.split(',') {
-            let Ok(ms) = entry.trim().parse::<u128>() else {
-                warn!(
-                    value = %escape_id_for_log(raw),
-                    "{DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS} is not a comma-separated list \
-                     of milliseconds; using the default schedule"
-                );
-                return Self::default_schedule();
-            };
+            // Before the entry is parsed: an entry past the limit is not read,
+            // so it cannot be the one that throws the whole value out.
             if waits.len() == MAX_RETRY_ENTRIES {
                 warn!(
                     max_entries = MAX_RETRY_ENTRIES,
@@ -136,6 +132,14 @@ impl RetrySchedule {
                 );
                 break;
             }
+            let Ok(ms) = entry.trim().parse::<u128>() else {
+                warn!(
+                    value = %escape_id_for_log(raw),
+                    "{DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS} is not a comma-separated list \
+                     of milliseconds; using the default schedule"
+                );
+                return Self::default_schedule();
+            };
             let clamped = ms.clamp(MIN_RETRY_WAIT.as_millis(), MAX_RETRY_WAIT.as_millis());
             if clamped != ms {
                 warn!(
@@ -1653,6 +1657,27 @@ mod tests {
         assert_eq!(schedule.redeliveries(), MAX_RETRY_ENTRIES);
     }
 
+    /// Qodo round 4: an entry past the limit is not read, so a malformed one
+    /// there cannot discard the valid entries before it.
+    #[test]
+    fn retry_schedule_ignores_a_malformed_entry_past_the_limit() {
+        let mut entries = vec!["1000"; MAX_RETRY_ENTRIES];
+        entries.extend(["soon", "-5"]);
+        let schedule = RetrySchedule::parse(Some(&entries.join(",")));
+        assert_eq!(
+            schedule.waits(),
+            ms(&[1000; MAX_RETRY_ENTRIES]).as_slice(),
+            "the eight valid entries were thrown out for one that is never read"
+        );
+        // Within the limit a malformed entry still falls back to the default.
+        let mut entries = vec!["1000"; MAX_RETRY_ENTRIES - 1];
+        entries.push("soon");
+        assert_eq!(
+            RetrySchedule::parse(Some(&entries.join(","))),
+            RetrySchedule::parse(None)
+        );
+    }
+
     #[test]
     fn retry_schedule_garbage_falls_back_to_the_default() {
         for raw in ["soon", "1500,x", "1500,,3000", "-5", "1.5"] {
@@ -2337,22 +2362,35 @@ while chunk := os.read(0, 4096):
             if !python3_available().await {
                 return None;
             }
-            Some(
-                Self::spawn(pane, |sink| {
-                    let script = sink.with_file_name("composer.py");
-                    std::fs::write(&script, COMPOSER).unwrap();
-                    format!(
-                        "exec python3 -u '{}' '{}'",
-                        script.display(),
-                        sink.display()
-                    )
-                })
-                .await,
-            )
+            Some(Self::spawn_python(pane, COMPOSER).await)
+        }
+
+        /// A worker running the Python `source`, which is handed the sink's path
+        /// as its one argument. The script is written through Tokio's file API
+        /// so the fixture does not block a runtime worker.
+        async fn spawn_python(pane: &str, source: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("composer.py");
+            tokio::fs::write(&script, source).await.unwrap();
+            Self::spawn_in(dir, pane, |sink| {
+                format!(
+                    "exec python3 -u '{}' '{}'",
+                    script.display(),
+                    sink.display()
+                )
+            })
+            .await
         }
 
         async fn spawn(pane: &str, command: impl FnOnce(&std::path::Path) -> String) -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            Self::spawn_in(tempfile::tempdir().unwrap(), pane, command).await
+        }
+
+        async fn spawn_in(
+            dir: tempfile::TempDir,
+            pane: &str,
+            command: impl FnOnce(&std::path::Path) -> String,
+        ) -> Self {
             let sink = dir.path().join("sink");
             let command = command(&sink);
             let registry = Arc::new(AgentPtyRegistry::new());
@@ -2451,11 +2489,19 @@ while chunk := os.read(0, 4096):
             )
         }
 
+        /// Everything the worker has received so far, read through Tokio's
+        /// file API so a polling test does not block a runtime worker.
+        async fn sink_text(&self) -> String {
+            tokio::fs::read_to_string(&self.sink)
+                .await
+                .unwrap_or_default()
+        }
+
         /// The lines the worker received, once the count has settled.
         async fn received_lines(&self, expected: usize) -> Vec<String> {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             loop {
-                let text = std::fs::read_to_string(&self.sink).unwrap_or_default();
+                let text = self.sink_text().await;
                 let lines: Vec<String> = text.lines().map(str::to_string).collect();
                 if lines.len() >= expected || tokio::time::Instant::now() >= deadline {
                     return lines;
@@ -2550,7 +2596,7 @@ while chunk := os.read(0, 4096):
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
         assert_eq!(redeliveries.attempts(), 2);
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let raw = std::fs::read_to_string(&fx.sink).unwrap_or_default();
+        let raw = fx.sink_text().await;
         assert_eq!(raw, format!("{POINTER}\r\r\r\r\r"));
         fx.stop();
     }
@@ -2603,7 +2649,7 @@ while chunk := os.read(0, 4096):
             "an Enter-only re-delivery must not be counted as a re-send of the pointer"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let raw = std::fs::read_to_string(&fx.sink).unwrap_or_default();
+        let raw = fx.sink_text().await;
         // Issue #1243: per re-delivery, the probe and, with the pointer still
         // in the input box after the grace, one more Enter.
         assert_eq!(
@@ -2693,21 +2739,12 @@ while chunk := os.read(0, 4096):
     else:
         os.write(1, chunk.replace(b'\r', b'').replace(b'\n', b''))
 "#;
-        let fx = Fixture::spawn("retry-composer-cleared", |sink| {
-            let script = sink.with_file_name("composer.py");
-            std::fs::write(&script, CLEARING_COMPOSER).unwrap();
-            format!(
-                "exec python3 -u '{}' '{}'",
-                script.display(),
-                sink.display()
-            )
-        })
-        .await;
+        let fx = Fixture::spawn_python("retry-composer-cleared", CLEARING_COMPOSER).await;
         let (handle, redeliveries) = fx.deliver_and_retry("1000").await;
         assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
         assert_eq!(redeliveries.attempts(), 1);
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let raw = std::fs::read_to_string(&fx.sink).unwrap_or_default();
+        let raw = fx.sink_text().await;
         assert_eq!(
             raw.matches(ID).count(),
             1,
@@ -2730,14 +2767,14 @@ while chunk := os.read(0, 4096):
         // pointer; the next Enter submits it, and the turn is reported.
         let submitted = format!("{POINTER}\r\r");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !std::fs::read_to_string(&fx.sink)
-            .unwrap_or_default()
-            .contains(&submitted)
-        {
+        loop {
+            let raw = fx.sink_text().await;
+            if raw.contains(&submitted) {
+                break;
+            }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the retry never pressed Enter on the retained pointer: {:?}",
-                std::fs::read_to_string(&fx.sink).unwrap_or_default()
+                "the retry never pressed Enter on the retained pointer: {raw:?}"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -2747,7 +2784,7 @@ while chunk := os.read(0, 4096):
         assert_eq!(end_of(handle).await, RetryEnd::Received);
         assert_eq!(redeliveries.attempts(), 1);
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let raw = std::fs::read_to_string(&fx.sink).unwrap_or_default();
+        let raw = fx.sink_text().await;
         assert_eq!(
             raw.matches(ID).count(),
             1,
@@ -2781,7 +2818,7 @@ while chunk := os.read(0, 4096):
         assert_eq!(redeliveries.attempts(), 0);
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
-            std::fs::read_to_string(&fx.sink).unwrap_or_default(),
+            fx.sink_text().await,
             format!("{POINTER}\n"),
             "nothing may reach the worker after its ack"
         );

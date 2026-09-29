@@ -2656,8 +2656,10 @@ async fn drain_stranded_payload(w: &mut (dyn std::io::Write + Send), landed: &[u
 /// Issue #1243: with an `echo` watch the CR is also held until the payload has
 /// rendered on the agent's screen, bounded by
 /// [`crate::submit_echo::SUBMIT_ECHO_BOUND`]; [`SUBMIT_DELAY`] stays the floor.
-/// The watch only times the CR, so every outcome above is classified exactly as
-/// without one.
+/// A watch that lags behind the output or cannot parse it holds the CR to the
+/// bound; only a closed output bus drops it to the floor
+/// ([`crate::submit_echo::EchoOutcome`]). The watch only times the CR, so every
+/// outcome above is classified exactly as without one.
 async fn deliver_payload_and_submit(
     w: &mut (dyn std::io::Write + Send),
     payload: &[u8],
@@ -9354,16 +9356,30 @@ impl AgentPtyRegistry {
 
     /// Issue #1243: subscribe to `agent_id`'s output for an echo-gated submit of
     /// `payload`. `None` when the payload is not eligible or the agent is gone.
-    /// Must be called before the payload is written.
-    fn echo_watch(&self, agent_id: &str, payload: &[u8]) -> Option<crate::submit_echo::EchoWatch> {
+    /// Must be awaited before the payload is written.
+    ///
+    /// The subscription copies up to [`SCROLLBACK_CAP_BYTES`] under the bus's
+    /// synchronous mutex and the watch parses all of it, so both run on the
+    /// blocking pool rather than on an async worker (Qodo, #1414).
+    async fn echo_watch(
+        &self,
+        agent_id: &str,
+        payload: &[u8],
+    ) -> Option<crate::submit_echo::EchoWatch> {
         crate::submit_echo::echo_token(payload)?;
         let (bus, rows, cols) = {
             let inner = self.inner.lock().unwrap();
             let agent = inner.agents.get(agent_id)?;
             (Arc::clone(&agent.bus), agent.pty_rows, agent.pty_cols)
         };
-        let (snapshot, rx) = bus.subscribe();
-        crate::submit_echo::EchoWatch::new(&snapshot, rx, rows, cols, payload)
+        let payload = payload.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let (snapshot, rx) = bus.subscribe();
+            crate::submit_echo::EchoWatch::new(&snapshot, rx, rows, cols, &payload)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// The shared body of [`Self::write_and_submit_guarded`] (payload +
@@ -9659,7 +9675,9 @@ impl AgentPtyRegistry {
         // its echo is missed. The writer is held, so nothing else is typed
         // into this pane in between.
         let echo = match (&mode, submit_gate) {
-            (SubmitMode::Submit, SubmitGate::Echo) => self.echo_watch(&target.agent_id, &payload),
+            (SubmitMode::Submit, SubmitGate::Echo) => {
+                self.echo_watch(&target.agent_id, &payload).await
+            }
             _ => None,
         };
         let delivery = match mode {
@@ -18269,6 +18287,76 @@ mod spawn_tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// Records when each write lands, on the Tokio clock.
+    #[derive(Default)]
+    struct TimedWriter {
+        writes: Vec<(tokio::time::Instant, Vec<u8>)>,
+    }
+
+    impl std::io::Write for TimedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes
+                .push((tokio::time::Instant::now(), buf.to_vec()));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl TimedWriter {
+        fn cr_at(&self) -> tokio::time::Instant {
+            self.writes
+                .iter()
+                .find(|(_, bytes)| bytes.as_slice() == b"\r")
+                .map(|(at, _)| *at)
+                .expect("the submit CR was written")
+        }
+    }
+
+    /// Qodo round 4 on PR #1414: an echo watch that lags behind a busy agent's
+    /// output must not let the CR go at the `SUBMIT_DELAY` floor — that is the
+    /// CR #1243 saw taken into a starved agent's paste. It holds to the bound.
+    /// A closed output bus, where nothing will ever paint, keeps the floor.
+    #[tokio::test(start_paused = true)]
+    async fn deliver_payload_holds_the_cr_to_the_echo_bound_when_the_watch_lags() {
+        use crate::submit_echo::{EchoWatch, SUBMIT_ECHO_BOUND};
+        let payload = b"Read the task file for your task. [delivery d-7f3a9c21]";
+
+        let (tx, rx) = tokio::sync::broadcast::channel(2);
+        let echo = EchoWatch::new(b"", rx, 24, 80, payload).expect("eligible");
+        // More output than the watch's queue holds: its next receive lags.
+        for _ in 0..4 {
+            tx.send(Arc::new(b"busy worker output ".to_vec())).unwrap();
+        }
+        let mut w = TimedWriter::default();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, payload, Some(echo)).await,
+            PayloadDelivery::Applied
+        );
+        assert!(
+            w.cr_at() - started >= SUBMIT_ECHO_BOUND,
+            "the CR went {:?} after the payload, before the {SUBMIT_ECHO_BOUND:?} bound",
+            w.cr_at() - started
+        );
+
+        let (tx, rx) = tokio::sync::broadcast::channel(2);
+        let echo = EchoWatch::new(b"", rx, 24, 80, payload).expect("eligible");
+        drop(tx);
+        let mut w = TimedWriter::default();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, payload, Some(echo)).await,
+            PayloadDelivery::Applied
+        );
+        assert_eq!(
+            w.cr_at() - started,
+            SUBMIT_DELAY,
+            "a closed bus keeps the floor"
+        );
     }
 
     #[tokio::test]

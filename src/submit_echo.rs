@@ -26,6 +26,13 @@
 //! pre-#1243 behaviour, only later. The `SUBMIT_DELAY` floor still applies, so
 //! on a box that keeps up the CR lands when it always did.
 //!
+//! **Losing the thread is not a reason to go early.** A watch that falls
+//! behind the output bus (a busy agent outruns its receiver's queue) or whose
+//! parser fails can no longer tell whether the payload rendered, and that
+//! happens under exactly the load #1243 is about, so it holds the CR to the
+//! bound rather than dropping to the floor. Only a closed bus — the agent is
+//! gone, and nothing will ever paint — returns at once.
+//!
 //! **Opt-in, not the default for every guarded submit.** A pane that does not
 //! echo its input (a raw-mode stand-in, a program that hides what is typed)
 //! pays the whole bound on every write, and the writer is held for it. The
@@ -92,9 +99,13 @@ pub enum EchoOutcome {
     Rendered,
     /// The bound passed without it.
     TimedOut,
-    /// The output could no longer be followed: the agent's output bus closed,
-    /// this watcher lagged behind it, or the screen could not be parsed.
-    Unreadable,
+    /// The output could no longer be followed — this watcher lagged behind the
+    /// agent's output bus, or the screen could not be parsed — so the wait was
+    /// held to the bound: the payload may still be inside a paste window.
+    Lost,
+    /// The agent's output bus closed. Nothing will render, so the wait ended at
+    /// once and the caller's `SUBMIT_DELAY` floor applies.
+    Closed,
 }
 
 /// Only ASCII letters, digits and `-`, which is what survives a line wrap and
@@ -183,7 +194,9 @@ impl EchoWatch {
             .count()
     }
 
-    /// Wait up to `bound` for the payload to render.
+    /// Wait up to `bound` for the payload to render. Returns before the bound
+    /// only when the payload rendered or the output bus closed; see
+    /// [`EchoOutcome`].
     pub async fn wait(mut self, bound: Duration) -> EchoOutcome {
         let deadline = tokio::time::Instant::now() + bound;
         loop {
@@ -198,30 +211,44 @@ impl EchoWatch {
             let chunk = match tokio::time::timeout_at(deadline, self.rx.recv()).await {
                 Err(_) => return EchoOutcome::TimedOut,
                 Ok(Ok(chunk)) => chunk,
-                Ok(Err(_)) => return EchoOutcome::Unreadable,
+                Ok(Err(broadcast::error::RecvError::Closed)) => return EchoOutcome::Closed,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    return Self::hold_to(deadline).await;
+                }
             };
             if !self.feed(&chunk) {
-                return EchoOutcome::Unreadable;
+                return Self::hold_to(deadline).await;
             }
-            if let Err(outcome) = self.drain(deadline) {
-                return outcome;
+            match self.drain(deadline) {
+                Ok(()) => {}
+                Err(EchoOutcome::Lost) => return Self::hold_to(deadline).await,
+                Err(outcome) => return outcome,
             }
         }
     }
 
+    /// The watch lost the thread: the screen it holds is missing output, so a
+    /// count over it could go either way. Nothing it reads can release the CR
+    /// early any more, so it waits out the bound.
+    async fn hold_to(deadline: tokio::time::Instant) -> EchoOutcome {
+        tokio::time::sleep_until(deadline).await;
+        EchoOutcome::Lost
+    }
+
     /// Take whatever else is already queued before the screen is re-read, up
     /// to `deadline`: output that keeps arriving must not hold the writer past
-    /// it.
+    /// it. `Err` is [`EchoOutcome::Lost`] or [`EchoOutcome::Closed`].
     fn drain(&mut self, deadline: tokio::time::Instant) -> Result<(), EchoOutcome> {
         while tokio::time::Instant::now() < deadline {
             match self.rx.try_recv() {
                 Ok(chunk) => {
                     if !self.feed(&chunk) {
-                        return Err(EchoOutcome::Unreadable);
+                        return Err(EchoOutcome::Lost);
                     }
                 }
                 Err(broadcast::error::TryRecvError::Empty) => return Ok(()),
-                Err(_) => return Err(EchoOutcome::Unreadable),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => return Err(EchoOutcome::Lost),
+                Err(broadcast::error::TryRecvError::Closed) => return Err(EchoOutcome::Closed),
             }
         }
         Ok(())
@@ -323,11 +350,44 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn wait_gives_up_when_the_output_bus_closes() {
+    async fn wait_gives_up_at_once_when_the_output_bus_closes() {
         let (tx, rx) = channel();
         let watch = EchoWatch::new(b"", rx, 24, 80, POINTER).expect("eligible");
         drop(tx);
-        assert_eq!(watch.wait(SUBMIT_ECHO_BOUND).await, EchoOutcome::Unreadable);
+        let started = tokio::time::Instant::now();
+        assert_eq!(watch.wait(SUBMIT_ECHO_BOUND).await, EchoOutcome::Closed);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// Qodo round 4: a watch that falls behind a busy agent's output can no
+    /// longer see the payload render, and that is when a CR at the floor lands
+    /// in the paste window (#1243). It holds to the bound instead — on the
+    /// blocking receive and on the drain behind it alike.
+    #[tokio::test(start_paused = true)]
+    async fn wait_holds_to_the_bound_when_it_lags_behind_the_output() {
+        // On the receive: more output than the queue holds before the wait.
+        let (tx, rx) = broadcast::channel(2);
+        let watch = EchoWatch::new(b"", rx, 24, 80, POINTER).expect("eligible");
+        for _ in 0..4 {
+            tx.send(Arc::new(b"chatter ".to_vec())).unwrap();
+        }
+        let started = tokio::time::Instant::now();
+        assert_eq!(watch.wait(SUBMIT_ECHO_BOUND).await, EchoOutcome::Lost);
+        assert_eq!(started.elapsed(), SUBMIT_ECHO_BOUND);
+
+        // On the drain: a lag found there is reported as lost, which `wait`
+        // holds to the bound exactly as above; a closed bus as closed.
+        let (tx, rx) = broadcast::channel(2);
+        let mut watch = EchoWatch::new(b"", rx, 24, 80, POINTER).expect("eligible");
+        for _ in 0..4 {
+            tx.send(Arc::new(b"chatter ".to_vec())).unwrap();
+        }
+        let later = tokio::time::Instant::now() + SUBMIT_ECHO_BOUND;
+        assert_eq!(watch.drain(later), Err(EchoOutcome::Lost));
+        let (tx, rx) = channel();
+        let mut watch = EchoWatch::new(b"", rx, 24, 80, POINTER).expect("eligible");
+        drop(tx);
+        assert_eq!(watch.drain(later), Err(EchoOutcome::Closed));
     }
 
     /// Auditor M5: a pane over the cell cap gets no gate (the caller then
@@ -436,16 +496,19 @@ while True:
     os.write(1, b'\r\n> ' + composer.replace(b'\n', b'\r\n') + b'\r\n')
 "#;
 
-    fn python_available() -> bool {
-        std::process::Command::new("python3")
+    /// Through Tokio's process API, so the check does not block a runtime
+    /// worker.
+    async fn python_available() -> bool {
+        tokio::process::Command::new("python3")
             .arg("--version")
             .output()
+            .await
             .is_ok_and(|out| out.status.success())
     }
 
     async fn start(pane: &str, dir: &std::path::Path) -> (Arc<AgentPtyRegistry>, String) {
         let script = dir.join("agent.py");
-        std::fs::write(&script, PASTE_WINDOW_AGENT).unwrap();
+        tokio::fs::write(&script, PASTE_WINDOW_AGENT).await.unwrap();
         let command = format!("exec python3 -u '{}'", script.display());
         let registry = Arc::new(AgentPtyRegistry::new());
         let agent = registry
@@ -488,7 +551,7 @@ while True:
     /// once the pointer is painted, and the agent submits it.
     #[tokio::test]
     async fn echo_gated_submit_lands_after_the_paste_window_the_fixed_delay_falls_into() {
-        if !python_available() {
+        if !python_available().await {
             eprintln!("SKIP: python3 is not available");
             return;
         }
