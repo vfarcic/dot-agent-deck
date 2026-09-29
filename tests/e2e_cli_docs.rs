@@ -253,8 +253,8 @@ fn resolved_slug(source: &str, relative: &str) -> String {
 }
 
 /// Scenario: Read every published Markdown page and follow its inline links and
-/// reference definitions outside code fences as a reader of the CLI output would.
-/// Each relative page target remains in the manifest and each anchor names a heading.
+/// reference definitions outside code fences, including definitions with the
+/// destination on the next line. Each target is published and each anchor exists.
 #[spec("cli/docs/005")]
 #[test]
 fn docs_005_relative_markdown_links_resolve_to_published_headings() {
@@ -269,6 +269,8 @@ fn docs_005_relative_markdown_links_resolve_to_published_headings() {
         r#"^ {0,3}\[([^\[\]]+)\]:[ \t]*(?:<([^<>]+)>|([^\s]+))(?:[ \t]+(?:"[^"]*"|'[^']*'|\([^)]*\)))?[ \t]*$"#,
     )
     .expect("valid reference definition regex");
+    let split_reference =
+        Regex::new(r"^ {0,3}\[[^\[\]]+\]:[ \t]*$").expect("valid split reference label regex");
     let mut pages = HashMap::new();
     for page in &manifest.page {
         let markdown = String::from_utf8(page_bytes(&page.slug))
@@ -278,7 +280,8 @@ fn docs_005_relative_markdown_links_resolve_to_published_headings() {
     for page in &manifest.page {
         let markdown = &pages[page.slug.as_str()];
         let mut in_fence = false;
-        for (line_number, line_text) in markdown.lines().enumerate() {
+        let lines: Vec<_> = markdown.lines().collect();
+        for (line_number, line_text) in lines.iter().enumerate() {
             let trimmed = line_text.trim_start();
             if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
                 in_fence = !in_fence;
@@ -287,11 +290,19 @@ fn docs_005_relative_markdown_links_resolve_to_published_headings() {
             if in_fence {
                 continue;
             }
+            let reference_text = if split_reference.is_match(line_text) {
+                lines.get(line_number + 1).map_or_else(
+                    || line_text.to_string(),
+                    |next| format!("{line_text}{next}"),
+                )
+            } else {
+                line_text.to_string()
+            };
             let mut destinations: Vec<_> = link
                 .captures_iter(line_text)
                 .map(|capture| capture.get(1).expect("inline target").as_str())
                 .collect();
-            if let Some(capture) = reference.captures(line_text)
+            if let Some(capture) = reference.captures(&reference_text)
                 && !capture[1].starts_with('^')
             {
                 destinations.push(
