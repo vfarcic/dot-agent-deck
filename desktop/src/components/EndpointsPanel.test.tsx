@@ -78,6 +78,9 @@ function renderPanel(
     mode?: RuntimeMode;
     saveError?: string;
     testEndpoint?: (settings: DesktopSettingsDto, selection: string) => Promise<EndpointTestReportDto>;
+    defaultDeckName?: (host: string, user?: string) => Promise<string>;
+    checkDeckName?: (name: string, id?: string) => Promise<string | null>;
+    renameDeck?: (id: string, name: string) => Promise<DesktopSettingsDto>;
   } = {},
 ) {
   const onSave = vi.fn();
@@ -90,20 +93,19 @@ function renderPanel(
       mode={options.mode ?? "live"}
     />
   );
+  const bridge = {
+    testEndpoint: options.testEndpoint ?? vi.fn(async () => report()),
+    defaultDeckName: options.defaultDeckName ?? vi.fn(async () => "build-box"),
+    checkDeckName: options.checkDeckName ?? vi.fn(async () => null),
+    renameDeck: options.renameDeck ?? vi.fn(async () => settings),
+    secretStatus: vi.fn(async () => ({ stored: false })),
+    storeSecret: vi.fn(async () => ({ stored: true })),
+    forgetSecret: vi.fn(async () => ({ stored: false })),
+  };
   const wrap = (element: React.ReactElement) =>
-    options.testEndpoint
+    (options.testEndpoint || options.defaultDeckName || options.checkDeckName || options.renameDeck)
       ? (
-        <SettingsBridgeProvider
-          value={{
-            testEndpoint: options.testEndpoint,
-            // PRD #802 M4 widened `SettingsBridge` with three credential
-            // actions. This panel reaches none of them; they are here because
-            // the context is one value and a partial one would not type-check.
-            secretStatus: vi.fn(async () => ({ stored: false })),
-            storeSecret: vi.fn(async () => ({ stored: true })),
-            forgetSecret: vi.fn(async () => ({ stored: false })),
-          }}
-        >
+        <SettingsBridgeProvider value={bridge}>
           {element}
         </SettingsBridgeProvider>
       )
@@ -172,25 +174,74 @@ describe("EndpointsPanel", () => {
   });
 
   /**
-   * Scenario: fill the draft's Host in. The moment the row is storable it stops
-   * being a draft — it goes into the document with a freshly minted id and
-   * becomes the selection, which is what pressing "Add a daemon" was asking for.
+   * Scenario: fill the draft's Host in and accept the derived deck name. The
+   * user confirms the row before it is stored and selected.
    */
-  it("stores a draft and selects it as soon as it is valid", () => {
-    const { onSave } = renderPanel();
+  /// Scenario: The suggested deck name is visible before saving a valid new remote deck.
+  it("stores a draft with its default name and selects it after confirmation", async () => {
+    const defaultDeckName = vi.fn(async () => "build");
+    const { onSave } = renderPanel({}, { defaultDeckName });
     fireEvent.click(screen.getByTestId("add-deck"));
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
 
+    await waitFor(() => expect(defaultDeckName).toHaveBeenCalledWith("build-box", undefined));
+    expect(screen.getByLabelText("Deck name")).toHaveValue("build");
+    expect(onSave).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("save-new-deck"));
+
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
     const saved = onSave.mock.calls[0][0] as DesktopSettingsDto;
     expect(saved.endpoints?.remote).toHaveLength(1);
     const added = saved.endpoints!.remote[0];
     expect(added.id).toMatch(/^[0-9a-f]{16}$/);
     expect(added.host).toBe("build-box");
+    expect(added).toHaveProperty("name", "build");
     expect(added.port).toBe(22);
     expect(saved.endpoints?.selection).toBe(added.id);
     // The whole document travels, not just this section.
     expect(saved.appearance).toEqual(DEFAULT_DESKTOP_SETTINGS.appearance);
     expect(saved.zoom).toEqual(DEFAULT_DESKTOP_SETTINGS.zoom);
+  });
+
+  /// Scenario: A user replaces the suggested name before saving a new deck; the chosen name reaches the saved row.
+  it("saves a user-chosen name for a new deck", async () => {
+    const defaultDeckName = vi.fn(async () => "deploy-build-box");
+    const { onSave } = renderPanel({}, {
+      defaultDeckName,
+      checkDeckName: vi.fn(async () => null),
+    });
+    fireEvent.click(screen.getByTestId("add-deck"));
+    fireEvent.change(screen.getByLabelText("User"), { target: { value: "deploy" } });
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    await waitFor(() => expect(defaultDeckName).toHaveBeenCalledWith("build-box", "deploy"));
+    expect(screen.getByLabelText("Deck name")).toHaveValue("deploy-build-box");
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "production" } });
+    fireEvent.click(screen.getByTestId("save-new-deck"));
+
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    expect(onSave.mock.calls[0][0].endpoints.remote[0].name).toBe("production");
+  });
+
+  /// Scenario: Invalid and already-taken names show the library's refusal and cannot be saved.
+  it("blocks a new deck name when the shared name check refuses it", async () => {
+    const checkDeckName = vi.fn(async (name: string) => name === "taken"
+      ? "A deck named 'taken' already exists."
+      : "Invalid deck name: a deck name must start with an ASCII letter or digit.");
+    const { onSave } = renderPanel({}, { defaultDeckName: vi.fn(async () => "build-box"), checkDeckName });
+    fireEvent.click(screen.getByTestId("add-deck"));
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    await waitFor(() => expect(screen.getByLabelText("Deck name")).toHaveValue("build-box"));
+
+    for (const [name, refusal] of [
+      ["-bad", "Invalid deck name: a deck name must start with an ASCII letter or digit."],
+      ["taken", "A deck named 'taken' already exists."],
+    ]) {
+      fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: name } });
+      await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(refusal));
+      expect(screen.getByTestId("save-new-deck")).toBeDisabled();
+      expect(onSave).not.toHaveBeenCalled();
+    }
+    expect(checkDeckName).toHaveBeenCalledWith("taken", undefined);
   });
 
   /**
@@ -359,19 +410,51 @@ describe("EndpointsPanel", () => {
     expect(saved.endpoints?.selection).toBe("local");
   });
 
-  /**
-   * Scenario: a daemon is named by its address, because there is no display name
-   * to give it — a user-chosen label would be exactly the arbitrary `String`
-   * the settings field-type guard refuses.
-   */
-  it("labels a daemon from its address, port included when it is not 22", () => {
+  /// Scenario: A named deck is listed under its CLI name with the address beside it, while a legacy name falls back to the address.
+  it("shows a deck name and its address together in settings", () => {
+    const named = { ...deck({ user: "deploy", port: 2222 }), name: "production" };
+    const legacy = { ...deck({ id: "deck0000000000bb", host: "ci-box" }), name: null };
     renderPanel({
       endpoints: {
-        remote: [deck({ user: "deploy", port: 2222 })],
+        remote: [named, legacy],
         selection: "local",
       },
     });
-    expect(screen.getByTestId("deck-choice-deck0000000000aa")).toHaveTextContent("deploy@build-box:2222");
+    const namedChoice = screen.getByTestId("deck-choice-deck0000000000aa");
+    expect(namedChoice).toHaveTextContent("production");
+    expect(namedChoice).toHaveTextContent("deploy@build-box:2222");
+    expect(screen.getByTestId("deck-choice-deck0000000000bb")).toHaveTextContent("ci-box");
+  });
+
+  /// Scenario: Renaming a selected deck updates its visible name without moving the selection or rewriting its address.
+  it("renames a stored deck by id and keeps it selected", async () => {
+    const row = { ...deck(), name: "build" };
+    const changed = { ...row, name: "production" };
+    const next = { ...DEFAULT_DESKTOP_SETTINGS, endpoints: { remote: [changed], selection: row.id } };
+    const renameDeck = vi.fn(async () => next);
+    const { onSave, update } = renderPanel({ endpoints: { remote: [row], selection: row.id } }, { renameDeck });
+
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "production" } });
+    fireEvent.click(screen.getByTestId("rename-deck"));
+    await waitFor(() => expect(renameDeck).toHaveBeenCalledWith(row.id, "production"));
+    update(next);
+
+    expect(screen.getByTestId(`deck-choice-${row.id}`)).toHaveTextContent("production");
+    expect(screen.getByTestId(`deck-choice-${row.id}`).querySelector("input")).toBeChecked();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: A refused rename shows the bridge's exact sentence and leaves the stored deck selected.
+  it("shows a rename refusal without changing the selected deck", async () => {
+    const row = { ...deck(), name: "build" };
+    const renameDeck = vi.fn(async (): Promise<DesktopSettingsDto> => { throw "A deck named 'taken' already exists."; });
+    const { onSave } = renderPanel({ endpoints: { remote: [row], selection: row.id } }, { renameDeck });
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "taken" } });
+    fireEvent.click(screen.getByTestId("rename-deck"));
+
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("A deck named 'taken' already exists."));
+    expect(screen.getByTestId(`deck-choice-${row.id}`).querySelector("input")).toBeChecked();
+    expect(onSave).not.toHaveBeenCalled();
   });
 
   /**

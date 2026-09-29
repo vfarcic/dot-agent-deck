@@ -2945,6 +2945,7 @@ describe("desktop settings (PRD 803)", () => {
    *
    * So absence stays absence, and presence round-trips.
    */
+  /// Scenario: A settings round trip keeps deck names, including a null legacy name, while preserving section absence.
   it("round-trips the endpoints section and never fabricates one", async () => {
     const { normalizeDesktopSettings } = await import("./bridge");
 
@@ -2958,8 +2959,8 @@ describe("desktop settings (PRD 803)", () => {
       appearance: { mode: "dark" },
       endpoints: {
         remote: [
-          { host: "build-box", id: "deck0000000000aa", port: 2222, user: "deploy", identity: "~/.ssh/id_ed25519", jump: "bastion", socket: "/run/user/1000/dot-agent-deck-attach.sock" },
-          { host: "ci-box", id: "deck0000000000bb", port: 22 },
+          { host: "build-box", id: "deck0000000000aa", name: "build", port: 2222, user: "deploy", identity: "~/.ssh/id_ed25519", jump: "bastion", socket: "/run/user/1000/dot-agent-deck-attach.sock" },
+          { host: "ci-box", id: "deck0000000000bb", name: null, port: 22 },
         ],
         selection: "deck0000000000aa",
       },
