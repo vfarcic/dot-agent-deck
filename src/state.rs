@@ -12042,6 +12042,9 @@ pub async fn handle_spawn_role_with_state(
             role_name: signal.role.clone(),
             is_start_role: false,
         }],
+        // Issue #1395: a spawned role is never the start role, which alone
+        // carries the context path.
+        context_path: None,
     }));
 
     SpawnRoleResponse {

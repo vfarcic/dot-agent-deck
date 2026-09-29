@@ -3898,6 +3898,13 @@ without depending on the config struct API.
 - **Does not assert:** a real agent or the `/clear` trigger, which shares the re-arm helper with compaction.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`).
 
+##### orchestration/remit/009 — A live-surfaced start-role tab re-arms from its own unique context file.
+- **Layer:** L2 lane 1 (real-binary PTY TUI attached before a headless daemon starts a prepared orchestration).
+- **Agent:** synthetic shell start role and `cat` worker; no credential.
+- **Asserts:** the already-attached TUI receives the first orchestration as a live surface. A later preparation in the same project overwrites the compatibility mirror; compaction of the first tab publishes a new context containing only its own brief.
+- **Does not assert:** a real agent or the `/clear` trigger, which shares the re-arm helper with compaction.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`).
+
 #### orchestration/layout
 
 ##### orchestration/layout/001 — Seven decks fit the single-column orchestration card area without scrolling (PRD #147).

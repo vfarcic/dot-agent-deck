@@ -2372,6 +2372,22 @@ pub struct OrchestrationSurface {
     pub orchestration_id: Option<String>,
     /// The spawned role panes, in role order.
     pub roles: Vec<OrchestrationSurfaceRole>,
+    /// Issue #1395 item 1: the per-publish orchestrator context file this
+    /// orchestration's start role was started with — the live-surface analogue
+    /// of [`crate::agent_pty::AgentRecord::orchestrator_context_path`], filled
+    /// by the daemon from what it recorded
+    /// ([`crate::state::AppState::orchestration_context_paths`]), never from a
+    /// client-supplied value. Present only on a surface that carries the start
+    /// role; the TUI sets it on the tab so compaction and `/clear` re-arm from
+    /// the tab's own file, and a later surface without it leaves the tab's path
+    /// alone.
+    ///
+    /// `None` from a daemon predating the field, for a surface of non-start
+    /// roles, and for a start the daemon holds no file for — the TUI then keeps
+    /// the fixed-path mirror fallback. Additive optional, so an older TUI
+    /// ignores it and no `PROTOCOL_VERSION` bump is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_path: Option<String>,
 }
 
 /// One role pane of a live-surfaced orchestration (see [`OrchestrationSurface`]).
@@ -3061,6 +3077,7 @@ mod tests {
                 display_title: None,
                 orchestration_id: None,
                 roles: Vec::new(),
+                context_path: None,
             }))
             .expect("serialize");
         assert!(matches!(
@@ -3117,6 +3134,36 @@ mod tests {
         }
     }
 
+    /// Issue #1395 item 1: `OrchestrationSurface::context_path` is additive
+    /// optional — an older daemon's surface (no key) decodes as `None`, `None`
+    /// puts no key on the wire, and a value round-trips.
+    #[test]
+    fn orchestration_surface_context_path_is_additive_optional() {
+        let legacy = r#"{"kind":"orchestration_surface","name":"n","cwd":"/p","roles":[]}"#;
+        let BroadcastMsg::OrchestrationSurface(back) =
+            serde_json::from_str::<BroadcastMsg>(legacy).expect("a surface without the field")
+        else {
+            panic!("expected a BroadcastMsg::OrchestrationSurface");
+        };
+        assert_eq!(back.context_path, None);
+        let wire = serde_json::to_value(BroadcastMsg::OrchestrationSurface(back.clone())).unwrap();
+        assert!(
+            wire.get("context_path").is_none(),
+            "None must be omitted from the wire: {wire}"
+        );
+
+        let path = "/p/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        let with_path = OrchestrationSurface {
+            context_path: Some(path.into()),
+            ..back
+        };
+        let json = serde_json::to_string(&BroadcastMsg::OrchestrationSurface(with_path)).unwrap();
+        let BroadcastMsg::OrchestrationSurface(round) = serde_json::from_str(&json).unwrap() else {
+            panic!("expected a BroadcastMsg::OrchestrationSurface");
+        };
+        assert_eq!(round.context_path.as_deref(), Some(path));
+    }
+
     // PRD #120: the live-orchestration-surface broadcast must round-trip
     // through the same `BroadcastMsg` wire the daemon forwards over KIND_EVENT,
     // and tag itself `orchestration_surface` so it's distinguishable from the
@@ -3142,6 +3189,7 @@ mod tests {
                     is_start_role: false,
                 },
             ],
+            context_path: None,
         });
         let json = serde_json::to_string(&msg).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

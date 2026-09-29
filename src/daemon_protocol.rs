@@ -4355,7 +4355,15 @@ async fn handle_connection(
                     // record is published and the role registered, before the
                     // reply. See `crate::spawn::surface_attach_started_agent`
                     // for what is emitted and why the sending TUI is unaffected.
-                    if let Some(record) = registry.agent_record_any(&id) {
+                    if let Some(mut record) = registry.agent_record_any(&id) {
+                        // Issue #1395 item 1: the start role's surface carries
+                        // the context file recorded just above, so a live tab
+                        // re-arms from its own file. Stamped from daemon state
+                        // only — the `ListAgents` rule — never from the request.
+                        state
+                            .read()
+                            .await
+                            .attach_orchestrator_context_paths(std::slice::from_mut(&mut record));
                         crate::spawn::surface_attach_started_agent(
                             &event_tx,
                             &record,

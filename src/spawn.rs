@@ -989,6 +989,10 @@ pub async fn spawn(
                     &roles,
                     &agents,
                     &orchestration_id,
+                    // Issue #1395: the file this spawn published for its
+                    // orchestrator — the same value recorded above — so a live
+                    // tab re-arms from it rather than from the mirror.
+                    context_path.as_deref(),
                 );
                 // …and give every role card its ROLE NAME, the same way the
                 // single-agent branch names its card: a synthetic `SessionStart`
@@ -2927,6 +2931,12 @@ pub(crate) fn surface_attach_started_agent(
                     role_name: role_name.clone(),
                     is_start_role: *is_start_role,
                 }],
+                // Issue #1395: stamped onto the start role's record by the
+                // caller from daemon state; `None` for every other role.
+                context_path: record
+                    .orchestrator_context_path
+                    .clone()
+                    .filter(|_| *is_start_role),
             };
             let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(surface));
             // After the surface, as `spawn` orders it, so the tab exists before
@@ -3044,6 +3054,7 @@ fn dispatched_orchestration_display_title(name: &str, cwd: &str) -> Option<Strin
 /// TUI attaches to the live PTY — it resolves the pane id through `list_agents`
 /// rather than via a registry agent id, so no `agent_id` rides on the wire.
 /// Delivery is best-effort: `send` errs only when there are no subscribers.
+#[allow(clippy::too_many_arguments)]
 fn surface_spawned_orchestration(
     event_tx: &broadcast::Sender<BroadcastMsg>,
     name: &str,
@@ -3056,6 +3067,7 @@ fn surface_spawned_orchestration(
     roles: &[RoleSpawn],
     agents: &[SpawnedAgent],
     orchestration_id: &str,
+    context_path: Option<&Path>,
 ) {
     let surface_roles = roles
         .iter()
@@ -3073,6 +3085,7 @@ fn surface_spawned_orchestration(
         display_title,
         orchestration_id: Some(orchestration_id.to_string()),
         roles: surface_roles,
+        context_path: context_path.map(|p| p.to_string_lossy().into_owned()),
     };
     let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(surface));
 }
@@ -7736,6 +7749,34 @@ mod tests {
                 .map(String::as_str),
             Some("builder")
         );
+    }
+
+    /// Issue #1395 item 1: the start role's surface carries the context path
+    /// stamped onto its record from daemon state; a non-start role's never
+    /// does, even if its record somehow carried one.
+    #[test]
+    fn attach_started_surface_carries_the_context_path_for_the_start_role_only() {
+        let path =
+            "/work/team/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        let (tx, mut rx) = broadcast::channel(8);
+        for start in [true, false] {
+            let mut membership = orchestration_membership("lead");
+            if let TabMembership::Orchestration { is_start_role, .. } = &mut membership {
+                *is_start_role = start;
+            }
+            let mut record = attach_record(Some("desktop-ab-0"), Some("lead"), Some(membership));
+            record.orchestrator_context_path = Some(path.into());
+            surface_attach_started_agent(&tx, &record, None);
+            let msgs = drain(&mut rx);
+            let Some(BroadcastMsg::OrchestrationSurface(surface)) = msgs.first() else {
+                panic!("expected a surface first, got {msgs:?}");
+            };
+            assert_eq!(
+                surface.context_path.as_deref(),
+                start.then_some(path),
+                "start role = {start}"
+            );
+        }
     }
 
     /// PRD #1223: nothing is announced for a pane with no pane id, a mode pane,

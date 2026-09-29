@@ -1424,6 +1424,21 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
 #[test]
 #[cfg(unix)]
 fn orchestration_remit_008_hydrated_tab_rearms_from_its_own_context() {
+    assert_attached_tab_rearms_from_own_context(false);
+}
+
+/// Scenario: Attach a TUI before the first orchestration starts, then prepare
+/// a second brief in the same project. When the live-surfaced first tab
+/// compacts, it republishes its own brief instead of the later mirror.
+#[spec("orchestration/remit/009")]
+#[test]
+#[cfg(unix)]
+fn orchestration_remit_009_live_surface_rearms_from_its_own_context() {
+    assert_attached_tab_rearms_from_own_context(true);
+}
+
+#[cfg(unix)]
+fn assert_attached_tab_rearms_from_own_context(live_surface: bool) {
     let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
     let project = common::harness_tempdir().expect("create hydrated orchestration project");
     std::fs::write(
@@ -1449,16 +1464,41 @@ fn orchestration_remit_008_hydrated_tab_rearms_from_its_own_context() {
         assert!(response.ok, "prepare {task} failed: {:?}", response.error);
         response.workflow_prepared.expect("prepared binding")
     };
-    let first = prepare("FIRST-HYDRATED-BRIEF-008");
-    let second = prepare("SECOND-MIRROR-BRIEF-008");
-    assert_ne!(first.context_path, second.context_path);
+    let (first_brief, second_brief, title, run_id) = if live_surface {
+        (
+            "FIRST-LIVE-BRIEF-009",
+            "SECOND-MIRROR-BRIEF-009",
+            "Live first run",
+            "remit-live-first-009",
+        )
+    } else {
+        (
+            "FIRST-HYDRATED-BRIEF-008",
+            "SECOND-MIRROR-BRIEF-008",
+            "Hydrated first run",
+            "remit-hydrated-first-008",
+        )
+    };
+    let first = prepare(first_brief);
+    let second = (!live_surface).then(|| prepare(second_brief));
     let mirror = cwd.join(".dot-agent-deck/orchestrator-context.md");
-    assert!(
-        std::fs::read_to_string(&mirror)
-            .expect("read the later compatibility mirror")
-            .contains("SECOND-MIRROR-BRIEF-008"),
-        "the mirror must hold the later brief before the TUI attaches"
-    );
+    let launch_deck = || {
+        TuiDeck::builder()
+            .with_pty_size(120, 40)
+            .with_env(
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                daemon.attach_socket.to_string_lossy().to_string(),
+            )
+            .with_env(
+                "DOT_AGENT_DECK_SOCKET",
+                daemon.hook_socket.to_string_lossy().to_string(),
+            )
+            .launch_with_fixture("minimal")
+    };
+    let deck = live_surface.then(&launch_deck);
+    if let Some(deck) = &deck {
+        deck.wait_for_string("No active agents");
+    }
 
     for (role_index, role) in first.roles.iter().enumerate() {
         let command = if role.start {
@@ -1475,7 +1515,7 @@ fn orchestration_remit_008_hydrated_tab_rearms_from_its_own_context() {
                 cols: 80,
                 env: vec![(
                     "DOT_AGENT_DECK_PANE_ID".into(),
-                    format!("remit-008-{role_index}"),
+                    format!("{run_id}-{role_index}"),
                 )],
                 display_name: Some(role.name.clone()),
                 tab_membership: Some(TabMembership::Orchestration {
@@ -1484,8 +1524,8 @@ fn orchestration_remit_008_hydrated_tab_rearms_from_its_own_context() {
                     role_name: role.name.clone(),
                     is_start_role: role.start,
                     orchestration_cwd: Some(cwd_wire.clone()),
-                    display_title: Some("Hydrated first run".into()),
-                    orchestration_id: Some("remit-hydrated-first-008".into()),
+                    display_title: Some(title.into()),
+                    orchestration_id: Some(run_id.into()),
                 }),
                 agent_type: None,
                 seed: None,
@@ -1501,22 +1541,28 @@ fn orchestration_remit_008_hydrated_tab_rearms_from_its_own_context() {
     let record = role_agent_record(&daemon.attach_socket, "orchestrator");
     let pane_id = record.pane_id_env.expect("start role pane id");
 
-    let deck = TuiDeck::builder()
-        .with_pty_size(120, 40)
-        .with_env(
-            "DOT_AGENT_DECK_ATTACH_SOCKET",
-            daemon.attach_socket.to_string_lossy().to_string(),
-        )
-        .with_env(
-            "DOT_AGENT_DECK_SOCKET",
-            daemon.hook_socket.to_string_lossy().to_string(),
-        )
-        .launch_with_fixture("minimal");
-    deck.wait_until_grid("hydrated orchestration tab", |grid| {
-        grid.lines()
-            .next()
-            .is_some_and(|tabs| tabs.contains("Hydrated first run"))
+    let second = second.unwrap_or_else(|| prepare(second_brief));
+    assert_ne!(first.context_path, second.context_path);
+    assert!(
+        std::fs::read_to_string(&mirror)
+            .expect("read the later compatibility mirror")
+            .contains(second_brief),
+        "the mirror must hold the later brief before compaction"
+    );
+    let deck = deck.unwrap_or_else(launch_deck);
+    deck.wait_until_grid("first orchestration tab", |grid| {
+        grid.lines().next().is_some_and(|tabs| tabs.contains(title))
     });
+    assert!(
+        wait_for_applied(
+            &daemon.attach_socket,
+            &pane_id,
+            INJECTED_EVENT_APPLIED_TIMEOUT,
+            |s| { s.live_target.is_some() }
+        ),
+        "the start role did not publish its live target before compaction; grid:\n{}",
+        deck.snapshot_grid()
+    );
 
     let before: std::collections::HashSet<_> = std::fs::read_dir(cwd.join(".dot-agent-deck"))
         .expect("list context files before compaction")
@@ -1524,7 +1570,7 @@ fn orchestration_remit_008_hydrated_tab_rearms_from_its_own_context() {
         .map(|entry| entry.path())
         .collect();
     let event = AgentEvent {
-        session_id: "remit-008-compaction".into(),
+        session_id: format!("{run_id}-compaction"),
         agent_type: AgentType::Codex,
         event_type: EventType::Compacting,
         tool_name: None,
@@ -1551,7 +1597,8 @@ fn orchestration_remit_008_hydrated_tab_rearms_from_its_own_context() {
             Duration::from_secs(10),
             |s| { s.status == dot_agent_deck::state::SessionStatus::Compacting }
         ),
-        "daemon did not apply the hydrated start role's compaction"
+        "daemon did not apply the first run's start-role compaction; records: {:?}",
+        common::agent_records_on(&daemon.attach_socket)
     );
 
     let rearmed = || {
@@ -1573,15 +1620,16 @@ fn orchestration_remit_008_hydrated_tab_rearms_from_its_own_context() {
     };
     assert!(
         common::wait_until(REASSERTION_DELIVERY_TIMEOUT, || rearmed().is_some()),
-        "hydrated tab never published a new context after compaction; grid:\n{}",
+        "first tab never published a new context after compaction; grid:\n{}",
         deck.snapshot_grid()
     );
     let rearmed_path = rearmed().expect("new context path");
     let content = std::fs::read_to_string(&rearmed_path).expect("read rearmed context");
     assert!(
-        content.contains("FIRST-HYDRATED-BRIEF-008")
-            && !content.contains("SECOND-MIRROR-BRIEF-008"),
-        "the hydrated first tab must rearm from its own file, not the later mirror; {} contains:\n{content}",
-        rearmed_path.display()
+        content.contains(first_brief) && !content.contains(second_brief),
+        "the first tab must rearm from its own file, not the later mirror; {}: first={}, second={}",
+        rearmed_path.display(),
+        content.contains(first_brief),
+        content.contains(second_brief)
     );
 }

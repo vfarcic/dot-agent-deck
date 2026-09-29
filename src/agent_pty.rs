@@ -792,6 +792,18 @@ pub fn is_windows_absolute_path(value: &str) -> bool {
     bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && is_sep(bytes[2])
 }
 
+/// Issue #1395: whether an [`OrchestrationSurface::context_path`] is shaped
+/// like what the daemon records — an absolute, control-free path whose last
+/// component is a per-publish `orchestrator-context-<32 hex>.md`. Never the
+/// fixed-path mirror, which the TUI already falls back to without being told.
+fn is_valid_surface_context_path(value: &str) -> bool {
+    is_valid_orchestration_cwd(value)
+        && std::path::Path::new(value)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(crate::orchestrator_context::is_unique_context_file_name)
+}
+
 /// PRD #120 (H1/M1/L2): wire-boundary validation for the live
 /// [`OrchestrationSurface`] broadcast, mirroring [`validate_tab_membership`]
 /// for the reconnect path. The receive path
@@ -820,6 +832,9 @@ pub fn is_windows_absolute_path(value: &str) -> bool {
 ///   [`validate_tab_membership`]).
 /// - **L2:** `cwd` drives `load_project_config` and is the bucket key, so it
 ///   must be a valid ABSOLUTE orchestration cwd → reject otherwise.
+/// - **Issue #1395:** `context_path` is read back by the tab's re-arm and has a
+///   defined `None` fallback (the fixed-path mirror), so a value that is not an
+///   absolute, control-free per-publish context path is nulled out.
 ///
 /// A surface left with no roles after the per-role drops is rejected: an
 /// orchestration always has ≥1 role, and a zero-role surface can only build a
@@ -858,6 +873,17 @@ pub fn validate_orchestration_surface(
         .is_some_and(|t| !is_valid_display_name(t))
     {
         surface.display_title = None;
+    }
+    // Issue #1395: the context path is read back by the tab's re-arm, and its
+    // absence has a defined fallback (the fixed-path mirror), so a value that
+    // is not an absolute, control-free path naming a per-publish context file
+    // is nulled out rather than dropping the tab.
+    if surface
+        .context_path
+        .as_deref()
+        .is_some_and(|p| !is_valid_surface_context_path(p))
+    {
+        surface.context_path = None;
     }
     // Drop any role that would OOM the synthesis allocation (role_index over the
     // cap) or smuggle control bytes into the tab via a non-empty role_name. An
@@ -14305,6 +14331,7 @@ mod spawn_tests {
             display_title: None,
             orchestration_id: None,
             roles: vec![surface_role(0, "orchestrator"), surface_role(1, "worker")],
+            context_path: None,
         }
     }
 
@@ -14355,6 +14382,7 @@ mod spawn_tests {
             display_title: None,
             orchestration_id: None,
             roles: vec![surface_role(ORCHESTRATION_ROLE_INDEX_MAX + 1, "rogue")],
+            context_path: None,
         };
         assert!(validate_orchestration_surface(surface).is_none());
     }
@@ -14423,6 +14451,32 @@ mod spawn_tests {
         assert!(validated.roles.iter().all(|r| r.role_name != "\x1b[31mpwn"));
     }
 
+    /// Issue #1395: a well-formed per-publish context path survives; anything
+    /// else — relative, control bytes, the fixed-path mirror, any other name —
+    /// is nulled out without dropping the surface.
+    #[test]
+    fn validate_orchestration_surface_nulls_a_malformed_context_path() {
+        let good = "/work/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        let mut surface = well_formed_surface();
+        surface.context_path = Some(good.into());
+        let validated = validate_orchestration_surface(surface).expect("valid surface");
+        assert_eq!(validated.context_path.as_deref(), Some(good));
+
+        for bad in [
+            ".dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md",
+            "/work\x1b[31m/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md",
+            "/work/.dot-agent-deck/orchestrator-context.md",
+            "/etc/passwd",
+            "",
+        ] {
+            let mut surface = well_formed_surface();
+            surface.context_path = Some(bad.into());
+            let validated =
+                validate_orchestration_surface(surface).expect("a bad path keeps the surface");
+            assert_eq!(validated.context_path, None, "{bad:?} must be nulled");
+        }
+    }
+
     // An empty role_name is the older-daemon wire shape — synthesis falls back
     // to a `role-{i}` placeholder, so it must NOT be dropped.
     #[test]
@@ -14433,6 +14487,7 @@ mod spawn_tests {
             display_title: None,
             orchestration_id: None,
             roles: vec![surface_role(0, "")],
+            context_path: None,
         };
         let validated = validate_orchestration_surface(surface).expect("empty role_name accepted");
         assert_eq!(validated.roles.len(), 1);
