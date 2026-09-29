@@ -1,186 +1,127 @@
 # Getting Started
 
-Agent Deck has two clients: a terminal UI (the TUI, `dot-agent-deck`) and a desktop app. Both are clients of the same background daemon, which owns the agents, so an agent started from one shows up in the other. The desktop app is an alpha; it covers the Dashboard, New agent, several daemons at once, Settings and voice control (see [Desktop app](desktop/index.md)). The desktop app needs a running daemon, and the simplest way to get one is to install and run the TUI, so this page starts there.
+This page takes you from nothing to one agent running in the deck, then points to the features you set up next. The steps say how to check that they worked.
 
-## Quick Start
+## How the pieces fit
 
-### macOS
+- **The daemon** runs in the background and owns the agents: their processes, terminals and statuses. The first `dot-agent-deck` run starts it; you do not start it yourself.
+- **The TUI** (`dot-agent-deck`) is a terminal client of that daemon. Quitting it can leave the agents running.
+- **The desktop app** (alpha) is a second client of the same daemon. An agent started from either client shows up in both. It covers the dashboard, starting agents, several daemons at once, settings and voice control; see [Desktop app](desktop/index.md). It connects to a daemon but does not start one, so start with the TUI.
+
+The deck tracks the status of five agents: [Claude Code](https://www.anthropic.com/claude-code) (`claude`), [OpenCode](https://opencode.ai) (`opencode`), [Pi](https://github.com/earendil-works/pi) (`pi`), [Codex](https://github.com/openai/codex) (`codex`) and [Devin](https://devin.ai) (`devin`). A pane can run any other command too, without status tracking.
+
+## Step 1: Install
+
+**macOS or Linux with Homebrew:**
 
 ```bash
-# 1. Install via Homebrew
 brew tap vfarcic/tap && brew install dot-agent-deck
-
-# 2. Launch the dashboard (hooks are auto-installed for detected agents)
-# Your previous workspace is restored automatically
-dot-agent-deck
 ```
 
-No Homebrew? Download the binary instead — `dot-agent-deck-darwin-arm64` for Apple Silicon, `dot-agent-deck-darwin-amd64` for Intel. See [Download Binary](installation.md#download-binary).
-
-### Linux
+**Linux without Homebrew** (use `arm64` in place of `amd64` on ARM):
 
 ```bash
-# 1. Download the binary. Swap `amd64` for `arm64` on ARM machines.
 mkdir -p ~/.local/bin
 curl -fsSL -o ~/.local/bin/dot-agent-deck \
   https://github.com/vfarcic/dot-agent-deck/releases/latest/download/dot-agent-deck-linux-amd64
 chmod +x ~/.local/bin/dot-agent-deck
+```
 
-# 2. Launch the dashboard (hooks are auto-installed for detected agents)
-# Your previous workspace is restored automatically
+**macOS without Homebrew:** download `dot-agent-deck-darwin-arm64` (Apple silicon) or `dot-agent-deck-darwin-amd64` (Intel) the same way; see [Download Binary](installation.md#download-binary).
+
+**Windows:** native Windows is not supported ([#164](https://github.com/vfarcic/dot-agent-deck/issues/164)). Install [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) and follow the Linux steps inside it.
+
+[Installation](installation.md) has the other methods (Nix, building from source) and the desktop app.
+
+**Check:**
+
+```bash
+dot-agent-deck --version    # prints: dot-agent-deck <version>
+```
+
+If this says `command not found` after the Linux download, add `export PATH="$HOME/.local/bin:$PATH"` to your shell's rc file and open a new shell.
+
+`dot-agent-deck docs` lists the documentation built into this binary, and `dot-agent-deck docs <topic>` prints a page, for example `dot-agent-deck docs orchestration`. That copy matches the installed version.
+
+## Step 2: Launch the deck
+
+```bash
 dot-agent-deck
 ```
 
-If `dot-agent-deck` comes back "command not found", `~/.local/bin` is not on your `PATH` — add `export PATH="$HOME/.local/bin:$PATH"` to your shell rc. [Homebrew](installation.md#homebrew-macos--linux) and [Nix](installation.md#nix) work on Linux too if you already use either.
+On startup the deck installs its status hooks for the agents it detects (see [Installation → Agent hooks](installation.md#agent-hooks)) and restores your previous workspace, if you had one (see [Resuming Sessions](session-management.md#resuming-sessions)).
 
-### Desktop app
+**Check:** on a first run the TUI shows an empty dashboard reading `No active agents. Press Ctrl+n to create an agent.`, with a row of buttons along the bottom and a ` COMMAND ` chip at its left.
 
-The desktop app is an **alpha** and a separate download, for Apple silicon Macs and Linux amd64. There is no Intel Mac, Linux arm64 or Windows build. It connects to a daemon rather than starting one, so install and run the TUI above first; [Installation → How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon) has the other way.
+![The TUI with no agents: “No active agents. Press Ctrl+n to create an agent.” above the command bar, which starts with a COMMAND chip](/img/dashboard-empty-tui.png)
 
-#### macOS (Apple silicon)
-
-1. Download `dot-agent-deck-desktop-alpha-macos-arm64.dmg` from the [latest release](https://github.com/vfarcic/dot-agent-deck/releases/latest).
-2. Check that it was built by this project's release workflow, and do not install it if the check fails ([Installation → Verify the download](installation.md#verify-the-download) says what a pass looks like):
-
-   ```bash
-   gh attestation verify dot-agent-deck-desktop-alpha-macos-arm64.dmg \
-     --repo vfarcic/dot-agent-deck \
-     --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml
-   ```
-
-3. Open the `.dmg` and drag **Agent Deck** to **Applications**.
-4. Launch **Agent Deck** from Applications. macOS should ask only to confirm opening an app downloaded from the internet. If it reports the app as damaged or from an unidentified developer instead, read that release's notes and follow [Installation → Desktop app → macOS](installation.md#macos): a release can ship an unsigned `.dmg`.
-
-#### Linux (amd64, Debian and Ubuntu)
-
-On Linux the desktop app ships only as a `.deb` package, which installs with `apt` on Debian, Ubuntu and other distributions that use it.
-
-```bash
-# 1. Download the package
-curl -fsSL -o dot-agent-deck-desktop-alpha-linux-amd64.deb \
-  https://github.com/vfarcic/dot-agent-deck/releases/latest/download/dot-agent-deck-desktop-alpha-linux-amd64.deb
-
-# 2. Check that it was built by this project's release workflow.
-#    If this does not report a verified attestation, stop: do not install it.
-gh attestation verify dot-agent-deck-desktop-alpha-linux-amd64.deb \
-  --repo vfarcic/dot-agent-deck \
-  --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml
-
-# 3. Install it; apt also pulls in the libraries it needs
-sudo apt install ./dot-agent-deck-desktop-alpha-linux-amd64.deb
-
-# 4. Launch it, or pick Agent Deck from your application menu
-dot-agent-deck-desktop
-```
-
-The check needs the [GitHub CLI](https://cli.github.com/) (`gh`). [Installation → Desktop app](installation.md#desktop-app) has the rest: signing, what to do if the app will not open, and keeping the app and the daemon on the same release.
-
-### Windows
-
-Native Windows is [not supported yet](https://github.com/vfarcic/dot-agent-deck/issues/164). For now, install [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) and follow the Linux instructions inside your WSL shell.
-
-> **Tip:** [Installation](installation.md) has every option side by side — Homebrew, a downloaded binary, Nix, building from source, and the desktop app — with what each one suits.
-
-Once the dashboard is running, press `?` inside the app to see all shortcuts. The dashboard is also fully mouse-clickable: a button bar along the bottom exposes the main commands (each labelled with its keyboard shortcut), and cards, tab headers, dialogs, the directory picker, and forms all respond to clicks. See [Keyboard Shortcuts → Mouse](keyboard-shortcuts.md#mouse).
-
-> On launch, dot-agent-deck automatically sets up live status, tool, and prompt tracking for the agents it detects — [Claude Code](https://www.anthropic.com/claude-code), [OpenCode](https://opencode.ai), [Pi](https://github.com/earendil-works/pi), [Codex](https://github.com/openai/codex), and [Devin](https://devin.ai). No configuration is needed. See [Troubleshooting](troubleshooting.md#hooks) if you want to manage this manually.
-
-## Launching
-
-**TUI:**
-
-Running `dot-agent-deck` opens a two-column layout with native embedded terminal panes:
-
-- **Left (1/3)** — the dashboard, displaying a card grid of agents
-- **Right (2/3)** — agent panes where Claude Code, OpenCode, Pi, Codex, or Devin instances run (stacked by default — only the focused pane is shown, at full height; toggle to tiled with `Ctrl+t` to see every pane at once)
-
-![The TUI with four agents: a column of agent cards on the left, each with its status (Idle, Working, Needs Input), directory and last prompt, and the focused agent's terminal pane on the right](/img/dashboard-tui.png)
-
-On a first run there are no agents yet, and the dashboard says so:
-
-![The TUI with no agents: “No active sessions. Press Ctrl+n to create a pane.” above the command bar](/img/dashboard-empty-tui.png)
-
-**Desktop:**
-
-Opening the desktop app shows the **Agent dashboard**: every agent as a row, with its status, grouped by daemon and by orchestration. It connects to the daemon on this machine and does not start one; if none is running, the Dashboard says **Daemon disconnected** (see [Installation → How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)).
-
-![The desktop app's dashboard with four agents in one daemon section, each row showing its status (running or waiting), name and uptime, and New agent, Columns and Refresh at the top](/img/dashboard-desktop.png)
-
-On a first run the daemon is healthy and owns no agents, and the Dashboard says **No agents are running yet**, with a **New agent** button:
+**Desktop app instead:** install it ([Installation → Desktop app](installation.md#desktop-app)), keep a daemon running (the TUI above is enough; see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)) and open **Agent Deck**. **Check:** the Dashboard says **No agents are running yet** and offers **New agent**. If it says **Daemon disconnected**, no daemon is running; start one and press **Reconnect**.
 
 ![The desktop app's dashboard with no agents: “No agents are running yet” and a New agent button](/img/dashboard-empty-desktop.png)
 
-Clicking a row opens that agent's terminal in a full-window pane; see [Desktop app → Dashboard](desktop/dashboard.md).
-
-## How it runs
-
-The deck is a small background daemon with clients on top of it: the TUI and the desktop app. The first `dot-agent-deck` invocation auto-spawns the daemon and connects to it over a per-user Unix socket — you don't have to start anything manually, and you don't have to clean anything up. The same daemon backs both local runs and `dot-agent-deck connect` (remote) sessions; there is no separate "local mode".
-
-The daemon owns the agent processes, which has one user-facing consequence: closing the TUI is a *detach*, not a kill. Your agents keep running. Reattach with `dot-agent-deck` later and the dashboard rehydrates with the agents still in their previous state. Detach, sleep, a network drop, or switching machines — none of them stop your agents, because the daemon outlives the TUI in every case. The only thing that stops a running agent is *you* choosing to upgrade-and-restart the daemon onto a new binary version, and even then you are asked first (see [Upgrading](installation.md#upgrading)).
-
-The desktop app attaches to that same daemon as a second client; it does not start one itself (see [Installation → How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)).
-
-About 30 seconds after every client (the TUI, the desktop app) has disconnected and every managed agent is gone, the daemon exits on its own and the socket is cleaned up. Override the window with `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` (in seconds; set `0` to disable idle shutdown and keep the daemon up indefinitely).
-
-## Basic Workflow
+## Step 3: Start an agent
 
 **TUI:**
 
-1. Launch the dashboard with `dot-agent-deck`
-2. Press `Ctrl+n` to open the **New Agent** form — pick a directory, give the agent a name, and enter the command to run (typically `claude`, `opencode`, `pi`, `codex`, or `devin`)
-3. Watch the agent's status, tool calls, and prompts update on the dashboard in real-time
-4. To type into an agent, move keyboard focus into its pane: press `Ctrl+d` to enter command mode, then either `j`/`k` (or `Down`/`Up`) to cycle through cards or `1`–`9` to jump directly to a card
-5. To close a pane, press `Ctrl+d` to leave it, then `Ctrl+w` on the selected card and choose **Close** in the confirmation. While you're typing inside a pane, `Ctrl+w` is the shell's ordinary delete-previous-word — it never closes anything. The dashboard tab itself can't be closed.
-
-> **Tip:** The command can be any shell command, but real-time status, tool, and prompt tracking on the dashboard work for `claude`, `opencode`, `pi`, `codex`, and `devin`.
-
-> **Tip:** `Ctrl+d` toggles: press it in a pane to enter command / navigation mode, press it again to go back to the pane.
+1. Press `Ctrl+n`. A directory picker opens.
+2. Move with `j`/`k` (or the arrow keys), open the highlighted directory with `l` or `Enter`, and go up with `h`. When you are inside the directory the agent should work in, press `Space` to choose it. (`Enter` on a directory with no subdirectories also chooses it.)
+3. In the **New Agent** form, leave **Mode** on `No mode` and press `Enter` to move to **Name** (pre-filled from the directory), then `Enter` again to move to **Command**. Type the command, for example `claude`, and press `Enter` to submit. `Tab` / `Shift+Tab` also move between fields, and `Esc` cancels.
 
 ![The TUI's New Agent form over the dashboard: the chosen directory at the top, a Mode row with No mode selected and an orchestration, schedule and dispatcher as the other choices, then the Name field pre-filled from the directory, an empty Command field, and Submit and Cancel](/img/new-agent-tui.png)
 
 **Desktop:**
 
-1. Open the app. The **Agent dashboard** lists the agents of the daemon it is connected to.
-2. Click **New agent** (or press `Ctrl+N` / `⌘N` on the Dashboard). Choose a daemon, browse to a directory and press **Use this directory**, leave **Mode** on **No mode**, then give the agent a **Name** and a **Command** (typically `claude`, `opencode`, `pi`, `codex`, or `devin`; it is pre-filled from your `default_command` or last command) and press **Create agent**. See [Desktop app → New agent](desktop/new-agent.md).
-3. Watch the agent's row: its status, and whichever columns you chose with **Columns**, update as the agent works.
-4. To type into an agent, click its row. Its terminal opens in a full-window pane over the Dashboard; press `Escape` or **Back to dashboard** to return.
-5. To close an agent, use the stop control on its row (`Close <name> agent`) and confirm with **Close agent**.
+1. Click **New agent** (or press `Ctrl+N` / `⌘N` on the Dashboard).
+2. Choose the daemon, browse to a directory and press **Use this directory**.
+3. Leave **Mode** on **No mode**, check **Name** and **Command** (pre-filled from `default_command` or your last command), and press **Create agent**. See [Desktop app → New agent](desktop/new-agent.md).
 
 ![The desktop app's New agent dialog over the Dashboard: the Local daemon chosen under Daemon, a directory chosen in the browser, the Mode chips with No mode selected, the Name pre-filled from the directory, an empty Command field, and Discard and Create agent](/img/new-agent-desktop.png)
 
-## Orchestration
+**Check:** a card (TUI) or row (desktop) appears for the agent. After you give the agent a prompt, its status moves from **Idle** to **Thinking** or **Working** (desktop: **waiting** to **running**). If the status never changes while the agent visibly works, its hooks are not reaching the daemon; see [Troubleshooting → Hooks](troubleshooting.md#hooks). If the pane shows a `command not found` error for a bare `claude`, `codex` and so on, see [Troubleshooting](troubleshooting.md#a-bare-command-like-claude-opencode-pi-codex-or-devin-fails-to-spawn).
 
-Orchestrations let you run a pipeline of AI agents where a designated orchestrator coordinates work across specialist workers — a coder, a reviewer, an auditor, a release agent, or any roles that fit your workflow. Each worker runs in its own pane with its own model and instructions, working independently and reporting back when done. You set the pipeline up once in `.dot-agent-deck.toml` and the deck handles the rest.
+**TUI:**
 
-The fastest way to get the config is to let an agent generate it: press `Ctrl+d` then `g` on the dashboard, choose **Yes**, and the agent analyzes your project and proposes a config with suitable roles. Treat the result as a starting point and tune it as you learn what works for your project.
+![The TUI with four agents: a column of agent cards on the left, each with its status (Idle, Working, Needs Input), directory and last prompt, and the focused agent's terminal pane on the right](/img/dashboard-tui.png)
 
-Once you have a config, starting an orchestration is the same as starting any other agent. In the TUI it opens an orchestration tab:
+**Desktop:**
 
-1. Press `Ctrl+n`.
-2. Navigate to the project directory that contains `.dot-agent-deck.toml` with `[[orchestrations]]`.
-3. Cycle the **Mode** field (`Left`/`Right` or `h`/`l`) until the orchestration name appears.
-4. Press `Enter` — the deck opens a tab with a pane for every role.
+![The desktop app's dashboard with four agents in one daemon section, each row showing its status (running or waiting), name and uptime, and New agent, Columns and Refresh at the top](/img/dashboard-desktop.png)
 
-![The demo-loop orchestration tab: two role cards, planner and builder, stacked in the sidebar and both Working, each showing its prompt, its current tool and a Last: age of a few seconds, with the orchestrator role, planner, selected and its pane filling the right-hand side](/img/orchestration-tui.png)
+## Step 4: Type into the agent, and come back
 
-In the desktop app, choose the project directory in **New agent**, pick its `Orch: <name>` chip under **Mode**, and press **Activate orchestration**; the Dashboard then shows the run as one group. Generating the config with `g` is TUI-only.
+**TUI:** the deck has two modes. In **command mode** (the bottom-left chip reads ` COMMAND `) keys drive the deck; in the pane (the chip reads ` TYPING `) keys go to the agent.
 
-![The desktop app's Dashboard with an activated orchestration shown as one ORCHESTRATION group, a row per role and an ORCHESTRATOR badge on the start role](/img/orchestration-desktop.png)
+- `Ctrl+d` switches between the two.
+- In command mode, `j`/`k` select a card, `Enter` or `1`–`9` focus a pane, and `?` shows every shortcut.
+- `Ctrl+t` switches between showing only the focused pane (stacked, the default) and showing every pane (tiled).
+- Everything is clickable too: the buttons along the bottom carry their shortcuts.
 
-For the full reference, examples, and configuration options, see [Orchestration](orchestration.md).
+**Desktop:** click an agent's row to open its terminal full-window; `Escape` or **Back to dashboard** returns.
 
-## Dispatching Work in the Background
+[Keyboard Shortcuts](keyboard-shortcuts.md) lists every key and mouse action.
 
-Dispatcher mode lets you start work without stopping what you are doing. Tell a dispatcher pane what you want started — "work on the search bug" — and it sets up a separate, isolated copy of your repository and puts an agent, or a whole team, to work there. Start several and they run in parallel without colliding with each other or with your working tree.
+## Step 5: Close an agent, or quit
 
-Press `Ctrl+n`, navigate to the project directory, cycle the **Mode** field to **dispatcher**, and press `Enter`. Then just ask. In the desktop app, pick the **dispatcher** chip under **Mode** in **New agent**.
+- **Close one agent (TUI):** in command mode, select its card and press `Ctrl+w`, then choose **Close**. Inside a pane `Ctrl+w` is the shell's delete-word and closes nothing.
+- **Close one agent (desktop):** use the stop control on its row (`Close <name> agent`) and confirm with **Close agent**.
+- **Quit the TUI:** in command mode press `Ctrl+c` and choose **Detach** (agents keep running; the next `dot-agent-deck` shows them again) or **Stop** (stops the agents and the daemon).
 
-For the full reference — choosing one agent or a team, watching the units, and cleanup, see [Dispatcher Mode](dispatcher-mode.md).
+**Check:** after **Detach**, `dot-agent-deck daemon status` lists your agents with their status. After **Stop**, it prints `daemon status: unavailable (…)` and exits 1.
 
-## Schedules
+## How it runs
 
-Schedules let the daemon spawn an agent (or run a command) on a cron schedule — a nightly review, a recurring digest, a periodic health check — without you being at the keyboard. They are defined globally, so they apply across every project.
+The daemon outlives the TUI: detach, close the terminal or lose an ssh connection, and the agents keep running. Running `dot-agent-deck` again reattaches. Agents keep running until they exit by themselves or something stops them, for example closing them, quitting with **Stop**, `dot-agent-deck daemon stop --force`, restarting the daemon onto a new binary (the TUI asks first when agents are running; see [Upgrading](installation.md#upgrading)), or the machine shutting down.
 
-The fastest way to create one is to let an agent author it: press `Ctrl+n`, cycle the **Mode** field to **schedule**, and the throwaway pane walks you through building the entry. Or press `s` on the dashboard to open the **Schedules** manager and choose `[Add a]`. The desktop app's **New agent** offers the same **schedule** chip, and has no Schedules manager. Every schedule needs a command that launches a `claude`, `opencode`, `pi`, `codex`, or `devin` agent — directly (`claude`, `opencode`, `pi`, `codex`, `devin`) or via a wrapper like `devbox run agent-new` — which is what gives the run full status tracking.
+About 30 seconds after the last client disconnects, if no agent is running and no enabled schedule is registered, the daemon exits by itself. `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` sets that window in seconds (`0` keeps the daemon up until it is stopped). See [Configuration](configuration.md) for the other settings.
 
-For the full reference — cron syntax, the global config file, tab reuse, and supervisor recipes — see [Schedules](scheduled-tasks.md).
+## Next steps
+
+| Goal | Where |
+|---|---|
+| Run a team of agents where one coordinates the others | [Orchestration](orchestration.md). In the TUI, select an agent's card in command mode and press `g` to have that agent draft a `.dot-agent-deck.toml` for its directory. |
+| Start isolated background work by asking a dispatcher pane | [Dispatcher Mode](dispatcher-mode.md) |
+| Run a prompt on a cron schedule | [Schedules](scheduled-tasks.md) |
+| Run agents on another machine over ssh | [Remote Environments](remote-environments.md) |
+| Understand what each status means, and resume after a reboot | [Session Management](session-management.md) |
+| Set a default command, bells, or other settings | [Configuration](configuration.md) |
+| Fix something that is not working | [Troubleshooting](troubleshooting.md) |

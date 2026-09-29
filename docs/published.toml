@@ -15,42 +15,42 @@
 [[page]]
 slug = "getting-started"
 title = "Getting Started"
-description = "First run: launch the TUI, start an agent, and see how the daemon, the TUI and the desktop app fit together."
+description = "Install the binary, launch the deck, start one agent and check each step, then find the next feature to set up."
 
 [[page]]
 slug = "installation"
 title = "Installation"
-description = "Install, verify and upgrade the dot-agent-deck binary (Homebrew, release download, Nix or source) and the desktop app."
+description = "Install, verify, upgrade and uninstall the dot-agent-deck binary (Homebrew, release download, Nix or source), its agent hooks, and the desktop app; inspect and stop the local daemon."
 
 [[page]]
 slug = "session-management"
 title = "Session Management"
-description = "What each agent status means in both clients, and how to detach from and resume running agent sessions."
+description = "What each agent status and card marker means in both clients, and how to detach from, resume or clear your workspace."
 
 [[page]]
 slug = "orchestration"
 title = "Orchestration"
-description = "Define orchestrator and worker roles in .dot-agent-deck.toml, start an orchestration, and how delegation between roles works."
+description = "Set up a multi-role orchestration in .dot-agent-deck.toml, start it in either client, and the full role, delegate and work-done reference."
 
 [[page]]
 slug = "idle-workers-and-notifications"
 title = "Idle Workers & Notifications"
-description = "How the deck reports a stuck, waiting or exited worker to its orchestrator, and how to configure those reports."
+description = "What the deck reports to an orchestrator about a stuck, waiting, blocked or exited worker, and how to tune or turn the reports off."
 
 [[page]]
 slug = "dispatcher-mode"
 title = "Dispatcher Mode"
-description = "Start background work units (one agent or a team) by asking a dispatcher pane, and follow them until they report back."
+description = "Start background work units (one agent or a team) from a dispatcher pane, check they started, and clean up afterwards."
 
 [[page]]
 slug = "scheduled-tasks"
 title = "Schedules"
-description = "Run a prompt in a directory on a cron schedule, including dispatching agents onto open GitHub issues, with a full reference."
+description = "Run a prompt on a cron schedule, or dispatch agents onto open GitHub issues: set up, check, troubleshoot, plus the full schedules.toml, cron and schedule CLI reference."
 
 [[page]]
 slug = "configuration"
 title = "Configuration"
-description = "Daemon settings, environment variables, the project .dot-agent-deck.toml, and the desktop app's desktop.toml."
+description = "Every configuration file and environment variable: config.toml (default_command, default_dir, bell), the project .dot-agent-deck.toml, the experimental flag, and the desktop app's desktop.toml."
 
 [[page]]
 slug = "remote-environments"
@@ -65,7 +65,7 @@ description = "What a Linux or macOS host must provide before dot-agent-deck rem
 [[page]]
 slug = "remote-recipes"
 title = "Remote Recipes"
-description = "Starting points for getting a machine and bootstrapping a Linux or macOS host so dot-agent-deck remote add succeeds."
+description = "Bootstrap commands for a Linux or macOS host, the reverse-tunnel recipes, and reading remote doctor's output."
 
 [[page]]
 slug = "keyboard-shortcuts"
@@ -90,22 +90,22 @@ description = "Start an agent from the desktop app: choose the daemon, the direc
 [[page]]
 slug = "desktop/daemons"
 title = "Daemons"
-description = "Watch several daemons, local and remote over ssh, from the desktop app, and add or test them in Settings."
+description = "Watch local and remote (ssh) daemons from the desktop app: add, test, choose and remove them; the list is shared with the CLI's remotes.toml."
 
 [[page]]
 slug = "desktop/settings"
 title = "Settings"
-description = "The desktop app's settings: appearance, zoom, the settings file and its keyboard shortcuts."
+description = "The desktop app's settings and desktop.toml: appearance, zoom, the settings file's keys, and the app's keyboard shortcuts."
 
 [[page]]
 slug = "desktop/voice"
 title = "Voice Control"
-description = "Drive the desktop app by voice: the speech and command services it needs and what is sent where."
+description = "Turn on and use voice control in the desktop app: the speech and command services it needs, their settings, and what is sent where."
 
 [[page]]
 slug = "troubleshooting"
 title = "Troubleshooting"
-description = "Symptoms, causes and fixes for common problems with hooks, spawning agents, delegation, remotes and panes."
+description = "Symptoms, causes and fixes for common problems with logs, hooks, spawning agents, upgrades, delegation, panes, configuration, schedules, remotes and the desktop app."
 
 [[page]]
 slug = "license"

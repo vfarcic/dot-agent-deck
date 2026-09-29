@@ -1,28 +1,30 @@
 # Installation
 
-Agent Deck has two clients of one daemon: the terminal UI (the `dot-agent-deck` binary, which also contains the daemon and the CLI) and the [desktop app](desktop/index.md). Most of this page is the binary. The desktop app is a separate download, covered in [Desktop app](#desktop-app) below; on its own it does not start a daemon, so read [How the desktop app gets a daemon](#how-the-desktop-app-gets-a-daemon) before installing it.
+dot-agent-deck is one binary, `dot-agent-deck`, which is the TUI, the background daemon and the CLI. The [desktop app](desktop/index.md) is a separate, optional download and a second client of the same daemon. Install the binary first; the desktop app connects to a daemon but does not start one (see [How the desktop app gets a daemon](#how-the-desktop-app-gets-a-daemon)).
+
+After installing, `dot-agent-deck docs` lists the documentation built into the binary, and `dot-agent-deck docs <topic>` prints one page. That copy always matches the installed version, so prefer it over the website when the two might differ.
 
 ## Platform Support
 
-| Platform | Status |
-|---|---|
-| macOS (Intel & Apple Silicon) | Supported |
-| Linux (amd64 & arm64) | Supported |
-| Windows (via WSL) | Supported (runs as Linux) |
-| Desktop app | macOS on Apple Silicon (`.dmg`) and Linux amd64 (`.deb`), as an alpha. No Intel Mac, Linux arm64 or Windows build. See [Desktop app](#desktop-app). |
-| Windows (native) | Not yet — the daemon still reports `Unsupported` on Windows and there is no `.exe` in the release artifacts. Progress is tracked in [#164](https://github.com/vfarcic/dot-agent-deck/issues/164); comment there if you need this. |
+| Platform | Binary (TUI, daemon, CLI) | Desktop app (alpha) |
+|---|---|---|
+| Linux amd64 | Yes | Yes (`.deb`, for Debian, Ubuntu and other `apt`-based distributions) |
+| Linux arm64 | Yes | No |
+| macOS Apple silicon | Yes | Yes (`.dmg`) |
+| macOS Intel | Yes | No |
+| Windows via WSL | Yes, install the Linux binary inside WSL | No |
+| Windows native | No ([#164](https://github.com/vfarcic/dot-agent-deck/issues/164)) | No |
 
 ## Choose an install method
 
-| Method | Best for |
+| Method | Use it when |
 |---|---|
-| [Homebrew](#homebrew-macos--linux) | macOS or Linux, if you already use `brew` |
-| [Download a binary](#download-binary) | anywhere, with no package manager |
-| [Nix](#nix) | Nix, NixOS and home-manager users |
-| [Build from source](#build-from-source) | contributors, or a platform with no published build |
-| [Desktop app](#desktop-app) | a graphical client beside the TUI, on an Apple Silicon Mac or Linux amd64 (alpha) |
+| [Homebrew](#homebrew-macos--linux) | macOS or Linux, and `brew` is already installed |
+| [Download a binary](#download-binary) | No package manager, or you want a specific release file |
+| [Nix](#nix) | Nix with flakes, NixOS or home-manager (not Intel macOS) |
+| [Build from source](#build-from-source) | Contributing, or a platform with no published binary |
 
-The first four get you the same `dot-agent-deck` binary, which is the TUI, the daemon and the CLI; skip to whichever suits you. The desktop app is a separate download and a second client of that daemon. It connects to a daemon rather than starting one, so read [How the desktop app gets a daemon](#how-the-desktop-app-gets-a-daemon) before installing it on its own.
+Every method installs the same `dot-agent-deck` binary. Then [check the install](#verify) and read [Agent hooks](#agent-hooks).
 
 ## Homebrew (macOS / Linux)
 
@@ -31,37 +33,53 @@ brew tap vfarcic/tap
 brew install dot-agent-deck
 ```
 
+Pre-releases are published as a separate formula, `vfarcic/tap/dot-agent-deck-beta`. The two formulas conflict with each other, so uninstall one before installing the other.
+
 ## Download Binary
 
-The binary for your platform, straight from the [latest release](https://github.com/vfarcic/dot-agent-deck/releases/latest) — no package manager required. Assets are named `dot-agent-deck-<os>-<arch>`:
+Release assets are named `dot-agent-deck-<os>-<arch>`:
 
 | Platform | Asset |
 |---|---|
-| Linux, Intel/AMD | `dot-agent-deck-linux-amd64` |
-| Linux, ARM | `dot-agent-deck-linux-arm64` |
-| macOS, Intel | `dot-agent-deck-darwin-amd64` |
-| macOS, Apple Silicon | `dot-agent-deck-darwin-arm64` |
+| Linux amd64 | `dot-agent-deck-linux-amd64` |
+| Linux arm64 | `dot-agent-deck-linux-arm64` |
+| macOS Intel | `dot-agent-deck-darwin-amd64` |
+| macOS Apple silicon | `dot-agent-deck-darwin-arm64` |
 
-Make it executable and put it somewhere on your `PATH`:
+Download the one for your platform from the latest release, make it executable and put it on your `PATH` as `dot-agent-deck`:
 
 ```bash
-chmod +x dot-agent-deck-linux-amd64
-mv dot-agent-deck-linux-amd64 ~/.local/bin/dot-agent-deck
+ASSET=dot-agent-deck-linux-amd64   # pick from the table above
+mkdir -p ~/.local/bin
+curl -fsSL -o ~/.local/bin/dot-agent-deck \
+  "https://github.com/vfarcic/dot-agent-deck/releases/latest/download/$ASSET"
+chmod +x ~/.local/bin/dot-agent-deck
 ```
 
-`~/.local/bin` is not on `PATH` on every distribution — add `export PATH="$HOME/.local/bin:$PATH"` to your shell rc if `dot-agent-deck --help` comes back "command not found". On macOS, if the binary is refused because it was downloaded from the internet, clear the quarantine flag with `xattr -d com.apple.quarantine dot-agent-deck`.
+- If `dot-agent-deck --version` then reports `command not found`, `~/.local/bin` is not on your `PATH`. Add `export PATH="$HOME/.local/bin:$PATH"` to your shell's rc file and open a new shell.
+- On macOS, if the binary is refused because it was downloaded from the internet, run `xattr -d com.apple.quarantine ~/.local/bin/dot-agent-deck`.
+- For a specific release, replace `latest/download` with `download/<tag>`, for example `download/v0.44.0`.
+
+**Optional: check where the file came from.** The release binaries, and the `checksums.txt` manifest beside them, carry build provenance from this repository's release workflow. With the [GitHub CLI](https://cli.github.com/) installed:
+
+```bash
+gh attestation verify ~/.local/bin/dot-agent-deck \
+  --repo vfarcic/dot-agent-deck \
+  --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml
+```
+
+It should report a verified attestation. If it does not, delete the file and download it again from the release page.
 
 ## Nix
 
-Requires Nix with flakes enabled (`nix-command` and `flakes` in `experimental-features`). The flake builds from source against the committed `Cargo.lock`, so there is no per-release hash to maintain, and it pins the released version, so `dot-agent-deck --version` reports the real version rather than a source-build placeholder. It covers `x86_64-linux`, `aarch64-linux` and `aarch64-darwin`. Intel Macs are served by the release binaries and the Homebrew tap instead, because the nixpkgs this flake pins has dropped `x86_64-darwin`.
+Requires Nix with flakes enabled (`nix-command` and `flakes` in `experimental-features`). The flake builds from source and supports `x86_64-linux`, `aarch64-linux` and `aarch64-darwin`. It has no `x86_64-darwin` (Intel Mac) build; use Homebrew or a downloaded binary there. `dot-agent-deck --version` reports the released version the flake pins.
 
-Run it once without installing anything:
+Run it once without installing:
 
 ```bash
 nix run github:vfarcic/dot-agent-deck
+nix run github:vfarcic/dot-agent-deck -- hooks install   # arguments after -- reach the binary
 ```
-
-Arguments after `--` reach the binary, so `nix run github:vfarcic/dot-agent-deck -- hooks install` works too. Pin a specific release by appending its tag: `github:vfarcic/dot-agent-deck/<tag>`. That works for any release from the first one that ships the flake onwards; earlier tags predate it, so there is no flake at that revision to build.
 
 Install it into your user profile:
 
@@ -69,12 +87,15 @@ Install it into your user profile:
 nix profile install github:vfarcic/dot-agent-deck
 ```
 
-**As a flake input.** NixOS and home-manager users add the flake as an input and take the package from it:
+To pin a release, append its tag: `github:vfarcic/dot-agent-deck/<tag>`. Tags from before the flake was added have no flake and fail to build.
+
+**As a flake input** (NixOS or home-manager):
 
 ```nix
 {
   inputs.dot-agent-deck.url = "github:vfarcic/dot-agent-deck";
-  # Optional. Build against your nixpkgs rather than the one this flake pins.
+  # Optional: build against your nixpkgs instead of the one this flake pins.
+  # Your nixpkgs must then carry rustc 1.97.1 or newer.
   inputs.dot-agent-deck.inputs.nixpkgs.follows = "nixpkgs";
 
   # NixOS
@@ -85,23 +106,18 @@ nix profile install github:vfarcic/dot-agent-deck
 }
 ```
 
-The `follows` line is the usual tradeoff: one nixpkgs in your closure instead of two, paid for by building against a nixpkgs this project has not tested against, which has to be recent enough to carry rustc 1.97.1 or newer.
-
-**Via the overlay.** If you would rather reach it as `pkgs.dot-agent-deck` everywhere, apply the overlay instead:
+**Via the overlay**, to reach it as `pkgs.dot-agent-deck`. The overlay builds against your nixpkgs, so it needs rustc 1.97.1 or newer there; an older rustc makes cargo stop and name the version it needs.
 
 ```nix
 {
   nixpkgs.overlays = [ inputs.dot-agent-deck.overlays.default ];
-
   environment.systemPackages = [ pkgs.dot-agent-deck ];
 }
 ```
 
-The overlay always builds against *your* nixpkgs, never the pinned one, so that rustc 1.97.1 minimum applies here whether or not you set `follows`. That number is the toolchain this project is built and tested on, declared as `rust-version` in `Cargo.toml` — so cargo refuses an older one up front and names the version it wants, instead of failing somewhere inside the build. An older rustc may well work; nothing here tests one, which is why it is not promised.
-
 ### The home-manager module
 
-`homeModules.default` installs the binary and writes your configuration declaratively. Import it and turn it on:
+`homeModules.default` installs the package and can write `~/.config/dot-agent-deck/config.toml` and `~/.config/dot-agent-deck/keybindings.toml`:
 
 ```nix
 {
@@ -110,17 +126,17 @@ The overlay always builds against *your* nixpkgs, never the pinned one, so that 
   programs.dot-agent-deck = {
     enable = true;
 
-    # ~/.config/dot-agent-deck/config.toml
+    # Rendered to ~/.config/dot-agent-deck/config.toml
     settings = {
       default_command = "claude";
-      worker_response_timeout_minutes = 90;
+      bell.on_idle = true;
     };
 
-    # ~/.config/dot-agent-deck/keybindings.toml
+    # Rendered to ~/.config/dot-agent-deck/keybindings.toml
     keybindings = {
       global = {
         toggle_layout = "Alt+Shift+l";
-        new_pane = "";            # empty string unbinds an action
+        new_pane = "";            # an empty string unbinds the action
       };
       dashboard.help = "F1";
     };
@@ -128,58 +144,80 @@ The overlay always builds against *your* nixpkgs, never the pinned one, so that 
 }
 ```
 
-`settings` and `keybindings` are freeform attribute sets rendered to TOML, so anything the two files accept can go in them. See [Configuration](configuration.md) for `config.toml` and [Keyboard Shortcuts](keyboard-shortcuts.md#customizing-keybindings) for the keybinding actions and their defaults. Each file is written only when its attribute set is non-empty, so `enable = true` on its own installs the package and leaves any config you already have untouched.
+| Option | Type | Default | Effect |
+|---|---|---|---|
+| `enable` | bool | `false` | Installs the package. |
+| `package` | package | `pkgs.dot-agent-deck` when the overlay is applied, otherwise this flake's package built against your nixpkgs | The package to install. Set it to `inputs.dot-agent-deck.packages.${pkgs.system}.default` to build against the flake's pinned nixpkgs. |
+| `settings` | TOML attribute set | `{ }` | Content of `config.toml`. Keys: see [Configuration](configuration.md). No file is written while it is empty. |
+| `keybindings` | TOML attribute set | `{ }` | Content of `keybindings.toml`. Actions and key notation: see [Keyboard Shortcuts](keyboard-shortcuts.md#customizing-keybindings). No file is written while it is empty. |
 
-`package` defaults to this flake's package built against your own nixpkgs, which is exactly what the overlay produces, so applying the overlay and importing the module gets you one build of the tool rather than two. Set it explicitly to `inputs.dot-agent-deck.packages.${pkgs.system}.default` if you would rather build against the nixpkgs this flake pins.
+home-manager links these files from the Nix store, so change `settings` and `keybindings` rather than editing the files or running `dot-agent-deck config set`. It does not manage `session.toml`, `remotes.toml` or `schedules.toml`, which the deck and its CLI write themselves. It does not run `dot-agent-deck hooks install`; run that once yourself after the first activation (see [Agent hooks](#agent-hooks)).
 
-**What the module deliberately does not manage.** Only `config.toml` and `keybindings.toml`. The other three files in that directory are left alone on purpose:
-
-| File | Why it is left alone |
-|---|---|
-| `session.toml` | Runtime state the deck writes itself (your saved workspace). home-manager symlinks its files read-only out of the Nix store, so managing it would stop the deck saving. |
-| `remotes.toml` | Written imperatively by `dot-agent-deck remote add`, same problem. |
-| `schedules.toml` | The one file whose location honours `$XDG_CONFIG_HOME`, unlike its neighbours. Managing it correctly needs handling the other two files must not get, so it is left for a follow-up. |
-
-**Hooks are still a one-off imperative step.** The module does not run `dot-agent-deck hooks install` for you, because that command edits *other* tools' configuration (Claude, OpenCode, Codex and friends), which sits outside home-manager's ownership and does not roll back when you switch generations. Run it once yourself after the first activation:
-
-```bash
-dot-agent-deck hooks install
-```
-
-### Contributing?
-
-`nix develop` is a consumer-oriented shell carrying just the Rust toolchain; contributors should use devbox instead, which pins the toolchain version and ships the recording and docs tooling the test suites need.
+`nix develop` gives a shell with the Rust toolchain only. To work on this repository, use the repository's devbox environment instead.
 
 ## Build from Source
+
+Requires Rust 1.97.1 or newer.
 
 ```bash
 git clone https://github.com/vfarcic/dot-agent-deck.git
 cd dot-agent-deck
-cargo build --release
+cargo build --release --locked
 ```
 
-The binary will be at `target/release/dot-agent-deck`.
+The binary is `target/release/dot-agent-deck`. Copy it onto your `PATH` rather than running it from `target/`, because agent hooks record the binary's path. A source build's `--version` reports a version derived from `git describe`.
 
 ## Verify
 
 ```bash
-dot-agent-deck --help
+dot-agent-deck --version    # prints: dot-agent-deck <version>
+dot-agent-deck --help       # lists the subcommands
+dot-agent-deck docs         # lists the embedded documentation topics
 ```
+
+If `--version` prints the version you installed, the binary works. If another copy is found first on your `PATH`, `command -v dot-agent-deck` shows which one runs.
+
+## Agent hooks
+
+The deck learns each agent's status (Thinking, Working, Needs Input, and so on) from hooks or plugins installed into that agent's own configuration. Whenever the TUI or the daemon starts, it installs them for every agent it detects:
+
+| Agent | Installed when | What is written |
+|---|---|---|
+| Claude Code | `~/.claude` exists | Hook entries in `~/.claude/settings.json`. The `StopFailure` hook (used for **Error** and **Blocked**) only when `claude --version` reports 2.1.78 or newer. |
+| OpenCode | `$XDG_CONFIG_HOME/opencode` (default `~/.config/opencode`) or `~/.opencode` exists | The plugin file `plugin/dot-agent-deck.js` under that directory. |
+| Codex | `codex` is on the daemon's `PATH` | Hooks in `$CODEX_HOME/hooks.json` (default `~/.codex`), and trust for those hooks. |
+| Devin | `devin` is on the daemon's `PATH` | Hook entries in `$XDG_CONFIG_HOME/devin/config.json` (default `~/.config/devin/config.json`). |
+| Pi | Every time the deck starts a Pi pane | A bundled extension; nothing to install. |
+
+The hooks call the installed binary by its absolute path, so moving or deleting the binary breaks them until you reinstall them.
+
+To install or reinstall by hand (for example, after installing an agent for the first time, or after moving the binary):
+
+```bash
+dot-agent-deck hooks install                    # Claude Code (the default)
+dot-agent-deck hooks install --agent opencode
+dot-agent-deck hooks install --agent codex
+dot-agent-deck hooks install --agent devin
+```
+
+`--agent` accepts `claude-code` (default), `opencode`, `codex` and `devin`; Pi has no hooks to install. Unlike the automatic install, these commands write the configuration even when the agent's directory does not exist yet. On success they print what they installed, for example `Installed hooks: SessionStart, SessionEnd, …` and `Settings file: /home/you/.claude/settings.json` for Claude Code, or `Trusted hooks: <n>` for Codex. On failure they print `Failed to install <agent> hooks: <reason>` and exit non-zero. `dot-agent-deck hooks uninstall --agent <agent>` removes them.
+
+An agent that was already running when the hooks were installed may need a restart to load them. If a card stays on its first status while the agent works, see [Troubleshooting → Hooks](troubleshooting.md#hooks).
 
 ## Desktop app
 
-The desktop app is published with every release, beside the CLI binaries, as an **alpha**: the assets are named `dot-agent-deck-desktop-alpha-*` and are not covered by the support expectations of the CLI. It is a second client of the same daemon the TUI uses, not a replacement for the TUI; see [Desktop app](desktop/index.md) for what it does.
+The desktop app is published alongside the CLI in releases, as an **alpha**: its assets are named `dot-agent-deck-desktop-alpha-*` and are not covered by the CLI's support expectations. What it does and lacks compared with the TUI is on [Desktop app](desktop/index.md).
 
 | Platform | Asset | Signed |
 |---|---|---|
-| macOS, Apple Silicon | `dot-agent-deck-desktop-alpha-macos-arm64.dmg` | Signed with the project's Apple Developer ID and notarized by Apple, starting with v0.42.0 |
-| Linux, amd64 | `dot-agent-deck-desktop-alpha-linux-amd64.deb` | Unsigned |
+| macOS Apple silicon | `dot-agent-deck-desktop-alpha-macos-arm64.dmg` | Signed and notarized from v0.42.0, unless that release's notes say otherwise |
+| Linux amd64 | `dot-agent-deck-desktop-alpha-linux-amd64.deb` | Unsigned |
 
-There is no desktop build for Intel Macs, Linux arm64 or Windows. Download from the [latest release](https://github.com/vfarcic/dot-agent-deck/releases/latest), and read that release's notes: they say whether its macOS build is signed, because a release whose signing credentials were missing ships an unsigned `.dmg` rather than none.
+Download from the [latest release](https://github.com/vfarcic/dot-agent-deck/releases/latest) and read that release's notes: they say whether its macOS build is signed. A release whose signing failed ships an unsigned `.dmg` rather than none.
 
 ### Verify the download
 
-Every release asset carries [build provenance](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations): proof that the file was produced by this repository's release workflow, from a named commit. Check it before installing, on either platform; for the unsigned `.deb` it is the only check anybody makes.
+Check the file's build provenance before installing it. For the unsigned `.deb` it is the only check. It needs the [GitHub CLI](https://cli.github.com/):
 
 ```bash
 gh attestation verify dot-agent-deck-desktop-alpha-macos-arm64.dmg \
@@ -187,100 +225,98 @@ gh attestation verify dot-agent-deck-desktop-alpha-macos-arm64.dmg \
   --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml
 ```
 
-Use the name of the file you downloaded. If it does not report a verified attestation from this repository's release workflow, do not install the file, and do not override any warning your OS raises about it.
+Use the name of the file you downloaded. A pass reports a verified attestation from this repository's release workflow. If it does not, do not install the file and do not override any warning your OS raises about it.
 
 ### macOS
 
 1. Open the `.dmg` and drag **Agent Deck** to **Applications**.
-2. Launch **Agent Deck** from Applications. macOS should ask only to confirm opening an app downloaded from the internet.
+2. Launch **Agent Deck** from Applications. For a signed release, macOS asks only to confirm opening an app downloaded from the internet.
 
-If macOS instead reports the app as damaged or from an unidentified developer, what to do depends on that release's notes. When they say the `.dmg` is signed and notarized, do not override the warning; [report it](https://github.com/vfarcic/dot-agent-deck/issues). The `xattr` command the CLI binary may need is not needed for a signed `.dmg`. When they say that release's `.dmg` is unsigned, the warning is expected: once the download has passed [the provenance check above](#verify-the-download), follow the workaround those notes give.
+If macOS reports the app as damaged or from an unidentified developer:
 
-The app bundle carries its own copy of the `dot-agent-deck` binary, at `/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck`, and does not put it on your `PATH`. To have `dot-agent-deck` in a terminal, install the CLI too ([Homebrew](#homebrew-macos--linux) or [a binary](#download-binary)), at the same version as the app.
+- The release notes say the `.dmg` is signed and notarized: do not override the warning; [report it](https://github.com/vfarcic/dot-agent-deck/issues).
+- The release notes say the `.dmg` is unsigned: the warning is expected. Once the file has passed [the provenance check](#verify-the-download), follow the workaround in those notes.
+
+The app carries its own copy of the binary at `/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck` and does not put it on your `PATH`. To use `dot-agent-deck` in a terminal, install the CLI too, at the same version as the app.
 
 ### Linux
 
 ```bash
+curl -fsSL -O \
+  https://github.com/vfarcic/dot-agent-deck/releases/latest/download/dot-agent-deck-desktop-alpha-linux-amd64.deb
+# verify it as above, then:
 sudo apt install ./dot-agent-deck-desktop-alpha-linux-amd64.deb
 ```
 
-`apt` pulls in the two libraries the package depends on, `libwebkit2gtk-4.1-0` and `libgtk-3-0`; `sudo dpkg -i` installs it too, but leaves missing dependencies for you to fix. The package is named `agent-deck`, adds **Agent Deck** to your desktop's application menu, and installs two programs: `/usr/bin/dot-agent-deck-desktop`, the app, and `/usr/bin/dot-agent-deck`, the same binary the CLI downloads provide. So after installing the `.deb`, `dot-agent-deck` is on your `PATH`, unless another copy (say in `~/.local/bin`) comes first. Check with `command -v dot-agent-deck` and `dot-agent-deck --version` which one you get.
+`apt` installs the dependencies (`libwebkit2gtk-4.1-0`, `libgtk-3-0`); `sudo dpkg -i` does not. The package is named `agent-deck`. It adds **Agent Deck** to the application menu and installs `/usr/bin/dot-agent-deck-desktop` (the app) and `/usr/bin/dot-agent-deck` (the same binary as the CLI downloads). If another `dot-agent-deck` comes earlier on your `PATH`, `command -v dot-agent-deck` shows which one runs.
 
-Launch it from the application menu, or run `dot-agent-deck-desktop`. Remove it with `sudo apt remove agent-deck`.
+Launch it from the application menu or with `dot-agent-deck-desktop`. Remove it with `sudo apt remove agent-deck`.
 
 ### How the desktop app gets a daemon
 
-**The desktop app connects to a daemon; it does not start one.** Opened with no daemon running on this machine, it shows **Daemon disconnected** with a **Reconnect** button. (Starting and replacing a daemon from inside the app is behind the [`experimental` flag](desktop/index.md#features-behind-the-experimental-flag).) Start one in either of these ways, then press **Reconnect**:
+The desktop app connects to a daemon and does not start one. With no daemon running, its Dashboard shows **Daemon disconnected** with a **Reconnect** button. (Starting a daemon from inside the app is one of the [features behind the `experimental` flag](desktop/index.md#features-behind-the-experimental-flag).) Start a daemon, then press **Reconnect**:
 
-- **Run the TUI**, `dot-agent-deck`, in a terminal. It starts the daemon on this machine if none is running, as it always does (see [How it runs](#how-it-runs)). You can use both clients side by side.
-- **Run the daemon alone**, with `dot-agent-deck daemon serve`. It runs in the foreground of that terminal until you stop it with `Ctrl+C`. On macOS without a CLI install, run the app's own copy: `"/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck" daemon serve`.
+- **Run the TUI**: `dot-agent-deck` starts a daemon if none is running. Both clients can be open at once.
+- **Run the daemon alone**: `dot-agent-deck daemon serve` runs it in the foreground of that terminal until `Ctrl+C`. On macOS without a CLI install: `"/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck" daemon serve`.
 
-**The daemon does not stay up on its own.** It exits about 30 seconds after its last client disconnects when it has no agents and no enabled [schedules](scheduled-tasks.md) — and a daemon that has just started counts as idle too. What that means in practice:
+A daemon with no clients, no agents and no enabled [schedules](scheduled-tasks.md) exits after about 30 seconds, and a daemon that has just started counts as having no clients. So:
 
-- While the desktop app is connected, it is a client, so the daemon stays up whatever else happens, and so it does while any agent is running.
-- A `daemon serve` that nothing connects to within those 30 seconds exits. Open the app (or press **Reconnect**) promptly, or start it with the timer off: `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 dot-agent-deck daemon serve`. `0` keeps the daemon up until it is stopped.
-- If you started the daemon with the TUI and then quit the TUI with **Detach**, the daemon stays up while the desktop app is connected or any agent is running, and otherwise exits 30 seconds later. Quitting the TUI with **Stop** shuts the daemon down, and the desktop app then shows **Daemon disconnected**.
-- When you quit the desktop app, the same rule applies: agents keep running, and a daemon with none exits 30 seconds after its last client leaves.
+- A `daemon serve` that nothing connects to within 30 seconds exits. Connect promptly, or run `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 dot-agent-deck daemon serve` to keep it up until it is stopped.
+- While the desktop app is connected, or any agent is running, the daemon stays up.
+- Quitting the TUI with **Detach** leaves the daemon running under the same rule. Quitting it with **Stop** shuts the daemon down, and the desktop app then shows **Daemon disconnected**.
+- Quitting the desktop app leaves agents running.
 
-The app finds the daemon at the same default address the TUI uses. If you point the TUI at another socket with `DOT_AGENT_DECK_ATTACH_SOCKET`, launch the app with the same variable in its environment. A **remote** daemon must also already be running on its host; the desktop app reaches it over ssh and does not install or start it. See [Desktop app → Daemons](desktop/daemons.md#what-a-remote-daemon-must-already-have).
-
-Whichever way it starts, the daemon installs the agent hooks on startup, so agents started from the desktop app report their status like any other (see [Troubleshooting → Hooks](troubleshooting.md#hooks)).
+The app looks for the daemon at the same default socket as the TUI. If you set `DOT_AGENT_DECK_ATTACH_SOCKET` for the TUI, set it in the app's environment too. A **remote** daemon must already be running on its host; see [Desktop app → Daemons](desktop/daemons.md#what-a-remote-daemon-must-already-have).
 
 ### Keep the app and the daemon on the same release
 
-The desktop app checks the daemon's protocol and its declared compatibility breaks when it connects. A daemon from another release, such as one started by a Homebrew CLI you have not upgraded, is handled in one of three ways:
+When it connects, the app compares its protocol and its declared compatibility breaks with the daemon's:
 
-- When the two builds speak the same protocol and no declared compatibility break sits between them, the app connects normally, even though their build stamps differ.
-- When they speak the same protocol but one side declares a compatibility break the other lacks, the Dashboard shows **Incompatible daemon** with a note naming the break and which side is behind. **Connect anyway** connects for the rest of that session, at the risk of the app reading some of the daemon's information with the wrong meaning.
-- When the protocols differ, the Dashboard shows **Incompatible daemon**, the app cannot read that daemon at all, and there is no Connect anyway. Upgrade whichever side is older and restart the daemon with the matching binary: `dot-agent-deck daemon restart`, then start it again with the TUI or `daemon serve`. The [daemon's refusal guards](#recycling-the-local-daemon) apply.
+| Situation | What the Dashboard shows | What to do |
+|---|---|---|
+| Same protocol, no compatibility break between the two builds | Connects normally | Nothing |
+| Same protocol, one side declares a compatibility break the other lacks | **Incompatible daemon**, naming the break and which side is behind, with **Connect anyway** | Upgrade the older side. **Connect anyway** connects for this session, but the app may misread some of what the daemon reports. |
+| Different protocol | **Incompatible daemon**, no Connect anyway | Upgrade the older side, then restart the daemon with the matching binary: `dot-agent-deck daemon restart`, then start it again with the TUI or `daemon serve` |
 
-So upgrade the CLI and the desktop app together.
+`daemon restart` refuses while agents or orchestration roles are live; see [Recycling the local daemon](#recycling-the-local-daemon). Upgrade the CLI and the desktop app together to avoid all of this.
 
 ## How it runs
 
-The first time you run `dot-agent-deck`, the binary auto-spawns a small per-user background daemon and connects to it over a Unix socket (under `$XDG_RUNTIME_DIR` when available, otherwise a per-uid path in `/tmp`). The same daemon is used for both local and remote (`dot-agent-deck connect`) sessions; there is no separate "local mode".
+The first `dot-agent-deck` run starts a per-user background daemon and connects to it over a Unix socket: `$XDG_RUNTIME_DIR/dot-agent-deck-attach.sock` when `XDG_RUNTIME_DIR` is set, otherwise a per-user directory under the system temp directory. `DOT_AGENT_DECK_ATTACH_SOCKET` overrides the path. The same daemon serves local runs; a [remote](remote-environments.md) host runs its own.
 
-The daemon outlives the TUI: detach the deck, your agents keep running, reattach later and they're still there. The desktop app is another client of the same daemon. About 30 seconds after every client has disconnected *and* every managed agent is gone (and no enabled schedule is registered), the daemon exits on its own. Set `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` to override the window (`0` keeps it up indefinitely).
+The daemon owns the agents. Quitting the TUI with **Detach** leaves them running, and the next `dot-agent-deck` shows them again. About 30 seconds after the last client disconnects, if no agent is running and no enabled schedule is registered, the daemon exits. `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` sets that window in seconds; `0` disables it.
 
 ## Upgrading
 
-After upgrading the `dot-agent-deck` binary, just relaunch it:
+Upgrade with the method you installed with (`brew upgrade dot-agent-deck`, a new download over the old file, `nix profile upgrade` on your profile entry, or a new build), then relaunch:
 
 ```bash
 dot-agent-deck
 ```
 
-On every launch, the TUI performs a build-version handshake with the running daemon. If a daemon spawned by the previous version is still alive, the binary versions differ and the TUI resolves it for you — what happens depends only on whether managed agents are running:
+On launch the TUI compares its build with the running daemon's. If they differ:
 
-- **No agents running** — the stale daemon is restarted **silently**. There is nothing to lose, so you are not prompted; the TUI lazy-spawns a fresh daemon at the new version and continues into the dashboard. This is the common case after a quiet upgrade.
-- **Agents running** — the TUI prompts you in your terminal. The prompt **names the live agents** and warns that restarting the daemon stops them. Press **S** to restart and continue on a fresh daemon at the new version (your agents are stopped), or press any other key to **keep the current daemon** and stay attached to it with your agents intact. Declining never strands you — you always land on a working session.
+- **No agents running**: the old daemon is restarted on the new binary without asking.
+- **Agents running, TUI in a terminal**: the TUI prints `Daemon version mismatch`, the two builds, and the agents a restart would stop. Press `S` to restart the daemon (stopping those agents), or any other key to keep the current daemon and attach to it with your agents intact. Upgrade later, when no agents are running.
+- **Agents running, protocol changed**: the prompt says this binary cannot attach. `S` restarts as above. Any other key exits with `error: daemon speaks attach protocol vN, but this binary speaks vM` and leaves the daemon and its agents running. To keep working with them, run the binary version the daemon came from (the message names it). To move to the new binary, stop the daemon when you are ready to lose those agents (see [Recycling the local daemon](#recycling-the-local-daemon)).
+- **Agents running, TUI not attached to a terminal** (a script or CI): it cannot ask, so it prints a recovery hint to stderr and exits non-zero. Run `dot-agent-deck daemon stop` first, then relaunch.
 
-You are never forced to upgrade-and-restart just to keep working: declining the prompt keeps you on the existing daemon, and you can finish or detach your agents and relaunch later, at which point (with no agents running) the daemon restarts silently.
+If you keep an older daemon, features added by the newer release may not work against it; see [Troubleshooting → Delegate prompts silently no-op after staying on an older daemon](troubleshooting.md#delegate-prompts-silently-no-op-after-staying-on-an-older-daemon).
 
-**The one exception is an upgrade that changes the attach protocol** — the wire the TUI and the daemon speak, which only a release that breaks compatibility changes. A TUI cannot attach to a daemon on a different protocol: the dashboard would look normal while every event it could not decode was silently dropped. So in that case the prompt says the new binary cannot attach, and declining exits instead of attaching, with a message like:
-
-```text
-error: daemon speaks attach protocol v11, but this binary speaks v10
-```
-
-Nothing is stopped: the daemon and its agents keep running. To keep working with them, relaunch with the build the daemon came from — the message names it. To move onto the new binary, run `dot-agent-deck daemon stop` (which stops those agents), then relaunch. With no agents running, a protocol change is handled like any other upgrade: the daemon restarts silently.
-
-If the TUI is not attached to a terminal (CI, scripts, piped stdout) **and** agents are running, it cannot prompt for the restart, so it prints a recovery hint to stderr and exits non-zero — the protocol message above, when the attach protocol changed. In that case, run `dot-agent-deck daemon stop` explicitly before relaunching — see [Recycling the local daemon](#recycling-the-local-daemon) below. (With no agents running, the non-interactive case still restarts silently.)
-
-See [Troubleshooting › Delegate prompts silently no-op after staying on an older daemon](troubleshooting.md#delegate-prompts-silently-no-op-after-staying-on-an-older-daemon) for the symptom you'll see if you keep an older daemon and then expect newer features to work against it.
+If the upgrade moved the binary to a new path (for example, you switched from a download to Homebrew), run `dot-agent-deck hooks install` for each agent you use so the hooks point at the new path. For the desktop app, install the new release's package the same way as the first time.
 
 ## Versioning
 
-`dot-agent-deck` is still in its `0.x` series, and the version digits follow a compatibility-first cadence while the major version is `0`:
+While the version is `0.x`:
 
-- A **protocol-/compatibility-breaking** change — one where an older and a newer build can no longer safely interoperate — bumps the **minor** digit (for example `0.31.x → 0.32.0`).
-- **New features and bug fixes** are **patch** releases (for example `0.31.1 → 0.31.2`).
+- A change after which an older and a newer build can no longer safely work together bumps the **minor** digit (`0.31.x` → `0.32.0`).
+- Features and fixes bump the **patch** digit (`0.31.1` → `0.31.2`).
 
-So while in `0.x` the minor digit signals **"compatibility broke"**, not "has new features". A bump from `0.31.x` to `0.32.0` is the cue to align both sides (see [Recycling the local daemon](#recycling-the-local-daemon) locally, or `dot-agent-deck remote upgrade` for a [remote](remote-environments.md)); a patch bump is always safe to mix.
+A minor bump is the cue to upgrade the daemon, the TUI and the desktop app together, and to run `dot-agent-deck remote upgrade` for each [remote](remote-environments.md). Builds that differ only in the patch digit work together.
 
 ## Inspecting the local daemon
 
-`dot-agent-deck daemon status` prints a read-only snapshot of the agents the local daemon is managing. It is a diagnostic: it never starts, stops, attaches to, or writes to anything, so it is safe to run at any time — including from a script, a `watch`, or while the TUI is open in another terminal.
+`dot-agent-deck daemon status` prints what the local daemon is managing. It is read-only: it does not start a daemon, and it changes nothing.
 
 ```bash
 dot-agent-deck daemon status
@@ -292,23 +328,23 @@ PANE	AGENT	ROLE	STATUS	TOOL	LABEL	CWD
 2	2	-	Working	Bash	api	/home/you/src/api
 ```
 
-The columns are tab-separated, so pipe the output through `column -t -s $'\t'` if you want it aligned in a terminal. A `-` means the daemon has no value for that cell yet.
+The columns are tab-separated (`column -t -s $'\t'` aligns them). `-` means no value.
 
-| Column | What it holds |
+| Column | Content |
 |---|---|
-| `PANE` | The pane id, the same value a managed agent sees as `DOT_AGENT_DECK_PANE_ID`. |
-| `AGENT` | The daemon's own id for the agent. |
-| `ROLE` | `mode:<name>` for a pane launched into a [mode](configuration.md), the role name for an [orchestration](orchestration.md) pane (suffixed `(orchestrator)` for the start role), `-` for a plain dashboard pane. |
-| `STATUS` | The live status: one of `Thinking`, `Working`, `Compacting`, `WaitingForInput`, `Idle`, `Error`. |
-| `TOOL` | The name of the tool the agent is running right now — the name only, never its arguments. |
+| `PANE` | Pane id; a managed agent sees it as `DOT_AGENT_DECK_PANE_ID`. |
+| `AGENT` | The daemon's id for the agent. |
+| `ROLE` | `mode:<name>` for a mode pane, the role name for an [orchestration](orchestration.md) pane (with `(orchestrator)` on the start role), `-` otherwise. |
+| `STATUS` | `Thinking`, `Working`, `Compacting`, `WaitingForInput`, `Idle`, `Error` or `Blocked`. See [Session statuses](session-management.md#session-statuses). |
+| `TOOL` | The name of the tool running now, without its arguments. |
 | `LABEL` | The pane's display name. |
-| `CWD` | The directory the agent was launched in. |
+| `CWD` | The directory the agent was started in. |
 
-When no agents are managed, the command prints `no managed agents` and still exits 0 — an empty deck is a successful answer, not a failure.
+With no agents it prints `no managed agents` and exits 0.
 
 ### JSON for scripts
 
-`--json` emits a versioned document instead of the table. This is the form to parse; the human table's columns are not a stable interface. The command prints it on a single line — the example below is reformatted for readability.
+Parse `--json`, not the table. It prints one line; reformatted here:
 
 ```bash
 dot-agent-deck daemon status --json
@@ -318,90 +354,55 @@ dot-agent-deck daemon status --json
 {
   "schema_version": 2,
   "agents": [
-    {
-      "agent_id": "1",
-      "pane_id": "1",
-      "label": "api",
-      "cwd": "/home/you/src/api",
-      "role": "mode:review",
-      "status": "Thinking"
-    },
-    {
-      "agent_id": "2",
-      "pane_id": "2",
-      "label": "api",
-      "cwd": "/home/you/src/api",
-      "status": "Working",
-      "active_tool": { "name": "Bash" }
-    }
+    { "agent_id": "1", "pane_id": "1", "label": "api", "cwd": "/home/you/src/api", "role": "mode:review", "status": "Thinking" },
+    { "agent_id": "2", "pane_id": "2", "label": "api", "cwd": "/home/you/src/api", "status": "Working", "active_tool": { "name": "Bash" } }
   ]
 }
 ```
 
-`schema_version` is the contract. It is bumped when a field is **removed** or changes meaning; new fields can appear without a bump, so parse tolerantly and ignore keys you do not recognise. Version `2` removed `active_tool.detail`, which version `1` carried — a script written against v1 that read the tool's arguments gets nothing under v2 rather than something subtly different.
-
-Every field except `agent_id` is optional and is **omitted entirely** when the daemon has no value for it, which is what the table renders as `-`. In the document above, agent `2` has no `role` key and agent `1` has no `active_tool` key. Read them with a fallback rather than assuming they are present:
-
-```bash
-dot-agent-deck daemon status --json | jq --raw-output '.agents[] | "\(.pane_id)\t\(.status // "unknown")\t\(.active_tool.name // "-")"'
-```
-
-```text
-1	Thinking	-
-2	Working	Bash
-```
-
-With no agents managed the document is `{"schema_version":2,"agents":[]}` and the exit code is still 0, so a filter like the one above simply produces no lines.
-
-Both forms deliberately omit your prompt text and the tool's arguments. A pane whose card reads `Bash — cargo test --package billing -- --nocapture` in the TUI appears as the bare tool name `Bash` in the table and as `{"name": "Bash"}` in the JSON. A status snapshot is routinely pasted into a bug report or run in a terminal someone else is watching, so it carries diagnostics and nothing private.
+- `schema_version` increases when a field is removed or changes meaning. New fields can appear without an increase, so ignore keys you do not recognise.
+- Every field except `agent_id` is omitted when it has no value, so read with a fallback, for example `jq -r '.agents[] | "\(.pane_id)\t\(.status // "unknown")\t\(.active_tool.name // "-")"'`.
+- With no agents the document is `{"schema_version":2,"agents":[]}` and the exit code is 0.
+- Neither form includes prompt text or tool arguments.
 
 ### When the daemon is unreachable
 
-If the query gets no answer, the command writes a one-line reason to **stderr**, prints nothing to stdout, and exits **1**. Unlike `daemon stop`, this is not treated as a benign no-op: a status query that got no answer learned nothing about the daemon, so reporting success would be a lie.
+The command writes one line to stderr, nothing to stdout, and exits **1**:
 
 ```text
-# no daemon has ever run for this user
-daemon status: unavailable (I/O error talking to daemon: No such file or directory (os error 2))
-
-# a daemon ran and has since exited, leaving its socket behind
-daemon status: unavailable (I/O error talking to daemon: Connection refused (os error 111))
-
-# a daemon is listening but wedged
-daemon status: unavailable (no response within 3s)
+daemon status: unavailable (I/O error talking to daemon: No such file or directory (os error 2))   # no daemon has run
+daemon status: unavailable (I/O error talking to daemon: Connection refused (os error 111))        # daemon exited, socket left behind
+daemon status: unavailable (no response within 3s)                                                # daemon is not answering
 ```
 
-The whole round trip is bounded at 3 seconds. On expiry the command **abandons** the query rather than retrying — a retry loop would add load to the exact daemon you are trying to diagnose.
-
-Exit 1 is reserved for "the daemon did not answer". A malformed invocation exits **2** instead, so a script can tell an unreachable daemon apart from a binary that is too old to understand the subcommand at all.
-
-**Status inspection never starts a daemon.** Launching the TUI lazy-spawns one (see [How it runs](#how-it-runs) above); `daemon status` never does, in either output form. Spawning a daemon to answer "is a daemon running?" would make the question unanswerable, so an absent daemon is reported as the failure above and the socket is left exactly as it was found.
-
-> Like `daemon stop`, this reports on the daemon on **this machine** only. Each remote attach has its own per-host daemon, covered in [Remote Environments](remote-environments.md).
+It waits at most 3 seconds and does not retry. Exit code **2** means the invocation itself was malformed (for example, a binary too old to know `daemon status`). This command covers only the daemon on this machine; each remote has its own (see [Remote Environments](remote-environments.md)).
 
 ## Recycling the local daemon
-
-`dot-agent-deck daemon stop` shuts down the running daemon gracefully. Use it after a binary upgrade or any time you want to start a fresh daemon process.
 
 ```bash
 dot-agent-deck daemon stop
 ```
 
-- **Idempotent.** If no daemon is running, the command prints `no daemon running` and exits 0.
-- **Data-loss guard.** If managed agents are still alive, the command refuses with a list of agent IDs and exits non-zero — terminating the daemon would kill those agents. Detach the agents first (close their panes, or quit the TUI to detach the deck while keeping the agents running), or pass `--force`. Run [`daemon status`](#inspecting-the-local-daemon) first if you want to see what is running before you decide.
-- **Orchestration guard.** If the daemon is holding [orchestration](orchestration.md) roles whose panes still have a live agent, the command refuses with the pane id, role name and orchestration of each one, and exits non-zero. This is a *different* loss from the one above, and the reason it gets its own refusal: the daemon keeps its role registrations in memory only, so stopping it deletes them for good. An agent that survives the stop keeps running and keeps reporting its status — its card looks completely healthy — but its `dot-agent-deck delegate` is refused from then on with "the daemon holds no orchestration role for pane …", and there is no recovery short of re-dispatching the orchestration. Let the orchestration finish, or pass `--force` knowing that is what you are spending.
-- **Grace window.** Sends `SIGTERM` and polls for the socket to disappear for up to 5 seconds. With `--force`, escalates to `SIGKILL` after that window. A `SIGTERM` timeout without `--force` exits non-zero so you can re-run with `--force` consciously.
+- **No daemon running**: prints `no daemon running` and exits 0.
+- **Managed agents running**: refuses, lists their ids and exits non-zero, because stopping the daemon stops them. Detach or close them first, or pass `--force`.
+- **Orchestration roles held**: if the daemon holds [orchestration](orchestration.md) roles whose panes still have a live agent, it refuses and lists each pane id, role and orchestration. The daemon keeps role registrations in memory only, so after a forced stop an agent that survives keeps running but can no longer delegate; its card is marked `orphaned` (see [Session statuses](session-management.md#diagnostic-markers-on-a-card)). Let the orchestration finish, or pass `--force` accepting that.
+- **Shutdown**: sends `SIGTERM` and waits up to 5 seconds for the daemon to stop. If it has not, the command exits non-zero; with `--force` it sends `SIGKILL` instead.
 
 ```bash
-# Force shutdown even when managed agents or orchestration roles are live.
-# This kills the managed agents, and permanently strands any orchestration
-# whose agent survives.
-dot-agent-deck daemon stop --force
+dot-agent-deck daemon stop --force   # stops managed agents and strands live orchestrations
 ```
 
-`dot-agent-deck daemon restart` is a thin wrapper: it runs `daemon stop`, then returns. The next `dot-agent-deck` invocation lazy-spawns a fresh daemon (see [How it runs](#how-it-runs) above). `--force` works the same way.
+`dot-agent-deck daemon restart` (also `--force`) runs `daemon stop`. The next `dot-agent-deck` starts a fresh daemon. Both commands act only on this machine's daemon; remotes are covered in [Remote Environments](remote-environments.md).
+
+## Uninstall
 
 ```bash
-dot-agent-deck daemon restart
+dot-agent-deck daemon stop                     # add --force if it refuses and you accept losing the agents
+for agent in claude-code opencode codex devin; do
+  dot-agent-deck hooks uninstall --agent "$agent"
+done
+brew uninstall dot-agent-deck                  # Homebrew; or delete the downloaded binary, or `nix profile remove`
+sudo apt remove agent-deck                     # desktop app on Linux; on macOS delete /Applications/Agent Deck.app
 ```
 
-> Stopping a *remote* daemon works differently — each remote attach has its own per-host daemon, governed by the lifecycle in [Remote Environments](remote-environments.md). The local `daemon stop` only touches the daemon on this machine.
+Your settings, keybindings, saved workspace and registered remotes are in `~/.config/dot-agent-deck/`, and schedules are in `$XDG_CONFIG_HOME/dot-agent-deck/schedules.toml` when `XDG_CONFIG_HOME` is set (otherwise the same directory). Delete them to remove your configuration too.

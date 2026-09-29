@@ -1,251 +1,239 @@
 # Keyboard Shortcuts
 
-Everything on this page is the TUI's. The desktop app has a few shortcuts of its own, listed on [Desktop app → Settings](desktop/settings.md#keyboard-shortcuts), and `keybindings.toml` does not affect it.
+Everything on this page is the TUI's. The desktop app has its own shortcuts, listed on [Desktop app → Settings](desktop/settings.md#keyboard-shortcuts); `keybindings.toml` does not affect it.
 
-Press `?` in command mode to see the shortcuts in the TUI itself:
+Press `?` in command mode to see the shortcuts in the TUI. The overlay and the bottom button bar are generated from your active [keybindings](#customizing-keybindings), so they show your real keys.
 
 ![The TUI's help overlay, opened with ?, listing the shortcuts by section: Global, Tab Navigation, Dashboard (command mode), Mode Tab, New Agent Form, Directory Picker and Session](/img/help-tui.png)
 
+## Modes
+
+The TUI is in one of two modes, and most keys depend on which:
+
+- **Command mode**: keys drive the deck. The chip at the far left of the bottom bar reads ` COMMAND `, the focused pane is dimmed, and a `COMMAND MODE — Ctrl+D to type` banner appears over it. The banner clears after a moment or when you press a command-mode key, and stays up if you press a key that is not bound to anything.
+- **Typing in a pane**: keys go to the program in the focused pane. The chip reads ` TYPING ` and the pane shows a cursor.
+
+`Ctrl+D` switches between them. The first button in the bar, `[Back to Pane Ctrl+D]` or `[Command Mode Ctrl+D]`, says where it takes you. The selected card keeps its `▸ ` marker in both modes.
+
 ## Mouse
 
-Every keyboard action below is also reachable with the mouse. Every clickable control shows its keyboard shortcut inline, so the on-screen controls double as a legend. On a dashboard card, a single click selects it and a double click focuses its pane.
+The main commands have clickable buttons along the bottom, each labelled with its keyboard shortcut. On a dashboard card, a click selects it and a double click focuses its pane. Cards, tab headers, dialogs, the directory picker and forms respond to clicks.
 
-**The wheel goes to whatever the pointer is over.** It scrolls the focused pane while the pointer is inside that pane. Elsewhere on the deck the wheel does nothing: over the card list, the stats bar, the tab bar, the bottom button bar, a pane's border, or a pane that is not the focused one, it is dropped — the same way a click that lands on nothing is. Point at the pane you want to scroll. (The card grid has no scroll of its own — it moves only as a consequence of moving the selection.) An open dialog is its own case: while the Schedules manager is up it takes the wheel for its own list, and the other modals swallow it rather than let it reach the pane behind them.
+The wheel scrolls the focused pane while the pointer is inside it. Anywhere else (the card list, the bars, a pane that is not focused, a pane's border) the wheel does nothing. The Schedules manager scrolls its own list; other dialogs ignore the wheel.
 
-In command mode the wheel always drives Agent Deck's own scrollback and is never forwarded to the agent, so a full-screen TUI cannot move under you while you read. While you are typing in a pane, the wheel goes to the agent if the agent has mouse reporting enabled — and it carries the cell the pointer is actually on, which is why a wheel from outside the pane is dropped rather than delivered at the nearest edge.
+- In command mode the wheel scrolls the deck's own copy of the pane's history and is not sent to the agent.
+- While typing in a pane, the wheel goes to the agent if the agent has turned on mouse reporting.
 
-**Whether anything actually moves depends on the agent** — see [Scrolling back through a pane](#scrolling-back-through-a-pane).
+Whether there is anything to scroll depends on the agent; see [Scrolling back through a pane](#scrolling-back-through-a-pane).
 
 ## Global Shortcuts
 
-| Key | Action | Works from |
+| Key | Action | Works in |
 |---|---|---|
-| `Ctrl+D` | Toggle between command mode and the pane — press it in a pane to reach the dashboard, press it again to go back to the pane you came from | Any mode |
-| `Ctrl+N` | New agent (directory picker, then name + command form) | Any mode |
-| `Ctrl+T` | Toggle stacked / tiled layout — stacked shows only the focused pane at full height, tiled shows every pane at once | Any mode |
-| `Ctrl+L` | Toggle the orchestration sidebar/pane-column split ratio between 34/66 and 25/75 (applies to every orchestration tab) | **Orchestration tabs, command mode only** |
-| `Ctrl+Z` | Zoom the focused agent pane — it takes the whole frame. Press again to restore. See [`Ctrl+Z` zooms the focused agent pane](#ctrlz-zooms-the-focused-agent-pane). | **Dashboard and orchestration tabs, command mode only** |
-| `Ctrl+W` | Close the selected pane on the dashboard, or an entire orchestration tab — after a confirmation. The dashboard tab itself cannot be closed. | **Command mode only** |
-| `Ctrl+E` | **Experimental — off by default.** Toggle the command-entry lock on an orchestration tab. See [`Ctrl+E` locks command entry to the orchestrator pane](#ctrle-locks-command-entry-to-the-orchestrator-pane). | **Command mode only, on an orchestration tab**, with the `experimental` flag on |
-| `Ctrl+C` | In a pane, sent to the agent as SIGINT. In command mode, opens the quit dialog — see [Dialogs](#dialogs). | Any mode |
+| `Ctrl+D` | Switch between command mode and the pane you came from | Both modes |
+| `Ctrl+N` | New agent: directory picker, then the New Agent form | Both modes |
+| `Ctrl+T` | Toggle stacked layout (only the focused pane, full height; the default) and tiled layout (every pane) | Both modes |
+| `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab | Both modes |
+| `Ctrl+W` | Close the selected pane on the dashboard, or a whole orchestration tab, after a confirmation. The dashboard tab cannot be closed. | Command mode |
+| `1`–`9` | Jump to card N and focus its pane | Command mode |
+| `Ctrl+L` | Toggle the orchestration sidebar / pane split between 34/66 and 25/75, for every orchestration tab | Command mode, on an orchestration tab |
+| `Ctrl+Z` | Zoom the focused pane to the whole frame; again to restore. See [below](#ctrlz-zooms-the-focused-agent-pane). | Command mode, on the dashboard or an orchestration tab |
+| `Ctrl+E` | **Experimental, off by default.** Toggle the command-entry lock. See [below](#ctrle-locks-command-entry-to-the-orchestrator-pane). | Command mode, on an orchestration tab, with the `experimental` flag on |
+| `Ctrl+C` | In a pane: sent to the program (interrupt). In command mode, the directory picker or the New Agent form: opens the [quit dialog](#dialogs). | Both modes |
 
-### Which mode you're in
-
-A chip at the far left of the bottom bar reads ` COMMAND ` when your keystrokes drive the deck and ` TYPING ` when they go into the focused pane. The first button in the bar — `[Back to Pane Ctrl+D]` or `[Command Mode Ctrl+D]` — says where `Ctrl+D` would take you. (While a **Filter** or **Rename** field is open, that row *is* the input field and its own prompt tells you where your keystrokes go.)
-
-Three other cues follow the mode:
-
-- **The cursor.** The focused pane shows a cursor only while you are typing into it. A cursor means what you type lands in that pane.
-- **Dimming and a banner.** Command mode dims the focused pane and overlays `COMMAND MODE — Ctrl+D to type`. The banner clears after a moment, or when you press a command-mode key. A key that isn't bound to anything keeps it up — that is the moment you most likely thought you were talking to the agent.
-- **The selected card.** It keeps its `▸ ` marker in both modes, but its highlight is de-emphasised while you are typing in a pane.
-
-### Reading and typing into a pane
-
-**Reading a pane in command mode.** Command mode is the safe resting state — the one mode in which a stray keystroke cannot reach an agent — and you can read in it. Pane content stays fully readable (dimmed, never blanked), and the focused pane scrolls there, by wheel and by `PageUp` / `PageDown`. The wheel is never forwarded to the agent's mouse protocol in command mode, so a full-screen TUI running in the pane cannot scroll under you while you read. How far back a pane scrolls is decided by the agent running in it, not by the mode: an agent that repaints its transcript in place rather than letting lines scroll off the top leaves nothing to scroll back through, in command mode or any other. See [How far back you can scroll depends on the agent](#how-far-back-you-can-scroll-depends-on-the-agent).
-
-**Typing into a pane.** Press `Enter` on the selected card (or `1`–`9` to jump to one) to type directly into its pane. `Ctrl+c` sends SIGINT to the pane's process, and `Ctrl+d` returns you to command mode. This is the mode the bottom-bar chip calls ` TYPING `, and the only one in which the focused pane shows a cursor. `PageUp` / `PageDown` belong to the program running in the pane here — they are sent through to it rather than scrolling the deck's view.
+Where a key is not claimed (for example `Ctrl+W`, `Ctrl+L`, `Ctrl+Z` or `Ctrl+E` while typing in a pane), it is passed to the program in the pane. While the close confirmation is open, only its keys and `Ctrl+C` work.
 
 ### `Ctrl+W` closes only from command mode
 
-`Ctrl+W` is delete-previous-word in shells, readline, and vim. So while you are typing in a pane it is sent straight through and deletes a word — it does not close anything. Press `Ctrl+D` first, and `Ctrl+W` there asks you to confirm before closing.
-
-The confirmation defaults to **Cancel**, so an accidental `Ctrl+W` followed by a reflexive `Enter` changes nothing. Choosing **Close** stops the agent and removes the card.
-
-### `Ctrl+E` locks command entry to the orchestrator pane
-
-> **Experimental — off unless you turn it on.** Set `experimental = true` under `[features]` in your `.dot-agent-deck.toml`, or launch with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the environment variable wins). With the flag off, `Ctrl+E` is not claimed anywhere and keystrokes reach a focused worker pane as usual.
-
-With the flag on, typing into a **worker** pane on an orchestration tab is locked by default. Keystrokes still reach the orchestrator's pane; aimed at a worker they are dropped, and the bottom bar says `Pane locked — Ctrl+d then Ctrl+e to unlock`. Press `Ctrl+D`, then `Ctrl+E`, and the deck reports `Pane entry: unlocked`. `Ctrl+E` leaves you in command mode, so press `Ctrl+D` again to type.
-
-This is not a read-only mode. The dashboard is untouched, and every pane still shows live output and scrolls normally. Why the pause is worth it is covered in [Typing into a worker is locked by default](orchestration.md#typing-into-a-worker-is-locked-by-default-experimental).
-
-- **`Ctrl+E` is command-mode only**, because it is readline's `end-of-line` inside a pane.
-- **The lock is one setting for the whole deck**, adopted by newly opened orchestration tabs, and not saved across restarts — every deck starts locked.
-- **A worker waiting on you is not locked.** While a role pane reports `WaitingForInput` every key reaches it, and the lock returns when that status clears. An agent that never reports `WaitingForInput` gets no exemption, and a temporarily typeable pane looks no different from a locked one.
-
-While locked, focus also follows a worker that starts waiting on you and returns to the orchestrator afterwards — see [Focus follows the lock](orchestration.md#focus-follows-the-lock).
+While you type in a pane, `Ctrl+W` is passed through (it deletes the previous word in shells and editors). In command mode it opens a confirmation that defaults to **Cancel**; choose **Close** to stop the agent and remove its card.
 
 ### `Ctrl+Z` zooms the focused agent pane
 
-On the Dashboard or an orchestration tab, `Ctrl+Z` in command mode gives the focused pane the whole frame, hiding the card sidebar and the other panes. The border title gains a `[Z]` so you can tell. Press `Ctrl+Z` again to restore the previous view exactly, including a `Ctrl+L` split. The full gesture is `Ctrl+D` then `Ctrl+Z`.
+On the dashboard or an orchestration tab, `Ctrl+Z` in command mode gives the focused pane the whole frame and hides the card sidebar and other panes. The pane's border title gains `[Z]`. Press `Ctrl+Z` again to restore the previous layout, including a `Ctrl+L` split. Hidden panes keep running; see [Zooming the focused pane](orchestration.md#zooming-the-focused-pane) for what that means on an orchestration tab.
 
-Nothing is stopped while zoomed, only hidden. What that costs on an orchestration tab is covered in [Zooming the focused pane](orchestration.md#zooming-the-focused-pane).
+- In a pane, `Ctrl+Z` is passed to the program (it suspends a job in a shell).
+- `1`–`9` while zoomed switches the zoom to that card's pane.
+- Zoom is per tab and is not saved: a new tab starts unzoomed, and reattaching shows the full view.
 
-- **Command mode only**, so `Ctrl+Z` inside a pane still suspends whatever is running there.
-- **Zoom follows focus.** Jump to another role with `1`–`9` while zoomed and you stay zoomed on that agent.
-- **Per-tab, and never saved.** Each tab remembers its own zoom, a tab you open later starts unzoomed, and reattaching returns the full view.
+### `Ctrl+E` locks command entry to the orchestrator pane
 
-The agent reflows to the new width both ways, so nothing is lost or garbled.
+> **Experimental, off unless you enable it.** Set `experimental = true` under `[features]` in `.dot-agent-deck.toml`, or run with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the environment variable wins). With the flag off, `Ctrl+E` is passed to the pane like any other key.
+
+With the flag on, typing into a **worker** pane on an orchestration tab is locked. Keys still reach the orchestrator's pane; keys aimed at a worker are dropped and the bottom bar says `Pane locked — Ctrl+d then Ctrl+e to unlock`. Press `Ctrl+D`, then `Ctrl+E`: the deck reports `Pane entry: unlocked`, and you are still in command mode, so press `Ctrl+D` to type. Output and scrolling are not affected.
+
+- The lock is one setting for the whole deck, applied to every orchestration tab, and every deck starts locked.
+- A worker whose status is **Needs Input** accepts keys until that status clears. An agent that never reports Needs Input gets no such exception.
+- While locked, focus moves to a worker that starts waiting on you and back to the orchestrator afterwards; see [Focus follows the lock](orchestration.md#focus-follows-the-lock) and [Typing into a worker is locked by default](orchestration.md#typing-into-a-worker-is-locked-by-default-experimental).
 
 ## Tab Navigation
 
 The tab bar appears when more than one tab is open.
 
-| Key | Action |
-|---|---|
-| `Ctrl+PageDown` | Next tab (works from any mode, including in a focused pane) |
-| `Ctrl+PageUp` | Previous tab (works from any mode, including in a focused pane) |
-| `Tab` / `Right` / `l` | Next tab — **only in command mode** |
-| `Shift+Tab` / `Left` / `h` | Previous tab — **only in command mode** |
-
-The command-mode-only keys reach the agent instead while you are typing in a pane, so press `Ctrl+D` first.
+| Key | Action | Works in |
+|---|---|---|
+| `Ctrl+PageDown` | Next tab | Both modes |
+| `Ctrl+PageUp` | Previous tab | Both modes |
+| `Tab` / `Right` / `l` | Next tab | Command mode |
+| `Shift+Tab` / `Left` / `h` | Previous tab | Command mode |
 
 ## Dashboard
 
-Command mode. If you're typing in a pane, press `Ctrl+D` first — otherwise the keystroke goes to the agent.
+Command mode. If you are typing in a pane, press `Ctrl+D` first.
 
 | Key | Action |
 |---|---|
-| `j` / `Down` | Select next card (wraps at end) |
-| `k` / `Up` | Select previous card (wraps at start) |
+| `j` / `Down` | Select the next card (wraps) |
+| `k` / `Up` | Select the previous card (wraps) |
 | `1`–`9` | Jump to card N and focus its pane |
-| `Enter` | Focus the selected card's pane |
-| `PageUp` | Scroll the focused pane back (see [Scrolling back through a pane](#scrolling-back-through-a-pane)) |
-| `PageDown` | Scroll the focused pane forward |
-| `/` | Filter agents (see [Dialogs](#dialogs)) |
-| `r` | Rename selected agent (see [Dialogs](#dialogs)) |
-| `g` | Generate `.dot-agent-deck.toml` (see [Dialogs](#dialogs)) |
-| `s` | Open the **Schedules** manager (`S` also works) (see [Schedules](./scheduled-tasks.md)) |
-| `?` | Toggle help overlay |
-| `y` / `n` | Approve / deny a pending permission request (only when an agent is waiting) |
-| `Esc` | Clear active filter |
+| `Enter` | Focus the selected card's pane (start typing into it) |
+| `PageUp` / `PageDown` | Scroll the focused pane back / forward |
+| `/` | Filter cards |
+| `Esc` | Clear the filter |
+| `r` | Rename the selected agent |
+| `g` | Ask the selected agent to generate `.dot-agent-deck.toml` for its directory |
+| `s` or `S` | Open the **Schedules** manager (see [Schedules](scheduled-tasks.md)) |
+| `y` / `n` | Approve / deny a pending permission request; only when the selected card shows **Needs Input** |
+| `?` | Toggle the help overlay |
 
 ### Scrolling back through a pane
 
-`PageUp` / `PageDown` scroll the **focused** pane back and forward — the keyboard equivalent of the wheel. They work in **command mode only**; while you are typing in a pane they go to the agent as `ESC[5~` / `ESC[6~`, so a pager, an editor, or the agent's own scrollback keeps them. `Ctrl+PageUp` / `Ctrl+PageDown` are separate chords and stay on tab navigation.
+`PageUp` / `PageDown` (and the wheel) scroll the focused pane in **command mode**. While you type in a pane they are passed to the program, so a pager, an editor or the agent's own scrolling receives them.
 
 #### How far back you can scroll depends on the agent
 
-Agent Deck routes the wheel and the scroll keys the same way for every pane, but **what there is to scroll is decided by the agent**.
+What there is to scroll depends on what the program in the pane writes:
 
-- **Agents that keep their own transcript** — `claude`, for example — request mouse tracking and redraw their conversation as you scroll. While you are typing in the pane, the wheel and scroll keys go to the agent and the agent scrolls. The history you reach is its own.
-- **Agents that expect the terminal to hold the history, while contributing none of it** — `codex` is the current example. It repaints its whole transcript in place instead of emitting new lines, so nothing ever scrolls off the top and the terminal is handed nothing to keep.
+- **Agents that keep their own transcript and handle the mouse**, such as `claude`: while you are typing in the pane, the wheel and scroll keys go to the agent and it scrolls its own history.
+- **Agents that redraw their whole screen in place**, such as `codex`: nothing scrolls off the top, so the deck has no history to show. A scroll in command mode briefly shows `Nothing to scroll — this pane has no scrollback to move through` (`Nothing to scroll — no scrollback` in a narrow pane). It clears after a moment or on your next key, and that key still does what it normally does.
+- **A full-screen program or dialog in the pane** (a picker, a permission dialog, an editor): scrolling does nothing, with no message, until it closes; the history is still there afterwards.
 
-For an agent in the second group, Agent Deck has nothing of its own to scroll in command mode, by wheel or by key. That is not a setting you can change. Rather than doing nothing silently, a scroll that cannot land briefly overlays the pane with `Nothing to scroll — this pane has no scrollback to move through` (or `Nothing to scroll — no scrollback` in a narrow pane). It clears after a moment or on your next keystroke, and that keystroke is not swallowed — it reaches the agent or runs its shortcut as usual. You only ever see it on a pane you actually tried to scroll.
-
-**A pane showing a full-screen interface is a third case.** A picker, a permission dialog or an editor switches to a second screen that keeps no scrollback of its own, so the deck cannot reach that pane's history while it is there. Nothing is lost — leaving that screen brings every line back — so a scroll there simply does nothing, with no notice.
-
-It can look like "scrolling works fine outside Agent Deck": scrolling up during a `codex` session in an ordinary terminal reaches what was on screen *before* codex started, never an earlier part of the conversation. A pane Agent Deck spawns starts empty, so there is nothing above to reach.
+A pane the deck starts is empty at first, so there is nothing above the agent's first output to scroll back to.
 
 ## Directory Picker
 
+Opened by `Ctrl+N` and by schedule authoring.
+
 | Key | Action |
 |---|---|
-| `j` / `Down` | Select next directory |
-| `k` / `Up` | Select previous directory |
-| `l` / `Right` / `Enter` | Enter directory (or confirm if no subdirs) |
+| `j` / `Down` | Select the next directory |
+| `k` / `Up` | Select the previous directory |
+| `l` / `Right` / `Enter` | Open the selected directory; in a directory with no subdirectories, choose it |
 | `h` / `Left` / `Backspace` | Go up one level |
-| `Space` | Confirm current directory |
-| `/` | Enter filter mode; type to narrow directories (case-insensitive) |
-| `Esc` | Clear filter (press twice to close) |
+| `Space` | Choose the directory you are in |
+| `/` | Filter: type to narrow the list (case-insensitive) |
+| `Esc` | Clear the filter; with no filter, cancel |
 | `q` | Cancel |
+| `Ctrl+C` | Open the quit dialog |
 
-Directory lists loop end-to-end, and the `..` parent entry stays visible even when a filter is active.
+While filtering: `Enter` stops editing and keeps the filter, `Backspace` deletes a character, `Up` / `Down` move, and `Esc` clears the filter. A `q` typed into the filter cancels the picker rather than adding the letter. The list wraps at both ends, and the `..` entry stays visible while a filter is active.
 
 ## New Agent Form
 
 | Key | Action |
 |---|---|
-| `Tab` / `Shift+Tab` | Switch between fields |
-| `Left` / `Right` / `h` / `l` | Cycle the **Mode** field (`No mode`, the project's orchestrations, and the built-in `schedule` and `dispatcher` options) |
-| `Enter` | Confirm field / submit form |
+| `Tab` / `Shift+Tab` | Next / previous field |
+| `Left` / `Right` or `h` / `l` | On **Mode**: cycle `No mode`, the orchestrations in the directory's `.dot-agent-deck.toml`, `schedule` and `dispatcher` |
+| `Enter` | Move to the next field; on the last field, submit |
 | `Esc` | Cancel |
+| `Ctrl+C` | Open the quit dialog |
 
 ## Dialogs
 
-| Dialog | Trigger | Keys |
+| Dialog | Opened by | Keys |
 |---|---|---|
-| **Filter** | `/` | Type to narrow visible cards · `Backspace` to delete · `Enter` to accept and stay filtered · `Esc` to clear and close |
-| **Rename** | `r` | Type the new name · `Enter` to confirm · `Esc` to cancel |
-| **Generate config** | `g` | `Up`/`Down` (or `k`/`j`) to choose **Yes** / **No** / **Never** · `Enter` to confirm · `Esc` to cancel. **Yes** asks the agent to write `.dot-agent-deck.toml`; **Never** suppresses the hint permanently for that directory. |
-| **Quit** | `Ctrl+C` from command mode | `Up`/`Down` (or `k`/`j`) to choose **Detach** (default) / **Stop** / **Cancel** · `Enter` to confirm · `Esc` to dismiss · `Ctrl+C` again to leave immediately. Detach keeps your agents running in the daemon; Stop terminates them and asks once more first. |
-| **Close confirmation** | `Ctrl+W`, the `[Close]` button, or a tab's `[×]` | `Up`/`Down` (or `k`/`j`) to choose **Cancel** (default) / **Close** · `Enter` to confirm · `Esc` to dismiss. The dialog names its target and closes exactly what was selected when it opened; a keystroke typed before it appeared is discarded rather than answering it. If a pane refuses to stop, the tab is kept so you can retry. |
-| **Help overlay** | `?` | `?`, `Esc`, or `q` to dismiss |
+| **Filter** | `/` | Type to narrow the cards · `Backspace` deletes · `Enter` keeps the filter and closes · `Esc` clears and closes |
+| **Rename** | `r` | Type the new name · `Enter` confirms · `Esc` cancels |
+| **Generate config** | `g` | `Up` / `Down` (or `k` / `j`) to choose **Yes**, **No** or **Never** · `Enter` confirms · `Esc` cancels. **Yes** asks the selected agent to write `.dot-agent-deck.toml`; **Never** stops offering it for that directory. |
+| **Quit** | `Ctrl+C` in command mode | `Up` / `Down` (or `k` / `j`) to choose **Detach** (default), **Stop** or **Cancel** · `Enter` confirms · `Esc` dismisses · `Ctrl+C` again leaves immediately. **Detach** keeps the agents running; **Stop** stops them and the daemon, asking once more first while agents are running. See [Resuming Sessions](session-management.md#resuming-sessions). |
+| **Close confirmation** | `Ctrl+W`, the `[Close]` button, or a tab's `[×]` | `Up` / `Down` (or `k` / `j`) to choose **Cancel** (default) or **Close** · `Enter` confirms · `Esc` dismisses. It names what it will close and closes exactly that. A key typed just before it appeared is discarded. If a pane refuses to stop, the tab is kept so you can try again. |
+| **Star prompt** | Shown at startup about once every 10 launches, until dismissed | `s` opens the repository to star it · `l` or `Esc` asks again later · `d` never asks again |
+| **Help overlay** | `?` | `?`, `Esc` or `q` closes it |
 
 ## Customizing Keybindings
 
-Every shortcut above can be remapped. dot-agent-deck reads an optional config file at:
+Remap shortcuts in an optional file:
 
 ```
 ~/.config/dot-agent-deck/keybindings.toml
 ```
 
-Override the path with `DOT_AGENT_DECK_KEYBINDINGS`. Keybindings are resolved **client-side**, so when two clients attach to one remote daemon, each can have its own.
+`DOT_AGENT_DECK_KEYBINDINGS` overrides the path. The file is read by the TUI when it starts, so restart the TUI after editing it. Each TUI reads its own file, so two TUIs attached to one daemon can use different keys.
 
-The file has two sections, `[global]` and `[dashboard]`. List only what you want to change. The help overlay (`?`) and the button bar are generated from the active config, so they always show your real keys.
-
-### Key notation
-
-- **Modifiers:** `Ctrl+`, `Alt+`, `Shift+` — combine in any order, e.g. `Alt+Shift+t`.
-- **Named keys:** `Enter`, `Esc`, `Tab`, `Space`, `Up`, `Down`, `Left`, `Right`, `Backspace`, `Delete`, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, and `F1`–`F12`.
-- **Printable characters:** `a`–`z`, `0`–`9`, `/`, `?`, etc.
-- **Unbound:** an empty string (`new_pane = ""`) disables the action entirely.
-
-Notation is case-insensitive for modifier and named keys (`ctrl+enter` == `Ctrl+Enter`).
+The file has two tables, `[global]` and `[dashboard]`, each mapping an action name to a key. List only what you change; everything else keeps its default. The table name is where the action is read from, not the mode it works in.
 
 ### Example
 
 ```toml
 # ~/.config/dot-agent-deck/keybindings.toml
-# Only override what you need — defaults apply for everything else.
-
 [global]
-toggle_layout = "Alt+Shift+l"   # move it off Ctrl+t
+toggle_layout = "Alt+Shift+l"                # move it off Ctrl+t
 toggle_orchestration_split = "Alt+Shift+s"   # move it off Ctrl+l
-toggle_zoom = "Ctrl+Alt+z"       # move zoom off Ctrl+Z
-new_pane = ""                    # disable the New Agent shortcut
+toggle_zoom = "Ctrl+Alt+z"                   # move zoom off Ctrl+z
+new_pane = ""                                # unbind New Agent
 
 [dashboard]
-help = "F1"                      # open help with F1 instead of ?
+help = "F1"                                  # help on F1 instead of ?
 ```
+
+**Check:** start `dot-agent-deck`. Any problem in the file is printed to the terminal before the dashboard opens, prefixed `keybindings (<path>):` or `Invalid keybindings at <path>:`. In the TUI, `?` and the bottom bar show the new keys.
+
+### Key notation
+
+- **Modifiers:** `Ctrl+` (or `Control+`), `Alt+`, `Shift+`, in any order and combination, for example `Alt+Shift+t`.
+- **Named keys:** `Enter`, `Esc` (or `Escape`), `Tab`, `Space`, `Up`, `Down`, `Left`, `Right`, `Backspace`, `Delete` (or `Del`), `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `F1`–`F12`.
+- **Any single character:** `a`, `Z`, `1`, `/`, `?` and so on.
+- **Unbound:** `""` disables the action.
+
+Modifier and named-key names are case-insensitive (`ctrl+enter` equals `Ctrl+Enter`). With `Ctrl` or `Alt`, a letter's case is ignored (`Ctrl+T` equals `Ctrl+t`); use `Shift+` for a shifted chord. Without them, an uppercase letter is the shifted key: `D` equals `Shift+d`.
 
 ### Actions and defaults
 
 `[global]`:
 
-| Action | Default | Description |
-|---|---|---|
-| `dashboard` | `Ctrl+d` | Toggle between command mode and the pane — any mode |
-| `new_pane` | `Ctrl+n` | New agent (directory picker → name + command) — any mode |
-| `close_pane` | `Ctrl+w` | Close selected agent / orchestration tab, with confirmation — **command mode only** |
-| `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout — any mode |
-| `toggle_orchestration_lock` | `Ctrl+e` | **Experimental — requires the `experimental` flag.** Toggle the orchestration command-entry lock — **command mode only, on an orchestration tab** |
-| `toggle_orchestration_split` | `Ctrl+l` | Toggle the orchestration split between 34/66 and 25/75, for every orchestration tab — **orchestration tabs, command mode only** |
-| `toggle_zoom` | `Ctrl+Z` | Zoom the focused pane to the whole frame; press again to restore. Per-tab, never saved — **Dashboard and orchestration tabs, command mode only** |
-| `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane |
-
-The section name is the TOML table a binding is read from, not the modes it applies in — which is why the command-mode-only actions live in `[global]`. Anywhere a chord is not claimed, it reaches the pane as ordinary input for whatever is running there.
+| Action | Default | Action performed | Works in |
+|---|---|---|---|
+| `dashboard` | `Ctrl+d` | Switch between command mode and the pane | Both modes |
+| `new_pane` | `Ctrl+n` | New agent | Both modes |
+| `close_pane` | `Ctrl+w` | Close the selected agent or orchestration tab, with confirmation | Command mode |
+| `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout | Both modes |
+| `toggle_orchestration_lock` | `Ctrl+e` | Toggle the command-entry lock (**experimental flag required**) | Command mode, orchestration tab |
+| `toggle_orchestration_split` | `Ctrl+l` | Toggle the orchestration split between 34/66 and 25/75 | Command mode, orchestration tab |
+| `toggle_zoom` | `Ctrl+z` | Zoom the focused pane; again to restore | Command mode, dashboard or orchestration tab |
+| `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane | Command mode |
 
 `[dashboard]` (command mode):
 
-| Action | Default | Description |
+| Action | Default | Action performed |
 |---|---|---|
-| `move_down` | `j` | Select next card |
-| `move_up` | `k` | Select previous card |
+| `move_down` | `j` | Select the next card |
+| `move_up` | `k` | Select the previous card |
 | `move_left` | `h` | Previous tab |
 | `move_right` | `l` | Next tab |
-| `filter` | `/` | Filter agents |
-| `rename` | `r` | Rename selected agent |
-| `help` | `?` | Toggle help overlay |
-| `focus_pane` | `Enter` | Focus selected pane |
-| `clear_filter` | `Esc` | Clear active filter |
+| `filter` | `/` | Filter cards |
+| `rename` | `r` | Rename the selected agent |
+| `help` | `?` | Toggle the help overlay |
+| `focus_pane` | `Enter` | Focus the selected card's pane |
+| `clear_filter` | `Esc` | Clear the filter |
 | `approve_permission` | `y` | Approve a pending permission request |
 | `deny_permission` | `n` | Deny a pending permission request |
 | `generate_config` | `g` | Generate `.dot-agent-deck.toml` |
-| `scroll_pane_up` | `PageUp` | Scroll the focused pane back — **command mode only** |
-| `scroll_pane_down` | `PageDown` | Scroll the focused pane forward — **command mode only** |
+| `open_scheduled_tasks` | `s` | Open the Schedules manager |
+| `scroll_pane_up` | `PageUp` | Scroll the focused pane back |
+| `scroll_pane_down` | `PageDown` | Scroll the focused pane forward |
 
-The `Down`/`Up`/`Tab`/`Shift+Tab`/`Left`/`Right` aliases and `Ctrl+PageUp` / `Ctrl+PageDown` tab navigation are not remappable and always work alongside your bindings. Remapping the scroll actions does not affect tab navigation, because those are separate chords.
+Not remappable, and they work alongside your bindings: `Down` / `Up` for card selection, `Tab` / `Shift+Tab` / `Left` / `Right` for tabs, `Ctrl+PageUp` / `Ctrl+PageDown`, `S` for the Schedules manager, and `Ctrl+C`, which always opens the quit dialog from command mode. There is no `quit` action.
 
-Rebinding an action both enables the new chord and retires the default, so `scroll_pane_up = "Ctrl+u"` leaves plain `PageUp` doing nothing in command mode. Setting either scroll action to `""` leaves the wheel as the only way to scroll that pane.
+Rebinding an action also retires its default key: after `scroll_pane_up = "Ctrl+u"`, `PageUp` does nothing in command mode. With both scroll actions set to `""`, the wheel is the only way to scroll.
 
-**Quit is not a remappable action.** `Ctrl+C` is hardcoded: from command mode it always opens the quit dialog. A `quit = "…"` line is ignored with a warning.
+### Problems in the file
 
-### Edge cases
-
-- **No config file** → all defaults.
-- **Malformed file** → a warning on stderr and a fallback to all defaults; it never crashes.
-- **Conflicting bindings** (two actions on one key) → a warning, and the first-defined action wins; the later one is left unbound.
-- **Unknown action name** → ignored with a warning.
-- **Empty binding** (`action = ""`) → that action is unbound and its default key does nothing.
-- **`Ctrl+c` is never routed through your config.** Even if you bind another action to it, `Ctrl+c` from command mode always opens the quit dialog.
+| Problem | Result |
+|---|---|
+| No file | All defaults. |
+| The file is not valid TOML | `Invalid keybindings at <path>: …` on stderr, and all defaults. The TUI still starts. |
+| Unknown table (for example `[globale]`) | Warning; the table is ignored and the rest applies. |
+| Unknown action name | Warning; that line is ignored. |
+| A key the notation does not recognise | Warning; that action keeps its default. |
+| An action bound to `Ctrl+C` | Warning; that action is left unbound. |
+| Two actions on one key (including a new binding that lands on another action's default) | Warning; the action listed earlier in the tables above keeps the key, and the later one is unbound. |
+| `action = ""` | That action is unbound. |
