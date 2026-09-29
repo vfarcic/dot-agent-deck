@@ -18,7 +18,7 @@ The agent cannot pick that work up reliably today, for two reasons:
 
 Make the website a landing page for people and make the docs a reference for the user's agent.
 
-1. **A single landing page** for people: what the tool is, why it is useful, a short demo, the one-line install, and a copy-paste prompt that hands the user's agent a concrete starting point ("Read https://agent-deck.devopstoolkit.ai/llms.txt, then help me install and set up dot-agent-deck").
+1. **A single landing page** for people, ported from the product page #1021 designed and PR #1155 shipped: what the tool is, why it is useful, a short demo, the one-line install, and a copy-paste prompt that hands the user's agent a concrete starting point ("Read https://agent-deck.devopstoolkit.ai/llms.txt, then help me install and set up dot-agent-deck").
 2. **Docs published as raw Markdown**, linked from the landing page with a plain `<a href>` in the served HTML. A person can still read them; they are not designed for that.
 3. **`llms.txt` and `llms-full.txt`**, generated from `docs/` at build time: an index an agent can follow, and the whole corpus in one fetch.
 4. **`dot-agent-deck docs [topic]`**, a subcommand that prints docs embedded in the binary at build time, so an agent working with an installed deck reads the docs **for that version**, with no network access needed.
@@ -36,7 +36,10 @@ Make the website a landing page for people and make the docs a reference for the
 
 ### In Scope
 
-- Replace the Docusaurus site with a landing page plus published Markdown (Decision 1).
+- Replace the Docusaurus site with a static landing page plus published Markdown, removing Node from the site build (Decision 1).
+- A published-docs manifest (`docs/published.toml`) that is the single list of published pages, their titles and one-line descriptions (Decision 5).
+- Update the `site_image_refs` linkage-check rule (#1200), which scans `site/src/` today, to follow the landing page to its new location.
+- Landing-page imagery: the "busy deck" screenshot from `.landing-assets/` (retaken with `experimental` off, or cropped, and with personal paths removed) on the landing page; the "dispatch" screenshot, cleaned the same way and without its annotation arrow, as an illustration in the dispatcher-mode doc.
 - Serve `.md` with a readable content type on **both** deploy targets `docs-publish.yml` feeds: the nginx image (`site/nginx-default.conf`, rolled out by Argo CD from `site/helm/`) and Netlify (`site/netlify.toml`).
 - `llms.txt` / `llms-full.txt` generation, listing every published page and nothing from `docs/develop/`.
 - `dot-agent-deck docs` (list topics) and `dot-agent-deck docs <topic>` (print one page), with the content embedded at build time.
@@ -56,14 +59,20 @@ Make the website a landing page for people and make the docs a reference for the
 
 ## Technical Approach
 
-### Decision 1 — Replace Docusaurus with a static landing page plus Markdown files (proposed; confirm at start)
+### Decision 1 — Drop Docusaurus; the landing page becomes static HTML and CSS (decided 2026-09-29)
 
-With the docs served as Markdown, Docusaurus's only remaining job would be rendering one page. A static HTML landing page, the Markdown files copied verbatim, `llms.txt`/`llms-full.txt`, and images is a much smaller build. The delivery pipeline stays: the same `site/Dockerfile` → GHCR → `site/helm` → Argo CD path, the same Netlify deploy, the same `/publish-docs` skill. Only what the build produces changes.
+Once the docs are served as Markdown, Docusaurus's only job would be rendering one page, and that page does not need it. `site/src/pages/index.js` (#1155) uses nothing from Docusaurus except `@theme/Layout` (navbar and footer) and `@docusaurus/Link`; it has no state, no event handlers and no tabs, so it is already a static page written in React. Its design lives in `index.module.css` (about 1,000 lines) and its text in `site/src/data/landing-content.js`, and both port to plain HTML and CSS mechanically. The design work from #1021 is kept, not redone.
 
-Consequences to handle:
-- All 15 pages carry Docusaurus front matter (`sidebar_position`, `title`). Either strip it or keep a minimal `title` that the `llms.txt` generator reads. The published files should not carry a sidebar position that means nothing without a sidebar.
+What removing it buys:
+- **No Node in the site build.** Seven npm dependencies go, with their Renovate churn, the `npm ci` stage in `site/Dockerfile`, and the `netlify-build` job in `docs-publish.yml`, which exists only to keep npm install scripts away from the Netlify token.
+- **A build that is only generation and copying**: the published Markdown, `llms.txt`/`llms-full.txt`, images and the landing page. The generator is a `cargo xtask` that reads the same manifest as the `docs` subcommand (Decision 5), so one parser serves the site and the binary.
+
+What it costs, all one-off:
+- Porting the page and giving it its own header and footer. #1021's Task 1 already required one candidate to abandon the Docusaurus theme, so this is a direction that issue anticipated.
+- Light and dark mode: #1021 required both, and the Docusaurus theme toggle goes. Use `prefers-color-scheme`, with a few lines of script if an explicit toggle is kept.
+- The `site_image_refs` rule and `site/Dockerfile`, `site/netlify.toml`, `site/nginx-default.conf` and `docs-publish.yml` all follow the new layout. The delivery path itself (GHCR image → `site/helm` → Argo CD, plus Netlify, plus `/publish-docs`) stays.
+- Docusaurus front matter (`sidebar_position`, `title`) is removed from all 15 pages; the manifest carries titles and descriptions instead, and each page's first heading is its title.
 - `docs/img` is a symlink to `../site/static/img`. The published Markdown and the embedded copy must resolve images the same way, or the embedded copy must drop them.
-- The existing landing page is a 406-line React component (`site/src/pages/index.js`). It becomes the source material for the new page, not the page itself.
 
 ### Decision 2 — Markdown is served readable, and the landing page links to it in plain HTML
 
@@ -89,9 +98,11 @@ The docs describe how to **install, configure, use and troubleshoot** dot-agent-
 - The landing-page prompt and `llms.txt` both mention the subcommand, so an agent that finds the website first learns the version-matched route exists.
 - **No experimental flag** (maintainer decision, 2026-09-29). The subcommand is read-only and has nothing to hide.
 
-### Decision 5 — `docs/develop/` stays unpublished and unembedded, enforced rather than configured
+### Decision 5 — One manifest decides what is published; `docs/develop/` stays out, enforced rather than configured
 
-Today one Docusaurus `exclude` glob (`develop/**`) is what keeps maintainer docs off the site. That glob disappears with Docusaurus, and a naive "copy `docs/`" would publish all 39 files. The replacement is an **explicit list of published pages** (the same list that drives `llms.txt` and the binary's topics), plus a test that fails if anything under `docs/develop/` appears in the site build output, in `llms.txt`/`llms-full.txt`, or among the embedded topics. None of the 15 user pages links into `docs/develop/` today, and the link check keeps it that way.
+`docs/published.toml` lists each published page's slug, title and one-line description. It is the single source for three things: what the site publishes, what `llms.txt` lists, and which topics `dot-agent-deck docs` offers. A page not in it is not published anywhere.
+
+Today one Docusaurus `exclude` glob (`develop/**`) is what keeps maintainer docs off the site. That glob disappears with Docusaurus, and a naive "copy `docs/`" would publish all 39 files. The manifest is the replacement, plus a test that fails if anything under `docs/develop/` appears in the site build output, in `llms.txt`/`llms-full.txt`, or among the embedded topics. None of the 15 user pages links into `docs/develop/` today, and the link check keeps it that way.
 
 ### Decision 6 — One PRD, one PR, one commit per piece
 
@@ -99,9 +110,9 @@ The maintainer reviews it all at once, so that the landing page, the content, `l
 
 ## Milestones
 
-- [ ] **Site replaced**: static landing page (pitch, demo, install, agent prompt, plain-HTML docs link), Markdown served as `text/markdown` on both nginx and Netlify, old `/docs/<page>/` URLs redirected, and a link check in place of Docusaurus's.
+- [ ] **Site replaced**: Docusaurus removed; the #1155 landing page ported to static HTML/CSS with its own header and footer, light and dark mode, an agent prompt and a plain-HTML docs link; cleaned screenshots in place; Markdown served as `text/markdown` on both nginx and Netlify, old `/docs/<page>/` URLs redirected, and a link check in place of Docusaurus's.
 - [ ] **Docs rewritten for the agent reader** per Decision 3: task-oriented, full config/CLI reference, internals only where diagnosis needs them, with removed internals moved to `docs/develop/` where not already there.
-- [ ] **`llms.txt` / `llms-full.txt` generated** from the explicit published-page list.
+- [ ] **Manifest and generation**: `docs/published.toml`, and a `cargo xtask` that builds the site output (Markdown, `llms.txt`, `llms-full.txt`, images, landing page) from it.
 - [ ] **`dot-agent-deck docs [topic]` subcommand** printing embedded, version-matched docs, with tests.
 - [ ] **Publication boundary enforced**: tests that `docs/develop/` is absent from the build output, the `llms` files and the embedded topics.
 - [ ] **Repo rules and skills updated**: CLAUDE.md rule 11, `publish-docs` skill, `CONTRIBUTING.md`, plus a changelog fragment.
@@ -116,6 +127,7 @@ The maintainer reviews it all at once, so that the landing page, the content, `l
 
 ## Risks
 
+- **Losing #1155's design in the port.** Mitigated by porting the existing CSS rather than restyling, and comparing old and new pages side by side at desktop and phone widths, in both themes, before the Docusaurus build is deleted.
 - **Lost discoverability.** Search engines indexed the HTML doc pages. Mitigated by the redirects and by keeping the Markdown published at stable URLs.
 - **Rewrite quality.** An agent following an inaccurate page does damage faster than a person would. Mitigated by Decision 3's precision requirement, review of the rewrite as its own commit, and the fresh-agent validation.
 - **Version skew between site and binary.** The site shows the latest docs. Mitigated by the subcommand, which the site points to.
@@ -123,10 +135,9 @@ The maintainer reviews it all at once, so that the landing page, the content, `l
 
 ## Open Questions
 
-- Confirm Decision 1 (drop Docusaurus entirely) at the start of implementation.
-- Should the published Markdown carry any front matter (for example `title`, `description`) for the `llms.txt` generator, or should the generator read the first heading?
-- Is the untracked `.landing-assets/` directory in the main checkout (two PNGs) meant as input for the new landing page?
+- Keep an explicit light/dark toggle, or follow the OS setting only?
 
 ## Work Log
 
 - **2026-09-29**: PRD created. Decisions from discussion with the maintainer: landing page for people plus Markdown docs for agents, linked from the landing page; `llms.txt`; version-matched `docs` subcommand; docs remain user-facing and cover internals only where diagnosis needs them; dev docs out of scope; one PRD and one PR with one commit per piece; no experimental flag; work in a worktree.
+- **2026-09-29**: Decided with the maintainer: drop Docusaurus and port the #1155 landing page to static HTML/CSS (its only Docusaurus dependencies are the layout wrapper and `Link`); replace front matter with a `docs/published.toml` manifest shared by the site, `llms.txt` and the `docs` subcommand; use the `.landing-assets/` screenshots after cleaning (busy deck on the landing page, dispatch in the dispatcher-mode doc).
