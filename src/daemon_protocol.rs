@@ -1000,6 +1000,15 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // channel are unchanged on the wire. What changed is which preparations are
     // refused, which a version number cannot express.
     "1233-prepare-refuses-ambiguous-orchestration",
+    // Issue #1337, at 10 without moving it -- #708's shape, applied to the
+    // sibling #708 missed. The daemon's "respawn failed" report into an
+    // orchestrator's pane, for a `clear = true` respawn that could not start a
+    // replacement at all, used to be written with an LF and left unsubmitted; a
+    // newer daemon SUBMITS it as a turn, and it no longer interpolates the
+    // config-supplied role name. Nothing on the wire moved: the change is what an
+    // existing delivery MEANS -- inert text becomes model input -- and it takes
+    // effect when the daemon starts on the new build.
+    "1337-respawn-failure-report-submitted",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.

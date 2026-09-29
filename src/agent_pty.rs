@@ -2638,7 +2638,7 @@ async fn deliver_payload_and_submit(
 ///
 /// Issue #876: and no DRAIN either, which is a decision rather than an omission.
 /// A notice's bytes are MEANT to stay in the input box — that is the whole
-/// deferral contract ([`crate::state::compose_respawn_failed_notice`]) — so
+/// deferral contract ([`AgentPtyRegistry::write_notice_guarded`]) — so
 /// erasing a partial one would delete the feature rather than a hazard. It also
 /// leaves no payload record to lapse: `note_automatic_write` ignores
 /// [`SubmitMode::Notice`] entirely, so issue #876's "the guard expires while the
@@ -3311,9 +3311,10 @@ struct AutomaticWrite {
     /// older than our last write, and the probe then submitted draft + notice as
     /// one turn. The silent-worker notice was a production `Notice` caller that
     /// fires inside the 60 s confirmation window, so that interleaving was
-    /// ordinary, not hypothetical. (Issues #702 and #708 moved it and both its
-    /// siblings onto the submitted path; the respawn-failure notice is the
-    /// `Notice` caller left, and the guard stays for it.)
+    /// ordinary, not hypothetical. (Issues #702, #708 and #1337 moved it and
+    /// every other production `Notice` caller onto the submitted path; the
+    /// guard stays for as long as `write_notice_guarded` does, and
+    /// `scheduler/idle-worker/015` pins it.)
     submitted_at: Option<Instant>,
     /// ONE ENTRY PER GUARDED PAYLOAD WRITE that no delivery has released yet,
     /// oldest first — a multiset, not a set.
@@ -5151,11 +5152,11 @@ impl Drop for PaneCleanupHold {
 /// that an automatic prompt delivery FAILED on `pane_id`.
 ///
 /// This is the replacement for writing a diagnostic line into the agent's own
-/// input buffer. That mechanism (`write_notice_guarded`) is retained for the
-/// one orchestrator-pane notice that still takes it — `compose_respawn_failed_notice`;
-/// issue #702 moved PRD #249's silence notice off it onto the submitted path, and
-/// issue #708 moved `compose_worker_exited_notice` and
-/// `compose_respawn_no_live_worker_notice` after it — but its own contract says LF may be
+/// input buffer. That mechanism (`write_notice_guarded`) no longer has a
+/// production caller — issue #702 moved PRD #249's silence notice off it onto
+/// the submitted path, issue #708 moved `compose_worker_exited_notice` and
+/// `compose_respawn_no_live_worker_notice` after it, and issue #1337
+/// `compose_respawn_failed_notice` — and its own contract says LF may be
 /// interpreted as Enter and that a later ordinary submit sends
 /// `notice + newline + user prompt` as ONE turn — pinned by the passing
 /// regression `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`.
@@ -8375,13 +8376,37 @@ impl AgentPtyRegistry {
     /// Failure and refusal are reported through the same [`GuardedSend`] vocabulary
     /// so callers classify a refused notice the way they classify a refused prompt.
     ///
-    /// Issue #702: what this path guarantees is DEFERRAL, not inertness — see
-    /// [`crate::state::compose_respawn_failed_notice`], which carries the whole
-    /// contract for the one production notice that still takes this call (issue
-    /// #708 moved the other two onto [`Self::write_and_submit_guarded`]). A caller that
-    /// wants an untrusted value in its text belongs on
-    /// [`Self::write_and_submit_guarded`] instead, where the text is a turn of
-    /// its own rather than a prefix glued to the next one.
+    /// **No production caller since issue #1337, retained as a documented
+    /// capability.** Every daemon-authored orchestrator notice that used to
+    /// take this call now submits instead: #702 moved PRD #249's silence notice,
+    /// #708 the worker-exited and respawn-no-live-worker notices, and #1337 the
+    /// respawn-failure notice ([`crate::state::compose_respawn_failed_notice`]),
+    /// each because a deferred line reaches nobody in an unattended dispatched
+    /// unit. It is kept rather than deleted because the guarded Notice tail is
+    /// the one way to put a visible, unsubmitted line into a pane under an
+    /// identity gate, and because its user-input-clock behaviour (below, and
+    /// `scheduler/idle-worker/015`) is what a future caller would inherit — so
+    /// it stays pinned while it exists. A new caller should first ask why its
+    /// text does not deserve a turn.
+    ///
+    /// **The DEFERRED family's contract**, which anything delivered here obeys
+    /// (moved from `compose_respawn_failed_notice`'s doc by #1337, when that
+    /// notice stopped being the family's last member):
+    ///
+    /// * **Not submitted, which means DEFERRED rather than inert.** The LF
+    ///   terminator leaves a visible line in scrollback instead of handing the
+    ///   agent a turn to answer. It is not a guarantee of inertness: whether an
+    ///   agent's TUI reads LF as Enter is unverified per agent, and a later
+    ///   ordinary prompt write submits these bytes fused to the NEXT real prompt
+    ///   (pinned by
+    ///   `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`).
+    /// * **Fixed daemon-authored text, and only pre-scrubbed interpolation.**
+    ///   Because these bytes can be submitted later, glued to somebody else's
+    ///   turn, nothing a repository or an agent controls should ride them, and
+    ///   there is no submitted-turn framing to fence such a value inside. A
+    ///   caller that wants an untrusted value in its text belongs on
+    ///   [`Self::write_and_submit_guarded`] instead, where the text is a turn
+    ///   of its own rather than a prefix glued to the next one.
     pub async fn write_notice_guarded<Fut>(
         &self,
         pane_id: &str,
