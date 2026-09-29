@@ -487,12 +487,53 @@ fn trim_end_glyphs(text: &str) -> &str {
     text.trim_end_matches(|c: char| c.is_whitespace() || ('\u{2500}'..='\u{259F}').contains(&c))
 }
 
+/// Whether a re-delivery may type the pointer again, decided once, when the
+/// delivery is armed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetypePolicy {
+    /// A silent worker whose screen does not show the pointer gets a fresh copy.
+    Allowed,
+    /// Enter only: the probe, and the second Enter over a pointer still in the
+    /// input box. For a worker whose delivery the deck cannot confirm (issue
+    /// #1390's wrap-only Codex), a pointer that left the screen may well have
+    /// been submitted, and a copy would start the task a second time.
+    Never,
+}
+
+impl RetypePolicy {
+    /// The policy for a worker of `agent_type`, or one the deck spawned as a
+    /// wrapper host (`spawned_as_wrapper_host`, from
+    /// [`AgentPtyRegistry::agent_spawned_as_wrapper_host`]).
+    ///
+    /// Keyed on the launch shape rather than on the wrapper's per-event
+    /// `wrapper_prompt_reports_unavailable` marker: the policy is fixed before
+    /// the first write, and a freshly respawned wrapper may not have emitted a
+    /// single event by then, so the marker's absence proves nothing yet. That
+    /// withdraws the retype from a wrapped Codex whose prompt hook works as
+    /// well, which costs it a recovery the Enter does not give, never a
+    /// duplicate. The wrapper's `Thinking` is no evidence either way: it is
+    /// classified from painted output, not reported by a prompt hook.
+    pub fn for_worker(agent_type: Option<&AgentType>, spawned_as_wrapper_host: bool) -> Self {
+        let declared_wrapper = agent_type.is_some_and(|agent_type| {
+            crate::agent_registry::spec(agent_type).strategy
+                == Some(crate::agent_registry::IntegrationStrategy::Wrapper)
+        });
+        if spawned_as_wrapper_host || declared_wrapper {
+            Self::Never
+        } else {
+            Self::Allowed
+        }
+    }
+}
+
 /// Handed back by [`PendingDeliveries::arm`] to the loop that owns the record.
 #[derive(Debug)]
 pub struct ArmedDelivery {
     /// This record's generation, for [`PendingDeliveries::finish`] and
     /// [`PendingDeliveries::is_current`].
     pub seq: u64,
+    /// Fixed at arm time, so nothing the worker reports mid-loop can widen it.
+    pub retype: RetypePolicy,
     /// Resolves when the record is removed by anything other than the loop
     /// itself: an ack, a `work-done`, or a newer delegation to the pane.
     pub cancel: oneshot::Receiver<()>,
@@ -555,6 +596,7 @@ impl PendingDeliveries {
         delivery_id: &str,
         worker_agent_id: &str,
         silence_seq: Option<u64>,
+        retype: RetypePolicy,
     ) -> ArmedDelivery {
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let mut inner = self.inner.lock().unwrap();
@@ -572,6 +614,7 @@ impl PendingDeliveries {
         );
         ArmedDelivery {
             seq,
+            retype,
             cancel: cancel_rx,
         }
     }
@@ -854,7 +897,11 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
         silence_report_armed,
         done,
     } = retry;
-    let ArmedDelivery { seq, cancel } = armed;
+    let ArmedDelivery {
+        seq,
+        retype,
+        cancel,
+    } = armed;
     let mut watch = Watch {
         cancel,
         closing: registry.pane_close_signal(&pane_id),
@@ -882,6 +929,7 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
     let redeliver_ctx = RedeliverCtx {
         registry: &registry,
         seq,
+        retype,
         pane_id: &pane_id,
         worker_agent_id: &worker_agent_id,
         role: &role,
@@ -1023,6 +1071,7 @@ enum Phase {
 struct RedeliverCtx<'a> {
     registry: &'a Arc<AgentPtyRegistry>,
     seq: u64,
+    retype: RetypePolicy,
     pane_id: &'a str,
     worker_agent_id: &'a str,
     role: &'a str,
@@ -1041,6 +1090,7 @@ async fn redeliver(
     let RedeliverCtx {
         registry,
         seq,
+        retype,
         pane_id,
         worker_agent_id,
         role,
@@ -1132,6 +1182,23 @@ async fn redeliver(
             );
             return Attempt::Skipped;
         }
+        // Issue #1383 audit: a worker whose delivery the deck cannot confirm
+        // (#1390) may have taken the first pointer, cleared it and started
+        // working without any turn the loop can see. A copy would be a second
+        // turn for the same task.
+        (Phase::Retype, Composer::Absent) if retype == RetypePolicy::Never => {
+            info!(
+                pane_id = %escape_id_for_log(pane_id),
+                role = %escape_id_for_log(role),
+                delivery_id = %delivery_id,
+                attempt,
+                total_attempts,
+                "delegate retry: the worker stayed silent after the Enter, but its agent cannot \
+                 confirm a delivered prompt (a wrapper-hosted pane), so the pointer that left \
+                 its screen may already be running; not retyping it"
+            );
+            return Attempt::Skipped;
+        }
         (Phase::Retype, Composer::Absent) => pointer,
     };
     let revalidate_registry = Arc::clone(registry);
@@ -1220,6 +1287,9 @@ async fn redeliver(
                     (Phase::Probe, Composer::Unreadable) =>
                         "its screen was cleared by a resize since the pointer went in, so pressed \
                          Enter rather than risk typing a second copy",
+                    (Phase::Probe, Composer::Absent) if retype == RetypePolicy::Never =>
+                        "the pointer is not on its screen, so pressed Enter; its agent cannot \
+                         confirm a delivered prompt, so the pointer is never retyped",
                     (Phase::Probe, Composer::Absent) =>
                         "the pointer is not on its screen, which cannot tell an empty input box \
                          from one holding it unshown, so pressed Enter first; the pointer is \
@@ -1747,7 +1817,7 @@ mod tests {
     #[test]
     fn pending_deliveries_ack_stops_the_loop_and_is_idempotent() {
         let store = PendingDeliveries::default();
-        let mut armed = store.arm("p1", "d-11111111", "a1", Some(7));
+        let mut armed = store.arm("p1", "d-11111111", "a1", Some(7), RetypePolicy::Allowed);
         assert_eq!(
             store.acknowledge("p1", "d-11111111", Some("a1")),
             AckOutcome::Stopped {
@@ -1765,7 +1835,7 @@ mod tests {
     #[test]
     fn pending_deliveries_unknown_id_leaves_the_record_armed() {
         let store = PendingDeliveries::default();
-        let armed = store.arm("p1", "d-11111111", "a1", None);
+        let armed = store.arm("p1", "d-11111111", "a1", None, RetypePolicy::Allowed);
         assert_eq!(
             store.acknowledge("p1", "d-22222222", None),
             AckOutcome::Unknown
@@ -1776,7 +1846,7 @@ mod tests {
     #[test]
     fn pending_deliveries_ack_from_another_pane_or_agent_does_not_match() {
         let store = PendingDeliveries::default();
-        let armed = store.arm("p1", "d-11111111", "a1", None);
+        let armed = store.arm("p1", "d-11111111", "a1", None, RetypePolicy::Allowed);
         assert_eq!(
             store.acknowledge("p2", "d-11111111", None),
             AckOutcome::Unknown
@@ -1792,11 +1862,11 @@ mod tests {
     #[test]
     fn pending_deliveries_supersede_cancels_the_older_loop() {
         let store = PendingDeliveries::default();
-        let mut old = store.arm("p1", "d-11111111", "a1", None);
+        let mut old = store.arm("p1", "d-11111111", "a1", None, RetypePolicy::Allowed);
         assert!(store.supersede("p1"));
         assert!(old.cancel.try_recv().is_err());
-        let mut older = store.arm("p1", "d-22222222", "a1", None);
-        let newer = store.arm("p1", "d-33333333", "a1", None);
+        let mut older = store.arm("p1", "d-22222222", "a1", None, RetypePolicy::Allowed);
+        let newer = store.arm("p1", "d-33333333", "a1", None, RetypePolicy::Allowed);
         assert!(older.cancel.try_recv().is_err(), "re-arming replaces");
         assert!(store.is_current("p1", newer.seq));
     }
@@ -1804,8 +1874,8 @@ mod tests {
     #[test]
     fn pending_deliveries_stale_finish_leaves_a_newer_record() {
         let store = PendingDeliveries::default();
-        let old = store.arm("p1", "d-11111111", "a1", None);
-        let newer = store.arm("p1", "d-22222222", "a1", None);
+        let old = store.arm("p1", "d-11111111", "a1", None, RetypePolicy::Allowed);
+        let newer = store.arm("p1", "d-22222222", "a1", None, RetypePolicy::Allowed);
         assert!(!store.finish("p1", old.seq));
         assert!(store.is_current("p1", newer.seq));
         assert!(store.finish("p1", newer.seq));
@@ -1815,7 +1885,7 @@ mod tests {
     #[test]
     fn pending_deliveries_work_done_cancels() {
         let store = PendingDeliveries::default();
-        let mut armed = store.arm("p1", "d-11111111", "a1", None);
+        let mut armed = store.arm("p1", "d-11111111", "a1", None, RetypePolicy::Allowed);
         assert!(store.retire_on_work_done("p1"));
         assert!(armed.cancel.try_recv().is_err());
         assert!(!store.retire_on_work_done("p1"));
@@ -1826,8 +1896,8 @@ mod tests {
         // The seq is known before the first write, so an ack that lands before
         // that write completes still names the watch to cancel (audit M3).
         let store = PendingDeliveries::default();
-        let _old = store.arm("p1", "d-11111111", "a1", Some(3));
-        let _newer = store.arm("p1", "d-22222222", "a1", Some(4));
+        let _old = store.arm("p1", "d-11111111", "a1", Some(3), RetypePolicy::Allowed);
+        let _newer = store.arm("p1", "d-22222222", "a1", Some(4), RetypePolicy::Allowed);
         assert_eq!(
             store.acknowledge("p1", "d-22222222", None),
             AckOutcome::Stopped {
@@ -1966,11 +2036,20 @@ while chunk := os.read(0, 4096):
             &self,
             schedule: &str,
         ) -> (tokio::task::JoinHandle<RetryEnd>, Arc<AtomicU32>) {
+            self.deliver_and_retry_with(schedule, RetypePolicy::Allowed)
+                .await
+        }
+
+        async fn deliver_and_retry_with(
+            &self,
+            schedule: &str,
+            retype: RetypePolicy,
+        ) -> (tokio::task::JoinHandle<RetryEnd>, Arc<AtomicU32>) {
             let event_rx = self.tx.subscribe();
-            let armed = self
-                .registry
-                .pending_deliveries()
-                .arm(&self.pane, ID, &self.agent, None);
+            let armed =
+                self.registry
+                    .pending_deliveries()
+                    .arm(&self.pane, ID, &self.agent, None, retype);
             let first = self
                 .registry
                 .write_and_submit_guarded_detailed(&self.pane, POINTER, &self.agent, || async {
@@ -2064,6 +2143,80 @@ while chunk := os.read(0, 4096):
         );
         assert!(!fx.registry.pending_deliveries().is_pending(&fx.pane));
         fx.stop();
+    }
+
+    /// Issue #1383 audit: a wrapper-hosted worker (#1390's wrap-only Codex)
+    /// that took the pointer, cleared it from its screen and reported no turn
+    /// gets the probe Enter on every re-delivery and never a second copy — its
+    /// silence is no evidence the task did not start.
+    #[tokio::test]
+    async fn retry_loop_never_retypes_into_a_worker_whose_delivery_cannot_be_confirmed() {
+        let fx = Fixture::start("retry-wrapper-host", false).await;
+        let (handle, redeliveries) = fx
+            .deliver_and_retry_with("150,150", RetypePolicy::Never)
+            .await;
+        assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
+        assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
+        fx.received_lines(3).await;
+        // Past the loop's end, so a late copy would be in the sink too.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let lines = fx.received_lines(3).await;
+        assert_eq!(
+            lines.iter().filter(|l| l.as_str() == POINTER).count(),
+            1,
+            "only the first write may carry the pointer: {lines:?}"
+        );
+        assert_eq!(
+            lines,
+            [POINTER, "", ""],
+            "one probe Enter per re-delivery and nothing else: {lines:?}"
+        );
+        fx.stop();
+    }
+
+    /// The Enter-only half survives the policy: a wrapper-hosted worker whose
+    /// input box still holds the pointer after the probe gets the second Enter.
+    #[tokio::test]
+    async fn retry_loop_still_presses_the_second_enter_for_a_worker_that_is_never_retyped() {
+        let Some(fx) = Fixture::start_composer("retry-wrapper-composer").await else {
+            eprintln!("SKIP: python3 is not available");
+            return;
+        };
+        let (handle, redeliveries) = fx
+            .deliver_and_retry_with("150,150", RetypePolicy::Never)
+            .await;
+        assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
+        assert_eq!(redeliveries.load(Ordering::SeqCst), 2);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let raw = std::fs::read_to_string(&fx.sink).unwrap_or_default();
+        assert_eq!(raw, format!("{POINTER}\r\r\r\r\r"));
+        fx.stop();
+    }
+
+    #[test]
+    fn retype_policy_withholds_the_retype_from_a_wrapper_hosted_worker() {
+        assert_eq!(
+            RetypePolicy::for_worker(Some(&AgentType::Codex), false),
+            RetypePolicy::Never,
+            "a declared Codex worker is hosted by the wrapper"
+        );
+        assert_eq!(
+            RetypePolicy::for_worker(Some(&AgentType::ClaudeCode), true),
+            RetypePolicy::Never,
+            "the launch shape wins over a declared type"
+        );
+        for agent_type in [
+            AgentType::ClaudeCode,
+            AgentType::OpenCode,
+            AgentType::Pi,
+            AgentType::Devin,
+        ] {
+            assert_eq!(
+                RetypePolicy::for_worker(Some(&agent_type), false),
+                RetypePolicy::Allowed,
+                "{agent_type:?}"
+            );
+        }
     }
 
     /// A pointer the worker's input box still holds after the probe — echoed,

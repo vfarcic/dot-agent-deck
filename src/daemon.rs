@@ -7676,6 +7676,7 @@ mod hook_ingestion_tests {
             "d-1383abcd",
             &fx.worker_agent,
             Some(silence.seq),
+            crate::delegate_retry::RetypePolicy::Allowed,
         );
         let token = fx.worker_token.clone();
         let ack = fx
@@ -7722,6 +7723,7 @@ mod hook_ingestion_tests {
             "d-1383abcd",
             &fx.worker_agent,
             None,
+            crate::delegate_retry::RetypePolicy::Allowed,
         );
         let token = fx.orchestrator_token.clone();
         let ack = fx
@@ -7749,6 +7751,7 @@ mod hook_ingestion_tests {
             "d-1383abcd",
             &fx.worker_agent,
             None,
+            crate::delegate_retry::RetypePolicy::Allowed,
         );
         let token = fx.worker_token.clone();
         let ack = fx

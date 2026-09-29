@@ -8617,11 +8617,20 @@ async fn dispatch_one_owned(
                 && crate::delegate_retry::agent_type_supports_retry(retry_agent_type.as_ref()) =>
         {
             let rx = event_tx.subscribe();
+            // Issue #1383 audit: a wrapper-hosted worker (#1390's wrap-only
+            // Codex) gets the Enter but never a retyped pointer. Decided here,
+            // before the first write, from the launch shape and the resolved
+            // type rather than from anything the worker reports later.
+            let retype = crate::delegate_retry::RetypePolicy::for_worker(
+                retry_agent_type.as_ref(),
+                registry.agent_spawned_as_wrapper_host(worker_agent_id),
+            );
             let armed = registry.pending_deliveries().arm(
                 &pane_id,
                 &delivery_id,
                 worker_agent_id,
                 silence.as_ref().map(|(_, armed, _)| armed.seq),
+                retype,
             );
             Some((armed, rx))
         }
@@ -18237,9 +18246,13 @@ mod tests {
         let silence = registry
             .arm_silence_watch(WORKER_PANE, ORCH_PANE, Some(&worker))
             .expect("arm the silent-worker watch");
-        let armed = registry
-            .pending_deliveries()
-            .arm(WORKER_PANE, ID, &worker, Some(silence.seq));
+        let armed = registry.pending_deliveries().arm(
+            WORKER_PANE,
+            ID,
+            &worker,
+            Some(silence.seq),
+            crate::delegate_retry::RetypePolicy::Allowed,
+        );
         let retry_rx = event_tx.subscribe();
         let watch_rx = event_tx.subscribe();
         let first = registry
