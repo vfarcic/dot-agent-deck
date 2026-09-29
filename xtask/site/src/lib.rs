@@ -455,7 +455,9 @@ pub fn netlify_headers(pages: &[Page]) -> String {
 /// The link check that replaced Docusaurus's `onBrokenLinks: 'throw'`.
 ///
 /// Every link and image target in the published Markdown, in each HTML page
-/// and in `llms.txt` is resolved against the output: a relative target against
+/// and in `llms.txt` (inline `](target)` links and images, and the target of
+/// every link reference definition, `[label]: target`, which reference-style
+/// links and images use) is resolved against the output: a relative target against
 /// the linking file's directory, a root-absolute one against the site root,
 /// and an absolute URL on `base_url` by its path. Each must name a file the
 /// site publishes (an `#id` on an HTML page must name an element on it), and
@@ -482,6 +484,11 @@ pub fn check_links(site: &Site, base_url: &str) -> Result<(), String> {
         let targets = match kind {
             LinkSource::Markdown => {
                 let mut t = markdown_link_targets(text);
+                t.extend(
+                    reference_definitions(text)
+                        .into_iter()
+                        .map(|(_, target)| target),
+                );
                 t.extend(html_attr_targets(text));
                 t
             }
@@ -593,6 +600,113 @@ fn markdown_link_targets(body: &str) -> Vec<&str> {
         }
     }
     targets
+}
+
+/// Every link reference definition outside code fences, as `(label, target)`
+/// with the label normalized the way CommonMark matches it (case-folded,
+/// whitespace collapsed). A definition is a line of up to three leading spaces,
+/// `[label]:`, a destination (bare or `<…>`, on that line or the next) and an
+/// optional quoted or parenthesized title; anything else after the destination
+/// makes the line prose, not a definition. Footnote definitions (`[^1]:`) are
+/// not links and are skipped. Checking every definition, used or not, is the
+/// strict side: an unused one to a missing page still fails the build.
+fn reference_definitions(body: &str) -> Vec<(String, &str)> {
+    let lines = unfenced_lines(body);
+    let mut definitions = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        if indent > 3 {
+            continue;
+        }
+        let Some(after_open) = line[indent..].strip_prefix('[') else {
+            continue;
+        };
+        let Some(label_end) = label_end(after_open) else {
+            continue;
+        };
+        let label = &after_open[..label_end];
+        if label.trim().is_empty() || label.starts_with('^') {
+            continue;
+        }
+        let Some(rest) = after_open[label_end + 1..].strip_prefix(':') else {
+            continue;
+        };
+        let rest = if rest.trim().is_empty() {
+            match lines.get(i + 1) {
+                Some(next) => *next,
+                None => continue,
+            }
+        } else {
+            rest
+        };
+        if let Some(target) = definition_destination(rest) {
+            definitions.push((normalize_label(label), target));
+        }
+    }
+    definitions
+}
+
+/// The byte offset of the `]` closing a link label that starts just after its
+/// `[`, honoring backslash escapes. `None` for an unescaped `[` inside, which
+/// CommonMark does not allow in a reference label, or no `]` on the line.
+fn label_end(text: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (i, c) in text.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '[' => return None,
+            ']' => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A definition's destination, if what follows `[label]:` is one: the
+/// destination, then nothing or a title (`"…"`, `'…'` or `(…)`, which may
+/// continue on later lines) after whitespace, and nothing after the title.
+fn definition_destination(rest: &str) -> Option<&str> {
+    let rest = rest.trim_start();
+    let (target, after) = if let Some(bracketed) = rest.strip_prefix('<') {
+        let end = bracketed.find(['<', '>'])?;
+        if bracketed.as_bytes()[end] != b'>' {
+            return None;
+        }
+        (&bracketed[..end], &bracketed[end + 1..])
+    } else {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        (&rest[..end], &rest[end..])
+    };
+    if target.is_empty() {
+        return None;
+    }
+    let title = after.trim_start();
+    if title.is_empty() {
+        return Some(target);
+    }
+    if title.len() == after.len() {
+        return None;
+    }
+    let close = match title.chars().next()? {
+        '"' => '"',
+        '\'' => '\'',
+        '(' => ')',
+        _ => return None,
+    };
+    match title[1..].find(close) {
+        Some(end) if !title[1 + end + 1..].trim().is_empty() => None,
+        _ => Some(target),
+    }
+}
+
+/// A link label as CommonMark matches it: case-folded, whitespace collapsed.
+fn normalize_label(label: &str) -> String {
+    label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Every `href="…"` and `src="…"` attribute value, for HTML and for raw HTML
@@ -875,31 +989,72 @@ fn first_heading(body: &str) -> Option<&str> {
     None
 }
 
-/// Every Markdown image target (`![alt](target)`) outside code fences.
+/// Every Markdown image target outside code fences: inline (`![alt](target)`)
+/// and reference-style (`![alt][label]`, `![alt][]`, `![alt]`) resolved
+/// through the page's link reference definitions. A reference-style image with
+/// no matching definition is plain text, not an image.
 fn image_targets(body: &str) -> Vec<&str> {
+    let definitions: BTreeMap<String, &str> = reference_definitions(body)
+        .into_iter()
+        .rev() // the first definition of a label wins, as in CommonMark
+        .collect();
     let mut targets = Vec::new();
     for line in unfenced_lines(body) {
         let mut rest = line;
         while let Some(start) = rest.find("![") {
             let after = &rest[start + 2..];
-            let Some(close) = after.find("](") else { break };
-            let target_start = &after[close + 2..];
-            let Some(end) = target_start.find(')') else {
-                break;
+            let Some(close) = alt_end(after) else { break };
+            let alt = &after[..close];
+            let tail = &after[close + 1..];
+            if let Some(target_start) = tail.strip_prefix('(') {
+                let Some(end) = target_start.find(')') else {
+                    break;
+                };
+                let target = target_start[..end]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_start_matches('<')
+                    .trim_end_matches('>');
+                if !target.is_empty() {
+                    targets.push(target);
+                }
+                rest = &target_start[end + 1..];
+                continue;
+            }
+            let (label, next) = match tail.strip_prefix('[').and_then(|l| {
+                let end = label_end(l)?;
+                Some((&l[..end], &l[end + 1..]))
+            }) {
+                Some(("", next)) => (alt, next),
+                Some((label, next)) => (label, next),
+                None => (alt, tail),
             };
-            let target = target_start[..end]
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim_start_matches('<')
-                .trim_end_matches('>');
-            if !target.is_empty() {
+            if let Some(&target) = definitions.get(&normalize_label(label)) {
                 targets.push(target);
             }
-            rest = &target_start[end + 1..];
+            rest = next;
         }
     }
     targets
+}
+
+/// The byte offset of the `]` closing an image's alt text that starts just
+/// after its `![`, allowing nested brackets and backslash escapes.
+fn alt_end(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut escaped = false;
+    for (i, c) in text.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '[' => depth += 1,
+            ']' if depth == 0 => return Some(i),
+            ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Check every image `page` references and return the RELATIVE ones as paths

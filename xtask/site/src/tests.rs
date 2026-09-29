@@ -836,6 +836,85 @@ fn link_check_rejects_links_into_develop() {
 }
 
 #[test]
+fn link_check_rejects_a_broken_reference_definition() {
+    let fx = Fixture::new();
+    for (body, target) in [
+        ("See [guide][setup].\n\n[setup]: missing.md\n", "missing.md"),
+        (
+            "See [guide][setup].\n\n   [setup]: <gone page.md> \"Setup\"\n",
+            "gone page.md",
+        ),
+        // The destination may sit on the line after the label.
+        ("See [setup].\n\n[setup]:\n  later.md\n", "later.md"),
+        // An unused definition is still checked.
+        (
+            "No link uses it.\n\n[Unused Label]: nowhere.md 'title'\n",
+            "nowhere.md",
+        ),
+    ] {
+        fs::write(fx.docs().join("start.md"), format!("# Start\n\n{body}")).unwrap();
+        let err = build(&fx.config).unwrap_err();
+        assert!(
+            err.contains(&format!(
+                "docs/start.md: `{target}` resolves to `/docs/{target}`"
+            )),
+            "{body:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn link_check_accepts_valid_reference_definitions_and_publishes_their_images() {
+    let fx = Fixture::new();
+    fs::write(
+        fx.docs().join("start.md"),
+        "# Start\n\nSee [the app][app], [Shot], ![a relative shot][rel] and ![abs][].\n\n\
+         [app]: desktop/index.md#desktop \"The app\"\n\
+         [shot]: </img/shot.png>\n\
+         [rel]: img/rel.png (relative)\n\
+         [abs]: /img/shot.png\n\
+         [web]: https://example.com/x\n\n\
+         Not definitions: a footnote and prose that merely starts like one.\n\n\
+         [^1]: gone.md\n\n\
+         [Note]: see gone.md for more\n\n    [indented]: code-block.md\n\n\
+         ```md\n[fenced]: gone.md\n```\n",
+    )
+    .unwrap();
+    let site = build(&fx.config).unwrap();
+    // The reference-style relative image is published like an inline one.
+    assert_eq!(site.files["docs/img/rel.png"], b"PNG-rel");
+}
+
+#[test]
+fn link_check_rejects_a_reference_definition_into_develop() {
+    let fx = Fixture::new();
+    for target in [
+        "develop/secret.md",
+        "<./develop/secret.md>",
+        "/docs/develop/secret.md",
+        "https://github.com/vfarcic/dot-agent-deck/blob/main/docs/develop/secret.md",
+    ] {
+        fs::write(
+            fx.docs().join("start.md"),
+            format!("# Start\n\nSee [secret].\n\n[secret]: {target}\n"),
+        )
+        .unwrap();
+        let err = build(&fx.config).unwrap_err();
+        assert!(err.contains("links into docs/develop/"), "{target}: {err}");
+    }
+
+    // A reference-style image into develop/ is refused before anything is
+    // published, as an inline one is.
+    fs::write(
+        fx.docs().join("start.md"),
+        "# Start\n\n![diagram][d]\n\n[d]: develop/diagram.png\n",
+    )
+    .unwrap();
+    let err = build(&fx.config).unwrap_err();
+    assert!(err.contains("is under docs/develop/"), "{err}");
+}
+
+#[test]
 fn link_check_ignores_code_fences_and_external_links() {
     let fx = Fixture::new();
     fs::write(
