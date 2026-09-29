@@ -1967,6 +1967,46 @@ struct PromptDelivery {
     can_report_prompts: bool,
 }
 
+/// Issue #1383: what a seed or orchestrator prompt write knew when it was
+/// issued, kept so its outcome can be applied on the frame it arrives in.
+struct IssuedPromptSend {
+    /// The logical delivery the write belongs to. An outcome whose delivery
+    /// has since been dropped or replaced (a re-arm starts a fresh one) is
+    /// discarded rather than applied to its successor.
+    delivery_id: Option<String>,
+    attempt: u32,
+    writes_payload: bool,
+    watermark: Option<DateTime<Utc>>,
+    capability: ConfirmationCapability,
+    /// Whether an earlier attempt of the same delivery had already written.
+    already_written: bool,
+    expected_agent_id: Option<String>,
+}
+
+/// Issue #1383: a prompt write the daemon has not answered yet. The daemon
+/// holds a submit's CR until the payload renders, up to
+/// [`crate::submit_echo::SUBMIT_ECHO_BOUND`], so the render loop issues the
+/// write and polls for its outcome instead of waiting on its own thread.
+/// While one is in flight nothing else happens for that pane's delivery — no
+/// confirmation check, deadline, retry or second write — so the outcome is
+/// applied to the state it was issued from.
+struct InFlightPromptSend {
+    pending: crate::pane::PendingSubmit,
+    issued: IssuedPromptSend,
+}
+
+/// Issue #1383: whether `issued` still belongs to the delivery now held for
+/// `pane_id`. `false` once that delivery has been dropped or replaced while the
+/// write was in flight, in which case its outcome answers nothing anyone is
+/// still waiting on.
+fn issued_for_current_delivery(
+    deliveries: &HashMap<String, PromptDelivery>,
+    pane_id: &str,
+    issued: &IssuedPromptSend,
+) -> bool {
+    deliveries.get(pane_id).map(|d| d.delivery_id.as_str()) == issued.delivery_id.as_deref()
+}
+
 /// PRD #20 R20-005: bounded exponential backoff for a retried automatic prompt.
 /// `attempts` is the number of failed attempts so far (≥ 1). Schedule: 500 ms,
 /// 1 s, then capped at 2 s — so a permanent non-delivery settles into an
@@ -2377,6 +2417,9 @@ struct UiState {
     /// so every (re)delivery carries the same agent identity + stable delivery
     /// id. Keyed by pane id; cleared when the prompt is delivered or abandoned.
     prompt_delivery: HashMap<String, PromptDelivery>,
+    /// Issue #1383: seed and orchestrator prompt writes still waiting on the
+    /// daemon, keyed by pane id. See [`InFlightPromptSend`].
+    in_flight_prompt_sends: HashMap<String, InFlightPromptSend>,
     /// PRD #127 M3.3: schedules listed in the "Schedules" manager dialog,
     /// loaded from the global config when the dialog opens.
     scheduled_tasks: Vec<config::ScheduledTask>,
@@ -2565,6 +2608,7 @@ impl UiState {
             pending_seed_prompts: Vec::new(),
             send_retry_backoff: HashMap::new(),
             prompt_delivery: HashMap::new(),
+            in_flight_prompt_sends: HashMap::new(),
             // next_delivery_seq removed (PRD #20 finding #3): delivery ids are now
             // minted globally unique via `mint_delivery_id`.
             scheduled_tasks: Vec::new(),
@@ -3828,7 +3872,39 @@ fn process_pending_seed_prompts(
     let mut prompts = std::mem::take(&mut ui.pending_seed_prompts);
     let mut backoff = std::mem::take(&mut ui.send_retry_backoff);
     let mut deliveries = std::mem::take(&mut ui.prompt_delivery);
+    let mut in_flight = std::mem::take(&mut ui.in_flight_prompt_sends);
     prompts.retain_mut(|sp| {
+        // Issue #1383: a write the daemon has not answered yet holds this
+        // seed's whole delivery — confirmation, deadline, retry — until its
+        // outcome arrives, and that outcome is applied first. See
+        // [`InFlightPromptSend`].
+        if let Some(sending) = in_flight.get_mut(&sp.pane_id) {
+            let Some(outcome) = sending.pending.poll() else {
+                return true;
+            };
+            let issued = in_flight
+                .remove(&sp.pane_id)
+                .expect("the entry polled above")
+                .issued;
+            if !issued_for_current_delivery(&deliveries, &sp.pane_id, &issued) {
+                tracing::debug!(
+                    pane_id = %sp.pane_id,
+                    delivery_id = issued.delivery_id.as_deref().unwrap_or_default(),
+                    "seed write answered after its delivery was dropped; outcome discarded"
+                );
+                return true;
+            }
+            return apply_seed_send_outcome(
+                outcome,
+                &issued,
+                &sp.pane_id,
+                snapshot,
+                now,
+                &mut backoff,
+                &mut deliveries,
+                &mut feedback,
+            );
+        }
         // Issue #424: CONFIRMATION FIRST. A previous frame's `Applied`/`Queued`
         // only proved the PTY accepted bytes, so the seed is still here; if the
         // agent has since reported submitting it, this delivery is done — clear
@@ -4052,123 +4128,179 @@ fn process_pending_seed_prompts(
             {
                 delivery.closures_at_write = Some(closures);
             }
-            match pane.write_and_submit_to_pane_with_identity(
+            let issued = IssuedPromptSend {
+                delivery_id: Some(delivery_id),
+                attempt,
+                writes_payload,
+                watermark,
+                capability,
+                already_written,
+                expected_agent_id,
+            };
+            // Issue #1383: started, not waited for — the daemon holds the CR
+            // until the payload renders, and this runs on the render thread.
+            // A controller that answers at once is applied at once, exactly as
+            // before; otherwise the outcome is applied on the frame it arrives
+            // in, and until then this pane's delivery is left alone (the top
+            // of this closure).
+            let mut pending = pane.begin_write_and_submit_to_pane_with_identity(
                 &sp.pane_id,
                 if writes_payload { &sp.prompt } else { "" },
-                expected_agent_id.as_deref(),
+                issued.expected_agent_id.as_deref(),
                 expected_session_id.as_deref(),
                 Some(&wire_delivery_id),
-            ) {
-                // Issue #424: the PTY accepted the bytes — that is ALL this
-                // means. Whether the agent's TUI was in submit-CR-aware mode
-                // when the CR landed is not knowable here, so the seed, its
-                // identity and its retry are RETAINED until the agent reports
-                // submitting it (checked at the top of this closure).
-                Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
-                    let delivery = deliveries
-                        .get_mut(&sp.pane_id)
-                        .expect("delivery inserted above");
-                    delivery.attempts = attempt;
-                    if delivery.watermark.is_none() {
-                        delivery.watermark = watermark;
-                    }
-                    if writes_payload {
-                        log_prompt_written("seed", &sp.pane_id, &delivery_id, attempt);
-                    } else {
-                        log_prompt_probe_submitted("seed", &sp.pane_id, &delivery_id, attempt);
-                    }
-                    match capability {
-                        // A recognized producer that structurally cannot report
-                        // a submitted prompt (Pi). Retrying could never be
-                        // confirmed — only retyped — so the write is final.
-                        ConfirmationCapability::CannotReport => {
-                            log_prompt_unconfirmable(
-                                "seed",
-                                &sp.pane_id,
-                                &delivery_id,
-                                "this agent cannot report a submitted prompt",
-                            );
-                            backoff.remove(&sp.pane_id);
-                            deliveries.remove(&sp.pane_id);
-                            return false;
-                        }
-                        // Reviewer finding B3: nothing has identified itself
-                        // yet. Hold the write PROVISIONAL — retained, so a
-                        // producer that signals at 10.1 s still arms retries and
-                        // a confirmation still finalizes — but do NOT retype
-                        // into a pane that has given no reason to think a second
-                        // copy would help. This is where the old code finalized
-                        // and threw the prompt away, which is what excluded the
-                        // slow-launcher class from the whole fix.
-                        ConfirmationCapability::Unknown => {
-                            backoff.remove(&sp.pane_id);
-                            return true;
-                        }
-                        ConfirmationCapability::Reports => {
-                            log_prompt_unconfirmed("seed", &sp.pane_id, &delivery_id, attempt);
-                            schedule_unconfirmed_retry(
-                                &mut backoff,
-                                snapshot,
-                                &sp.pane_id,
-                                expected_agent_id.as_deref(),
-                                now,
-                                attempt,
-                            );
-                            return true;
-                        }
-                    }
+            );
+            return match pending.poll() {
+                Some(outcome) => apply_seed_send_outcome(
+                    outcome,
+                    &issued,
+                    &sp.pane_id,
+                    snapshot,
+                    now,
+                    &mut backoff,
+                    &mut deliveries,
+                    &mut feedback,
+                ),
+                None => {
+                    in_flight.insert(sp.pane_id.clone(), InFlightPromptSend { pending, issued });
+                    true
                 }
-                // Issue #424 (tester's finding, C2): a TERMINAL outcome is
-                // terminal HERE too. This arm used to funnel every non-success
-                // result into `schedule_send_retry`, so a `WrongSession` on a
-                // provisional delivery — the pane changed hands, the
-                // identity-aware controller refused before writing — left the
-                // stale seed alive and retrying until the deadline instead of
-                // stopping, and an `Ambiguous` could be retried after a PARTIAL
-                // write, which is the one thing that variant exists to forbid.
-                // The orchestrator path already did this
-                // ([`is_terminal_send_result`]); only the seed path did not.
-                Ok(other) if seed_result_is_terminal(other, already_written) => {
-                    log_prompt_stopped(
-                        "seed",
-                        &sp.pane_id,
-                        &delivery_id,
-                        describe_send_result(other),
-                    );
-                    feedback = Some(format!(
-                        "Seed prompt not delivered ({}); abandoned",
-                        describe_send_result(other)
-                    ));
-                    backoff.remove(&sp.pane_id);
-                    deliveries.remove(&sp.pane_id);
-                    return false;
-                }
-                // Explicit non-delivery: retain for retry, back off, surface
-                // feedback. Bounded by the deadline checked at the top of this
-                // closure (finding #13) — never a forever loop.
-                Ok(other) => {
-                    schedule_send_retry(&mut backoff, &sp.pane_id, now);
-                    feedback = Some(format!(
-                        "Seed prompt not delivered ({}); will retry",
-                        describe_send_result(other)
-                    ));
-                    return true;
-                }
-                // Transport failure: retain for retry, back off, surface feedback.
-                Err(e) => {
-                    schedule_send_retry(&mut backoff, &sp.pane_id, now);
-                    feedback = Some(format!("Seed prompt not delivered ({e}); will retry"));
-                    return true;
-                }
-            }
+            };
         }
         true
     });
     ui.pending_seed_prompts = prompts;
     ui.send_retry_backoff = backoff;
     ui.prompt_delivery = deliveries;
+    ui.in_flight_prompt_sends = in_flight;
     if let Some(message) = feedback {
         ui.status_message = Some((message, now));
+    }
+}
+
+/// Issue #1383: apply the outcome of a seed write to its delivery, on whichever
+/// frame the outcome arrives in — straight away for a controller that answers
+/// synchronously, on a later frame for the daemon-backed one. This is the body
+/// the synchronous call's `match` used to have, unchanged except that what it
+/// knew at the call is now read from `issued`. Returns whether the seed is
+/// retained.
+#[allow(clippy::too_many_arguments)]
+fn apply_seed_send_outcome(
+    outcome: Result<SendResult, PaneError>,
+    issued: &IssuedPromptSend,
+    pane_id: &str,
+    snapshot: &AppState,
+    now: std::time::Instant,
+    backoff: &mut HashMap<String, SendRetryState>,
+    deliveries: &mut HashMap<String, PromptDelivery>,
+    feedback: &mut Option<String>,
+) -> bool {
+    let delivery_id = issued.delivery_id.as_deref().unwrap_or_default();
+    let expected_agent_id = &issued.expected_agent_id;
+    let (attempt, writes_payload, watermark, capability, already_written) = (
+        issued.attempt,
+        issued.writes_payload,
+        issued.watermark,
+        issued.capability,
+        issued.already_written,
+    );
+    match outcome {
+        // Issue #424: the PTY accepted the bytes — that is ALL this
+        // means. Whether the agent's TUI was in submit-CR-aware mode
+        // when the CR landed is not knowable here, so the seed, its
+        // identity and its retry are RETAINED until the agent reports
+        // submitting it (checked at the top of the delivery closure).
+        Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
+            let delivery = deliveries
+                .get_mut(pane_id)
+                .expect("checked by the caller: the delivery this write belongs to is still held");
+            delivery.attempts = attempt;
+            if delivery.watermark.is_none() {
+                delivery.watermark = watermark;
+            }
+            if writes_payload {
+                log_prompt_written("seed", pane_id, delivery_id, attempt);
+            } else {
+                log_prompt_probe_submitted("seed", pane_id, delivery_id, attempt);
+            }
+            match capability {
+                // A recognized producer that structurally cannot report
+                // a submitted prompt (Pi). Retrying could never be
+                // confirmed — only retyped — so the write is final.
+                ConfirmationCapability::CannotReport => {
+                    log_prompt_unconfirmable(
+                        "seed",
+                        pane_id,
+                        delivery_id,
+                        "this agent cannot report a submitted prompt",
+                    );
+                    backoff.remove(pane_id);
+                    deliveries.remove(pane_id);
+                    false
+                }
+                // Reviewer finding B3: nothing has identified itself
+                // yet. Hold the write PROVISIONAL — retained, so a
+                // producer that signals at 10.1 s still arms retries and
+                // a confirmation still finalizes — but do NOT retype
+                // into a pane that has given no reason to think a second
+                // copy would help. This is where the old code finalized
+                // and threw the prompt away, which is what excluded the
+                // slow-launcher class from the whole fix.
+                ConfirmationCapability::Unknown => {
+                    backoff.remove(pane_id);
+                    true
+                }
+                ConfirmationCapability::Reports => {
+                    log_prompt_unconfirmed("seed", pane_id, delivery_id, attempt);
+                    schedule_unconfirmed_retry(
+                        backoff,
+                        snapshot,
+                        pane_id,
+                        expected_agent_id.as_deref(),
+                        now,
+                        attempt,
+                    );
+                    true
+                }
+            }
+        }
+        // Issue #424 (tester's finding, C2): a TERMINAL outcome is
+        // terminal HERE too. This arm used to funnel every non-success
+        // result into `schedule_send_retry`, so a `WrongSession` on a
+        // provisional delivery — the pane changed hands, the
+        // identity-aware controller refused before writing — left the
+        // stale seed alive and retrying until the deadline instead of
+        // stopping, and an `Ambiguous` could be retried after a PARTIAL
+        // write, which is the one thing that variant exists to forbid.
+        // The orchestrator path already did this
+        // ([`is_terminal_send_result`]); only the seed path did not.
+        Ok(other) if seed_result_is_terminal(other, already_written) => {
+            log_prompt_stopped("seed", pane_id, delivery_id, describe_send_result(other));
+            *feedback = Some(format!(
+                "Seed prompt not delivered ({}); abandoned",
+                describe_send_result(other)
+            ));
+            backoff.remove(pane_id);
+            deliveries.remove(pane_id);
+            false
+        }
+        // Explicit non-delivery: retain for retry, back off, surface
+        // feedback. Bounded by the deadline checked at the top of the
+        // delivery closure (finding #13) — never a forever loop.
+        Ok(other) => {
+            schedule_send_retry(backoff, pane_id, now);
+            *feedback = Some(format!(
+                "Seed prompt not delivered ({}); will retry",
+                describe_send_result(other)
+            ));
+            true
+        }
+        // Transport failure: retain for retry, back off, surface feedback.
+        Err(e) => {
+            schedule_send_retry(backoff, pane_id, now);
+            *feedback = Some(format!("Seed prompt not delivered ({e}); will retry"));
+            true
+        }
     }
 }
 
@@ -4977,6 +5109,41 @@ fn deliver_orchestrator_prompt(
 ) {
     let start_pane_id = role_pane_ids[start_role_index].clone();
 
+    // Issue #1383: a write the daemon has not answered yet holds the whole
+    // delivery — confirmation, deadline, retry — until its outcome arrives, and
+    // that outcome is applied first. See [`InFlightPromptSend`].
+    if let Some(sending) = ui.in_flight_prompt_sends.get_mut(start_pane_id.as_str()) {
+        let Some(outcome) = sending.pending.poll() else {
+            return;
+        };
+        let issued = ui
+            .in_flight_prompt_sends
+            .remove(start_pane_id.as_str())
+            .expect("the entry polled above")
+            .issued;
+        if !issued_for_current_delivery(&ui.prompt_delivery, &start_pane_id, &issued) {
+            tracing::debug!(
+                pane_id = %start_pane_id,
+                delivery_id = issued.delivery_id.as_deref().unwrap_or_default(),
+                "orchestrator write answered after its delivery was dropped; outcome discarded"
+            );
+            return;
+        }
+        apply_orchestrator_send_outcome(
+            ui,
+            outcome,
+            &issued,
+            snapshot,
+            now,
+            tab_id,
+            &start_pane_id,
+            start_role_index,
+            role_statuses,
+            orchestrator_prompt,
+        );
+        return;
+    }
+
     // Issue #424: CONFIRMATION FIRST. A previous frame's `Applied`/`Queued`
     // proved only that the PTY accepted bytes, so the prompt is still here and
     // the role is still not `Working`; if the orchestrator has since reported
@@ -5213,20 +5380,77 @@ fn deliver_orchestrator_prompt(
     {
         delivery.closures_at_write = Some(closures);
     }
-    match pane.write_and_submit_to_pane_with_identity(
+    let issued = IssuedPromptSend {
+        delivery_id,
+        attempt,
+        writes_payload,
+        watermark,
+        capability,
+        already_written: attempt > 1,
+        expected_agent_id,
+    };
+    // Issue #1383: started, not waited for — see the seed path's twin. Until
+    // the outcome arrives, the top of this function leaves the delivery alone.
+    let mut pending = pane.begin_write_and_submit_to_pane_with_identity(
         &start_pane_id,
         &prompt_text,
-        expected_agent_id.as_deref(),
+        issued.expected_agent_id.as_deref(),
         expected_session_id.as_deref(),
         wire_delivery_id.as_deref(),
-    ) {
+    );
+    match pending.poll() {
+        Some(outcome) => apply_orchestrator_send_outcome(
+            ui,
+            outcome,
+            &issued,
+            snapshot,
+            now,
+            tab_id,
+            &start_pane_id,
+            start_role_index,
+            role_statuses,
+            orchestrator_prompt,
+        ),
+        None => {
+            ui.in_flight_prompt_sends
+                .insert(start_pane_id, InFlightPromptSend { pending, issued });
+        }
+    }
+}
+
+/// Issue #1383: apply the outcome of an orchestrator prompt write, on whichever
+/// frame the outcome arrives in — the seed path's twin
+/// ([`apply_seed_send_outcome`]). This is the body the synchronous call's
+/// `match` used to have, unchanged except that what it knew at the call is now
+/// read from `issued`.
+#[allow(clippy::too_many_arguments)]
+fn apply_orchestrator_send_outcome(
+    ui: &mut UiState,
+    outcome: Result<SendResult, PaneError>,
+    issued: &IssuedPromptSend,
+    snapshot: &AppState,
+    now: std::time::Instant,
+    tab_id: TabId,
+    start_pane_id: &str,
+    start_role_index: usize,
+    role_statuses: &mut [OrchestrationRoleStatus],
+    orchestrator_prompt: &mut Option<String>,
+) {
+    let logged_id = issued.delivery_id.as_deref().unwrap_or_default();
+    let expected_agent_id = &issued.expected_agent_id;
+    let (attempt, writes_payload, watermark, capability) = (
+        issued.attempt,
+        issued.writes_payload,
+        issued.watermark,
+        issued.capability,
+    );
+    match outcome {
         // Issue #424: the PTY accepted the bytes — that is ALL this means. The
         // prompt, the role's non-`Working` status, the delivery identity and the
         // retry are RETAINED until the orchestrator reports submitting it
-        // (checked at the top of this function).
+        // (checked at the top of `deliver_orchestrator_prompt`).
         Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
-            let logged_id = delivery_id.clone().unwrap_or_default();
-            if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+            if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id) {
                 delivery.attempts = attempt;
                 if delivery.watermark.is_none() {
                     delivery.watermark = watermark;
@@ -5234,9 +5458,9 @@ fn deliver_orchestrator_prompt(
                 delivery.can_report_prompts |= capability == ConfirmationCapability::Reports;
             }
             if writes_payload {
-                log_prompt_written("orchestrator", &start_pane_id, &logged_id, attempt);
+                log_prompt_written("orchestrator", start_pane_id, logged_id, attempt);
             } else {
-                log_prompt_probe_submitted("orchestrator", &start_pane_id, &logged_id, attempt);
+                log_prompt_probe_submitted("orchestrator", start_pane_id, logged_id, attempt);
             }
             match capability {
                 // A recognized producer that structurally cannot report a
@@ -5245,14 +5469,14 @@ fn deliver_orchestrator_prompt(
                 ConfirmationCapability::CannotReport => {
                     log_prompt_unconfirmable(
                         "orchestrator",
-                        &start_pane_id,
-                        &logged_id,
+                        start_pane_id,
+                        logged_id,
                         "this agent cannot report a submitted prompt",
                     );
                     finalize_orchestrator_prompt(
                         ui,
                         tab_id,
-                        &start_pane_id,
+                        start_pane_id,
                         start_role_index,
                         role_statuses,
                         orchestrator_prompt,
@@ -5266,14 +5490,14 @@ fn deliver_orchestrator_prompt(
                 // the role and threw the prompt away, which is what excluded the
                 // slow-launcher class from the whole fix.
                 ConfirmationCapability::Unknown => {
-                    ui.send_retry_backoff.remove(start_pane_id.as_str());
+                    ui.send_retry_backoff.remove(start_pane_id);
                 }
                 ConfirmationCapability::Reports => {
-                    log_prompt_unconfirmed("orchestrator", &start_pane_id, &logged_id, attempt);
+                    log_prompt_unconfirmed("orchestrator", start_pane_id, logged_id, attempt);
                     schedule_unconfirmed_retry(
                         &mut ui.send_retry_backoff,
                         snapshot,
-                        &start_pane_id,
+                        start_pane_id,
                         expected_agent_id.as_deref(),
                         now,
                         attempt,
@@ -5288,7 +5512,7 @@ fn deliver_orchestrator_prompt(
             abandon_orchestrator_prompt(
                 ui,
                 tab_id,
-                &start_pane_id,
+                start_pane_id,
                 orchestrator_prompt,
                 now,
                 format!(
@@ -5298,7 +5522,7 @@ fn deliver_orchestrator_prompt(
             );
         }
         Ok(other) => {
-            schedule_send_retry(&mut ui.send_retry_backoff, &start_pane_id, now);
+            schedule_send_retry(&mut ui.send_retry_backoff, start_pane_id, now);
             let msg = if other == SendResult::HistoryOnly {
                 "History-only session cannot accept live input".to_string()
             } else {
@@ -5310,7 +5534,7 @@ fn deliver_orchestrator_prompt(
             ui.status_message = Some((msg, now));
         }
         Err(e) => {
-            schedule_send_retry(&mut ui.send_retry_backoff, &start_pane_id, now);
+            schedule_send_retry(&mut ui.send_retry_backoff, start_pane_id, now);
             ui.status_message = Some((
                 format!("Orchestrator prompt not delivered ({e}); will retry"),
                 now,
@@ -35780,6 +36004,242 @@ mod tests {
                     .expect("ready timestamp"),
             ),
         }
+    }
+
+    /// Issue #1383: a controller whose submits are started and answered later,
+    /// the shape the daemon-backed controller has now that a submit holds its
+    /// CR until the payload renders. Its synchronous submit PANICS: the render
+    /// loop calling it would be the render loop waiting on the daemon.
+    struct HeldSubmitPaneController {
+        started: std::sync::Mutex<Vec<crate::pane::PendingSubmitSender>>,
+    }
+
+    impl HeldSubmitPaneController {
+        fn new() -> Self {
+            Self {
+                started: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn started(&self) -> usize {
+            self.started.lock().unwrap().len()
+        }
+
+        /// Answer the most recently started submit.
+        fn answer(&self, outcome: Result<crate::event::SendResult, PaneError>) {
+            let sender = self
+                .started
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("a submit was started");
+            sender.send(outcome).expect("the handle is still held");
+        }
+    }
+
+    impl PaneController for HeldSubmitPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_and_submit_to_pane_with_identity(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _expected_agent_id: Option<&str>,
+            _expected_session_id: Option<&str>,
+            _delivery_id: Option<&str>,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            panic!("the render loop must start a prompt submit, not wait for one");
+        }
+        fn begin_write_and_submit_to_pane_with_identity(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _expected_agent_id: Option<&str>,
+            _expected_session_id: Option<&str>,
+            _delivery_id: Option<&str>,
+        ) -> crate::pane::PendingSubmit {
+            let (sender, pending) = crate::pane::PendingSubmit::channel();
+            self.started.lock().unwrap().push(sender);
+            pending
+        }
+        fn name(&self) -> &str {
+            "held-submit"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Scenario: a card's seed prompt is due and the deck writes it, but the
+    /// daemon has not answered yet (it is waiting for the agent to paint the
+    /// text before pressing Enter). The render loop must start the write and
+    /// carry on drawing; frames that pass while it is unanswered must not
+    /// write again, and the answer, when it comes, is applied as it always was.
+    #[test]
+    fn a_seed_write_the_daemon_has_not_answered_does_not_hold_the_render_loop() {
+        const PANE_ID: &str = "held-seed-pane";
+        const AGENT_ID: &str = "held-seed-agent";
+        const PROMPT: &str = "Read the dispatch seed and begin";
+
+        let controller = Arc::new(HeldSubmitPaneController::new());
+        let pane: Arc<dyn PaneController> = controller.clone();
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(ready_seed_prompt(PANE_ID, PROMPT));
+        let snapshot = announced_prompt_snapshot(PANE_ID, AGENT_ID);
+
+        // The synchronous submit panics, so returning at all is the proof.
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(controller.started(), 1, "the seed write must be started");
+        assert!(ui.in_flight_prompt_sends.contains_key(PANE_ID));
+        assert_eq!(
+            ui.prompt_delivery.get(PANE_ID).map(|d| d.attempts),
+            Some(0),
+            "an unanswered write has not been counted yet"
+        );
+
+        for _ in 0..3 {
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        }
+        assert_eq!(
+            controller.started(),
+            1,
+            "frames that pass while the write is unanswered must not write again"
+        );
+        assert_eq!(ui.pending_seed_prompts.len(), 1, "the seed is still held");
+
+        controller.answer(Ok(crate::event::SendResult::Applied));
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert!(!ui.in_flight_prompt_sends.contains_key(PANE_ID));
+        assert_eq!(
+            ui.prompt_delivery.get(PANE_ID).map(|d| d.attempts),
+            Some(1),
+            "the answer counts the write, as the synchronous call did"
+        );
+        assert!(
+            ui.send_retry_backoff.contains_key(PANE_ID),
+            "an unconfirmed write arms its retry, as the synchronous call did"
+        );
+        assert_eq!(ui.pending_seed_prompts.len(), 1, "still unconfirmed");
+        assert_eq!(controller.started(), 1);
+    }
+
+    /// Scenario: an orchestration's start role is ready and the deck writes
+    /// its role prompt, but the daemon has not answered yet. The render loop
+    /// must not wait; frames in the meantime must not write again or finalize
+    /// the role. Answered, the write is counted and its retry armed. A second
+    /// write whose delivery is replaced before the daemon answers (a re-arm
+    /// starts a fresh one) has its answer discarded rather than applied to the
+    /// new delivery.
+    #[test]
+    fn an_orchestrator_write_the_daemon_has_not_answered_does_not_hold_the_render_loop() {
+        const PANE_ID: &str = "held-orchestrator-pane";
+        const AGENT_ID: &str = "held-orchestrator-agent";
+        const PROMPT: &str = "Read the orchestrator seed and begin";
+        let tab_id: TabId = 1383;
+
+        let controller = Arc::new(HeldSubmitPaneController::new());
+        let now = std::time::Instant::now();
+        let mut ui = default_ui();
+        ui.orchestration_prompt_anchor_at.insert(tab_id, now);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let snapshot = announced_prompt_snapshot(PANE_ID, AGENT_ID);
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some(PROMPT.to_string());
+        let mut frame = |ui: &mut UiState, prompt: &mut Option<String>, at| {
+            deliver_orchestrator_prompt(
+                ui,
+                controller.as_ref(),
+                &snapshot,
+                at,
+                tab_id,
+                &[PANE_ID.to_string()],
+                0,
+                &mut role_statuses,
+                prompt,
+            )
+        };
+
+        frame(&mut ui, &mut prompt, now);
+        assert_eq!(controller.started(), 1, "the role prompt must be started");
+        assert!(ui.in_flight_prompt_sends.contains_key(PANE_ID));
+        for _ in 0..3 {
+            frame(&mut ui, &mut prompt, now);
+        }
+        assert_eq!(
+            controller.started(),
+            1,
+            "frames that pass while the write is unanswered must not write again"
+        );
+        assert_eq!(prompt.as_deref(), Some(PROMPT));
+        assert!(!ui.orchestration_prompted.contains(&tab_id));
+
+        controller.answer(Ok(crate::event::SendResult::Applied));
+        frame(&mut ui, &mut prompt, now);
+        assert!(!ui.in_flight_prompt_sends.contains_key(PANE_ID));
+        assert_eq!(
+            ui.prompt_delivery.get(PANE_ID).map(|d| d.attempts),
+            Some(1),
+            "the answer counts the write, as the synchronous call did"
+        );
+        assert!(ui.send_retry_backoff.contains_key(PANE_ID));
+
+        // The retry comes due and is started; its delivery is then replaced
+        // while the daemon is still working on it.
+        let retry_at = ui.send_retry_backoff[PANE_ID].next_attempt_at;
+        frame(&mut ui, &mut prompt, retry_at);
+        assert_eq!(controller.started(), 2, "the retry must be started");
+        ui.send_retry_backoff.remove(PANE_ID);
+        ui.prompt_delivery.remove(PANE_ID);
+        controller.answer(Ok(crate::event::SendResult::Applied));
+        frame(&mut ui, &mut prompt, retry_at);
+        assert!(!ui.in_flight_prompt_sends.contains_key(PANE_ID));
+        assert!(
+            !ui.prompt_delivery.contains_key(PANE_ID)
+                && !ui.send_retry_backoff.contains_key(PANE_ID),
+            "an answer for a replaced delivery must not be applied to anything"
+        );
+        assert_eq!(controller.started(), 2);
     }
 
     /// Scenario: Write an orchestrator's spawn-time prompt to a ready pane and have the controller report Applied or Queued without an agent hook. The prompt, identity, retry, and non-Working role must remain provisional until a matching UserPromptSubmit-derived event arrives, after which all delivery state clears and the role becomes Working.

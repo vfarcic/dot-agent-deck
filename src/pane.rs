@@ -17,6 +17,63 @@ pub enum PaneError {
     NotAvailable,
 }
 
+/// Issue #1383: the outcome of a write-and-submit that may still be running.
+///
+/// The TUI polls one of these from its render loop instead of waiting for the
+/// submit, because a submit now holds its CR until the payload renders — up to
+/// [`crate::submit_echo::SUBMIT_ECHO_BOUND`] on a pane that does not echo —
+/// and a render thread waiting that long cannot redraw.
+pub struct PendingSubmit {
+    state: PendingSubmitState,
+}
+
+/// The sending half of [`PendingSubmit::channel`].
+pub type PendingSubmitSender = std::sync::mpsc::Sender<Result<crate::event::SendResult, PaneError>>;
+
+enum PendingSubmitState {
+    Ready(Option<Result<crate::event::SendResult, PaneError>>),
+    Waiting(std::sync::mpsc::Receiver<Result<crate::event::SendResult, PaneError>>),
+}
+
+impl PendingSubmit {
+    /// A submit that has already finished.
+    pub fn ready(result: Result<crate::event::SendResult, PaneError>) -> Self {
+        Self {
+            state: PendingSubmitState::Ready(Some(result)),
+        }
+    }
+
+    /// A submit that finishes when the returned sender is sent its outcome.
+    pub fn channel() -> (PendingSubmitSender, Self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (
+            tx,
+            Self {
+                state: PendingSubmitState::Waiting(rx),
+            },
+        )
+    }
+
+    /// The outcome, once: `None` while the submit is still running and after
+    /// the outcome has been taken. A sender dropped without an outcome (the
+    /// task running the submit ended early) reads as a failed submit, so a
+    /// caller never waits on one forever.
+    pub fn poll(&mut self) -> Option<Result<crate::event::SendResult, PaneError>> {
+        let outcome = match &mut self.state {
+            PendingSubmitState::Ready(outcome) => return outcome.take(),
+            PendingSubmitState::Waiting(rx) => match rx.try_recv() {
+                Ok(outcome) => outcome,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(PaneError::CommandFailed(
+                    "write_and_submit: the submit ended without an outcome".to_string(),
+                )),
+            },
+        };
+        self.state = PendingSubmitState::Ready(None);
+        Some(outcome)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneDirection {
     Up,
@@ -497,6 +554,32 @@ pub trait PaneController: Send + Sync {
         _delivery_id: Option<&str>,
     ) -> Result<crate::event::SendResult, PaneError> {
         self.write_and_submit_to_pane(pane_id, text)
+    }
+    /// Issue #1383: [`Self::write_and_submit_to_pane_with_identity`] started
+    /// without waiting for it, for a caller on the TUI's render thread. The
+    /// daemon holds a submit's CR until the payload renders, up to
+    /// [`crate::submit_echo::SUBMIT_ECHO_BOUND`], and the render thread must
+    /// keep drawing meanwhile.
+    ///
+    /// The default impl runs the synchronous method and returns its outcome
+    /// ready — correct for the local-PTY test mocks, whose submit does not
+    /// wait on a daemon. The daemon-backed `EmbeddedPaneController` overrides
+    /// it to run the RPC on its runtime.
+    fn begin_write_and_submit_to_pane_with_identity(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: Option<&str>,
+        expected_session_id: Option<&str>,
+        delivery_id: Option<&str>,
+    ) -> PendingSubmit {
+        PendingSubmit::ready(self.write_and_submit_to_pane_with_identity(
+            pane_id,
+            text,
+            expected_agent_id,
+            expected_session_id,
+            delivery_id,
+        ))
     }
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;

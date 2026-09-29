@@ -9190,9 +9190,11 @@ impl AgentPtyRegistry {
     ///
     /// Only non-empty payloads are gated: an empty one is a submit-only probe,
     /// which #424 already refuses once the user has typed. The TUI/desktop
-    /// `WriteAndSubmit` RPC deliberately stays on the immediate entry — the TUI
-    /// calls it from its UI thread, and the desktop's `SubmitText` is the user's
-    /// own submit.
+    /// `WriteAndSubmit` RPC stays on the immediate entry: the desktop's
+    /// `SubmitText` is the user's own submit, and the TUI called the RPC on
+    /// its UI thread. Since issue #1383 the TUI starts the call and polls for
+    /// the answer instead; moving its prompts onto this entry was not
+    /// revisited there.
     pub async fn write_and_submit_guarded_first_write<Fut>(
         &self,
         pane_id: &str,

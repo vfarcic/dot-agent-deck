@@ -14,7 +14,8 @@ use crate::event::AgentType;
 use crate::focus_report::FocusReporter;
 use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
 use crate::pane::{
-    AgentSpawnOptions, PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome,
+    AgentSpawnOptions, PaneController, PaneDirection, PaneError, PaneInfo, PendingSubmit,
+    RenameOutcome,
 };
 
 /// Result of [`EmbeddedPaneController::hydrate_from_daemon`]. One entry per
@@ -4275,6 +4276,47 @@ impl PaneController for EmbeddedPaneController {
             .map_err(|e| PaneError::CommandFailed(format!("write_and_submit: {e}")))
     }
 
+    /// Issue #1383: the same RPC as
+    /// [`Self::write_and_submit_to_pane_with_identity`], run on the
+    /// controller's runtime so the render thread does not wait for it. The
+    /// daemon holds the submit's CR until the payload renders — up to
+    /// [`crate::submit_echo::SUBMIT_ECHO_BOUND`] on a pane that does not echo
+    /// — and the render loop polls the returned handle each frame instead.
+    ///
+    /// Dropping the handle does not cancel the RPC: the daemon completes the
+    /// write whether or not anyone reads its answer, exactly as it does for a
+    /// response lost in transit.
+    fn begin_write_and_submit_to_pane_with_identity(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: Option<&str>,
+        expected_session_id: Option<&str>,
+        delivery_id: Option<&str>,
+    ) -> PendingSubmit {
+        let (tx, pending) = PendingSubmit::channel();
+        let client = self.client.clone();
+        let pane_id = pane_id.to_string();
+        let text = text.to_string();
+        let expected_agent_id = expected_agent_id.map(str::to_string);
+        let expected_session_id = expected_session_id.map(str::to_string);
+        let delivery_id = delivery_id.map(str::to_string);
+        self.runtime.spawn(async move {
+            let outcome = client
+                .write_and_submit_with_identity(
+                    &pane_id,
+                    &text,
+                    expected_agent_id.as_deref(),
+                    expected_session_id.as_deref(),
+                    delivery_id.as_deref(),
+                )
+                .await
+                .map_err(|e| PaneError::CommandFailed(format!("write_and_submit: {e}")));
+            let _ = tx.send(outcome);
+        });
+        pending
+    }
+
     fn name(&self) -> &str {
         "embedded"
     }
@@ -5436,7 +5478,7 @@ mod tests {
         /// hold this across tempdir + bind, as `daemon_client`'s tests do.
         static BIND_LOCK: Mutex<()> = Mutex::new(());
 
-        fn runtime() -> tokio::runtime::Runtime {
+        pub(super) fn runtime() -> tokio::runtime::Runtime {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
@@ -5444,7 +5486,7 @@ mod tests {
                 .expect("build the test runtime")
         }
 
-        fn bind(
+        pub(super) fn bind(
             runtime: &tokio::runtime::Runtime,
             tag: &str,
         ) -> (
@@ -5921,6 +5963,86 @@ mod tests {
 
             drop((controller, other));
             registry.shutdown_all();
+        }
+    }
+
+    /// Issue #1383: the TUI's prompt submits are started on the controller's
+    /// runtime and polled, because the daemon holds a submit's CR until the
+    /// payload renders and the render thread must keep drawing meanwhile.
+    #[cfg(unix)]
+    mod started_submits {
+        use super::focus_claims::{bind, runtime};
+        use super::*;
+        use crate::daemon_protocol::{AttachResponse, KIND_REQ, read_frame, write_resp};
+
+        /// Scenario: the TUI starts a prompt submit against a daemon that has
+        /// not answered yet. Starting it must return at once, polling it must
+        /// report it unanswered, and once the daemon answers the poll must
+        /// report that answer.
+        #[test]
+        fn a_started_submit_returns_before_the_daemon_answers() {
+            let runtime = runtime();
+            let (_dir, path, listener) = bind(&runtime, "held-submit");
+            let gate = tokio::sync::watch::Sender::new(false);
+            let mut open = gate.subscribe();
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = Arc::clone(&requests);
+            let server = runtime.spawn(async move {
+                while let Ok(mut stream) = listener.accept().await {
+                    let Ok(Some((KIND_REQ, _))) = read_frame(&mut stream).await else {
+                        continue;
+                    };
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = open.wait_for(|open| *open).await;
+                    let _ = write_resp(&mut stream, &AttachResponse::err("held daemon")).await;
+                }
+            });
+            let controller = EmbeddedPaneController::new(path, runtime.handle().clone());
+
+            let started = Instant::now();
+            let mut pending = controller.begin_write_and_submit_to_pane_with_identity(
+                "pane-1383",
+                "Read the seed and begin",
+                Some("agent-1383"),
+                None,
+                Some("delivery-1383"),
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "starting a submit must not wait for the daemon: {:?}",
+                started.elapsed()
+            );
+            let asked = Instant::now() + Duration::from_secs(5);
+            while requests.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                assert!(
+                    Instant::now() < asked,
+                    "the submit never reached the daemon"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                pending.poll().is_none(),
+                "a submit the daemon has not answered must poll as unanswered"
+            );
+
+            gate.send_replace(true);
+            let answered = Instant::now() + Duration::from_secs(5);
+            let outcome = loop {
+                if let Some(outcome) = pending.poll() {
+                    break outcome;
+                }
+                assert!(
+                    Instant::now() < answered,
+                    "the daemon's answer never arrived"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert!(
+                outcome.is_err(),
+                "the held daemon refuses, and the poll must report it: {outcome:?}"
+            );
+            assert!(pending.poll().is_none(), "an outcome is taken once");
+            server.abort();
         }
     }
 }

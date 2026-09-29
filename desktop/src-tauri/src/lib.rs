@@ -87,7 +87,31 @@ use crate::settings::DesktopSettings;
 use crate::terminal::DesktopState;
 
 const WATCH_RETRY_DELAY: Duration = Duration::from_secs(1);
-const COORDINATOR_DELIVERY_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long one coordinator-seed `WriteAndSubmit` may take to answer before
+/// this attempt counts as failed and the delivery loop retries.
+///
+/// Issue #1383: the daemon holds a submit's Enter until the payload has
+/// rendered on the agent's screen, for up to
+/// [`dot_agent_deck::submit_echo::SUBMIT_ECHO_BOUND`] on a pane that never
+/// shows it, and the answer comes after that Enter — behind the capability
+/// probe and any wait for the pane's writer. The old 2 s equalled the bound, so
+/// it could fire while the daemon was still holding the Enter. That does not
+/// lose the prompt (the daemon finishes the write and records its outcome
+/// under the delivery id, so the retry is answered from that record), but it
+/// reports a failure for a write that went ahead and spends a retry on it.
+/// Hence the bound plus 2 s of margin.
+const COORDINATOR_DELIVERY_RPC_TIMEOUT: Duration =
+    dot_agent_deck::submit_echo::SUBMIT_ECHO_BOUND.saturating_add(Duration::from_secs(2));
+const _: () = assert!(
+    COORDINATOR_DELIVERY_RPC_TIMEOUT.as_millis()
+        > dot_agent_deck::submit_echo::SUBMIT_ECHO_BOUND.as_millis(),
+    "a coordinator-seed write must be given longer than the daemon may hold its Enter"
+);
+/// How long the post-failure lookup of a role's start may take. It shared
+/// [`COORDINATOR_DELIVERY_RPC_TIMEOUT`]'s 2 s until issue #1383 raised that one
+/// for the submit's echo wait; this is a listing, which submits nothing, so it
+/// keeps the 2 s.
+const ROLE_RECONCILE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Post-`SessionStart` wait before injecting the coordinator seed. See the
 /// call site in `deliver_coordinator_prompt` for why the TUI's 500 ms is not
@@ -1181,7 +1205,7 @@ async fn reconcile_failed_start<D: OrchestrationDaemon + Sync>(
     indeterminate: bool,
 ) -> Option<UnconfirmedStop> {
     match daemon
-        .reconcile_orchestration_agent(pane_id, orchestration_id, COORDINATOR_DELIVERY_RPC_TIMEOUT)
+        .reconcile_orchestration_agent(pane_id, orchestration_id, ROLE_RECONCILE_RPC_TIMEOUT)
         .await
     {
         Ok(Some(agent_id)) => {
@@ -6626,6 +6650,8 @@ mod tests {
         expected_agent_id: String,
         expected_session_id: Option<String>,
         delivery_id: String,
+        /// How long the delivery loop gave this attempt to be answered.
+        timeout: Duration,
     }
 
     /// One `prepare-orchestration` request, recorded verbatim. PRD #819 M6's whole
@@ -6892,7 +6918,7 @@ mod tests {
             expected_agent_id: &str,
             expected_session_id: Option<&str>,
             delivery_id: &str,
-            _timeout: Duration,
+            timeout: Duration,
         ) -> Result<SendResult, String> {
             self.submissions.lock().unwrap().push(PromptSubmission {
                 pane_id: pane_id.to_string(),
@@ -6900,6 +6926,7 @@ mod tests {
                 expected_agent_id: expected_agent_id.to_string(),
                 expected_session_id: expected_session_id.map(str::to_string),
                 delivery_id: delivery_id.to_string(),
+                timeout,
             });
             self.outcomes
                 .lock()
@@ -7753,6 +7780,16 @@ command = "configured-planner"
             Some("session-planner")
         );
         assert_eq!(submissions[0].delivery_id, submissions[1].delivery_id);
+        // Issue #1383: the daemon holds each submit's Enter for up to the echo
+        // bound, so an attempt given no more than that could time out on a
+        // write that is still going ahead.
+        for submission in submissions.iter() {
+            assert!(
+                submission.timeout > dot_agent_deck::submit_echo::SUBMIT_ECHO_BOUND,
+                "a seed attempt must outlast the daemon's echo wait: {:?}",
+                submission.timeout
+            );
+        }
         drop(submissions);
 
         assert_eq!(
