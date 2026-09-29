@@ -1,0 +1,11 @@
+[Unit]
+Description=Sample memory every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
