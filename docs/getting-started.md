@@ -41,7 +41,7 @@ dot-agent-deck --version    # prints: dot-agent-deck <version>
 
 If this says `command not found` after the Linux download, add `export PATH="$HOME/.local/bin:$PATH"` to your shell's rc file and open a new shell.
 
-`dot-agent-deck docs` lists the documentation built into this binary, and `dot-agent-deck docs <topic>` prints a page, for example `dot-agent-deck docs orchestration`. That copy matches the installed version.
+`dot-agent-deck docs` lists the documentation built into this binary, and `dot-agent-deck docs <topic>` prints a page, for example `dot-agent-deck docs orchestration`. That copy matches the installed version. If `dot-agent-deck docs` reports an unrecognized subcommand, the installed version predates it: read the documentation at [agent-deck.devopstoolkit.ai/llms.txt](https://agent-deck.devopstoolkit.ai/llms.txt) instead, which follows the latest release rather than your installed version.
 
 ## Step 2: Launch the deck
 

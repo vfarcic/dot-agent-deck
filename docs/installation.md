@@ -2,7 +2,7 @@
 
 dot-agent-deck is one binary, `dot-agent-deck`, which is the TUI, the background daemon and the CLI. The [desktop app](desktop/index.md) is a separate, optional download and a second client of the same daemon. Install the binary first; the desktop app connects to a daemon but does not start one (see [How the desktop app gets a daemon](#how-the-desktop-app-gets-a-daemon)).
 
-After installing, `dot-agent-deck docs` lists the documentation built into the binary, and `dot-agent-deck docs <topic>` prints one page. That copy always matches the installed version, so prefer it over the website when the two might differ.
+After installing, `dot-agent-deck docs` lists the documentation built into the binary, and `dot-agent-deck docs <topic>` prints one page. That copy always matches the installed version, so prefer it over the website when the two might differ. If `dot-agent-deck docs` reports an unrecognized subcommand, the installed version predates it: read the documentation at [agent-deck.devopstoolkit.ai/llms.txt](https://agent-deck.devopstoolkit.ai/llms.txt) instead, keeping in mind that the website follows the latest release rather than your installed version.
 
 ## Platform Support
 

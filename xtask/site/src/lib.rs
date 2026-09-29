@@ -684,7 +684,9 @@ pub fn llms_txt(config: &SiteConfig, pages: &[Page]) -> String {
          prefer it: it prints these pages as they are for the installed version, with no network \
          access. `dot-agent-deck docs` lists the topics, `dot-agent-deck docs <topic>` prints one \
          page, and `dot-agent-deck docs --all` prints every page. A topic is the page's path \
-         below `/docs/` without `.md`, for example `dot-agent-deck docs desktop/voice`.\n\n",
+         below `/docs/` without `.md`, for example `dot-agent-deck docs desktop/voice`. Older \
+         releases do not have it: if `dot-agent-deck docs` reports an unrecognized subcommand, \
+         use these pages, which follow the latest release rather than the installed one.\n\n",
     );
     out.push_str(&format!(
         "Every page in one file: [llms-full.txt]({}/llms-full.txt)\n\n",
