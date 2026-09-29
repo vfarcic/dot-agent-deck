@@ -272,7 +272,10 @@ fn free_id(taken_id: &str, entries: &[RemoteEntry]) -> String {
             format!("{}{suffix}", &taken_id[..keep])
         })
         .find(|id| is_usable_deck_id(id) && !entries.iter().any(|row| deck_id(row) == *id))
-        .expect("an unbounded suffix search always finds a free id")
+        // Each suffix gives a different usable id, so the search fails only
+        // if `entries` holds a row for every one of the `u64` suffixes — far
+        // more rows than a file that fits in memory can.
+        .expect("a deck list holds fewer rows than there are suffixes")
 }
 
 /// Whether `raw` can be used as a deck id as written: the charset and bound of
@@ -304,7 +307,7 @@ pub fn is_usable_deck_id(raw: &str) -> bool {
 /// the reserved words.
 pub fn deck_id(entry: &RemoteEntry) -> String {
     match entry.id.as_deref() {
-        Some(id) if has_own_id(entry) => id.to_string(),
+        Some(id) if is_usable_deck_id(id) => id.to_string(),
         _ => derived_id(&entry.name),
     }
 }
@@ -1057,6 +1060,13 @@ pub fn remove(path: &Path, which: DeckRef<'_>) -> Result<Option<RemoteEntry>, Re
 pub enum RenameDeckError {
     #[error("That deck is no longer in the deck list.")]
     NotFound,
+    /// The row found is not the deck the caller was looking at — see
+    /// [`rename`]'s `is_expected`.
+    #[error(
+        "That deck changed since this window loaded it, so it was not renamed. It is shown as it \
+         is now; try again."
+    )]
+    Changed,
     #[error("A deck named '{name}' already exists.")]
     DuplicateName { name: String },
     #[error("Invalid deck name: {0}.")]
@@ -1084,10 +1094,23 @@ pub enum RenameDeckError {
 /// rename is invisible to everything keyed on it. A row with an `id` of its
 /// own keeps it untouched. Every other key of the row, and every comment in
 /// the file, stays as it was ([`DeckDocument::replace`]).
+///
+/// # A `which` is not proof the row is still that deck
+///
+/// A row with no `id` answers to one derived from its name, so a `remote
+/// remove prod` then `remote add prod <other host>` hands the old deck's id to
+/// an unrelated one — and a rename by that id, made against a list read
+/// before, would rename the new deck. `is_expected` is shown the row `which`
+/// found, as it is on disk under the lock; `false` refuses the rename with
+/// [`RenameDeckError::Changed`] and writes nothing. A caller that read the row
+/// earlier checks here that it still is the deck it read (the desktop compares
+/// the address and the name it showed); one that just resolved `which` passes
+/// `|_| true`.
 pub fn rename(
     path: &Path,
     which: DeckRef<'_>,
     new_name: &str,
+    is_expected: impl FnOnce(&RemoteEntry) -> bool,
 ) -> Result<RemoteEntry, RenameDeckError> {
     validate_deck_name(new_name)?;
     edit(path, |document| {
@@ -1097,6 +1120,9 @@ pub fn rename(
             .position(|row| which.matches(row))
             .ok_or(RenameDeckError::NotFound)?;
         let current = &entries[index];
+        if !is_expected(current) {
+            return Err(RenameDeckError::Changed);
+        }
         if current.name == new_name {
             return Ok(current.clone());
         }
@@ -2410,7 +2436,10 @@ added_at = "2026-01-01T00:00:00+00:00"
         let path = dir.path().join("remotes.toml");
         add(&path, desktop_entry("build")).unwrap();
 
-        let renamed = rename(&path, DeckRef::Id("0123456789abcdef"), "build-box").unwrap();
+        let renamed = rename(&path, DeckRef::Id("0123456789abcdef"), "build-box", |_| {
+            true
+        })
+        .unwrap();
         assert_eq!(renamed.name, "build-box");
 
         let rows = RemotesFile::load(&path).unwrap().remotes;
@@ -2434,7 +2463,7 @@ added_at = "2026-01-01T00:00:00+00:00"
             "prod/1",
             &"a".repeat(MAX_DECK_NAME_BYTES + 1),
         ] {
-            let error = rename(&path, DeckRef::Name("prod"), bad).unwrap_err();
+            let error = rename(&path, DeckRef::Name("prod"), bad, |_| true).unwrap_err();
             assert!(
                 matches!(error, RenameDeckError::InvalidName(_)),
                 "{bad:?}: {error:?}"
@@ -2451,7 +2480,7 @@ added_at = "2026-01-01T00:00:00+00:00"
         add(&path, entry("staging", "staging.example.com")).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let error = rename(&path, DeckRef::Name("prod"), "staging").unwrap_err();
+        let error = rename(&path, DeckRef::Name("prod"), "staging", |_| true).unwrap_err();
         assert!(
             matches!(&error, RenameDeckError::DuplicateName { name } if name == "staging"),
             "{error:?}"
@@ -2466,7 +2495,7 @@ added_at = "2026-01-01T00:00:00+00:00"
         let path = dir.path().join("remotes.toml");
         add(&path, entry("prod", "prod.example.com")).unwrap();
 
-        let error = rename(&path, DeckRef::Id("n-gone"), "fresh").unwrap_err();
+        let error = rename(&path, DeckRef::Id("n-gone"), "fresh", |_| true).unwrap_err();
         assert!(matches!(error, RenameDeckError::NotFound), "{error:?}");
     }
 
@@ -2485,7 +2514,7 @@ added_at = "2026-01-01T00:00:00+00:00"
         );
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let same = rename(&path, DeckRef::Name("prod"), "prod").unwrap();
+        let same = rename(&path, DeckRef::Name("prod"), "prod", |_| true).unwrap();
         assert_eq!(same.name, "prod");
         assert_eq!(same.id, None, "a no-op stores no id either");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
@@ -2505,7 +2534,7 @@ added_at = "2026-01-01T00:00:00+00:00"
         let key = deck_id(&before[0]);
         assert_eq!(key, "n-prod");
 
-        let renamed = rename(&path, DeckRef::Id(&key), "production").unwrap();
+        let renamed = rename(&path, DeckRef::Id(&key), "production", |_| true).unwrap();
 
         assert_eq!(renamed.name, "production");
         assert_eq!(renamed.id.as_deref(), Some("n-prod"));
@@ -2519,8 +2548,85 @@ added_at = "2026-01-01T00:00:00+00:00"
         add(&path, entry("db.internal", "db.example.com")).unwrap();
         let hashed = deck_id(&RemotesFile::load(&path).unwrap().remotes[1]);
         assert!(hashed.starts_with("h-"), "{hashed}");
-        let renamed = rename(&path, DeckRef::Name("db.internal"), "db").unwrap();
+        let renamed = rename(&path, DeckRef::Name("db.internal"), "db", |_| true).unwrap();
         assert_eq!(deck_id(&renamed), hashed);
+    }
+
+    /// Scenario: `remote add prod` writes a row with no `id` (known as
+    /// `n-prod`); `remote remove prod` and `remote add prod` at another host
+    /// hand that id to a different deck. A rename by `n-prod` from a caller
+    /// that read the first deck is refused, and nothing is written.
+    #[test]
+    fn a_rename_of_a_row_the_caller_does_not_expect_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remotes.toml");
+        add(&path, entry("prod", "a.example.com")).unwrap();
+        let read = RemotesFile::load(&path).unwrap().remotes[0].clone();
+        remove(&path, DeckRef::Name("prod")).unwrap();
+        add(&path, entry("prod", "b.example.com")).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            deck_id(&RemotesFile::load(&path).unwrap().remotes[0]),
+            "n-prod"
+        );
+
+        let mut seen = None;
+        let error = rename(&path, DeckRef::Id("n-prod"), "production", |row| {
+            seen = Some(row.host.clone());
+            address_key(row) == address_key(&read)
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, RenameDeckError::Changed), "{error:?}");
+        assert_eq!(
+            seen.as_deref(),
+            Some("b.example.com"),
+            "shown the row on disk"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains(&dir.path().display().to_string())
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // The check runs before the no-op: a same-name rename of a row that is
+        // not the expected one is refused too, rather than reported as done.
+        let error = rename(&path, DeckRef::Id("n-prod"), "prod", |_| false).unwrap_err();
+        assert!(matches!(error, RenameDeckError::Changed), "{error:?}");
+    }
+
+    /// Scenario: a row written before the naming rule carries a name the rule
+    /// refuses (`my deck`, with a space), so it answers to a hashed `h-…` id.
+    /// Renaming it by that id to a valid name works, and the row keeps the id.
+    #[test]
+    fn a_row_whose_stored_name_breaks_the_rule_can_be_renamed_by_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = registry(
+            &dir,
+            "[[remotes]]\n\
+             name = \"my deck\"\n\
+             type = \"ssh\"\n\
+             host = \"legacy.example.com\"\n\
+             port = 22\n\
+             version = \"0.40.0\"\n\
+             added_at = \"2026-01-01T00:00:00Z\"\n",
+        );
+        let before = RemotesFile::load(&path).unwrap().remotes[0].clone();
+        assert!(validate_deck_name(&before.name).is_err());
+        let key = deck_id(&before);
+        assert!(key.starts_with("h-"), "{key}");
+
+        let renamed = rename(&path, DeckRef::Id(&key), "legacy", |_| true).unwrap();
+
+        assert_eq!(renamed.name, "legacy");
+        let after = RemotesFile::load(&path).unwrap().remotes;
+        assert_eq!(after[0].name, "legacy");
+        assert_eq!(
+            deck_id(&after[0]),
+            key,
+            "the row keeps the id it was known by"
+        );
     }
 
     #[test]
@@ -2542,7 +2648,7 @@ added_at = "2026-01-01T00:00:00+00:00"
              colour = \"green\" # a field from a newer build\n",
         );
 
-        rename(&path, DeckRef::Name("a"), "build").unwrap();
+        rename(&path, DeckRef::Name("a"), "build", |_| true).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();
         for kept in [
@@ -2569,7 +2675,7 @@ added_at = "2026-01-01T00:00:00+00:00"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("remotes.toml");
         add(&path, entry("prod", "prod.example.com")).unwrap();
-        rename(&path, DeckRef::Name("prod"), "production").unwrap();
+        rename(&path, DeckRef::Name("prod"), "production", |_| true).unwrap();
 
         let added = add(&path, entry("prod", "new-prod.example.com")).unwrap();
 

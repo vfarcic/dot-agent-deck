@@ -185,7 +185,7 @@ pub fn data_turn(request: &IntentRequest<'_>) -> Option<String> {
 ///
 /// It was, beside the instructions. `directory_listing` deliberately admits
 /// ordinary printable prose in a directory name, a project config names its
-/// orchestrations and a remote deck is labelled with its own host, so a cloned
+/// orchestrations and a remote deck is labelled with its name or its host, so a cloned
 /// repository could put a sentence addressed to the model in the most trusted
 /// role a request has. The command table stays there ([`commands_state`]); this
 /// moved out.

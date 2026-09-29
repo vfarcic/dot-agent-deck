@@ -1294,7 +1294,7 @@ export interface DeckRuntimeState {
    * Daemons settings with no name field and no rename, and an added deck takes
    * the name the library derives when it is saved.
    */
-  renameDeck?: (id: string, name: string) => Promise<import("./lib/bridge").DesktopSettingsDto>;
+  renameDeck?: (deck: import("./lib/bridge").RemoteEndpointDto, name: string) => Promise<import("./lib/bridge").DesktopSettingsDto>;
   defaultDeckName?: (host: string, user?: string) => Promise<string>;
   checkDeckName?: (name: string, id?: string) => Promise<string | null>;
   /**

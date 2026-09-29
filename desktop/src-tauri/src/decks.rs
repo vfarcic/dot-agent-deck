@@ -391,8 +391,8 @@ pub fn apply(path: &Path, edits: &[DeckEdit]) -> Result<(), ApplyError> {
     })
 }
 
-/// Rename the deck `id` names to `name` through the shared library's rename
-/// (issue #1426).
+/// Rename `deck` — the row as the window showed it — to `name` through the
+/// shared library's rename (issue #1426).
 ///
 /// The library is the authority: it validates the name, refuses one another
 /// deck has, and does it against a fresh read under the registry's lock. The
@@ -401,8 +401,29 @@ pub fn apply(path: &Path, edits: &[DeckEdit]) -> Result<(), ApplyError> {
 /// `desktop.toml`, and everything else keyed on the id, still names it.
 /// Nothing about the address changes, so the fleet's per-deck keys (wire ids,
 /// derived from the address) do not move either.
-pub fn rename(path: &Path, id: &EndpointId, name: &str) -> Result<(), RenameDeckError> {
-    deck_list::rename(path, DeckRef::Id(id.as_str()), name).map(drop)
+///
+/// # The row must still be the deck the window showed
+///
+/// The row is found by `deck.id`, which for a row with no stored `id` is
+/// derived from its name — so a `remote remove prod` and `remote add prod
+/// <other host>` in a terminal hand the id to an unrelated deck, exactly the
+/// case [`apply`] guards an update against. The rename applies only while the
+/// row on disk still reaches `deck`'s address ([`base_address`]) **and** still
+/// carries the name the window showed — so a rename made elsewhere since the
+/// window loaded is not silently replaced either. Otherwise it is
+/// [`RenameDeckError::Changed`] and nothing is written. `deck.name` is `None`
+/// for a row whose stored name the rule refuses, and such a row matches it
+/// while its name is still one the rule refuses.
+pub fn rename(
+    path: &Path,
+    deck: &RemoteEndpointSettings,
+    name: &str,
+) -> Result<(), RenameDeckError> {
+    deck_list::rename(path, DeckRef::Id(deck.id.as_str()), name, |entry| {
+        deck_list::address_key(entry) == base_address(deck)
+            && DeckName::parse(&entry.name).ok() == deck.name
+    })
+    .map(drop)
 }
 
 /// The name a deck at `host` (and `user`) is given when it is added without
@@ -581,7 +602,9 @@ fn fresh_id(base: &EndpointId, entries: &[RemoteEntry]) -> EndpointId {
                 .iter()
                 .any(|entry| deck_list::deck_id(entry) == id.as_str())
         })
-        .expect("an unbounded suffix search always finds a free id")
+        // Each suffix gives a different id, so the search fails only if
+        // `entries` holds a row for every one of the `u64` suffixes.
+        .expect("a deck list holds fewer rows than there are suffixes")
 }
 
 #[cfg(test)]
@@ -1372,7 +1395,7 @@ mod tests {
     fn a_save_never_renames_an_existing_deck() {
         let (_dir, path) = registry(CLI_ROW);
         let loaded = load_rows(&path).unwrap();
-        rename(&path, &loaded[0].id, "production").unwrap();
+        rename(&path, &loaded[0], "production").unwrap();
 
         let stale = loaded.clone();
         let mut changed = loaded.clone();
@@ -1399,7 +1422,7 @@ mod tests {
         let before = load_rows(&path).unwrap();
         assert_eq!(before[0].id.as_str(), "n-prod");
 
-        rename(&path, &before[0].id, "production").unwrap();
+        rename(&path, &before[0], "production").unwrap();
 
         let after = load_rows(&path).unwrap();
         assert_eq!(after.len(), 1);
@@ -1421,25 +1444,102 @@ mod tests {
         );
     }
 
+    /// Scenario: the window loaded `prod`, a CLI row with no `id`, so it knows
+    /// the deck as `n-prod`. In a terminal `prod` is removed and a new `prod`
+    /// added at another host, which also answers to `n-prod`. Renaming from
+    /// the stale window is refused and writes nothing: it must not rename the
+    /// new deck.
+    #[test]
+    fn a_stale_rename_does_not_rename_a_deck_re_added_under_the_same_name() {
+        let (_dir, path) = registry(CLI_ROW);
+        let shown = load_rows(&path).unwrap().remove(0);
+        assert_eq!(shown.id.as_str(), "n-prod");
+
+        let replacement = CLI_ROW.replace("build.example.com", "other.example.com");
+        assert_ne!(replacement, CLI_ROW);
+        std::fs::write(&path, &replacement).unwrap();
+        assert_eq!(
+            load_rows(&path).unwrap()[0].id,
+            shown.id,
+            "the id is reused"
+        );
+
+        let error = rename(&path, &shown, "production").unwrap_err();
+
+        assert!(matches!(error, RenameDeckError::Changed), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "That deck changed since this window loaded it, so it was not renamed. It is \
+             shown as it is now; try again."
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), replacement);
+    }
+
+    /// Scenario: the window loaded `prod`; meanwhile it was renamed to
+    /// `staging` elsewhere. Renaming it from the window to `production` is
+    /// refused, so the other rename is not silently replaced.
+    #[test]
+    fn a_stale_rename_does_not_replace_a_rename_made_elsewhere() {
+        let (_dir, path) = registry(CLI_ROW);
+        let shown = load_rows(&path).unwrap().remove(0);
+        rename(&path, &shown, "staging").unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let error = rename(&path, &shown, "production").unwrap_err();
+
+        assert!(matches!(error, RenameDeckError::Changed), "{error:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let fresh = load_rows(&path).unwrap().remove(0);
+        rename(&path, &fresh, "production").unwrap();
+        assert_eq!(
+            load_rows(&path).unwrap()[0]
+                .name
+                .as_ref()
+                .map(DeckName::as_str),
+            Some("production"),
+            "the row as it is now renames"
+        );
+    }
+
+    /// Scenario: a row written before the naming rule is called `my deck`.
+    /// The desktop shows it by its address (no name) under a hashed `h-…` id;
+    /// renaming it to `legacy` works through that id, and the desktop then
+    /// shows it by the new name under the same id.
+    #[test]
+    fn a_deck_whose_stored_name_breaks_the_rule_can_be_renamed() {
+        let (_dir, path) = registry(&CLI_ROW.replace("\"prod\"", "\"my deck\""));
+        let shown = load_rows(&path).unwrap().remove(0);
+        assert!(shown.id.as_str().starts_with("h-"), "{}", shown.id.as_str());
+        assert_eq!(shown.name, None, "shown by its address");
+
+        rename(&path, &shown, "legacy").unwrap();
+
+        let after = load_rows(&path).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, shown.id, "the same id");
+        assert_eq!(after[0].name.as_ref().map(DeckName::as_str), Some("legacy"));
+    }
+
     #[test]
     fn a_refused_rename_says_why_in_the_library_s_words() {
         let (_dir, path) = registry(&format!(
             "{CLI_ROW}\n[[remotes]]\nname = \"staging\"\ntype = \"ssh\"\nhost = \"s.example\"\n\
              port = 22\nversion = \"0.40.0\"\nadded_at = \"2026-01-01T00:00:00Z\"\n"
         ));
-        let id = EndpointId::parse("n-prod").unwrap();
+        let prod = load_rows(&path).unwrap().remove(0);
+        assert_eq!(prod.id.as_str(), "n-prod");
 
-        let duplicate = rename(&path, &id, "staging").unwrap_err();
+        let duplicate = rename(&path, &prod, "staging").unwrap_err();
         assert_eq!(
             duplicate.to_string(),
             "A deck named 'staging' already exists."
         );
-        let invalid = rename(&path, &id, "my deck").unwrap_err();
+        let invalid = rename(&path, &prod, "my deck").unwrap_err();
         assert!(
             invalid.to_string().starts_with("Invalid deck name: "),
             "{invalid}"
         );
-        let gone = rename(&path, &EndpointId::parse("n-gone").unwrap(), "x").unwrap_err();
+        let gone = rename(&path, &row("n-gone", "gone.example"), "x").unwrap_err();
         assert_eq!(gone.to_string(), "That deck is no longer in the deck list.");
     }
 
@@ -1463,7 +1563,7 @@ mod tests {
             invalid,
             RenameDeckError::InvalidName(deck_list::DeckNameError::BadStart).to_string()
         );
-        let error = rename(&path, &prod, "-lab").unwrap_err();
+        let error = rename(&path, &load_rows(&path).unwrap()[0], "-lab").unwrap_err();
         assert_eq!(invalid, error.to_string(), "the check and the rename agree");
     }
 

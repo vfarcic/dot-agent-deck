@@ -287,12 +287,12 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
    */
   const saveSectionOf = (document: DesktopSettingsDto, next: EndpointSettingsDto) => {
     const write = endpointSectionToSave(document.endpoints, next);
-    if (!write) return;
+    if (!write) return undefined;
     // `document` is named as what this edit was made against (issue #828): for
     // `runTest`'s write-back it is `latest.current`, which can trail the
     // document on screen by a render, and measuring the edit against the newer
     // one would write this snapshot's stale fields over it.
-    onSave({ ...document, endpoints: write }, document);
+    return onSave({ ...document, endpoints: write }, document);
   };
 
   /** {@link saveSectionOf} against the document this render was given. */
@@ -315,6 +315,12 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
    * The name is checked once more at the moment of confirming, because the
    * verdict on screen may still be in flight; a refusal is shown and nothing is
    * stored. An empty name stores none, and the library derives one.
+   *
+   * The name can still be taken between that check and the save (a `remote
+   * add` in a terminal). The save then writes nothing and the window is shown
+   * the list as it is on disk, without this deck — so the draft comes back,
+   * name and all, and the name check beside the field says why, for the user
+   * to choose another name and add it again.
    */
   const confirmDraft = async () => {
     const pending = latestDraft.current;
@@ -343,7 +349,15 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
     const current = sectionOf(document);
     const row: RemoteEndpointDto = name ? { ...now, name } : now;
     setDraft(undefined);
-    saveSectionOf(document, { remote: [...current.remote, row], selection: row.id });
+    const outcome = await saveSectionOf(document, { remote: [...current.remote, row], selection: row.id });
+    if (!outcome || outcome.saved || !outcome.disk) return;
+    if (sectionOf(outcome.disk).remote.some((stored) => stored.id === row.id)) return;
+    // Another draft started meanwhile is the user's newer intent; leave it.
+    if (latestDraft.current) return;
+    setDraft(now);
+    setDraftName(name);
+    draftNameTouched.current = Boolean(name);
+    setNameCheck(undefined);
   };
 
   /** Rename the stored deck on screen (issue #1426); never through `onSave`. */

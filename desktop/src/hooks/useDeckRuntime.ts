@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createFixtureSnapshot } from "../data/fixture";
 import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
-import type { DesktopSettingsDto, EndpointSettingsDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
+import type { DesktopSettingsDto, EndpointSettingsDto, RemoteEndpointDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
 import { voiceDeckStep } from "../lib/newAgent";
 import { agentKey } from "../lib/agentKey";
 import { LaunchCleanupError } from "../lib/actionError";
@@ -379,7 +379,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   const forgetSecret = useCallback((id: VoiceSecretId) => bridge.forgetSecret(id), [bridge]);
   // Issue #1426. Not wrapped in `setError` either: a refused name is a sentence
   // the Daemons panel shows beside the field.
-  const renameDeck = useCallback((id: string, name: string) => bridge.renameDeck(id, name), [bridge]);
+  const renameDeck = useCallback((deck: RemoteEndpointDto, name: string) => bridge.renameDeck(deck, name), [bridge]);
   const defaultDeckName = useCallback((host: string, user?: string) => bridge.defaultDeckName(host, user), [bridge]);
   const checkDeckName = useCallback((name: string, id?: string) => bridge.checkDeckName(name, id), [bridge]);
 

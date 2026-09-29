@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "../lib/bridge";
 import { PartialSettingsSaveError } from "../lib/settingsError";
+import type { SaveOutcome } from "../lib/settingsContract";
 import type { DeckRuntimeState } from "../types";
 
 export interface DesktopSettingsState {
@@ -79,8 +80,13 @@ export interface DesktopSettingsState {
    * is not the one on screen — a write-back that runs after an `await` and
    * builds on a snapshot it kept. Omitted, the document on screen is assumed,
    * which is right for any handler reacting to the render it was given.
+   *
+   * The hook's own `save` resolves with what became of the write once it
+   * settles (never rejects), for a caller that must act on it; everything else
+   * ignores it. Typed as the panel contract's `onSave` is, so a hand-built
+   * state in a test need not return one.
    */
-  save: (next: DesktopSettingsDto, from?: DesktopSettingsDto) => void;
+  save: (next: DesktopSettingsDto, from?: DesktopSettingsDto) => void | Promise<SaveOutcome>;
   /**
    * Run a write that is NOT a save and adopt the document it resolves with
    * (issue #1426's rename, which the shared library performs and which a save
@@ -89,7 +95,10 @@ export interface DesktopSettingsState {
    * Queued behind any save still in flight, so the document it answers with is
    * the newest and a slower save cannot overwrite it on screen. Resolves with
    * that document; a rejection is handed back unchanged, for the caller to
-   * show where the user asked, and leaves the document on screen as it was.
+   * show where the user asked, and leaves the document on screen as it was —
+   * unless it is a {@link PartialSettingsSaveError}, whose document on disk is
+   * adopted first (the rename's target changed elsewhere, so the window's copy
+   * is stale).
    * Optional so a hand-built state in a test need not restate it.
    */
   apply?: (write: () => Promise<DesktopSettingsDto>) => Promise<DesktopSettingsDto>;
@@ -224,13 +233,13 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
     // settled, so the last choice made is the last one on disk. The inner
     // handlers never reject, so one failed save cannot break the chain for
     // every save after it.
-    queue.current = queue.current.then(() => {
+    const outcome = queue.current.then((): Promise<SaveOutcome> => {
       // Read here, when this save runs, because only now is it known whether
       // the one before it failed.
       const sentBase = carried.current ?? base;
       carried.current = undefined;
       return saveSettings(next, sentBase)
-        .then((written) => {
+        .then((written): SaveOutcome => {
           // Any save that came back at all means the document on disk is one this
           // build can read: `save_to` refuses before writing otherwise. True of a
           // superseded response too, so this is cleared before the ticket check —
@@ -242,8 +251,9 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
           // one is the file as written, so applying it also shows what another
           // window saved meanwhile (issue #828).
           if (newest.current === ticket) setSettings(written);
+          return { saved: true };
         })
-        .catch((cause: unknown) => {
+        .catch((cause: unknown): SaveOutcome => {
           // Issue #1350's review: the deck edits reached the shared deck list
           // and `desktop.toml` did not — or the deck list changed outside the
           // app, so nothing was written and this window's list is stale.
@@ -254,10 +264,10 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
           // edit is not carried: the next save diffs against what is on screen.
           if (cause instanceof PartialSettingsSaveError) {
             carried.current = undefined;
-            if (newest.current !== ticket) return;
+            if (newest.current !== ticket) return { saved: false };
             setSettings(cause.written);
             setSaveFailure(cause.message);
-            return;
+            return { saved: false, disk: cause.written };
           }
           // The edit did not reach the file, so the next save must carry it —
           // superseded or not, which is exactly the case where it would
@@ -269,15 +279,18 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
           //
           // Superseded failures are dropped for the same reason as superseded
           // successes: the message would be about a choice no longer on screen.
-          if (newest.current !== ticket) return;
+          if (newest.current !== ticket) return { saved: false };
           const message = cause instanceof Error ? cause.message : String(cause);
           // The lead-in is composed here rather than in each panel, because a
           // panel now renders `saveError` verbatim: the other thing that reaches
           // that prop is a document problem, which is already a whole sentence and
           // must not acquire a "saving it failed" preamble it has not earned.
           setSaveFailure(`This change is applied, but saving it failed, so it will not survive a restart. ${message}`);
+          return { saved: false };
         });
     });
+    queue.current = outcome.then(() => undefined);
+    return outcome;
   }, [saveSettings]);
 
   const apply = useCallback((write: () => Promise<DesktopSettingsDto>) => {
@@ -290,6 +303,11 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
       setSaveFailure(undefined);
       if (newest.current === ticket) setSettings(written);
       return written;
+    }, (cause: unknown) => {
+      // Issue #1426: the rename's deck changed elsewhere, so nothing was
+      // written and the window's list is stale — show the list as it is.
+      if (cause instanceof PartialSettingsSaveError && newest.current === ticket) setSettings(cause.written);
+      throw cause;
     });
     // The queue carries on whatever this write did; the caller hears about it.
     queue.current = done.then(() => undefined, () => undefined);

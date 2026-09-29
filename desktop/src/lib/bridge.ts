@@ -1545,15 +1545,19 @@ export interface DeckBridge {
    */
   testEndpoint(settings: DesktopSettingsDto, selection: string): Promise<EndpointTestReportDto>;
   /**
-   * Rename the stored deck `id` to `name` in the shared deck list (issue
-   * #1426), resolving with the settings as they now are on disk.
+   * Rename the stored deck `deck` — the row as the window shows it — to `name`
+   * in the shared deck list (issue #1426), resolving with the settings as they
+   * now are on disk.
    *
    * Not a settings save: a save never renames a deck. The deck keeps its id, so
    * the selection and everything keyed on the deck still name it. **Rejects
    * with the sentence to show** when the name is refused — invalid, or another
-   * deck's — or the deck list could not be written.
+   * deck's — or the deck list could not be written. When the deck on disk is no
+   * longer `deck` (its address or name changed elsewhere, or its id now names
+   * another deck), nothing is renamed and it rejects with a
+   * {@link PartialSettingsSaveError} carrying the settings as they are on disk.
    */
-  renameDeck(id: string, name: string): Promise<DesktopSettingsDto>;
+  renameDeck(deck: RemoteEndpointDto, name: string): Promise<DesktopSettingsDto>;
   /**
    * The name a deck at `host` (and `user`) would get if added without one —
    * what the add form pre-fills (issue #1426). The shared library derives it,
@@ -4156,9 +4160,19 @@ export class TauriDeckBridge implements DeckBridge {
    * and the rename changed no address, so the fleet is not re-established — the
    * crate emits a snapshot carrying the new name itself.
    */
-  async renameDeck(id: string, name: string): Promise<DesktopSettingsDto> {
+  async renameDeck(deck: RemoteEndpointDto, name: string): Promise<DesktopSettingsDto> {
     const invoke = await this.getInvoke();
-    const raw = await invoke<DesktopSettingsDto>("desktop_rename_deck", { id, name });
+    let raw: DesktopSettingsDto;
+    try {
+      raw = await invoke<DesktopSettingsDto>("desktop_rename_deck", { deck, name });
+    } catch (cause) {
+      // The deck changed since this window loaded it: nothing was renamed, and
+      // the crate hands back the list as it is so the window can show it.
+      const partial = partialSettingsSave(cause);
+      if (!partial) throw cause;
+      const written = await this.afterSettingsWrite(normalizeDesktopSettings(partial.written));
+      throw new PartialSettingsSaveError(partial.message, written);
+    }
     return this.afterSettingsWrite(normalizeDesktopSettings(raw));
   }
 

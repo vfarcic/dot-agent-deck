@@ -2504,13 +2504,20 @@ async fn desktop_set_settings(
 /// Rename a remote deck (issue #1426) and return the settings as they are now
 /// on disk — the same shape [`desktop_set_settings`] answers with.
 ///
-/// `id` is the row's `id` as the settings document carries it; `name` is the
-/// new name. The shared library does the rename ([`crate::decks::rename`]):
-/// it validates the name, refuses one another deck has, and keeps the deck's
-/// id, so the selection and everything keyed on the deck still name it.
+/// `deck` is the row as the window shows it — the settings document's own row,
+/// so it arrives through the same validating types a save does; `name` is the
+/// new name. The shared library does the rename ([`crate::decks::rename`]): it
+/// validates the name, refuses one another deck has, and keeps the deck's id,
+/// so the selection and everything keyed on the deck still name it. The row
+/// is found by `deck`'s id and renamed only while it still has `deck`'s
+/// address and name: an id derived from a name can pass to another deck, and
+/// the window must not rename a deck it never showed.
 ///
 /// A refusal rejects with the sentence the rename form shows as it is — the
-/// library's own wording, the same one [`desktop_check_deck_name`] gives. A
+/// library's own wording, the same one [`desktop_check_deck_name`] gives. When
+/// the row is no longer the deck the window showed, the rejection also carries
+/// the settings re-read from disk (a [`crate::dto::DesktopSettingsSaveError::Partial`],
+/// as a save's conflict does), so the window shows the list as it is. A
 /// failure to read or write the deck list rejects with a sentence that names
 /// no path; the path goes to the app's log.
 ///
@@ -2522,30 +2529,48 @@ async fn desktop_rename_deck(
     app: AppHandle,
     webview: Webview,
     state: State<'_, DesktopState>,
-    id: String,
+    deck: crate::settings::RemoteEndpointSettings,
     name: String,
-) -> Result<DesktopSettings, String> {
+) -> Result<DesktopSettings, crate::dto::DesktopSettingsSaveError> {
+    use dot_agent_deck::deck_list::RenameDeckError;
     ensure_main_webview(&webview)?;
-    let id = crate::settings::EndpointId::parse(&id).map_err(|error| error.to_string())?;
     // Bounded before it is handed on: nothing longer can be a valid name.
     if name.len() > dot_agent_deck::deck_list::MAX_DECK_NAME_BYTES {
-        return Err(dot_agent_deck::deck_list::RenameDeckError::InvalidName(
+        return Err(RenameDeckError::InvalidName(
             dot_agent_deck::deck_list::DeckNameError::TooLong { len: name.len() },
         )
-        .to_string());
+        .to_string()
+        .into());
     }
     let renamed = tauri::async_runtime::spawn_blocking(move || {
-        crate::decks::rename(&crate::decks::remotes_path(), &id, &name)?;
-        Ok::<_, dot_agent_deck::deck_list::RenameDeckError>(
-            crate::settings::load_snapshot().settings,
-        )
+        crate::decks::rename(&crate::decks::remotes_path(), &deck, &name)?;
+        Ok::<_, RenameDeckError>(crate::settings::load_snapshot().settings)
     })
     .await
     .map_err(|error| {
         eprintln!("desktop decks: the rename task did not complete: {error}");
         "Renaming the deck did not complete. Try again.".to_string()
     })?;
-    let written = renamed.map_err(rename_error_message)?;
+    let written = match renamed {
+        Ok(written) => written,
+        Err(RenameDeckError::Changed) => {
+            let message = RenameDeckError::Changed.to_string();
+            let Ok(disk) =
+                tauri::async_runtime::spawn_blocking(|| crate::settings::load_snapshot().settings)
+                    .await
+            else {
+                return Err(message.into());
+            };
+            apply_selection(&app, &state, &disk).await;
+            return Err(crate::dto::DesktopSettingsSaveError::Partial(
+                crate::dto::DesktopPartialSettingsSave {
+                    message,
+                    written: disk,
+                },
+            ));
+        }
+        Err(error) => return Err(rename_error_message(error).into()),
+    };
     apply_selection(&app, &state, &written).await;
     refresh_and_emit(&app, &state.daemon).await;
     Ok(written)
@@ -3474,8 +3499,11 @@ fn selector_voice_decks(
 /// deck reference exists to name a deck OTHER than the one in view.
 ///
 /// The label is `deckName`'s (`desktop/src/lib/displayText.ts`): "Local deck"
-/// for the local endpoint, the `user@host[:port]` label for a remote one — so a
-/// report or an ambiguity sentence names a deck the way the screen does.
+/// for the local endpoint, and for a remote one its name in the deck list, or
+/// its `user@host[:port]` address when it has no usable name (issue #1426) — so
+/// a report or an ambiguity sentence names a deck the way the screen does. A
+/// named deck still answers to its address, but only the label is sent to the
+/// Commands endpoint ([`voice::prompt::state`]).
 ///
 /// **Eligibility is the webview's `deck_step`**, the New agent dialog's deck
 /// step as it stands ([`voice::VoiceDeckChoice`] says why that one piece is

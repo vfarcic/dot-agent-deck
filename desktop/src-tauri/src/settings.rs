@@ -2364,7 +2364,8 @@ impl SaveFailure {
     }
 
     /// The deck list changed outside the app in a way this save's deck edits
-    /// cannot be applied to ([`crate::decks::ApplyError::Conflict`]), so
+    /// cannot be applied to ([`crate::decks::ApplyError::Conflict`], or a name
+    /// an added deck carries taken meanwhile — [`Self::duplicate_name`]), so
     /// nothing was written — neither file.
     pub fn deck_list_conflict(&self) -> bool {
         self.conflict
@@ -2382,6 +2383,24 @@ impl SaveFailure {
                          applied. The settings are shown as they are on disk now; make the \
                          change again."
                     .to_string(),
+            },
+            decks_saved: false,
+            conflict: true,
+        }
+    }
+
+    /// Issue #1426: a deck this save adds carries a name another deck took
+    /// since the add form checked it — a `remote add` in a terminal. Nothing
+    /// was written. It is a [`Self::deck_list_conflict`] too, because the
+    /// window's list is stale in the same way: it lacks the deck that took the
+    /// name, and it shows the added deck as stored when it is not. Shown the
+    /// list on disk, the window drops that row, and the add form can offer the
+    /// deck again under another name.
+    fn duplicate_name(remotes: &Path, error: &crate::decks::ApplyError) -> Self {
+        Self {
+            error: SettingsWriteError {
+                detail: format!("the deck list {}: {error}", remotes.display()),
+                public: format!("{error} The daemon was not added; choose another name."),
             },
             decks_saved: false,
             conflict: true,
@@ -3213,14 +3232,8 @@ pub(crate) fn save_at(
         crate::decks::apply(remotes, &edits).map_err(|error| match error {
             crate::decks::ApplyError::Config(error) => SaveFailure::from(deck_list_error(error)),
             crate::decks::ApplyError::Conflict => SaveFailure::conflict(remotes),
-            // Issue #1426: the name the user chose for a new deck is taken.
-            // Nothing was written, and the sentence names no path — it is the
-            // add form's own message.
             error @ crate::decks::ApplyError::DuplicateName { .. } => {
-                SaveFailure::from(SettingsWriteError {
-                    detail: format!("the deck list {}: {error}", remotes.display()),
-                    public: error.to_string(),
-                })
+                SaveFailure::duplicate_name(remotes, &error)
             }
         })?;
         decks_saved = !edits.is_empty();
@@ -10050,11 +10063,10 @@ level = 1.0
             let before = load_snapshot_at(&path, &remotes).settings;
             assert_eq!(row_ids(&before), ["n-prod", "0123456789abcdef"]);
 
-            let prod = EndpointId::parse("n-prod").unwrap();
-            let lab = EndpointId::parse("0123456789abcdef").unwrap();
+            let rows = &before.endpoints.as_ref().unwrap().remote;
             let suffix = if selection == "all" { "-2" } else { "" };
-            crate::decks::rename(&remotes, &prod, &format!("production{suffix}")).unwrap();
-            crate::decks::rename(&remotes, &lab, &format!("bench{suffix}")).unwrap();
+            crate::decks::rename(&remotes, &rows[0], &format!("production{suffix}")).unwrap();
+            crate::decks::rename(&remotes, &rows[1], &format!("bench{suffix}")).unwrap();
 
             let after = load_snapshot_at(&path, &remotes).settings;
             assert_eq!(row_ids(&after), row_ids(&before), "{selection}");
@@ -10298,6 +10310,51 @@ level = 1.0
         );
         assert!(!failure.public().contains(&dir.path().display().to_string()));
         assert_eq!(std::fs::read_to_string(&remotes).unwrap(), replacement);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), document_before);
+    }
+
+    /// Issue #1426: the add form checked the name `lab` and found it free;
+    /// before the save landed, `remote add lab` in a terminal took it. The
+    /// save writes nothing and fails as a conflict, so the command shows the
+    /// list as it is on disk — without the deck that was not added — and the
+    /// sentence names the taken name, not a path.
+    #[test]
+    fn adding_a_deck_under_a_name_taken_since_the_check_is_a_conflict() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let remotes = dir.path().join("remotes.toml");
+        std::fs::write(&remotes, CLI_DECK).unwrap();
+        std::fs::write(&path, "version = 1\n").unwrap();
+        let snapshot = load_snapshot_at(&path, &remotes);
+
+        let taken = format!(
+            "{CLI_DECK}\n{}",
+            CLI_DECK
+                .replace("\"prod\"", "\"lab\"")
+                .replace("build.example.com", "other.example.com")
+        );
+        std::fs::write(&remotes, &taken).unwrap();
+        let document_before = std::fs::read_to_string(&path).unwrap();
+
+        let mut edited = snapshot.settings.clone();
+        edited
+            .endpoints
+            .as_mut()
+            .unwrap()
+            .remote
+            .push(RemoteEndpointSettings {
+                name: Some(DeckName::parse("lab").unwrap()),
+                ..deck_row("0123456789abcdef", "lab.example.com")
+            });
+        let failure = save_at(&path, &remotes, Some(&snapshot.settings), &edited).unwrap_err();
+
+        assert!(failure.deck_list_conflict());
+        assert!(!failure.decks_saved());
+        assert_eq!(
+            failure.public(),
+            "A deck named 'lab' already exists. The daemon was not added; choose another name."
+        );
+        assert_eq!(std::fs::read_to_string(&remotes).unwrap(), taken);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), document_before);
     }
 
