@@ -1134,3 +1134,143 @@ fn pane_restart_013_force_restart_cancels_the_silent_worker_notice() {
             );
         });
 }
+
+/// Scenario: Type an unsent draft into a worker pane and delegate a task while
+/// that draft holds the task pointer. A forced pane restart must reply promptly,
+/// and the waiting task must either reach the replacement worker as a submitted
+/// line or produce a delivery notice, without carrying the old draft forward.
+#[test]
+#[spec("pane/restart/015")]
+fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
+    let _env = EnvRestore::set(&[
+        ("DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS", "60000"),
+        ("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", "0"),
+        ("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0"),
+        ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build draft-and-restart runtime")
+        .block_on(async {
+            use std::io::Write as _;
+
+            const DRAFT: &str = "restart-draft-must-stay-with-old-worker";
+            let fx = fixture("cat").await;
+            let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = std::sync::Arc::clone(&notices);
+            fx.daemon.registry.set_delivery_notice_sink(std::sync::Arc::new(
+                move |notice| captured.lock().expect("lock delivery notices").push(notice),
+            ));
+            tokio::fs::write(
+                fx._dir.path().join(".dot-agent-deck.toml"),
+                format!("{}clear = false\n", config("cat")),
+            )
+            .await
+            .expect("configure delivery to the current worker");
+
+            let handle = fx
+                .daemon
+                .registry
+                .subscribe(&fx.worker_agent_id)
+                .expect("subscribe to worker input");
+            {
+                let mut writer = handle.writer.lock().await;
+                writer.write_all(DRAFT.as_bytes()).expect("type worker draft");
+                writer.flush().expect("flush worker draft");
+            }
+            assert!(
+                fx.daemon.registry.draft_pending(WORKER_PANE),
+                "precondition: the worker has no unsent draft"
+            );
+
+            let queued = delegate_to_worker(&fx, false).await;
+            assert_eq!(
+                queued.delivered,
+                vec![WORKER_ROLE.to_string()],
+                "precondition: the delegate was not queued; response = {queued:?}"
+            );
+            let task_file = fx
+                ._dir
+                .path()
+                .join(".dot-agent-deck/worker-task-coder.md");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !task_file.exists() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(task_file.exists(), "precondition: dispatch never prepared the task file");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let old_snapshot = fx
+                .daemon
+                .registry
+                .snapshot(&fx.worker_agent_id)
+                .expect("snapshot drafted worker");
+            assert!(
+                old_snapshot.windows(DRAFT.len()).any(|bytes| bytes == DRAFT.as_bytes())
+                    && !old_snapshot.windows(POINTER.len()).any(|bytes| bytes == POINTER),
+                "precondition: pointer was not waiting behind the unsent draft; snapshot = {:?}",
+                String::from_utf8_lossy(&old_snapshot)
+            );
+
+            let restarted = tokio::time::timeout(
+                Duration::from_secs(8),
+                restart_role(&fx, ORCH_PANE, WORKER_ROLE, true),
+            )
+            .await
+            .expect("pane restart did not reply within eight seconds while a delegate waited on a draft");
+            assert!(
+                restarted.restarted && restarted.error.is_none(),
+                "pane restart must succeed while a delegate waits on a draft; response = {restarted:?}"
+            );
+            let replacement = fx
+                .daemon
+                .registry
+                .pane_current_agent_id(WORKER_PANE)
+                .expect("restart left no worker in the pane");
+            assert_ne!(replacement, fx.worker_agent_id, "restart did not replace the worker");
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+            let submitted_pointer = [POINTER, b"\r\n"].concat();
+            let replacement_snapshot = loop {
+                let snapshot = fx.daemon.registry.snapshot(&replacement).unwrap_or_default();
+                let delivered = snapshot
+                    .windows(submitted_pointer.len())
+                    .any(|bytes| bytes == submitted_pointer);
+                let reported = notices
+                    .lock()
+                    .expect("lock delivery notices")
+                    .iter()
+                    .any(|notice: &dot_agent_deck::agent_pty::DeliveryNotice| {
+                        notice.pane_id == WORKER_PANE
+                    });
+                if delivered || reported || tokio::time::Instant::now() >= deadline {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            };
+            let reported = notices
+                .lock()
+                .expect("lock delivery notices")
+                .iter()
+                .any(|notice: &dot_agent_deck::agent_pty::DeliveryNotice| {
+                    notice.pane_id == WORKER_PANE
+                });
+            assert!(
+                replacement_snapshot
+                    .windows(submitted_pointer.len())
+                    .any(|bytes| bytes == submitted_pointer)
+                    || reported,
+                "waiting delegate was silently lost; replacement snapshot = {:?}, notices = {:?}",
+                String::from_utf8_lossy(&replacement_snapshot),
+                notices.lock().expect("lock delivery notices")
+            );
+            assert!(
+                !replacement_snapshot
+                    .windows(DRAFT.len())
+                    .any(|bytes| bytes == DRAFT.as_bytes()),
+                "old worker draft reached the replacement pane: {:?}",
+                String::from_utf8_lossy(&replacement_snapshot)
+            );
+        });
+}

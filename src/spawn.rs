@@ -1312,13 +1312,81 @@ pub(crate) async fn run_delivery(
     prompt: String,
     detach: bool,
 ) {
+    run_delivery_inner(
+        registry,
+        pane_id,
+        agent_id,
+        event_rx,
+        prompt,
+        detach,
+        AUTOMATIC_PROMPT_DEADLINE,
+    )
+    .await;
+}
+
+/// [`run_delivery`] with the whole-delivery deadline supplied by the caller.
+///
+/// Issue #544 test seam: production always passes
+/// [`AUTOMATIC_PROMPT_DEADLINE`] (through [`run_delivery`]); this exists so a
+/// test can shorten the deadline and prove that a first write waiting for the
+/// user's draft does not consume it
+/// (`dispatch_024_spawn_seed_preserves_deadline_after_draft_wait`). `#[cfg(test)]`
+/// rather than a knob, because the deadline is a safety bound, not a setting.
+/// Unix-only because its only users drive a `/bin/cat` byte target.
+#[cfg(all(test, unix))]
+pub(crate) async fn run_delivery_with_deadline(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: String,
+    agent_id: String,
+    event_rx: Option<broadcast::Receiver<BroadcastMsg>>,
+    prompt: String,
+    detach: bool,
+    delivery_deadline: Duration,
+) {
+    run_delivery_inner(
+        registry,
+        pane_id,
+        agent_id,
+        event_rx,
+        prompt,
+        detach,
+        delivery_deadline,
+    )
+    .await;
+}
+
+async fn run_delivery_inner(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: String,
+    agent_id: String,
+    event_rx: Option<broadcast::Receiver<BroadcastMsg>>,
+    prompt: String,
+    detach: bool,
+    delivery_deadline: Duration,
+) {
     if detach {
         let registry = Arc::clone(registry);
         tokio::spawn(async move {
-            deliver(&registry, &pane_id, &agent_id, event_rx, &prompt).await;
+            deliver(
+                &registry,
+                &pane_id,
+                &agent_id,
+                event_rx,
+                &prompt,
+                delivery_deadline,
+            )
+            .await;
         });
     } else {
-        deliver(registry, &pane_id, &agent_id, event_rx, &prompt).await;
+        deliver(
+            registry,
+            &pane_id,
+            &agent_id,
+            event_rx,
+            &prompt,
+            delivery_deadline,
+        )
+        .await;
     }
 }
 
@@ -1328,6 +1396,7 @@ async fn deliver(
     agent_id: &str,
     event_rx: Option<broadcast::Receiver<BroadcastMsg>>,
     prompt: &str,
+    delivery_deadline: Duration,
 ) {
     // Issue #424, reviewer finding B9: ONE absolute deadline for the whole
     // delivery, captured BEFORE the readiness wait. `started` used to be minted
@@ -1335,7 +1404,7 @@ async fn deliver(
     // in production — so an automatic prompt could stay active for ~90 s while
     // the two TUI paths enforce the shared 60 s `AUTOMATIC_PROMPT_DEADLINE` from
     // enqueue. Every wait and every write below is bounded by this one instant.
-    let deadline = Instant::now() + AUTOMATIC_PROMPT_DEADLINE;
+    let mut deadline = Instant::now() + delivery_deadline;
     // Issue #424, reviewer finding B4: `readiness` is carried past the write. It
     // is not "may we deliver" (the fallback still delivers, exactly as before)
     // but "can this producer report a submitted prompt at all" — which decides
@@ -1514,7 +1583,43 @@ async fn deliver(
     // agent frees for the next spawn — so after a multi-second readiness wait
     // it could type this dispatch prompt into a replacement. (Issue #917
     // deleted that primitive, so the contrast is history, not a choice.)
-    match guarded_submit(registry, pane_id, agent_id, prompt, deadline).await {
+    //
+    // Issue #544, PR #1398 review: the pre-write drain runs AGAIN under the
+    // writer, immediately before the bytes, because this write may first wait
+    // out the user's draft for up to the cap. Drained only above, every event
+    // that arrived during that wait — the agent's own `SessionStart` among
+    // them — would reach the confirmation loop as post-write, which is the
+    // window #666's drain exists to close. The drain above stays: it stops a
+    // delivery whose target already changed before it starts waiting.
+    let pre_write = || {
+        event_rx.as_mut().and_then(|rx| {
+            drain_pre_write_events(
+                rx,
+                pane_id,
+                agent_id,
+                &mut generation,
+                &mut drained_capability,
+                &mut pre_write_agent_start,
+            )
+        })
+    };
+    let first = guarded_first_submit(
+        registry,
+        pane_id,
+        agent_id,
+        prompt,
+        &mut deadline,
+        pre_write,
+    )
+    .await;
+    let first = match first {
+        Ok(outcome) => outcome,
+        Err(reason) => {
+            log_prompt_stopped(DELIVERY_LOG_PATH, pane_id, &delivery_id, reason);
+            return;
+        }
+    };
+    match first {
         GuardedOutcome::Written => {}
         // Issue #424 H3/H5: the FIRST write of this delivery was refused because
         // the pane's input box already holds bytes of ours that the user has
@@ -1719,8 +1824,79 @@ async fn guarded_submit(
     match tokio::time::timeout(remaining_before(deadline), send).await {
         Err(_) => GuardedOutcome::Refused("deadline elapsed while writing"),
         Ok(Err(e)) => GuardedOutcome::Failed(e),
-        Ok(Ok(GuardedSendDetail::RefusedUserInput)) => GuardedOutcome::RefusedUserInput,
-        Ok(Ok(GuardedSendDetail::Outcome(outcome))) => match outcome {
+        Ok(Ok(detail)) => classify_guarded_detail(detail),
+    }
+}
+
+/// Issue #544: [`guarded_submit`] for a delivery's FIRST write, which waits
+/// while the user has an unsent draft in the pane — and must not let that wait
+/// turn into "deadline elapsed while writing", which would DROP the prompt, the
+/// outcome #424 exists to prevent.
+///
+/// So the deadline is enforced INSIDE the write
+/// ([`AgentPtyRegistry::write_and_submit_guarded_first_write_within`]), which
+/// moves it later by exactly the time spent waiting for the draft and by
+/// nothing else: a write that never waited is bounded by `deadline` as it was
+/// before the gate existed, and time queued behind another writer cannot
+/// borrow the draft's allowance (PR #1398 review). It bounds only the time
+/// before the first byte: a write already under way runs to completion and is
+/// classified by what it actually did (PR #1398 re-review), so an expiry here
+/// is a refusal with nothing written. `deadline` is then moved
+/// by the same wait, so the confirmation chain after the write still gets the
+/// same span it did before — which is also what keeps
+/// [`crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`] a bound on how long a
+/// payload record can be guarding a live delivery.
+///
+/// `pre_write` runs under the pane's writer on the pass that writes, just
+/// before the bytes go in; a `Some(reason)` stops the delivery with nothing
+/// written, returned as `Err(reason)`. It exists for the pre-write drain (issue #666): run once before
+/// this call as well, it would leave every event that arrives during a draft
+/// wait to be read as post-write evidence — a `SessionStart` among them.
+async fn guarded_first_submit(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    agent_id: &str,
+    prompt: &str,
+    deadline: &mut Instant,
+    pre_write: impl FnOnce() -> Option<&'static str>,
+) -> Result<GuardedOutcome, &'static str> {
+    let closing = Arc::clone(registry);
+    let mut stopped = None;
+    let send = registry.write_and_submit_guarded_first_write_within(
+        pane_id,
+        prompt,
+        agent_id,
+        || {
+            let live = !closing.is_pane_closing(pane_id);
+            if live {
+                stopped = pre_write();
+            }
+            let proceed = live && stopped.is_none();
+            async move { proceed }
+        },
+        Instant::now(),
+        *deadline,
+    );
+    let sent = send.await;
+    if let Some(reason) = stopped {
+        return Err(reason);
+    }
+    Ok(match sent {
+        Err(AgentPtyError::DeadlineElapsed) => {
+            GuardedOutcome::Refused("deadline elapsed while writing")
+        }
+        Err(e) => GuardedOutcome::Failed(e),
+        Ok(sent) => {
+            *deadline += sent.deferred;
+            classify_guarded_detail(sent.detail)
+        }
+    })
+}
+
+fn classify_guarded_detail(detail: GuardedSendDetail) -> GuardedOutcome {
+    match detail {
+        GuardedSendDetail::RefusedUserInput => GuardedOutcome::RefusedUserInput,
+        GuardedSendDetail::Outcome(outcome) => match outcome {
             GuardedSend::Applied => GuardedOutcome::Written,
             GuardedSend::WrongSession => GuardedOutcome::Refused("agent-replaced"),
             GuardedSend::Stale => GuardedOutcome::Refused("target went stale"),
@@ -3353,8 +3529,22 @@ async fn deliver_on_idle(
     if cancelled.as_deref() == Some(prompt) {
         registry.note_payload_settled(pane_id, prompt);
     }
+    // Issue #544: a FIRST write, so it also waits while the user has an unsent
+    // draft in the pane — which the debounce above does not cover, because a
+    // draft left idle for longer than the debounce reads as "not typing". It
+    // shares this fire's budget: `started` is the debounce's own start, and the
+    // draft cap is clamped to `REUSE_DELIVERY_HARD_TIMEOUT`, so the two waits
+    // together stay within this path's own one-minute limit rather than
+    // stacking — whatever `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` is set to.
     match registry
-        .write_and_submit_guarded(pane_id, prompt, expected_agent_id, || async { true })
+        .write_and_submit_guarded_first_write_capped(
+            pane_id,
+            prompt,
+            expected_agent_id,
+            || async { true },
+            started,
+            REUSE_DELIVERY_HARD_TIMEOUT,
+        )
         .await
     {
         Ok(GuardedSend::Applied) => {
@@ -5622,6 +5812,247 @@ mod tests {
             }),
             "the slow genuine confirmation must confirm attempt 1; captured log = {log:?}"
         );
+    }
+
+    /// Scenario: Type an unsent user draft before the production spawn-seed
+    /// delivery starts. Its first prompt must wait, then reach the same pane
+    /// as a separate submitted line after the user submits the draft.
+    #[spec("scheduler/dispatch/024")]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_024_spawn_seed_waits_for_a_preexisting_draft() {
+        const PANE_ID: &str = "spawn-seed-draft-pane";
+        const DRAFT: &str = "spawn-seed-user-draft-544";
+        const SEED: &str = "SPAWN-SEED-544-POINTER";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, PANE_ID);
+        type_user_draft(&registry, &agent_id, PANE_ID, DRAFT, 0).await;
+
+        run_delivery(
+            &registry,
+            PANE_ID.to_string(),
+            agent_id.clone(),
+            None,
+            SEED.to_string(),
+            true,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let waiting = registry.snapshot(&agent_id).expect("seed target snapshot");
+        assert!(
+            !waiting
+                .windows(SEED.len())
+                .any(|bytes| bytes == SEED.as_bytes()),
+            "spawn seed reached a pane with an unsent user draft: {:?}",
+            String::from_utf8_lossy(&waiting)
+        );
+
+        write_user_bytes(&registry, &agent_id, PANE_ID, b"\r").await;
+        let seed_line = format!("{SEED}\r\n");
+        wait_for_echo_bytes(&registry, &agent_id, seed_line.as_bytes()).await;
+        let delivered = registry.snapshot(&agent_id).expect("seed target snapshot");
+        let text = String::from_utf8_lossy(&delivered);
+        assert!(
+            text.contains(&format!("{DRAFT}\r\n"))
+                && text.contains(&seed_line)
+                && !text.contains(&format!("{DRAFT}{SEED}")),
+            "spawn seed and completed user draft were not separate lines: {text:?}"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Hold a user's unsent draft beyond a spawn seed's short delivery
+    /// deadline, then submit the draft. The seed must still arrive as its own
+    /// submitted line after the draft.
+    #[spec("scheduler/dispatch/024")]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_024_spawn_seed_preserves_deadline_after_draft_wait() {
+        const PANE_ID: &str = "spawn-seed-deadline-pane";
+        const DRAFT: &str = "spawn-seed-deadline-draft-544";
+        const SEED: &str = "SPAWN-SEED-DEADLINE-544";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, PANE_ID);
+        type_user_draft(&registry, &agent_id, PANE_ID, DRAFT, 0).await;
+
+        run_delivery_with_deadline(
+            &registry,
+            PANE_ID.to_string(),
+            agent_id.clone(),
+            None,
+            SEED.to_string(),
+            true,
+            Duration::from_secs(1),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let waiting = registry.snapshot(&agent_id).expect("seed target snapshot");
+        assert!(
+            !waiting
+                .windows(SEED.len())
+                .any(|bytes| bytes == SEED.as_bytes()),
+            "spawn seed did not wait for the draft: {:?}",
+            String::from_utf8_lossy(&waiting)
+        );
+
+        write_user_bytes(&registry, &agent_id, PANE_ID, b"\r").await;
+        let seed_line = format!("{SEED}\r\n");
+        wait_for_echo_bytes(&registry, &agent_id, seed_line.as_bytes()).await;
+        let delivered = registry.snapshot(&agent_id).expect("seed target snapshot");
+        let text = String::from_utf8_lossy(&delivered);
+        assert!(
+            text.contains(&format!("{DRAFT}\r\n"))
+                && text.contains(&seed_line)
+                && !text.contains(&format!("{DRAFT}{SEED}")),
+            "spawn seed and completed user draft were not separate lines: {text:?}"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A spawn seed waits behind a draft after its readiness wait
+    /// has ended, and the agent starts its session during that wait. Once the
+    /// draft is submitted, that pre-write start must not authorize a third
+    /// payload copy in the pane.
+    #[spec("scheduler/dispatch/025")]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_025_session_start_during_draft_wait_does_not_duplicate_seed() {
+        const PANE_ID: &str = "spawn-seed-start-during-draft-pane";
+        const DRAFT: &str = "spawn-seed-start-during-draft-544";
+        const SEED: &str = "SPAWN-SEED-START-DURING-DRAFT-544";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_typed_byte_target(&registry, PANE_ID, Some(AgentType::ClaudeCode));
+        type_user_draft(&registry, &agent_id, PANE_ID, DRAFT, 0).await;
+        let (event_tx, event_rx) = broadcast::channel(16);
+
+        let previous_wait = std::env::var("DOT_AGENT_DECK_SESSION_START_WAIT_MS").ok();
+        // SAFETY: nextest runs this test in its own process. The previous value
+        // is restored after the delivery task passes its readiness wait.
+        unsafe { std::env::set_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS", "100") };
+        run_delivery_with_deadline(
+            &registry,
+            PANE_ID.to_string(),
+            agent_id.clone(),
+            Some(event_rx),
+            SEED.to_string(),
+            true,
+            Duration::from_secs(8),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        unsafe {
+            match previous_wait {
+                Some(value) => std::env::set_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS", value),
+                None => std::env::remove_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS"),
+            }
+        }
+        let before_start = registry.snapshot(&agent_id).expect("seed target snapshot");
+        assert_eq!(
+            payload_echoes(&before_start, SEED),
+            0,
+            "seed was not deferred before SessionStart: {:?}",
+            String::from_utf8_lossy(&before_start)
+        );
+        event_tx
+            .send(BroadcastMsg::Event(typed_prompt_watch_event(
+                PANE_ID,
+                &agent_id,
+                "session-that-started-before-the-seed-write",
+                EventType::SessionStart,
+                AgentType::ClaudeCode,
+                false,
+            )))
+            .expect("send SessionStart during the draft wait");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        write_user_bytes(&registry, &agent_id, PANE_ID, b"\r").await;
+        wait_for_echo_bytes(&registry, &agent_id, format!("{SEED}\r\n").as_bytes()).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let delivered = registry.snapshot(&agent_id).expect("seed target snapshot");
+        let copies = payload_echoes(&delivered, SEED);
+        assert!(
+            copies <= 4,
+            "pre-write SessionStart authorized a duplicate seed payload: {copies} echoes, snapshot={:?}",
+            String::from_utf8_lossy(&delivered)
+        );
+        assert!(
+            String::from_utf8_lossy(&delivered).contains(&format!("{DRAFT}\r\n")),
+            "user draft was not submitted separately from the seed"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The pane starts one hook session, then starts a different one
+    /// while its seed is waiting behind a draft. Releasing the draft must not
+    /// submit a seed addressed to the conversation that has already ended.
+    #[spec("scheduler/dispatch/025")]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_025_session_change_during_draft_wait_refuses_stale_seed() {
+        const PANE_ID: &str = "spawn-seed-session-change-draft-pane";
+        const SEED: &str = "SPAWN-SEED-STALE-SESSION-544";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_typed_byte_target(&registry, PANE_ID, Some(AgentType::ClaudeCode));
+        type_user_draft(
+            &registry,
+            &agent_id,
+            PANE_ID,
+            "draft-before-session-change",
+            0,
+        )
+        .await;
+        let (event_tx, event_rx) = broadcast::channel(16);
+        run_delivery(
+            &registry,
+            PANE_ID.to_string(),
+            agent_id.clone(),
+            Some(event_rx),
+            SEED.to_string(),
+            true,
+        )
+        .await;
+        event_tx
+            .send(BroadcastMsg::Event(typed_prompt_watch_event(
+                PANE_ID,
+                &agent_id,
+                "ready-session",
+                EventType::SessionStart,
+                AgentType::ClaudeCode,
+                false,
+            )))
+            .expect("announce the initial ready session");
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let waiting = registry.snapshot(&agent_id).expect("seed target snapshot");
+        assert_eq!(
+            payload_echoes(&waiting, SEED),
+            0,
+            "seed did not remain behind the draft before session change"
+        );
+        event_tx
+            .send(BroadcastMsg::Event(typed_prompt_watch_event(
+                PANE_ID,
+                &agent_id,
+                "new-session-before-seed-write",
+                EventType::SessionStart,
+                AgentType::ClaudeCode,
+                false,
+            )))
+            .expect("announce replacement session during draft wait");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        write_user_bytes(&registry, &agent_id, PANE_ID, b"\r").await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let released = registry.snapshot(&agent_id).expect("seed target snapshot");
+        assert_eq!(
+            payload_echoes(&released, SEED),
+            0,
+            "seed reached a new conversation after SessionStart during draft wait: {:?}",
+            String::from_utf8_lossy(&released)
+        );
+        registry.shutdown_all();
     }
 
     /// Scenario: Abandon a spawn prompt against its exact pane owner, then replace that owner and exhaust the 256-watch cap for a new delivery. Abandonment must report state without pane bytes, a stale report must not mark the replacement, and the 257th delivery must visibly report that it is unwatched.

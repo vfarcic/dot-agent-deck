@@ -8,7 +8,7 @@ import TabItem from '@theme/TabItem';
 
 # Orchestration
 
-Orchestrations are multi-agent pipelines where a designated **orchestrator** agent coordinates work across one or more **worker** agents. Each worker runs in its own pane, gets tasks injected into it, and signals completion back to the orchestrator — all automatically, through the daemon.
+Orchestrations are multi-agent pipelines where a designated **orchestrator** agent coordinates work across one or more **worker** agents. Each worker runs in its own pane, receives its tasks from the orchestrator, and reports back to it when it is done — you talk to the orchestrator, and it runs the team.
 
 > **Prefer video?** This page is a written companion to the walkthrough below — a full development pipeline (coder → reviewer + auditor → release) running end-to-end on a real project.
 
@@ -16,13 +16,11 @@ Orchestrations are multi-agent pipelines where a designated **orchestrator** age
 
 ## Why orchestrations work
 
-An agent reviewing its own code is like a developer reviewing their own PR: the same assumptions, the same blind spots, the same conviction that what they wrote is correct. Running the reviewer as a separate agent — in a fresh session, pointed at a different model if you like — removes that bias.
+An agent reviewing its own code is like a developer reviewing their own PR: the same assumptions and the same blind spots. Running the reviewer as a separate agent — in a fresh session, on a different model if you like — gives you an independent second opinion.
 
-Specialization compounds the effect. An agent forced to juggle several concerns at once does each one less well than an agent with a single focused brief. Giving each role its own agent — and, where you can, its own model family — keeps every pass sharp: a fresh, specialized context with no unrelated baggage, and independent judgment that does not inherit another agent's blind spots.
+Each role also gets a single focused brief instead of juggling several concerns, and starts from only the context the orchestrator hands it, instead of a long conversation full of unrelated error traces and tool output.
 
-Orchestrations also address context decay. As an agent accumulates a long conversation, implementation details, error traces, and tool output pile up and dilute focus. Worker agents receive only the context the orchestrator explicitly hands them, keeping each one sharp on its task.
-
-The tradeoff is wall-clock time: chaining agents is slower than a single run. But since you are not sitting there watching, the duration rarely matters. You hand off a task, do something else, and come back when the pipeline is done.
+The cost is time: a chain of agents is slower than a single run. Since you are not watching it, that rarely matters — hand off the task, do something else, and come back when the pipeline is done.
 
 ## How it works
 
@@ -52,7 +50,7 @@ flowchart TD
     Release -->|work-done| PR
 ```
 
-Delegation signals travel through the daemon: no messages are lost if you detach the TUI and reattach later. Work-done feedback lands in the orchestrator's scrollback, survives any number of detach/reattach cycles, and is visible the moment you open the orchestration tab.
+You can detach the TUI, or close the desktop app, and come back whenever you like: the orchestration keeps running, and every worker's report is in the orchestrator's pane when you come back.
 
 ## Quick setup
 
@@ -126,25 +124,25 @@ These work from anywhere, including while typing in a role pane:
 
 The sidebar shows each role's status live (thinking, working, waiting, idle, error) so you can see at a glance who is busy without switching panes.
 
-The tab bar carries the same signal one level up: a **background** orchestration tab's label is colored by the single most urgent status among its panes, in priority order Error (red) > Needs Input (magenta) > Working (green) > Thinking (blue), so you can tell which of several open orchestration tabs needs attention without switching to any of them. Color means "something in here needs you": a tab whose roles are all idle stays in the ordinary tab color, and so does the tab you are currently on — it keeps the usual highlight the active tab always has, since you are already looking at it.
+The tab bar does the same one level up: a **background** orchestration tab's label takes the color of its most urgent pane — Error (red), then Needs Input (magenta), then Working (green), then Thinking (blue) — so you can see which open orchestration needs you without switching to it. A tab whose roles are all idle keeps the ordinary tab color, and the tab you are on keeps the usual active-tab highlight.
 
-In the default `Stacked` pane layout, only the focused role's pane is drawn — switching roles swaps which pane is visible, but every other role's agent keeps running underneath, and the sidebar is what tells you it's still busy or idle. Toggle to `Tiled` (`Ctrl+t`) to see every role's pane at once.
+In the default `Stacked` layout only the focused role's pane is shown; the other agents keep running, and the sidebar shows what they are doing. Press `Ctrl+t` for `Tiled` to see every role's pane at once.
 
 ### Zooming the focused pane
 
-The 34/66 split is right while you are supervising — the sidebar is how you see which of seven agents is working. It is wrong once you have stopped supervising and started working *in* one agent: reading a long diff, following a plan, going back and forth with the orchestrator on a laptop screen. Press `Ctrl+Z` in command mode and the focused agent's pane takes the whole frame; press it again and the previous view returns exactly as it was. See [`Ctrl+Z` zooms the focused agent pane](keyboard-shortcuts.md#ctrlz-zooms-the-focused-agent-pane) for what it hides, what it keeps, and how it behaves on other tabs.
+When you want to work *in* one agent rather than watch the team — reading a long diff, or going back and forth with the orchestrator on a laptop screen — press `Ctrl+Z` in command mode and the focused pane takes the whole frame. Press it again to get the previous view back exactly as it was. See [`Ctrl+Z` zooms the focused agent pane](keyboard-shortcuts.md#ctrlz-zooms-the-focused-agent-pane) for what it hides, what it keeps, and how it behaves on other tabs.
 
-**Every agent keeps running while you are zoomed.** Zoom changes what is drawn and nothing else: no pane is stopped, delegation still routes, work-done and status hooks still arrive, and an idle worker is still detected. The `[Z]` marker on the border is there precisely because the failure mode is human — concluding your other agents have disappeared, or watching one agent while another sits blocked behind the hidden sidebar. Zoomed, you are genuinely less informed about everyone else; that is the trade the feature exists to let you make deliberately, which is why it is a working posture rather than a supervising one.
+**Every agent keeps running while you are zoomed** — tasks, reports, statuses and [idle-worker reports](idle-workers-and-notifications.md) all carry on. What you lose is the sidebar, so while the border shows `[Z]` you will not see a worker that is waiting for you. Zoom in to work; zoom out to supervise.
 
 ### Typing into a worker is locked by default (experimental)
 
 > **Experimental — this section describes a surface that is off unless you turn it on.** Set `experimental = true` under a `[features]` table in your `.dot-agent-deck.toml`, or launch with `DOT_AGENT_DECK_EXPERIMENTAL=1`. With the flag off — the default — typing into a worker pane works exactly as it always has and the deck never moves focus on its own.
 
-You talk to the orchestrator; the orchestrator talks to the workers. With the flag on, an orchestration tab makes that the default rather than a convention you have to remember: keystrokes aimed at a worker role are dropped instead of delivered until you deliberately unlock with `Ctrl+d`, `Ctrl+e`. See [`Ctrl+E` locks command entry to the orchestrator pane](keyboard-shortcuts.md#ctrle-locks-command-entry-to-the-orchestrator-pane) for the chord, its scope, and the exemption for a worker that is waiting on you.
+You talk to the orchestrator; the orchestrator talks to the workers. With the flag on, keystrokes aimed at a worker pane are dropped until you unlock with `Ctrl+d`, `Ctrl+e`. See [`Ctrl+E` locks command entry to the orchestrator pane](keyboard-shortcuts.md#ctrle-locks-command-entry-to-the-orchestrator-pane) for the keys, where the lock applies, and why a worker that is waiting on you stays typeable.
 
-The reason is that an orchestration has a single orchestrator. Type into a worker and you become a second, uncoordinated actor inside it: you change state the orchestrator believes it owns, and there is no path for it to learn that you did. What you usually get is not an obviously broken deck but a quietly diverged one — commonly the orchestrator and a worker contradicting each other into a deadlock. And most of the time it is not even deliberate: you open a worker pane to see how it is doing, get distracted, and type your next instruction into the pane that happens to be in front of you rather than the one you meant.
+This protects you from the easy mistake of typing your next instruction into the worker pane you happened to be looking at. The orchestrator never learns about an instruction you give a worker directly, and the two can end up working against each other.
 
-**Nothing is read-only, and nothing is taken away.** When you do want to reach into a worker — a provider hiccup parked an agent, a weaker model never called `work-done`, an agent is waiting somewhere you did not expect — it costs one deliberate `Ctrl+d`, `Ctrl+e`. That pause is the whole feature: it converts a reflex into a decision, which is why the default has to be locked for it to mean anything.
+**Nothing is read-only.** When you do need to reach into a worker — an agent stuck after a provider hiccup, a model that never sent `work-done`, a prompt you did not expect — press `Ctrl+d`, `Ctrl+e` and type.
 
 #### Focus follows the lock
 
@@ -154,23 +152,31 @@ While the deck is **unlocked**, no automatic focus move happens at all. Focus st
 
 ## How delegation works
 
-The orchestrator delegates a task to one or more workers. The deck delivers the task to each worker's pane automatically, including the worker's [`prompt_template`](#configuration-reference) as standing context. Each worker works independently, then signals completion. The deck notifies the orchestrator, which reads the summary and decides what to do next.
+The orchestrator delegates a task to one or more workers. Each worker receives the task in its pane, together with its role's [`prompt_template`](#configuration-reference), works on it, and reports back with `work-done`. The orchestrator reads the report and decides what to do next.
 
 ![Coder pane active and working after receiving a delegation from the orchestrator](./img/orchestration-coder.png)
 
-A worker that never signals completion would otherwise stall the pipeline silently, since the orchestrator is parked waiting for it and gets no turn in which to notice. The daemon covers that case on a timeout, and reports sooner a worker whose own hook says it has stopped to wait for input (for Claude Code, a permission prompt), so the orchestrator can act on it instead of waiting out the timeout — see [Idle Workers & Notifications](idle-workers-and-notifications.md), which also shows how to turn the moments a run stops and waits for you into messages that reach you away from the terminal.
+If a worker gets stuck — it never reports back, or it sits at a permission prompt — the deck tells the orchestrator so it can act. See [Idle Workers & Notifications](idle-workers-and-notifications.md), which also shows how to have those moments sent to your phone.
+
+### A deck prompt waits while you have an unsent draft
+
+The deck sends messages into panes for you — a delegated task, a worker's report, a scheduled prompt, the reports in [Idle Workers & Notifications](idle-workers-and-notifications.md). If you have typed something into that pane — in the TUI or in the desktop app's terminal — and not sent it yet, the deck's message **waits** instead of being sent together with your text. Press **Enter** to send what you typed, or **Ctrl+U** or **Ctrl+C** to clear it, and the waiting message follows on its own. Other panes, and the rest of the orchestration, keep running meanwhile.
+
+The wait lasts at most **60 seconds**, so a stray keystroke cannot stall an unattended run. After that the message is sent anyway — possibly together with your text — and the pane's status shows **Error** (**FAILED** in the desktop app). To change the limit, set `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS` (milliseconds) on the command that starts the deck, or `0` to switch the wait off. A daemon that is already running keeps its old value until you restart it.
+
+Only text you typed **through the deck**, in either client, makes a message wait. Text the agent puts in its own input box — a prompt recalled from history, an autocompletion — does not, and messages the deck or the desktop app send at your request, such as a new orchestration's first prompt, never wait.
 
 ### One task per worker at a time
 
-A worker that has been delegated a task owes a `work-done` for it, and until that arrives the deck refuses to hand the same worker another task. `dot-agent-deck delegate` then exits non-zero with `this delegate was NOT sent`, naming the worker, how many delegations it still owes, and how long ago the oldest was issued. When a delegate names several `--to` roles, the free ones still get the task: the command prints a warning naming the refused ones and exits 0, so re-send to just those roles rather than repeating the whole delegate, which would hand the free roles the task twice.
+A worker that has been given a task stays busy with it until it sends `work-done`, and until then the deck will not give it another one. `dot-agent-deck delegate` then exits non-zero with `this delegate was NOT sent`, naming the worker, how many tasks it still owes, and how long ago the oldest was sent. When a delegate names several `--to` roles, the free ones still get the task: the command prints a warning naming the busy ones and exits 0 — re-send to just those roles, since repeating the whole delegate would give the free roles the task twice.
 
-The refusal depends on what the deck has delegated, not on the worker's status card, which the agent reports about itself and which can be wrong for hours — an agent whose API quota has run out can go on showing `Working`. It also does not depend on whether the worker's agent is still alive: a worker whose agent exited without reporting still owes its task, and a plain delegate to it is refused like any other until you run `dot-agent-deck pane restart <role>`, which the orchestrator already knows to do for a crashed worker. If the orchestrator itself has been restarted since it delegated, the new orchestrator is not refused over work it never delegated: the task is sent, and the command reports the earlier delegation it superseded.
+What counts is whether the worker has reported back, not what its status says: its card in the TUI can show `Working` or idle, and its row in the desktop app **RUNNING** or **WAITING**, while the worker still owes a `work-done`. A worker whose agent exited without reporting is still busy too; `dot-agent-deck pane restart <role>` frees it. If the orchestrator's own agent has been replaced since it delegated, the new orchestrator is not blocked by the old one's tasks — the delegate is sent, and the command says which earlier task it superseded.
 
 When the earlier task is not coming back, there are three ways out:
 
-- **`dot-agent-deck delegate --supersede …`** dispatches anyway, and the command says it superseded. It does not cancel the earlier task: on a `clear = false` worker the new task is typed into the same live session, and if the earlier task's `work-done` does arrive it is credited like any other. On a `clear = true` worker the delegation replaces the agent, so what the replaced agent owed is dropped.
-- **`dot-agent-deck pane restart <role>`** replaces the worker's agent and drops what it owed, since the replacement never saw that task; the [idle-worker and went-quiet reports](idle-workers-and-notifications.md) for that task are cancelled with it. A delegate that was already on its way to the pane when the restart ran is kept, because it is delivered to the replacement.
-- **Waiting it out.** The deck stops counting a delegation seven days after it was issued, whether or not anything answered it. Seven days is deliberately long: forgetting a delegation whose worker is still busy would mislabel that worker's genuine completion as [unsolicited](#orchestrator-is-told-a-completion-was-unsolicited).
+- **`dot-agent-deck delegate --supersede …`** sends the task anyway, and the command says it superseded. The earlier task is not cancelled: on a `clear = false` worker the new task goes into the same session, and a late `work-done` for the earlier task still counts. On a `clear = true` worker the new task restarts the agent, so the earlier task is dropped.
+- **`dot-agent-deck pane restart <role>`** replaces the worker's agent and drops the task it owed, along with that task's [idle-worker and went-quiet reports](idle-workers-and-notifications.md). A task that was still being handed to the worker when you restarted it is kept and goes to the replacement.
+- **Waiting it out.** Seven days after a task was sent, the deck stops counting it, whether or not the worker answered.
 
 ### What `clear` does to delivery
 
@@ -178,32 +184,19 @@ When the earlier task is not coming back, there are three ways out:
 
 With `clear = false` the agent is left running. The task is typed straight into the session that is already sitting there, so delivery is immediate and the worker keeps everything it learned from previous delegations.
 
-With `clear = true` — the default — every delegation is a cold start. The deck stops the worker's agent, launches the role's `command` again in the same pane, and delivers the task to the replacement. The role card stays where it is and keeps its name; the process underneath is new and the previous conversation is gone. That is the point: workers get a clean context per task instead of accumulating one long, drifting session.
+With `clear = true` — the default — every task starts fresh. The deck stops the worker's agent, starts the role's `command` again in the same pane, and hands the task to the new agent. The role's card in the TUI, or its row in the desktop app, stays where it is with the same name, but the previous conversation is gone, so each task gets a clean context instead of one long, drifting session.
 
-There does not have to be a worker there to begin with. If the role's pane is empty — you closed it, or its agent died — the delegation creates a fresh one from the role's `command` instead of failing, so a role stays reachable for as long as the orchestration is running. If the replacement cannot be started, or dies before it takes the task, the deck tells your orchestrator rather than dropping the task silently; see [A delegated worker never came up](#a-delegated-worker-never-came-up).
+The role's pane does not even have to exist. If you closed it, or its agent died, the next task starts a fresh worker from the role's `command`, so a role stays reachable for as long as the orchestration runs. If the new worker cannot be started, or dies before it takes the task, the orchestrator is told in its pane; see [A delegated worker never came up](#a-delegated-worker-never-came-up).
 
-The cost of that restart is timing. A freshly launched agent says its session has started well **before** its input box is ready, so a task typed in at that instant can land in a pane that is not listening yet. You then see either the task text sitting unsubmitted in the worker's input box until someone presses Enter, or nothing at all — a worker that looks healthy and idle while the orchestrator waits for a `work-done` that will never come.
+A freshly started agent needs a moment before it accepts input, so a `clear = true` task arrives after a short wait: about one to eight seconds for a plain `claude`, `codex`, `opencode` or `pi` command, depending on the agent. For a role launched through a wrapper such as `devbox run …`, declare the [`agent`](#declaring-the-agent-behind-a-launcher-command), or a Codex, Pi or OpenCode worker waits up to 30 seconds on every task.
 
-The deck therefore holds a `clear = true` task for a short **readiness buffer** once the replacement has started. The only effect you should notice is that a `clear = true` delegation takes about a second longer to appear in the worker's pane than a `clear = false` one. How long the deck holds a task depends on what it can tell about the worker:
-
-| what the deck can tell about the worker | how long it holds the task |
-|---|---|
-| it announced that its session is up | 1 second |
-| the deck watched it take over its terminal | 5 seconds |
-| it announces nothing before its first task | 8 seconds |
-| the deck cannot tell which agent it is, and it announced nothing | the 30-second wait, then 1 second |
-
-Which row a worker falls into depends on how its agent integrates with the deck — and on the deck being able to tell which agent the role runs. For a plain `claude`, `codex`, `opencode` or `pi` command it can. For a role launched through something else, such as `devbox run codex-big`, it cannot unless you [declare the agent](#declaring-the-agent-behind-a-launcher-command), and a Codex, Pi or OpenCode worker then lands in the last row on every delegation.
-
-A fixed delay makes a lost task much less likely, but it cannot *prove* that the replacement is listening. If tasks still go missing on your machine — a heavily loaded host, or an agent that boots more slowly than the buffer allows for — raise the buffer with the `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` environment variable, in milliseconds, on the process that starts the deck:
+If tasks still go missing on your machine — the task text sits unsubmitted in the worker's input box, or the worker looks idle and never starts — raise the wait with the `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` environment variable, in milliseconds, on the process that starts the deck:
 
 ```bash
 DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=2000 dot-agent-deck
 ```
 
-Values above `30000` are capped, and `0` disables the wait entirely. It covers a schedule's first prompt as well as a delegation, and **the value you set replaces every row of the table above** rather than being added to it — so raising it slows every case down equally, and setting it below one of the longer waits shortens that case to your value. If your machine needs more than a second, please report it: that is the evidence needed to tune the defaults.
-
-`clear = false` also avoids the problem, because the agent is already running and listening — but it changes what the worker remembers, so choose `clear` for the context behaviour you want rather than to work around delivery.
+The value replaces the deck's own wait for every agent rather than adding to it, and also applies to a schedule's first prompt. Values above `30000` are capped. If your machine needs more than a second, please [open an issue](https://github.com/vfarcic/dot-agent-deck/issues) — it helps tune the default.
 
 ### Parallel delegation
 
@@ -213,13 +206,12 @@ The orchestrator can delegate to multiple workers simultaneously — for example
 
 ## Context handoff
 
-Workers cold-start with no memory of prior conversation, no access to other workers' outputs, and no shared scratchpad. Whatever the orchestrator includes in a delegation is the **entire context the worker has** — plus the worker's `prompt_template`. The orchestrator's `prompt_template` is where you tell it how to delegate well: which files to reference, how to summarise prior findings when chaining workers, and what to include when retrying after a failure.
+Workers start with no memory of earlier conversations, no access to other workers' output, and no shared scratchpad. What the orchestrator puts in a task is the **entire context the worker has** — plus the worker's `prompt_template`. Use the orchestrator's `prompt_template` to tell it how to delegate well: which files to reference, how to summarise earlier findings when chaining workers, and what to include when retrying after a failure.
 
-Task text passed inline goes through the orchestrator's own shell before dot-agent-deck ever sees it, so parts of it can be executed or quietly dropped while the delegation still reports success. The generated protocol therefore defaults to handing the task over as a file, which is read off disk verbatim — nothing for you to configure.
+The deck teaches the orchestrator and the workers how to hand tasks and reports over, and they do it by writing files. Two things to check in your role commands:
 
-That default assumes the agent is *authorized* to write a file, which is not the same as having a file-writing tool: a role launched with a restricted tool allowlist — `claude --allowedTools Bash Read`, say — hits an interactive approval prompt instead, and an unattended pane parks there forever. The protocol has a fallback for that case, but it cannot grant itself the tool. That part is yours: if a role is expected to take the primary path, add the file-writing tool to its `command`'s allowlist (e.g. `--allowedTools Bash Read Write`) so it never meets the prompt.
-
-The commands the generated protocol tells an agent to run name the deck by the **absolute path** of the binary that wrote them — `/home/you/.local/bin/dot-agent-deck work-done …` rather than `dot-agent-deck work-done …`. They run later, in the agent's own shell, and a bare name would be looked up in that shell's `PATH`, which need not match the deck's: a login shell that puts `~/bin` first can hand the command to a different `dot-agent-deck`, and the signal is then lost without an error anywhere. One consequence to know about: a permission rule that matches the command's text, such as a Claude Code allow rule written as `Bash(dot-agent-deck work-done:*)`, does not match the path form, so write the rule against the path the protocol shows.
+- **Let every role write files.** A role launched with a restricted tool allowlist — `claude --allowedTools Bash Read`, say — stops at an approval prompt each time it tries, and an unattended pane waits there indefinitely. Add the file-writing tool to its allowlist, e.g. `--allowedTools Bash Read Write`.
+- **Write permission rules against the full path.** The commands the deck gives agents use the full path to the deck binary — `/home/you/.local/bin/dot-agent-deck work-done …`, not `dot-agent-deck work-done …`. A rule matching the command text, such as a Claude Code allow rule `Bash(dot-agent-deck work-done:*)`, does not match that, so write the rule against the path you see in the agent's pane.
 
 ### Use a tracking file
 
@@ -245,7 +237,7 @@ When generating a config, the deck's agent picks from these built-in suggestions
 
 ### Why `release` has `clear = false`
 
-The release flow is stateful: open branch → push → create PR → wait for CI → merge. If the agent is restarted between the PR creation and the CI wait, it loses the PR URL and branch name. `clear = false` lets the release agent carry state across delegations and retries, so it can pick up where it left off after a CI failure.
+A release is a sequence: open a branch, push, create the PR, wait for CI, merge. A release agent restarted between creating the PR and waiting for CI would forget the PR URL and branch name. With `clear = false` it keeps them across tasks, so it can pick up where it left off after a CI failure.
 
 ## Configuration reference
 
@@ -254,7 +246,7 @@ The release flow is stateful: open branch → push → create PR → wait for CI
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `name` | string | no | cwd basename | Display name shown in the tab bar. Defaults to the project directory name when empty. |
-| `default` | bool | no | `false` | Marks this as the orchestration to open when nothing named one — in practice a [schedule](scheduled-tasks.md) rooted here, since the New Agent form and a dispatcher agent both ask. Exactly one orchestration may declare it, and it must have roles; with a single orchestration it does nothing. Without any declaration the first orchestration with roles wins, which is what happened before this key existed. See [Which orchestration a schedule opens](#which-orchestration-a-schedule-opens). |
+| `default` | bool | no | `false` | The orchestration opened when nothing names one — in practice a [schedule](scheduled-tasks.md) in this directory, since the New Agent form and a dispatcher agent ask you. At most one orchestration may set it, and it must have roles; with a single orchestration it does nothing. If none sets it, the first orchestration with roles is used. See [Which orchestration a schedule opens](#which-orchestration-a-schedule-opens). |
 | `extends` | string | no | — | Inherit another orchestration's roles by its `name`, then override them with this block's own `[[orchestrations.roles]]` entries, matched by role name. Written for the case where several orchestrations run the same team on different providers. See [Sharing a workflow with `extends`](#sharing-a-workflow-with-extends). |
 | `roles` | array | yes¹ | — | Role definitions. Must contain at least one role with `start = true`. ¹Optional in a block that `extends` another, which may restate only the roles it changes. |
 
@@ -265,24 +257,21 @@ The release flow is stateful: open branch → push → create PR → wait for CI
 | `name` | string | yes | — | Role identifier. Shown on the role card in the deck so you can tell agents apart at a glance. Also used in `--to` arguments and in task/work-done file names. Must be unique within the orchestration. Must not contain `/`, `\`, or `..`. |
 | `command` | string | yes | — | Shell command that launches the agent for this role. Must result in a `claude`, `opencode`, `pi`, `codex`, or `devin` process (e.g. `claude`, `devbox run agent-big`, `opencode --model gpt-4o`, `pi --provider openrouter`, `codex`, `devin`). Other commands will run but won't get live status tracking on the role card. |
 | `agent` | string | no | — | Which agent `command` actually launches, when the command cannot say so itself — one of `claude`, `opencode`, `pi`, `codex`, `devin`. Set it whenever `command` runs the agent through something else (`devbox run -- codex`, `mise exec -- codex`, `make codex`, `./run-codex.sh`). See [Declaring the agent behind a launcher command](#declaring-the-agent-behind-a-launcher-command). |
-| `start` | bool | no | `false` | `true` marks this role as the orchestrator. Exactly one role per orchestration must have `start = true`, and `dot-agent-deck validate` reports anything else as an error. If a config sets it on no role anyway, the role named `orchestrator` is the orchestrator, else the first role; if it sets it on several, the first of them is. That one answer holds however the orchestration is opened — the New Agent form, a schedule or a dispatch. |
+| `start` | bool | no | `false` | `true` marks this role as the orchestrator. Exactly one role per orchestration must have `start = true`, and `dot-agent-deck validate` reports anything else as an error. If no role sets it, the role named `orchestrator` is the orchestrator, else the first role; if several do, the first of them is. |
 | `description` | string | no | — | Tells the orchestrator when to use this role and what it is for, so it can decide which worker to delegate to in a given situation. Also shown on the role card in the deck. |
-| `prompt_template` | string | no | — | Standing instructions the orchestrator prepends to every task it sends this role. When set, the orchestrator's task text — however it was passed, `--task` or `--task-file` — is appended under a `## Task` heading, so the worker sees both the template and the task together. |
-| `clear` | bool | no | `true` | Restart the agent before each delegation, so every task starts from a clean context. The deck terminates the running agent, launches the role's `command` again in the same pane, waits through a readiness buffer, and only then delivers the task. Set to `false` for roles that need to carry state across delegations (e.g. a `release` role that must remember the PR URL and branch name when retrying after a CI failure). See [What `clear` does to delivery](#what-clear-does-to-delivery). |
+| `prompt_template` | string | no | — | Standing instructions sent with every task this role receives. The worker sees the template first and the orchestrator's task below it, under a `## Task` heading. |
+| `clear` | bool | no | `true` | Restart the agent before each task, so every task starts from a clean context. Set to `false` for roles that need to remember things between tasks (e.g. a `release` role that must remember the PR URL and branch name when retrying after a CI failure). See [What `clear` does to delivery](#what-clear-does-to-delivery). |
 
 ### Declaring the agent behind a launcher command
 
-The deck works out which agent a role runs by looking at the first word of its `command`. `claude --model opus`, `/usr/local/bin/codex`, `env FOO=1 codex` and `sh -c 'codex …'` all resolve fine. What cannot resolve is a command whose first word is a **launcher**: `devbox run -- codex`, `mise exec -- codex`, `nix develop -c codex`, `make codex`, or a project script like `./run-codex.sh`. The deck sees `devbox`, or `make`, or `run-codex.sh` — and there is no way to tell from the outside what any of those will end up starting, so it does not guess.
+The deck recognises the agent when `command` starts it directly: `claude --model opus`, `/usr/local/bin/codex`, `env FOO=1 codex` and `sh -c 'codex …'` all work. It cannot tell what a **launcher** will start — `devbox run -- codex`, `mise exec -- codex`, `nix develop -c codex`, `make codex`, or a project script like `./run-codex.sh`.
 
-Three things follow from that:
+What you see when it cannot tell:
 
-- **The role card reads No agent** and shows no status.
-- **A Codex role stays blank until its first task.** Codex does not identify itself until its first turn begins, so behind a launcher the card shows nothing from launch until you delegate to it. Claude identifies itself as soon as it starts, which is why the same `devbox run` wrapper looks fine for a Claude role and broken for a Codex one.
-- **Every `clear = true` delegation to a Codex, Pi or OpenCode role waits up to 30 seconds before the task is delivered**, because the deck cannot tell when an agent it has not identified is ready. A Claude role behind a launcher still delivers promptly.
+- In the TUI the role card reads **No agent** and shows no status; in the desktop app the row's **CLI** column is blank. A **Codex** role stays blank from launch until you delegate its first task to it, and then quietly starts working; a Claude role behind the same wrapper looks fine, because Claude identifies itself as soon as it starts.
+- A Codex, Pi or OpenCode role with `clear = true` behind a launcher waits up to **30 seconds** for every task. `dot-agent-deck validate` warns about each such role.
 
-`dot-agent-deck validate` warns about each role in this state, and the daemon log records a warning each time a delegation pays that wait.
-
-`agent` is how you answer the question the command cannot:
+Set `agent` to say which agent the launcher starts:
 
 ```toml
 [[orchestrations.roles]]
@@ -293,15 +282,15 @@ agent = "codex"
 
 Notes on how it behaves:
 
-- The value is the agent's command name — `claude`, `opencode`, `pi`, `codex` or `devin` — matched exactly and in lower case. It is the same name `dot-agent-deck wrap --agent <name>` takes, and both resolve it the same way.
-- **An unrecognised name gives you no agent rather than a guess.** `agent = "codx"` does not fall back to reading the command; it means "this pane has no agent", the same as if detection had failed. That is deliberate — silently overruling what you wrote would be worse — but it does mean a typo looks like the problem you were trying to fix. `dot-agent-deck validate` warns about an unknown name and lists the ones it accepts.
-- The declaration **wins over the command**. If you declare `agent = "codex"` on a role whose command runs Claude, you get Codex, so keep the two in step.
-- It is re-read from `.dot-agent-deck.toml` on every delegation, exactly like `command` is. Edit either one and the next `clear = true` delegation picks it up — you do not have to recreate the role's pane.
-- Leaving `agent` out, or leaving it empty, changes nothing: the deck reads the command as it always has. Existing configs need no edit.
+- The value is the agent's command name — `claude`, `opencode`, `pi`, `codex` or `devin` — in lower case, exactly as `dot-agent-deck wrap --agent <name>` takes it.
+- **A misspelled name gives the role no agent at all.** `agent = "codx"` does not fall back to the command, so the card reads **No agent** — the very problem you were fixing. `dot-agent-deck validate` warns about an unknown name and lists the accepted ones.
+- `agent` **wins over the command**. Declare `agent = "codex"` on a role whose command runs Claude and the deck treats it as Codex, so keep the two in step.
+- A change to `agent` or `command` applies to the next `clear = true` task; you do not have to recreate the role's pane.
+- Leaving `agent` out, or empty, changes nothing: the deck reads the command as usual.
 
 ### Minimal example
 
-The deck writes the delegation protocol — how to pass a task safely — into the orchestrator's context automatically at launch, so no `prompt_template` below needs to restate it.
+The deck teaches the orchestrator how to delegate and how workers report back, so a `prompt_template` only needs to describe your workflow.
 
 ```toml
 [[orchestrations]]
@@ -475,9 +464,10 @@ If critical context is missing, surface it in your work-done summary.
 
 ## Restarting and spawning worker panes
 
-Two CLI subcommands reach into a **running** orchestration without restarting the whole tab or the deck: `dot-agent-deck pane restart <role>` and `dot-agent-deck pane spawn <role>`. Like [`dot-agent-deck delegate`](#how-delegation-works), both must be run from the orchestration's own orchestrator pane, and both refuse a call from any other pane.
+Two commands change a **running** orchestration without restarting the tab or the deck. Like [`dot-agent-deck delegate`](#how-delegation-works), only the orchestrator can run them, from its own pane; from any other pane they are refused.
 
-`dot-agent-deck pane restart <role>` restarts a worker role's pane within the calling orchestrator's own orchestration — its primary intended use is the orchestrating agent recovering on its own after a worker pane's agent crashes, rather than a human reaching for it from the TUI. `dot-agent-deck pane spawn <role>` spawns a role that is declared in `.dot-agent-deck.toml` but was not yet spawned into the running orchestration — for example, a role you added to the config file after the tab was already open; it is refused if the role is already live in this orchestration instance, or if it is not in the config at all.
+- **`dot-agent-deck pane restart <role>`** restarts a worker in this orchestration. It is meant mainly for the orchestrator to recover by itself when a worker's agent crashes.
+- **`dot-agent-deck pane spawn <role>`** starts a role that is in `.dot-agent-deck.toml` but not yet running in this orchestration — for example, one you added to the file after opening the tab. It is refused if the role is already running here, or is not in the file.
 
 A `prompt_template` line can make the self-healing behavior explicit:
 
@@ -487,9 +477,9 @@ If a delegated worker role stops responding or its pane looks dead, run
 the task it was working on. Only ask the user if the restart itself fails.
 ```
 
-The re-delegation in that snippet is accepted even though the earlier task never reported back: restarting a worker drops the delegation it owed, so the deck does not [refuse it as busy](#one-task-per-worker-at-a-time).
+The re-delegation works even though the earlier task never reported back: restarting a worker drops the task it owed, so the worker is no longer [busy](#one-task-per-worker-at-a-time).
 
-You don't have to add this yourself to get the behavior — the orchestrator's own context teaches it both commands automatically, so a `prompt_template` line like the one above is reinforcement, not the only way the orchestrator learns these commands exist.
+The deck already teaches the orchestrator both commands, so a line like this only reinforces the behavior.
 
 ## Validate your config
 
@@ -504,13 +494,13 @@ It reports errors (which stop an orchestration opening) and warnings (which do n
 
 ## More than one orchestration
 
-A project can define more than one `[[orchestrations]]` block, and the usual reason is that different kinds of work want different workflows — a feature that needs a test-plan gate and a release step is not the same pipeline as a one-line bug fix. A second reason is the same team wired to a different set of agent CLIs, so a contributor who has credentials for only one provider can still run it and work survives one provider's credits running out.
+A project can define more than one `[[orchestrations]]` block — usually because different kinds of work want different workflows (a feature with a test plan and a release step is not a one-line bug fix), or to run the same team on a different set of agents, for someone with credentials for only one provider or for when one provider's credits run out.
 
-Two keys make that practical, and the first two sections below cover them. **Defining** several orchestrations is a separate question from **running** several at the same time, which the sections after them are about.
+The first two sections below cover the two keys that help with that; the rest are about **running** several orchestrations at the same time.
 
 ### Sharing a workflow with `extends`
 
-Two orchestrations that share a workflow — the same roles, the same prompts, the same order — should not be two copies of it. `extends` lets one inherit another's roles, so the second is only what actually differs. The clearest case is a set of provider variants, where that is just each role's `command`:
+`extends` lets one orchestration inherit another's roles, so you write only what differs instead of copying the whole block. The clearest case is a set of provider variants, where only each role's `command` changes:
 
 ```toml
 [[orchestrations]]
@@ -543,24 +533,24 @@ name = "coder"
 command = "devbox run agent-coder-oc"
 ```
 
-`GPT` gets both roles with `mixed`'s `start`, `description` and `prompt_template` intact; only the two commands differ. Editing the orchestrator's `prompt_template` in `mixed` changes it for every variant — which is the point, and the reason to prefer this over copying the block.
+`GPT` gets both roles with `mixed`'s `start`, `description` and `prompt_template`; only the two commands differ. Edit the orchestrator's `prompt_template` in `mixed` and every variant gets the change.
 
 The rules:
 
 - **`extends` names the parent's literal `name`.** The parent may appear anywhere in the file, above or below. A block with no `name` cannot be a parent.
-- **Roles are matched by name and the parent's ORDER is kept**, so a variant always opens with the same pane layout as its parent, whatever order you write the overrides in.
+- **Roles are matched by name and keep the parent's order**, so a variant opens with the same roles, in the same order, as its parent, whatever order you write the overrides in.
 - **An omitted field keeps the parent's value.** Restate only what differs. To turn off an inherited `clear = true`, write `clear = false` explicitly — an omitted boolean means "inherit", not "false".
 - **A role name the parent does not have is added** as a new role, and must carry its own `command` since there is nothing to inherit one from.
 - **Chains work** (`a` extends `b` extends `c`); a cycle is rejected when the file is read.
-- **`default` and `name` are never inherited** — they identify the block, not its workflow.
+- **`default` and `name` are never inherited.**
 
-An `extends` naming an orchestration that does not exist, or forming a cycle, stops the whole config from loading, with a message naming both sides.
+An `extends` that names an orchestration that does not exist, or forms a cycle, stops the whole file from loading, with a message naming both orchestrations.
 
 ### Which orchestration a schedule opens
 
-**Most of the time nothing needs a default.** Both ways of starting an orchestration by hand ask you which one: the New Agent form (`Ctrl+n`) lists every orchestration as a Mode chip to cycle through, and a [dispatcher pane](dispatcher-mode.md) lists them and asks before it starts anything.
+**Most of the time you do not need a default.** When you start an orchestration yourself you choose it: the TUI's New Agent form (`Ctrl+n`) lists every orchestration in its Mode field, the desktop app's **New agent** offers each one as a **Mode** chip, and a [dispatcher pane](dispatcher-mode.md) asks before it starts anything.
 
-`default = true` is for the case where **there is nobody to ask** — a [schedule](scheduled-tasks.md) whose working directory defines orchestrations. It fires on a cron tick, and something has to decide which team it opens:
+`default = true` is for when **there is nobody to ask** — a [schedule](scheduled-tasks.md) whose working directory defines several orchestrations:
 
 ```toml
 [[orchestrations]]
@@ -573,18 +563,18 @@ name = "issue"
 # roles …
 ```
 
-`default` sits on the block, so it moves with the block. Exactly one orchestration may declare it, and that orchestration must define roles — `dot-agent-deck validate` rejects both mistakes. **With a single orchestration the key does nothing; omit it.**
+Only one orchestration may set it, and that orchestration must define roles — `dot-agent-deck validate` rejects both mistakes. **With a single orchestration the key does nothing; leave it out.**
 
-**If nothing declares it, the first orchestration with roles wins.** With several orchestrations it is worth declaring anyway, because reordering the file then changes which team every scheduled run opens, and nothing in that diff says so.
+**If nothing sets it, the first orchestration with roles is used.** With several orchestrations, set it anyway: otherwise reordering the blocks in the file quietly changes which team every scheduled run opens.
 
-When the choice is left implicit, the deck says so rather than quietly picking. `dot-agent-deck validate` is where **you** see it:
+`dot-agent-deck validate` warns you when the choice is left to the order of the file:
 
 ```
 $ dot-agent-deck validate
 [warning] 'prd': 2 orchestrations are defined and none declares `default = true`, so a dispatch or schedule that names none opens this one purely because it comes first in the file — reordering the file would silently change that. Add `default = true` to the one you want.
 ```
 
-A **dispatcher agent** is told the same thing in its own words, and its listing marks the default so it can act on *"just use the usual one"* rather than asking twice:
+A **dispatcher agent** sees the default marked in its list, so you can tell it *"just use the usual one"*:
 
 ```
 Available dispatch targets:
@@ -595,13 +585,13 @@ Available dispatch targets:
 Ask the user which they want before dispatching, then pass the matching flag.
 ```
 
-A **schedule** has nobody to tell, so its copy goes only to the daemon log. That is the whole reason to declare the default: it is the one path where the deck cannot ask you and cannot show you that it did not.
+A **schedule** cannot ask or show you anything, so for a schedule this warning only reaches the [daemon log](troubleshooting.md#enabling-debug-logs) — which is why setting `default` matters most there.
 
 ### Running several at the same time
 
-Concurrent orchestrations are safe **across directories**. Each orchestration tab is kept separate, so a delegate never reaches another orchestration's worker and a work-done never reaches another orchestration's orchestrator — even when two orchestrations share the same `name`. Distinct directories also mean distinct `.dot-agent-deck/` coordination files and distinct working trees, so the two pipelines never contend for the same state on disk either.
+Orchestrations in **different directories** run side by side safely. Tasks and reports never cross from one orchestration tab to another, even when two orchestrations have the same `name`, and each directory has its own `.dot-agent-deck/` files and its own working tree.
 
-For parallel lines of work on the *same project*, give each orchestration its own **git worktree**. A worktree is a second checkout of the same repository at a different path, so each orchestration gets its own directory — its own coordination files and its own source tree — while sharing one git history and one set of branches. This is the model the deck's own [scheduled issue dispatch](scheduled-tasks.md) already uses: one worktree per dispatched issue.
+For parallel work on the *same project*, give each orchestration its own **git worktree** — a second checkout of the same repository at a different path, sharing one git history and one set of branches. [Scheduled issue dispatch](scheduled-tasks.md) works the same way: one worktree per issue.
 
 Create one however you prefer. By hand it is a single command:
 
@@ -613,12 +603,12 @@ If your project vendors the `/worktree-prd` skill (from [dot-ai](https://github.
 
 ### Same-directory orchestrations are discouraged
 
-Opening a second orchestration in a directory that already runs one is allowed, and delegations and `work-done` still reach the right tab — but two things are shared, no matter what the deck does:
+You can open a second orchestration in a directory that already runs one, and tasks still reach the right workers — but the two share two things:
 
-- **The coordination files.** `.dot-agent-deck/worker-task-<role>.md` and `.dot-agent-deck/work-done-<role>.md` are keyed by role name within the directory. Two orchestrations that both have a `coder` role write the same two files, so the second brief overwrites the first before the first worker has necessarily read it.
-- **The working tree.** Both sets of workers edit the same files, stage into the same git index, and build into the same target directory. This is the same hazard as two people working in one checkout, and no amount of file namespacing fixes it.
+- **The task and report files.** `.dot-agent-deck/worker-task-<role>.md` and `.dot-agent-deck/work-done-<role>.md` are named by role. Two orchestrations that both have a `coder` role use the same two files, so one's task can overwrite the other's before its worker has read it.
+- **The working tree.** Both sets of workers edit the same files, stage into the same git index and build into the same target directory — like two people working in one checkout.
 
-So when you select an orchestration whose directory already hosts a live one, the New Agent form shows a warning:
+So when you pick an orchestration whose directory already runs one, the New Agent form warns you:
 
 ```
   ! This directory already runs an orchestration.
@@ -626,39 +616,37 @@ So when you select an orchestration whose directory already hosts a live one, th
     and one working tree; /worktree-prd isolates.
 ```
 
-The warning is non-blocking: press `Enter` and the tab opens as usual. It exists to make the shared files and the shared tree explicit at the moment they start to matter, so proceeding is a deliberate choice rather than a surprise. If the two orchestrations genuinely need to run at once, a worktree per orchestration is the isolated alternative.
+Press `Enter` and the tab opens anyway. The desktop app's **New agent** shows the same warning, and **Activate orchestration** still starts the run. If the two really need to run at once, give each its own worktree instead.
 
 ## Troubleshooting
 
 ### Worker says `DOT_AGENT_DECK_PANE_ID is not set`
 
-The `dot-agent-deck delegate` and `work-done` commands read `DOT_AGENT_DECK_PANE_ID` to identify the calling pane. This variable is set automatically in every role pane when the orchestration tab opens. If it is missing, the command was run outside an orchestration pane (e.g. from your own terminal, not from inside an agent's pane).
+`dot-agent-deck delegate` and `work-done` only work from inside a role pane of an orchestration tab, where the deck sets this variable for you. You see this error when one of them is run somewhere else — from your own terminal, for example.
 
 ### "delegate from non-orchestrator pane"
 
-Only the orchestrator — the role with `start = true` — can call `dot-agent-deck delegate`. If a worker tries to delegate, the daemon rejects it and logs this message. Check that your config has exactly one role with `start = true`: without one, the orchestrator is the role named `orchestrator`, or else the first role, which may not be the one you meant.
+Only the orchestrator — the role with `start = true` — can run `dot-agent-deck delegate`; a worker that tries is refused with this message. Check that your config has exactly one role with `start = true`: without one, the orchestrator is the role named `orchestrator`, or else the first role, which may not be the one you meant.
 
 ### `pane restart` says "has not crashed; pass --force to restart a healthy pane"
 
-Without `--force`, `dot-agent-deck pane restart <role>` only restarts a pane whose agent has exited — whether it crashed or its command simply finished. It refuses a pane whose agent is still running, so that a worker is not killed mid-task by accident. Pass `--force` when you do mean to restart a running agent.
-
-The orchestrator is not taught `--force` up front, but it sees this message if its own restart is refused, so it can still reach for the flag. If you want forcing a restart to stay your decision, say so in the orchestrator's `prompt_template`; the deck does not enforce it.
+Without `--force`, `dot-agent-deck pane restart <role>` only restarts a worker whose agent has exited — crashed, or simply finished — so it cannot kill a worker mid-task by accident. The orchestrator is not taught `--force`, but it sees this message and can use the flag. If you want force-restarts to stay your decision, say so in the orchestrator's `prompt_template`.
 
 ### `pane restart` never detects a wedged-but-alive agent
 
-An agent that is still running but hung — stuck in a loop, or waiting on something that never comes — has not exited, so `pane restart` refuses it with "has not crashed", exactly as it refuses a healthy one. If you suspect a worker is wedged rather than merely slow, check what its pane is showing before reaching for `--force`.
+An agent that is still running but hung — stuck in a loop, or waiting on something that never comes — has not crashed, so `pane restart` refuses it with "has not crashed", exactly as it refuses a healthy one. If you think a worker is hung rather than slow, look at its pane, then use `--force` if it really is stuck.
 
 ### `pane spawn` refuses to create a second pane under an already-running role name
 
-`dot-agent-deck pane spawn <role>` is refused if the role is already live — it starts a NEW pane for a role that has none, not a second instance of one that already has one. To run two instances of the same kind of worker at once, give the second one its own role name in `.dot-agent-deck.toml` (e.g. `reviewer2`) rather than spawning the same name twice.
+`dot-agent-deck pane spawn <role>` starts a pane for a role that has none; it does not start a second copy of a running role. To run two of the same kind of worker at once, give the second its own role name in `.dot-agent-deck.toml` (e.g. `reviewer2`).
 
 ### `delegate` says "this delegate was NOT sent: every worker it reached still owes a work-done"
 
-The worker has not reported `work-done` for an earlier delegation, so the deck refused to hand it another task — see [One task per worker at a time](#one-task-per-worker-at-a-time) for why and for the three ways out. If you believe the worker did report, look for that `work-done` in its pane: a `work-done` the daemon refused (for example over a [capability token](troubleshooting.md#work-done-dispatch-or-delegate-fails-with-refused--hook-capability-token)) never reached the deck.
+The worker has not sent `work-done` for an earlier task, so it is still busy — see [One task per worker at a time](#one-task-per-worker-at-a-time) for the three ways out. If you believe the worker did report, look for its `work-done` in its pane: one that was refused (for example over a [capability token](troubleshooting.md#work-done-dispatch-or-delegate-fails-with-refused--hook-capability-token)) never reached the deck.
 
 ### Worker receives no task
 
-The role name in `--to` must match the `name` field in the config exactly (case-sensitive). Check for typos. Also verify the worker's pane is part of the same orchestration tab — you cannot delegate across tabs.
+The role name in `--to` must match the `name` field in the config exactly (case-sensitive). Also check that the worker is in the same orchestration tab — you cannot delegate across tabs.
 
 ### A role card reads "No agent", or a Codex role stays blank until the first task
 
@@ -666,48 +654,53 @@ The role's `command` launches the agent through something the deck cannot see pa
 
 ### A delegated worker never came up
 
-A `clear = true` delegation stops the worker before its replacement exists, so if the replacement does not come up, the pane is left with no agent and the task has nowhere to go. The deck then tells your orchestrator, in a report submitted as a turn of its own, and delivers nothing — so no `work-done` can arrive for that delegation. Which report you see depends on how far the replacement got:
+When a `clear = true` worker is restarted for a new task and the new agent does not come up, the task was not delivered, and no `work-done` will come for it. Your orchestrator's pane gets one of two reports, depending on how far the new agent got:
 
-- `⚠ delegated worker respawn failed (dot-agent-deck daemon report)` — the replacement could not be started at all.
-- `⚠ delegated worker never came up (dot-agent-deck daemon report)` — the replacement started, then died before it could take the task.
+- `⚠ delegated worker respawn failed (dot-agent-deck daemon report)` — the new agent could not be started at all.
+- `⚠ delegated worker never came up (dot-agent-deck daemon report)` — the new agent started, then died before it could take the task.
 
-An orchestrator running unattended receives either one and can act on it: the report asks it to re-delegate, reassign the task, or notify you. It names the worker's pane; the daemon log names the role and, for a respawn that failed, the underlying error.
+An unattended orchestrator can then re-delegate, reassign the task, or notify you. The report names the worker's pane; the [daemon log](troubleshooting.md#enabling-debug-logs) names the role and, for a respawn that failed, the error.
 
-The usual cause is the role's `command` — a launcher that fails in that directory, a binary that is not on the daemon's `PATH`, or an agent that exits immediately on start. Re-delegating to the same role runs that same command again, so it fails the same way until the command is fixed. Jump into the worker's pane and look at its scrollback: whatever the replacement printed before it died is still there. Running the role's `command` by hand in the worker's directory reproduces most of these in one step.
+The usual cause is the role's `command` — a launcher that fails in that directory, a binary that is not on the `PATH` the deck was started with, or an agent that exits as soon as it starts. Re-delegating to the same role runs that same command again, so it fails the same way until the command is fixed. Look at the worker's pane: whatever the agent printed before it died is still there. Running the role's `command` by hand in the worker's directory reproduces most of these.
 
 ### Closing a worker's pane and then delegating to it
 
-The role comes back. Closing a pane takes a few seconds to finish, and a `clear = true` delegation that arrives during it waits for the close to complete and then creates a fresh worker for the role — which is what `clear = true` means in the first place. The same recovery applies to a worker whose agent simply died: the next delegation to that role starts a new one rather than failing.
+The role comes back: the next `clear = true` task for it starts a fresh worker, even if it arrives while the pane is still closing. The same happens for a worker whose agent died.
 
 If you want a role to stay gone, remove it from `.dot-agent-deck.toml` (or close the whole orchestration tab); closing one worker's pane is not a way to take a role out of an orchestration that is still running.
 
 ### Orchestrator receives no work-done feedback
 
-Feedback is written into the orchestrator's pane. If that pane is closed, there is nowhere to write it and the message is lost silently. The `.dot-agent-deck/work-done-<role>.md` file is written first, so for a delegated task it can still be read manually — unless the daemon could not write it, in which case the daemon log carries a `failed to write work-done summary` warning and any file at that path belongs to an **earlier** delegation (or is a partial write).
+Reports are sent into the orchestrator's pane; if that pane is closed, they are lost. For a delegated task the report is also saved to `.dot-agent-deck/work-done-<role>.md`, which you can read yourself — unless the [daemon log](troubleshooting.md#enabling-debug-logs) shows a `failed to write work-done summary` warning, in which case that file is from an **earlier** task (or incomplete).
 
 ### Orchestrator is told a completion was "unsolicited"
 
-A `work-done` that answers no outstanding delegation is reported to the orchestrator with an explicit label saying so, followed by the worker's report inline. The commonest cause is a worker being tasked **directly by a person**: the worker still remembers, from an earlier delegation, that it should signal completion, so it does so for work the orchestrator never asked for. Without the label the orchestrator would read that as a delegated task coming back and re-plan on it.
+A `work-done` that answers no task the orchestrator delegated reaches the orchestrator labelled as unsolicited, with the worker's report included, so the orchestrator does not mistake it for a task coming back. The most common cause is **you giving a worker a task directly**: the worker still has the reporting instructions from an earlier task, so it reports again for work the orchestrator never asked for.
 
-Nothing is dropped — the report still arrives, framed as information rather than as delivered work — and `.dot-agent-deck/work-done-<role>.md` is left untouched, so it cannot overwrite the report from the last task the orchestrator did delegate. If you want a completion to be reported as delegated work, delegate it: task the worker through the orchestrator rather than typing into its pane.
+The report still arrives, but `.dot-agent-deck/work-done-<role>.md` is not updated — it keeps the last report for a task the orchestrator did delegate. To have a result count as delegated work, give the task through the orchestrator instead of typing into the worker's pane.
 
-A completion is also labelled this way when the worker owes nothing for another reason: the delegation never reached it (for example when [a delegated worker never came up](#a-delegated-worker-never-came-up)), it was issued more than seven days ago, or the worker was restarted with `dot-agent-deck pane restart <role>` since.
+A report is also labelled unsolicited, and no file is written, when:
+
+- the **orchestrator** runs `dot-agent-deck work-done` without `--done` — nobody delegates to the orchestrator; use `--done` to close out the orchestration, or delegate the work to a role;
+- its task never reached the worker — for example, the orchestrator's pane showed `⚠ delegated worker respawn failed` or `⚠ delegated worker never came up` (see [A delegated worker never came up](#a-delegated-worker-never-came-up));
+- its task was sent more than seven days ago;
+- `dot-agent-deck pane restart <role>` dropped the task the worker owed.
 
 ### The summary file could not be written
 
-When the daemon cannot write `.dot-agent-deck/work-done-<role>.md` — for example because the `.dot-agent-deck` directory cannot be created or is not writable — it tells the orchestrator the file is unavailable and puts the worker's report in the message itself. That way the orchestrator is not pointed at the file, which would still hold the report from the previous task given to that role. An inlined report loses its Markdown formatting, because the message is collapsed to a single line.
+When `.dot-agent-deck/work-done-<role>.md` cannot be written (for example, the `.dot-agent-deck` directory cannot be created), the orchestrator is told the file is unavailable and gets the worker's report in the message instead, as a single line without its Markdown formatting.
 
 ### Prompt template is not being applied
 
-The daemon re-reads `.dot-agent-deck.toml` on every delegation, so edits take effect immediately without restarting the pane. Verify the role's `name` in the config matches the `--to` argument exactly, and that the config file is at the project root.
+Edits to `.dot-agent-deck.toml` apply to the next task without restarting the pane. Check that the role's `name` matches the `--to` argument exactly, and that the config file is at the project root.
 
 ### Two orchestrations with the same project name conflict
 
-If you run two orchestration tabs from different directories that happen to have the same basename (e.g. `~/a/myproject` and `~/b/myproject`), the deck tells them apart by their full path. Two tabs of the *same* orchestration in the *same* directory are also kept separate, but they still share the coordination files and the working tree, which is why the deck warns about that case. See [Running several at the same time](#running-several-at-the-same-time).
+They do not: two orchestration tabs from directories with the same name (e.g. `~/a/myproject` and `~/b/myproject`) are kept apart, and so are two tabs of the same orchestration in the same directory. The second case still shares task files and the working tree, which is why the deck warns about it. See [Running several at the same time](#running-several-at-the-same-time).
 
 ## See also
 
-- [Idle Workers & Notifications](idle-workers-and-notifications.md) — the timeout that reports a silent worker to the orchestrator, and an example recipe for notifying yourself
+- [Idle Workers & Notifications](idle-workers-and-notifications.md) — the reports the deck sends the orchestrator about stuck workers, and how to get those moments to you
 - [Dispatcher Mode](dispatcher-mode.md) — start a single agent or a whole orchestration in an isolated copy of the repository
 - [Configuration](configuration.md) — global and project-level configuration options
 - [Keyboard Shortcuts](keyboard-shortcuts.md) — all keybindings, including tab navigation

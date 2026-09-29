@@ -1582,6 +1582,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the seed path's own call site (it shares `schedule_unconfirmed_retry` and `delivery_capability` with this one); that the marker reaches the pane from a real wrapper (`codex/trust/005`); the daemon-owned detached path (`scheduler/dispatch/022`); Claude Code's shorter floor, which is unit-tested in `src/prompt_delivery.rs` (`confirmation_latency_floor_takes_the_slowest_reporting_producer`); any real agent's actual confirmation latency — the 8.45 s figure is the downstream measurement #637 quotes, not one taken here.
 - **Platform coverage:** mac+linux+windows.
 
+##### prompt/pane-input/042 — An interactive Claude draft holds a real delegate until Ctrl+U releases it (issue #544).
+- **Layer:** L2, lane 2, PTY-attached (real TUI, real delegate CLI, and interactive Claude Haiku worker).
+- **Agent:** real Claude Code pinned to Haiku with Bash, Read and Write allowed; runtime-skipped when the CLI or credential is unavailable.
+- **Asserts:** a typed draft remains visible and a unique task sentinel remains absent during the wait; Ctrl+U clears the draft, the separately submitted delegate task reaches Claude, and Claude creates the sentinel with expected content.
+- **Does not assert:** exact model prose, timing of a completed work-done report, or behavior on other agents' native input editors.
+- **Platform coverage:** mac+linux.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
@@ -3281,6 +3288,7 @@ without depending on the config struct API.
 - **Layer:** fast synthetic PTY integration (real `handle_delegate` and `handle_work_done`, managed worker and orchestrator PTYs, and production silence-watch accounting; no socket or LLM).
 - **Agent:** none (`cat` worker stand-in plus a raw no-echo orchestrator observer).
 - **Asserts:** delegation A's fixed `worker-task-coder.md` pointer physically reaches the worker, real work-done handling retires A, an unsent user draft then physically reaches the same pane, and delegation B produces another observable copy of the same pointer; independently, a late completion for an older of two live delegations leaves the newer delivery's no-event notice armed.
+- **Draft gate setup:** sets `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS=0` because this older test pins delivery-record retirement, while `scheduler/dispatch/023` pins waiting on that same drafted worker pane.
 - **Does not assert:** the payload guard's records or refusal reason, exact task-file contents, or which safe mechanism admits B; the outcome is solely that B is physically delivered after A completed.
 - **Platform coverage:** mac+linux.
 
@@ -3436,6 +3444,20 @@ without depending on the config struct API.
 - **Does not assert:** that the marker is authentic (it is not; the re-price is gated on the frozen launch record and can only make a write later, both pinned by `hold_readiness_buffer`'s unit tests); a real wrapper producing the two facts in this order across the 30 s window (`orchestration/delegate/026` runs the real wrapper on the pre-release upgrade); the scheduler seam (`scheduler/spawn/010`).
 - **Platform coverage:** mac+linux (unix-only — daemon-owned PTYs and a POSIX shell stand-in).
 
+##### orchestration/delegate/040 — A capped draft wait eventually delivers the real delegate pointer (issue #544).
+- **Layer:** L2, lane 1, PTY-attached (real TUI and delegate CLI).
+- **Agent:** none (`orch-deck` cat roles).
+- **Asserts:** an unsent worker draft delays the pointer, then the configured two-second cap allows delivery without dropping it; after a synthetic agent event gives the worker a renderable session, its card badge is not Error while the pointer is deferred and becomes Error after cap delivery.
+- **Does not assert:** that the draft remains private after cap expiry, native agent behavior, or that the card renders the notice text (a pre-existing gap for every `DeliveryNotice`). The notice detail is asserted at the sink by `scheduler/dispatch/023`.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/041 — An attached worker draft delays a real delegate pointer until Enter (issue #544).
+- **Layer:** L2, lane 1, PTY-attached (real TUI and delegate CLI).
+- **Agent:** none (`orch-deck` cat roles).
+- **Asserts:** the focused worker shows a draft while the pointer remains absent for three seconds; Enter leaves the draft and pointer as separate submitted lines in the worker PTY.
+- **Does not assert:** native agent editor behavior, retry policy, or any real-agent action on the task file.
+- **Platform coverage:** mac+linux.
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
@@ -3505,6 +3527,13 @@ without depending on the config struct API.
 - **Why it exists:** the fast-tier `orchestration/work-done/007` drives the handler in-process; this covers the CLI → hook socket → daemon → file → screen path end to end (PR #1341 review). Confirmed red with the `save_full_report` call disabled.
 - **Does not assert:** the file-framing edge cases (unit-tested); the Filed path's framing through the real binary (the lane-2 `delegate_work_done_chain_claude` drives that write with a real agent); an orchestrator reading the file.
 - **Platform coverage:** mac+linux (unix-only PTY/UDS).
+
+##### orchestration/work-done/010 — A deferred completion leaves the daemon responsive and releases after Ctrl+U (issue #544).
+- **Layer:** L2, lane 1, PTY-attached (real TUI, work-done CLI, agent-event CLI, and daemon status CLI).
+- **Agent:** none (`orch-deck` cat roles).
+- **Asserts:** work-done feedback remains absent while an orchestrator draft is pending; a worker event requiring the daemon's state write lock is broadcast and daemon status completes promptly during the wait; Ctrl+U releases feedback without joining it to the cleared draft. A sibling sends two completions in arrival order during the same draft wait and checks that Ctrl+U releases both as separate, ordered turns.
+- **Does not assert:** the exact feedback prose, real-agent handling, or other hook callers' lock behavior.
+- **Platform coverage:** mac+linux.
 
 #### orchestration/provenance
 
@@ -4981,6 +5010,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** a real agent's hook (`orchestration/delegate/014` covers a real Claude worker through a `clear = true` respawn); the late non-start frame stamped newer, or the incoming generation's older-stamped first frame, which `daemon::hook_ingestion_tests` pins at the ingestion seam and `status/supersede/019` / `/020` at the card layer.
 - **Platform coverage:** mac+linux (the e2e tier is Unix-only).
 
+##### pane/restart/015 — Restart replies promptly while a delegate waits on a worker's unsent draft (PR #1398 finding #12).
+- **Layer:** L1/fast (in-process real delegate and restart handlers against daemon-owned `cat` panes; no socket or LLM).
+- **Agent:** none (`cat` stand-ins make the draft and task pointer visible in PTY snapshots).
+- **Asserts:** an unsent draft keeps the queued delegate pointer out of the old worker pane; `pane restart --force` succeeds within eight seconds, below the CLI's fourteen-second reply budget; the waiting delegate then reaches the replacement as a submitted line or produces an explicit delivery notice, without the old draft reaching the replacement.
+- **Does not assert:** the CLI/socket encoding of the reply, or a real agent's editor behavior.
+- **Platform coverage:** mac+linux (unix-only).
+
 #### pane/spawn
 
 ##### pane/spawn/001 — Spawning a configured-but-unspawned role succeeds and it becomes reachable (issue #868).
@@ -5824,6 +5860,27 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** that a never-confirmed delivery is still retried on this path (the TUI half of that is `prompt/pane-input/041`; the daemon schedule itself is unit-tested beside `unconfirmed_retry_delay`); any real agent's confirmation latency.
 - **Platform coverage:** mac+linux+windows.
 
+##### scheduler/dispatch/023 — An unsent worker draft holds a production delegate pointer until the user submits it (issue #544).
+- **Layer:** fast integration (production `handle_delegate` into a real `cat` PTY).
+- **Agent:** none; `cat` observes the submitted PTY bytes.
+- **Asserts:** a draft typed through the attached writer remains separate from the delegate pointer; the pointer stays absent during a one-second unsent window while additional user keystrokes still reach the PTY promptly, and arrives after Enter as its own submitted line. Sibling controls assert Ctrl+U release, that forwarded terminal reports do not defer, that cap expiry delivers, publishes one `DeliveryNotice`, and clears the bit for a later first write, and that closing the target during the wait sends no pointer bytes.
+- **Does not assert:** an agent's native editor occupancy, a real agent's interpretation of the pointer, or the daemon-to-TUI rendering of the capped-delivery notice.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/024 — A spawn seed waits for a draft already in its target pane (issue #544).
+- **Layer:** L1 (production `run_delivery` and `run_delivery_with_deadline` test seam against a real byte-observation PTY).
+- **Agent:** none (`cat` target).
+- **Asserts:** spawn-seed attempt one leaves the unsent draft alone, then follows a user Enter as a separate submitted line. With a one-second delivery deadline, holding the draft for two seconds still allows the seed to arrive as its own line after Enter.
+- **Does not assert:** the production sixty-second deadline duration, confirmation retry sequence, or card-notice rendering.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/025 — A SessionStart during a deferred spawn-seed wait cannot authorize a duplicate payload (issue #544, PR #1398 review).
+- **Layer:** L1 (production spawn delivery against a real byte-observation PTY, with a synthetic hook event).
+- **Agent:** none (`cat` target stamped with the deck's Claude launch type).
+- **Asserts:** a genuine SessionStart sent after readiness times out but before the draft releases and the seed is written cannot authorize a third seed payload; the draft and seed reach the pane as separate submitted lines. A sibling starts a second hook session while the seed is deferred and checks that releasing the draft does not send the stale seed into that new conversation.
+- **Does not assert:** a real agent's interpretation of the seed or its hook timing.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/pi
 
 ##### scheduler/pi/001 — A SCHEDULED, UNATTENDED real `pi` job (no TUI client attached) boots and its bundled extension reports the Pi pane's status via `agent-event`, re-broadcast on the daemon's event stream (PRD #201 M4.2).
@@ -5854,6 +5911,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Layer:** L2.
 - **Agent:** none (run-now + simulated STREAM_IN keystroke; observes PTY prompt-echo occurrence count over time). Debounce window injected via `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` so the test is fast.
 - **Asserts:** after a simulated keystroke, a reuse fire's prompt is NOT delivered within the debounce window and IS delivered into the same pane once the window elapses; a later fire with no recent input is delivered immediately.
+- **Draft gate setup:** sets `DOT_AGENT_DECK_DRAFT_DEFER_CAP_MS=0` because the simulated keystroke is an unsent draft, which issue #544's gate would otherwise hold the prompt behind; `scheduler/reuse/005` pins that gate.
 - **Does not assert:** the production default debounce duration (the test injects a short one); queue depth beyond the latest prompt.
 - **Platform coverage:** mac+linux.
 
@@ -5865,6 +5923,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Why it exists:** this wait is the race. It runs for at least the debounce (5 s by default) and up to 60 s under continuous typing, and it used to retain nothing but a pane id and finish through the ungated `write_to_pane_and_submit` — so an agent that exited during the window had a scheduled prompt submitted into whoever inherited its pane. `scheduler/reuse/003` covers the debounce's timing on the real binary but cannot see a `GuardedSend`, and it is L2; a security regression guard belongs where CI runs it.
 - **Does not assert:** the reuse DECISION that resolves the identity (`decide_reuse_spawns_fresh_when_the_pane_id_was_inherited_by_another_agent`, a pure unit test beside it, and `scheduler/reuse/001` / `/002` for the tab-count surface); the hard-timeout policy (`decide_delivery_capped` is pure and unit-tested); the issue #424 F1 record lifecycle this delivery now participates in.
 - **Platform coverage:** mac+linux (the `/bin/cat` byte target is POSIX).
+
+##### scheduler/reuse/005 — A reused pane's unsent draft keeps the next scheduled prompt queued beyond the idle debounce (issue #544).
+- **Layer:** L2, lane 1 (real daemon `RunNow` and simulated STREAM_IN into a recorder PTY).
+- **Agent:** none.
+- **Asserts:** after the debounce has elapsed, the prompt remains absent while the user draft is unsent; Enter releases it and the recorder sees the draft and prompt as separate lines.
+- **Does not assert:** native agent editor state, real-agent prompt handling, or the default cap duration.
+- **Platform coverage:** mac+linux.
 
 #### scheduler/manager
 
@@ -6177,6 +6242,34 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** four delegated workers. `redelegated-worker` waits, is reported once, sends `work-done` while still at its prompt and is delegated to again: the orchestrator receives a SECOND notice, after the per-worker spacing (#1365 item 3). `many-times-cleared-worker`'s conversation is cleared twelve times, it waits in the newest session, and a delayed `thinking` and a delayed `session_start` from its FIRST session arrive: its wait is still reported once (#1365 item 4). `subagent-worker`'s wait is a subagent's `permission_request`, and that subagent's `subagent_stop` follows inside the debounce: it is never reported (#1364). `other-subagent-worker` is the control — its waiting subagent keeps waiting while a DIFFERENT subagent stops, and it is reported once. `resumed-worker`'s agent is replaced through the real registry; the successor starts a session of its own, resumes its predecessor's session id, is delegated to and waits, and is reported once — the predecessor's session is not one the successor moved past (Qodo on #1393). Exactly five notices in all.
 - **Verified load-bearing:** red on the pre-fix code, and red again with each of the three changes reverted alone — the delegate-time path no longer reopening a settled episode (one notice for `redelegated-worker`), the superseded-session memory capped at eight again (none for `many-times-cleared-worker`), and the `SubagentStop` arm disabled (one for `subagent-worker`); `resumed-worker` was red (no notice) before the record learned whose sessions it holds.
 - **Does not assert:** the card's status after the subagent ends (`status/subagent/006`); a real agent's subagent; the rendering in an attached TUI.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/026 — Response watches start when a deferred delegate pointer reaches the worker (issue #544, PR #1398 review).
+- **Layer:** fast integration (production delegate handler and response watches with real `cat` PTYs and shortened test clocks).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** after a worker's unsent draft holds its pointer longer than both the idle-worker and no-event windows, neither report reaches the orchestrator; Enter delivers the pointer, and only after the configured windows then elapse do both reports arrive.
+- **Does not assert:** real-agent event handling, rendered card state, or the exact wording of either report.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/027 — A delegate queued behind a parked pointer is not reported idle before its own pointer is written (issue #544, PR #1398 review).
+- **Layer:** fast integration (production delegate handler and response watches with real `cat` PTYs and shortened test clocks).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** a worker's unsent draft parks a first delegate's pointer, and a `--supersede` delegate dispatched meanwhile queues behind it past both response windows; neither the idle-worker nor the no-event report reaches the orchestrator while it is queued. Enter delivers both pointers, and only after the windows then elapse do both reports arrive. Verified red on the pre-fix code, where the queued delegate's idle-worker report fired one second after it was armed.
+- **Does not assert:** a queued dispatch that ends without writing (the queued mark's seq-guarding and dequeue are pinned by the `agent_pty` unit test `delegation_idle_clock_holds_a_queued_pointer_write_until_it_dequeues`), real-agent event handling, rendered card state, or the exact wording of either report.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/028 — An idle-worker report waiting on the orchestrator's draft is dropped when the worker reports work-done meanwhile (issue #544, PR #1398 review finding #18).
+- **Layer:** fast integration (production delegate handler, idle-worker watch and work-done handler with real `cat` PTYs and shortened test clocks).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** with an unsent draft typed into the orchestrator pane, the idle-worker window elapses and its report waits; the worker's `work-done` arrives during that wait; after Enter the orchestrator receives the work-done feedback and never the "has not responded with work-done" report. Verified red on the pre-fix code, where the stale report was delivered right after the draft was submitted.
+- **Does not assert:** the other resolutions the same check refuses on (supersede, release, `pane restart`), which share the one generation bump pinned by the `agent_pty` unit test `delegation_resolution_epoch_moves_on_every_resolution`; real-agent event handling; the exact wording of either message.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/029 — A went-quiet report waiting on the orchestrator's draft is dropped when the worker reports work-done meanwhile (issue #544, PR #1398 review finding #18).
+- **Layer:** fast integration (production delegate handler, silent-worker watch and work-done handler with real `cat` PTYs and shortened test clocks).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** with an unsent draft typed into the orchestrator pane, the no-event window elapses and its report waits; the worker's `work-done` arrives during that wait; after Enter the orchestrator receives the work-done feedback and never the "delegated worker went quiet" report. Verified red on the pre-fix code, where the stale report was delivered right after the draft was submitted.
+- **Does not assert:** the other resolutions the same check refuses on (see `scheduler/idle-worker/028`), real-agent event handling, or the exact wording of either message.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live

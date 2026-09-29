@@ -535,8 +535,10 @@ fn loggable_env_value(raw: &str) -> String {
 /// diagnostic when the derived default was `None`. That contradicts the
 /// documented "values above the cap are capped": an absurd number is a number,
 /// and the honest reading of it is "as long as you are allowed to ask for".
-/// `max` is 30 s for both knobs, so the clamped result always fits in `u64`.
-fn parse_bounded_ms_override(
+/// Every caller passes a compile-time cap of at most 600 s (the readiness
+/// buffer and no-event window at 30 s, the waiting-notice debounce and the
+/// #544 draft-defer cap at 600 s), so the clamped result always fits in `u64`.
+pub(crate) fn parse_bounded_ms_override(
     var: &str,
     raw: &str,
     max: std::time::Duration,
@@ -558,7 +560,9 @@ fn parse_bounded_ms_override(
         );
         return Some(max);
     }
-    // `requested_ms <= max_ms` and `max_ms` is 30_000, so this never saturates.
+    // `requested_ms <= max_ms`, and every caller's `max` is a const of at most
+    // 600 s (600_000 ms), so this never saturates. It could only saturate for a
+    // `max` above `u64::MAX` milliseconds, which no caller passes.
     Some(std::time::Duration::from_millis(
         u64::try_from(requested_ms).unwrap_or(u64::MAX),
     ))
@@ -2538,20 +2542,26 @@ enum WorkDoneReportChannel {
 /// degrades to drop-and-log (PRD #220 decision B): there is deliberately no queue
 /// and no file-backed outbox here, because an outcome with no live recipient is a
 /// deck-wide attention question that belongs with issue #630.
-async fn return_dispatch_completion(signal: &WorkDoneSignal, registry: &AgentPtyRegistry) -> bool {
+///
+/// Issue #544: this half only RESOLVES the return and composes the report; the
+/// write is [`PendingDispatchReturn::deliver`], which the daemon performs after
+/// releasing its `AppState` guard because the write may wait for the caller's
+/// unsent draft. `None` is the old `false` — not a dispatched unit's terminal
+/// completion.
+async fn prepare_dispatch_completion(
+    signal: &WorkDoneSignal,
+    registry: &AgentPtyRegistry,
+) -> Option<PendingDispatchReturn> {
     // Only a TERMINAL completion returns. A dispatched unit reporting progress
     // without `--done` has not finished, and its caller is owed one report, not a
     // running commentary.
     if !signal.done {
-        return false;
+        return None;
     }
-    let Some(crate::dispatch_return::RetainedReturn {
+    let crate::dispatch_return::RetainedReturn {
         unit_agent_id,
         caller,
-    }) = registry.take_dispatch_return(&signal.pane_id)
-    else {
-        return false;
-    };
+    } = registry.take_dispatch_return(&signal.pane_id)?;
     // PRD #220 Phase 2 review (finding A4): the unit name is producer-supplied and
     // rode into this line raw. Escaped and clamped through the module that already
     // owns that treatment — a raw newline in a field value forges a whole log line,
@@ -2595,9 +2605,146 @@ async fn return_dispatch_completion(signal: &WorkDoneSignal, registry: &AgentPty
         &signal.task,
         full_report.as_deref(),
     );
-    crate::daemon::deliver_dispatch_result(registry, &caller.pane_id, &caller.agent_id, &message)
+    Some(PendingDispatchReturn {
+        pane_id: caller.pane_id,
+        agent_id: caller.agent_id,
+        message,
+    })
+}
+
+/// Issue #544: a dispatched unit's completion report, resolved and composed
+/// under the `AppState` guard and written after it — see
+/// [`prepare_dispatch_completion`].
+struct PendingDispatchReturn {
+    pane_id: String,
+    agent_id: String,
+    message: String,
+}
+
+impl PendingDispatchReturn {
+    async fn deliver(self, registry: &AgentPtyRegistry) {
+        crate::daemon::deliver_dispatch_result(
+            registry,
+            &self.pane_id,
+            &self.agent_id,
+            &self.message,
+        )
         .await;
-    true
+    }
+}
+
+/// Issue #544: the one pane write a `work-done` owes, computed by
+/// [`AppState::prepare_work_done`] and performed by [`Self::deliver`].
+///
+/// Two steps because the write is an automatic first write, and a first write
+/// now WAITS while the recipient pane holds the user's unsent draft — up to
+/// [`crate::draft_deferral::DEFAULT_DRAFT_DEFER_CAP`]. The daemon's hook loop
+/// used to await the whole of `handle_work_done` under `state.read()`, and
+/// Tokio's `RwLock` is write-preferring, so one waiting hand-off would have
+/// queued the next `state.write()` behind it and every reader behind that:
+/// hook ingestion for the whole daemon stalled on one person's draft. The
+/// guard is needed only to compute the write, so it is released before the
+/// write begins.
+#[must_use = "a work-done's feedback is only written by `deliver`"]
+pub struct WorkDoneDelivery(WorkDoneWrite);
+
+enum WorkDoneWrite {
+    Nothing,
+    DispatchReturn(PendingDispatchReturn),
+    Feedback {
+        orch_pane_id: String,
+        role_name: String,
+        feedback: String,
+        expected_orchestrator_agent_id: String,
+        expected_orchestration: Option<OrchestrationIdentity>,
+    },
+}
+
+impl WorkDoneDelivery {
+    /// The pane the write goes to, or `None` when there is nothing to write.
+    pub fn target_pane_id(&self) -> Option<&str> {
+        match &self.0 {
+            WorkDoneWrite::Nothing => None,
+            WorkDoneWrite::DispatchReturn(pending) => Some(&pending.pane_id),
+            WorkDoneWrite::Feedback { orch_pane_id, .. } => Some(orch_pane_id),
+        }
+    }
+
+    /// Perform the write, if there is one. Needs no `AppState`.
+    pub async fn deliver(self, registry: &AgentPtyRegistry) {
+        let (
+            orch_pane_id,
+            role_name,
+            feedback,
+            expected_orchestrator_agent_id,
+            expected_orchestration,
+        ) = match self.0 {
+            WorkDoneWrite::Nothing => return,
+            WorkDoneWrite::DispatchReturn(pending) => return pending.deliver(registry).await,
+            WorkDoneWrite::Feedback {
+                orch_pane_id,
+                role_name,
+                feedback,
+                expected_orchestrator_agent_id,
+                expected_orchestration,
+            } => (
+                orch_pane_id,
+                role_name,
+                feedback,
+                expected_orchestrator_agent_id,
+                expected_orchestration,
+            ),
+        };
+        // Re-validated under the held writer, the same two questions every other
+        // orchestrator-bound delivery on this path asks: the pane must not be
+        // mid-close, and it must still be in the orchestration this completion was
+        // routed within. `orchestration_still_matches` fails OPEN when either side
+        // is unknown, so this can refuse nothing the routing accepted for a
+        // reason other than a re-home during the write's wait for the writer.
+        let outcome = registry
+            .write_and_submit_guarded_first_write(
+                &orch_pane_id,
+                &feedback,
+                &expected_orchestrator_agent_id,
+                || async {
+                    if registry.is_pane_closing(&orch_pane_id) {
+                        return false;
+                    }
+                    orchestration_still_matches(
+                        expected_orchestration.as_ref(),
+                        registry.pane_orchestration(&orch_pane_id).as_ref(),
+                    )
+                },
+                std::time::Instant::now(),
+            )
+            .await;
+        match outcome {
+            Ok(crate::agent_pty::GuardedSend::Applied) => {}
+            // A partial write: some bytes reached the AUTHORIZED orchestrator, so
+            // the report is not retried into a duplicate half-line. Distinguished
+            // from the refusals below because bytes DID land — treating it as
+            // undelivered would invite exactly the retry that doubles it.
+            Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
+                pane_id = %orch_pane_id,
+                role = %role_name,
+                "work-done: feedback delivery was ambiguous (partial write); not retried"
+            ),
+            Ok(refused) => warn!(
+                pane_id = %orch_pane_id,
+                role = %role_name,
+                expected_agent_id = %expected_orchestrator_agent_id,
+                outcome = ?refused,
+                "work-done: identity gate refused the feedback write (the orchestrator pane no \
+                 longer belongs to the agent this completion was routed to); nothing written"
+            ),
+            Err(e) => warn!(
+                pane_id = %orch_pane_id,
+                role = %role_name,
+                error = %e,
+                "work-done: failed to write feedback into orchestrator pane"
+            ),
+        }
+    }
 }
 
 /// Issue #433 + #448: compose the single-line feedback the daemon submits into
@@ -2814,6 +2961,32 @@ pub fn compose_idle_worker_prompt(role: &str, elapsed: std::time::Duration) -> S
 /// and the registry membership holds only the un-defaulted field, so the two
 /// sources can disagree about the cwd for a perfectly healthy pane — a
 /// comparison that would refuse a legitimate nudge.
+/// PR #1398 finding #18: the write-time re-check every deck notice about a
+/// worker makes, in its `revalidate` closure: refuse the notice when one of the
+/// worker's delegations has been resolved — a `work-done`, a supersede, a
+/// release or a restart — since the notice's watch fired and captured
+/// `resolution` ([`AgentPtyRegistry::delegation_resolution_epoch`]). The notice
+/// may have waited minutes on the orchestrator's unsent draft by then, and a
+/// report that a worker never answered, delivered after it did, is worse than
+/// none. The refusal is logged here; the caller reports nothing.
+pub(crate) fn delegation_still_unresolved(
+    registry: &AgentPtyRegistry,
+    worker_pane_id: &str,
+    resolution: Option<u64>,
+    notice: &'static str,
+) -> bool {
+    if registry.delegation_resolution_epoch_is(worker_pane_id, resolution) {
+        return true;
+    }
+    tracing::info!(
+        worker_pane_id = %worker_pane_id,
+        notice,
+        "the worker's delegation was resolved (work-done, supersede, release or restart) while \
+         the notice waited to be written; not sent"
+    );
+    false
+}
+
 pub(crate) fn orchestration_still_matches(
     expected: Option<&OrchestrationIdentity>,
     live: Option<&crate::agent_pty::PaneOrchestration>,
@@ -3051,6 +3224,12 @@ fn arm_idle_worker_watch_for_delegation(
         return None;
     };
     let seq = armed.seq;
+    // Issue #544 (PR #1398 review): the caller spawns this delegation's
+    // dispatch next, and it may queue behind an earlier dispatch to the pane
+    // that is waiting for the worker's draft. Marked before the watch exists,
+    // so the watch never sees the delegation as "written with no wait"; the
+    // `PointerQueueClock` the caller builds next ends the mark on every path.
+    registry.queue_delegation_pointer_write(worker_pane_id, seq);
     arm_idle_worker_watch(
         Arc::clone(registry),
         worker_pane_id.to_string(),
@@ -3058,6 +3237,142 @@ fn arm_idle_worker_watch_for_delegation(
         timeout,
     );
     Some(seq)
+}
+
+/// Issue #544 (PR #1398 review): keep the idle-worker watch's clock off the
+/// time the delegation's task pointer spent waiting for the worker's own
+/// unsent draft. A worker cannot answer a task it has not been given, so with
+/// `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS` shorter than that wait the
+/// watch used to report a worker idle whose pointer had not been written yet.
+///
+/// PR #1398 review: the same holds for the time the delegation's dispatch
+/// spent queued behind an earlier dispatch to the same pane, which is exactly
+/// when that earlier one is waiting for the draft.
+///
+/// Called once the plain timeout has run: holds while the dispatch is queued
+/// or the pointer write is still under way, then until
+/// `armed_at + timeout + pointer_queued_for + pointer_deferred`. `true`
+/// to go on and report — including when the record is gone, which the caller's
+/// seq-conditional take then settles — and `false` when the delegation was
+/// cancelled meanwhile.
+///
+/// Those two marks do not cover the whole dispatch. Between the dispatch
+/// taking both locks (the dequeue) and the pointer write beginning, the record
+/// is neither queued nor in progress — for a `clear = true` delegation that is
+/// the respawn and its `SessionStart` wait — so the due time is computed and
+/// may already have passed. That is deliberate: respawn time counts against
+/// the worker, as it did before #544, and the watch may report during it.
+async fn wait_out_pointer_deferral(
+    registry: &AgentPtyRegistry,
+    worker_pane_id: &str,
+    seq: u64,
+    timeout: std::time::Duration,
+    cancel: &mut tokio::sync::oneshot::Receiver<()>,
+) -> bool {
+    loop {
+        let Some(clock) = registry.delegation_idle_clock(worker_pane_id, seq) else {
+            return true;
+        };
+        let wait = if clock.pointer_queued || clock.pointer_in_progress {
+            crate::draft_deferral::DRAFT_POLL_INTERVAL
+        } else {
+            let due = clock.armed_at + timeout + clock.pointer_queued_for + clock.pointer_deferred;
+            match due.checked_duration_since(std::time::Instant::now()) {
+                Some(wait) if !wait.is_zero() => wait,
+                _ => return true,
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = &mut *cancel => return false,
+            _ = tokio::time::sleep(wait) => {}
+        }
+    }
+}
+
+/// Issue #544 (PR #1398 review): ends the "queued" mark
+/// [`arm_idle_worker_watch_for_delegation`] put on a delegation's pointer write
+/// — explicitly once its dispatch holds the pane's dispatch locks, and on drop
+/// otherwise, so a dispatch that returns early, panics or is dropped while it
+/// waits for a lock never leaves the idle-worker watch holding forever.
+///
+/// Built by `handle_delegate_with_state` right after the mark is set and moved
+/// into the spawned `dispatch_one_owned`, so the mark is never outside a guard:
+/// a panic before the spawn, or a spawned task dropped unpolled, still drops it.
+struct PointerQueueClock {
+    registry: Arc<AgentPtyRegistry>,
+    worker_pane_id: String,
+    delegation_seq: Option<u64>,
+    queued: bool,
+}
+
+impl PointerQueueClock {
+    fn new(
+        registry: Arc<AgentPtyRegistry>,
+        worker_pane_id: String,
+        delegation_seq: Option<u64>,
+    ) -> Self {
+        Self {
+            registry,
+            worker_pane_id,
+            delegation_seq,
+            queued: true,
+        }
+    }
+
+    /// The generation of the idle-worker record this dispatch owns, if any.
+    fn delegation_seq(&self) -> Option<u64> {
+        self.delegation_seq
+    }
+
+    fn dequeue(&mut self) {
+        if !std::mem::take(&mut self.queued) {
+            return;
+        }
+        if let Some(seq) = self.delegation_seq {
+            self.registry
+                .dequeue_delegation_pointer_write(&self.worker_pane_id, seq);
+        }
+    }
+}
+
+impl Drop for PointerQueueClock {
+    fn drop(&mut self) {
+        self.dequeue();
+    }
+}
+
+/// Issue #544: announces a delegation's task pointer write to its idle-worker
+/// watch, and on drop — whichever way the write ends — reports how long it
+/// waited for the worker's draft. See [`wait_out_pointer_deferral`].
+struct PointerWriteClock<'a> {
+    registry: &'a AgentPtyRegistry,
+    worker_pane_id: &'a str,
+    seq: Option<u64>,
+    deferred: std::time::Duration,
+}
+
+impl<'a> PointerWriteClock<'a> {
+    fn begin(registry: &'a AgentPtyRegistry, worker_pane_id: &'a str, seq: Option<u64>) -> Self {
+        if let Some(seq) = seq {
+            registry.begin_delegation_pointer_write(worker_pane_id, seq);
+        }
+        Self {
+            registry,
+            worker_pane_id,
+            seq,
+            deferred: std::time::Duration::ZERO,
+        }
+    }
+}
+
+impl Drop for PointerWriteClock<'_> {
+    fn drop(&mut self) {
+        if let Some(seq) = self.seq {
+            self.registry
+                .finish_delegation_pointer_write(self.worker_pane_id, seq, self.deferred);
+        }
+    }
 }
 
 /// PRD #126: arm the idle watch for one just-armed delegation. Spawns a task
@@ -3097,11 +3412,11 @@ fn arm_idle_worker_watch(
     armed: crate::agent_pty::ArmedDelegation,
     timeout: std::time::Duration,
 ) {
-    let crate::agent_pty::ArmedDelegation { seq, cancel } = armed;
+    let crate::agent_pty::ArmedDelegation { seq, mut cancel } = armed;
     tokio::spawn(async move {
         tokio::select! {
             _ = tokio::time::sleep(timeout) => {}
-            _ = cancel => {
+            _ = &mut cancel => {
                 tracing::debug!(
                     pane_id = %worker_pane_id,
                     seq,
@@ -3110,6 +3425,19 @@ fn arm_idle_worker_watch(
                 return;
             }
         }
+        if !wait_out_pointer_deferral(&registry, &worker_pane_id, seq, timeout, &mut cancel).await {
+            tracing::debug!(
+                pane_id = %worker_pane_id,
+                seq,
+                "idle-worker watch: cancelled while the task pointer's draft wait was being \
+                 added to the timeout"
+            );
+            return;
+        }
+        // PR #1398 finding #18: captured BEFORE the take, so the write below can
+        // refuse once a completion, supersede, release or restart has resolved
+        // this delegation while the notice waited on the orchestrator's draft.
+        let resolution = registry.delegation_resolution_epoch(&worker_pane_id);
         let Some(delegation) = registry.take_outstanding_delegation_if(&worker_pane_id, seq) else {
             tracing::debug!(
                 pane_id = %worker_pane_id,
@@ -3123,13 +3451,22 @@ fn arm_idle_worker_watch(
         let expected_orchestration = delegation.orchestration.clone();
         let revalidate_registry = Arc::clone(&registry);
         let revalidate_pane = orchestrator_pane_id.clone();
+        let revalidate_worker = worker_pane_id.clone();
         let outcome = registry
-            .write_and_submit_guarded(
+            .write_and_submit_guarded_first_write(
                 &orchestrator_pane_id,
                 &prompt,
                 &delegation.orchestrator_agent_id,
                 || async move {
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                        return false;
+                    }
+                    if !delegation_still_unresolved(
+                        &revalidate_registry,
+                        &revalidate_worker,
+                        resolution,
+                        "idle-worker watch",
+                    ) {
                         return false;
                     }
                     orchestration_still_matches(
@@ -3139,6 +3476,7 @@ fn arm_idle_worker_watch(
                             .as_ref(),
                     )
                 },
+                std::time::Instant::now(),
             )
             .await;
         // Issue #424 S3: one-shot, exactly like the delegate pointer in
@@ -3750,6 +4088,10 @@ fn arm_waiting_notice_watch(
             }
             _ = tokio::time::sleep_until(deadline) => {}
         }
+        // PR #1398 finding #18: captured before the ledger read below, so a
+        // completion that lands while the notice waits on the orchestrator's
+        // draft refuses it at write time.
+        let resolution = registry.delegation_resolution_epoch(&worker_pane_id);
         if !registry.waiting_notice_is_current(&worker_pane_id, seq) {
             return;
         }
@@ -3815,7 +4157,7 @@ fn arm_waiting_notice_watch(
         let revalidate_worker_agent = worker_agent_id.clone();
         let revalidate_orchestrator = orchestrator_pane_id.clone();
         let outcome = registry
-            .write_and_submit_guarded(
+            .write_and_submit_guarded_first_write(
                 &orchestrator_pane_id,
                 &notice,
                 &expected_agent_id,
@@ -3833,6 +4175,12 @@ fn arm_waiting_notice_watch(
                         || revalidate_registry
                             .commission_owed_to_agent(&revalidate_worker, &revalidate_worker_agent)
                             != Some(owner)
+                        || !delegation_still_unresolved(
+                            &revalidate_registry,
+                            &revalidate_worker,
+                            resolution,
+                            "waiting notice",
+                        )
                     {
                         return false;
                     }
@@ -3843,6 +4191,7 @@ fn arm_waiting_notice_watch(
                             .as_ref(),
                     )
                 },
+                std::time::Instant::now(),
             )
             .await;
         settle_one_shot_payload_record(
@@ -3996,10 +4345,13 @@ fn delegate_no_event_window(
 ///   input; it just arrived late, attached to somebody else's turn.
 /// * **The concatenation hazard therefore does not apply to this notice**, and
 ///   with it goes the reason PRD #249 finding B3 gave for keeping untrusted
-///   values out. What DOES apply is issue #544's accepted limitation, shared
-///   with every automatic submit including the idle prompt: a pane already
-///   holding an unsent human draft gets that draft submitted along with this
-///   text. `write_guarded`'s user-input guard refuses only a REPEAT of bytes it
+///   values out. What DOES apply is the draft hazard every automatic submit
+///   shares, including the idle prompt: a pane holding an unsent human draft
+///   gets that draft submitted along with this text. Since issue #544 the write
+///   first WAITS while the deck has seen the user type an unsent draft into the
+///   orchestrator pane, up to the draft-deferral cap, so what remains is a
+///   draft older than the cap and text the deck never saw typed.
+///   `write_guarded`'s #424 user-input guard refuses only a REPEAT of bytes it
 ///   already wrote, which this never is.
 /// * **Still no role name and no delegated task text.** That half of B3 is NOT
 ///   relaxed. The identifying detail rides the `warn!` that always accompanies
@@ -4552,6 +4904,8 @@ fn arm_delegate_silence_watch(
         // One-shot: consume our own record. A `false` means work-done, a
         // supersede or a pane close resolved this delegation while the window
         // ran and the cancellation had not been observed yet — suppress.
+        // PR #1398 finding #18: captured before the take — see the idle watch.
+        let resolution = registry.delegation_resolution_epoch(&worker_pane_id);
         if !registry.cancel_silence_watch_if(&worker_pane_id, seq) {
             tracing::debug!(
                 pane_id = %worker_pane_id,
@@ -4630,13 +4984,22 @@ fn arm_delegate_silence_watch(
         let notice = compose_delegate_silence_notice(window, pane_text.as_deref());
         let revalidate_registry = Arc::clone(&registry);
         let revalidate_pane = orchestrator_pane_id.clone();
+        let revalidate_worker = worker_pane_id.clone();
         let outcome = registry
-            .write_and_submit_guarded(
+            .write_and_submit_guarded_first_write(
                 &orchestrator_pane_id,
                 &notice,
                 &expected_agent_id,
                 || async move {
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                        return false;
+                    }
+                    if !delegation_still_unresolved(
+                        &revalidate_registry,
+                        &revalidate_worker,
+                        resolution,
+                        "silent-worker watch",
+                    ) {
                         return false;
                     }
                     orchestration_still_matches(
@@ -4646,6 +5009,7 @@ fn arm_delegate_silence_watch(
                             .as_ref(),
                     )
                 },
+                std::time::Instant::now(),
             )
             .await;
         settle_one_shot_payload_record(
@@ -5084,7 +5448,9 @@ async fn run_delegate_late_readiness_recovery(
 /// including pressing the Enter #1031 says a human has to press — the probe is
 /// refused before a byte rather than submitting their unsent draft. It says
 /// nothing about what the box HOLDS, which no write-side check can, and that
-/// residual is issue #544's accepted limitation rather than something this adds.
+/// residual is not something this adds. Issue #544's draft gate does not apply
+/// here: a probe carries no payload, and the refusal above already covers the
+/// draft the gate would wait for.
 ///
 /// One attempt, never retried. An `Ambiguous` outcome means the CR itself did not
 /// complete, and a second CR is as likely to submit whatever the operator has
@@ -6808,7 +7174,10 @@ async fn dispatch_one_owned(
     task: String,
     cwd: Option<String>,
     silence_watch: Option<SilenceWatch>,
-    delegation_seq: Option<u64>,
+    // Issue #544 (PR #1398 review): carries the generation of the idle-worker
+    // record this dispatch owns and ends its "queued" mark — see
+    // [`PointerQueueClock`].
+    mut pointer_queue: PointerQueueClock,
     // Issue #606: the daemon's own state, when the caller has one, so a worker
     // pane that had to be RE-CREATED can have its orchestration role registered
     // again. `None` for callers with no daemon state (unit fixtures): the
@@ -6829,8 +7198,19 @@ async fn dispatch_one_owned(
     // callers with no daemon state, and for an orchestration with no title.
     recorded_title: Option<OrchestrationTitle>,
 ) {
-    let dispatch_mutex = registry.pane_dispatch_lock(&pane_id);
-    let _dispatch_guard = dispatch_mutex.lock().await;
+    // Issue #544 (PR #1398 review): the ORDER lock first, held to the end, and
+    // then the dispatch lock — which the pointer write below sets down while it
+    // waits for the worker's unsent draft, so a `pane restart` is not parked
+    // behind that wait. Dispatches to this pane still run one at a time in the
+    // order they queued, because every one of them holds the order lock
+    // throughout. See [`crate::agent_pty::PaneDispatchHold`].
+    let delegation_seq = pointer_queue.delegation_seq();
+    let dispatch_order = registry.pane_dispatch_order_lock(&pane_id);
+    let _dispatch_order_guard = dispatch_order.lock().await;
+    let mut dispatch_hold = registry.hold_pane_dispatch(&pane_id).await;
+    // Issue #544 (PR #1398 review): no longer queued behind another dispatch,
+    // so the idle-worker watch's clock may run again.
+    pointer_queue.dequeue();
     // Issue #590: from here on this dispatch's commission is "the caller's own"
     // rather than "in flight" to `retire_commissions_of_replaced_agent`, which
     // is why the guard goes now and only whether it existed is kept.
@@ -6841,6 +7221,8 @@ async fn dispatch_one_owned(
         .as_ref()
         .map(crate::agent_pty::CommissionDispatchInFlight::arm_id);
     drop(commission_in_flight);
+    // Counted as in flight again only while the draft wait has the lock down.
+    dispatch_hold.set_commission_arm_id(commission_arm_id);
 
     // Look the role config up by `(worker cwd, orchestration name,
     // target role)` so the per-role `prompt_template` wrapping is
@@ -7424,7 +7806,7 @@ async fn dispatch_one_owned(
                     let notice_outcome = match orchestrator_agent_id.as_deref() {
                         Some(orchestrator_agent_id) => {
                             registry
-                                .write_and_submit_guarded(
+                                .write_and_submit_guarded_first_write(
                                     &orchestrator_pane_id,
                                     &notice,
                                     orchestrator_agent_id,
@@ -7439,6 +7821,7 @@ async fn dispatch_one_owned(
                                                 .as_ref(),
                                         )
                                     },
+                                    std::time::Instant::now(),
                                 )
                                 .await
                         }
@@ -7873,6 +8256,9 @@ async fn dispatch_one_owned(
                 // the identity binding and revalidation closure are untouched. A
                 // deferred line reached nobody in a dispatched unit, whose
                 // orchestrator then waited for a `work-done` that could not come.
+                // Issue #544: an automatic first write, so it waits for the
+                // orchestrator's unsent draft up to the cap, exactly like the
+                // dead-replacement arm above.
                 let notice_registry = Arc::clone(&registry);
                 let notice_pane = orchestrator_pane_id.clone();
                 let notice_orchestration = orchestration.clone();
@@ -7880,7 +8266,7 @@ async fn dispatch_one_owned(
                 let notice_outcome = match orchestrator_agent_id.as_deref() {
                     Some(orchestrator_agent_id) => {
                         registry
-                            .write_and_submit_guarded(
+                            .write_and_submit_guarded_first_write(
                                 &orchestrator_pane_id,
                                 &notice,
                                 orchestrator_agent_id,
@@ -7893,6 +8279,7 @@ async fn dispatch_one_owned(
                                         notice_registry.pane_orchestration(&notice_pane).as_ref(),
                                     )
                                 },
+                                std::time::Instant::now(),
                             )
                             .await
                     }
@@ -8117,9 +8504,16 @@ async fn dispatch_one_owned(
     // still caught by the post-lock re-validation), defeating the exact
     // guarantee PRD #249 finding B1 built this call to enforce. Treat an
     // unresolved identity as "no verified target" and never attempt the write.
+    // Issue #544 (PR #1398 review): how long the pointer waited for the
+    // worker's draft — non-zero means the dispatch lock was set down, so a
+    // `pane restart` may have replaced the worker meanwhile.
+    let mut pointer_deferred = std::time::Duration::ZERO;
     let outcome = if let Some(worker_agent_id) = expected_worker_agent_id.as_deref() {
-        registry
-            .write_and_submit_guarded_detailed(
+        // Issue #544: the idle-worker watch armed in `handle_delegate` must
+        // not count the time this write waits for the worker's draft.
+        let mut pointer_clock = PointerWriteClock::begin(&registry, &pane_id, delegation_seq);
+        let sent = registry
+            .write_and_submit_guarded_first_write_parking(
                 &pane_id,
                 &one_liner,
                 worker_agent_id,
@@ -8134,8 +8528,22 @@ async fn dispatch_one_owned(
                             .as_ref(),
                     )
                 },
+                std::time::Instant::now(),
+                &mut dispatch_hold,
             )
-            .await
+            .await;
+        // PR #1398 review: a refusal reached while waiting for the draft comes
+        // back with the dispatch lock still set down. Everything below settles
+        // this dispatch's records under it, as it always has.
+        dispatch_hold.resume().await;
+        if let Ok(sent) = &sent {
+            pointer_clock.deferred = sent.deferred;
+        }
+        drop(pointer_clock);
+        sent.map(|sent| {
+            pointer_deferred = sent.deferred;
+            sent.detail
+        })
     } else {
         tracing::debug!(
             pane_id = %pane_id,
@@ -8197,8 +8605,29 @@ async fn dispatch_one_owned(
                 role = %target_role,
                 expected_agent_id = ?expected_worker_agent_id,
                 outcome = ?refused,
+                deferred_ms = pointer_deferred.as_millis(),
                 "delegate: identity gate refused the task pointer; nothing written"
             );
+            // Issue #544 (PR #1398 review): refused AFTER waiting for the
+            // worker's draft means the worker changed while the pointer
+            // waited — most often a `pane restart`, which no longer queues
+            // behind that wait. The pointer is not carried over to the
+            // replacement: the restart cancelled the task it was handed, just
+            // as it cancels one already delivered. But it must not vanish
+            // silently, so the pane's card says so — reported against the
+            // pane's CURRENT occupant, because a report bound to the replaced
+            // one is dropped by the sink.
+            if !pointer_deferred.is_zero()
+                && let Some(agent_id) = registry.pane_current_agent_id(&pane_id)
+            {
+                registry.publish_delivery_notice(crate::agent_pty::DeliveryNotice {
+                    pane_id: pane_id.clone(),
+                    agent_id,
+                    delivery_id: crate::prompt_delivery::mint_delivery_id(&pane_id),
+                    session_id: None,
+                    detail: crate::draft_deferral::DRAFT_WAIT_WORKER_REPLACED_NOTICE,
+                });
+            }
             false
         }
         Err(e) => {
@@ -10218,6 +10647,11 @@ impl AppState {
                 orchestration_cwd.as_deref(),
                 cwd.as_deref(),
             );
+            // Issue #544 (PR #1398 review): the guard that ends the "queued"
+            // mark the arm just set, built before anything else can fail and
+            // moved into the dispatch, so the mark is never outside it.
+            let pointer_queue =
+                PointerQueueClock::new(Arc::clone(&registry), pane_id.clone(), delegation_seq);
             // Issue #590 review (Qodo, #1285): tell the in-flight guard which idle
             // record this dispatch owns, so a `pane restart` that lands while it
             // is queued keeps that record and cancels only the replaced agent's.
@@ -10258,7 +10692,7 @@ impl AppState {
                     task,
                     cwd,
                     silence_watch,
-                    delegation_seq,
+                    pointer_queue,
                     state_for_dispatch,
                     commission_in_flight,
                     recorded_title,
@@ -10510,8 +10944,12 @@ fn restart_refusal_for_crashed_pane(
 /// immediately after `_dispatch_guard` is acquired, below, before
 /// `recreate_identity` is built or `respawn_or_recreate_agent_for_pane` is
 /// called — by the time this second check runs, no concurrent dispatch on
-/// this pane can still be in-flight (this function now holds the same lock
-/// they all serialize on), so its result is authoritative. `--force` skips
+/// this pane can be mid-respawn (this function now holds the same lock
+/// they all serialize on), so its result is authoritative. A dispatch can
+/// still be PARKED here — waiting for the worker's unsent draft with the
+/// lock set down (issue #544, [`crate::agent_pty::PaneDispatchHold`]) — but
+/// it has finished its respawn by then, and this restart's replacement makes
+/// its pointer write refuse rather than land in the new agent. `--force` skips
 /// both checks identically, by design: it means "restart regardless of
 /// crash state."
 pub async fn handle_restart_role_with_state(
@@ -11049,7 +11487,34 @@ impl AppState {
     /// `done: true` from the orchestrator pane itself signals the whole
     /// orchestration is complete; we log and exit without writing back a
     /// "completed" prompt to the orchestrator (it just issued it).
+    ///
+    /// Issue #544: the write is an automatic first write that may wait for the
+    /// orchestrator's unsent draft, so a caller holding a lock on this
+    /// `AppState` must not use this — it takes [`Self::prepare_work_done`] under
+    /// the lock and [`WorkDoneDelivery::deliver`] after releasing it, as the
+    /// daemon's hook loop does.
     pub async fn handle_work_done(&self, signal: WorkDoneSignal, registry: &AgentPtyRegistry) {
+        self.prepare_work_done(signal, registry)
+            .await
+            .deliver(registry)
+            .await;
+    }
+
+    /// Issue #544: everything [`Self::handle_work_done`] does except the pane
+    /// write, which it returns. See [`WorkDoneDelivery`].
+    pub async fn prepare_work_done(
+        &self,
+        signal: WorkDoneSignal,
+        registry: &AgentPtyRegistry,
+    ) -> WorkDoneDelivery {
+        WorkDoneDelivery(self.prepare_work_done_write(signal, registry).await)
+    }
+
+    async fn prepare_work_done_write(
+        &self,
+        signal: WorkDoneSignal,
+        registry: &AgentPtyRegistry,
+    ) -> WorkDoneWrite {
         // PRD #126: the worker answered, so one outstanding delegation is
         // resolved. Retire FIRST — above every early return below — so an
         // unknown pane, an orchestrator's own `--done`, or a missing
@@ -11144,8 +11609,8 @@ impl AppState {
                 // entry itself, held daemon-side against its own delivery pane,
                 // which is what lets this route WITHOUT widening the admission
                 // gate below: a pane nobody dispatched still takes the warning.
-                if return_dispatch_completion(&signal, registry).await {
-                    return;
+                if let Some(pending) = prepare_dispatch_completion(&signal, registry).await {
+                    return WorkDoneWrite::DispatchReturn(pending);
                 }
                 // Issue #1082: unknown to `pane_role_map` AND unclaimed by any
                 // retained dispatch return, so nothing upstream has matched this
@@ -11157,7 +11622,7 @@ impl AppState {
                     pane_id = %escape_id_for_log(&signal.pane_id),
                     "work-done from unknown pane"
                 );
-                return;
+                return WorkDoneWrite::Nothing;
             }
         };
 
@@ -11181,8 +11646,9 @@ impl AppState {
             // completion is also the one thing its caller has been waiting for.
             // An ordinary orchestration has no retained entry here and is
             // unchanged: logged, and no feedback written.
-            return_dispatch_completion(&signal, registry).await;
-            return;
+            return prepare_dispatch_completion(&signal, registry)
+                .await
+                .map_or(WorkDoneWrite::Nothing, WorkDoneWrite::DispatchReturn);
         }
 
         // Write summary to .dot-agent-deck/work-done-{role}.md — and remember
@@ -11244,14 +11710,14 @@ impl AppState {
                 role = %role_name,
                 "work-done: no orchestrator pane found for this orchestration"
             );
-            return;
+            return WorkDoneWrite::Nothing;
         };
 
         // If the work-done came from the orchestrator itself (without
         // --done), skip the feedback write — the orchestrator doesn't need
         // to be reminded of its own work.
         if signal.pane_id == orch_pane_id {
-            return;
+            return WorkDoneWrite::Nothing;
         }
 
         // Issue #508: a report the inlined paths will cut short is saved in full
@@ -11318,7 +11784,7 @@ impl AppState {
                     "work-done: the delegation was commissioned by a different orchestrator pane \
                      than the one this completion routed to; nothing written"
                 );
-                return;
+                return WorkDoneWrite::Nothing;
             }
             None => registry.pane_current_agent_id(&orch_pane_id),
         };
@@ -11329,56 +11795,14 @@ impl AppState {
                 "work-done: the orchestrator pane has no live agent to authorize the feedback \
                  write; nothing written"
             );
-            return;
+            return WorkDoneWrite::Nothing;
         };
-        // Re-validated under the held writer, the same two questions every other
-        // orchestrator-bound delivery on this path asks: the pane must not be
-        // mid-close, and it must still be in the orchestration this completion was
-        // routed within. `orchestration_still_matches` fails OPEN when either side
-        // is unknown, so this can refuse nothing the routing above accepted for a
-        // reason other than a re-home during the write's wait for the writer.
-        let expected_orchestration = self.pane_orchestration_map.get(&orch_pane_id).cloned();
-        let outcome = registry
-            .write_and_submit_guarded(
-                &orch_pane_id,
-                &feedback,
-                &expected_orchestrator_agent_id,
-                || async {
-                    if registry.is_pane_closing(&orch_pane_id) {
-                        return false;
-                    }
-                    orchestration_still_matches(
-                        expected_orchestration.as_ref(),
-                        registry.pane_orchestration(&orch_pane_id).as_ref(),
-                    )
-                },
-            )
-            .await;
-        match outcome {
-            Ok(crate::agent_pty::GuardedSend::Applied) => {}
-            // A partial write: some bytes reached the AUTHORIZED orchestrator, so
-            // the report is not retried into a duplicate half-line. Distinguished
-            // from the refusals below because bytes DID land — treating it as
-            // undelivered would invite exactly the retry that doubles it.
-            Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
-                pane_id = %orch_pane_id,
-                role = %role_name,
-                "work-done: feedback delivery was ambiguous (partial write); not retried"
-            ),
-            Ok(refused) => warn!(
-                pane_id = %orch_pane_id,
-                role = %role_name,
-                expected_agent_id = %expected_orchestrator_agent_id,
-                outcome = ?refused,
-                "work-done: identity gate refused the feedback write (the orchestrator pane no \
-                 longer belongs to the agent this completion was routed to); nothing written"
-            ),
-            Err(e) => warn!(
-                pane_id = %orch_pane_id,
-                role = %role_name,
-                error = %e,
-                "work-done: failed to write feedback into orchestrator pane"
-            ),
+        WorkDoneWrite::Feedback {
+            expected_orchestration: self.pane_orchestration_map.get(&orch_pane_id).cloned(),
+            orch_pane_id,
+            role_name,
+            feedback,
+            expected_orchestrator_agent_id,
         }
     }
 
@@ -17084,7 +17508,7 @@ mod tests {
             "probe task".to_string(),
             None,
             None,
-            None,
+            PointerQueueClock::new(registry.clone(), "worker-pane-no-agent".to_string(), None),
             None,
             None,
             None,
@@ -17176,7 +17600,7 @@ mod tests {
                 "do the task".to_string(),
                 None,
                 None,
-                Some(armed.seq),
+                PointerQueueClock::new(registry.clone(), WORKER_PANE.to_string(), Some(armed.seq)),
                 None,
                 None,
                 None,
@@ -17247,7 +17671,7 @@ mod tests {
                     orchestration: None,
                 },
             }),
-            None,
+            PointerQueueClock::new(registry.clone(), worker_pane.to_string(), None),
             None,
             None,
             None,
@@ -17359,9 +17783,9 @@ mod tests {
         // advance the user-input clock, so it cannot re-arm a later blind probe
         // — is exactly what a future caller would inherit. The submitted
         // notices are turns of their own and cannot re-arm a later blind probe
-        // by leaving bytes in the input box — they inherit instead the idle
-        // prompt's own issue #544 limitation, which is a different question
-        // from this one.
+        // by leaving bytes in the input box — they share instead the idle
+        // prompt's draft hazard (issue #544, now deferred up to a cap), which
+        // is a different question from this one.
         let notice = NOTICE;
         assert_eq!(
             registry

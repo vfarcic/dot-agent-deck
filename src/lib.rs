@@ -24,8 +24,10 @@ pub mod devin_hooks_manage;
 // PRD #1223 M1: the daemon's one-level, bounded directory listing that backs
 // the desktop's new-agent directory step.
 pub mod directory_listing;
+// Issue #544: automatic first writes wait while the user has an unsent draft.
 pub mod dispatch;
 pub mod dispatch_return;
+pub mod draft_deferral;
 pub mod embedded_pane;
 // Issue #1121: the endpoint I/O that `platform::paths`' pure resolvers must not
 // do — creating the owner-only fallback directory, the connect side's
@@ -59,6 +61,7 @@ pub mod orchestrator_context;
 pub mod orchestrator_ext;
 pub mod palette;
 pub mod pane;
+pub mod pane_delivery_queue;
 pub mod pane_input;
 pub mod pane_screen_text;
 pub mod platform;
