@@ -1,0 +1,113 @@
+# The published docs (PRD #1419, Decision 5).
+#
+# This file is the single list of what is published: the site's Markdown,
+# `llms.txt`, `llms-full.txt` and the topics `dot-agent-deck docs` offers are
+# all generated from it. A page under `docs/` that is not listed here is not
+# published anywhere. Nothing under `docs/develop/` may be listed; the parser
+# rejects a `develop/` slug.
+#
+# Array order is the reading order used by every consumer.
+#
+#   slug        - the file path under `docs/` without `.md` ("desktop/voice")
+#   title       - the page's title (its first `#` heading)
+#   description - one line saying what the page is for
+
+[[page]]
+slug = "getting-started"
+title = "Getting Started"
+description = "First run: launch the TUI, start an agent, and see how the daemon, the TUI and the desktop app fit together."
+
+[[page]]
+slug = "installation"
+title = "Installation"
+description = "Install, verify and upgrade the dot-agent-deck binary (Homebrew, release download, Nix or source) and the desktop app."
+
+[[page]]
+slug = "session-management"
+title = "Session Management"
+description = "What each agent status means in both clients, and how to detach from and resume running agent sessions."
+
+[[page]]
+slug = "orchestration"
+title = "Orchestration"
+description = "Define orchestrator and worker roles in .dot-agent-deck.toml, start an orchestration, and how delegation between roles works."
+
+[[page]]
+slug = "idle-workers-and-notifications"
+title = "Idle Workers & Notifications"
+description = "How the deck reports a stuck, waiting or exited worker to its orchestrator, and how to configure those reports."
+
+[[page]]
+slug = "dispatcher-mode"
+title = "Dispatcher Mode"
+description = "Start background work units (one agent or a team) by asking a dispatcher pane, and follow them until they report back."
+
+[[page]]
+slug = "scheduled-tasks"
+title = "Schedules"
+description = "Run a prompt in a directory on a cron schedule, including dispatching agents onto open GitHub issues, with a full reference."
+
+[[page]]
+slug = "configuration"
+title = "Configuration"
+description = "Daemon settings, environment variables, the project .dot-agent-deck.toml, and the desktop app's desktop.toml."
+
+[[page]]
+slug = "remote-environments"
+title = "Remote Environments"
+description = "Run the deck and its agents on a remote host over ssh: connecting, detaching, reattaching, version skew and failure modes."
+
+[[page]]
+slug = "remote-requirements"
+title = "Remote Environment Requirements"
+description = "What a Linux or macOS host must provide before dot-agent-deck remote add can register it as a remote."
+
+[[page]]
+slug = "remote-recipes"
+title = "Remote Recipes"
+description = "Starting points for getting a machine and bootstrapping a Linux or macOS host so dot-agent-deck remote add succeeds."
+
+[[page]]
+slug = "keyboard-shortcuts"
+title = "Keyboard Shortcuts"
+description = "Every TUI keyboard shortcut and mouse action, and how to customize them in keybindings.toml."
+
+[[page]]
+slug = "desktop/index"
+title = "Desktop App"
+description = "What the desktop app (alpha) is, what it needs to run, and what it has and lacks compared with the TUI."
+
+[[page]]
+slug = "desktop/dashboard"
+title = "Dashboard"
+description = "The desktop app's main screen: agents per daemon, their statuses, the agent pane, and closing agents and orchestrations."
+
+[[page]]
+slug = "desktop/new-agent"
+title = "New Agent"
+description = "Start an agent from the desktop app: choose the daemon, the directory, the mode and the command."
+
+[[page]]
+slug = "desktop/daemons"
+title = "Daemons"
+description = "Watch several daemons, local and remote over ssh, from the desktop app, and add or test them in Settings."
+
+[[page]]
+slug = "desktop/settings"
+title = "Settings"
+description = "The desktop app's settings: appearance, zoom, the settings file and its keyboard shortcuts."
+
+[[page]]
+slug = "desktop/voice"
+title = "Voice Control"
+description = "Drive the desktop app by voice: the speech and command services it needs and what is sent where."
+
+[[page]]
+slug = "troubleshooting"
+title = "Troubleshooting"
+description = "Symptoms, causes and fixes for common problems with hooks, spawning agents, delegation, remotes and panes."
+
+[[page]]
+slug = "license"
+title = "License"
+description = "The license dot-agent-deck is distributed under (MIT)."

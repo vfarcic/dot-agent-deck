@@ -61,6 +61,9 @@
 //!
 //! - `docs` — invokes the `xtask-docs` binary's logic (paired-`.md`
 //!   generator). Forwards remaining args.
+//! - `site` — PRD #1419: builds the website's output (published Markdown,
+//!   `llms.txt`, `llms-full.txt`, images) from `docs/published.toml` into the
+//!   directory given as its argument. The logic is `xtask-site`'s library.
 //! - `clean-e2e-tmp` — issue #322: reaps stale e2e harness temp dirs left
 //!   behind by SIGKILLed test processes. Decides by whether the owning PID
 //!   in the `dad-tests-<pid>-*` name is still alive rather than by age
@@ -1513,6 +1516,9 @@ fn main() -> ExitCode {
     }
     if matches!(args.first().map(String::as_str), Some("clean-e2e-tmp")) {
         return clean_tmp::run(&args[1..]);
+    }
+    if matches!(args.first().map(String::as_str), Some("site")) {
+        return xtask_site::run(&repo_root(), &args[1..]);
     }
     // Accepted anywhere in the remaining args, because the `linkage-check`
     // subcommand name itself is optional: `cargo xtask --list-rules` and

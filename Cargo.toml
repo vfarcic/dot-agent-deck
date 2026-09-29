@@ -6,6 +6,7 @@ members = [
     "xtask/docs",
     "xtask/linkage-check",
     "xtask/screenshots",
+    "xtask/site",
     "xtask/spec",
 ]
 
