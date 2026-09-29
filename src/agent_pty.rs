@@ -1789,6 +1789,20 @@ fn spawn_with_dir(
         );
     }
 
+    // Issue #1385: name THIS deck to the child by its absolute path, so the Pi
+    // extension execs the deck that spawned it rather than whatever its own
+    // `$PATH` resolves the bare name to. Every child gets it, not only a
+    // detected Pi, because a project wrapper (`devbox run agent`) can launch Pi
+    // without the command naming it. Applied straight to `cmd` for the lifetime
+    // tag's reason — a replayed `spawn_env` would carry the previous
+    // generation's binary across a daemon upgrade — and removed when there is
+    // no usable path, so a value inherited from an enclosing deck's pane never
+    // names a different deck.
+    match crate::platform::paths::executable_path() {
+        Some(path) => cmd.env(crate::platform::paths::DOT_AGENT_DECK_EXE, path),
+        None => cmd.env_remove(crate::platform::paths::DOT_AGENT_DECK_EXE),
+    }
+
     // Issue #1233 item 2: as late as the parent can decide it. See `spawn_in`.
     #[cfg(unix)]
     if let Some(dir) = verified_dir {
@@ -17092,6 +17106,47 @@ mod spawn_tests {
         };
         assert!(matches!(err, AgentPtyError::PreparedDirChanged(_)));
         assert!(registry.is_empty(), "a refused spawn must register nothing");
+    }
+
+    /// Issue #1385: every child is told the spawning deck's own absolute path in
+    /// `DOT_AGENT_DECK_EXE`, and that value wins over one inherited from an
+    /// enclosing deck's pane and over a caller-supplied (replayed) one.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_names_the_running_deck_in_dot_agent_deck_exe() {
+        let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let key = crate::platform::paths::DOT_AGENT_DECK_EXE;
+        let expected =
+            crate::platform::paths::executable_path().expect("the test binary has a usable path");
+        let prior = std::env::var(key).ok();
+        // SAFETY: serialized by ENV_TEST_LOCK and restored before asserting.
+        unsafe {
+            std::env::set_var(key, "/an/enclosing/deck/dot-agent-deck");
+        }
+        let pty = spawn(SpawnOptions {
+            command: Some(
+                "sh -c '[ \"$DOT_AGENT_DECK_EXE\" = \"$EXPECTED_EXE\" ] && exit 42; exit 1'",
+            ),
+            env: vec![
+                ("EXPECTED_EXE".into(), expected.clone()),
+                (key.into(), "/a/replayed/spawn-env/dot-agent-deck".into()),
+            ],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+        let mut child = pty.child;
+        let status = child.wait().expect("wait should succeed");
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert_eq!(
+            status.exit_code(),
+            42,
+            "the child must see {key}={expected:?}, not an inherited or replayed value"
+        );
     }
 
     #[test]

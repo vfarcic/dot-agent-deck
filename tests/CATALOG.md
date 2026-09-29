@@ -5191,6 +5191,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
 - **Cost note:** one short Haiku turn through pi (orchestrator delegates) + one short Haiku turn through claude (worker creates a file + work-done) — well under Decision 23's <$0.05/run bound.
 
+##### pi/live/003 — The Pi extension shells the deck that spawned it, named by `DOT_AGENT_DECK_EXE`, not whatever `dot-agent-deck` is first on Pi's own `PATH` (issue #1385, following #549).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, plus a `SubscribeEvents` stream on its daemon). The deck's `PATH` starts with a DECOY `dot-agent-deck` — a script that only appends its arguments to a log and exits 0 — and deliberately does NOT carry the built binary's directory, unlike `pi/live/001`, which prepends it and so cannot tell a `PATH` lookup from the absolute path. The bundled extension reaches the per-test HOME through the daemon-startup auto-materialize. Launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`.
+- **Agent:** REAL `pi` as one restored pane with NO prompt, so it makes no model call and needs no credential: its `session_start` fires at boot whether or not it is authenticated, and that is what makes the extension shell `agent-event` and `get-seed`. Runtime-skipped (Decision 26) only when `pi` is absent. Lane 2 because it spawns a real agent CLI.
+- **Asserts:** the decoy log is empty — the extension ran nothing through `PATH`; the daemon broadcast carries a Pi frame with the injected agent id under the `agent-event` CLI's `<pane>-session` key, which only the extension's call through the real deck can produce (the card-surfacing `SessionStart` is also typed Pi but keys on the bare pane id and has no agent id); and the card shows the `Pi ·` identity. Checked by mutation: with the spawn-time `DOT_AGENT_DECK_EXE` export replaced by a removal, the extension falls back to the bare name and the test fails with the decoy having received `agent-event --type finished`.
+- **Does not assert:** a model turn, delegation or `work-done` through the path (`pi/live/002`, `chain-smoke/pi/002`); the fallback to the bare name when the variable is absent, which the extension's TS unit tests cover.
+- **Platform coverage:** mac+linux (unix-only: the decoy is a `#!/bin/sh` script).
+- **Cost note:** no model call.
+
 ### Mouse Parity (PRD #80)
 
 These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-only TUI action gains a clickable affordance carrying its shortcut inline, funneled through the single `dispatch_action` action layer.

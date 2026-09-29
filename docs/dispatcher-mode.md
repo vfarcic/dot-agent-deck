@@ -51,6 +51,8 @@ If you just want an agent to do something for you right now, in front of you, yo
 
 Then talk to it: *"Start work on the login timeout bug."*
 
+The pane starts each unit by running the deck's `dispatch` command under the deck's full path — `/home/you/.local/bin/dot-agent-deck dispatch …`, not `dot-agent-deck dispatch …` — so it reaches this deck whatever the agent's own `PATH` holds. If you let the agent run commands through a permission rule, write the rule against that path: a Claude Code allow rule such as `Bash(dot-agent-deck dispatch:*)` does not match it.
+
 ## One agent, or a team?
 
 Each unit can start as a **single agent** or as a **full multi-role orchestration** — a team of agents with an orchestrator delegating to workers, as configured in your project's `.dot-agent-deck.toml`.

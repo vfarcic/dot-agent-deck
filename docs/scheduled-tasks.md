@@ -67,6 +67,8 @@ Either way an agent opens — running the command you chose, which defaults to y
 - lets you **try the prompt with the same agent** before saving;
 - **confirms the whole schedule** with you, then saves it.
 
+It saves by running the deck's `schedule add` (or, when editing, `schedule update`) command under the deck's full path — `/home/you/.local/bin/dot-agent-deck schedule add …` — so the schedule reaches this deck whatever the agent's own `PATH` holds. A permission rule that lets the agent run that command, such as a Claude Code allow rule, has to name that path; `Bash(dot-agent-deck schedule:*)` does not match it.
+
 When it is done it tells you the pane can be closed — it existed only to create the schedule. When the schedule runs, a single-agent run **appears live in its own pane** on the deck, while an orchestration run opens in its tab when you next open the deck. The desktop app shows both on its Dashboard like agents you started yourself: a single-agent run as a row, an orchestration run as an **ORCHESTRATION** group.
 
 ## What happens when a schedule runs

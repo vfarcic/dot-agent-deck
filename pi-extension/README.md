@@ -7,6 +7,8 @@ The bundled Pi orchestrator extension for dot-agent-deck (PRD #201). It makes a 
 
 Both paths route over the daemon socket using the pane env vars the daemon already injects (`DOT_AGENT_DECK_PANE_ID` / `DOT_AGENT_DECK_AGENT_ID` / `DOT_AGENT_DECK_VIA_DAEMON`). The extension reads them via the CLI; it does not set them.
 
+**Which `dot-agent-deck` it runs (issue #1385).** The deck exports its own absolute executable path to every agent it spawns as `DOT_AGENT_DECK_EXE`, and the extension execs that path (`resolveDeckBin`). A bare `dot-agent-deck` would be looked up in Pi's own `PATH`, which can reach a different install than the deck that spawned the pane. When the variable is absent — an older deck — the extension falls back to the bare name, exactly as before.
+
 This directory contains the **entire** JS/TS toolchain for the extension and is kept off the Rust critical path (`cargo`/`nextest` never touch it). Bundling into the binary (`include_str!`) and materialization into Pi's extension dir are later milestones (M3.1/M3.2).
 
 ## Layout

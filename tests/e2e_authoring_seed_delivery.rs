@@ -129,6 +129,17 @@ fn start_cat(
     send_json_request(daemon, &request)
 }
 
+/// The seed the DAEMON composes for `kind` in `cwd`. Since issue #1385 a seed
+/// names the deck by `binary_name()` — the composing process's own path — and
+/// the daemon here is the built `dot-agent-deck`, not this test binary, so the
+/// expected text is composed as that binary would compose it.
+fn daemon_composed_seed(kind: AuthoringKind, cwd: &Path) -> String {
+    dot_agent_deck::platform::paths::set_test_current_exe_override(std::path::PathBuf::from(env!(
+        "CARGO_BIN_EXE_dot-agent-deck"
+    )));
+    kind.compose_seed(cwd)
+}
+
 fn stand_in_log(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|_| "<the stand-in wrote no log>".to_string())
 }
@@ -214,7 +225,7 @@ fn newagent_authoring_001_each_kind_delivers_its_tui_seed_and_is_advertised() {
         let log_path = cwd.join(&log_name);
         let pane_id = format!("newagent-authoring-001-{kind_name}");
         start_stand_in(&daemon, &cwd, &pane_id, &log_name, 1, Some(kind_name));
-        assert_ready_then_received_once(&log_path, &kind.compose_seed(&cwd), kind);
+        assert_ready_then_received_once(&log_path, &daemon_composed_seed(kind, &cwd), kind);
     }
 
     let options_response = send_json_request(&daemon, &json!({"op": "new-agent-options"}));
@@ -294,7 +305,11 @@ fn newagent_authoring_002_late_readiness_delivers_once_and_plain_start_delivers_
         None,
     );
 
-    assert_ready_then_received_once(&authoring_log, &KIND.compose_seed(&authoring_cwd), KIND);
+    assert_ready_then_received_once(
+        &authoring_log,
+        &daemon_composed_seed(KIND, &authoring_cwd),
+        KIND,
+    );
     assert!(
         common::wait_for_file_substr_count(
             &plain_log,
