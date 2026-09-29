@@ -1,6 +1,6 @@
 # PRD #1184: Chain several voice commands from one utterance
 
-**Status**: Draft — not started, and the one of the three that may be deferred: M1 is a go/no-go measurement, and the milestones are written so each stops cleanly. Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1260](1260-voice-sticky-dictation-mode.md) and [PRD #1261](1261-voice-numbered-choice.md).
+**Status**: M1 measured 2026-09-29 — **NO-GO (not now)**, nothing shipped; see the Work Log. Originally: the one of the three that may be deferred: M1 is a go/no-go measurement, and the milestones are written so each stops cleanly. Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1260](1260-voice-sticky-dictation-mode.md) and [PRD #1261](1261-voice-numbered-choice.md).
 **Priority**: Low
 **Created**: 2026-09-29
 **Issue**: [#1184](https://github.com/vfarcic/dot-agent-deck/issues/1184)
@@ -157,7 +157,7 @@ Credentialed fixtures run locally only; a `SKIP:` is not a pass. No L2 `tests/e2
 
 Each milestone ends at a state that can ship or stop on its own.
 
-- [ ] **M1 — Go/no-go measurement (no product change).** Build the `steps` schema and prompt on a branch; run a chain fixture set against the default backend repeatedly; measure span fidelity (does `said` copy the transcript?), segmentation accuracy, contrast handling, and whether **single-command fixtures regress**. **Clean stop:** if single commands regress or spans are unreliable, record the numbers here and close the issue as not now, with nothing shipped.
+- [x] **M1 — Go/no-go measurement (no product change).** Done 2026-09-29: **NO-GO — not now** (Work Log, "M1 measured"). Build the `steps` schema and prompt on a branch; run a chain fixture set against the default backend repeatedly; measure span fidelity (does `said` copy the transcript?), segmentation accuracy, contrast handling, and whether **single-command fixtures regress**. **Clean stop:** if single commands regress or spans are unreliable, record the numbers here and close the issue as not now, with nothing shipped.
 - [ ] **M2 — Validation only.** Schema, `said` verification, per-step grounding, contrast refusal, `lands_on`, predicted-state validation, position rules. A valid chain is still refused with "chains are not enabled yet" — so this milestone ships nothing user-visible and **can stop here** with the validation layer tested.
 - [ ] **M3 — Navigation-only chains.** Execution, per-step revalidation, stop-and-report, chain Undo — for steps with a `lands_on` screen and a last step that is any navigation-safe row. **Clean stop:** a useful, bounded feature ("open the overview and then the tester") even if M4 never lands.
 - [ ] **M4 — Pauses and last-step specials.** The `AwaitingChoice` pause (needs #1261 shipped), the mutually exclusive case as a choice, D5 last steps, dictation and `dictation_on` last steps (needs #1260 shipped).
@@ -181,3 +181,32 @@ Each milestone ends at a state that can ship or stop on its own.
 ### 2026-09-29 — Created
 
 Written from issue #1184 and its comment by a dispatched unit, alongside PRDs #1260 and #1261. The design — spans verified like dictation's prefix, per-span grounding, a closed `lands_on` column deciding which rows can be non-last, `start_new_agent` excluded, the mutually exclusive case offered as a choice, and Undo that reverses the whole chain or is not offered — is this document's; M1 decides whether any of it is built.
+
+### 2026-09-29 — M1 measured: NO-GO (not now)
+
+The `steps` shape (`{action, params, steps: [{action, params, said}] | null}`, top-level mirroring step 1) was built as a **patch that did not ship** and run against the real Commands backend. Patch, runner scripts, raw answers (JSONL), every run log and the scoring script are at `~/code/dot-agent-deck/.dot-agent-deck/1184-m1/` (`m1-steps.patch` applies to `9adbf1f9`; `analyse.py <backend>[-b]` reproduces every number below). Per-step grounding was scored with the real `action_grounded`, not an approximation. Two prompt variants: **A** adds the chain rules to the system prompt and changes its "ONE action" preamble; **B** leaves the system prompt byte for byte and carries the chain rules only as the `steps` field's schema description. Chain set: 35 utterances (20 chains, two of them three-step, including a hostile listing; 9 contrast; 2 mutually exclusive; 4 single commands containing "and"/"then"), 5 runs each on gpt-5-mini (default), 5 (A) / 3 (B) on claude-haiku-4-5. Regression: the 149-fixture manifest. Runs that hit OpenAI's 500k TPM limit (429s from concurrent streams) were excluded and re-run sequentially.
+
+| criterion | gpt-5-mini A | gpt-5-mini B | haiku A | haiku B |
+| --- | --- | --- | --- | --- |
+| span fidelity: `said` a verbatim run of the transcript | 189/189 steps | 223/226 | 147/147 | 87/88 |
+| chains with spans in order, non-overlapping, only connectives between | 91/91 | 105/108 | 69/71 | 42/43 |
+| segmentation: right actions in right order | 81/100 | **95/100** | 66/100 | 41/60 |
+| …and every step grounded in its own span | 71/100 | 85/100 | 60/100 | 35/60 |
+| wrong chain the M2 rules would accept (PRD rules / + full coverage) | 3 / 0 | 0 / 0 | 0 / 0 | 1 / 0 |
+| contrast utterances returned as ≥2 steps (app refusal catches all) | 0/45 | 3/45 | 0/45 | 0/27 |
+| single commands with "and"/"then" split into ≥2 steps | 2/20 | 1/20 | 5/20 | 1/12 |
+| **149-fixture regression**, failures per clean run | **3–6, mean 4.5, 0/6 green** | **0–3, mean 1.5, 1/4 green** | 3–6 (base 3–5) | 4–5 (base 3–5) |
+| same-session baseline, unpatched | 0–1, mean 0.6, 2/5 green (5 runs) | same | 3–5, mean 4.2 (5 runs) | same |
+
+**Why NO-GO.** The PRD's stop condition is "if single commands regress … close the issue as not now". They do. Under A the default backend regresses clearly: `close-the-agent-on-the-overview` ("Close the agent") becomes `stop_agent` 6/6 (0/5 at baseline) and `start-new-agent-adversarial-no-confirm` becomes `stop_agent` 6/6 (2/5 at baseline). Grounding refuses both, so nothing unsafe runs, but "Close the agent" stops working. B mostly recovers (mean 1.5 against 0.6), but `close-the-agent-on-the-overview` still fails 2/4 against 0/5, so it is smaller, not gone. On Haiku, `choose-mode-dispatcher-chip-label` (the bare word "dispatcher") answers `none` 4/5 under A and 2/3 under B, against 0/5 at baseline. Spans themselves are reliable, so it is the regression and not span fidelity that stops this. It is the same pattern this file's `TOOL_INSTRUCTIONS` doc records for three earlier prompt interventions: a change to the prompt moves a failure instead of removing one.
+
+**Findings a revisit must start from** (none of them built):
+
+- **Variant B is the starting point**: 95/100 segmentation, 0 wrong chains accepted, and the smallest regression. Test it against the whole manifest before anything else.
+- **Per-span grounding refuses the PRD's own headline example.** In "open the overview and then the tester", step 2's span is "the tester" and has no `open_agent` verb, so it is ungrounded in 5/5 runs on every backend and variant. M2 would need a rule for the elided verb, such as a verbless step inheriting the previous step's verb when both rows share it. That rule weakens the per-span defence, so it has to be argued, not assumed.
+- **The spans rule needs FULL coverage, not only connectives between spans.** The rule as written accepted 3 (A) and 1 (Haiku B) chains that silently dropped their first step ("make it a dispatcher, use codex and name it triage bot" → type and name only). Requiring the words before the first span and after the last to be empty, or politeness words only, rejected all 4, with no cost to correct chains.
+- **Dictation text gets split.** "type run the tests and then commit" came back as two dictation steps, or as dictation + `submit_prompt` on Haiku 5/5 under A. Grounding refuses those chains, but that means refusing a legitimate single dictation. M2 would need "a dictation step anywhere → fall back to the top-level single answer" (the top level was right in every such case on B).
+- **`dictation_on` can never be a step**: its whole-utterance grounding refuses "turn typing on" as a span 5/5. The position table's "last only" should read "never".
+- **Mutually exclusive values**: gpt-5-mini returns two steps of the same row (5/5 directories, 4/5 modes on B), which the PRD's "same row twice → choice" rule turns into a choice. Haiku returns one step, which is today's behaviour.
+
+Nothing shipped: production code is unchanged at the end of M1, and the measurement lives only in the patch.
