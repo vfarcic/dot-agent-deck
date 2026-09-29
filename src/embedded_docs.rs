@@ -80,10 +80,12 @@ pub fn render_all(pages: &[EmbeddedPage]) -> String {
 }
 
 /// The diagnostic for a topic that is not published: names it and lists every
-/// valid topic.
+/// valid topic. The topic is echoed in its Debug-quoted form, so an escape
+/// sequence or control character in it reaches the terminal as text
+/// (`"\u{1b}[31m"`) rather than as the byte itself.
 pub fn unknown_topic(pages: &[EmbeddedPage], topic: &str) -> String {
     format!(
-        "error: unknown docs topic `{topic}`. Valid topics:\n\n{}",
+        "error: unknown docs topic {topic:?}. Valid topics:\n\n{}",
         topic_list(pages)
     )
 }
@@ -201,8 +203,28 @@ mod tests {
         let DocsOutput::Error(err) = run(&PAGES_FIXTURE, Some("nope"), false) else {
             panic!("unknown topic must fail");
         };
-        assert!(err.contains("`nope`"));
+        assert!(err.contains("\"nope\""));
         assert!(err.contains("orchestration") && err.contains("desktop/voice"));
+    }
+
+    #[test]
+    fn unknown_topic_echoes_no_control_bytes() {
+        let DocsOutput::Error(err) = run(&PAGES_FIXTURE, Some("a\x1b[31mb\rc\nd"), false) else {
+            panic!("unknown topic must fail");
+        };
+        let first_line = err.lines().next().expect("diagnostic line");
+        assert_eq!(
+            first_line,
+            r#"error: unknown docs topic "a\u{1b}[31mb\rc\nd". Valid topics:"#
+        );
+        let echoed = err
+            .split("\n\n")
+            .next()
+            .expect("diagnostic before the list");
+        assert!(
+            !echoed.contains(['\x1b', '\r', '\n']),
+            "raw control byte in {echoed:?}"
+        );
     }
 
     #[test]
