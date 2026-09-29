@@ -55,7 +55,9 @@ use dot_agent_deck_desktop::voice::{
     NO_MATCH_ACTION, ParamKind, REMOTE_TIMEOUT, Screen, Transcript, VoiceChoice, VoiceDirectories,
     VoiceDirectoryEntry, VoiceNewAgent, VoiceNewAgentForm, VoiceOutcome,
     dictation::normalise,
-    handle_utterance_with, table,
+    handle_utterance_with,
+    schema::DECK_HIDDEN_HINT,
+    table,
     test_support::{
         api_preset, api_resolver, in_orchestration, in_titled_orchestration, role_agent_in_state,
         with_tool,
@@ -711,10 +713,14 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                             .sentence()
                             .contains(&format!("Preselected daemon: {label}."))
                     });
+                // Compared against the hint itself rather than against words
+                // it once contained: #1045 renamed the screen "Daemons", and a
+                // `contains("deck")` check went red on every deck-hidden
+                // fixture with the refusal reading exactly as intended.
                 let hidden_deck_explained = !fixture.deck_hidden
                     || fixture.action != "open_deck"
                     || matches!(&answer.outcome, VoiceOutcome::Unavailable { hint, .. }
-                        if hint.contains("deck") && hint.contains("experimental"));
+                        if hint == DECK_HIDDEN_HINT);
                 if action_matches
                     && actual_outcome == fixture.outcome
                     && agent_matches

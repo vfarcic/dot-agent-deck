@@ -532,6 +532,165 @@ action = "dictate_to_agent"
 outcome = "dispatch"
 dictate_prefix = "tell it to"
 
+# PRD #1260 — the dictation MODE's switches, in `Idle` (the only state these
+# fixtures run in: with the mode on nothing reaches the model, so in-mode
+# classification is proven by `voice::outcome`'s unit tests, not here).
+#
+# **The entry and exit phrasings never reach the model**, and that is stated
+# rather than hidden: both rows are `heard_as_whole`, and every utterance that
+# grounds to one of them — the phrase, less an edge politeness word — is
+# answered by the local fast path first. So these fixtures pin the whole
+# pipeline's answer for the phrasings users say (a local path that went away
+# would hand them to the model, and they would still have to route here), and
+# the `screens` column through the unavailable pair.
+[[fixtures]]
+name = "dictation-on-type-on"
+utterance = "type on"
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-start-typing-politely"
+utterance = "Okay, start typing."
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-start-dictation"
+utterance = "Start dictation."
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-unavailable"
+utterance = "type on"
+screen = "overview"
+action = "dictation_on"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "dictation-off-type-off"
+utterance = "Type off."
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-stop-typing"
+utterance = "stop typing"
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-done-typing-please"
+utterance = "done typing, thanks"
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-unavailable"
+utterance = "type off"
+screen = "deck"
+action = "dictation_off"
+outcome = "unavailable"
+
+# A switch phrase said INSIDE a sentence is not a switch. The first two go
+# through the local `type` opener; the last three reach the model, through an
+# opener no list holds, with a reserved phrase in the middle of what is to be
+# typed — the case where another row stealing it would be a silent wrong
+# action rather than a visible typo.
+[[fixtures]]
+name = "dictate-type-on-in-passing"
+utterance = "type on the tester's prompt that the build is on"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "type"
+
+[[fixtures]]
+name = "dictate-the-word-on"
+utterance = "type the word on"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "type"
+
+[[fixtures]]
+name = "dictate-stop-typing-in-passing"
+utterance = "tell it we should stop typing the logs to a file"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "tell it"
+
+[[fixtures]]
+name = "dictate-send-it-in-passing"
+utterance = "ask it to send it to the reviewer when it is done"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "ask it to"
+
+# Measured 2026-09-29: "tell it the mute button in the settings is broken"
+# came back `list_commands` (refused by grounding, so nothing ran) — the model
+# does not read a bare "tell it <statement>" as dictation. `voice_off` did not
+# steal it, which is what this fixture is for, so it is phrased the way the
+# row's description offers ("tell it to ...") rather than pinned red on a gap
+# that predates the mode.
+[[fixtures]]
+name = "dictate-mute-in-passing"
+utterance = "tell it to fix the mute button in the settings"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "tell it to"
+
+# The in-mode "voice off" list (`VOICE_OFF_PHRASES`) is answered locally only
+# while the mode is on; in `Idle` the same words are the model's to answer. So
+# each phrase the list holds that no other fixture says is pinned to
+# `voice_off` here, on the agent screen the mode lives on — the model and the
+# list must mean the same thing by them, or "mute" would stop the microphone in
+# the mode and do something else a moment later.
+[[fixtures]]
+name = "voice-off-mute"
+utterance = "mute"
+screen = "agent"
+action = "voice_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "voice-off-mic-off"
+utterance = "mic off"
+screen = "agent"
+action = "voice_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "voice-off-stop-voice-control"
+utterance = "stop voice control"
+screen = "agent"
+action = "voice_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "voice-off-turn-voice-off"
+utterance = "turn voice off"
+screen = "agent"
+action = "voice_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "voice-off-stop-voice"
+utterance = "stop voice"
+screen = "agent"
+action = "voice_off"
+outcome = "dispatch"
+
 # PRD #1223 — `open_new_agent`, the first row with a `deck_ref` and the first
 # optional param. The bare phrase must open the dialog; a named deck must
 # resolve against the planted fleet; and the deck screen must say where the
