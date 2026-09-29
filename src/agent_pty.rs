@@ -3478,8 +3478,22 @@ const PASTE_MARKER_PREFIX: &[u8] = b"\x1b[20";
 /// misattribute one client's ESC to another's CR, and both of those suppress
 /// drains — that direction only refuses a later same-payload delivery (reported,
 /// and bounded by [`PAYLOAD_RECORD_TTL`]), never admits a doubled one.
+///
+/// **One stream, both senders** (issue #544, PR #1398 finding #16). The PTY
+/// reads ONE interleaved byte stream, so this is fed all of it: the user's
+/// bytes ([`PaneInputState::note_user_bytes`]) and the exact bytes the deck
+/// writes ([`PaneInputState::note_deck_bytes`], through [`PaneWriter::daemon`])
+/// — payload, its own paste framing, its CR or LF, the erases that drain a
+/// partial write — each at the moment the writer accepts it, under the writer
+/// lock, so the order here is the order at the PTY. Framing and the keypress
+/// behind a byte do not care who sent it: our CR ends the user's half-sent
+/// `ESC`, a multi-line payload's `ESC[201~` closes a paste the user left open,
+/// and a user's partial marker completed by our bytes is a marker. Origin
+/// decides only the draft bit (see [`crate::draft_deferral::DraftTracker`])
+/// and nothing about the #424 payload records, which only the USER's submit
+/// drains.
 #[derive(Default)]
-struct UserInputStream {
+struct PaneInputStream {
     /// How many bytes of a paste marker have matched so far.
     matched: usize,
     /// Once the fifth byte disambiguates, whether it is the START marker.
@@ -3498,16 +3512,21 @@ struct UserInputStream {
     draft: crate::draft_deferral::DraftTracker,
 }
 
-impl UserInputStream {
+impl PaneInputStream {
     /// Feed the user's bytes; `true` if any of them submits the input box.
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        self.feed_as(bytes, crate::draft_deferral::ByteOrigin::User)
+    }
+
+    /// Feed bytes `origin` wrote; `true` if any of them submits the input box.
     ///
     /// Every byte is fed, deliberately: this is a state machine, so a
     /// short-circuiting `any` would stop tracking paste state at the first
     /// terminator and mis-read the rest of the buffer.
-    fn feed(&mut self, bytes: &[u8]) -> bool {
+    fn feed_as(&mut self, bytes: &[u8], origin: crate::draft_deferral::ByteOrigin) -> bool {
         let mut submitted = false;
         for byte in bytes {
-            submitted |= self.feed_byte(*byte);
+            submitted |= self.feed_byte(*byte, origin);
         }
         submitted
     }
@@ -3518,32 +3537,11 @@ impl UserInputStream {
     /// decision just made and the paste framing as it stood BEFORE this byte —
     /// so the closing marker's bytes are paste content and the opening one's are
     /// not.
-    fn feed_byte(&mut self, byte: u8) -> bool {
+    fn feed_byte(&mut self, byte: u8, origin: crate::draft_deferral::ByteOrigin) -> bool {
         let in_paste = self.in_paste;
         let submits = self.scan_submit(byte);
-        self.draft.feed_byte(byte, submits, in_paste);
+        self.draft.feed_byte(byte, submits, in_paste, origin);
         submits
-    }
-
-    /// Issue #544: a SUBMIT write of ours landed in full, so its CR reached the
-    /// agent between two of the user's bytes. Outside a paste it submitted the
-    /// box, and it also ends whatever the user had half-sent: the escape
-    /// sequence the draft bit was parsing, a partially matched paste marker, and
-    /// the `ESC` a following `CR` would read as `Alt+Enter` — the agent now sees
-    /// our bytes in their place, so none of them can be completed by the user's
-    /// next write. All of it resets together, exactly as the user's own Enter
-    /// resets the draft bit's parser (PR #1398 finding #15 and its sweep).
-    ///
-    /// INSIDE a paste the user still has open, our CR is paste content and
-    /// submits nothing, so nothing resets: the box still holds the paste, and
-    /// the framing must stay open for the closing marker that is still coming.
-    fn note_daemon_submit(&mut self) {
-        if self.in_paste {
-            return;
-        }
-        self.draft.clear();
-        self.matched = 0;
-        self.preceding = Some(b'\r');
     }
 
     /// The submit half of [`Self::feed_byte`]: paste framing, then the keypress
@@ -3618,8 +3616,8 @@ struct PaneInputState {
     automatic: HashMap<String, AutomaticWrite>,
     /// Issue #424 S1: where each pane's user-input stream is, so that neither a
     /// newline inside a paste nor a newline KEY is read as a submission. See
-    /// [`UserInputStream`].
-    input: HashMap<String, UserInputStream>,
+    /// [`PaneInputStream`].
+    input: HashMap<String, PaneInputStream>,
 }
 
 /// A pane id the clocks deliberately ignore: empty, or one of the
@@ -3650,7 +3648,7 @@ impl PaneInputState {
     /// a byte. The user-input clock still advances, so the blind probe stays
     /// refused: the box the probe wanted to submit is gone either way.
     ///
-    /// Issue #424 S1: "a submission" is decided by [`UserInputStream`] — paste
+    /// Issue #424 S1: "a submission" is decided by [`PaneInputStream`] — paste
     /// framing here, the keypress behind the byte in
     /// [`crate::ui::user_byte_submits_input_box`] — and never by scanning for a
     /// raw CR/LF. A multi-line paste carries newlines the agent's editor STORES,
@@ -3785,16 +3783,25 @@ impl PaneInputState {
             .is_some_and(|stream| stream.in_paste || stream.draft.pending())
     }
 
-    /// Issue #544: a SUBMIT write of ours reached the PTY in full, so its CR
-    /// submitted whatever was in the box — the user's draft included — unless
-    /// the user had a paste open, where it is paste content (see
-    /// [`UserInputStream::note_daemon_submit`]). Without this, every automatic
-    /// write after a capped one would wait out a whole cap again for a draft
-    /// that is no longer there.
-    fn note_box_submitted(&mut self, pane_id_env: &str) {
-        if let Some(stream) = self.input.get_mut(pane_id_env) {
-            stream.note_daemon_submit();
+    /// Issue #544 (PR #1398 finding #16): bytes the DECK just wrote into
+    /// `pane_id_env`, fed into the same stream as the user's and in the same
+    /// order the PTY received them — see [`PaneInputStream`]. They move the
+    /// paste framing, the submit scan and the draft parser exactly as they
+    /// move the agent's own; a CR of ours that submits clears the draft bit,
+    /// and nothing of ours sets it.
+    ///
+    /// Deliberately NOT a user keystroke: no user-input clock is stamped, and a
+    /// submit here drains no #424 payload record — those guard a delivery
+    /// against the USER having typed or submitted since, and our own CR is
+    /// neither.
+    fn note_deck_bytes(&mut self, pane_id_env: &str, bytes: &[u8]) {
+        if is_sentinel_pane_id(pane_id_env) || bytes.is_empty() {
+            return;
         }
+        self.input
+            .entry(pane_id_env.to_string())
+            .or_default()
+            .feed_as(bytes, crate::draft_deferral::ByteOrigin::Deck);
     }
 
     /// Would a blind submit CR into `pane_id_env` submit something other than
@@ -3931,23 +3938,55 @@ impl PaneWriter {
         }
     }
 
-    /// Issue #544: record that a SUBMIT write of ours just landed in full, as
-    /// the writer that made it — a no-op once this writer's agent has left the
-    /// registry, like [`Self::note_automatic_write`]. See
-    /// [`PaneInputState::note_box_submitted`].
-    fn note_box_submitted(&self, pane_id_env: &str) {
-        let mut state = self.state.lock().unwrap();
-        if !self.retired.load(Ordering::SeqCst) {
-            state.note_box_submitted(pane_id_env);
-        }
-    }
-
     /// Write as the DAEMON: the bytes are ours, so they are not user input and
     /// must not advance the user-input clock. Every daemon-initiated write into
     /// a pane goes through here; everything that reaches the plain
     /// [`std::io::Write`] impl is somebody else typing.
-    fn daemon(&mut self) -> &mut (dyn std::io::Write + Send) {
-        &mut *self.inner
+    ///
+    /// Issue #544 (PR #1398 finding #16): the bytes are still fed into the
+    /// pane's input stream, as the deck's, at the moment the writer accepts
+    /// them — see [`DeckWrite`].
+    fn daemon(&mut self) -> DeckWrite<'_> {
+        DeckWrite { writer: self }
+    }
+}
+
+/// Issue #544 (PR #1398 finding #16): [`PaneWriter::daemon`]'s view of the
+/// writer. Each write goes to the PTY and then, for exactly the bytes the
+/// writer ACCEPTED, into the pane's input stream as the deck's
+/// ([`PaneInputState::note_deck_bytes`]) — under the writer the caller already
+/// holds, so no user byte can land between the write and its record.
+///
+/// "Accepted" is the only count there is: a partial write feeds the prefix
+/// that went in, and the erases [`drain_stranded_payload`] sends are fed like
+/// any other byte. Accepted is not proven delivered — a later flush can fail —
+/// so for those bytes the stream can run ahead of the PTY. Deck bytes never set
+/// the draft bit, so what that can cost is framing or a clear: a paste our
+/// partial write opened reads as open (first writes wait, up to the cap), or a
+/// CR the writer accepted and the PTY never received reads as a submit. The
+/// second is the judgement `PayloadDelivery::Applied` already makes: nothing
+/// after `write` tells an accepted one-byte CR from a delivered one.
+struct DeckWrite<'a> {
+    writer: &'a mut PaneWriter,
+}
+
+impl std::io::Write for DeckWrite<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.writer.inner.write(buf)?;
+        if written > 0
+            && let Some(pane_id) = self.writer.pane_id_env.as_deref()
+        {
+            let mut state = self.writer.state.lock().unwrap();
+            // Issue #542: checked under `state`'s lock — see [`PaneWriter::retired`].
+            if !self.writer.retired.load(Ordering::SeqCst) {
+                state.note_deck_bytes(pane_id, &buf[..written]);
+            }
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.inner.flush()
     }
 }
 
@@ -7489,7 +7528,7 @@ impl AgentPtyRegistry {
     ///
     /// * **the user submits.** A submission through [`PaneWriter`] drains the
     ///   input box, so nothing of ours is left in it to double
-    ///   ([`PaneInputState::note_user_bytes`] — decided by [`UserInputStream`],
+    ///   ([`PaneInputState::note_user_bytes`] — decided by [`PaneInputStream`],
     ///   because a newline inside a paste is editor content, and a newline KEY
     ///   is the user carrying on typing).
     /// * **the delivery reaches a terminal outcome.** The detached confirmation
@@ -9366,8 +9405,8 @@ impl AgentPtyRegistry {
             });
         }
         let delivery = match mode {
-            SubmitMode::Submit => deliver_payload_and_submit(w.daemon(), &payload).await,
-            SubmitMode::Notice => deliver_payload_as_notice(w.daemon(), &payload).await,
+            SubmitMode::Submit => deliver_payload_and_submit(&mut w.daemon(), &payload).await,
+            SubmitMode::Notice => deliver_payload_as_notice(&mut w.daemon(), &payload).await,
         };
         match delivery {
             // Issue #424 F1: bytes of OURS are now in this pane, which is what
@@ -9376,17 +9415,14 @@ impl AgentPtyRegistry {
             // (partial) case too — something of ours landed there, and a partial
             // write is the case where a replacement is most tempting and most
             // dangerous.
+            //
+            // Issue #544: what our bytes did to the user's draft is already
+            // recorded — [`PaneWriter::daemon`] fed each of them into the pane's
+            // input stream as it was accepted, so a CR of ours that submitted
+            // the box has cleared the draft bit, and one that landed inside a
+            // paste the user still has open has not.
             PayloadDelivery::Applied => {
                 w.note_automatic_write(pane_id, mode, &payload);
-                // Issue #544: our CR submitted the whole box (unless the user
-                // has a paste open, where it is content — the stream decides),
-                // so nothing the user typed is waiting in it any more. Only a SUBMIT that
-                // landed in full says so: a Notice leaves its bytes (and the
-                // draft) in the box, and an ambiguous write may not have sent
-                // its CR at all.
-                if matches!(mode, SubmitMode::Submit) {
-                    w.note_box_submitted(pane_id);
-                }
                 finish(GuardedSend::Applied, deferred)
             }
             // Issue #876: an ambiguous write is recorded only while bytes of
@@ -13048,7 +13084,7 @@ mod tests {
             // separate writes, and the classification must not depend on how
             // the frame was chopped up.
             for split in 0..=frame.len() {
-                let mut stream = UserInputStream::default();
+                let mut stream = PaneInputStream::default();
                 let mut submitted = stream.feed(&frame[..split]);
                 submitted |= stream.feed(&frame[split..]);
                 assert_eq!(
@@ -13111,7 +13147,7 @@ mod tests {
         ];
 
         for (bytes, expected, why) in cases {
-            let mut stream = UserInputStream::default();
+            let mut stream = PaneInputStream::default();
             assert_eq!(
                 stream.feed(bytes),
                 expected,
@@ -18731,7 +18767,7 @@ mod spawn_tests {
     /// other — including when a marker or a report is split across writes.
     #[test]
     fn draft_bit_shares_the_stream_with_paste_framing() {
-        let mut stream = UserInputStream::default();
+        let mut stream = PaneInputStream::default();
         assert!(
             !stream.feed(b"\x1b[<64;10;5M\x1b[I"),
             "reports submit nothing"
@@ -18761,7 +18797,7 @@ mod spawn_tests {
     /// framing, counts it: the two agree that only `ESC[201~` ends the paste.
     #[test]
     fn a_pasted_opening_marker_is_a_draft_and_leaves_the_paste_open() {
-        let mut stream = UserInputStream::default();
+        let mut stream = PaneInputStream::default();
         assert!(!stream.feed(b"\x1b[200~\x1b[200~"));
         assert!(stream.in_paste, "a nested opening marker left the paste");
         assert!(stream.draft.pending(), "a pasted ESC[200~ is not a draft");
@@ -18822,7 +18858,7 @@ mod spawn_tests {
         const PANE: &str = "issue-544-submit-in-paste";
         let mut state = PaneInputState::default();
         state.note_user_bytes(PANE, b"\x1b[200~abc");
-        state.note_box_submitted(PANE);
+        state.note_deck_bytes(PANE, b"PAYLOAD\r");
         state.note_user_bytes(PANE, b"\x1b[201~");
         assert!(
             state.draft_pending(PANE),
@@ -18839,7 +18875,7 @@ mod spawn_tests {
         const PANE: &str = "issue-544-esc-then-submit";
         let mut state = PaneInputState::default();
         state.note_user_bytes(PANE, b"\x1b");
-        state.note_box_submitted(PANE);
+        state.note_deck_bytes(PANE, b"PAYLOAD\r");
         state.note_user_bytes(PANE, b"\r");
         assert!(
             !state.draft_pending(PANE),
@@ -18856,11 +18892,111 @@ mod spawn_tests {
         const PANE: &str = "issue-544-submit-mid-marker";
         let mut state = PaneInputState::default();
         state.note_user_bytes(PANE, b"\x1b[20");
-        state.note_box_submitted(PANE);
+        state.note_deck_bytes(PANE, b"PAYLOAD\r");
         state.note_user_bytes(PANE, b"0~abc\r");
         assert!(
             !state.draft_pending(PANE),
             "the user's Enter was read as a newline inside a paste nobody opened"
+        );
+    }
+
+    /// PR #1398 finding #16, one stream: a deck write inside a paste the user
+    /// still has open. A single-line payload and its CR are paste content, so
+    /// the paste stays open and nothing is submitted; a multi-line NOTICE's own
+    /// closing marker ends the paste, after which the user's Enter submits.
+    #[test]
+    fn deck_writes_inside_an_open_user_paste() {
+        const PANE: &str = "issue-544-deck-in-paste";
+        let mut state = PaneInputState::default();
+        state.note_user_bytes(PANE, b"\x1b[200~abc");
+        state.note_deck_bytes(PANE, b"PAYLOAD\r");
+        assert!(state.input[PANE].in_paste, "our CR is paste content");
+        state.note_user_bytes(PANE, b"def\x1b[201~");
+        assert!(state.draft_pending(PANE), "the paste is still in the box");
+        state.note_user_bytes(PANE, b"\r");
+        assert!(!state.draft_pending(PANE), "the user's Enter submits it");
+
+        let mut state = PaneInputState::default();
+        state.note_user_bytes(PANE, b"\x1b[200~abc");
+        state.note_deck_bytes(PANE, b"\x1b[200~one\ntwo\x1b[201~\n");
+        assert!(!state.input[PANE].in_paste, "our closing marker ended it");
+        assert!(state.draft_pending(PANE), "a notice submits nothing");
+        state.note_user_bytes(PANE, b"\r");
+        assert!(
+            !state.draft_pending(PANE),
+            "the user's Enter after our notice closed the paste is a submit"
+        );
+    }
+
+    /// PR #1398 finding #16, one stream: a deck write right after a lone user
+    /// `ESC`. A lone Escape keypress is not a draft, so neither a multi-line
+    /// submit nor a multi-line notice written after it leaves one; the
+    /// notice's paste is closed by its own marker; and the user's typing
+    /// afterwards is read afresh.
+    #[test]
+    fn deck_writes_after_a_lone_user_escape() {
+        const PANE: &str = "issue-544-deck-after-esc";
+        for (deck, why) in [
+            (&b"\x1b[200~one\ntwo\x1b[201~\r"[..], "a multi-line submit"),
+            (b"\x1b[200~one\ntwo\x1b[201~\n", "a multi-line notice"),
+            (b"NOTICE\n", "a single-line notice"),
+        ] {
+            let mut state = PaneInputState::default();
+            state.note_user_bytes(PANE, b"\x1b");
+            state.note_deck_bytes(PANE, deck);
+            assert!(!state.input[PANE].in_paste, "{why}: paste left open");
+            assert!(
+                !state.draft_pending(PANE),
+                "{why}: a lone Escape is a draft"
+            );
+            state.note_user_bytes(PANE, b"]abc");
+            assert!(state.draft_pending(PANE), "{why}: later typing is a draft");
+            state.note_user_bytes(PANE, b"\r");
+            assert!(!state.draft_pending(PANE), "{why}: the Enter submits");
+        }
+    }
+
+    /// PR #1398 finding #16, one stream: user bytes split around a deck write.
+    /// The PTY sees them in that order, so the model does too — a draft typed
+    /// around our notice is one draft, a user CSI completed by our byte is a
+    /// key, and a paste marker our partial write left half-sent is completed
+    /// by the user's next bytes exactly as the agent's parser completes it.
+    #[test]
+    fn user_bytes_split_around_a_deck_write() {
+        const PANE: &str = "issue-544-split-around-deck";
+        let mut state = PaneInputState::default();
+        state.note_user_bytes(PANE, b"dra");
+        state.note_deck_bytes(PANE, b"NOTICE\n");
+        state.note_user_bytes(PANE, b"ft");
+        assert!(state.draft_pending(PANE), "the draft around our notice");
+        state.note_user_bytes(PANE, b"\r");
+        assert!(!state.draft_pending(PANE));
+
+        let mut state = PaneInputState::default();
+        state.note_user_bytes(PANE, b"\x1b[200~ab");
+        state.note_deck_bytes(PANE, b"NOTICE\n");
+        state.note_user_bytes(PANE, b"c\x1b[201~");
+        assert!(!state.input[PANE].in_paste);
+        assert!(state.draft_pending(PANE), "the paste around our notice");
+
+        let mut state = PaneInputState::default();
+        state.note_user_bytes(PANE, b"\x1b[");
+        state.note_deck_bytes(PANE, b"NOTICE\n");
+        assert!(
+            state.draft_pending(PANE),
+            "the user's half-sent key, completed by our byte, is an edit"
+        );
+
+        // An ambiguous write of ours that stopped inside its own opening
+        // marker: the user's next bytes complete it.
+        let mut state = PaneInputState::default();
+        state.note_deck_bytes(PANE, b"\x1b[20");
+        assert!(!state.draft_pending(PANE));
+        state.note_user_bytes(PANE, b"0~abc\r");
+        assert!(state.input[PANE].in_paste, "the marker completed");
+        assert!(
+            state.draft_pending(PANE),
+            "the user's Enter inside the paste is content"
         );
     }
 
@@ -18931,6 +19067,74 @@ mod spawn_tests {
             GuardedSend::Applied
         );
         assert!(!registry.draft_pending(PANE), "our CR submitted the box");
+        registry.shutdown_all();
+    }
+
+    /// PR #1398 finding #16: a multi-line payload of ours is framed in its own
+    /// `ESC[200~` … `ESC[201~`. Written at the cap into a paste the user still
+    /// has open, its closing marker ends that paste for the agent, and its CR
+    /// then submits the box. The user's next Enter is therefore a plain Enter
+    /// that submits, and the next first write must not wait for a draft that
+    /// is no longer there.
+    #[tokio::test]
+    async fn a_capped_multiline_write_closes_the_users_open_paste() {
+        use std::io::Write as _;
+        const PANE: &str = "issue-544-capped-paste";
+        const CAP: Duration = Duration::from_millis(300);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let type_bytes = |bytes: &'static [u8]| {
+            let registry = Arc::clone(&registry);
+            let agent = agent.clone();
+            async move {
+                let handle = registry.subscribe(&agent).expect("attach");
+                let mut writer = handle.writer.lock().await;
+                writer.write_all(bytes).expect("type");
+            }
+        };
+        type_bytes(b"\x1b[200~abc").await;
+        assert!(registry.draft_pending(PANE), "the control");
+        let capped = registry
+            .write_and_submit_guarded_first_write_capped(
+                PANE,
+                "ISSUE-544-LINE-ONE\nISSUE-544-LINE-TWO",
+                &agent,
+                || async { true },
+                Instant::now(),
+                CAP,
+            )
+            .await
+            .expect("capped write");
+        assert_eq!(capped, GuardedSend::Applied);
+
+        type_bytes(b"\r").await;
+        assert!(
+            !registry.draft_pending(PANE),
+            "the user's Enter after our paste closed was read as paste content"
+        );
+        let started = Instant::now();
+        let next = registry
+            .write_and_submit_guarded_first_write_capped(
+                PANE,
+                "ISSUE-544-NEXT",
+                &agent,
+                || async { true },
+                Instant::now(),
+                CAP,
+            )
+            .await
+            .expect("next write");
+        assert_eq!(next, GuardedSend::Applied);
+        assert!(
+            started.elapsed() < CAP,
+            "the next first write waited for a draft the agent already submitted"
+        );
         registry.shutdown_all();
     }
 

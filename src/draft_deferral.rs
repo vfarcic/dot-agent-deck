@@ -10,9 +10,10 @@
 //! is refused once the user has typed since); this module is the first-write
 //! half.
 //!
-//! The daemon cannot see an agent's input box, but it does see every byte a
-//! deck client forwards into it (`PaneWriter`'s `Write` impl in
-//! [`crate::agent_pty`]). So it keeps one bit per pane — [`DraftTracker`]: "the
+//! The daemon cannot see an agent's input box, but it does see every byte that
+//! reaches it: what a deck client forwards (`PaneWriter`'s `Write` impl in
+//! [`crate::agent_pty`]) and what the daemon writes itself. So it keeps one bit
+//! per pane — [`DraftTracker`]: "the
 //! user has sent input since their last submit or clear" — and a first write
 //! consults it through [`decide_first_write`]: while the bit is set the write
 //! WAITS, re-checking about every [`DRAFT_POLL_INTERVAL`], until the user
@@ -189,18 +190,18 @@ const MAX_CSI_LEN: u8 = 32;
 const MAX_STRING_LEN: u16 = 4096;
 
 /// Issue #544: "has the user sent input into this pane since their last submit
-/// or clear?", decided from the bytes a deck client forwards.
+/// or clear?", decided from the pane's input stream.
 ///
-/// **Sets it:** every byte that is not part of a recognised terminal REPORT —
+/// **Sets it:** every USER byte that is not part of a recognised terminal REPORT —
 /// printable text and UTF-8, arrows and other navigation keys (editing a
 /// history-recalled prompt is editing a draft), `Backspace`, `Tab`, `LF`
 /// (`Ctrl+J`), `ESC CR` (`Alt+Enter`), `Shift+Enter`'s `ESC[13;2u`, and
 /// anything inside a bracketed paste.
 ///
-/// **Clears it:** a byte that SUBMITS the input box, as decided by the caller
-/// (`crate::agent_pty`'s paste framing plus
-/// [`crate::ui::user_byte_submits_input_box`]), and outside a paste `Ctrl+U`
-/// (`0x15`, line-kill) and `Ctrl+C` (`0x03`). Both clear keys are
+/// **Clears it:** a byte that SUBMITS the input box, whoever sent it, as
+/// decided by the caller (`crate::agent_pty`'s paste framing plus
+/// [`crate::ui::user_byte_submits_input_box`]), and outside a paste the user's
+/// `Ctrl+U` (`0x15`, line-kill) and `Ctrl+C` (`0x03`). Both clear keys are
 /// approximations — `Ctrl+U` kills only the current line of a multi-line
 /// draft in Claude Code — and an approximation here can only let a draft
 /// through as before, never hold a prompt past the cap.
@@ -219,10 +220,45 @@ const MAX_STRING_LEN: u16 = 4096;
 ///
 /// State is carried across calls, so a report split between two writes is
 /// still recognised.
+///
+/// **One stream, two senders** (PR #1398 finding #16). The pane's PTY reads
+/// ONE byte stream: the user's keystrokes and the deck's own writes, in the
+/// order they were written. The parser here, like `crate::agent_pty`'s paste
+/// framing, is fed all of it, because a deck write moves the agent's parser
+/// exactly as a keystroke does — its CR ends a half-sent sequence, its own
+/// paste markers open and close a paste. [`ByteOrigin`] decides only what a
+/// byte does to the BIT: a user byte of content sets it, a deck byte never
+/// does, and a byte that submits clears it whoever sent it. The clear keys
+/// (`Ctrl+U`, `Ctrl+C`) clear it only from the user; the deck never sends
+/// them, and if it did, keeping the bit is the bounded direction.
+///
+/// A sequence is input on behalf of whoever sent its bytes after the `ESC`:
+/// a lone `ESC` followed by a deck byte is the user's Escape key and the
+/// deck's text, so it sets nothing, while a user's `Alt+]` and the text they
+/// kept typing still count when a deck byte is what ends the would-be reply.
 #[derive(Debug, Default)]
 pub(crate) struct DraftTracker {
     pending: bool,
     escape: Escape,
+    /// Whether a USER byte is part of the sequence being parsed — the `ESC`
+    /// that opened it included. Meaningless in [`Escape::Ground`].
+    seq_user: bool,
+    /// Whether the byte being fed is the user's. Set for each byte by
+    /// [`Self::feed_byte`].
+    by_user: bool,
+    /// Set by [`Self::ground`] when this byte opened a NEW sequence, whose
+    /// sender is this byte's alone.
+    fresh: bool,
+}
+
+/// Who wrote a byte into a pane's PTY input. See [`DraftTracker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ByteOrigin {
+    /// Forwarded from an attached deck client: the user typing.
+    User,
+    /// Written by the daemon itself: a payload, its paste framing, its CR or
+    /// LF, or the erases that take a partial write back out.
+    Deck,
 }
 
 impl DraftTracker {
@@ -230,27 +266,48 @@ impl DraftTracker {
         self.pending
     }
 
-    /// Our own `Applied` SUBMIT write sent a CR, which submitted whatever was
-    /// in the box — the user's draft included. A hard reset exactly like the
-    /// user's own Enter in [`Self::feed_byte`]: a partial sequence left in the
-    /// parser (a lone `ESC`) is over too, or the user's next `]` would continue
-    /// it and swallow their typing as an OSC report (PR #1398 finding #15).
-    pub(crate) fn clear(&mut self) {
-        self.pending = false;
-        self.escape = Escape::Ground;
-    }
-
-    /// Feed one user byte. `submits` is whether it submitted the input box and
-    /// `in_paste` whether it arrived inside a bracketed paste — both decided by
-    /// the caller's stream state, which owns paste framing.
-    pub(crate) fn feed_byte(&mut self, byte: u8, submits: bool, in_paste: bool) {
+    /// Feed one byte of the pane's input stream. `submits` is whether it
+    /// submitted the input box and `in_paste` whether it arrived inside a
+    /// bracketed paste — both decided by the caller's stream state, which owns
+    /// paste framing — and `origin` who wrote it.
+    pub(crate) fn feed_byte(
+        &mut self,
+        byte: u8,
+        submits: bool,
+        in_paste: bool,
+        origin: ByteOrigin,
+    ) {
         if submits {
-            // Enter is a hard reset: whatever sequence was being parsed is over.
+            // Enter is a hard reset, whoever pressed it: the box was
+            // submitted, and whatever sequence was being parsed is over.
             self.pending = false;
             self.escape = Escape::Ground;
             return;
         }
-        self.escape = self.step(byte, in_paste);
+        self.by_user = origin == ByteOrigin::User;
+        self.fresh = false;
+        let next = self.step(byte, in_paste);
+        match next {
+            Escape::Ground => self.seq_user = false,
+            _ if self.fresh => {}
+            _ => self.seq_user |= self.by_user,
+        }
+        self.escape = next;
+    }
+
+    /// The byte being fed is input: set the bit if the user sent it.
+    fn input_byte(&mut self) {
+        self.pending |= self.by_user;
+    }
+
+    /// The sequence parsed so far, WITHOUT the byte being fed, is input.
+    fn input_sequence(&mut self) {
+        self.pending |= self.seq_user;
+    }
+
+    /// The sequence up to and including the byte being fed is input.
+    fn input_through(&mut self) {
+        self.pending |= self.seq_user || self.by_user;
     }
 
     fn step(&mut self, byte: u8, in_paste: bool) -> Escape {
@@ -270,7 +327,7 @@ impl DraftTracker {
                 // Pasted content after all: count the ESC and read this byte
                 // afresh, still inside the paste.
                 _ => {
-                    self.pending = true;
+                    self.input_sequence();
                     self.ground(byte, in_paste)
                 }
             },
@@ -287,13 +344,17 @@ impl DraftTracker {
                 b'P' => Escape::Dcs { len: 0, esc: false },
                 b'O' => Escape::Ss3,
                 // The first ESC was a key of its own; this one starts afresh.
+                // Counted only when the user is the one who went on typing:
+                // a lone Escape keypress followed by a deck write edits
+                // nothing of theirs.
                 ESC => {
-                    self.pending = true;
-                    Escape::Esc { paste: false }
+                    self.input_byte();
+                    self.ground(byte, in_paste)
                 }
-                // `Alt+<key>`, `Alt+Enter`, `Alt+Backspace`: an edit.
+                // `Alt+<key>`, `Alt+Enter`, `Alt+Backspace`: an edit, and the
+                // key's sender is the one who made it.
                 _ => {
-                    self.pending = true;
+                    self.input_byte();
                     Escape::Ground
                 }
             },
@@ -307,7 +368,7 @@ impl DraftTracker {
             } => match byte {
                 0x30..=0x3f => {
                     if len >= MAX_CSI_LEN {
-                        self.pending = true;
+                        self.input_through();
                         return Escape::Ground;
                     }
                     let is_private = !params && matches!(byte, b'<' | b'=' | b'>' | b'?');
@@ -330,7 +391,7 @@ impl DraftTracker {
                     // Bounded like the parameter bytes above: past the bound
                     // this is input, not a report the deck knows.
                     if len >= MAX_CSI_LEN {
-                        self.pending = true;
+                        self.input_through();
                         return Escape::Ground;
                     }
                     Escape::Csi {
@@ -359,7 +420,7 @@ impl DraftTracker {
                         return Escape::Ground;
                     }
                     if paste {
-                        self.pending = true;
+                        self.input_through();
                         return Escape::Ground;
                     }
                     if !params && byte == b'M' {
@@ -370,19 +431,19 @@ impl DraftTracker {
                         || (dollar && byte == b'y')
                         || (!params && matches!(byte, b'I' | b'O'));
                     if !report {
-                        self.pending = true;
+                        self.input_through();
                     }
                     Escape::Ground
                 }
                 // Not a CSI after all: count what was sent as input and read
                 // this byte afresh.
                 _ => {
-                    self.pending = true;
+                    self.input_sequence();
                     self.ground(byte, in_paste)
                 }
             },
             Escape::Ss3 => {
-                self.pending = true;
+                self.input_through();
                 Escape::Ground
             }
             Escape::Osc { len, esc } | Escape::Dcs { len, esc } => {
@@ -408,11 +469,11 @@ impl DraftTracker {
                     BEL if is_osc => Escape::Ground,
                     // A control byte inside a reply means it was never one.
                     0x00..=0x1f => {
-                        self.pending = true;
+                        self.input_sequence();
                         self.ground(byte, in_paste)
                     }
                     _ if len >= MAX_STRING_LEN => {
-                        self.pending = true;
+                        self.input_through();
                         Escape::Ground
                     }
                     _ => next(len + 1, false),
@@ -433,14 +494,21 @@ impl DraftTracker {
     fn ground(&mut self, byte: u8, in_paste: bool) -> Escape {
         match byte {
             // Inside a paste an ESC is content — unless it opens the closing
-            // marker, which `Escape::Esc { paste: true }` decides.
-            0x1b => Escape::Esc { paste: in_paste },
+            // marker, which `Escape::Esc { paste: true }` decides. Either way
+            // it opens a sequence of its own, sent by whoever sent it.
+            0x1b => {
+                self.seq_user = self.by_user;
+                self.fresh = true;
+                Escape::Esc { paste: in_paste }
+            }
             0x15 | 0x03 if !in_paste => {
-                self.pending = false;
+                if self.by_user {
+                    self.pending = false;
+                }
                 Escape::Ground
             }
             _ => {
-                self.pending = true;
+                self.input_byte();
                 Escape::Ground
             }
         }
@@ -452,10 +520,15 @@ mod tests {
     use super::*;
 
     fn feed(tracker: &mut DraftTracker, bytes: &[u8]) {
+        feed_as(tracker, bytes, ByteOrigin::User);
+    }
+
+    /// [`feed`] for bytes `origin` wrote, outside any paste.
+    fn feed_as(tracker: &mut DraftTracker, bytes: &[u8], origin: ByteOrigin) {
         let mut preceding = None;
         for &byte in bytes {
             let submits = crate::ui::user_byte_submits_input_box(preceding, byte);
-            tracker.feed_byte(byte, submits, false);
+            tracker.feed_byte(byte, submits, false, origin);
             preceding = Some(byte);
         }
     }
@@ -656,7 +729,7 @@ mod tests {
     fn inside_a_paste_every_byte_is_content() {
         let mut tracker = DraftTracker::default();
         for &byte in b"\x15\x03\x1b" {
-            tracker.feed_byte(byte, false, true);
+            tracker.feed_byte(byte, false, true, ByteOrigin::User);
             assert!(tracker.pending(), "{byte:#x}");
         }
     }
@@ -666,13 +739,13 @@ mod tests {
     /// opening marker is outside the paste and the closing one inside it.
     fn feed_paste(tracker: &mut DraftTracker, bytes: &[u8]) {
         for &byte in b"\x1b[200~" {
-            tracker.feed_byte(byte, false, false);
+            tracker.feed_byte(byte, false, false, ByteOrigin::User);
         }
         for &byte in bytes {
-            tracker.feed_byte(byte, false, true);
+            tracker.feed_byte(byte, false, true, ByteOrigin::User);
         }
         for &byte in b"\x1b[201~" {
-            tracker.feed_byte(byte, false, true);
+            tracker.feed_byte(byte, false, true, ByteOrigin::User);
         }
     }
 
@@ -692,7 +765,7 @@ mod tests {
         ];
         for (chunk, in_paste) in chunks {
             for &byte in chunk {
-                tracker.feed_byte(byte, false, in_paste);
+                tracker.feed_byte(byte, false, in_paste, ByteOrigin::User);
             }
         }
         assert!(!tracker.pending(), "a split empty paste set the bit");
@@ -758,12 +831,57 @@ mod tests {
         assert!(!pending_after(b"\x1b[201~"));
     }
 
+    /// Our own SUBMIT write is payload + CR, fed as the deck's bytes: the
+    /// payload sets nothing and the CR submits the box, the user's draft
+    /// included.
     #[test]
     fn our_own_submit_clears_the_bit() {
         let mut tracker = DraftTracker::default();
         feed(&mut tracker, b"draft");
-        tracker.clear();
+        feed_as(&mut tracker, b"PAYLOAD", ByteOrigin::Deck);
+        assert!(tracker.pending(), "our payload does not clear the draft");
+        feed_as(&mut tracker, b"\r", ByteOrigin::Deck);
         assert!(!tracker.pending());
+    }
+
+    /// PR #1398 finding #16: the deck's bytes move the parser but never set
+    /// the bit — neither as text nor as paste content nor as a newline.
+    #[test]
+    fn deck_bytes_never_set_the_bit() {
+        for bytes in [
+            &b"PAYLOAD"[..],
+            b"PAYLOAD\n",
+            b"\x1b[200~one\ntwo\x1b[201~",
+            b"\x7f\x7f",
+        ] {
+            let mut tracker = DraftTracker::default();
+            feed_as(&mut tracker, bytes, ByteOrigin::Deck);
+            assert!(!tracker.pending(), "{bytes:?}");
+        }
+    }
+
+    /// PR #1398 finding #16: a sequence the user began and a deck byte ended
+    /// is decided by who sent the bytes after the `ESC`. A lone Escape and
+    /// then our text is not a draft; `Alt+]` and the text the user kept typing
+    /// is one, even though our LF is what ended the would-be reply.
+    #[test]
+    fn a_users_sequence_ended_by_a_deck_byte_counts_only_the_users_part() {
+        let mut tracker = DraftTracker::default();
+        feed(&mut tracker, b"\x1b");
+        feed_as(&mut tracker, b"NOTICE\n", ByteOrigin::Deck);
+        assert!(!tracker.pending(), "a lone Escape before our notice");
+
+        let mut tracker = DraftTracker::default();
+        feed(&mut tracker, b"\x1b]typed");
+        assert!(!tracker.pending(), "still a would-be reply");
+        feed_as(&mut tracker, b"NOTICE\n", ByteOrigin::Deck);
+        assert!(tracker.pending(), "the user's Alt+] and text were dropped");
+
+        // A deck `Ctrl+U` is not the user clearing their draft.
+        let mut tracker = DraftTracker::default();
+        feed(&mut tracker, b"draft");
+        feed_as(&mut tracker, b"\x15", ByteOrigin::Deck);
+        assert!(tracker.pending());
     }
 
     /// Sweep (PR #1398): CSI intermediate bytes are bounded like parameter
@@ -780,12 +898,13 @@ mod tests {
 
     /// PR #1398 finding #15: a daemon submit resets the escape parser exactly
     /// as a user submit does, so a stale lone `ESC` cannot turn later typing
-    /// into an OSC report.
+    /// into an OSC report. Since finding #16 that is the parser reading our
+    /// bytes rather than a reset of its own.
     #[test]
     fn a_daemon_submit_resets_a_stale_escape_prefix() {
         let mut tracker = DraftTracker::default();
         feed(&mut tracker, b"\x1b");
-        tracker.clear();
+        feed_as(&mut tracker, b"PAYLOAD\r", ByteOrigin::Deck);
         feed(&mut tracker, b"]abc");
         assert!(tracker.pending(), "typing after a daemon submit is a draft");
     }
