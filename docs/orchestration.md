@@ -718,7 +718,7 @@ When `.dot-agent-deck/work-done-<role>.md` cannot be written (for example, the `
 
 ### The report went to a different file than `work-done-<role>.md`
 
-If a file the deck did not write is already at `.dot-agent-deck/work-done-<role>.md` — usually because the worker saved its own report there — the deck leaves that file exactly as it is, saves the report to a new file in the same `.dot-agent-deck` directory, and tells the orchestrator both where the report is and that the existing file was left alone, since it may hold more of the worker's report. To avoid this, have workers save their reports under another name; the reporting instructions the deck gives them already suggest one.
+If a file the deck did not write is already at `.dot-agent-deck/work-done-<role>.md` — usually because the worker saved its own report there — the deck leaves that file exactly as it is, saves the report to a new file in the same `.dot-agent-deck` directory, and tells the orchestrator both where the report is and that the existing file was left alone, since it may hold more of the worker's report. That message arrives in the orchestrator's pane, the same way any other work-done report does, in the TUI and in the desktop app alike. To avoid this, have workers save their reports under another name; the reporting instructions the deck gives them already suggest one.
 
 ### Prompt template is not being applied
 

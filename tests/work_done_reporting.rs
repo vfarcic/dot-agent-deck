@@ -1337,7 +1337,7 @@ fn all_named_report_paths(
         .collect()
 }
 
-/// Scenario: Delegate to `coder` twice and have it report each time, so the daemon writes `.dot-agent-deck/work-done-coder.md` and then replaces its own file as before. Then have the worker write its own detailed report to that same path and report `work-done` with only a brief summary, and after that write a second report there and hand that very file to `work-done` as its report, the way `--task-file` does. Both times the worker's file must survive byte-for-byte, and the orchestrator must be told the report was saved elsewhere, name the file that holds it, and be told the file at the role-keyed path was left alone.
+/// Scenario: Delegate to `coder` twice and have it report each time, so the daemon writes `.dot-agent-deck/work-done-coder.md` and then replaces its own file as before. Then have the worker write its own detailed report to that same path and report `work-done` with only a brief summary; write a second report there and hand that very file to `work-done` as its report, the way `--task-file` does; and write a third one in the deck's own frame-marker format before a brief summary. Each time the worker's file must survive byte-for-byte, and the orchestrator must be told the report was saved elsewhere, name the file that holds it, and be told the file at the role-keyed path was left alone.
 #[spec("orchestration/work-done/011")]
 #[test]
 fn work_done_011_a_worker_report_at_the_summary_path_is_kept() {
@@ -1383,9 +1383,14 @@ fn work_done_011_a_worker_report_at_the_summary_path_is_kept() {
         // The same file handed to `work-done` AS its report, which is exactly what
         // `work-done --task-file .dot-agent-deck/work-done-coder.md` sends.
         let own_file = "# Second review\n\n- finding: task-file-is-the-output-9b04\n";
+        // The worker copies the deck's own report format, frame markers and all,
+        // for a longer report (Greptile P1 on #1438) — still not the deck's bytes.
+        let framed = "[UNTRUSTED-WORKER-REPORT:\n# Third review\n- BLOCKER: \
+                      framed-by-the-worker-2f81\n:END-UNTRUSTED-WORKER-REPORT]\n";
         for (round, parked, summary) in [
             (1, detailed, brief.to_string()),
             (2, own_file, own_file.to_string()),
+            (3, framed, brief.to_string()),
         ] {
             std::fs::write(harness.summary_path(), parked).expect("the worker writes its report");
             harness.delegate().await;

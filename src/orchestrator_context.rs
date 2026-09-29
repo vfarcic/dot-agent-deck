@@ -2188,7 +2188,14 @@ fn write_coordination_file_as(
         // first, and a declined file must come out of this untouched.
         Overwrite::ReplaceIf(_) => options.create(true).read(true).write(true),
     };
-    crate::platform::fsperm::set_create_mode_owner_only(&mut options);
+    // Issue #331: the guarded replace reads the file before rewriting it, and on
+    // Windows the owner-only create mode replaces the handle's whole access mask,
+    // so `.read(true)` alone would be dropped there.
+    if matches!(overwrite, Overwrite::ReplaceIf(_)) {
+        crate::platform::fsperm::set_create_mode_owner_only_readable(&mut options);
+    } else {
+        crate::platform::fsperm::set_create_mode_owner_only(&mut options);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;

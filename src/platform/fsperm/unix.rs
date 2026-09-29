@@ -382,6 +382,14 @@ pub fn set_create_mode_owner_only(opts: &mut std::fs::OpenOptions) {
     opts.mode(0o600);
 }
 
+/// [`set_create_mode_owner_only`] for a caller that also reads through the
+/// handle. On Unix the mode says nothing about the handle's access, which
+/// `.read(true)` already sets, so the two are the same; the Windows counterpart
+/// is where they differ (issue #331).
+pub fn set_create_mode_owner_only_readable(opts: &mut std::fs::OpenOptions) {
+    set_create_mode_owner_only(opts);
+}
+
 /// Re-assert owner-only (0o600) permissions on an already-open file. Defense in
 /// depth: if a stale temp file from a crashed previous save existed,
 /// `OpenOptions::mode()` would NOT have re-applied the bits, so re-set them

@@ -7191,8 +7191,10 @@ enum SummaryWrite {
 /// with a brief summary, or hand this very file to `work-done --task-file`.
 /// Either way the unconditional write used to replace the worker's file, and
 /// the first measured instance lost six review findings with nothing saying so.
-/// The file is replaced only when it is empty or holds a report the deck could
-/// have written ([`is_daemon_framed_report`]); anything else is left alone and
+/// The file is replaced only when it is empty or is still exactly the report
+/// this daemon process last wrote there ([`is_this_daemons_summary`]; after a
+/// restart, with no such record, one whose first and last lines are the frame
+/// markers); anything else is left alone and
 /// reported as [`SummaryWrite::Occupied`], so the caller can save the report
 /// under a fresh name instead. The check reads the file at the destination
 /// rather than comparing the `--task-file` path with it, which is why it needs
@@ -7220,16 +7222,22 @@ fn write_work_done_summary(
         return SummaryWrite::Failed;
     };
     let file_name = format!("work-done-{safe_role}.md");
+    let path =
+        crate::orchestrator_context::context_dir_of(std::path::Path::new(cwd)).join(&file_name);
+    let content = frame_untrusted_report_for_file(summary);
     // Issue #329 §1: owner-only, directory and file — a worker's report is as
     // sensitive as the task that produced it, and this pair used to land at 0664.
     // Issue #509: framed as untrusted worker-authored text, in full.
     match crate::orchestrator_context::replace_coordination_file_if(
         std::path::Path::new(cwd),
         &file_name,
-        &frame_untrusted_report_for_file(summary),
-        &mut is_daemon_framed_report,
+        &content,
+        &mut |file| is_this_daemons_summary(&path, file),
     ) {
-        Ok(crate::orchestrator_context::GuardedReplace::Written(_)) => SummaryWrite::Written,
+        Ok(crate::orchestrator_context::GuardedReplace::Written(written)) => {
+            written_summaries().insert(written, SummaryFingerprint::of(content.as_bytes()));
+            SummaryWrite::Written
+        }
         Ok(crate::orchestrator_context::GuardedReplace::Kept(_)) => {
             tracing::info!(
                 file = %file_name,
@@ -7255,9 +7263,122 @@ fn write_work_done_summary(
     }
 }
 
+/// Issue #331 (Greptile P1 on #1438): the length and hash of a summary this
+/// process wrote. Equality is the whole use, so std's hasher is enough: the
+/// question is "are these still the bytes I wrote", asked of files in the
+/// operator's own project, not a defence against a crafted collision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SummaryFingerprint {
+    len: u64,
+    hash: u64,
+}
+
+impl SummaryFingerprint {
+    fn of(bytes: &[u8]) -> Self {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        Self {
+            len: bytes.len() as u64,
+            hash: hasher.finish(),
+        }
+    }
+}
+
+/// What this daemon process last wrote at each summary path. Process memory
+/// only, so a restarted daemon starts with no record and falls back to
+/// [`is_daemon_framed_report`] for a path until it writes there again.
+fn written_summaries()
+-> std::sync::MutexGuard<'static, HashMap<std::path::PathBuf, SummaryFingerprint>> {
+    static WRITTEN: std::sync::LazyLock<
+        std::sync::Mutex<HashMap<std::path::PathBuf, SummaryFingerprint>>,
+    > = std::sync::LazyLock::new(Default::default);
+    WRITTEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Issue #331: whether the non-empty `file` at `path` may be replaced by a new
+/// summary — that is, whether it is this deck's own earlier report.
+///
+/// When this process wrote `path`, the file must still hold exactly those
+/// bytes: a worker that edited the deck's report, appended to it, or replaced
+/// it with its own — frame markers included (Greptile P1 on #1438) — has made
+/// it a file the deck did not write. Only when there is no record, because the
+/// daemon has restarted since, does it fall back to the frame-marker check,
+/// which cannot tell the deck's report from an agent's copy of its format.
+fn is_this_daemons_summary(
+    path: &std::path::Path,
+    file: &mut std::fs::File,
+) -> std::io::Result<bool> {
+    let recorded = written_summaries().get(path).copied();
+    let Some(recorded) = recorded else {
+        return is_daemon_framed_report(file);
+    };
+    if file.metadata()?.len() != recorded.len {
+        return Ok(false);
+    }
+    use std::io::Read as _;
+    let mut bytes = Vec::with_capacity(recorded.len as usize);
+    file.read_to_end(&mut bytes)?;
+    Ok(SummaryFingerprint::of(&bytes) == recorded)
+}
+
+/// Issue #331: file a COMMISSIONED report and say where the orchestrator can
+/// find it — the role-keyed summary ([`write_work_done_summary`]),
+/// or, when that path holds a file the deck did not write, a fresh,
+/// never-reused name through the same create-exclusive save #508 uses
+/// ([`save_full_report`]). A save that fails too degrades to the inlined
+/// report, exactly as a failed write does.
+fn file_commissioned_report(
+    cwd: Option<&str>,
+    safe_role: &str,
+    role: &str,
+    pane_id: &str,
+    summary: &str,
+) -> WorkDoneReportChannel {
+    match write_work_done_summary(cwd, safe_role, role, pane_id, summary) {
+        SummaryWrite::Written => WorkDoneReportChannel::Filed,
+        SummaryWrite::Failed => WorkDoneReportChannel::Unfiled,
+        SummaryWrite::Occupied => {
+            match save_full_report(cwd, &format!("work-done-{safe_role}"), summary) {
+                Some(path) => WorkDoneReportChannel::Diverted(path),
+                None => WorkDoneReportChannel::Unfiled,
+            }
+        }
+    }
+}
+
+/// [`file_commissioned_report`] on tokio's blocking pool (Qodo on PR #1438),
+/// for [`save_full_report_off_runtime`]'s reason: it creates a directory, reads
+/// the existing summary — the whole file, when this daemon has a record to
+/// compare it with — and writes up to the whole report, none of which belongs
+/// on a runtime worker thread. A task that could not even complete is a failed
+/// write, reported as one.
+async fn file_commissioned_report_off_runtime(
+    cwd: Option<String>,
+    safe_role: String,
+    role: String,
+    pane_id: String,
+    summary: String,
+) -> WorkDoneReportChannel {
+    match tokio::task::spawn_blocking(move || {
+        file_commissioned_report(cwd.as_deref(), &safe_role, &role, &pane_id, &summary)
+    })
+    .await
+    {
+        Ok(channel) => channel,
+        Err(e) => {
+            warn!(error = %e, "work-done: the summary write task did not complete");
+            WorkDoneReportChannel::Unfiled
+        }
+    }
+}
+
 /// Issue #331: whether `file` holds a report the deck could have written —
 /// [`frame_untrusted_report_for_file`]'s output, whose first line is the frame's
-/// opening marker and whose last line is its closing marker.
+/// opening marker and whose last line is its closing marker. The fallback for a
+/// path this daemon process has no record of ([`is_this_daemons_summary`]).
 ///
 /// Only the two ends are read, so a report of any length costs two small reads.
 /// A file an agent wrote with those two lines at its ends is indistinguishable
@@ -12249,33 +12370,14 @@ impl AppState {
                         "work-done: credited to one of several outstanding delegations"
                     );
                 }
-                match write_work_done_summary(
-                    self.pane_cwd_map.get(&signal.pane_id).map(String::as_str),
-                    &safe_name,
-                    &role_name,
-                    &signal.pane_id,
-                    &signal.task,
-                ) {
-                    SummaryWrite::Written => WorkDoneReportChannel::Filed,
-                    SummaryWrite::Failed => WorkDoneReportChannel::Unfiled,
-                    // Issue #331: the role-keyed path holds a file the deck did
-                    // not write, so the report goes to a fresh, never-reused
-                    // name — the same create-exclusive save #508 uses — and the
-                    // feedback names it. A save that fails too degrades to the
-                    // inlined report, exactly as a failed write does.
-                    SummaryWrite::Occupied => {
-                        match save_full_report_off_runtime(
-                            self.pane_cwd_map.get(&signal.pane_id).cloned(),
-                            format!("work-done-{safe_name}"),
-                            signal.task.clone(),
-                        )
-                        .await
-                        {
-                            Some(path) => WorkDoneReportChannel::Diverted(path),
-                            None => WorkDoneReportChannel::Unfiled,
-                        }
-                    }
-                }
+                file_commissioned_report_off_runtime(
+                    self.pane_cwd_map.get(&signal.pane_id).cloned(),
+                    safe_name.clone(),
+                    role_name.clone(),
+                    signal.pane_id.clone(),
+                    signal.task.clone(),
+                )
+                .await
             }
             crate::agent_pty::WorkDoneProvenance::Unsolicited => {
                 tracing::info!(
@@ -15955,6 +16057,11 @@ mod tests {
             appended,
             // Carries the frame, but not as the file's first line.
             "note\n[UNTRUSTED-WORKER-REPORT:\nr\n:END-UNTRUSTED-WORKER-REPORT]\n".to_string(),
+            // Greptile P1 on #1438: a worker's own report in the deck's exact
+            // format. This daemon wrote the path, so it knows these are not its
+            // bytes, frame or no frame.
+            "[UNTRUSTED-WORKER-REPORT:\nA longer report.\n:END-UNTRUSTED-WORKER-REPORT]\n"
+                .to_string(),
         ] {
             std::fs::write(&path, &parked).unwrap();
             #[cfg(unix)]
@@ -15982,6 +16089,31 @@ mod tests {
                 );
             }
         }
+
+        // With no record of the path — a daemon restarted since its last write
+        // there — the fallback is the frame check: a framed file is taken for
+        // the deck's own, an unframed one is still kept.
+        let restarted = tempfile::tempdir().expect("tempdir");
+        let restarted_str = restarted.path().to_str().expect("utf8 cwd");
+        let restarted_path = restarted.path().join(".dot-agent-deck/work-done-coder.md");
+        std::fs::create_dir_all(restarted_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &restarted_path,
+            frame_untrusted_report_for_file("Before the restart."),
+        )
+        .unwrap();
+        assert_eq!(
+            write_work_done_summary(Some(restarted_str), "coder", "coder", "pane-1", "After."),
+            SummaryWrite::Written,
+            "with no record, a framed file is replaced as the deck's own"
+        );
+        std::fs::write(&restarted_path, "# Unframed\n").unwrap();
+        written_summaries().remove(&restarted_path);
+        assert_eq!(
+            write_work_done_summary(Some(restarted_str), "coder", "coder", "pane-1", "After."),
+            SummaryWrite::Occupied,
+            "with no record, an unframed file is still kept"
+        );
     }
 
     /// Issue #509: the file framing keeps what the inline framing has to throw
