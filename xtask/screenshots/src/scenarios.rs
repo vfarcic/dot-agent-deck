@@ -112,6 +112,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "voice-typing-mode",
+        description: "The desktop agent pane with voice typing mode on: the pane's Typing to marker, the voice row's reminder and its Stop typing button.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "schedules",
         description: "The TUI Schedules manager with one configured task.",
         clients: &[Client::Tui],

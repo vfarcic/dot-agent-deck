@@ -35,6 +35,7 @@ Each image is named `<scenario>-<client>.png`, so the `dashboard` scenario produ
 | `agent-pane` | desktop | Agent pane over the Dashboard, showing a fixed implementation transcript. |
 | `settings-daemons` | desktop | Daemons settings with one configured remote. The browser fixture cannot produce a successful Test connection result. |
 | `settings-voice` | desktop | Voice settings. |
+| `voice-typing-mode` | desktop | Agent pane with voice typing mode on, entered through the fixture's scripted microphone (`?voice=type%20on`). |
 | `schedules` | TUI | Schedules manager with one disabled task, keeping the next-fire field stable. |
 | `help` | TUI | The `?` keyboard shortcut overlay. |
 

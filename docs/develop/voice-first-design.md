@@ -149,7 +149,47 @@ What the layers do not cover, stated so a later reader does not assume it. **A s
 
 Linkage rule 13 (`xtask/linkage-check/src/voice_command_registry.rs`) proves that every entry in `VOICE_ACTIONS` is **classified** — `voice: true` when a row invokes it, a non-empty `no_voice` reason when none does — and that every row's `invoke`, screens and param kinds resolve. It does **not** prove that every capability is **registered**: a control wired with a bare `onClick` that never reaches `VOICE_ACTIONS` is invisible to it, and the rule could not tell a capability from a close button anyway. A green rule 13 therefore says the registry is consistent, not that the app is voice-operable. #1195 is the work to make registration hard to forget; until it lands, routing a new control through `VOICE_ACTIONS` is a discipline, not something a gate enforces.
 
-## 8. Checklist for a new surface
+## 8. A mode: a class of spoken words the model is never asked about
+
+Sections 2 to 7 are about **one utterance at a time**: each is resolved against what is on screen, grounded against its own words, and forgotten. PRD #1260's typing mode ("type on" / "type off") is the first thing since PRD #802's rebuild that changes how **later** utterances are treated, and it does so by taking them away from the model entirely. That makes it a different kind of surface from a row, and the reasons it is safe are the part to keep when the next mode is designed (#1261's numbered choice is the next; #1184's chains pause in the states these two define).
+
+### Why bypassing the model's grounding is safe here
+
+While the mode is on, no `IntentRequest` is built. The utterance is answered in Rust by `outcome::dictation_intercept`, and everything that is not a reserved phrase is typed whole — the `dictate_to_agent` row's `heard_as` grounding is not consulted, because the mode the user entered *is* the grounding. That is only acceptable because of what the mode can reach:
+
+- **Every action reachable from inside it is reversible or a stop.** Typing into the pane on screen (visible, unsent, editable), ending the mode (sends nothing), turning voice off, and a submit. No row that moves a screen, names an observed object, or starts or stops an agent is reachable. The submit is the one irreversible action, and it is the same whole-utterance trade `submit_prompt` already makes in `Idle` (below) rather than a second rule.
+- **Fidelity gets stronger, not weaker.** The app already supplied the typed text and the model only marked where it starts (`desktop-gui.md`, "The model marks a boundary; the app supplies the text"). In the mode the model does not even mark the boundary: the whole transcript is typed. So section 6's untrusted-name threat has nothing to act on — no observed name and no transcript leaves the machine for the Commands stage while the mode is on.
+- **Entry is as tightly held as exit.** `dictation_on` is `heard_as_whole` and answered by the local fast path, so it cannot ground on a word said in passing; it has no target param and aims at the pane on screen, so it cannot aim at an agent the user is not looking at; and it is refused on a pane the host already knows cannot take input, because in a mode the same failure would repeat on every utterance.
+- **The two failures that removed the first mode are answered, not reintroduced.** A missed exit types the exit phrase — visibly and unsent, because the mode arms no countdown — and a false positive cannot truncate anybody mid-sentence, because every reserved phrase is compared against the *whole* utterance, which is bounded by the capture's own silence detection.
+
+### The reserved set
+
+The words that stay live in the mode are lists in `voice/dictation.rs`, matched by whole-utterance equality after `WHOLE_UTTERANCE_POLITENESS` is trimmed from the edges:
+
+| list | row | live |
+| --- | --- | --- |
+| `DICTATION_ON_PHRASES` | `dictation_on` | in `Idle`, ahead of the `type` opener (which would otherwise type the word "on") |
+| `DICTATION_OFF_PHRASES` | `dictation_off` | in the mode; in `Idle` too, where the panel answers that there was nothing to stop |
+| `VOICE_OFF_PHRASES` | `voice_off` | in the mode only — in `Idle` the model answers `voice_off` from its description |
+| `SUBMIT_PHRASES`, plus `submit_prompt`'s `heard_as_whole` entries | `submit_prompt` | in the mode; `SUBMIT_PHRASES` in `Idle` too |
+
+**Each phrase in the set is a phrase the user cannot dictate alone**, and that is the cost the whole design is priced in. Said inside a longer utterance it is typed; said on its own it acts. Three classes today — stop typing, stop listening, send — and adding a fourth is a decision recorded in the PRD that adds it, not a list edit. Linkage-check rule 14 holds two properties over the lists: every phrase in each list appears in its row's `description` (so a phrase the fast path answers is one the model was told about, and the phrase fixtures pin the model's `Idle` answer for the voice-off phrases the model owns there), and the lists — the four above and `DICTATION_OPENERS` — are pairwise disjoint, so the order they are checked in is never load-bearing.
+
+### Classification order
+
+Every step is a whole-utterance equality except the opener, which is whole *words at the front*:
+
+1. **An empty transcript** is a no-match with no backend call, in every state.
+2. **With the mode declared**, `dictation_intercept` answers in full: `VOICE_OFF_PHRASES`, then `DICTATION_OFF_PHRASES`, then a submit, then typed whole. The order is PRD #802's decided one — the bigger stop first — and with disjoint lists it decides nothing; it exists so that a future overlap cannot leave a live microphone after a user asked for it to stop.
+3. **Without it**, `local_intercept`: the on and off phrases, then `SUBMIT_PHRASES`, then a `DICTATION_OPENERS` opener; everything else goes to the model.
+
+### The state model
+
+The panel owns the mode; Rust stays stateless per utterance (section 2). `VoiceControlPanel.tsx` holds a `VoicePanelState` — `idle` or `dictating` with its composite `{deckId, agentId}` target and the deck selected at entry — in a ref mirrored into state, and declares the target with each utterance, which is how `handle_utterance_with_dictation` learns the mode is on at all. The panel is also the only thing that knows whose prompt it was typing to, so leaving the mode, and a "type off" said with no mode on, are reported in the panel's own sentences.
+
+Precedence is **D5 confirmation > `AwaitingChoice` > `Dictating` > `Idle`** (PRD #1260's "Voice panel states and precedence" is the one statement of it for all three PRDs). Entering a higher state ends a lower one; ending a state returns to `Idle`, never to a state it pre-empted, because a mode that comes back by itself is one the user did not see start. The mode ends on every change of context the host already observes — the pane closing or showing another agent, its agent no longer writable, the selected deck changing, a confirmation opening, voice turning off, the panel unmounting — and sends nothing when it does.
+
+## 9. Checklist for a new surface
 
 Answer these while the surface is still a sketch:
 
@@ -162,3 +202,4 @@ Answer these while the surface is still a sketch:
 7. **If it is genuinely un-voiceable today, is the `no_voice` reason a fitness statement someone can disagree with?** "Opens a multi-step interactive dialog the table has no resolver kind for" can be argued with and eventually overturned, as it was here; "not yet" cannot.
 8. **Which words ask for each new row?** Every row needs a `heard_as` vocabulary drawn from its own id and description, or an `ungrounded` reason that says why it cannot have one — and `heard_as_whole` in place of `heard_as` only when a pick triggered by a word used in passing could not be undone. Check it against the phrasings users actually say — the phrase fixtures are where a too-narrow vocabulary shows up as a refusal — and widen the vocabulary rather than the rule.
 9. **Does every visible label on the surface work as a spoken command for its own control?** A control's visible label is part of its voice vocabulary: if you add a button, its words go in the row's `heard_as` and its description, and an entry in `voice_outcome_every_control_label_asks_for_its_own_row` and a phrase fixture pin it. Where the label also names a destructive action, the bare label reads as the harmless one (section 5's ambiguity principle), and a label that deliberately should not be a voice phrase is listed with its reason in section 5.
+10. **Does it change how the NEXT utterance is treated?** Then it is a mode, not a row, and section 8 applies: say which phrases stay live and what each costs the user who wanted to say it, make every exit a whole utterance and at least one exit a visible control, end it on every change of context, and slot it into the panel's precedence rather than beside it.
