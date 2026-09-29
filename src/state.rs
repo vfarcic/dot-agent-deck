@@ -5561,9 +5561,15 @@ async fn run_delegate_late_readiness_recovery(
 /// including pressing the Enter #1031 says a human has to press — the probe is
 /// refused before a byte rather than submitting their unsent draft. It says
 /// nothing about what the box HOLDS, which no write-side check can, and that
-/// residual is not something this adds. Issue #544's draft gate does not apply
-/// here: a probe carries no payload, and the refusal above already covers the
-/// draft the gate would wait for.
+/// residual is not something this adds.
+///
+/// Issue #544 × #1383: nor does that gate see every draft. A draft can be
+/// pending with nobody having typed since the deck's last write: a bracketed
+/// paste left open takes the pointer's own CR as paste content, so the draft
+/// survives it. #544's deferral does not apply to an empty payload, so the
+/// probe checks [`AgentPtyRegistry::draft_pending`] itself, under the held
+/// writer, and is skipped rather than pressing Enter on the draft — the check
+/// the in-place retry's probe makes. The recovery is spent either way.
 ///
 /// One attempt, never retried. An `Ambiguous` outcome means the CR itself did not
 /// complete, and a second CR is as likely to submit whatever the operator has
@@ -5594,9 +5600,15 @@ async fn probe_delegate_submit(
     rearm.spend();
     let revalidate_registry = Arc::clone(registry);
     let revalidate_pane = worker_pane_id.to_string();
+    let refused_for_draft = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let draft_flag = Arc::clone(&refused_for_draft);
     let outcome = registry
         .write_and_submit_guarded_detailed(worker_pane_id, "", worker_agent_id, || async move {
             if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                return false;
+            }
+            if revalidate_registry.draft_pending(&revalidate_pane) {
+                draft_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 return false;
             }
             orchestration_still_matches(
@@ -5611,6 +5623,12 @@ async fn probe_delegate_submit(
     // submit clock for an empty payload and records no bytes, precisely because a
     // probe leaves the box holding whatever the last payload write put there.
     match outcome {
+        Ok(_) if refused_for_draft.load(std::sync::atomic::Ordering::SeqCst) => tracing::debug!(
+            pane_id = %worker_pane_id,
+            role = %role,
+            "delegate: the worker's pane holds an unsent draft, so the submit recovery was \
+             skipped rather than pressing Enter on it"
+        ),
         Ok(crate::agent_pty::GuardedSendDetail::Outcome(
             crate::agent_pty::GuardedSend::Applied,
         )) => {
@@ -18688,36 +18706,36 @@ mod tests {
         registry.shutdown_all();
     }
 
-    /// Issue #1383 × #544 (audit, medium): #1031's late-readiness recovery
-    /// reads a receiver subscribed as the pointer goes in, not the one the
-    /// dispatch took before the worker's draft wait. That earlier receiver sat
-    /// unread through the wait, so a busy bus could leave it more than the bus
-    /// holds behind, and the recovery ended on its first read — the late
-    /// `SessionStart` that should submit a pointer whose Enter was swallowed was
-    /// never seen.
-    ///
-    /// The fixture is `orchestration/delegate/035`'s — a `clear = true` worker
-    /// whose `claude`-named stub swallows its first submit, so the readiness gate
-    /// times out and the pointer parks unsubmitted — with a pending draft in
-    /// the worker pane delaying the pointer, and more events than the bus holds
-    /// sent during that delay.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn delegate_late_readiness_recovery_reads_a_receiver_from_the_pointer_write() {
-        const ORCH_PANE: &str = "late-draft-orch";
-        const WORKER_PANE: &str = "late-draft-worker";
-        const SUBMITTED: &str = "SWALLOW-STUB-SUBMITTED:Read .dot-agent-deck/worker-task-coder.md";
-        use std::os::unix::fs::PermissionsExt;
+    /// What `orchestration/delegate/035`'s `claude`-named stub prints once it
+    /// submits the task pointer. It swallows its FIRST CR, so the pointer parks
+    /// unsubmitted, and submits on every CR after that.
+    const LATE_READINESS_SUBMITTED: &str =
+        "SWALLOW-STUB-SUBMITTED:Read .dot-agent-deck/worker-task-coder.md";
 
-        // No in-place retry, so nothing but the recovery can submit the pointer.
-        let _schedule = RETRY_SCHEDULE_ENV_LOCK.lock().await;
-        let _env = RetryScheduleEnv::set("0");
-        let cwd = tempfile::tempdir().expect("tempdir");
-        // The BASENAME gives the pane its launch identity (fact S).
-        let stub = cwd.path().join("claude");
-        tokio::fs::write(
-            &stub,
-            r#"#!/usr/bin/env python3
+    /// The fixture #1031's late-readiness recovery tests start from:
+    /// `orchestration/delegate/035`'s `clear = true` worker, delegated to and
+    /// respawned, with its replacement stub up in raw mode. The delegate's
+    /// readiness gate is still waiting when this returns.
+    #[cfg(unix)]
+    struct LateReadinessFixture {
+        _cwd: tempfile::TempDir,
+        registry: Arc<AgentPtyRegistry>,
+        event_tx: broadcast::Sender<BroadcastMsg>,
+        _event_rx: broadcast::Receiver<BroadcastMsg>,
+        worker: String,
+    }
+
+    #[cfg(unix)]
+    impl LateReadinessFixture {
+        async fn start(orch_pane: &str, worker_pane: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let cwd = tempfile::tempdir().expect("tempdir");
+            // The BASENAME gives the pane its launch identity (fact S).
+            let stub = cwd.path().join("claude");
+            tokio::fs::write(
+                &stub,
+                r#"#!/usr/bin/env python3
 import os, sys, termios
 fd = sys.stdin.fileno()
 new = termios.tcgetattr(fd)
@@ -18745,110 +18763,175 @@ while True:
             buf.append(byte)
             os.write(1, bytes([byte]))
 "#,
-        )
-        .await
-        .expect("write stub");
-        tokio::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .await
-            .expect("chmod stub");
-        tokio::fs::write(
-            cwd.path().join(".dot-agent-deck.toml"),
-            format!(
-                "[[orchestrations]]\nname = \"test-orchestration\"\n\n\
-                 [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"true\"\nstart = true\n\n\
-                 [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"{}\"\nclear = true\n",
-                stub.display()
-            ),
-        )
-        .await
-        .expect("write config");
-        let cwd_str = cwd.path().to_string_lossy().into_owned();
-
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let old_agent = registry
-            .spawn_agent(crate::agent_pty::SpawnOptions {
-                command: Some("/bin/cat"),
-                cwd: Some(&cwd_str),
-                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
-                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
-                    WORKER_PANE.to_string(),
-                )]),
-                ..crate::agent_pty::SpawnOptions::default()
-            })
-            .expect("spawn the first occupant");
-        let (event_tx, _event_rx) = broadcast::channel::<BroadcastMsg>(64);
-        let mut state = AppState::default();
-        let orchestration = OrchestrationIdentity::NameCwd {
-            name: "test-orchestration".to_string(),
-            cwd: cwd_str.clone(),
-        };
-        state
-            .pane_role_map
-            .insert(ORCH_PANE.to_string(), "orchestrator".to_string());
-        state
-            .pane_role_map
-            .insert(WORKER_PANE.to_string(), "coder".to_string());
-        state.orchestrator_pane_ids.insert(ORCH_PANE.to_string());
-        state
-            .pane_orchestration_map
-            .insert(ORCH_PANE.to_string(), orchestration.clone());
-        state
-            .pane_orchestration_map
-            .insert(WORKER_PANE.to_string(), orchestration);
-        state
-            .pane_cwd_map
-            .insert(WORKER_PANE.to_string(), cwd_str.clone());
-        state
-            .handle_delegate(
-                DelegateSignal {
-                    pane_id: ORCH_PANE.to_string(),
-                    task: "List the files in the current directory.".to_string(),
-                    to: vec!["coder".to_string()],
-                    supersede: false,
-                    timestamp: Utc::now(),
-                    token: None,
-                },
-                &registry,
-                &event_tx,
             )
-            .await;
+            .await
+            .expect("write stub");
+            tokio::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .await
+                .expect("chmod stub");
+            tokio::fs::write(
+                cwd.path().join(".dot-agent-deck.toml"),
+                format!(
+                    "[[orchestrations]]\nname = \"test-orchestration\"\n\n\
+                     [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"true\"\nstart = true\n\n\
+                     [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"{}\"\nclear = true\n",
+                    stub.display()
+                ),
+            )
+            .await
+            .expect("write config");
+            let cwd_str = cwd.path().to_string_lossy().into_owned();
 
-        let screen = async |agent: &str| {
-            registry
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let old_agent = registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    cwd: Some(&cwd_str),
+                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        worker_pane.to_string(),
+                    )]),
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn the first occupant");
+            let (event_tx, _event_rx) = broadcast::channel::<BroadcastMsg>(64);
+            let mut state = AppState::default();
+            let orchestration = OrchestrationIdentity::NameCwd {
+                name: "test-orchestration".to_string(),
+                cwd: cwd_str.clone(),
+            };
+            state
+                .pane_role_map
+                .insert(orch_pane.to_string(), "orchestrator".to_string());
+            state
+                .pane_role_map
+                .insert(worker_pane.to_string(), "coder".to_string());
+            state.orchestrator_pane_ids.insert(orch_pane.to_string());
+            state
+                .pane_orchestration_map
+                .insert(orch_pane.to_string(), orchestration.clone());
+            state
+                .pane_orchestration_map
+                .insert(worker_pane.to_string(), orchestration);
+            state
+                .pane_cwd_map
+                .insert(worker_pane.to_string(), cwd_str.clone());
+            state
+                .handle_delegate(
+                    DelegateSignal {
+                        pane_id: orch_pane.to_string(),
+                        task: "List the files in the current directory.".to_string(),
+                        to: vec!["coder".to_string()],
+                        supersede: false,
+                        timestamp: Utc::now(),
+                        token: None,
+                    },
+                    &registry,
+                    &event_tx,
+                )
+                .await;
+
+            let screen = async |agent: &str| {
+                registry
+                    .snapshot_off_runtime(agent)
+                    .await
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_default()
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let worker = loop {
+                if let Some(record) = registry.agent_records().into_iter().find(|record| {
+                    record.pane_id_env.as_deref() == Some(worker_pane) && record.id != old_agent
+                }) && screen(&record.id).await.contains("SWALLOW-STUB-READY")
+                {
+                    break record.id;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the replacement stub never entered raw mode"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            Self {
+                _cwd: cwd,
+                registry,
+                event_tx,
+                _event_rx,
+                worker,
+            }
+        }
+
+        async fn screen_of(&self, agent: &str) -> String {
+            self.registry
                 .snapshot_off_runtime(agent)
                 .await
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .unwrap_or_default()
-        };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let worker = loop {
-            if let Some(record) = registry.agent_records().into_iter().find(|record| {
-                record.pane_id_env.as_deref() == Some(WORKER_PANE) && record.id != old_agent
-            }) && screen(&record.id).await.contains("SWALLOW-STUB-READY")
-            {
-                break record.id;
+        }
+
+        /// Past the delegate's 30 s `SessionStart` wait on a paused clock, as
+        /// `/035` does: a gate that times out is what gives the delivery its
+        /// standing (fact U).
+        async fn time_out_the_readiness_gate(&self) {
+            tokio::time::pause();
+            tokio::time::advance(
+                std::time::Duration::from_secs(30) + std::time::Duration::from_millis(2),
+            )
+            .await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the replacement stub never entered raw mode"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        };
+            tokio::time::resume();
+        }
+
+        /// A `SessionStart` from the worker, after the pointer went in.
+        fn send_late_session_start(&self, worker_pane: &str) {
+            self.event_tx
+                .send(BroadcastMsg::Event(
+                    serde_json::from_value(serde_json::json!({
+                        "session_id": "late",
+                        "agent_type": "claude_code",
+                        "event_type": "session_start",
+                        "timestamp": "2026-09-29T00:00:00Z",
+                        "pane_id": worker_pane,
+                        "agent_id": self.worker,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap();
+        }
+    }
+
+    /// Issue #1383 × #544 (audit, medium): #1031's late-readiness recovery
+    /// reads a receiver subscribed as the pointer goes in, not the one the
+    /// dispatch took before the worker's draft wait. That earlier receiver sat
+    /// unread through the wait, so a busy bus could leave it more than the bus
+    /// holds behind, and the recovery ended on its first read — the late
+    /// `SessionStart` that should submit a pointer whose Enter was swallowed was
+    /// never seen.
+    ///
+    /// The fixture is `orchestration/delegate/035`'s — a `clear = true` worker
+    /// whose `claude`-named stub swallows its first submit, so the readiness gate
+    /// times out and the pointer parks unsubmitted — with a pending draft in
+    /// the worker pane delaying the pointer, and more events than the bus holds
+    /// sent during that delay.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_late_readiness_recovery_reads_a_receiver_from_the_pointer_write() {
+        const ORCH_PANE: &str = "late-draft-orch";
+        const WORKER_PANE: &str = "late-draft-worker";
+
+        // No in-place retry, so nothing but the recovery can submit the pointer.
+        let _schedule = RETRY_SCHEDULE_ENV_LOCK.lock().await;
+        let _env = RetryScheduleEnv::set("0");
+        let fx = LateReadinessFixture::start(ORCH_PANE, WORKER_PANE).await;
+        let (registry, event_tx, worker) = (&fx.registry, &fx.event_tx, fx.worker.as_str());
+        let screen = async |agent: &str| fx.screen_of(agent).await;
 
         // A bracketed paste left open in the worker pane: the pointer will wait
         // for it once the readiness gate lets it go.
         registry.note_deck_bytes_for_test(WORKER_PANE, b"\x1b[200~");
-        // Past the 30 s `SessionStart` wait on a paused clock, as `/035` does:
-        // a gate that times out is what gives the delivery its standing (fact U).
-        tokio::time::pause();
-        tokio::time::advance(
-            std::time::Duration::from_secs(30) + std::time::Duration::from_millis(2),
-        )
-        .await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::resume();
+        fx.time_out_the_readiness_gate().await;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while registry.pane_dispatch_lock(WORKER_PANE).try_lock().is_err() {
             assert!(
@@ -18859,7 +18942,7 @@ while True:
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(
-            !screen(&worker).await.contains("SWALLOW-STUB-SWALLOWED"),
+            !screen(worker).await.contains("SWALLOW-STUB-SWALLOWED"),
             "precondition: the pointer waits for the draft"
         );
         // More than the bus holds, while the pointer waits.
@@ -18878,44 +18961,129 @@ while True:
         }
         registry.note_deck_bytes_for_test(WORKER_PANE, b"\x1b[201~");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !screen(&worker).await.contains("SWALLOW-STUB-SWALLOWED") {
+        while !screen(worker).await.contains("SWALLOW-STUB-SWALLOWED") {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the pointer never reached the stub after the draft ended: {:?}",
-                screen(&worker).await
+                screen(worker).await
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(
-            !screen(&worker).await.contains(SUBMITTED),
+            !screen(worker).await.contains(LATE_READINESS_SUBMITTED),
             "precondition: parked"
         );
 
         // The late start, after the pointer went in.
-        event_tx
-            .send(BroadcastMsg::Event(
-                serde_json::from_value(serde_json::json!({
-                    "session_id": "late",
-                    "agent_type": "claude_code",
-                    "event_type": "session_start",
-                    "timestamp": "2026-09-29T00:00:00Z",
-                    "pane_id": WORKER_PANE,
-                    "agent_id": worker,
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
+        fx.send_late_session_start(WORKER_PANE);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while !screen(&worker).await.contains(SUBMITTED) {
+        while !screen(worker).await.contains(LATE_READINESS_SUBMITTED) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "a late SessionStart after the pointer went in did not submit it; the recovery \
                  read a receiver that fell behind during the draft wait: {:?}",
-                screen(&worker).await
+                screen(worker).await
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         registry.shutdown_all();
+    }
+
+    /// Issue #1031 × #544: the late-readiness recovery's bare Enter submits
+    /// whatever the worker's composer holds, so it is skipped while the pane
+    /// has an unsent draft — here a bracketed paste left open after the
+    /// pointer parked, which nobody typed, so #424's "someone typed since the
+    /// deck's last write" check does not catch it. The recovery is one-shot:
+    /// once skipped, nothing submits the draft later either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_late_readiness_recovery_presses_no_enter_over_a_pending_draft() {
+        use std::sync::Mutex;
+        const ORCH_PANE: &str = "late-probe-draft-orch";
+        const WORKER_PANE: &str = "late-probe-draft-worker";
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let captured = CapturedLog::default();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+                .with_ansi(false)
+                .finish(),
+        );
+        let log = || String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+
+        // No in-place retry, so nothing but the recovery can press Enter.
+        let _schedule = RETRY_SCHEDULE_ENV_LOCK.lock().await;
+        let _env = RetryScheduleEnv::set("0");
+        let fx = LateReadinessFixture::start(ORCH_PANE, WORKER_PANE).await;
+        fx.time_out_the_readiness_gate().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !fx
+            .screen_of(&fx.worker)
+            .await
+            .contains("SWALLOW-STUB-SWALLOWED")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pointer never reached the stub: {:?}",
+                fx.screen_of(&fx.worker).await
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        fx.registry
+            .note_deck_bytes_for_test(WORKER_PANE, b"\x1b[200~");
+        assert!(
+            fx.registry.draft_pending(WORKER_PANE),
+            "precondition: a draft"
+        );
+        assert!(
+            !fx.registry.user_typed_since_automatic_write(WORKER_PANE),
+            "precondition: nobody typed since the pointer went in"
+        );
+        fx.send_late_session_start(WORKER_PANE);
+
+        let skipped = "the submit recovery was skipped rather than pressing Enter on it";
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !log().contains(skipped) {
+            assert!(
+                !fx.screen_of(&fx.worker)
+                    .await
+                    .contains(LATE_READINESS_SUBMITTED),
+                "the late-readiness recovery pressed Enter on a pending draft"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the late-readiness recovery never reached its write; log:\n{}",
+                log()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !fx.screen_of(&fx.worker)
+                .await
+                .contains(LATE_READINESS_SUBMITTED),
+            "the late-readiness recovery pressed Enter on a pending draft"
+        );
+        fx.registry.shutdown_all();
     }
 
     /// Serialises the in-process tests that read

@@ -28,7 +28,7 @@ An approximation in the clear keys can only let a draft through as before; it ca
 
 ## Prompts that do not wait
 
-Only daemon-originated automatic first writes are gated. The TUI/desktop `WriteAndSubmit` RPC deliberately stays on the immediate write path: the TUI calls it from its UI thread, and the desktop's `SubmitText` is the user's own submit. So prompts the TUI or the desktop app send on the user's behalf — such as a new orchestration's first prompt to its orchestrator — do not wait. Empty payloads (submit-only probes) are not gated either; #424 already refuses those once the user has typed.
+Only daemon-originated automatic first writes are gated. The TUI/desktop `WriteAndSubmit` RPC deliberately stays on the immediate write path: the TUI calls it from its UI thread, and the desktop's `SubmitText` is the user's own submit. So prompts the TUI or the desktop app send on the user's behalf — such as a new orchestration's first prompt to its orchestrator — do not wait. Empty payloads (submit-only probes) are not deferred either; #424 already refuses those once the user has typed. A draft can also be pending with nobody having typed since the deck last wrote — a bracketed paste left open takes the deck's own CR as paste content — so the two probes that press Enter into a delegated worker, the in-place re-send's and #1031's late-readiness recovery, check `draft_pending` under the writer and are skipped rather than submitting it ([Delegate delivery](delegate-delivery.md#draft-deferral-544)).
 
 ## The cap
 
