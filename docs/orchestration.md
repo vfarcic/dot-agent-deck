@@ -701,7 +701,7 @@ Reports are sent into the orchestrator's pane; if that pane is closed, they are 
 
 ### Orchestrator is told a completion was "unsolicited"
 
-A `work-done` that answers no task the orchestrator delegated reaches the orchestrator labelled as unsolicited, with the worker's report included, so the orchestrator does not mistake it for a task coming back. The most common cause is **you giving a worker a task directly**: the worker still has the reporting instructions from an earlier task, so it reports again for work the orchestrator never asked for.
+A `work-done` that answers no task the deck has on record for that worker reaches the orchestrator labelled as unsolicited, with the worker's report included, so the orchestrator does not mistake it for a task coming back. The label says only that the deck has no outstanding task for that worker on record; it tells the orchestrator that a person may have tasked the worker directly or that the deck may have lost track of a task the orchestrator sent, and to count the report as its own task only if it matches one it is still waiting on. The most common cause is **you giving a worker a task directly**: the worker still has the reporting instructions from an earlier task, so it reports again for work the orchestrator never asked for.
 
 The report still arrives, but `.dot-agent-deck/work-done-<role>.md` is not updated — it keeps the last report for a task the orchestrator did delegate. To have a result count as delegated work, give the task through the orchestrator instead of typing into the worker's pane.
 
@@ -710,7 +710,8 @@ A report is also labelled unsolicited, and no file is written, when:
 - the **orchestrator** runs `dot-agent-deck work-done` without `--done` — nobody delegates to the orchestrator; use `--done` to close out the orchestration, or delegate the work to a role;
 - its task never reached the worker — for example, the orchestrator's pane showed `⚠ delegated worker respawn failed` or `⚠ delegated worker never came up` (see [A delegated worker never came up](#a-delegated-worker-never-came-up));
 - its task was sent more than seven days ago;
-- `dot-agent-deck pane restart <role>` dropped the task the worker owed.
+- `dot-agent-deck pane restart <role>` dropped the task the worker owed;
+- you closed the worker's pane or the orchestrator's pane and the close failed — the deck forgets the tasks between the two as soon as a close starts, and a task sent while the close is in progress is not recorded at all.
 
 ### The summary file could not be written
 

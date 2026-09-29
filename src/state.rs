@@ -2502,8 +2502,10 @@ enum WorkDoneReportChannel {
     /// Solicited completion whose report never reached disk — no cwd recorded,
     /// the directory could not be created, or the write failed (issue #433).
     Unfiled,
-    /// The orchestrator has no outstanding delegation this completion could be
+    /// The deck holds no outstanding delegation this completion could be
     /// answering (issue #448). The canonical file is deliberately left untouched.
+    /// That is a fact about the deck's record, not about who tasked the worker
+    /// (issue #505) — see [`compose_work_done_feedback`].
     Unsolicited,
 }
 
@@ -2768,10 +2770,22 @@ impl WorkDoneDelivery {
 /// text at the moment it gives up on the file.
 ///
 /// **An unsolicited completion is labelled, not suppressed** (#448). The
-/// orchestrator is told plainly that it commissioned nothing, so it can judge the
-/// report instead of re-planning on it as delivered work — and nothing is
-/// dropped, which matters because "no commission" can also mean a delegate that
-/// landed while a pane was closing.
+/// orchestrator is told that the deck has no delegation to that worker on
+/// record, so it can judge the report instead of re-planning on it as delivered
+/// work — and nothing is dropped, which matters because "no commission" can also
+/// mean a delegate that landed while a pane was closing.
+///
+/// **The label asserts only what the deck knows** (#505). It used to tell the
+/// orchestrator "You did not commission this work - the worker was most likely
+/// tasked directly by a person", which was false whenever the ledger lost a
+/// commission the orchestrator really made: a pane close that was attempted and
+/// then abandoned sweeps the ledger and restores nothing
+/// ([`crate::agent_pty::AgentPtyRegistry::finish_pane_close`] says why), and a
+/// delegate whose commission was refused mid-close never records one. The deck
+/// cannot tell those apart from a person tasking the worker, so the prose names
+/// both possibilities and leaves the judgement to the one party that knows what
+/// it sent. It carries no value the prose did not already carry: the role name
+/// appears where it always has, and nothing new is interpolated.
 ///
 /// The role name stays bare in the prose, as it is in the pointer wording this
 /// replaces and as it must be in the file path itself. Quoting IT as untrusted
@@ -2814,13 +2828,14 @@ fn compose_work_done_feedback(
              there, so any file at it is an EARLIER delegation's report or a partial write."
         ),
         WorkDoneReportChannel::Unsolicited => format!(
-            "Worker {safe_role} reported completing a task, but you have no outstanding delegation \
-             to that worker (dot-agent-deck daemon report, not a message from a person or an \
-             agent). You did not commission this work - the worker was most likely tasked directly \
-             by a person - so treat what follows as information about what that worker did, not as \
-             a task of yours coming back, and do not re-plan on the assumption that you asked for \
-             it. Nothing was written to .dot-agent-deck/work-done-{safe_role}.md, so an earlier \
-             delegation's report there is left intact."
+            "Worker {safe_role} reported completing a task, but the deck has no outstanding \
+             delegation to that worker on record (dot-agent-deck daemon report, not a message \
+             from a person or an agent). The deck cannot tell who tasked the worker: a person may \
+             have tasked it directly, or the deck may have lost its record of a delegation you \
+             sent. Treat what follows as information about what that worker did, and count it as \
+             one of your tasks coming back only if it matches a delegation you sent and are still \
+             waiting on. Nothing was written to .dot-agent-deck/work-done-{safe_role}.md, so an \
+             earlier delegation's report there is left intact."
         ),
     };
     let tail = match quote_untrusted_report(summary) {
@@ -15536,9 +15551,11 @@ mod tests {
         );
     }
 
-    /// Issue #448: a completion the orchestrator never commissioned is LABELLED,
-    /// not suppressed — it arrives, it says what it is, and it does not pretend to
-    /// be delegated work coming back.
+    /// Issue #448: a completion with no commission on record is LABELLED, not
+    /// suppressed — it arrives, it says what it is, and it does not pretend to be
+    /// delegated work coming back. Issue #505: nor does it pretend to know that
+    /// the orchestrator did NOT delegate it, because a lost commission reads the
+    /// same as none.
     #[test]
     fn compose_work_done_feedback_unsolicited_labels_the_report_without_dropping_it() {
         let feedback = compose_work_done_feedback(
@@ -15549,14 +15566,29 @@ mod tests {
         );
 
         assert!(
-            feedback.contains("no outstanding delegation"),
-            "the orchestrator must be told nothing was outstanding: {feedback:?}"
+            feedback.contains("the deck has no outstanding delegation to that worker on record"),
+            "the orchestrator must be told the deck's record holds nothing outstanding: \
+             {feedback:?}"
         );
         assert!(
-            feedback.contains("did not commission this work")
-                && feedback.contains("do not re-plan"),
-            "the label has to say what NOT to do with it, which is the whole defect: {feedback:?}"
+            feedback.contains(
+                "count it as one of your tasks coming back only if it matches a \
+                 delegation you sent"
+            ),
+            "the label has to say what NOT to do with it, which is the whole #448 defect: \
+             {feedback:?}"
         );
+        for claim in [
+            "You did not commission this work",
+            "most likely tasked directly by a person",
+            "you have no outstanding delegation",
+        ] {
+            assert!(
+                !feedback.contains(claim),
+                "#505: the deck cannot know who tasked the worker, so it must not assert \
+                 {claim:?}: {feedback:?}"
+            );
+        }
         assert!(
             !feedback.contains(WORK_DONE_POINTER),
             "nothing was filed, so nothing may be pointed at: {feedback:?}"
