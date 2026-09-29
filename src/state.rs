@@ -7306,6 +7306,28 @@ async fn bind_dispatched_commission(
 ///
 /// The **respawn-error** exit is absent from this list on purpose: the record is
 /// armed inside the success arm, so a failed respawn never creates one.
+///
+/// # The noted delivery's no-delivery invariant
+///
+/// Issue #1383 (Qodo, PR #1414). The delivery id is noted as the pane's current
+/// delivery before anything else can fail, unbound to any worker, and an unbound
+/// delivery takes an ack from any sender as recorded. So every exit after
+/// [`crate::delegate_retry::PendingDeliveries::note_delivery`] either binds it
+/// to the agent the pointer reached or drops it with
+/// [`crate::delegate_retry::PendingDeliveries::forget_delivery_if_current`],
+/// which leaves a newer delegation's delivery alone:
+///
+/// 1. **The pi-native `clear = true` return** — binds, to the respawned pi the
+///    seed was stashed for: this is a delivery.
+/// 2. **The dead-replacement return** — drops.
+/// 3. **The readiness-buffer close return** — drops. The close does not:
+///    `forget_pane` keeps an unbound delivery for the dispatch in flight.
+/// 4. **The respawn-error return** — drops.
+/// 5. **The tail** — binds before the send when the worker resolves, and drops
+///    whenever the send did not deliver, as the commission's exit 5 releases:
+///    an unresolved identity, `WrongSession`, `Stale`, `NoLiveTarget` (a draft
+///    wait that ended on a replaced worker among them), refused user input, or
+///    `Err`.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_one_owned(
     registry: Arc<AgentPtyRegistry>,
@@ -7776,6 +7798,16 @@ async fn dispatch_one_owned(
                         reserved_silence.take(),
                         "pi-native seed delivery spawns no silent-worker watch",
                     );
+                    // Noted-delivery audit exit 1: the seed IS the delivery, so
+                    // it is bound to the agent it was stashed for rather than
+                    // dropped — otherwise it would take an ack from any sender
+                    // for as long as the pane kept it. No watch: released above.
+                    registry.pending_deliveries().bind_current(
+                        &pane_id,
+                        &delivery_id,
+                        &new_agent_id,
+                        None,
+                    );
                     return;
                 }
                 // Issue #243: does this agent announce ANYTHING before its
@@ -8062,6 +8094,10 @@ async fn dispatch_one_owned(
                         reserved_silence.take(),
                         "the clear=true replacement worker never became live",
                     );
+                    // Noted-delivery audit exit 2: nothing reached anyone.
+                    registry
+                        .pending_deliveries()
+                        .forget_delivery_if_current(&pane_id, &delivery_id);
                     return;
                 }
                 // PRD #249 M1: the readiness gate. Sitting AFTER the
@@ -8314,6 +8350,12 @@ async fn dispatch_one_owned(
                                 reserved_silence.take(),
                                 "the worker pane began closing during the readiness buffer",
                             );
+                            // Noted-delivery audit exit 3: the close keeps an
+                            // unbound delivery for the dispatch in flight
+                            // (`forget_pane`), so this dispatch drops it.
+                            registry
+                                .pending_deliveries()
+                                .forget_delivery_if_current(&pane_id, &delivery_id);
                             return;
                         }
                         _ = hold_readiness_buffer(
@@ -8519,6 +8561,13 @@ async fn dispatch_one_owned(
                 // no live worker agent on this pane to receive
                 // it, and the submit-write would just log a
                 // second `NotFound`.
+                //
+                // Noted-delivery audit exit 4 (Qodo, PR #1414): nothing reached
+                // anyone, and left noted this delivery would take an ack from any
+                // sender until a newer delegation replaced it.
+                registry
+                    .pending_deliveries()
+                    .forget_delivery_if_current(&pane_id, &delivery_id);
                 return;
             }
         }
@@ -8998,6 +9047,12 @@ async fn dispatch_one_owned(
             &target_role,
             "the identity gate refused the task pointer",
         );
+        // Noted-delivery audit exit 5: the pointer reached no one, whether the
+        // identity never resolved (so nothing was bound) or the send was
+        // refused or failed after the bind.
+        registry
+            .pending_deliveries()
+            .forget_delivery_if_current(&pane_id, &delivery_id);
     }
     // Issue #1031: armed HERE, above the `silence` destructuring, and that
     // position is the whole point rather than tidiness. The silent-worker report
@@ -18077,6 +18132,85 @@ mod tests {
             log.contains("delegate: worker identity could not be resolved"),
             "dispatch_one_owned must take the else arm and refuse the write itself, rather than \
              ever handing the primitive a bare None; captured log = {log:?}"
+        );
+    }
+
+    /// Qodo, PR #1414: a `clear = true` delegate whose respawn fails reached
+    /// nobody, so the delivery it noted before the respawn must not survive the
+    /// dispatch. Left noted and unbound, it took an ack from any sender as
+    /// recorded, until a newer delegation happened to replace it.
+    ///
+    /// Scenario: a `clear = true` role whose command cannot be spawned is
+    /// delegated to a pane with no agent; once the dispatch gives up, an ack of
+    /// the id written into the task file, from a stranger or an unidentified
+    /// sender, is answered `Unknown` and nothing is kept for the pane.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_one_owned_drops_its_noted_delivery_when_the_respawn_fails() {
+        const WORKER_PANE: &str = "respawn-fails-worker";
+        let cwd = tempfile::tempdir().expect("tempdir");
+        tokio::fs::write(
+            cwd.path().join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"test-orchestration\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"true\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"coder\"\n\
+             command = \"/nonexistent/dot-agent-deck-1414-no-such-binary\"\nclear = true\n",
+        )
+        .await
+        .expect("write config");
+        let cwd_str = cwd.path().to_string_lossy().into_owned();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+
+        dispatch_one_owned(
+            registry.clone(),
+            event_tx,
+            Some(OrchestrationIdentity::NameCwd {
+                name: "test-orchestration".to_string(),
+                cwd: cwd_str.clone(),
+            }),
+            "respawn-fails-orch".to_string(),
+            "coder".to_string(),
+            WORKER_PANE.to_string(),
+            "probe task".to_string(),
+            Some(cwd_str),
+            None,
+            PointerQueueClock::new(registry.clone(), WORKER_PANE.to_string(), None),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            registry.agent_records().is_empty(),
+            "precondition: the respawn must have failed"
+        );
+        let task_file = tokio::fs::read_to_string(
+            cwd.path()
+                .join(".dot-agent-deck")
+                .join("worker-task-coder.md"),
+        )
+        .await
+        .expect("the task file is written before the respawn");
+        let delivery_id = task_file
+            .split_whitespace()
+            .find(|word| crate::delegate_retry::is_valid_delivery_id(word))
+            .expect("the task file names its delivery id")
+            .to_string();
+        for sender in [Some("stranger-agent"), None] {
+            assert_eq!(
+                registry
+                    .pending_deliveries()
+                    .acknowledge(WORKER_PANE, &delivery_id, sender),
+                crate::delegate_retry::AckOutcome::Unknown,
+                "a failed respawn's delivery reached nobody, so an ack of it from {sender:?} \
+                 must not be recorded"
+            );
+        }
+        assert!(
+            !registry.pending_deliveries().tracks_pane(WORKER_PANE),
+            "nothing may be kept for a delivery that reached nobody"
         );
     }
 

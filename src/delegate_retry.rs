@@ -735,6 +735,43 @@ impl PendingDeliveries {
         }
     }
 
+    /// The dispatch that noted `delivery_id` left without the pointer reaching
+    /// anyone (Qodo, PR #1414): drop everything kept for it, so an ack of it
+    /// from any sender answers [`AckOutcome::Unknown`] and records nothing.
+    /// Left in place, an unbound delivery would take such an ack from anyone,
+    /// for as long as no newer delegation replaced it, for a task nobody got.
+    ///
+    /// A no-op unless `delivery_id` is still the pane's current delivery, so a
+    /// newer delegation that superseded it is never touched.
+    pub fn forget_delivery_if_current(&self, pane_id: &str, delivery_id: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner
+            .current
+            .get(pane_id)
+            .is_some_and(|current| current.delivery_id == delivery_id)
+        {
+            return false;
+        }
+        inner.current.remove(pane_id);
+        if inner
+            .records
+            .get(pane_id)
+            .is_some_and(|record| record.delivery_id == delivery_id)
+        {
+            inner.records.remove(pane_id);
+        }
+        // An ack taken before the dispatch gave up (the ack-before-bind
+        // residual) must not make a later one read as a repeat.
+        if inner
+            .last_acked
+            .get(pane_id)
+            .is_some_and(|last| last == delivery_id)
+        {
+            inner.last_acked.remove(pane_id);
+        }
+        true
+    }
+
     /// The pane closed for good (Qodo, PR #1414): drop what is kept for it, so
     /// a daemon that outlives many panes does not keep every one's last
     /// delivery. `closed_agent_id` is the agent whose record just left the
@@ -2553,6 +2590,44 @@ mod tests {
             store.acknowledge("p1", "d-22222222", Some("a1")),
             AckOutcome::NotPending { silence_seq: None }
         );
+    }
+
+    /// Qodo, PR #1414: a dispatch that gives up on its delivery drops it, so
+    /// no sender's ack of it is recorded afterwards — including one taken
+    /// before it gave up — and a newer delegation's delivery is left alone.
+    #[test]
+    fn pending_deliveries_forget_delivery_if_current_drops_only_its_own_delivery() {
+        let store = PendingDeliveries::default();
+        store.note_delivery("p1", "d-11111111");
+        // The ack-before-bind residual: taken from anyone while unbound.
+        assert_eq!(
+            store.acknowledge("p1", "d-11111111", Some("a0")),
+            AckOutcome::NotPending { silence_seq: None }
+        );
+        assert!(store.forget_delivery_if_current("p1", "d-11111111"));
+        for sender in [Some("a0"), Some("a1"), None] {
+            assert_eq!(
+                store.acknowledge("p1", "d-11111111", sender),
+                AckOutcome::Unknown,
+                "sender {sender:?}"
+            );
+        }
+        assert!(!store.tracks_pane("p1"), "nothing may be kept for it");
+
+        // A newer delegation superseded it: forgetting the old id is a no-op.
+        store.note_delivery("p1", "d-22222222");
+        store.supersede("p1");
+        store.note_delivery("p1", "d-33333333");
+        let armed = store.arm("p1", "d-33333333", "a1", Some(2), RetypePolicy::Never);
+        assert!(!store.forget_delivery_if_current("p1", "d-22222222"));
+        assert!(store.is_current("p1", armed.seq));
+        assert_eq!(
+            store.current_for_test("p1"),
+            Some(("d-33333333".to_string(), Some(2)))
+        );
+        // Its own id drops the armed record too.
+        assert!(store.forget_delivery_if_current("p1", "d-33333333"));
+        assert!(!store.is_pending("p1"));
     }
 
     /// Qodo, PR #1414: with nothing pending, a delivery bound to its worker is
