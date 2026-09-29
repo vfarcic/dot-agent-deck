@@ -27,7 +27,6 @@ The **Voice** button at the bottom of the window turns voice control on and off.
 
 The desktop app covers part of what the TUI does. These are TUI-only today:
 
-- [Workspace modes](../workspace-modes.md): mode tabs with side panes. The desktop app cannot start a mode, and shows the agents of a mode tab started from the TUI as one **MODE TAB** group on the Dashboard.
 - The [Schedules manager](../scheduled-tasks.md#the-schedules-dialog). The desktop app can start a schedule-authoring agent from **New agent**, but cannot list, edit or run schedules; use the TUI or the `dot-agent-deck schedule` CLI.
 - Generating `.dot-agent-deck.toml` with `g`, filtering agents with `/`, renaming an agent, and [customising keybindings](../keyboard-shortcuts.md).
 - Automatic workspace save and restore, and the quit dialog's **Detach** / **Stop**.

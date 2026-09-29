@@ -31,7 +31,7 @@
  * Remote environments are real but secondary -- they are about WHERE the deck
  * runs, not what it does -- and keep the band they already had. The desktop
  * app is not secondary any more: since PRD #1321 the page presents both
- * clients from the top, and its install detail sits with the CLI's. Workspace modes are being REMOVED (issue #1199), so they are
+ * clients from the top, and its install detail sits with the CLI's. Workspace modes were removed (issue #1199), so they are
  * gone from the marketing surface entirely.
  *
  * The four-step story arc was rebuilt on that basis. The old ending, "walk
@@ -254,13 +254,10 @@ export const why = {
 };
 
 /**
- * The design decisions the page argues from. "Focus-mode side panes" was the
- * third of these and is GONE: workspace modes are being removed (issue #1199,
- * "they do not work well"), and a marketing page should not advertise a
- * feature on its way out.
+ * The design decisions the page argues from.
  *
- * What took the slot is not filler to keep the grid at four -- it is the
- * "walk away" claim, displaced out of the story's fourth row. It belongs here:
+ * The third is not filler to keep the grid at four -- it is the "walk away"
+ * claim, displaced out of the story's fourth row. It belongs here:
  * the agents outliving your terminal session is a decision about how the thing
  * is built, and it is a claim a sentence can make and a screenshot cannot.
  */
@@ -428,7 +425,7 @@ export const verify = {
 /**
  * The screenshot catalogue. Every entry here is rendered -- an unreferenced
  * entry is removed rather than left to rot, which is how `orchestration`,
- * `dashboard`, `modes` and now `card` and `reattach` left in turn.
+ * `dashboard` and now `card` and `reattach` left in turn.
  *
  * Each story row carries the frame its own copy describes, and each caption
  * describes what is IN the frame rather than what the row argues, so a

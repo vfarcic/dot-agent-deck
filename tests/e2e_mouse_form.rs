@@ -9,9 +9,8 @@
 //! keystroke. Decision 6: gated behind the `e2e` feature so `cargo test-fast`
 //! never compiles it.
 //!
-//! Fixture: the `form` fixture defines two modes (`demo`, `demo2`) so the
-//! form's Mode chip selector exposes ≥2 real chips (plus the implicit
-//! "No mode" option), making click-to-select-chip observable. The form opens
+//! The form's Mode chip selector exposes the built-in `schedule` choice.
+//! The form opens
 //! focused on the Mode field (NewPaneFormState::new).
 
 mod common;
@@ -55,22 +54,18 @@ fn form_001_click_field_moves_focus() {
     deck.wait_for_string("nm777");
 }
 
-/// Scenario: Open the form and click the `demo2` mode chip (not the default
-/// selection). That chip must become selected — the same as Left/Right/h/l
-/// cycling to it — so the form reflects the `demo2` mode (its title shows
-/// `demo2 mode`). RED until M8 renders clickable mode chips (today only the
-/// single selected mode is shown in a `◀ … ▶` cycler, so `demo2` isn't even
-/// on screen to click).
+/// Scenario: Open the form and click the built-in `schedule` chip. It must
+/// become selected, as it would through keyboard cycling, and the form must
+/// show the schedule authoring title.
 #[spec("mouse/form/001")]
 #[test]
 fn form_001_click_mode_chip_selects() {
     let deck = TuiDeck::launch_with_fixture("form");
     open_form(&deck);
 
-    click_target(&deck, "demo2");
+    click_target(&deck, "[schedule]");
 
-    // Selecting the demo2 mode is reflected in the form (title → "demo2 mode").
-    deck.wait_for_string("demo2 mode");
+    deck.wait_for_string("schedule mode");
 }
 
 /// Scenario: Open the form, fill Name + Command via the keyboard, then click

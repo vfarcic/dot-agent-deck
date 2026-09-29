@@ -54,7 +54,6 @@ pub mod keybindings;
 pub mod lifetime_tag;
 pub mod logging;
 pub mod login_shell;
-pub mod mode_manager;
 // PRD #1223 M2: what the daemon reports about itself to a new-agent form.
 pub mod new_agent_options;
 pub mod opencode_manage;

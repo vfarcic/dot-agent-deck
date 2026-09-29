@@ -64,9 +64,7 @@ The fastest way to get an orchestration config is to let an agent generate it fr
 4. Review the proposal. The agent will list each role and explain why it chose it.
 5. Tell the agent what to drop or change — or confirm as-is — and it writes `.dot-agent-deck.toml` to your project root.
 
-The generated file includes both `[[modes]]` and `[[orchestrations]]`. You can remove either section if you only need one.
-
-To write the config by hand, use the [configuration reference](#configuration-reference) later on this page as a guide. `dot-agent-deck init` generates a modes-only starter template — it does not include an orchestration block.
+To write the config by hand, run `dot-agent-deck init` for a commented orchestration starter, or use the [configuration reference](#configuration-reference) later on this page as a guide.
 
 ## Starting an orchestration tab
 
@@ -75,11 +73,11 @@ Both clients start an orchestration from their New agent flow, by choosing the o
 <Tabs groupId="client">
 <TabItem value="tui" label="TUI">
 
-Opening an orchestration tab uses the same `Ctrl+n` flow as a regular pane, but the **Mode** field selects an orchestration instead of a workspace mode.
+Opening an orchestration tab uses the same `Ctrl+n` flow as a regular pane, but the **Mode** field selects an orchestration instead of `No mode`.
 
 1. Press `Ctrl+n` to open the New Agent form.
 2. Use `Enter` to step into directories and `Space` to select the project directory that contains your `.dot-agent-deck.toml` with an `[[orchestrations]]` block.
-3. In the unified form, use `Left`/`Right` (or `h`/`l`) to cycle the **Mode** field past any workspace modes until the orchestration name appears.
+3. In the unified form, use `Left`/`Right` (or `h`/`l`) to cycle the **Mode** field until the orchestration name appears.
 4. Press `Enter`. The command field is not used for orchestration tabs — each role pane is launched with its own [`command`](#configuration-reference) from the config.
 
 A new tab opens with one pane per role. The role cards appear on the left sidebar; the orchestrator's pane is active on the right. Each pane has the role's `command` running inside it.
@@ -188,7 +186,7 @@ With `clear = false` the agent is left running. The task is typed straight into 
 
 With `clear = true` — the default — every task starts fresh. The deck stops the worker's agent, starts the role's `command` again in the same pane, and hands the task to the new agent. The role's card in the TUI, or its row in the desktop app, stays where it is with the same name, but the previous conversation is gone, so each task gets a clean context instead of one long, drifting session.
 
-The role's pane does not even have to exist. If you closed it, or its agent died, the next task starts a fresh worker from the role's `command`, so a role stays reachable for as long as the orchestration runs. If the new worker cannot be started, the orchestrator is told in its pane; see [A delegated worker never came up](#a-delegated-worker-never-came-up).
+The role's pane does not even have to exist. If you closed it, or its agent died, the next task starts a fresh worker from the role's `command`, so a role stays reachable for as long as the orchestration runs. If the new worker cannot be started, or dies before it takes the task, the orchestrator is told in its pane; see [A delegated worker never came up](#a-delegated-worker-never-came-up).
 
 A freshly started agent needs a moment before it accepts input, so a `clear = true` task arrives after a short wait: about one to eight seconds for a plain `claude`, `codex`, `opencode` or `pi` command, depending on the agent. For a role launched through a wrapper such as `devbox run …`, declare the [`agent`](#declaring-the-agent-behind-a-launcher-command), or a Codex, Pi or OpenCode worker waits up to 30 seconds on every task.
 
@@ -289,8 +287,6 @@ Notes on how it behaves:
 - `agent` **wins over the command**. Declare `agent = "codex"` on a role whose command runs Claude and the deck treats it as Codex, so keep the two in step.
 - A change to `agent` or `command` applies to the next `clear = true` task; you do not have to recreate the role's pane.
 - Leaving `agent` out, or empty, changes nothing: the deck reads the command as usual.
-
-For a mode's agent pane the same key lives on `[[modes]]` — see [Workspace Modes](workspace-modes.md#declaring-the-agent-behind-a-launcher-command).
 
 ### Minimal example
 
@@ -658,9 +654,14 @@ The role's `command` launches the agent through something the deck cannot see pa
 
 ### A delegated worker never came up
 
-When a `clear = true` worker is restarted for a new task and the new agent never starts, your orchestrator's pane gets `⚠ delegated worker never came up (dot-agent-deck daemon report)`: the task was not delivered, and no `work-done` will come for it. An unattended orchestrator can then re-delegate, reassign the task, or notify you. The report names the worker's pane; the [daemon log](troubleshooting.md#enabling-debug-logs) names the role and the error.
+When a `clear = true` worker is restarted for a new task and the new agent does not come up, the task was not delivered, and no `work-done` will come for it. Your orchestrator's pane gets one of two reports, depending on how far the new agent got:
 
-The usual cause is the role's `command` — a launcher that fails in that directory, a binary that is not on the `PATH` the deck was started with, or an agent that exits as soon as it starts. Look at the worker's pane: whatever the agent printed before it died is still there. Running the role's `command` by hand in the worker's directory reproduces most of these.
+- `⚠ delegated worker respawn failed (dot-agent-deck daemon report)` — the new agent could not be started at all.
+- `⚠ delegated worker never came up (dot-agent-deck daemon report)` — the new agent started, then died before it could take the task.
+
+An unattended orchestrator can then re-delegate, reassign the task, or notify you. The report names the worker's pane; the [daemon log](troubleshooting.md#enabling-debug-logs) names the role and, for a respawn that failed, the error.
+
+The usual cause is the role's `command` — a launcher that fails in that directory, a binary that is not on the `PATH` the deck was started with, or an agent that exits as soon as it starts. Re-delegating to the same role runs that same command again, so it fails the same way until the command is fixed. Look at the worker's pane: whatever the agent printed before it died is still there. Running the role's `command` by hand in the worker's directory reproduces most of these.
 
 ### Closing a worker's pane and then delegating to it
 
@@ -681,7 +682,7 @@ The report still arrives, but `.dot-agent-deck/work-done-<role>.md` is not updat
 A report is also labelled unsolicited, and no file is written, when:
 
 - the **orchestrator** runs `dot-agent-deck work-done` without `--done` — nobody delegates to the orchestrator; use `--done` to close out the orchestration, or delegate the work to a role;
-- its task never reached the worker — for example, the orchestrator's pane showed `⚠ respawn failed for role '<role>'` or `⚠ delegated worker never came up`;
+- its task never reached the worker — for example, the orchestrator's pane showed `⚠ delegated worker respawn failed` or `⚠ delegated worker never came up` (see [A delegated worker never came up](#a-delegated-worker-never-came-up));
 - its task was sent more than seven days ago;
 - `dot-agent-deck pane restart <role>` dropped the task the worker owed.
 
@@ -700,6 +701,6 @@ They do not: two orchestration tabs from directories with the same name (e.g. `~
 ## See also
 
 - [Idle Workers & Notifications](idle-workers-and-notifications.md) — the reports the deck sends the orchestrator about stuck workers, and how to get those moments to you
-- [Workspace Modes](workspace-modes.md) — the simpler tab type that pairs an agent with live side panes
+- [Dispatcher Mode](dispatcher-mode.md) — start a single agent or a whole orchestration in an isolated copy of the repository
 - [Configuration](configuration.md) — global and project-level configuration options
 - [Keyboard Shortcuts](keyboard-shortcuts.md) — all keybindings, including tab navigation

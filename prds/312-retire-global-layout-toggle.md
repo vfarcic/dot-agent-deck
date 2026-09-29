@@ -4,12 +4,14 @@
 **Priority**: Medium
 **Created**: 2026-08-01
 
+> **Update (#1199):** workspace modes were removed in [#1199](https://github.com/vfarcic/dot-agent-deck/issues/1199), so mode tabs no longer exist and the M3 "mode tabs" work is moot. Read the mode-tab bullet, the M3 milestone and Open Question 2 below in that light; the toggle now governs two tab types — the dashboard and orchestration tabs.
+
 ## Problem Statement
 
 `ui.pane_layout` is a single global field (`src/ui.rs:1531`, default `Stacked`) toggled by `Ctrl+T` (`src/ui.rs:6481`) and read by all three `render_terminal_panes` call sites — dashboard, mode tabs and orchestration tabs. One switch governs three tab types whose needs are not the same, and in two of the three neither setting is right:
 
 - **Orchestration tabs.** `Tiled` divides the pane column equally among every role — with seven roles that is a handful of rows each, unusable. `Stacked` is the only workable setting, and once [#311](https://github.com/vfarcic/dot-agent-deck/issues/311) removes collapsed frames the two become indistinguishable here. The toggle then does nothing.
-- **Mode tabs.** Side panes exist to be watched while the agent works — live test and lint output (`docs/workspace-modes.md:8`). `Stacked` collapses them to title rows, defeating the point. `Tiled` is the correct arrangement, and it is not what the default gives you.
+- **Mode tabs.** Side panes exist to be watched while the agent works — live test and lint output. `Stacked` collapses them to title rows, defeating the point. `Tiled` is the correct arrangement, and it is not what the default gives you.
 - **Dashboard tabs.** Behaviour depends on how many panes happen to be open.
 
 So the user is handed a global mode switch to manage a decision that follows deterministically from which kind of tab they are looking at. `Ctrl+T` is also spent — one of only four global chords (`docs/keyboard-shortcuts.md:25`) — on a setting nobody should have to think about.

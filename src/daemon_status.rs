@@ -241,6 +241,7 @@ mod tests {
 
     fn snapshot(status: SessionStatus) -> SessionSnapshot {
         SessionSnapshot {
+            subagent_wait: None,
             status,
             agent_type: None,
             active_tool: None,

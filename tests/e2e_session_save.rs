@@ -69,7 +69,7 @@ fn save_001_new_pane_state_change_writes_snapshot() {
             "DOT_AGENT_DECK_SESSION",
             session_file.to_str().expect("session path is UTF-8"),
         )
-        .launch_with_fixture("modes");
+        .launch_with_fixture("plain-project");
     deck.wait_for_string("No active agents");
 
     // Precondition: a fresh launch (no `--continue`, restore not yet wired)
@@ -115,7 +115,7 @@ fn save_002_detach_path_writes_snapshot() {
             "DOT_AGENT_DECK_SESSION",
             session_file.to_str().expect("session path is UTF-8"),
         )
-        .launch_with_fixture("modes");
+        .launch_with_fixture("plain-project");
     deck.wait_for_string("No active agents");
 
     // Two dashboard panes present → a real workspace to detach from.
@@ -159,7 +159,7 @@ fn save_002_detach_path_writes_snapshot() {
 }
 
 /// Drive the new-pane dialog to open the single orchestration in the `orch-deck`
-/// fixture. With no `[[modes]]` defined the Mode chip row is `[No mode] [Orch:
+/// fixture. The Mode chip row is `[No mode] [Orch:
 /// demo-orch] [schedule]`, so ONE Right selects the orchestration; selecting an
 /// orchestration HIDES the Command field, so a second Enter submits the form.
 /// Mirrors `e2e_dashboard_selection`'s `open_orchestration`.

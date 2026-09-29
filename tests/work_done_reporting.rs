@@ -405,13 +405,51 @@ fn work_done_003_failed_summary_write_inlines_the_report_instead_of_pointing_at_
     });
 }
 
-/// The daemon's own respawn-failure notice, and the test's synchronization edge:
-/// `dispatch_one_owned` writes it into the orchestrator pane immediately before
-/// the error return under audit, so observing it proves the dispatch task has
-/// reached that arm and the test never has to guess at timing.
-const RESPAWN_FAILED_NEEDLE: &str = "respawn failed for role 'coder'";
+/// The daemon's own respawn-failure report's opening clause, and the test's
+/// synchronization edge: `dispatch_one_owned` submits it into the orchestrator
+/// pane immediately before the error return under audit, so observing it proves
+/// the dispatch task has reached that arm and the test never has to guess at
+/// timing. Spelled out here rather than imported, like the needles above.
+const RESPAWN_FAILED_NEEDLE: &str =
+    "delegated worker respawn failed (dot-agent-deck daemon report)";
 
-/// Scenario: On a project whose `coder` role sets `clear = true`, points at a binary that does not exist, and whose idle detector is switched off, delegate so the respawn kills the live worker and then fails to replace it, then have that same worker pane report `work-done` — the case of a person tasking it directly afterwards. The orchestrator pane must be told the respawn failed and must then report the completion as one it never commissioned, never pointing at a summary file.
+/// Issue #1337: the report's stable FINAL clause. It ends in `.`, which the
+/// payload encoding's trailing-whitespace trim cannot eat, so the byte after it
+/// is exactly the terminator the daemon chose — CR if it SUBMITTED the report,
+/// LF if it left it as deferred scrollback.
+const RESPAWN_FAILED_TAIL: &str = "daemon log names the role and the error.";
+
+/// Issue #1337: the byte after each respawn-failure report's final clause, in
+/// order — one entry per opening clause, `None` for a report whose final clause
+/// or terminator has not landed yet. Anchored to the report's own opening and
+/// final clauses rather than to the first line break after it began, so an
+/// unrelated line break cannot be mistaken for the terminator in either
+/// direction.
+fn respawn_failed_terminators(snapshot: &str) -> Vec<Option<u8>> {
+    snapshot
+        .match_indices(RESPAWN_FAILED_NEEDLE)
+        .map(|(start, _)| {
+            let rest = &snapshot[start..];
+            let end = rest.find(RESPAWN_FAILED_TAIL)? + RESPAWN_FAILED_TAIL.len();
+            rest.as_bytes().get(end).copied()
+        })
+        .collect()
+}
+
+/// Issue #1337: every respawn-failure report in the pane, from its opening
+/// clause to its final clause, so the test can say what the text carries.
+fn respawn_failed_reports(snapshot: &str) -> Vec<&str> {
+    snapshot
+        .match_indices(RESPAWN_FAILED_NEEDLE)
+        .filter_map(|(start, _)| {
+            let rest = &snapshot[start..];
+            let end = rest.find(RESPAWN_FAILED_TAIL)? + RESPAWN_FAILED_TAIL.len();
+            Some(&rest[..end])
+        })
+        .collect()
+}
+
+/// Scenario: On a project whose `coder` role sets `clear = true`, points at a binary that does not exist, and whose idle detector is switched off, delegate so the respawn kills the live worker and then fails to replace it, then have that same worker pane report `work-done` — the case of a person tasking it directly afterwards. The orchestrator pane must be handed a SUBMITTED respawn-failure report that names no role, and must then report the completion as one it never commissioned, never pointing at a summary file. After the user types into the orchestrator, a second delegate must produce a second, identical report that is still submitted.
 #[spec("orchestration/work-done/005")]
 #[test]
 fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
@@ -456,6 +494,42 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
              snapshot = {after_delegate:?}"
         );
 
+        // Issue #1337, both halves. The report must be SUBMITTED — an LF line
+        // in scrollback reaches nobody in an unattended dispatched unit — and it
+        // must interpolate no config-supplied role name (PRD #249 finding B3);
+        // the pane id is masked first because it happens to contain the role's
+        // name. Verified red on the pre-fix build: the old text was
+        // `⚠ respawn failed for role 'coder' on pane work-done-coder-pane (see
+        // daemon log for details)` followed by LF (`terminator = Some(10)`).
+        let after_delegate = harness
+            .wait_for_orchestrator(
+                |snapshot| matches!(respawn_failed_terminators(snapshot).first(), Some(Some(_))),
+                Duration::from_secs(5),
+            )
+            .await;
+        let report = respawn_failed_reports(&after_delegate)
+            .first()
+            .copied()
+            .unwrap_or_default();
+        assert!(
+            !report.replace(WORKER_PANE, "").contains(WORKER_ROLE),
+            "the respawn-failure report must carry no role name — the role rides the daemon \
+             log; report = {report:?}"
+        );
+        assert!(
+            report.contains(WORKER_PANE),
+            "the report must name the worker pane it is about; report = {report:?}"
+        );
+        assert_eq!(
+            respawn_failed_terminators(&after_delegate)
+                .first()
+                .copied()
+                .flatten(),
+            Some(b'\r'),
+            "the respawn-failure report must be SUBMITTED (CR after its final clause), not left \
+             as an LF line in scrollback; snapshot = {after_delegate:?}"
+        );
+
         // The delegate never reached the worker, so a completion arriving now was
         // asked for by a person, not by the orchestrator.
         harness
@@ -482,6 +556,31 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
         assert!(
             !harness.summary_path().exists(),
             "an uncommissioned completion writes no summary file at all"
+        );
+
+        // Second-failure arm (issue #1337): the role command is still broken,
+        // so the next delegate fails the same way and composes a BYTE-IDENTICAL
+        // report. A person typing into the orchestrator in between arms the
+        // repeat-payload refusal; the report's payload record must have been
+        // released on `Applied`, or the second report is refused as a repeat of
+        // the user's own input and the orchestrator is never told.
+        harness.registry.note_user_input(ORCH_PANE);
+        harness.delegate().await;
+        let after_second = harness
+            .wait_for_orchestrator(
+                |snapshot| {
+                    let terminators = respawn_failed_terminators(snapshot);
+                    terminators.len() >= 2 && terminators[1].is_some()
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        let terminators = respawn_failed_terminators(&after_second);
+        assert_eq!(
+            terminators.get(1).copied().flatten(),
+            Some(b'\r'),
+            "a second, byte-identical respawn-failure report must still be submitted after user \
+             input; terminators so far = {terminators:?}; snapshot = {after_second:?}"
         );
     });
 }

@@ -33,14 +33,13 @@ pub struct PaneInfo {
     pub command: Option<String>,
 }
 
-/// PRD #92 F4: per-pane result of a multi-pane close operation (a mode
-/// tab teardown via [`crate::tab::TabManager::close_tab`], or a mode
-/// deactivation via [`crate::mode_manager::ModeManager::deactivate_mode`]).
+/// PRD #92 F4: per-pane result of a multi-pane close operation (a tab
+/// teardown via [`crate::tab::TabManager::close_tab`]).
 ///
 /// Pre-F4 the same operations returned `Result<Vec<String>, _>` and
 /// silently dropped any [`PaneController::close_pane`] errors. That
 /// produced the user-visible bug where pressing `Ctrl+W` on an
-/// unhealthy mode-tab destroyed the dashboard cards while the underlying
+/// unhealthy tab destroyed the dashboard cards while the underlying
 /// agent processes survived in the daemon registry — the TUI thought
 /// they were gone.
 ///
@@ -321,7 +320,6 @@ pub trait PaneController: Send + Sync {
     /// this method**: every production spawn now goes through
     /// `create_pane_with_options` with real dims computed via the
     /// `*_pane_dims` SSOT helpers in `ui.rs` (`dashboard_pane_dims`,
-    /// `mode_agent_pane_dims`, `mode_side_pane_dims`,
     /// `orchestration_role_pane_dims`). After the M2.15 fixup pass 2,
     /// the legacy `EmbeddedPaneController::create_pane` override was
     /// deleted so no production controller can hit the 24×80 fallback —

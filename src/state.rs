@@ -801,6 +801,15 @@ pub struct SessionSnapshot {
     /// absence, so no `PROTOCOL_VERSION` bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<BlockedReason>,
+    /// Issue #1364 (Greptile on #1393): which subagents alone raised a
+    /// `WaitingForInput` — [`SessionState::subagent_wait`] — so a TUI that
+    /// attaches while one is pending can still end it on that subagent's
+    /// `SubagentStop`. `Some` only while the status is `WaitingForInput`.
+    /// Additive optional, the `blocked` precedent: an older reader ignores the
+    /// key (and keeps its pre-#1364 card), a newer one tolerates its absence,
+    /// so no `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_wait: Option<SubagentWait>,
 }
 
 #[derive(Debug, Clone)]
@@ -857,6 +866,10 @@ pub struct SessionState {
     /// there is no un-orphaning edge to watch for and clearing on the next
     /// unmarked event would just make the badge flicker.
     pub orchestration_orphaned: bool,
+    /// Issue #1364: set while the status is a [`SessionStatus::WaitingForInput`]
+    /// that only subagents raised — see [`SubagentWait`]. `None` for a wait the
+    /// main thread raised and whenever the status is anything else.
+    pub subagent_wait: Option<SubagentWait>,
     /// Issue #559: this session's producer DECLARED that it will never report a
     /// submitted prompt — an event arrived carrying
     /// [`crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`], which
@@ -877,6 +890,25 @@ pub struct SessionState {
     /// read it belong to the TUI that spawned the pane, not to one that
     /// reattached later. See [`Self::confirmation_producer`].
     pub prompt_reports_unavailable: bool,
+}
+
+/// Issue #1364: who raised a [`SessionStatus::WaitingForInput`] that came from
+/// subagents alone (events carrying [`crate::event::SUBAGENT_ID_METADATA_KEY`]),
+/// and what the card read before it.
+///
+/// A subagent's terminal event — `SubagentStop`, which a subagent's
+/// `StopFailure` also arrives as — is informational and asserts nothing about
+/// the main thread (#1354). But a subagent that asked for permission and then
+/// ended has taken its prompt with it, and nothing else would ever lift the
+/// card off Needs Input. So a `SubagentStop` naming the LAST subagent recorded
+/// here ends the wait. It resumes to Idle when the card was Idle before (a
+/// background agent after the turn ended) and to Thinking otherwise, as the
+/// subagent's answered `ToolEnd` does — never to Working, Error or Blocked,
+/// which a subagent event must not assert on the parent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SubagentWait {
+    pub subagent_ids: Vec<String>,
+    pub resume_idle: bool,
 }
 
 impl SessionState {
@@ -910,6 +942,7 @@ impl SessionState {
             // the wire means there was no live session to snapshot at all.
             last_activity_ms: Some(self.last_activity.timestamp_millis()),
             blocked: self.blocked.clone(),
+            subagent_wait: self.subagent_wait.clone(),
         }
     }
 
@@ -1348,11 +1381,17 @@ pub struct AppState {
     /// See #401 for the underlying reason a status report cannot be trusted on
     /// identity alone: the hook socket is unauthenticated.
     pub untagged_status_panes: HashSet<String>,
-    /// Issue #447 (Qodo, #1347): per pane, the most recent hook sessions the
-    /// pane has genuinely moved past, newest last and at most
-    /// [`WAITING_SUPERSEDED_SESSIONS_KEPT`] of them. Written and read only by
-    /// [`Self::apply_event_watching_waiting`], so it is empty in the TUI, and
-    /// dropped with the pane by [`Self::unregister_pane`].
+    /// Issue #447 (Qodo, #1347): per pane, the hook sessions the pane has
+    /// genuinely moved past while its current registry agent owned it — the
+    /// newest [`WAITING_SUPERSEDED_SESSIONS_KEPT`] of them. Written and read
+    /// only by [`Self::apply_event_watching_waiting`], so it is empty in the
+    /// TUI, and dropped with the pane by [`Self::unregister_pane`].
+    ///
+    /// Scoped to one agent generation (#1365 item 4): only a report naming the
+    /// pane's live agent can open or close an episode, so the sessions of an
+    /// agent that no longer owns the pane are never consulted, and the record
+    /// is reset when the agent changes — it fills with one agent's `/clear`s,
+    /// not the pane's.
     ///
     /// It exists because `pane_hook_session`'s timestamp cannot answer "is this
     /// report from a conversation that is over?" on its own: a `SessionStart`
@@ -1360,7 +1399,7 @@ pub struct AppState {
     /// (issue #424 D2), so an old session's delayed start and a new session's
     /// early-stamped one look alike by time. By NAME they do not — the old one
     /// is a session this pane has already left.
-    waiting_superseded_sessions: HashMap<String, VecDeque<String>>,
+    waiting_superseded_sessions: HashMap<String, SupersededSessions>,
     /// Maps pane_id → orchestration role name (set when orchestration tab opens).
     pub pane_role_map: HashMap<String, String>,
     /// Maps pane_id → working directory for orchestration panes.
@@ -2906,7 +2945,8 @@ pub fn compose_idle_worker_prompt(role: &str, elapsed: std::time::Duration) -> S
 /// The rules, in the order they are decided:
 ///
 /// * **Either side unknown → match.** A pane with no orchestration
-///   `tab_membership` (dashboard/mode pane, or one spawned without membership
+///   `tab_membership` (a dashboard pane, a legacy `TabMembership::Mode` pane
+///   from an older TUI, or one spawned without membership
 ///   metadata) legitimately reports `None`, and the `write_and_submit_guarded`
 ///   agent-id gate is the primary identity guard — this check is defense in
 ///   depth, so it must not refuse on absence.
@@ -3623,12 +3663,59 @@ pub(crate) fn compose_worker_waiting_notice(
 }
 
 /// Issue #447: how many superseded hook sessions per pane
-/// [`AppState::apply_event_watching_waiting`] remembers. A report from a session
-/// further back than this reads as current; the cost of that is at most one
-/// wait closed early or one notice about a wait that has ended, and the pane
-/// would have to have been cleared this many times while such a report was in
-/// flight.
-const WAITING_SUPERSEDED_SESSIONS_KEPT: usize = 8;
+/// [`AppState::waiting_superseded_sessions`] remembers for its live agent,
+/// oldest forgotten first. It bounds the daemon's memory against an agent (or
+/// a same-uid process posting admitted events) that rolls sessions without
+/// end (Qodo, #1393), at roughly 4096 session ids per pane. It used to be
+/// eight, which a ninth `/clear` while one report was in flight was enough to
+/// defeat (#1365 item 4); a report would now have to stay in flight across
+/// thousands of `/clear`s of the same agent to read as current again.
+const WAITING_SUPERSEDED_SESSIONS_KEPT: usize = 4096;
+
+/// Issue #447: the hook sessions one pane has moved past, and the registry
+/// agent that owned the pane while it did — see
+/// [`AppState::waiting_superseded_sessions`].
+///
+/// Sessions are kept as keyed 64-bit digests, not as the ids themselves: a
+/// session id is producer-supplied and a hook line may be up to
+/// [`crate::bounded_read::MAX_HOOK_LINE_BYTES`] long, so storing thousands of
+/// them would bound the count and not the memory (Qodo, #1393). A collision
+/// under the per-record random key would at worst make a new session read as
+/// superseded, which is to say miss one notice.
+#[derive(Debug, Default, Clone)]
+struct SupersededSessions {
+    agent_id: Option<String>,
+    key: std::hash::RandomState,
+    sessions: HashSet<u64>,
+    /// The same digests as `sessions`, oldest first, for eviction at
+    /// [`WAITING_SUPERSEDED_SESSIONS_KEPT`].
+    order: VecDeque<u64>,
+}
+
+impl SupersededSessions {
+    fn digest(&self, session_id: &str) -> u64 {
+        use std::hash::BuildHasher as _;
+        self.key.hash_one(session_id)
+    }
+
+    fn contains(&self, session_id: &str) -> bool {
+        self.sessions.contains(&self.digest(session_id))
+    }
+
+    /// Remember `session_id`, forgetting the oldest beyond
+    /// [`WAITING_SUPERSEDED_SESSIONS_KEPT`].
+    fn insert(&mut self, session_id: &str) {
+        let digest = self.digest(session_id);
+        if self.sessions.insert(digest) {
+            self.order.push_back(digest);
+            if self.order.len() > WAITING_SUPERSEDED_SESSIONS_KEPT
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.sessions.remove(&oldest);
+            }
+        }
+    }
+}
 
 /// What [`AppState::apply_event`] did with one event — the answer issue #447's
 /// waiting-for-input watch needs and every other caller ignores (Qodo, #1347).
@@ -3637,8 +3724,8 @@ enum AppliedEvent {
     /// Admission control refused it: nothing on any card moved.
     Rejected,
     /// Admitted, but the status on the card is not one it wrote — an
-    /// informational event (`SubagentStart`, `SubagentStop`, `Unknown`, a
-    /// subagent's `ToolStart`), or one whose status arm declined to overwrite
+    /// informational event (`SubagentStart`, a `SubagentStop` that ends no
+    /// subagent's wait, `Unknown`, a subagent's `ToolStart`), or one whose status arm declined to overwrite
     /// what was there (`ToolStart` on `WaitingForInput`, `ShellBusy` on a real
     /// status).
     StatusKept,
@@ -3725,10 +3812,13 @@ impl AppState {
         // made is stale in the same sense. Anything else is current, including
         // a new session's start whatever its clock says, and a report on a pane
         // with no generation yet.
+        let live_agent_id = registry.pane_current_agent_id(&pane_id);
         let superseded = self
             .waiting_superseded_sessions
             .get(&pane_id)
-            .is_some_and(|sessions| sessions.contains(&event_session_id));
+            .is_some_and(|superseded| {
+                superseded.agent_id == live_agent_id && superseded.contains(&event_session_id)
+            });
         let from_current_generation = !superseded
             && match &generation_before {
                 Some((current, current_ts)) if *current == event_session_id => {
@@ -3739,34 +3829,55 @@ impl AppState {
         if !from_current_generation {
             return;
         }
+        // Every current report re-keys the record to the pane's live agent, so
+        // `agent_id` always names whose sessions it holds — including the
+        // session the pane was on before this report. When that owner has been
+        // replaced, the record starts over for the successor WITHOUT the
+        // predecessor's session: it is not one the successor moved past, and a
+        // successor that resumes that conversation must still be heard (Qodo,
+        // #1393). The predecessor's own late reports are refused by admission
+        // control before they get here.
+        let superseded = self
+            .waiting_superseded_sessions
+            .entry(pane_id.clone())
+            .or_default();
+        //
+        // A record with no owner yet is ADOPTED by the first published one, not
+        // replaced: a worker's tagged events are admitted while its spawn is
+        // still pending, before the registry names it as the pane's owner, so
+        // "no owner, then this agent" is that same worker arriving (Qodo,
+        // #1393). A predecessor is always a published owner, so a real
+        // replacement is still `Some(old)` giving way to `Some(new)`.
+        let previous_was_live_agents =
+            superseded.agent_id.is_none() || superseded.agent_id == live_agent_id;
+        if previous_was_live_agents {
+            superseded.agent_id.clone_from(&live_agent_id);
+        } else {
+            *superseded = SupersededSessions {
+                agent_id: live_agent_id.clone(),
+                ..SupersededSessions::default()
+            };
+        }
         // Remember the session a current report moved the pane off. A stale
         // one that moved it — the old session's delayed start regressing the
         // pane under #424 D2 — records nothing, so the genuine session it
         // displaced is not mistaken for an old one.
-        if let Some((previous, _)) = &generation_before
+        if previous_was_live_agents
+            && let Some((previous, _)) = &generation_before
             && self
                 .pane_hook_session
                 .get(&pane_id)
                 .is_none_or(|(now, _)| now != previous)
         {
-            let sessions = self
-                .waiting_superseded_sessions
-                .entry(pane_id.clone())
-                .or_default();
-            if !sessions.contains(previous) {
-                sessions.push_back(previous.clone());
-                if sessions.len() > WAITING_SUPERSEDED_SESSIONS_KEPT {
-                    sessions.pop_front();
-                }
-            }
+            superseded.insert(previous);
         }
-        let live_agent_id = registry.pane_current_agent_id(&pane_id);
         if self.pane_status(&pane_id) == Some(SessionStatus::WaitingForInput) {
             self.open_waiting_episode(
                 &pane_id,
                 event_agent_id.as_deref(),
                 live_agent_id.as_deref(),
                 registry,
+                false,
             );
             return;
         }
@@ -3819,6 +3930,7 @@ impl AppState {
         reporting_agent_id: Option<&str>,
         live_agent_id: Option<&str>,
         registry: &Arc<AgentPtyRegistry>,
+        reopen_settled: bool,
     ) {
         let (Some(reporting_agent_id), Some(live_agent_id)) = (reporting_agent_id, live_agent_id)
         else {
@@ -3843,6 +3955,7 @@ impl AppState {
             pane_id,
             live_agent_id,
             debounce * WAITING_NOTICE_COOLDOWN_FACTOR,
+            reopen_settled,
         ) else {
             return;
         };
@@ -3868,6 +3981,10 @@ impl AppState {
     /// Issue #447: [`Self::open_waiting_episode`] for a worker that has just
     /// been delegated to while its status already reads `WaitingForInput`. The
     /// reporting agent is the one recorded on the session that set the status.
+    ///
+    /// A settled episode for the same agent is reopened (#1365 item 3): its one
+    /// notice was about an earlier delegation, and the worker that finished it
+    /// without leaving its prompt owes this one with nobody told.
     fn open_waiting_episode_if_already_waiting(
         &self,
         pane_id: &str,
@@ -3888,6 +4005,7 @@ impl AppState {
             session.agent_id.as_deref(),
             live_agent_id.as_deref(),
             registry,
+            true,
         );
     }
 }
@@ -4201,13 +4319,15 @@ fn delegate_no_event_window(
 /// then emitted no event at all.
 ///
 /// **Issue #702: this notice belongs to [`compose_idle_worker_prompt`]'s family,
-/// not to [`compose_respawn_failed_notice`]'s.** The contract is keyed on the
-/// DELIVERY MECHANISM, and it is stated once — here for the submitted family, on
-/// [`compose_respawn_failed_notice`] for the deferred one. Issue #708 moved this
-/// notice's two siblings, [`compose_worker_exited_notice`] and
-/// [`compose_respawn_no_live_worker_notice`], into this family as well, and
-/// issue #714's [`compose_worker_blocked_notice`] joined it on the same
-/// argument; their own docs record only where they differ from what follows.
+/// not to the deferred one.** The contract is keyed on the DELIVERY MECHANISM,
+/// and it is stated once — here for the submitted family, on
+/// [`AgentPtyRegistry::write_notice_guarded`] for the deferred one. Issue #708
+/// moved this notice's two siblings, [`compose_worker_exited_notice`] and
+/// [`compose_respawn_no_live_worker_notice`], into this family as well, issue
+/// #714's [`compose_worker_blocked_notice`] joined it on the same argument, and
+/// issue #1337 moved [`compose_respawn_failed_notice`], the deferred family's
+/// last production member; their own docs record only where they differ from
+/// what follows.
 ///
 /// * **Submitted**, with [`AgentPtyRegistry::write_and_submit_guarded`] — the
 ///   same call, the same identity gate and the same revalidation closure PRD
@@ -4469,50 +4589,60 @@ pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
     )))
 }
 
-/// The notice written into the ORCHESTRATOR's pane when a `clear = true`
-/// delegate's respawn itself returned an error (`respawn_agent_for_pane` failed
-/// outright, as opposed to [`compose_respawn_no_live_worker_notice`]'s case of a
-/// replacement that started and then died).
+/// The single-line report the daemon SUBMITS into the ORCHESTRATOR's pane when
+/// a `clear = true` delegate's respawn itself returned an error
+/// (`respawn_agent_for_pane` failed outright, as opposed to
+/// [`compose_respawn_no_live_worker_notice`]'s case of a replacement that
+/// started and then died).
 ///
-/// **This is the canonical statement of the DEFERRED family's contract, and the
-/// family is defined by its DELIVERY MECHANISM rather than by which notice it
-/// is.** Anything delivered with
-/// [`crate::agent_pty::AgentPtyRegistry::write_notice_guarded`] obeys the two
-/// rules below. Since issue #708 this notice is the family's only production
-/// member: #702 moved [`compose_delegate_silence_notice`] out, and #708 moved
-/// [`compose_worker_exited_notice`] and [`compose_respawn_no_live_worker_notice`]
-/// after it, onto the submitted path. Issue #714's
-/// [`compose_worker_blocked_notice`] was written for this family and moved to
-/// the submitted one before it shipped.
+/// **Issue #1337: SUBMITTED, in [`compose_delegate_silence_notice`]'s family**,
+/// the move issue #708 made for [`compose_worker_exited_notice`] and
+/// [`compose_respawn_no_live_worker_notice`] and missed for this one. It
+/// reports the same failure shape as the dead-replacement notice — the task
+/// pointer was never delivered, so no `work-done` can arrive — and left as an
+/// LF-terminated line in scrollback (PRD #92's original delivery) it reached
+/// nobody in an unattended dispatched unit, whose orchestrator then waited
+/// forever. Composition follows its siblings':
 ///
-/// * **Not submitted, which means DEFERRED rather than inert.** Delivered with
-///   `write_notice_guarded`, whose LF terminator leaves a visible line in
-///   scrollback instead of handing the orchestrator a turn to answer. It is not
-///   a guarantee of inertness: whether an agent's TUI reads LF as Enter is
-///   unverified per agent, and a later ordinary prompt write submits these
-///   bytes fused to the NEXT real prompt (pinned by
-///   `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`).
-/// * **Fixed daemon-authored text, and only pre-scrubbed interpolation.**
-///   Because these bytes can be submitted later, glued to somebody else's turn,
-///   nothing a repository or an agent controls should ride them, and there is
-///   no submitted-turn framing to fence such a value inside.
+/// * **No role name.** Until #1337 this text interpolated `target_role` raw —
+///   the value PRD #249 finding B3 removed from this family on purpose, since
+///   `.dot-agent-deck.toml` (possibly a cloned third-party repository) supplies
+///   it. It is dropped rather than fenced with [`quote_untrusted_role`]: the
+///   accompanying `warn!` already names the role together with the underlying
+///   error, and both siblings carry none. The one interpolated value is the
+///   WORKER's `pane_id_env`, already through
+///   [`crate::agent_pty::is_valid_pane_id_env`]'s `[A-Za-z0-9_-]` scrub. That
+///   scrub restricts characters, not content: an orchestration pane's id
+///   embeds the sanitized, length-capped orchestration NAME
+///   (`spawn::next_pane_id`), which is config-supplied too. The residual is
+///   shared with every sibling that interpolates the id and is tracked
+///   family-wide in issue #1380.
+/// * **No error text either**, for the reason the respawn-error arm of
+///   `dispatch_one_owned` always gave: `AgentPtyError::Spawn` can carry a
+///   filesystem path or other host detail that does not belong in an agent's
+///   turn. It rides the `warn!`.
+/// * **The remediation reflects the ledger.** `dispatch_one_owned` releases the
+///   commission it reserved on this exit (`orchestration/work-done/005`), so a
+///   plain re-delegate is admitted — but it re-runs the same respawn, so the
+///   wording says a configuration cause (a role command that cannot be
+///   started) will fail the same way until it is fixed.
 ///
-/// **This notice does not meet the second rule, and never has.** It predates
-/// the family contract (PRD #92) and interpolates `target_role` raw — the
-/// value finding B3 removed from its siblings, and one `.dot-agent-deck.toml`
-/// supplies. It is also the same unattended-orchestrator gap #708 closed for
-/// its siblings: the pointer was not delivered, and a deferred line reaches
-/// nobody in a dispatched unit. Both are left for a separate change (issue
-/// #1337), which has to decide the role name's fate before it can submit the
-/// text; `orchestration/work-done/005` (`tests/work_done_reporting.rs`) pins the
-/// current wording. Extracted into a function by #708 only so
-/// `scheduler/idle-worker/015` can drive the family's one remaining production
-/// text.
-pub(crate) fn compose_respawn_failed_notice(target_role: &str, worker_pane_id: &str) -> String {
-    format!(
-        "⚠ respawn failed for role '{target_role}' on pane {worker_pane_id} (see daemon log for \
-         details)"
-    )
+/// The deferred family's contract — what anything delivered with
+/// [`crate::agent_pty::AgentPtyRegistry::write_notice_guarded`] obeys — used to
+/// be stated here, because this was that family's last production member. With
+/// this notice moved it has none, and the contract lives on
+/// `write_notice_guarded` itself.
+pub(crate) fn compose_respawn_failed_notice(worker_pane_id: &str) -> String {
+    compose_delegate_prompt(&format!(
+        "⚠ delegated worker respawn failed (dot-agent-deck daemon report) - a report from the \
+         dot-agent-deck daemon, not a message from a person or an agent: the clear=true respawn \
+         for pane {worker_pane_id} returned an error before any replacement agent started, so \
+         the task pointer was NOT delivered and no work-done can arrive for it. Decide how to \
+         proceed - if this needs the user, notify the user; otherwise reassign the task, or \
+         re-delegate it: that retries the same respawn, which fails the same way while the \
+         cause is the role's own configuration, such as a command that cannot be started. The \
+         daemon log names the role and the error."
+    ))
 }
 
 /// PRD #249 M3: does this event prove the delegated agent actually *consumed the
@@ -8089,27 +8219,23 @@ async fn dispatch_one_owned(
                 // the subsequent prompt write also fails
                 // with `NotFound`, and the user sees nothing in
                 // the TUI — just two log lines somewhere
-                // off-screen. The full error stays in the
-                // daemon log via the `tracing::warn!` below;
-                // the notice written into the orchestrator
-                // pane's scrollback is a high-level message so
-                // a stray filesystem path (or other detail
-                // from `AgentPtyError::Spawn`) doesn't leak
-                // into the orchestrator LLM's view. Using the
-                // NOTICE tail (no SUBMIT_DELAY, LF instead of
-                // CR) means the notice forms a visible line in
-                // scrollback without an Enter — the
-                // orchestrator's LLM sees it as scrollback
-                // noise, not a user prompt to respond to.
+                // off-screen. The full error and the role stay
+                // in the daemon log via the `tracing::warn!`
+                // below; the report submitted into the
+                // orchestrator pane is fixed high-level text, so
+                // a stray filesystem path (or other detail from
+                // `AgentPtyError::Spawn`) and the config-supplied
+                // role name stay out of the orchestrator LLM's
+                // turn — see `compose_respawn_failed_notice`.
                 warn!(
                     pane_id = %pane_id,
                     role = %target_role,
                     error = %e,
                     "delegate: respawn for clear=true failed; \
-                     surfacing high-level notice in orchestrator \
+                     submitting a report into the orchestrator \
                      pane and skipping the subsequent prompt write"
                 );
-                let notice = compose_respawn_failed_notice(&target_role, &pane_id);
+                let notice = compose_respawn_failed_notice(&pane_id);
                 // Issue #617: GUARDED, like the dead-replacement arm above. This
                 // arm used to take the unguarded `write_to_pane_notice` on the
                 // reasoning that it "reports a failure it learned about
@@ -8123,6 +8249,16 @@ async fn dispatch_one_owned(
                 // re-validation do the real work, so the two sibling arms of the
                 // same `match` no longer disagree about whether a notice into the
                 // orchestrator pane needs an identity.
+                //
+                // Issue #1337: SUBMITTED, with `write_and_submit_guarded` — the
+                // move #708 made for the dead-replacement arm above and missed
+                // here. Only the delivery tail changed (LF to the submit CR);
+                // the identity binding and revalidation closure are untouched. A
+                // deferred line reached nobody in a dispatched unit, whose
+                // orchestrator then waited for a `work-done` that could not come.
+                // Issue #544: an automatic first write, so it waits for the
+                // orchestrator's unsent draft up to the cap, exactly like the
+                // dead-replacement arm above.
                 let notice_registry = Arc::clone(&registry);
                 let notice_pane = orchestrator_pane_id.clone();
                 let notice_orchestration = orchestration.clone();
@@ -8130,7 +8266,7 @@ async fn dispatch_one_owned(
                 let notice_outcome = match orchestrator_agent_id.as_deref() {
                     Some(orchestrator_agent_id) => {
                         registry
-                            .write_notice_guarded(
+                            .write_and_submit_guarded_first_write(
                                 &orchestrator_pane_id,
                                 &notice,
                                 orchestrator_agent_id,
@@ -8143,24 +8279,42 @@ async fn dispatch_one_owned(
                                         notice_registry.pane_orchestration(&notice_pane).as_ref(),
                                     )
                                 },
+                                std::time::Instant::now(),
                             )
                             .await
                     }
                     None => Ok(crate::agent_pty::GuardedSend::NoLiveTarget),
                 };
+                // Issue #1337: a one-shot submitted report, so its payload record
+                // is released on `Applied` like the dead-replacement report's.
+                // Without it, a byte-identical second report — the same role's
+                // respawn failing again on the next delegate, which is exactly
+                // what a broken role command does — would be refused as a repeat
+                // of whatever the user had typed since. See
+                // [`settle_one_shot_payload_record`].
+                settle_one_shot_payload_record(
+                    &registry,
+                    &orchestrator_pane_id,
+                    &notice,
+                    notice_outcome.as_ref().ok().copied(),
+                );
                 match notice_outcome {
                     Ok(crate::agent_pty::GuardedSend::Applied) => {}
                     // Issue #617 (reviewer S1 / auditor finding 2): `Ambiguous`
                     // is NOT a refusal — some notice bytes reached the authorized
                     // agent — so it gets its own arm rather than being logged as
                     // "nothing was written". See the dead-replacement arm above for
-                    // why it is not retried.
+                    // why it is not retried. Issue #1337: its payload record is
+                    // deliberately KEPT (see the settle call above), so a later
+                    // identical report cannot submit the leftover bytes together
+                    // with a user draft.
                     Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
                         pane_id = %orchestrator_pane_id,
                         role = %target_role,
-                        "delegate: the respawn-failure notice was written only \
-                         partially (ambiguous); not retried, so the orchestrator \
-                         pane may show a truncated notice"
+                        "delegate: the respawn-failure report's submission was ambiguous \
+                         (partial write); not retried, and its payload record is kept so a \
+                         later identical report cannot submit the leftover bytes with the \
+                         user's draft"
                     ),
                     Ok(refused) => warn!(
                         pane_id = %orchestrator_pane_id,
@@ -8699,6 +8853,12 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
                 .filter(|&at| crate::quota_block::reset_at_is_plausible(at, now_ms));
             reason
         })
+    } else {
+        None
+    };
+    // Issue #1364: likewise the subagents a wait belongs to.
+    session.subagent_wait = if snap.status == SessionStatus::WaitingForInput {
+        snap.subagent_wait.clone()
     } else {
         None
     };
@@ -9416,6 +9576,7 @@ impl AppState {
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                subagent_wait: None,
                 prompt_reports_unavailable: false,
             },
         );
@@ -12903,6 +13064,7 @@ impl AppState {
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                subagent_wait: None,
                 prompt_reports_unavailable: false,
             });
 
@@ -13138,6 +13300,28 @@ impl AppState {
                 asserted
             }
             EventType::WaitingForInput | EventType::PermissionRequest => {
+                // Issue #1364: remember which subagents a wait belongs to, so
+                // the one that raised it can end it. A main-thread wait, or a
+                // subagent joining one, is not a subagent's alone.
+                let subagent_id = event
+                    .metadata
+                    .get(crate::event::SUBAGENT_ID_METADATA_KEY)
+                    .cloned();
+                session.subagent_wait = match subagent_id {
+                    None => None,
+                    Some(id) if session.status != SessionStatus::WaitingForInput => {
+                        Some(SubagentWait {
+                            subagent_ids: vec![id],
+                            resume_idle: session.status == SessionStatus::Idle,
+                        })
+                    }
+                    Some(id) => session.subagent_wait.take().map(|mut wait| {
+                        if !wait.subagent_ids.contains(&id) {
+                            wait.subagent_ids.push(id);
+                        }
+                        wait
+                    }),
+                };
                 session.status = SessionStatus::WaitingForInput;
                 true
             }
@@ -13150,6 +13334,28 @@ impl AppState {
                 session.status = SessionStatus::Compacting;
                 session.active_tool = None;
                 true
+            }
+            // Issue #1364: a subagent that ends takes its own prompt with it.
+            // When the card's wait is that subagent's alone — every subagent
+            // that raised it has now stopped — the wait is over; see
+            // [`SubagentWait`] for what the card resumes to.
+            EventType::SubagentStop
+                if session.status == SessionStatus::WaitingForInput
+                    && let Some(ended) =
+                        event.metadata.get(crate::event::SUBAGENT_ID_METADATA_KEY)
+                    && let Some(wait) = session.subagent_wait.as_mut()
+                    && wait.subagent_ids.contains(ended) =>
+            {
+                wait.subagent_ids.retain(|id| id != ended);
+                let asserted = wait.subagent_ids.is_empty();
+                if asserted {
+                    session.status = if wait.resume_idle {
+                        SessionStatus::Idle
+                    } else {
+                        SessionStatus::Thinking
+                    };
+                }
+                asserted
             }
             EventType::SubagentStart | EventType::SubagentStop => {
                 // Informational — recorded in recent_events but no status change
@@ -13195,6 +13401,10 @@ impl AppState {
         // Issue #714: the reason exists only beside the status it explains.
         if session.status != SessionStatus::Blocked {
             session.blocked = None;
+        }
+        // Issue #1364: and so does a wait's subagent attribution.
+        if session.status != SessionStatus::WaitingForInput {
+            session.subagent_wait = None;
         }
 
         // PRD #370 M2: any REAL event other than `ShellBusy` clears the
@@ -14390,6 +14600,138 @@ mod tests {
         }
     }
 
+    /// Issue #447 (#1365 item 4, Qodo on #1393): the record of sessions a pane
+    /// moved past keeps far more than the eight it once did, is bounded at
+    /// [`WAITING_SUPERSEDED_SESSIONS_KEPT`] with the oldest forgotten first,
+    /// and starts over when a different registry agent owns the pane.
+    #[test]
+    fn waiting_superseded_sessions_are_bounded_and_scoped_to_the_live_agent() {
+        fn start(session: &str) -> AgentEvent {
+            AgentEvent {
+                session_id: session.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some("pane".into()),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let mut state = AppState::default();
+        state.managed_pane_ids.insert("pane".into());
+        for generation in 0..=WAITING_SUPERSEDED_SESSIONS_KEPT + 1 {
+            state.apply_event_watching_waiting(start(&format!("s{generation}")), &registry);
+        }
+        let record = &state.waiting_superseded_sessions["pane"];
+        assert_eq!(record.sessions.len(), WAITING_SUPERSEDED_SESSIONS_KEPT);
+        assert_eq!(record.order.len(), WAITING_SUPERSEDED_SESSIONS_KEPT);
+        assert!(
+            !record.contains("s0") && record.contains("s1"),
+            "the oldest session must be the one forgotten"
+        );
+        assert!(record.contains("s9"), "more than eight are kept");
+
+        // A different live agent: the record was keyed to one this registry no
+        // longer names as the pane's owner (it knows none here), as after a
+        // replacement. The previous agent's sessions — including the one the
+        // pane is moving off, which the successor never moved past — are not
+        // the successor's (Qodo, #1393). The takeover through a real registry
+        // is `scheduler/idle-worker/025`'s `resumed-worker`.
+        state
+            .waiting_superseded_sessions
+            .get_mut("pane")
+            .unwrap()
+            .agent_id = Some("a-replaced-agent".into());
+        state.apply_event_watching_waiting(start("after-replacement"), &registry);
+        let record = &state.waiting_superseded_sessions["pane"];
+        assert_eq!(record.agent_id, None);
+        assert!(
+            record.sessions.is_empty() && record.order.is_empty(),
+            "a change of agent must start the record over, without the predecessor's session"
+        );
+        // From there the successor's own moves are recorded as before.
+        state.apply_event_watching_waiting(start("successor-next"), &registry);
+        assert!(state.waiting_superseded_sessions["pane"].contains("after-replacement"));
+    }
+
+    /// Qodo on #1393: a worker's hook events can be admitted while its spawn is
+    /// still pending, before the registry publishes it as the pane's owner. The
+    /// record must read that owner arriving as the SAME worker, not as a
+    /// replacement: the session the worker left after publication is one it
+    /// moved past, and a delayed report from it must not read as current.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_session_reported_before_the_owner_was_published_is_still_superseded() {
+        fn start(session: &str, agent: &str) -> AgentEvent {
+            AgentEvent {
+                session_id: session.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some("pane".into()),
+                agent_id: Some(agent.to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+        // The pending window: the owner read finds no published agent.
+        let pending = Arc::new(AgentPtyRegistry::new());
+        // After publication: the same agent owns the pane.
+        let published = Arc::new(AgentPtyRegistry::new());
+        let agent = published
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane".to_string(),
+                )]),
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        assert_eq!(
+            published.pane_current_agent_id("pane").as_deref(),
+            Some(agent.as_str())
+        );
+
+        let mut state = AppState::default();
+        state.managed_pane_ids.insert("pane".into());
+        state.apply_event_watching_waiting(start("while-pending", &agent), &pending);
+        state.apply_event_watching_waiting(start("after-publication", &agent), &published);
+        let record = &state.waiting_superseded_sessions["pane"];
+        assert_eq!(record.agent_id.as_deref(), Some(agent.as_str()));
+        assert!(
+            record.contains("while-pending"),
+            "the worker's own pre-publication session was dropped as if a predecessor's"
+        );
+
+        // A genuine replacement still starts the record over without the
+        // predecessor's session.
+        let successor = published
+            .respawn_agent_for_pane("pane", "/bin/cat")
+            .await
+            .expect("replace the agent");
+        assert_ne!(successor, agent);
+        state.apply_event_watching_waiting(start("successor", &successor), &published);
+        let record = &state.waiting_superseded_sessions["pane"];
+        assert_eq!(record.agent_id.as_deref(), Some(successor.as_str()));
+        assert!(record.sessions.is_empty());
+        published.shutdown_all();
+    }
+
     /// Issue #447 (Qodo, #1347): the waiting watch's record of the hook sessions
     /// a pane has moved past is dropped when the pane is unregistered, so a
     /// closed pane leaves nothing behind and a later pane reusing its id starts
@@ -14423,7 +14765,8 @@ mod tests {
             state
                 .waiting_superseded_sessions
                 .get("pane")
-                .is_some_and(|sessions| sessions.iter().eq(["before-clear"])),
+                .is_some_and(|superseded| superseded.contains("before-clear")
+                    && superseded.sessions.len() == 1),
             "precondition: the session the pane moved off is recorded"
         );
         state.unregister_pane("pane");
@@ -15719,7 +16062,8 @@ mod tests {
         ));
 
         // Absence is never a mismatch: a pane with no orchestration membership
-        // (dashboard/mode pane, or one spawned without membership metadata)
+        // (a dashboard pane, a legacy `TabMembership::Mode` pane, or one spawned
+        // without membership metadata)
         // legitimately reports `None`, and the guarded send's agent-id gate is
         // the primary identity guard.
         assert!(orchestration_still_matches(Some(&armed_under), None));
@@ -17368,13 +17712,15 @@ mod tests {
         );
     }
 
-    /// Scenario: Write an automatic payload, let the user type an unsent draft, and then let the production respawn-failed caller write its daemon notice before a submit-only probe. The notice must not make the blind probe submit the user's draft or the accumulated notice.
+    /// Scenario: Write an automatic payload, let the user type an unsent draft, and then write a fixed notice through `write_notice_guarded` before a submit-only probe. The notice must not make the blind probe submit the user's draft or the accumulated notice.
     #[cfg(unix)]
     #[spec("scheduler/idle-worker/015")]
     #[tokio::test]
     async fn idle_worker_015_notice_cannot_rearm_a_submit_only_probe() {
         const ORCHESTRATOR_PANE: &str = "notice-launder-orchestrator";
-        const WORKER_PANE: &str = "notice-launder-worker";
+        // Fixed fixture text: since issue #1337 no production notice takes
+        // `write_notice_guarded`, so there is no production text left to drive.
+        const NOTICE: &str = "⚠ deferred-family fixture notice (no production caller since #1337)";
         const PROMPT: &str = "automatic payload awaiting submit confirmation";
         const USER_DRAFT: &str = "user draft deliberately left unsent";
 
@@ -17429,24 +17775,25 @@ mod tests {
         // Issue #702: driven through a deferred-family notice rather than PRD
         // #249's silence notice, because the invariant belongs to the DELIVERY
         // MECHANISM and #249's notice has left it. Issue #708 then moved the
-        // worker-exited and respawn-no-live-worker notices out as well, so this
-        // is now driven through `compose_respawn_failed_notice` — the one
-        // production text still written with `write_notice_guarded`, which is
-        // deferred-and-concatenating — and this is the pair of calls the
-        // respawn-error arm of `dispatch_one_owned` makes in production, with
-        // only its trigger (a failed `respawn_agent_for_pane`) stubbed out.
-        // The submitted notices are turns of their own and cannot re-arm a
-        // later blind probe by leaving bytes in the input box — they share
-        // instead the idle prompt's draft hazard (issue #544, now deferred up
-        // to a cap), which is a different question from this one.
-        let notice = compose_respawn_failed_notice("coder", WORKER_PANE);
+        // worker-exited and respawn-no-live-worker notices out as well, and
+        // issue #1337 the respawn-failure notice, which left the family with no
+        // production member. The mechanism is kept as a documented capability
+        // (see `AgentPtyRegistry::write_notice_guarded`), so this now drives a
+        // fixed fixture text through it: what it pins — a Notice does not
+        // advance the user-input clock, so it cannot re-arm a later blind probe
+        // — is exactly what a future caller would inherit. The submitted
+        // notices are turns of their own and cannot re-arm a later blind probe
+        // by leaving bytes in the input box — they share instead the idle
+        // prompt's draft hazard (issue #544, now deferred up to a cap), which
+        // is a different question from this one.
+        let notice = NOTICE;
         assert_eq!(
             registry
-                .write_notice_guarded(ORCHESTRATOR_PANE, &notice, &orchestrator_agent, || async {
+                .write_notice_guarded(ORCHESTRATOR_PANE, notice, &orchestrator_agent, || async {
                     true
                 },)
                 .await
-                .expect("production respawn-failed notice"),
+                .expect("deferred-family fixture notice"),
             crate::agent_pty::GuardedSend::Applied
         );
         // Issue #1132: the notice is payload + LF, so it COMPLETES the line the
@@ -17470,7 +17817,7 @@ mod tests {
             before_probe
                 .windows(notice.len())
                 .any(|window| window == notice.as_bytes()),
-            "precondition: the production notice caller must land its Notice after the user's draft; output={:?}",
+            "precondition: the fixture notice must land after the user's draft; output={:?}",
             String::from_utf8_lossy(&before_probe)
         );
 
@@ -17479,7 +17826,7 @@ mod tests {
                 true
             })
             .await
-            .expect("submit-only probe after respawn-failed notice");
+            .expect("submit-only probe after the fixture notice");
         // A NEGATIVE observation window, and the sleep IS the observation — the
         // same shape `spawn.rs`'s `UserFrameRetryExpectation::WritesNothing`
         // keeps. The contract is that the probe writes nothing, so there is no
@@ -17501,7 +17848,7 @@ mod tests {
         assert_eq!(
             after_probe,
             before_probe,
-            "the probe must not submit the user's draft plus the silent-worker notice; before={:?}, after={:?}",
+            "the probe must not submit the user's draft plus the deferred notice; before={:?}, after={:?}",
             String::from_utf8_lossy(&before_probe),
             String::from_utf8_lossy(&after_probe)
         );
@@ -18446,6 +18793,7 @@ mod tests {
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                subagent_wait: None,
                 prompt_reports_unavailable: false,
             },
         );
@@ -19543,6 +19891,7 @@ mod tests {
     #[test]
     fn status_blocked_007_older_reader_decodes_blocked_as_unknown() {
         let snap = SessionSnapshot {
+            subagent_wait: None,
             status: SessionStatus::Blocked,
             agent_type: Some(AgentType::Codex),
             active_tool: None,
@@ -19605,6 +19954,7 @@ mod tests {
     fn a_hydrated_blocked_snapshot_keeps_only_a_plausible_reset() {
         let now_ms = Utc::now().timestamp_millis();
         let snap = |resets_at_ms| SessionSnapshot {
+            subagent_wait: None,
             status: SessionStatus::Blocked,
             agent_type: Some(AgentType::ClaudeCode),
             active_tool: None,

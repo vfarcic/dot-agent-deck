@@ -74,10 +74,15 @@ mod tests {
     #[test]
     fn prompt_contains_key_sections() {
         let prompt = config_gen_prompt("/tmp/test");
-        assert!(prompt.contains("[[modes]]"));
-        assert!(prompt.contains("[[modes.panes]]"));
-        assert!(prompt.contains("[[modes.rules]]"));
         assert!(prompt.contains(".dot-agent-deck.toml"));
+        assert!(prompt.contains("[[orchestrations]]"));
+        // Issue #1199: the generator must never be taught to write a
+        // `[[modes]]` block (it would only be ignored with a warning) — nor
+        // its panes or rules.
+        assert!(!prompt.contains("[[modes.panes]]"));
+        assert!(!prompt.contains("[[modes.rules]]"));
+        assert!(!prompt.contains("reactive_panes"));
+        assert!(!prompt.contains("init_command"));
     }
 
     #[test]

@@ -138,6 +138,7 @@ fn selected_card_fixture() -> SessionState {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        subagent_wait: None,
         prompt_reports_unavailable: false,
     }
 }
@@ -367,20 +368,20 @@ fn mode_chip_001_bottom_bar_names_current_mode() {
     );
 }
 
-/// Scenario: Render the global-only Mode-tab bar, the context-rich Dashboard/Orchestration bar, and the PaneInput bar. Every context must keep the chip at the same left edge while retaining the destination-naming Ctrl+D button beside it.
+/// Scenario: Render the global-only bar, the context-rich Dashboard/Orchestration bar, and the PaneInput bar. Every context must keep the chip at the same left edge while retaining the destination-naming Ctrl+D button beside it.
 #[spec("mode/chip/002")]
 #[test]
 fn mode_chip_002_is_universal_and_keeps_destination_button() {
     let config = KeybindingConfig::default();
     let dashboard = render_button_bar_for_mode_to_buffer(&config, UiMode::Normal, 200, 2);
-    let mode_tab = render_button_bar_to_buffer(200);
+    let global_only_bar = render_button_bar_to_buffer(200);
     // Dashboard and Orchestration share the production Cards bottom-bar path;
     // render it independently here so failures name both user-visible contexts.
     let orchestration = render_button_bar_with_bindings_to_buffer(&config, 200, 2);
 
     for (context, buffer) in [
         ("Dashboard", &dashboard),
-        ("Mode tab", &mode_tab),
+        ("Global-only button bar", &global_only_bar),
         ("Orchestration tab", &orchestration),
     ] {
         assert_mode_chip_at_origin(buffer, COMMAND_CHIP, context);

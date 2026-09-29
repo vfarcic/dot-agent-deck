@@ -1938,8 +1938,8 @@ pub struct PreparedStartRequest {
     /// daemon's own working directory, and therefore not the prepared project.
     pub cwd: Option<String>,
     /// The orchestration membership the request declares, and `None` for a
-    /// request that declares none at all (a dashboard pane, or a
-    /// [`crate::agent_pty::TabMembership::Mode`] tab).
+    /// request that declares none at all (a dashboard pane, or the deprecated
+    /// [`crate::agent_pty::TabMembership::Mode`] an older TUI may still send).
     pub membership: Option<PreparedStartMembership>,
 }
 

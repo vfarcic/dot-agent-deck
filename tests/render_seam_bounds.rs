@@ -64,6 +64,7 @@ fn fixture_session() -> SessionState {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        subagent_wait: None,
         prompt_reports_unavailable: false,
     }
 }
@@ -108,7 +109,7 @@ fn bounded_seams() -> Vec<Seam> {
         // Group A — through the shared `draw_to_buffer` helper.
         seam("render_stats_bar_to_buffer", |w, h| {
             let stats = DashboardStats::default();
-            let buffer = render_stats_bar_to_buffer(&stats, None, w, h);
+            let buffer = render_stats_bar_to_buffer(&stats, w, h);
             dims(&buffer)
         }),
         seam("render_quit_confirm_to_buffer", |w, h| {
@@ -123,7 +124,7 @@ fn bounded_seams() -> Vec<Seam> {
         // Group C — seams that build their own `TestBackend`.
         seam("render_help_overlay_with_bindings_to_buffer", |w, h| {
             let keybindings = KeybindingConfig::default();
-            let buffer = render_help_overlay_with_bindings_to_buffer(&keybindings, None, w, h);
+            let buffer = render_help_overlay_with_bindings_to_buffer(&keybindings, w, h);
             dims(&buffer)
         }),
         seam("render_hints_bar_to_buffer", |w, h| {

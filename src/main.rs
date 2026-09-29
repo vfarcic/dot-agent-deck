@@ -541,7 +541,8 @@ enum RemoteCmd {
         name: String,
     },
     /// Re-run the binary install flow against an existing entry, then bump
-    /// the registry's version field.
+    /// the registry's version field. On a host whose deck Homebrew installed,
+    /// runs `brew upgrade dot-agent-deck` there instead of downloading a copy.
     Upgrade {
         /// Friendly name of the registry entry to upgrade.
         name: String,
@@ -1783,9 +1784,18 @@ fn main() -> ExitCode {
             RemoteCmd::Remove { name } => {
                 let path = dot_agent_deck::remote::default_remotes_path();
                 match dot_agent_deck::remote::remove(&name, &path) {
-                    Ok(_) => {
+                    Ok(removed) => {
+                        // Issue #1372: a Homebrew-installed deck is removed
+                        // through Homebrew, not by deleting a file brew owns.
+                        let uninstall = if removed.install.as_deref()
+                            == Some(dot_agent_deck::remote::INSTALL_HOMEBREW)
+                        {
+                            "brew uninstall dot-agent-deck".to_string()
+                        } else {
+                            format!("rm {}", dot_agent_deck::remote::REMOTE_INSTALL_PATH)
+                        };
                         println!(
-                            "Removed remote '{name}' from local registry. The dot-agent-deck binary on the remote and its hooks are unaffected; if you want to clean those up, ssh in and run `dot-agent-deck hooks uninstall` and `rm ~/.local/bin/dot-agent-deck`."
+                            "Removed remote '{name}' from local registry. The dot-agent-deck binary on the remote and its hooks are unaffected; if you want to clean those up, ssh in and run `dot-agent-deck hooks uninstall` and `{uninstall}`."
                         );
                         ExitCode::SUCCESS
                     }

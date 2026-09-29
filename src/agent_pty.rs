@@ -461,7 +461,7 @@ pub fn is_valid_cwd(value: &str) -> bool {
 
 /// Which tab a daemon-tracked agent pane belonged to at spawn time
 /// (PRD #76 M2.12). Echoed back via `list_agents` so the TUI can rebuild
-/// the user's mode/orchestration tab structure on reconnect instead of
+/// the user's orchestration tab structure on reconnect instead of
 /// stranding every hydrated pane on the dashboard.
 ///
 /// Validation: the embedded `name` follows the same `is_valid_display_name`
@@ -472,7 +472,7 @@ pub fn is_valid_cwd(value: &str) -> bool {
 ///
 /// Wire shape (serde):
 /// ```json
-/// { "kind": "mode", "name": "k8s-ops" }
+/// { "kind": "mode", "name": "k8s-ops" }            // deprecated (#1199)
 /// { "kind": "orchestration", "name": "tdd-cycle", "role_index": 2 }
 /// ```
 ///
@@ -484,9 +484,14 @@ pub fn is_valid_cwd(value: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TabMembership {
-    /// Agent pane of a Mode tab. Side panes (the cards on the left) are
-    /// NOT daemon-tracked — they respawn fresh from `ModeConfig.panes` on
-    /// reconnect, see PRD #76 M2.12 design decision 2.
+    /// **Deprecated by issue #1199 (workspace modes were removed).** Was the
+    /// agent pane of a workspace-mode tab. Kept so an older TUI's `StartAgent`
+    /// and an older daemon's `list_agents` reply still decode — dropping the
+    /// variant would make either fail to parse, which is a wire break with no
+    /// `PROTOCOL_VERSION` bump to announce it. The TUI never constructs it
+    /// again: a hydrated record carrying it lands on the dashboard as a plain
+    /// card (with a session warning), and the daemon keeps handling it as the
+    /// opaque label it always was.
     Mode { name: String },
     /// One role slot of an orchestration tab. `role_index` is the position
     /// of this role in `OrchestrationConfig.roles`; on reconnect a dead
@@ -1640,7 +1645,7 @@ fn spawn_with_dir(
 
     // PRD #20 blocker-3: apply the Wrapper integration strategy at the COMMON
     // spawn boundary. Every launch path that reaches a real child — fresh/plain
-    // new-pane, plain/mode RESTORE, orchestration role, scheduler single/role,
+    // new-pane, plain RESTORE, orchestration role, scheduler single/role,
     // issue-dispatch single/role, and respawn — funnels through here, so a
     // Wrapper-strategy agent (Codex) is wrapped into
     // `dot-agent-deck wrap --agent <name> -- <command>` exactly once regardless
@@ -1650,8 +1655,7 @@ fn spawn_with_dir(
     // non-Wrapper agents, so native agents and pre-wrapped commands are
     // untouched. The BARE command remains the persisted/user-facing metadata
     // upstream (Command field, last_command, SavedPane.command) — only the
-    // actual exec here is transformed. Mode panes type their command into a
-    // shell rather than passing it here; those seams wrap at the type site.
+    // actual exec here is transformed.
     let resolved_agent = opts
         .agent_type
         .clone()
@@ -2693,7 +2697,7 @@ async fn deliver_payload_and_submit(
 ///
 /// Issue #876: and no DRAIN either, which is a decision rather than an omission.
 /// A notice's bytes are MEANT to stay in the input box — that is the whole
-/// deferral contract ([`crate::state::compose_respawn_failed_notice`]) — so
+/// deferral contract ([`AgentPtyRegistry::write_notice_guarded`]) — so
 /// erasing a partial one would delete the feature rather than a hazard. It also
 /// leaves no payload record to lapse: `note_automatic_write` ignores
 /// [`SubmitMode::Notice`] entirely, so issue #876's "the guard expires while the
@@ -2788,7 +2792,7 @@ pub struct RunningAgent {
     /// Captured from [`SpawnOptions::tab_membership`] after validation;
     /// invalid values are stored as `None` (same drop pattern as
     /// `display_name`). The TUI uses this on reconnect to rebuild
-    /// mode/orchestration tabs instead of stranding every hydrated pane
+    /// orchestration tabs instead of stranding every hydrated pane
     /// on the dashboard. `None` means dashboard pane (or an older daemon
     /// predating this field — wire-format `skip_serializing_if` keeps the
     /// hydration path backwards compatible).
@@ -3165,7 +3169,7 @@ pub struct AgentRecord {
     /// `None` means either the agent was a dashboard pane, the spawn
     /// supplied an invalid value (dropped at capture), or the daemon ran
     /// an older binary that didn't persist this field. The TUI uses this
-    /// to rebuild mode/orchestration tabs on reconnect.
+    /// to rebuild orchestration tabs on reconnect.
     /// `skip_serializing_if` keeps the wire shape backwards-compatible
     /// with daemons predating this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3366,9 +3370,10 @@ struct AutomaticWrite {
     /// older than our last write, and the probe then submitted draft + notice as
     /// one turn. The silent-worker notice was a production `Notice` caller that
     /// fires inside the 60 s confirmation window, so that interleaving was
-    /// ordinary, not hypothetical. (Issues #702 and #708 moved it and both its
-    /// siblings onto the submitted path; the respawn-failure notice is the
-    /// `Notice` caller left, and the guard stays for it.)
+    /// ordinary, not hypothetical. (Issues #702, #708 and #1337 moved it and
+    /// every other production `Notice` caller onto the submitted path; the
+    /// guard stays for as long as `write_notice_guarded` does, and
+    /// `scheduler/idle-worker/015` pins it.)
     submitted_at: Option<Instant>,
     /// ONE ENTRY PER GUARDED PAYLOAD WRITE that no delivery has released yet,
     /// oldest first — a multiset, not a set.
@@ -5501,11 +5506,11 @@ impl Drop for PaneCleanupHold {
 /// that an automatic prompt delivery FAILED on `pane_id`.
 ///
 /// This is the replacement for writing a diagnostic line into the agent's own
-/// input buffer. That mechanism (`write_notice_guarded`) is retained for the
-/// one orchestrator-pane notice that still takes it — `compose_respawn_failed_notice`;
-/// issue #702 moved PRD #249's silence notice off it onto the submitted path, and
-/// issue #708 moved `compose_worker_exited_notice` and
-/// `compose_respawn_no_live_worker_notice` after it — but its own contract says LF may be
+/// input buffer. That mechanism (`write_notice_guarded`) no longer has a
+/// production caller — issue #702 moved PRD #249's silence notice off it onto
+/// the submitted path, issue #708 moved `compose_worker_exited_notice` and
+/// `compose_respawn_no_live_worker_notice` after it, and issue #1337
+/// `compose_respawn_failed_notice` — and its own contract says LF may be
 /// interpreted as Enter and that a later ordinary submit sends
 /// `notice + newline + user prompt` as ONE turn — pinned by the passing
 /// regression `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`.
@@ -6288,6 +6293,13 @@ impl AgentPtyRegistry {
     /// postponing its notice for ever, and a wait already reported is not
     /// reported again. An open episode for a DIFFERENT agent is replaced.
     ///
+    /// `reopen_settled` is the one exception, for the delegate-time caller: a
+    /// NEW commission to a worker still at the prompt its settled episode was
+    /// about is a new thing to report — the notice already sent was about the
+    /// delegation a `work-done` has since retired — so a settled record for the
+    /// same agent is replaced (#1365 item 3). An unsettled one is still kept:
+    /// its pending notice fires for the new commission too.
+    ///
     /// `cooldown` bounds the rate per worker pane: the returned `not_before` is
     /// the previous submitted notice plus `cooldown`. It delays a notice; it
     /// never drops one.
@@ -6296,6 +6308,7 @@ impl AgentPtyRegistry {
         worker_pane_id: &str,
         worker_agent_id: &str,
         cooldown: Duration,
+        reopen_settled: bool,
     ) -> Option<ArmedWaitingNotice> {
         let mut tracker = self.delegations.lock().unwrap();
         if tracker.closing_panes.contains(worker_pane_id) {
@@ -6304,7 +6317,9 @@ impl AgentPtyRegistry {
         if tracker
             .waiting_notices
             .get(worker_pane_id)
-            .is_some_and(|open| open.worker_agent_id == worker_agent_id)
+            .is_some_and(|open| {
+                open.worker_agent_id == worker_agent_id && !(reopen_settled && open.settled)
+            })
         {
             return None;
         }
@@ -7490,7 +7505,8 @@ impl AgentPtyRegistry {
     /// PRD #126 M1 audit (finding 2): the orchestration membership of the live
     /// agent on `pane_id`, per its registry `tab_membership`. `None` when no live
     /// agent owns the pane, or when it carries no orchestration membership (a
-    /// dashboard/mode pane, or a pane spawned without membership metadata).
+    /// dashboard pane, a legacy `TabMembership::Mode` pane from an older TUI,
+    /// or a pane spawned without membership metadata).
     ///
     /// The idle watch uses it twice: to refuse delivery into a pane that has
     /// since been re-homed into a *different* orchestration (because `None` is
@@ -9184,13 +9200,37 @@ impl AgentPtyRegistry {
     /// Failure and refusal are reported through the same [`GuardedSend`] vocabulary
     /// so callers classify a refused notice the way they classify a refused prompt.
     ///
-    /// Issue #702: what this path guarantees is DEFERRAL, not inertness — see
-    /// [`crate::state::compose_respawn_failed_notice`], which carries the whole
-    /// contract for the one production notice that still takes this call (issue
-    /// #708 moved the other two onto [`Self::write_and_submit_guarded`]). A caller that
-    /// wants an untrusted value in its text belongs on
-    /// [`Self::write_and_submit_guarded`] instead, where the text is a turn of
-    /// its own rather than a prefix glued to the next one.
+    /// **No production caller since issue #1337, retained as a documented
+    /// capability.** Every daemon-authored orchestrator notice that used to
+    /// take this call now submits instead: #702 moved PRD #249's silence notice,
+    /// #708 the worker-exited and respawn-no-live-worker notices, and #1337 the
+    /// respawn-failure notice ([`crate::state::compose_respawn_failed_notice`]),
+    /// each because a deferred line reaches nobody in an unattended dispatched
+    /// unit. It is kept rather than deleted because the guarded Notice tail is
+    /// the one way to put a visible, unsubmitted line into a pane under an
+    /// identity gate, and because its user-input-clock behaviour (below, and
+    /// `scheduler/idle-worker/015`) is what a future caller would inherit — so
+    /// it stays pinned while it exists. A new caller should first ask why its
+    /// text does not deserve a turn.
+    ///
+    /// **The DEFERRED family's contract**, which anything delivered here obeys
+    /// (moved from `compose_respawn_failed_notice`'s doc by #1337, when that
+    /// notice stopped being the family's last member):
+    ///
+    /// * **Not submitted, which means DEFERRED rather than inert.** The LF
+    ///   terminator leaves a visible line in scrollback instead of handing the
+    ///   agent a turn to answer. It is not a guarantee of inertness: whether an
+    ///   agent's TUI reads LF as Enter is unverified per agent, and a later
+    ///   ordinary prompt write submits these bytes fused to the NEXT real prompt
+    ///   (pinned by
+    ///   `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`).
+    /// * **Fixed daemon-authored text, and only pre-scrubbed interpolation.**
+    ///   Because these bytes can be submitted later, glued to somebody else's
+    ///   turn, nothing a repository or an agent controls should ride them, and
+    ///   there is no submitted-turn framing to fence such a value inside. A
+    ///   caller that wants an untrusted value in its text belongs on
+    ///   [`Self::write_and_submit_guarded`] instead, where the text is a turn
+    ///   of its own rather than a prefix glued to the next one.
     pub async fn write_notice_guarded<Fut>(
         &self,
         pane_id: &str,
@@ -17007,6 +17047,7 @@ mod spawn_tests {
             rows: 0,
             cols: 0,
             live: live_type.map(|agent_type| crate::state::SessionSnapshot {
+                subagent_wait: None,
                 status: crate::state::SessionStatus::Working,
                 agent_type,
                 active_tool: None,
@@ -20898,21 +20939,21 @@ mod spawn_tests {
         let reg = Arc::new(AgentPtyRegistry::new());
         let cooldown = Duration::from_secs(60);
         let mut first = reg
-            .arm_waiting_notice("worker", "agent-1", cooldown)
+            .arm_waiting_notice("worker", "agent-1", cooldown, false)
             .expect("a fresh episode arms");
         assert_eq!(
             first.not_before, None,
             "a pane never reported has no cooldown"
         );
         assert!(
-            reg.arm_waiting_notice("worker", "agent-1", cooldown)
+            reg.arm_waiting_notice("worker", "agent-1", cooldown, false)
                 .is_none(),
             "a repeated report for the same agent must not restart the debounce"
         );
         assert!(reg.waiting_notice_is_current("worker", first.seq));
 
         let second = reg
-            .arm_waiting_notice("worker", "agent-2", cooldown)
+            .arm_waiting_notice("worker", "agent-2", cooldown, false)
             .expect("a different agent replaces the episode");
         assert!(
             matches!(
@@ -20957,14 +20998,16 @@ mod spawn_tests {
         let reg = Arc::new(AgentPtyRegistry::new());
         let cooldown = Duration::from_secs(120);
 
-        let unsent = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        let unsent = reg
+            .arm_waiting_notice("worker", "agent", cooldown, false)
+            .unwrap();
         reg.settle_waiting_notice("worker", unsent.seq, false);
         assert!(
             !reg.waiting_notice_is_current("worker", unsent.seq),
             "a settled episode is no longer pending"
         );
         assert!(
-            reg.arm_waiting_notice("worker", "agent", cooldown)
+            reg.arm_waiting_notice("worker", "agent", cooldown, false)
                 .is_none(),
             "the same agent re-reporting the same wait must not open a second episode"
         );
@@ -20972,7 +21015,9 @@ mod spawn_tests {
             reg.cancel_waiting_notice("worker", "agent"),
             "leaving the state ends it"
         );
-        let after_unsent = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        let after_unsent = reg
+            .arm_waiting_notice("worker", "agent", cooldown, false)
+            .unwrap();
         assert_eq!(
             after_unsent.not_before, None,
             "an episode that sent nothing must not delay the next one"
@@ -20981,7 +21026,9 @@ mod spawn_tests {
         let before = Instant::now();
         reg.settle_waiting_notice("worker", after_unsent.seq, true);
         assert!(reg.cancel_waiting_notice("worker", "agent"));
-        let next = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        let next = reg
+            .arm_waiting_notice("worker", "agent", cooldown, false)
+            .unwrap();
         let floor = next
             .not_before
             .expect("a submitted notice starts the cooldown");
@@ -20996,12 +21043,14 @@ mod spawn_tests {
             "close sweeps the episode"
         );
         assert!(
-            reg.arm_waiting_notice("worker", "agent", cooldown)
+            reg.arm_waiting_notice("worker", "agent", cooldown, false)
                 .is_none(),
             "a closing pane must not open an episode"
         );
         drop(reg.finish_pane_close("worker", true));
-        let reopened = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        let reopened = reg
+            .arm_waiting_notice("worker", "agent", cooldown, false)
+            .unwrap();
         assert_eq!(
             reopened.not_before, None,
             "a closed pane's cooldown must not outlive it onto a pane id reused later"
@@ -21016,12 +21065,14 @@ mod spawn_tests {
     fn waiting_notice_settled_after_a_close_records_no_cooldown() {
         let reg = Arc::new(AgentPtyRegistry::new());
         let cooldown = Duration::from_secs(120);
-        let armed = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        let armed = reg
+            .arm_waiting_notice("worker", "agent", cooldown, false)
+            .unwrap();
         drop(reg.begin_pane_close("worker"));
         drop(reg.finish_pane_close("worker", true));
         reg.settle_waiting_notice("worker", armed.seq, true);
         let successor = reg
-            .arm_waiting_notice("worker", "successor", cooldown)
+            .arm_waiting_notice("worker", "successor", cooldown, false)
             .expect("the reused pane id opens a fresh episode");
         assert_eq!(
             successor.not_before, None,

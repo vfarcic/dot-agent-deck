@@ -62,7 +62,7 @@ Four tests in `main.rs` (`rule_numbers_are_unique_and_run_from_one_without_a_gap
 
 ```text
 linkage-check: 1 failure(s):
-  [16] docs/workspace-modes.md:238: `/img/<missing>.png` resolves to `site/static/img/<missing>.png`, which does not exist — …
+  [16] docs/getting-started.md:99: `/img/<missing>.png` resolves to `site/static/img/<missing>.png`, which does not exist — …
 each `[N]` names a rule — `cargo xtask linkage-check --list-rules` prints all 16
 ```
 

@@ -15,38 +15,37 @@ expression: buf
                                                                                                               
                                                                                                               
    ┌ help ───────────────────────────────────────────────────────────────────────────────────────────────┐    
-   │  global (works from any pane)                       mode tab (in-tab navigation)                    │    
+   │  global (works from any pane)                       mouse                                           │    
    │                                                                                                     │    
-   │  ctrl+d             toggle command / pane           j / down           focus next pane              │    
-   │  ctrl+n             create new agent                k / up             focus previous pane          │    
-   │  ctrl+t             toggle layout (stacked/tiled)   enter           enter paneinput on selected     │    
-   │  ctrl+c             quit                            esc             deselect side pane              │    
-   │                                                     mouse click     focus pane                      │    
-   │  tab navigation                                     ctrl+click      open hyperlink                  │    
-   │                                                     ctrl+d             return to command mode       │    
-   │  tab / right / l    next tab                                                                        │    
-   │  shift+tab / left / h prev tab                      new agent form                                  │    
-   │  ctrl+pgdn          next tab                                                                        │    
-   │  ctrl+pgup          prev tab                        tab             switch field                    │    
+   │  ctrl+d             toggle command / pane           mouse click     focus pane                      │    
+   │  ctrl+n             create new agent                ctrl+click      open hyperlink                  │    
+   │  ctrl+t             toggle layout (stacked/tiled)                                                   │    
+   │  ctrl+c             quit                            new agent form                                  │    
+   │                                                                                                     │    
+   │  tab navigation                                     tab             switch field                    │    
    │                                                     ◀/▶             cycle mode                      │    
-   │  dashboard (command mode)                           enter           next field / confirm            │    
-   │                                                     esc             cancel                          │    
-   │  j / down           select next card                                                                │    
-   │  k / up             select previous card            directory picker                                │    
-   │  1-9                jump to card n                                                                  │    
-   │  enter              focus selected pane             j / down        select next                     │    
-   │  ctrl+w             close selected agent (confirms) k / up          select previous                 │    
-   │  ctrl+l             toggle orch tab split ratio     l / right / enter   enter directory             │    
-   │  ctrl+z             zoom focused pane               h / left / bksp     go up one level             │    
-   │  /                  filter agents                   space           confirm current directory       │    
-   │  esc                clear filter                    /               filter (case-insensitive)       │    
-   │  r                  rename agent                    esc             clear filter (twice = close)    │    
-   │  g                  generate .dot-agent-deck.toml   q               cancel                          │    
+   │  tab / right / l    next tab                        enter           next field / confirm            │    
+   │  shift+tab / left / h prev tab                      esc             cancel                          │    
+   │  ctrl+pgdn          next tab                                                                        │    
+   │  ctrl+pgup          prev tab                        directory picker                                │    
+   │                                                                                                     │    
+   │  dashboard (command mode)                           j / down        select next                     │    
+   │                                                     k / up          select previous                 │    
+   │  j / down           select next card                l / right / enter   enter directory             │    
+   │  k / up             select previous card            h / left / bksp     go up one level             │    
+   │  1-9                jump to card n                  space           confirm current directory       │    
+   │  enter              focus selected pane             /               filter (case-insensitive)       │    
+   │  ctrl+w             close selected agent (confirms) esc             clear filter (twice = close)    │    
+   │  ctrl+l             toggle orch tab split ratio     q               cancel                          │    
+   │  ctrl+z             zoom focused pane                                                               │    
+   │  /                  filter agents                   session                                         │    
+   │  esc                clear filter                                                                    │    
+   │  r                  rename agent                    panes auto-saved continuously.                  │    
+   │  g                  generate .dot-agent-deck.toml   restored automatically on launch.               │    
    │  y / n              approve / deny permission                                                       │    
-   │  s                  schedules manager               session                                         │    
+   │  s                  schedules manager                                                               │    
    │  pageup / pagedown  scroll focused pane                                                             │    
-   │  ?                  toggle this help                panes auto-saved continuously.                  │    
-   │                                                     restored automatically on launch.               │    
+   │  ?                  toggle this help                                                                │    
    │  [close]                                                                                            │    
    │  press ? or esc to close                                                                            │    
    └─────────────────────────────────────────────────────────────────────────────────────────────────────┘

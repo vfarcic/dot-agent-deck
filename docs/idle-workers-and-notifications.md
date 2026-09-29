@@ -6,7 +6,7 @@ title: Idle Workers & Notifications
 
 If a worker in an [orchestration](orchestration.md) gets stuck — it stops responding, sits at a prompt, or exits without finishing its task — the deck tells the orchestrator, so the orchestrator can chase the worker, hand the task to another role, or let you know. What it does with that news is up to the instructions you give it.
 
-This only happens inside an orchestration — an orchestration tab in the TUI, an **ORCHESTRATION** group on the desktop app's Dashboard. A plain agent pane, a workspace mode and a single-agent schedule never get these reports.
+This only happens inside an orchestration — an orchestration tab in the TUI, an **ORCHESTRATION** group on the desktop app's Dashboard. A plain agent pane and a single-agent schedule never get these reports.
 
 The deck does not message you itself. To hear about a stuck run on your phone, have the orchestrator send the message — see [Getting these moments to you](#getting-these-moments-to-you).
 
@@ -20,16 +20,20 @@ Each report appears in the orchestrator's pane as a new message — the same in 
 | `⚠ delegated worker went quiet` | A worker showed no sign of starting its task within 30 seconds of receiving it | `DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS` |
 | `A delegated worker is waiting for input` | A worker that has not finished its task has been waiting for input for 30 seconds | `DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS` |
 | `⚠ delegated worker exited without work-done` | A worker's agent exited before it reported | — |
-| `⚠ delegated worker never came up` | A `clear = true` worker that was restarted for a new task never started | — |
+| `⚠ delegated worker never came up` | A `clear = true` worker that was restarted for a new task died before it could take the task, so the task was not delivered | — |
+| `⚠ delegated worker respawn failed` | A `clear = true` worker could not be restarted at all — usually because the role's `command` cannot be started — so the task was not delivered | — |
 | `⚠ delegated worker blocked by a provider usage limit` | A worker that has not finished its task shows **Blocked** because its provider's usage limit or credits ran out | — |
 
 Good to know:
 
 - **The went-quiet and waiting reports include what the worker's pane is showing** — the agent idle at its input, a permission prompt, a login screen — so the orchestrator can tell "stuck on a prompt" from "never got the task".
 - **"Waiting for input" depends on the agent.** For Claude Code it means a permission prompt. A Claude Code worker that asks you a question in plain text simply finishes its turn, so only the first report (the timeout) covers it. [Session management](session-management.md) lists which agents show Blocked.
-- **After an "exited" report, the worker still counts as busy with its task**, so run `dot-agent-deck pane restart <role>` (or use `delegate --supersede`) before giving that role new work; see [One task per worker at a time](orchestration.md#one-task-per-worker-at-a-time).
+- **A wait raised by a Claude Code or Codex subagent ends when that subagent stops or fails**, since its prompt goes with it: the worker's card in the TUI leaves **Needs Input** (in the desktop app its row leaves **WAITING**, unless the agent is now idle), and a waiting report not yet sent is cancelled. One already sent stays sent, so the orchestrator can receive a waiting report about a prompt that is no longer there.
+- **A worker that sent `work-done` while still at a prompt and is then given a new task** can be reported as waiting again, for the new task, no sooner than two minutes after its previous report.
+- **After an "exited" report, the worker still counts as busy with its task**, so run `dot-agent-deck pane restart <role>` (or use `delegate --supersede`) before giving that role new work; see [One task per worker at a time](orchestration.md#one-task-per-worker-at-a-time). A `work-done` that arrives just after this report is to be trusted over it.
 - **The "blocked" report asks the orchestrator to look at the worker's card first**, because a usage limit can clear on its own: reassign or tell you if the card still shows Blocked, keep waiting if the worker is working again.
-- **`⚠ respawn failed for role …` is shown but not sent.** When the deck cannot start a replacement worker at all, this line appears in the orchestrator's input box without Enter, so the orchestrator acts on it only once you send it.
+- **After a "respawn failed" report, re-delegating to that role fails the same way** until the role's configuration is fixed, so the orchestrator should tell you or reassign the task.
+- **The exited, never-came-up, respawn-failed and blocked reports name the worker by its pane, never by its role.** The pane id can include the orchestration's name from your project configuration, in a sanitised form ([#1380](https://github.com/vfarcic/dot-agent-deck/issues/1380) tracks that). The [daemon log](troubleshooting.md#enabling-debug-logs) line next to each names the role and, where there is one, the underlying error. What to do when you see one yourself is under [A delegated worker never came up](orchestration.md#a-delegated-worker-never-came-up).
 - **If you are part-way through typing in the orchestrator's pane**, in the TUI or the desktop app, a report waits until you send or clear what you typed — see [A deck prompt waits while you have an unsent draft](orchestration.md#a-deck-prompt-waits-while-you-have-an-unsent-draft).
 
 ## Configuring the timeout
@@ -49,7 +53,7 @@ A change applies to the next task the orchestrator delegates. You do not need to
 
 ### Where the key goes — read this before you file a bug
 
-> **A misplaced `worker_response_timeout_minutes` is silently ignored.** It must appear **above the first table header** — above the first `[[modes]]` or `[[orchestrations]]` in the file. Added at the end of the file, it becomes part of whatever table came last, where it does nothing. The file still loads, `dot-agent-deck validate` still says `Config is valid.`, and the timeout stays at 120 minutes.
+> **A misplaced `worker_response_timeout_minutes` is silently ignored.** It must appear **above the first table header** — above the first `[[orchestrations]]` (or any other table header) in the file. Added at the end of the file, it becomes part of whatever table came last, where it does nothing. The file still loads, `dot-agent-deck validate` still says `Config is valid.`, and the timeout stays at 120 minutes.
 
 This is the most likely reason for "I set the timeout and nothing changed":
 
@@ -80,7 +84,7 @@ command = "claude"
 start = true
 ```
 
-Comments and blank lines before the first table are fine. If your file starts with `[[modes]]` on line one, the key goes on line one and `[[modes]]` moves down.
+Comments and blank lines before the first table are fine. If your file starts with `[[orchestrations]]` on line one, the key goes on line one and `[[orchestrations]]` moves down.
 
 ## Tuning the other reports
 

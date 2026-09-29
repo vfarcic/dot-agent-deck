@@ -304,21 +304,10 @@ fn mixed_actually_spans_more_than_one_launcher() {
     );
 }
 
-/// The `[[modes]]` half of the same file, kept honest for the same reason: it is
-/// what `dot-agent-deck` opens for a `dev` pane on this repo.
-#[test]
-fn the_repo_config_still_defines_its_dev_mode() {
-    let config = dogfood_config();
-    assert!(
-        config.modes.iter().any(|m| m.name == "dev"),
-        "the `dev` mode is what a pane opened on this repo uses; losing it is silent"
-    );
-}
-
 /// A guard on the file's own most-documented trap: a top-level key written below
 /// the first table header is silently absorbed into that table, and `validate`
 /// still reports the config as valid. `worker_response_timeout_minutes` sits
-/// above `[[modes]]` for exactly this reason — assert it survived, since the
+/// above the first `[[orchestrations]]` for exactly this reason — assert it survived, since the
 /// symptom of losing it is only that a silent worker is never reported.
 #[test]
 fn the_top_level_timeout_key_is_still_above_the_first_table_header() {

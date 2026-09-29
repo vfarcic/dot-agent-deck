@@ -87,7 +87,7 @@ fn help_001_overlay_reflects_active_bindings() {
     // clipped (120×44 comfortably fits the help columns + footer).
     let width: u16 = 120;
     let height: u16 = 44;
-    let buffer = render_help_overlay_with_bindings_to_buffer(&config, None, width, height);
+    let buffer = render_help_overlay_with_bindings_to_buffer(&config, width, height);
 
     let text = buffer_to_text(&buffer);
     assert!(

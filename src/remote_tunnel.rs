@@ -1865,10 +1865,16 @@ mod tunnel {
     /// here because it asks what this line means to ask, not because something
     /// gets through without it.
     ///
-    /// Both candidates are tried, in that order, because `~/.local/bin` — the
-    /// path [`crate::remote`]'s installer writes — is often absent from the
-    /// `PATH` of a non-interactive `ssh` command, while a host whose deck came
-    /// from a package manager has only the PATH one.
+    /// The candidates are tried in order: `~/.local/bin` — the path
+    /// [`crate::remote`]'s installer writes, often absent from the `PATH` of a
+    /// non-interactive `ssh` command — then `PATH`, then Homebrew's `bin` at
+    /// each of its default prefixes (issue #1372). The last rung is there
+    /// because Homebrew puts itself on `PATH` from a login profile, which a
+    /// non-interactive `ssh` command does not read, so a host whose only deck
+    /// came from `brew` would otherwise have no candidate at all. This probe
+    /// runs for a deck the desktop knows by its ssh settings rather than by a
+    /// `remotes.toml` entry, so it cannot use the binary path `remote add`
+    /// records there; it looks where Homebrew would have put one instead.
     ///
     /// `2>/dev/null` on the invocation, for one narrow reason rather than
     /// tidiness. An older remote build's clap diagnostic would otherwise land
@@ -1993,7 +1999,12 @@ mod tunnel {
         // snippet — and every other code falls through to the rungs below,
         // which is the compatibility path for a host whose binary is older than
         // the subcommand or is not installed at all.
-        "for dad_cmd in \"${HOME:-}/.local/bin/dot-agent-deck\" \"$(command -v dot-agent-deck 2>/dev/null)\"; do ",
+        "for dad_cmd in \"${HOME:-}/.local/bin/dot-agent-deck\" \"$(command -v dot-agent-deck 2>/dev/null)\" ",
+        // Homebrew's `bin` at each of `crate::remote::HOMEBREW_PREFIXES`
+        // (issue #1372) — `the_probe_names_every_homebrew_prefix` keeps the
+        // two lists in step.
+        "/opt/homebrew/bin/dot-agent-deck /usr/local/bin/dot-agent-deck ",
+        "/home/linuxbrew/.linuxbrew/bin/dot-agent-deck; do ",
         "[ -n \"$dad_cmd\" ] && [ -x \"$dad_cmd\" ] || continue; ",
         "dad_answer=$(\"$dad_cmd\" daemon endpoint 2>/dev/null); dad_rc=$?; ",
         "if [ \"$dad_rc\" = 0 ] && [ -n \"$dad_answer\" ]; ",
@@ -2992,7 +3003,7 @@ mod tests {
     fn run_socket_probe(snippet: &str, env: &[(&str, &str)]) -> String {
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(snippet)
+            .arg(super::tunnel_tests::without_host_homebrew(snippet))
             .env_clear()
             // The fallback rungs call `id -u`.
             .env("PATH", "/usr/bin:/bin")
@@ -5708,7 +5719,9 @@ mod tunnel_tests {
     fn run_probe_under(shell: &[String], snippet: &str, env: &[(&str, &str)]) -> String {
         let mut command = std::process::Command::new(&shell[0]);
         command.args(&shell[1..]);
-        command.arg("-c").arg(snippet);
+        command
+            .arg("-c")
+            .arg(super::tunnel_tests::without_host_homebrew(snippet));
         command.env_clear();
         // The fallback rungs call `id -u`, so the child needs a PATH even
         // when the test is about there being no deck on it.
@@ -5734,6 +5747,69 @@ mod tunnel_tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
             .expect("make the stand-in executable");
         dir.to_path_buf()
+    }
+
+    /// `snippet` with its Homebrew rungs pointed at a path that cannot exist.
+    ///
+    /// Those rungs are absolute, so `env_clear` does not reach them: without
+    /// this, a machine with the deck installed by Homebrew — an ordinary Mac —
+    /// would have its own deck answer in every test that expects a fallback
+    /// rung. The same reason the helpers above clear the environment.
+    pub(super) fn without_host_homebrew(snippet: &str) -> String {
+        crate::remote::HOMEBREW_PREFIXES
+            .iter()
+            .fold(snippet.to_string(), |snippet, prefix| {
+                snippet.replace(
+                    &format!("{prefix}/bin/dot-agent-deck"),
+                    "/nonexistent-homebrew-prefix/bin/dot-agent-deck",
+                )
+            })
+    }
+
+    /// Every Homebrew prefix the installer knows is a rung of the probe, so a
+    /// host `remote add` recorded as a Homebrew install is one the probe can
+    /// also find a resolver on.
+    #[test]
+    fn the_probe_names_every_homebrew_prefix() {
+        for prefix in crate::remote::HOMEBREW_PREFIXES {
+            assert!(
+                REMOTE_SOCKET_PROBE.contains(&format!(" {prefix}/bin/dot-agent-deck")),
+                "{prefix} is missing from the probe: {REMOTE_SOCKET_PROBE}"
+            );
+        }
+    }
+
+    /// Issue #1372: a host whose only deck came from Homebrew, with `brew`
+    /// not on the non-interactive `PATH` — the ordinary macOS case — still
+    /// has its resolver answer.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_finds_a_homebrew_install_off_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let empty_home = temp.path().join("empty-home");
+        std::fs::create_dir_all(&empty_home).expect("create the empty home");
+        let brew_bin = install_standin(
+            &temp.path().join("homebrew/bin"),
+            &answering_standin("/run/deck/attach.sock"),
+        );
+        let snippet = REMOTE_SOCKET_PROBE.replace(
+            &format!("{}/bin/dot-agent-deck", crate::remote::HOMEBREW_PREFIXES[0]),
+            &brew_bin.join("dot-agent-deck").display().to_string(),
+        );
+        for shell in probe_shells() {
+            assert_eq!(
+                run_probe_under(
+                    &shell,
+                    &snippet,
+                    &[
+                        ("HOME", &empty_home.to_string_lossy()),
+                        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                    ]
+                ),
+                "/run/deck/attach.sock",
+                "the Homebrew rung must answer ({shell:?})"
+            );
+        }
     }
 
     /// A stand-in that answers `daemon endpoint` with `path` and refuses

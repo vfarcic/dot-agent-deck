@@ -4472,10 +4472,10 @@ fn dispatch_023_delegate_waits_for_unsent_worker_draft() {
 /// Scenario: A worker's unsent draft holds its delegate pointer longer than
 /// both short response windows. The orchestrator must receive no idle or
 /// silence warning until after the pointer is actually submitted to the worker.
-#[spec("scheduler/idle-worker/025")]
+#[spec("scheduler/idle-worker/026")]
 #[test]
 #[cfg(unix)]
-fn idle_worker_025_response_clocks_start_after_deferred_pointer() {
+fn idle_worker_026_response_clocks_start_after_deferred_pointer() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
@@ -4550,10 +4550,10 @@ fn idle_worker_025_response_clocks_start_after_deferred_pointer() {
 /// superseding delegate queues behind it for longer than its own response
 /// windows. The orchestrator must receive no idle or silence warning for the
 /// queued delegate until its pointer has actually been written.
-#[spec("scheduler/idle-worker/026")]
+#[spec("scheduler/idle-worker/027")]
 #[test]
 #[cfg(unix)]
-fn idle_worker_026_queued_delegate_clocks_start_after_its_pointer() {
+fn idle_worker_027_queued_delegate_clocks_start_after_its_pointer() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
@@ -4754,10 +4754,10 @@ fn run_stale_response_notice_after_work_done(watch: ResponseWatch) {
 /// that draft. The worker reports work-done during the wait; after the user
 /// presses Enter the orchestrator gets the completion and never the stale
 /// idle report.
-#[spec("scheduler/idle-worker/027")]
+#[spec("scheduler/idle-worker/028")]
 #[test]
 #[cfg(unix)]
-fn idle_worker_027_waiting_idle_report_is_dropped_after_work_done() {
+fn idle_worker_028_waiting_idle_report_is_dropped_after_work_done() {
     run_stale_response_notice_after_work_done(ResponseWatch::Idle);
 }
 
@@ -4765,10 +4765,10 @@ fn idle_worker_027_waiting_idle_report_is_dropped_after_work_done() {
 /// no-event window runs out, so the "went quiet" report waits on that draft.
 /// The worker reports work-done during the wait; after the user presses Enter
 /// the orchestrator gets the completion and never the stale silence report.
-#[spec("scheduler/idle-worker/028")]
+#[spec("scheduler/idle-worker/029")]
 #[test]
 #[cfg(unix)]
-fn idle_worker_028_waiting_silence_report_is_dropped_after_work_done() {
+fn idle_worker_029_waiting_silence_report_is_dropped_after_work_done() {
     run_stale_response_notice_after_work_done(ResponseWatch::Silence);
 }
 

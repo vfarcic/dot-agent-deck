@@ -1000,6 +1000,15 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // channel are unchanged on the wire. What changed is which preparations are
     // refused, which a version number cannot express.
     "1233-prepare-refuses-ambiguous-orchestration",
+    // Issue #1337, at 10 without moving it -- #708's shape, applied to the
+    // sibling #708 missed. The daemon's "respawn failed" report into an
+    // orchestrator's pane, for a `clear = true` respawn that could not start a
+    // replacement at all, used to be written with an LF and left unsubmitted; a
+    // newer daemon SUBMITS it as a turn, and it no longer interpolates the
+    // config-supplied role name. Nothing on the wire moved: the change is what an
+    // existing delivery MEANS -- inert text becomes model input -- and it takes
+    // effect when the daemon starts on the new build.
+    "1337-respawn-failure-report-submitted",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -1696,7 +1705,7 @@ pub enum AttachRequest {
     /// aimed at the wrong machine.
     ///
     /// `pane_ids` is every pane the confirmed close would tear down (one for a
-    /// dashboard card, all of them for a Mode/Orchestration tab), because a
+    /// dashboard card, all of them for an orchestration tab), because a
     /// multi-role orchestration shares ONE worktree across its role panes and
     /// any of them resolves it. The reply is best-effort: the caller renders no
     /// warning on any error, which is the same way it treats a down daemon.
@@ -4285,8 +4294,8 @@ async fn handle_connection(
                     // the worker pane and orchestrator pane purely from
                     // daemon state — no TUI round-trip, no broadcast hop.
                     // We do this only for orchestration panes; dashboard
-                    // and mode panes don't participate in delegate
-                    // dispatch.
+                    // panes (and a legacy `TabMembership::Mode` pane)
+                    // don't participate in delegate dispatch.
                     if let (Some(pane_id), Some(meta)) =
                         (pane_id_env.as_deref(), orchestration_meta)
                     {
@@ -7988,6 +7997,7 @@ mod tests {
             SessionStatus::Error,
         ] {
             let snap = SessionSnapshot {
+                subagent_wait: None,
                 status: status.clone(),
                 agent_type: Some(AgentType::ClaudeCode),
                 active_tool: Some(ActiveTool {
@@ -8027,6 +8037,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: Some(SessionSnapshot {
+                subagent_wait: None,
                 status: SessionStatus::Working,
                 agent_type: Some(AgentType::ClaudeCode),
                 active_tool: None,
@@ -8110,6 +8121,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            subagent_wait: None,
             prompt_reports_unavailable: false,
         };
         let snap = session.live_snapshot();
