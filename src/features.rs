@@ -170,6 +170,18 @@ pub fn show_desktop_agent_profiles() -> bool {
     experimental_enabled()
 }
 
+/// Production wrapper for the desktop agent screen's **unwired details**
+/// (issue #1400): the Diff, Checks, Delegations and Artifacts tabs and the
+/// ATT, MODEL and USAGE fields, none of which a live daemon supplies today.
+/// One wrapper per surface (CLAUDE.md #9) so `grep
+/// show_desktop_agent_details` finds every gate — see PRD #1399, which decides
+/// per tab and field whether each is kept, fixed or removed. A presentation
+/// switch, carried to the webview by `desktop_features`, exactly like
+/// [`show_desktop_deck`].
+pub fn show_desktop_agent_details() -> bool {
+    experimental_enabled()
+}
+
 /// Guards [`init_and_watch`] so the periodic watcher thread is spawned at
 /// most once per process (reviewer #4 / audit INFO-3): a second call is a
 /// no-op rather than leaking a duplicate poll thread.

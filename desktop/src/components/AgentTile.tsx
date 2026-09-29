@@ -29,6 +29,8 @@ import type {
 } from "../types";
 import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } from "../lib/terminalInput";
 import { blockedReasonText } from "../lib/blockedReason";
+import { displayUptime } from "../lib/displayText";
+import { useOverviewClock } from "./AgentOverview";
 import { OutputReader } from "./OutputReader";
 import { TerminalViewport } from "./TerminalViewport";
 
@@ -39,6 +41,19 @@ const tabs: { id: PanelTab; label: string; icon: typeof SquareTerminal }[] = [
   { id: "handoffs", label: "Delegations", icon: Handshake },
   { id: "artifacts", label: "Artifacts", icon: Box },
 ];
+
+/**
+ * Issue #1400 — the tab this agent's pane actually shows. With the agent
+ * details hidden (`DesktopFeatures.showAgentDetails` off) only Terminal is on
+ * offer, so a stored tab naming one of the other four falls back to it rather
+ * than rendering a panel no tab selects. Derived, never written back, so the
+ * stored choice survives the flag being turned on. `App`'s list of shown
+ * terminals reads this too, so the two cannot disagree about which tiles
+ * mounted one.
+ */
+export function shownPanelTab(tab: PanelTab, showDetails: boolean): PanelTab {
+  return showDetails ? tab : "terminal";
+}
 
 export interface AgentTileProps {
   agent: AgentSession;
@@ -54,7 +69,8 @@ export interface AgentTileProps {
    * The four differences M1 established, recorded here because this prop is
    * where a later implementer will look for them:
    *
-   * 1. **Panel tabs — all five at BOTH sizes.** The tab set is a property of
+   * 1. **Panel tabs — the same set at BOTH sizes** (all five with
+   *    `showDetails`, Terminal alone without it). The tab set is a property of
    *    the agent, not of the box. `tab` is controlled by `App` and keyed by
    *    agent id, so the overlay inherits the tile's tab and hands it back on
    *    close; a presentation that dropped tabs would have to coerce that
@@ -101,6 +117,14 @@ export interface AgentTileProps {
    * promote the tile's element in place rather than re-parent it.
    */
   presentation: AgentPanePresentation;
+  /**
+   * Issue #1400 — `DesktopFeatures.showAgentDetails`: whether to offer the
+   * Diff, Checks, Delegations and Artifacts tabs and the ATT, MODEL and USAGE
+   * fields, which a live daemon supplies nothing for. Required, so each render
+   * site says which rather than inheriting a default. PRD #1399 decides what
+   * becomes of each.
+   */
+  showDetails: boolean;
   mode: RuntimeMode;
   selected: boolean;
   tab: PanelTab;
@@ -199,9 +223,10 @@ function formatTokens(tokens: number): string {
 export function AgentTile({
   agent,
   presentation,
+  showDetails,
   mode,
   selected,
-  tab,
+  tab: storedTab,
   terminalFeed,
   evidence,
   inputResult,
@@ -231,6 +256,7 @@ export function AgentTile({
   // inline status condition and the composer's own copy of it could.
   const input = terminalInputState(agent, inputResult);
   const fixture = mode === "fixture";
+  const tab = shownPanelTab(storedTab, showDetails);
   /**
    * PRD #1105 M1 difference 4. The Reader launcher is `"tile"`-only, and
    * hiding the BUTTON is not enough: `readerOpen` is reset only when
@@ -248,6 +274,12 @@ export function AgentTile({
   /* Issue #1143 — read once, so the header's two live-colour cues and its
      wording cannot disagree about the same record. */
   const held = recordFreshness === "held";
+  /* Issue #1400 — TIME is the agent's uptime since the daemon spawned it, on
+     the overview's clock so it keeps counting between daemon events. A held
+     record's process may be gone, so it claims no running span; nor does a
+     record with no spawn instant, which keeps `duration`'s own reading. */
+  const now = useOverviewClock();
+  const uptime = held ? undefined : displayUptime(agent.spawnedAtMs, now);
   /**
    * The Reader is suppressed at overlay presentation (M1 difference 4, above)
    * AND whenever any pane is open over this screen (see `panePresent`). The
@@ -359,10 +391,12 @@ export function AgentTile({
           printed `ATT 01` as if the daemon tracked retries; it tracks none.
         */}
         <div className="agent-header-actions">
-          <div className="agent-attempt" title={agent.attempt === undefined ? "No attempt count is reported by the daemon" : "Current attempt"}>
-            <span>ATT</span>
-            <strong>{agent.attempt === undefined ? "—" : agent.attempt.toString().padStart(2, "0")}</strong>
-          </div>
+          {showDetails && (
+            <div className="agent-attempt" title={agent.attempt === undefined ? "No attempt count is reported by the daemon" : "Current attempt"}>
+              <span>ATT</span>
+              <strong>{agent.attempt === undefined ? "—" : agent.attempt.toString().padStart(2, "0")}</strong>
+            </div>
+          )}
           {/*
             PRD #1105 M5's deck entry point, and M2's way back out. Both are
             native `<button>`s in the header rather than a click handler on the
@@ -398,7 +432,7 @@ export function AgentTile({
       </div>
 
       <div className="agent-instruments" aria-label={`${agent.role} run metrics`}>
-        <div><span>TIME</span><strong>{agent.duration}</strong></div>
+        <div title={uptime && `Spawned by the daemon at: ${uptime.title}`}><span>TIME</span><strong>{uptime?.label ?? agent.duration}</strong></div>
         {fixture ? (
           <>
             <div><span>TOKENS</span><strong>{formatTokens(agent.tokens)}</strong></div>
@@ -408,14 +442,18 @@ export function AgentTile({
         ) : (
           <>
             <div><span>TOOLS</span><strong>{agent.toolCount}</strong></div>
-            <div><span>MODEL</span><strong>—</strong></div>
-            <div><span>USAGE</span><strong>—</strong></div>
+            {showDetails && (
+              <>
+                <div><span>MODEL</span><strong>—</strong></div>
+                <div><span>USAGE</span><strong>—</strong></div>
+              </>
+            )}
           </>
         )}
       </div>
 
       <div className="agent-tabs" role="tablist" aria-label={`${agent.role} details`}>
-        {tabs.map(({ id, label, icon: Icon }) => (
+        {(showDetails ? tabs : tabs.filter(({ id }) => id === "terminal")).map(({ id, label, icon: Icon }) => (
           <button
             key={id}
             className={tab === id ? "is-active" : ""}

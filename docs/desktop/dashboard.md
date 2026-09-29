@@ -63,11 +63,11 @@ What each status means, and which agents can report Blocked, is on [Session Mana
 
 Click a row, or its open control (`Open <name> agent`), to open that agent's live terminal in a full-window pane over the Dashboard. Type into it as you would into the TUI's pane. Press `Escape`, or **Back to dashboard**, to close the pane; the agent keeps running.
 
-Besides **Terminal**, the pane has **Diff**, **Checks**, **Delegations** and **Artifacts** tabs. The daemon does not provide that data today, so against a real daemon each of them says so (for example "Diff data is not exposed by the daemon").
+Between the header and the terminal, the pane shows the agent's assignment and two readings: **TIME**, how long the agent has been running (hover it for the exact time it started), and **TOOLS**, how many tool calls it has reported. TIME reads `—` when the daemon did not say when it started the agent.
 
 The pane's header names the agent by its type (for example Codex), or by its role when it belongs to an orchestration, rather than by the display name its row shows. Beside that is its status, and below it the agent's command and its model, which reads `Unavailable` because the daemon does not report one.
 
-![An agent's full-window pane: the header reads Codex with a RUNNING status and codex · Unavailable below it, with a close control on the right; under it the agent's assignment, a row of time, token, cost and context readings, then the Terminal, Diff, Checks, Delegations and Artifacts tabs, and the Terminal tab showing the agent's live output: the files it read and edited, a test run that passed, and its summary](/img/agent-pane-desktop.png)
+![An agent's full-window pane: the header reads Codex with a RUNNING status and codex · Unavailable below it, with a close control on the right; under it the agent's assignment, a row of time, token, cost and context readings, then the Terminal tab showing the agent's live output: the files it read and edited, a test run that passed, and its summary](/img/agent-pane-desktop.png)
 
 ## Closing agents and orchestrations
 
