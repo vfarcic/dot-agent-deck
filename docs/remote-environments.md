@@ -3,6 +3,9 @@ sidebar_position: 7.4
 title: Remote Environments
 ---
 
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
 # Remote Environments
 
 A **remote environment** is a per-project host that runs the deck — the agents, and everything supervising them, live on the remote. Linux and Apple Silicon macOS are both validated end to end; a Mac needs two extra setup steps, listed in [Remote Environment Requirements](remote-requirements.md#macos-as-a-remote-host). Your laptop is just a terminal: `dot-agent-deck connect` opens an ssh session and runs the deck on the host, so your usual ssh config and keys apply. When you disconnect, the agents on the remote keep running.
@@ -15,6 +18,9 @@ For host prerequisites see [Remote Environment Requirements](remote-requirements
 
 ## Quick start
 
+<Tabs groupId="client">
+<TabItem value="tui" label="TUI">
+
 ```bash
 # 1. Register a remote (one-time per host).
 dot-agent-deck remote add my-vm user@host
@@ -24,6 +30,23 @@ dot-agent-deck connect my-vm
 ```
 
 `remote add` connects over ssh, installs `dot-agent-deck` to `~/.local/bin/dot-agent-deck` on the host, sets up the agent hooks, and adds the remote to your list of remotes. `connect` then opens an ssh session and runs the deck there. Your local command stays in the foreground for as long as the session lasts and exits with the remote's exit code, so it behaves predictably in a script.
+
+</TabItem>
+<TabItem value="desktop" label="Desktop">
+
+The desktop app reaches a daemon that is **already installed and running** on the host, over an ssh tunnel from your laptop; it installs nothing and starts nothing there, and most of this page's lifecycle (`connect`, stop versus detach, the upgrade nudge) is the TUI's.
+
+1. Install the deck on the host, most simply with `dot-agent-deck remote add my-vm user@host` from a machine with the CLI.
+2. Make sure a daemon is running on the host and stays up: keep agents running on it, or run `dot-agent-deck daemon serve` there with `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`, or under `systemd --user` or a LaunchAgent ([Requirements](remote-requirements.md#recommended-for-persistent-and-safe-use)).
+3. In the app, open **Settings → Daemons**, press **Add a daemon**, fill in **Host** (and **User**, **Port**, **Key file** or **Jump host** as needed), and press **Test connection**, which also finds the daemon's socket.
+4. Pick the daemon in the **Daemon** selector on the Dashboard, or **All daemons**.
+
+![Settings → Daemons with a remote daemon, build-box, chosen in the Daemon row beside All daemons and This machine, its Host filled in, the other fields showing their placeholders, and Test connection below, not yet pressed](/img/settings-daemons-desktop.png)
+
+[Desktop app → Daemons](desktop/daemons.md) has the fields, the test results and what they mean.
+
+</TabItem>
+</Tabs>
 
 Other registry commands:
 

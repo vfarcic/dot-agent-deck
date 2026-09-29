@@ -20217,13 +20217,18 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
     // contain the delete confirmation on its natural lines — superseding the
     // PRD #127 width cap + `truncate_cell` + `wrap_to_width` band-aids.
     let count_chars = |s: &str| s.chars().count();
+    // The NAME cell is padded to the widest name PLUS a gutter, so the longest
+    // name never runs straight into its STATUS cell (`nightly-triagedisabled`).
+    // `status_col` below already carries its own trailing padding.
+    const NAME_GUTTER: usize = 2;
     let name_col = ui
         .scheduled_tasks
         .iter()
         .map(|t| count_chars(&t.name))
         .max()
         .unwrap_or(0)
-        .max("NAME".len());
+        .max("NAME".len())
+        + NAME_GUTTER;
     let next_col = ui
         .scheduled_tasks
         .iter()
@@ -24364,6 +24369,63 @@ mod tests {
         assert!(
             rendered.contains(" Schedules "),
             "schedule manager must render the Schedules title: {rendered}"
+        );
+    }
+
+    /// Scenario: Render the Schedules dialog once with only a short name and
+    /// once with a longer name that fills its column. The header and every row
+    /// must leave a visible space between the name and status columns.
+    #[test]
+    fn schedule_manager_separates_name_and_status_columns() {
+        let mut touching = Vec::new();
+        for (tasks, cells) in [
+            (
+                vec![make_scheduled_task("job", true)],
+                vec![("NAME", "STATUS"), ("job", "idle")],
+            ),
+            (
+                vec![
+                    make_scheduled_task("job", true),
+                    make_scheduled_task("nightly-triage", false),
+                ],
+                vec![
+                    ("NAME", "STATUS"),
+                    ("job", "idle"),
+                    ("nightly-triage", "disabled"),
+                ],
+            ),
+        ] {
+            let mut ui = default_ui();
+            ui.scheduled_tasks = tasks;
+            let buffer = draw_to_buffer(80, 24, |frame| {
+                render_scheduled_tasks(frame, &ui);
+            });
+            let area = buffer.area();
+            let lines: Vec<String> = (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect();
+
+            for (name, status) in cells {
+                let line = lines
+                    .iter()
+                    .find(|line| line.contains(name) && line.contains(status))
+                    .unwrap_or_else(|| {
+                        panic!("missing {name}/{status} in dialog:\n{}", lines.join("\n"))
+                    });
+                let gap = &line[line.find(name).unwrap() + name.len()..line.find(status).unwrap()];
+                if gap.is_empty() || !gap.chars().all(char::is_whitespace) {
+                    touching.push(format!("{name}/{status}: {}", line.trim_end()));
+                }
+            }
+        }
+        assert!(
+            touching.is_empty(),
+            "name and status must have a space between them:\n{}",
+            touching.join("\n")
         );
     }
 
