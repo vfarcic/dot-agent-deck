@@ -22,8 +22,8 @@
 //! * bound back at their own absolute paths: the build clone **read-only** (so
 //!   `build.rs`'s `git describe` and cargo's fingerprints keep working, and build
 //!   code cannot plant a hook or a config in it), the trust domain's target dir
-//!   **read-write**, and the Rust toolchain's sysroot read-only when it lives
-//!   under the home;
+//!   **read-write**, and the Rust toolchain's sysroot read-only when a mask
+//!   would hide it;
 //! * a fresh Cargo home in the private `/tmp`, with the fetch phase's `registry`
 //!   bound read-only beneath it — never the operator's Cargo home, whose
 //!   `config.toml`, `credentials.toml` and `bin/` stay outside;
@@ -451,10 +451,13 @@ fn base_shape(host: &Host, tc: &Toolchain, cwd: &Path, target: Option<&Path>) ->
             tmpfs.push((p.clone(), SMALL_BYTES));
         }
     }
+    // The toolchain is bound back read-only when any mask hides it — the home,
+    // an outside Cargo home, or a host-only dir such as `/var/lib/docker`.
     if host
         .home
-        .as_ref()
-        .is_some_and(|h| tc.sysroot.starts_with(h))
+        .iter()
+        .chain(tmpfs.iter().map(|(p, _)| p))
+        .any(|m| tc.sysroot.starts_with(m))
     {
         ro.push(tc.sysroot.clone());
     }
@@ -1415,6 +1418,44 @@ mod tests {
             !tmpfs.contains(&PathBuf::from("/run/containerd")),
             "`/run` already masks it: {tmpfs:?}"
         );
+    }
+
+    #[test]
+    fn a_sysroot_under_any_mask_is_bound_back_read_only_after_it() {
+        let mut t = tc();
+        t.sysroot = "/var/lib/docker/rust/stable".into();
+        let p = build_plan(
+            &host(),
+            &t,
+            Path::new("/home/op/code/xver-src"),
+            Path::new("/home/op/code/xver-target"),
+            Path::new("/nonexistent-fetch-home"),
+            vec![],
+        )
+        .expect("plan");
+        let args = bwrap_args(&p.shape, &host().harness);
+        let mask = pos(&args, &["--tmpfs", "/var/lib/docker"]);
+        let back = pos(
+            &args,
+            &[
+                "--ro-bind",
+                "/var/lib/docker/rust/stable",
+                "/var/lib/docker/rust/stable",
+            ],
+        );
+        assert!(mask < back, "the sysroot must land on top of the mask");
+        // A sysroot under no mask needs no bind of its own.
+        t.sysroot = "/opt/rust/stable".into();
+        let p = build_plan(
+            &host(),
+            &t,
+            Path::new("/home/op/code/xver-src"),
+            Path::new("/home/op/code/xver-target"),
+            Path::new("/nonexistent-fetch-home"),
+            vec![],
+        )
+        .expect("plan");
+        assert!(!p.shape.ro.contains(&PathBuf::from("/opt/rust/stable")));
     }
 
     /// Container mounts as the build namespace sees them (issue #1413): the
