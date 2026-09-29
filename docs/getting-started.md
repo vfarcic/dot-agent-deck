@@ -43,13 +43,35 @@ If `dot-agent-deck` comes back "command not found", `~/.local/bin` is not on you
 
 ### Desktop app
 
-The desktop app is a separate download: a signed `.dmg` for Apple silicon Macs and a `.deb` for Linux amd64. See [Installation → Desktop app](installation.md#desktop-app) for which file to pick, how to install it, and how it gets a daemon to connect to.
+The desktop app is an **alpha** and a separate download, for Apple silicon Macs and Linux amd64. There is no Intel Mac, Linux arm64 or Windows build. It connects to a daemon rather than starting one, so install and run the TUI above first; [Installation → How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon) has the other way.
+
+#### macOS (Apple silicon)
+
+1. Download `dot-agent-deck-desktop-alpha-macos-arm64.dmg` from the [latest release](https://github.com/vfarcic/dot-agent-deck/releases/latest).
+2. Open the `.dmg` and drag **Agent Deck** to **Applications**.
+3. Launch **Agent Deck** from Applications. macOS should ask only to confirm opening an app downloaded from the internet.
+
+#### Linux (amd64)
+
+```bash
+# 1. Download the package
+curl -fsSL -o dot-agent-deck-desktop-alpha-linux-amd64.deb \
+  https://github.com/vfarcic/dot-agent-deck/releases/latest/download/dot-agent-deck-desktop-alpha-linux-amd64.deb
+
+# 2. Install it; apt also pulls in the libraries it needs
+sudo apt install ./dot-agent-deck-desktop-alpha-linux-amd64.deb
+
+# 3. Launch it, or pick Agent Deck from your application menu
+dot-agent-deck-desktop
+```
+
+[Installation → Desktop app](installation.md#desktop-app) shows how to verify the download before installing it, what to do if macOS warns about the app, and how to keep the app and the daemon on the same release.
 
 ### Windows
 
 Native Windows is [not supported yet](https://github.com/vfarcic/dot-agent-deck/issues/164). For now, install [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) and follow the Linux instructions inside your WSL shell.
 
-> **Tip:** [Installation](installation.md) has every option side by side — Homebrew, a downloaded binary, Nix, and building from source — with what each one suits.
+> **Tip:** [Installation](installation.md) has every option side by side — Homebrew, a downloaded binary, Nix, building from source, and the desktop app — with what each one suits.
 
 Once the dashboard is running, press `?` inside the app to see all shortcuts. The dashboard is also fully mouse-clickable: a button bar along the bottom exposes the main commands (each labelled with its keyboard shortcut), and cards, tab headers, dialogs, the directory picker, and forms all respond to clicks. See [Keyboard Shortcuts → Mouse](keyboard-shortcuts.md#mouse).
 

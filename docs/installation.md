@@ -25,8 +25,9 @@ Agent Deck has two clients of one daemon: the terminal UI (the `dot-agent-deck` 
 | [Download a binary](#download-binary) | anywhere, with no package manager |
 | [Nix](#nix) | Nix, NixOS and home-manager users |
 | [Build from source](#build-from-source) | contributors, or a platform with no published build |
+| [Desktop app](#desktop-app) | a graphical client beside the TUI, on an Apple Silicon Mac or Linux amd64 (alpha) |
 
-Any of them gets you the same binary; skip to whichever suits you.
+The first four get you the same `dot-agent-deck` binary, which is the TUI, the daemon and the CLI; skip to whichever suits you. The desktop app is a separate download and a second client of that daemon. It connects to a daemon rather than starting one, so read [How the desktop app gets a daemon](#how-the-desktop-app-gets-a-daemon) before installing it on its own.
 
 ## Homebrew (macOS / Linux)
 
