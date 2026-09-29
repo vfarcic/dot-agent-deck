@@ -65,6 +65,7 @@ fn fixture_session() -> SessionState {
         shell_synthetic_working: false,
         orchestration_orphaned: false,
         subagent_wait: None,
+        prompt_reports_unavailable: false,
     }
 }
 

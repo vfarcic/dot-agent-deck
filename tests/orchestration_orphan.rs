@@ -129,6 +129,7 @@ fn card(orphaned: bool) -> SessionState {
         shell_synthetic_working: false,
         orchestration_orphaned: orphaned,
         subagent_wait: None,
+        prompt_reports_unavailable: false,
     }
 }
 

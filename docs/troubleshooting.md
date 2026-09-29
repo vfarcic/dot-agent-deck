@@ -61,6 +61,8 @@ If a Codex card still shows only coarse status with no tool or prompt detail, ch
 3. **Re-run the install manually** to see any error the silent startup step swallowed: `dot-agent-deck hooks install --agent codex`.
 4. **Approve them by hand as a fallback:** run Codex once and approve the deck's hooks in its interactive `/hooks` review. Codex remembers that trust for subsequent runs.
 
+While those hooks are not trusted — or if you switch the deck's `UserPromptSubmit` hook off in Codex's `/hooks` list — Codex also cannot tell the deck that it received an automatic prompt — a mode's seed, an orchestration role's first task, a dispatched unit's task. The deck then types such a prompt in **once** and does not retry it, rather than risk giving Codex the same task twice. If a Codex pane's automatic prompt sometimes goes missing, fixing the trust step above is also the fix for that.
+
 Trust is pinned to each hook's exact content, so it deliberately fails *closed*: if a definition changes underneath a trust record, Codex refuses to run it and the card falls back to coarse status rather than running something unreviewed. Re-running the install re-records trust for the new content.
 
 ### Codex as a role or worker: allow sandbox network access
@@ -124,6 +126,8 @@ If `command -v` finds the command in your login shell but a pane still can't spa
 After upgrading the `dot-agent-deck` binary, the new TUI can keep talking to a daemon that was spawned by the *previous* version. The wire format stays compatible, but newer features (delegate role maps, orchestration tab fields, and similar internal refactors) silently no-op because the older daemon doesn't know about the newer shape.
 
 This only happens when you are **deliberately** still on the older daemon. The common cause: you upgraded while agents were running, the launch prompt warned that restarting would stop them, and you **declined the restart to keep your agents** — which leaves the new TUI attached to the older daemon on purpose. (It can also happen with a very old, pre-handshake binary that attached without any version check.) With no agents running, the handshake restarts the daemon silently, so a fresh daemon at the new version is the normal outcome.
+
+When the upgrade changed the wire format itself — the attach protocol — declining does not leave you attached at all: the TUI refuses with `error: daemon speaks attach protocol vN, but this binary speaks vM` and exits, leaving the daemon and its agents running. See [Upgrading](installation.md#upgrading) for the two ways on from there.
 
 ### Symptom
 

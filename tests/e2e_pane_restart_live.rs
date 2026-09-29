@@ -18,7 +18,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TuiDeck, agent_records_on, retry_pane_restart_until_success};
+use common::{TuiDeck, agent_records_on, retry_pane_restart_until_success, write_hook_line};
 use dot_agent_deck::agent_pty::TabMembership;
 use spec::spec;
 
@@ -217,5 +217,142 @@ fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
          still-attached TUI failed to render the restarted pane's live PTY once \
          focused after the fact.\nGrid:\n{}",
         deck.snapshot_grid()
+    );
+}
+
+/// The registry agent id `role` runs under right now, read from the daemon.
+fn role_agent_id(deck: &TuiDeck, role: &str) -> Option<(String, String)> {
+    agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|r| {
+            matches!(
+                &r.tab_membership,
+                Some(TabMembership::Orchestration { role_name, .. }) if role_name == role
+            )
+        })
+        .and_then(|r| r.pane_id_env.map(|pane| (r.id, pane)))
+}
+
+/// One hook frame as `agent_id`'s own hook would post it for `pane_id`.
+fn session_start_hook(pane_id: &str, agent_id: &str, session_id: &str, prompt: &str) -> String {
+    serde_json::json!({
+        "session_id": session_id,
+        "agent_type": "claude_code",
+        "event_type": "session_start",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "pane_id": pane_id,
+        "agent_id": agent_id,
+        "user_prompt": prompt,
+    })
+    .to_string()
+}
+
+/// Scenario: Open the `pane-restart-live` orchestration, let `coder` crash and restart it with the real `pane restart` CLI, so the daemon has published two generations on coder's pane. The new generation reports a `SessionStart` whose prompt marks its card; then a late `SessionStart` from the REPLACED generation arrives, as a slow-booting old agent's hook can. The attached TUI must keep showing the live generation's card and never draw the replaced one's (issue #320).
+#[spec("pane/restart/014")]
+#[test]
+fn restart_014_a_replaced_generations_late_start_cannot_take_the_card_back() {
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .with_pty_size(160, 40)
+        .launch_with_fixture("pane-restart-live");
+    deck.wait_for_string("No active agents");
+    open_orchestration(&deck);
+    deck.wait_for_absence("┌ New Agent");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+
+    let records = agent_records_on(deck.attach_socket_path());
+    let orchestrator = records
+        .iter()
+        .find(|r| {
+            matches!(
+                &r.tab_membership,
+                Some(TabMembership::Orchestration {
+                    is_start_role: true,
+                    ..
+                })
+            )
+        })
+        .expect("the orchestrator role must be registered");
+    let orchestrator_pane_id = orchestrator
+        .pane_id_env
+        .clone()
+        .expect("the orchestrator role must carry a pane id");
+    let cwd = orchestrator
+        .cwd
+        .clone()
+        .expect("the orchestrator role must carry its cwd");
+    let (replaced, coder_pane) =
+        role_agent_id(&deck, CODER_ROLE).expect("coder must have a daemon record before it exits");
+
+    std::fs::write(
+        std::path::Path::new(&cwd).join(".dot-agent-deck.toml"),
+        LONG_LIVED_CONFIG,
+    )
+    .expect("swap coder's command to a long-lived one before restarting it");
+    retry_pane_restart_until_success(
+        deck.hook_socket_path(),
+        &orchestrator_pane_id,
+        CODER_ROLE,
+        Duration::from_secs(30),
+    );
+    let replaced_by_now = || role_agent_id(&deck, CODER_ROLE).filter(|(id, _)| *id != replaced);
+    assert!(
+        common::wait_until(Duration::from_secs(15), || replaced_by_now().is_some()),
+        "the restart must publish a new generation on coder's pane"
+    );
+    let (live, live_pane) = replaced_by_now().expect("a new generation was just observed");
+    assert_eq!(live_pane, coder_pane, "a restart keeps the role's pane");
+
+    // Command mode, so the role cards are what the screen draws.
+    deck.send_bytes(b"\x04");
+    write_hook_line(
+        deck.hook_socket_path(),
+        &session_start_hook(
+            &coder_pane,
+            &live,
+            "live-generation-320",
+            "live-generation-marker",
+        ),
+    )
+    .expect("post the live generation's SessionStart");
+    assert!(
+        deck.wait_for_grid_string_within("live-generation-marker", Duration::from_secs(10)),
+        "precondition: the live generation's card must show its prompt.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // The late frame, then a barrier on the ORCHESTRATOR's pane, on one
+    // connection: the daemon reads a connection's lines in order, so once the
+    // barrier is drawn the late frame has been applied. The barrier is on
+    // another pane so it retires nothing on coder's — a barrier from coder's
+    // live generation would re-retire a card the late frame had wrongly taken
+    // back, and hide the very thing this asserts.
+    let late_then_barrier = format!(
+        "{}\n{}",
+        session_start_hook(
+            &coder_pane,
+            &replaced,
+            "replaced-generation-320",
+            "replaced-generation-marker",
+        ),
+        session_start_hook(
+            &orchestrator_pane_id,
+            &orchestrator.id,
+            "orchestrator-barrier-320",
+            "barrier-marker-320",
+        ),
+    );
+    write_hook_line(deck.hook_socket_path(), &late_then_barrier)
+        .expect("post the replaced generation's late SessionStart and the barrier");
+    let drawn = deck.wait_for_grid_string_within("barrier-marker-320", Duration::from_secs(10));
+    let grid = deck.snapshot_grid();
+    assert!(
+        drawn,
+        "precondition: the barrier frame must be drawn.\nGrid:\n{grid}"
+    );
+    assert!(
+        grid.contains("live-generation-marker") && !grid.contains("replaced-generation-marker"),
+        "a late SessionStart from the generation `pane restart` replaced took coder's card \
+         back in the attached TUI.\nGrid:\n{grid}"
     );
 }

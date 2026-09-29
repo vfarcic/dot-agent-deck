@@ -25,7 +25,7 @@ It has no history before 2026-08-29 because it could not: `git show daf94f0^:dev
 
 ## Fix 1 — the nodejs plugin is disabled
 
-`devbox.json` sets `disable_plugin: true` on the **existing** `nodejs` entry. The package and its version pin stay; only the plugin's init hook goes, and with it the symlink the two errors above are about.
+`devbox.json` sets `disable_plugin: true` on the **existing** `nodejs` entry. The package and its version pin stay; only the plugin's init hook goes, and with it the symlink the two errors above are about. (Since issue #1300 that entry is `github:NixOS/nixpkgs/nixos-26.05#nodejs_24` rather than `nodejs@24.12.0`, because Devbox's versioned index has no Node 24 at or above the desktop lockfile's 24.15.0 floor. Devbox attaches no plugin to a flake-reference entry at all, so the flag is inert on it today and is kept for the day the entry goes back to a versioned form. The measurements below are from the `nodejs@24.12.0` entry they were taken against. [Desktop GUI developer preview](desktop-gui.md) has the reasoning.)
 
 Measured on this repository's manifest (devbox 0.18.0, 2026-09-04), cold `.devbox` both times, the two runs differing only in that flag:
 
