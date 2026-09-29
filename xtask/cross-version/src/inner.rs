@@ -42,6 +42,9 @@ pub(crate) const SETTLE: Duration = Duration::from_millis(400);
 /// reverse: the previous release), and #1045 renamed the button from "New
 /// Pane" to "New Agent", so both spellings count.
 const COMMAND_MODE_BUTTONS: [&str; 2] = ["[New Agent Ctrl+N]", "[New Pane Ctrl+N]"];
+/// The deck's own experimental-flag label, drawn alone on the screen's last
+/// row below the footer — see [`footer_mode`].
+const EXPERIMENTAL_LABEL: &str = "experimental: on";
 /// How long the daemon gets after its one SIGTERM. Well past its 3 s agent
 /// grace (`AGENT_TERMINATE_GRACE`).
 pub(crate) const DAEMON_GRACE: Duration = Duration::from_secs(20);
@@ -2845,8 +2848,16 @@ pub(crate) enum FooterMode {
 /// bar is accepted as a second spelling of `Command`, for a build whose chip is
 /// missing. `None` when the row carries neither, e.g. the inline Filter/Rename
 /// prompts, which draw no chip.
+///
+/// The deck reserves the screen's last row for its `experimental: on` label
+/// (`render_experimental_footer`), blank when the flag is off, so with
+/// `--experimental` the footer is the row above that label — which is skipped
+/// the same way a blank row is.
 pub(crate) fn footer_mode(grid: &str) -> Option<FooterMode> {
-    let row = grid.lines().rev().find(|l| !l.trim().is_empty())?;
+    let row = grid
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty() && l.trim() != EXPERIMENTAL_LABEL)?;
     let head = row.trim_start();
     if head.starts_with("TYPING") {
         Some(FooterMode::Typing)
@@ -3087,6 +3098,18 @@ mod tests {
         let typing = grid_with_footer(
             " TYPING  PaneInput mode — type to interact, Ctrl+d for dashboard   [Command Mode Ctrl+D]",
         );
+        assert_eq!(footer_mode(&typing), Some(FooterMode::Typing));
+    }
+
+    #[test]
+    fn footer_mode_skips_the_experimental_label_below_the_footer() {
+        // `--experimental` puts the label on the last row, under the chip.
+        let command = grid_with_footer(
+            " COMMAND  [Back to Pane Ctrl+D] [New Agent Ctrl+N]\nexperimental: on",
+        );
+        assert_eq!(footer_mode(&command), Some(FooterMode::Command));
+        let typing =
+            grid_with_footer(" TYPING  PaneInput mode\n                experimental: on   ");
         assert_eq!(footer_mode(&typing), Some(FooterMode::Typing));
     }
 
