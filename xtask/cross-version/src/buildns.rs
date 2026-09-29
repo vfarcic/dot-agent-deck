@@ -363,7 +363,7 @@ impl Host {
             outer_pid: proc::namespace("self", "pid").ok_or("cannot read /proc/self/ns/pid")?,
             outer_net: proc::namespace("self", "net").ok_or("cannot read /proc/self/ns/net")?,
             harness: std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?,
-            host_only: isolation::host_only_dirs_to_mask(&[]),
+            host_only: isolation::host_only_dirs_to_mask(&[], &[]),
         })
     }
 }

@@ -557,13 +557,20 @@ pub const HOST_ONLY_DIRS: &[&str] = &["/var/lib/docker"];
 
 /// The [`HOST_ONLY_DIRS`] present on this host, resolved — the kernel mounts on
 /// the resolved path, and that is what mountinfo lists — and without any that
-/// lie under one of `already`, which masks them anyway.
-pub fn host_only_dirs_to_mask(already: &[&Path]) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = HOST_ONLY_DIRS
+/// lie under one of `already`, which masks them anyway, or that contain one of
+/// `keep`, which the namespace needs (a runs root under `/var/lib/docker` would
+/// otherwise be buried beneath the mask).
+pub fn host_only_dirs_to_mask(already: &[&Path], keep: &[&Path]) -> Vec<PathBuf> {
+    host_only_dirs_from(HOST_ONLY_DIRS, already, keep)
+}
+
+fn host_only_dirs_from(candidates: &[&str], already: &[&Path], keep: &[&Path]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = candidates
         .iter()
         .filter_map(|p| std::fs::canonicalize(p).ok())
         .filter(|p| p.is_dir() && p != Path::new("/"))
         .filter(|p| !already.iter().any(|m| p.starts_with(m)))
+        .filter(|p| !keep.iter().any(|k| k.starts_with(p)))
         .collect();
     out.sort();
     out.dedup();
@@ -964,6 +971,27 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_host_only_dir_holding_the_sandbox_or_under_a_mask_is_not_masked() {
+        let dir = std::env::temp_dir().join(format!("xver-host-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let docker = dir.join("docker");
+        std::fs::create_dir_all(docker.join("runs/r1")).expect("dir");
+        let docker = std::fs::canonicalize(&docker).expect("canonical");
+        let cand = docker.display().to_string();
+        let missing = dir.join("absent").display().to_string();
+        let sandbox = docker.join("runs/r1");
+        let elsewhere = Path::new("/home/op/code/runs/r1");
+        assert_eq!(
+            host_only_dirs_from(&[&cand, &missing], &[], &[elsewhere]),
+            vec![docker.clone()],
+            "an existing dir is masked; a missing one is not"
+        );
+        assert!(host_only_dirs_from(&[&cand], &[], &[&sandbox]).is_empty());
+        assert!(host_only_dirs_from(&[&cand], &[&dir], &[elsewhere]).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

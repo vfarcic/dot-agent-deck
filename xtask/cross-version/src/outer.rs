@@ -1456,8 +1456,8 @@ fn run_one(
                     .iter()
                     .map(|m| m.target.as_path())
                     .chain(masked_home.as_deref())
-                    .chain([sb.root.as_path()])
                     .collect::<Vec<_>>(),
+                &[sb.root.as_path()],
             ),
             masks,
             masked_home,
