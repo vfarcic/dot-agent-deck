@@ -37,6 +37,8 @@ const { terminals, FakeTerminal, FakeFitAddon } = vi.hoisted(() => {
       this.handlers.add(handler);
       return { dispose: () => { this.handlers.delete(handler); } };
     }
+    attachCustomKeyEventHandler(): void {}
+    input(data: string): void { this.typeKey(data); }
     /** A keystroke: what xterm hands the component's `onData` callback. */
     typeKey(data: string): void { for (const handler of [...this.handlers]) handler(data); }
     dispose(): void { this.disposed = true; }

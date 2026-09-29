@@ -42,8 +42,14 @@ The desktop app has a few keyboard shortcuts of its own. None of the TUI's [keyb
 
 | Keys | Where | Does |
 | --- | --- | --- |
-| `Ctrl+N` / `⌘N` | Dashboard, with no agent pane open | Opens [New agent](new-agent.md) |
-| `Escape` | Agent pane | Closes the pane and returns to the Dashboard |
+| `Ctrl+N` / `⌘N` | Dashboard, with no agent pane open and not typing in an agent's terminal | Opens [New agent](new-agent.md) |
+| `Escape` | Agent pane, when you are not typing in its terminal | Closes the pane and returns to the Dashboard |
 | `Escape` | Settings | Closes Settings |
 | `Ctrl` / `⌘` with `=`, `+`, `-`, `0` | Everywhere | Zoom (above) |
 | `j` `k` `l` `h` `Space` `/` `.` `q` | New agent's directory list | Move, open, go up, use, filter, show hidden, close (see [New agent](new-agent.md#directory)) |
+
+### Keys typed into an agent's terminal
+
+While you are typing in an agent's terminal, your keys go to the agent the way they do in the TUI, so the agent's own shortcuts work: `Escape`, `Tab`, `Shift+Tab`, the arrow keys and `Ctrl` with a letter all reach it. `Ctrl+C` interrupts the agent, and `Escape` goes to the agent rather than closing the pane, so use **Back to dashboard** to leave. The zoom keys stay with the app.
+
+To start a new line without sending the message, press `Shift+Enter` or `Ctrl+J`; both work in every supported agent. `Ctrl+Enter` reaches the agent as `Ctrl+Enter`, and what it does is up to the agent, as it is in the TUI. See [Shift+Enter or Ctrl+Enter sends the message](../troubleshooting.md#shiftenter-or-ctrlenter-sends-the-message) for what each agent does with it.

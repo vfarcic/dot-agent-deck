@@ -3,6 +3,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import type { SendResult, TerminalBuffer, TerminalFeed } from "../types";
+import { agentKeySequence } from "../lib/terminalKeys";
 import { registerRefit, registerTerminal, unregisterRefit, unregisterTerminal } from "../lib/terminalRegistry";
 
 interface TerminalViewportProps {
@@ -209,6 +210,28 @@ export function TerminalViewport({
 
     const inputDisposable = terminal.onData((data) => {
       if (!readOnlyRef.current) onInputRef.current(data);
+    });
+    // Issue #1422 — the keys xterm would encode differently from the TUI
+    // (Ctrl+Enter and Shift+Enter above all: xterm sends the submitting CR for
+    // both). `terminal.input` routes the replacement through
+    // `onData`, so it passes the same input gates as a key xterm sent itself.
+    //
+    // This is the one key hook on the terminal, so any other key the app needs
+    // to claim from it belongs here too — issue #1403's copy gesture, which has
+    // to decide per keypress (a selection present or not) whether Ctrl+C is a
+    // copy or the agent's interrupt, is the one known to be coming.
+    terminal.attachCustomKeyEventHandler((event) => {
+      const sequence = agentKeySequence(event);
+      if (sequence === undefined) return true;
+      // Claim the key the way xterm claims one it sends: no newline typed into
+      // its helper textarea, and no bubbling to the app's window shortcuts.
+      // Returning false covers the keypress and keyup halves as well.
+      event.preventDefault();
+      if (event.type === "keydown") {
+        event.stopPropagation();
+        terminal.input(sequence, true);
+      }
+      return false;
     });
     // PRD #882 — `fit()` PROPOSES a size; the daemon disposes.
     //

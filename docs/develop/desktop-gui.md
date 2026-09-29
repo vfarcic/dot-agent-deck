@@ -795,6 +795,51 @@ All four are the manual smoke check's, below. [The driver tier](#the-driver-tier
 
 The browser tier does answer the geometry questions it can: `desktop/e2e/agent-pane-overlay.spec.ts` measures that the pane's box really occupies the viewport in both engines, that the grid beneath is the **same DOM node** and still `isConnected` while the pane is up, that the overview beneath is likewise, and that `Escape` returns to the screen the pane was opened from. Those are engine-side measurements about this app's layout; they say nothing about a PTY.
 
+## Keys in an agent's terminal
+
+Issue [#1422](https://github.com/vfarcic/dot-agent-deck/issues/1422). The agent's terminal is xterm.js, and xterm.js encodes keys itself (`Keyboard.ts` in `@xterm/xterm@6.0.0`), so the bytes an agent receives from the desktop are xterm.js's, not the TUI's `keyevent_to_bytes` (`src/ui.rs`). For almost every key the two agree. `desktop/src/lib/terminalKeys.ts` holds the exceptions and nothing else, and `TerminalViewport.tsx` installs it with `attachCustomKeyEventHandler` — the terminal's one key hook. A key the module does not name is left to xterm.js, so an app shortcut or a key xterm.js already sends correctly is untouched. The replacement goes through `terminal.input(…, true)`, which fires `onData`, so a translated key passes the same input gates (`disableStdin`, the `readOnly` guard) as any other; the handler also claims the key the way xterm.js claims one it sends (`preventDefault` plus `stopPropagation`), so it neither types into the helper textarea nor reaches the app's window-level listeners.
+
+**What changed.** xterm.js sends a bare CR for Enter whatever Shift or Ctrl is held — the byte that submits — so Shift+Enter and Ctrl+Enter were indistinguishable from Enter. They now send the TUI's CSI u form, `ESC[13;<m>u` with `m = 1 + (Shift 1 | Alt 2 | Ctrl 4)`. xterm.js also sent nothing at all for Ctrl+/, where xterm, GNOME Terminal and the TUI send US (0x1f); it now sends 0x1f. Cmd/Super chords and keys pressed while an input method is composing are never claimed, and Ctrl+Alt is not read as Ctrl+/ because that is how Windows reports AltGr.
+
+**Measured, not read off the source.** Each row below is what `onData` received for a real key press in Playwright's Chromium and WebKit (the fixture deck, 2026-09-29), after this change. The two engines agreed on every row. A — in the TUI column means that row was not compared.
+
+| Key | Desktop sends | TUI sends | Note |
+| --- | --- | --- | --- |
+| Enter | CR | CR | |
+| Shift+Enter | `ESC[13;2u` | `ESC[13;2u` | was CR before #1422 |
+| Ctrl+Enter | `ESC[13;5u` | `ESC[13;5u` | was CR before #1422 |
+| Alt+Enter | `ESC CR` | `ESC CR` | |
+| Cmd/Super+Enter | CR | CR | left to xterm.js |
+| Escape, Tab, Shift+Tab | `ESC`, HT, `ESC[Z` | same | |
+| Backspace / Alt+Backspace | DEL / `ESC DEL` | same | |
+| Ctrl+Backspace | BS (0x08) | BS, or DEL on a terminal speaking the kitty keyboard protocol | xterm.js matches xterm and GNOME Terminal; not changed |
+| Ctrl+letter (C, D, J, K, L, O, R, T, U, V, W, Z) | C0 byte | same | |
+| Ctrl+/ | US (0x1f) | US | xterm.js sent nothing before #1422 |
+| Ctrl+Space | NUL | NUL | |
+| Alt+letter | `ESC` letter | same | on macOS, Option types a character instead (`macOptionIsMeta` is off, as in Terminal.app by default) |
+| Shift+Up, Ctrl+Left | `ESC[1;2A`, `ESC[1;5D` | same | |
+| Alt+Left | `ESC[1;3D` | `ESC ESC[D` | both are common encodings of Alt+Left; not changed |
+| Home, End, PageUp, Delete | `ESC[H`, `ESC[F`, `ESC[5~`, `ESC[3~` | same | |
+| Shift+PageUp / Shift+PageDown | nothing | — | scrolls xterm.js's own scrollback |
+| Ctrl+Shift+C, Ctrl+Shift+V | nothing | — | left to the webview; copy is [#1403](https://github.com/vfarcic/dot-agent-deck/issues/1403) |
+| Cmd+K | nothing | — | opens the command palette. Ctrl+K goes to the agent as 0x0b while a terminal has focus, so it does not |
+
+**What each agent does with the modified Enters is the agent's binding, and they differ.** Measured on this machine on 2026-09-29 by injecting the bytes into each agent in a private tmux server and reading its input box (typing, never submitting — except where the table says a chord submitted):
+
+| Agent (version) | `ESC[13;2u` (Shift+Enter) | `ESC[13;5u` (Ctrl+Enter) | LF (Ctrl+J) |
+| --- | --- | --- | --- |
+| Claude Code 2.1.284 | newline | **submits** — its default keybindings map `ctrl+enter` to `chat:sendNow` | newline (`ctrl+j` is its `chat:newline`; PRD #227 measured the byte) |
+| Codex 0.156.1 | newline | ignored | newline |
+| OpenCode 1.18.33 | newline | newline | newline |
+| Pi 0.84.4 | newline | ignored | newline (PRD #227) |
+| Devin 3000.11.3 | newline | ignored | newline |
+
+CR submits in all of them. So the fix forwards Ctrl+Enter faithfully rather than mapping it to a newline: that is what the TUI and a terminal speaking the kitty keyboard protocol send, and it is the only choice that lets Claude Code's `chat:sendNow` work at all. Mapping it to LF would have made it a newline everywhere, which is what Windows Terminal before 1.25 did (Claude Code's own changelog names that case), at the cost of parity with the TUI and of every agent's own Ctrl+Enter binding. Shift+Enter and Ctrl+J are the newline chords that work in every supported agent, and the user docs say so.
+
+**What tests it.** `desktop/src/components/TerminalViewport.keys.test.tsx` runs the real xterm.js in jsdom (only the WebGL and fit addons are stubbed) and asserts the bytes for each key above that matters, that a translated key is claimed rather than bubbling, that Cmd/Super chords still bubble to the app, and that a read-only terminal sends nothing. `desktop/src/lib/terminalKeys.test.ts` covers the pure classification. `desktop/e2e/agent-terminal-input.spec.ts`'s "forwards modified Enter as the TUI does" presses the chords with each engine's own key events. None of these runs WebKitGTK, WKWebView or WebView2, and none reaches a real agent; the agent table above is a manual measurement and goes stale as agents change their bindings.
+
+**For [#1403](https://github.com/vfarcic/dot-agent-deck/issues/1403).** A copy gesture has to be decided per key press — Ctrl+C is a copy only while there is a selection, and the agent's interrupt otherwise — so it belongs in the same `attachCustomKeyEventHandler` callback, ahead of `agentKeySequence`, rather than in a second handler: xterm.js keeps exactly one.
+
 ## The New agent flow
 
 PRD [#1223](https://github.com/vfarcic/dot-agent-deck/issues/1223) — the desktop's version of the TUI's `Ctrl+n`, with a deck field in front of it because the desktop drives several decks. It closes [#1041](https://github.com/vfarcic/dot-agent-deck/issues/1041), which was that `DesktopAction::StartAgent` existed and nothing in the frontend reached it. It mirrors `Ctrl+n` and **not** the Runs screen: the two share daemon verbs (`PrepareOrchestration`, `StartPreparedAgent`) and no form rules, and the Runs screen's divergences are [#1044](https://github.com/vfarcic/dot-agent-deck/issues/1044)'s. The frontend is `desktop/src/components/NewAgentDialog.tsx` with its rules as testable functions in `desktop/src/lib/newAgent.ts`; the backend is the `desktop_list_directories`, `desktop_new_agent_options` and `desktop_new_agent_orchestrations` commands plus the `StartAgent` and `StartOrchestration` arms of `desktop_run_action`, all in `desktop/src-tauri/src/lib.rs`. It ships visible — the desktop has no experimental-flag mechanism.

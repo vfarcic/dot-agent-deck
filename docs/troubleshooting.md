@@ -7,15 +7,25 @@ title: Troubleshooting
 
 Most of this page applies to both clients, the TUI and the [desktop app](desktop/index.md), because the problems live in the daemon or the agents they share. A section that applies to only one client says so under its heading. For a desktop app that shows **Daemon disconnected**, see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon).
 
-## Shift+Enter Submits Instead of Inserting a Newline
+## Shift+Enter or Ctrl+Enter Sends the Message
 
-*Applies to the TUI.*
+Inside an agent's pane, in the TUI or in the [desktop app](desktop/index.md), **Shift+Enter** and **Ctrl+J** insert a new line into the agent's draft and plain **Enter** sends it — the same behavior you get running the agent directly. Both newline keys work in every supported agent.
 
-Inside an embedded agent pane, **Shift+Enter** inserts a newline into the agent's draft and plain **Enter** submits it — the same behavior you get running the agent directly. This works with **no terminal configuration** on any terminal that implements the enhanced ("kitty") keyboard protocol, which the deck negotiates for you at startup.
+**Ctrl+Enter** reaches the agent as Ctrl+Enter, and agents do different things with it:
+
+| Agent | Ctrl+Enter |
+| --- | --- |
+| Claude Code | Sends the message (its own "send now" shortcut) |
+| OpenCode | Inserts a new line |
+| Codex, Pi, Devin | Nothing |
+
+That is each agent's own choice, and an agent's update can change it.
+
+In the desktop app none of this needs configuring. In the TUI it works with **no terminal configuration** on any terminal that implements the enhanced ("kitty") keyboard protocol, which the deck negotiates for you at startup; the rest of this section is about the TUI.
 
 If you already have `keybind = shift+enter=csi:13;2u` in `~/Library/Application Support/com.mitchellh.ghostty/config`, you can leave it — it still works and does no harm, and it is not needed.
 
-### If It Still Submits
+### If Shift+Enter Still Sends the Message in the TUI
 
 - **You are running the deck inside tmux.** tmux reports no keyboard-enhancement support, so the deck skips the negotiation there and Shift+Enter falls back to its previous behavior. Either run the deck outside tmux, or have tmux pass extended keys through with `set -s extended-keys always` and `set -s extended-keys-format csi-u`.
 - **Your terminal does not implement the enhanced keyboard protocol.** Bind the keystroke to the CSI u encoding yourself if your terminal supports custom keybinds — in Ghostty that is the `keybind = shift+enter=csi:13;2u` line above. The deck forwards the modifier faithfully either way.
