@@ -98,13 +98,32 @@ SSH_OPTS=(-i "$BOX_KEY" -o IdentitiesOnly=yes -o UserKnownHostsFile="$KNOWN_HOST
 
 os() { openstack "$@"; }
 
-# Print the ID of the named resource, or nothing: `os_id security group NAME`.
-# `show` by name exits non-zero when the resource is absent, which is the only
-# signal needed here. The kind may arrive as one word or several.
+# Print the ID of the named resource, or nothing when it is absent:
+# `os_id security group NAME`. The kind may arrive as one word or several.
+# `show` by name exits non-zero both when the resource is absent and when the
+# API call itself fails; only the first is "absent". Anything else — an auth
+# error, a timeout, an ambiguous name — is printed and returned as a failure,
+# so teardown never reports a resource gone because a lookup broke.
 os_id() {
-  local name="${*: -1}" kind
+  local name="${*: -1}" kind out err
   read -ra kind <<< "${*:1:$#-1}"
-  os "${kind[@]}" show "$name" -f value -c id 2>/dev/null || true
+  err="$(mktemp)"
+  if out="$(os "${kind[@]}" show "$name" -f value -c id 2>"$err")"; then
+    rm -f "$err"; printf '%s\n' "$out"; return 0
+  fi
+  if grep -qiE "No [a-z ]+ (found for|with a name or ID of)" "$err"; then
+    rm -f "$err"; return 0
+  fi
+  cat "$err" >&2; rm -f "$err"
+  return 1
+}
+
+# True when the named resource exists; dies when the lookup itself fails.
+# Called directly (never inside $(...)), so the die reaches the script.
+exists() {
+  local id
+  id="$(os_id "$@")" || die "OpenStack lookup failed: $*"
+  [ -n "$id" ]
 }
 
 require_cloud() {
@@ -119,14 +138,20 @@ floating_ip() {
     | jq -r --arg d "$NAME" '.[] | select(.Description == $d) | .["Floating IP Address"]' | head -n1
 }
 
-my_cidrs() {
+# Fill ALLOW_CIDRS (your public IPv4/32 when --allow-cidr was not given) and
+# validate it. Runs in the current shell, not a subshell, so a failure here
+# stops the script before any rule is touched.
+resolve_cidrs() {
   if [ ${#ALLOW_CIDRS[@]} -eq 0 ]; then
     local ip
     ip="$(curl -fsS --max-time 10 https://api.ipify.org)" || die "could not detect your public IP; pass --allow-cidr"
     [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "unexpected public IP answer: $ip"
     ALLOW_CIDRS=("$ip/32")
   fi
-  printf '%s\n' "${ALLOW_CIDRS[@]}"
+  local cidr
+  for cidr in "${ALLOW_CIDRS[@]}"; do
+    [[ "$cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] || die "not an IPv4 CIDR: $cidr"
+  done
 }
 
 # -------- ensure_* : each creates its resource only when it is missing ------
@@ -139,7 +164,21 @@ ensure_box_key() {
 }
 
 ensure_image() {
-  [ -n "$(os_id image "$IMAGE_NAME")" ] && return
+  if exists image "$IMAGE_NAME"; then
+    local status
+    status="$(os image show "$IMAGE_NAME" -f value -c status)"
+    # An upload in progress elsewhere: give it time to finish.
+    for _ in $(seq 1 60); do
+      [ "$status" = saving ] || [ "$status" = queued ] || break
+      sleep 10
+      status="$(os image show "$IMAGE_NAME" -f value -c status)"
+    done
+    [ "$status" = active ] && return
+    # A failed or abandoned upload; the image is shared but no server can boot
+    # from it in this state, so replacing it loses nothing.
+    log "image $IMAGE_NAME is '$status', not active; deleting it and uploading again"
+    os image delete "$IMAGE_NAME"
+  fi
   mkdir -p "$CACHE_DIR"
   local img want got
   img="$CACHE_DIR/$(basename "$IMAGE_URL")"
@@ -156,46 +195,80 @@ ensure_image() {
   os image create "$IMAGE_NAME" --file "$img" --disk-format qcow2 --container-format bare \
     --private --property os_distro=ubuntu --property os_version=26.04 \
     --property dad_sha256="$want" >/dev/null
+  local status
+  status="$(os image show "$IMAGE_NAME" -f value -c status)"
+  [ "$status" = active ] || die "uploaded image $IMAGE_NAME is '$status', not active; run \`up\` again to replace it"
 }
 
+# Each step is checked on its own, so a run interrupted between creating the
+# router and wiring it is repaired by the next `up` rather than skipped.
 ensure_network() {
-  if [ -z "$(os_id network "$NET")" ]; then
+  if ! exists network "$NET"; then
     log "creating network $NET"
     os network create "$NET" >/dev/null
   fi
-  if [ -z "$(os_id subnet "$SUBNET")" ]; then
+  if ! exists subnet "$SUBNET"; then
     log "creating subnet $SUBNET ($SUBNET_CIDR)"
     os subnet create "$SUBNET" --network "$NET" --subnet-range "$SUBNET_CIDR" \
       --dns-nameserver 1.1.1.1 --dns-nameserver 8.8.8.8 >/dev/null
   fi
-  if [ -z "$(os_id router "$ROUTER")" ]; then
-    log "creating router $ROUTER (gateway on $EXTERNAL_NET)"
+  if ! exists router "$ROUTER"; then
+    log "creating router $ROUTER"
     os router create "$ROUTER" >/dev/null
+  fi
+  if [ "$(os router show "$ROUTER" -f json | jq -r '.external_gateway_info // empty | tostring')" = "" ]; then
+    log "setting the gateway of $ROUTER on $EXTERNAL_NET"
     os router set "$ROUTER" --external-gateway "$EXTERNAL_NET"
+  fi
+  local subnet_id
+  subnet_id="$(os_id subnet "$SUBNET")"
+  if [ -z "$(os port list --router "$ROUTER" --fixed-ip "subnet=$subnet_id" -f value -c ID)" ]; then
+    log "attaching $SUBNET to $ROUTER"
     os router add subnet "$ROUTER" "$SUBNET"
   fi
 }
 
+# A new group gets its rules here. An existing one is reconciled only when
+# --allow-cidr was passed, or when it has no ingress rule at all (a run that
+# stopped between creating it and adding them); otherwise the rules set with
+# `allow-ip` are left as they are.
 ensure_secgroup() {
-  if [ -z "$(os_id security group "$SECGROUP")" ]; then
+  if ! exists security group "$SECGROUP"; then
     log "creating security group $SECGROUP"
     os security group create "$SECGROUP" --description "dot-agent-deck box $NAME: SSH and mosh from allowed CIDRs only" >/dev/null
+    set_allowed_cidrs
+  elif [ ${#ALLOW_CIDRS[@]} -gt 0 ] || [ -z "$(os security group rule list "$SECGROUP" --ingress -f value -c ID)" ]; then
     set_allowed_cidrs
   fi
 }
 
-# Replace every ingress rule with SSH (tcp/22) and mosh (udp/60000-61000) from
-# the allowed CIDRs. Egress keeps OpenStack's default allow-all.
+# Make the ingress rules exactly SSH (tcp/22) and mosh (udp/60000-61000) from
+# the allowed CIDRs. Egress keeps OpenStack's default allow-all. The CIDRs are
+# resolved first and the new rules added before any old one is removed, so a
+# failure part-way leaves the previous access in place rather than none.
 set_allowed_cidrs() {
-  local rule cidr
-  for rule in $(os security group rule list "$SECGROUP" --ingress -f value -c ID); do
-    os security group rule delete "$rule"
+  resolve_cidrs
+  local rules keep cidr id
+  rules="$(os security group rule list "$SECGROUP" --ingress -f json)"
+  keep="$(printf '%s\n' "${ALLOW_CIDRS[@]}" | jq -R . | jq -sc .)"
+  # A rule is wanted when it is one of the two shapes from an allowed CIDR.
+  local wanted='((.["IP Protocol"] == "tcp" and ((.["Port Range"] // "") | test("^22(:22)?$")))
+                 or (.["IP Protocol"] == "udp" and (.["Port Range"] // "") == "60000:61000"))
+                and (.["IP Range"] as $r | $keep | any(.[]; . == $r))'
+  for cidr in "${ALLOW_CIDRS[@]}"; do
+    if ! jq -e --arg c "$cidr" '[.[] | select(.["IP Range"] == $c and .["IP Protocol"] == "tcp" and ((.["Port Range"] // "") | test("^22(:22)?$")))] | length > 0' <<< "$rules" >/dev/null; then
+      log "allowing SSH from $cidr"
+      os security group rule create "$SECGROUP" --ingress --ethertype IPv4 --protocol tcp --dst-port 22 --remote-ip "$cidr" >/dev/null
+    fi
+    if ! jq -e --arg c "$cidr" '[.[] | select(.["IP Range"] == $c and .["IP Protocol"] == "udp" and (.["Port Range"] // "") == "60000:61000")] | length > 0' <<< "$rules" >/dev/null; then
+      log "allowing mosh from $cidr"
+      os security group rule create "$SECGROUP" --ingress --ethertype IPv4 --protocol udp --dst-port 60000:61000 --remote-ip "$cidr" >/dev/null
+    fi
   done
-  while read -r cidr; do
-    log "allowing SSH and mosh from $cidr"
-    os security group rule create "$SECGROUP" --ingress --ethertype IPv4 --protocol tcp --dst-port 22 --remote-ip "$cidr" >/dev/null
-    os security group rule create "$SECGROUP" --ingress --ethertype IPv4 --protocol udp --dst-port 60000:61000 --remote-ip "$cidr" >/dev/null
-  done < <(my_cidrs)
+  for id in $(jq -r --argjson keep "$keep" ".[] | select(($wanted) | not) | .ID" <<< "$rules"); do
+    log "removing ingress rule $id"
+    os security group rule delete "$id"
+  done
 }
 
 ensure_keypair() {
@@ -204,15 +277,24 @@ ensure_keypair() {
   os keypair create "$KEYPAIR" --public-key "$BOX_KEY.pub" >/dev/null
 }
 
+# The volume holds /home, so it is never deleted automatically: a volume in a
+# state a server cannot use stops `up` with the state named, and the operator
+# decides whether it holds anything worth keeping.
 ensure_volume() {
-  [ -n "$(os_id volume "$VOLUME")" ] && return
-  log "creating volume $VOLUME (${VOLUME_SIZE} GB, $VOLUME_TYPE)"
-  os volume create "$VOLUME" --size "$VOLUME_SIZE" --type "$VOLUME_TYPE" >/dev/null
+  if ! exists volume "$VOLUME"; then
+    log "creating volume $VOLUME (${VOLUME_SIZE} GB, $VOLUME_TYPE)"
+    os volume create "$VOLUME" --size "$VOLUME_SIZE" --type "$VOLUME_TYPE" >/dev/null
+  fi
+  local status
   for _ in $(seq 1 60); do
-    [ "$(os volume show "$VOLUME" -f value -c status)" = available ] && return
-    sleep 2
+    status="$(os volume show "$VOLUME" -f value -c status)"
+    case "$status" in
+      available|in-use) return ;;
+      creating|attaching|detaching|reserved|downloading) sleep 2 ;;
+      *) die "volume $VOLUME is '$status'; inspect it with \`openstack volume show $VOLUME\` — delete it only if it holds nothing, since it is /home" ;;
+    esac
   done
-  die "volume $VOLUME did not become available"
+  die "volume $VOLUME is still '$status' after two minutes"
 }
 
 # -------- cloud-init ---------------------------------------------------------
@@ -233,11 +315,13 @@ hostname: ${NAME}
 # itself and exits 2 only when it finds no signature at all; any other answer,
 # including an error, leaves the disk alone. bootcmd runs on every boot, before
 # mounts and users_groups, so the user is created on the mounted volume and
-# keeps UID 1000 across rebuilds.
+# keeps UID 1000 across rebuilds. The mount stays nofail so a missing volume
+# still boots to a reachable box instead of emergency mode; \`up\` then refuses
+# to continue unless /home really is this volume.
 bootcmd:
   - |
     dev=${device}
-    for _ in \$(seq 1 30); do [ -b "\$dev" ] && break; sleep 1; done
+    for _ in \$(seq 1 120); do [ -b "\$dev" ] && break; sleep 1; done
     blkid -p "\$dev" >/dev/null 2>&1; rc=\$?
     if [ "\$rc" -eq 2 ]; then mkfs.ext4 -q -L dad-home "\$dev"; fi
 mounts:
@@ -304,7 +388,7 @@ do_up() {
   ensure_keypair
   ensure_volume
 
-  if [ -z "$(os_id server "$NAME")" ]; then
+  if ! exists server "$NAME"; then
     local volume_id userdata
     volume_id="$(os_id volume "$VOLUME")"
     mkdir -p "$STATE_DIR"
@@ -337,7 +421,19 @@ do_up() {
   wait_for_ssh "$ip"
   trust_host_key "$ip"
   log "waiting for cloud-init to finish"
-  ssh "${SSH_OPTS[@]}" "$BOX_USER@$ip" 'sudo cloud-init status --wait >/dev/null; cloud-init status --long | sed -n "1,3p"; sudo resize2fs "$(findmnt -no SOURCE /home)" >/dev/null 2>&1; findmnt -no SOURCE,SIZE /home'
+  # cloud-init exits 1 on a failure and 2 on a recoverable error (a deprecation
+  # warning, say); only 1 stops the run. Then /home must be the data volume —
+  # the filesystem bootcmd labelled — or the user's files would land on the
+  # root disk, which `down` throws away.
+  ssh "${SSH_OPTS[@]}" "$BOX_USER@$ip" '
+    set -u
+    sudo cloud-init status --wait >/dev/null; rc=$?
+    cloud-init status --long | sed -n "1,3p"
+    [ "$rc" -ne 1 ] || { echo "cloud-init failed; see /var/log/cloud-init.log on the box" >&2; exit 1; }
+    src="$(findmnt -no SOURCE /home)" || { echo "/home is not a mount point: the data volume did not mount" >&2; exit 1; }
+    [ "$(sudo blkid -o value -s LABEL "$src")" = dad-home ] || { echo "/home is $src, not the dad-home data volume" >&2; exit 1; }
+    sudo resize2fs "$src" >/dev/null || { echo "resize2fs $src failed" >&2; exit 1; }
+    findmnt -no SOURCE,SIZE /home' || die "the box is up but not ready (above); fix it before bootstrapping — \`$0 ssh --name $NAME\`"
 
   if [ "$BOOTSTRAP" -eq 1 ]; then
     log "running bootstrap.sh on the box"
@@ -360,18 +456,27 @@ Box '$NAME' is up.
 EOF
 }
 
+# `do_down discard` is destroy's path: the volume is deleted next, so an
+# unconfirmed shutdown loses nothing and does not stop the teardown.
 do_down() {
+  local discard="${1:-}"
   require_cloud
-  if [ -n "$(os_id server "$NAME")" ]; then
+  if exists server "$NAME"; then
     # Stop first: a bare delete powers the guest off without a shutdown, and
-    # whatever /home had not yet flushed to the volume would be lost.
+    # whatever /home had not yet flushed to the volume would be lost. So the
+    # server is deleted only once it is confirmed SHUTOFF.
     if [ "$(os server show "$NAME" -f value -c status)" = ACTIVE ]; then
       log "shutting down $NAME"
       os server stop "$NAME"
-      for _ in $(seq 1 60); do
-        [ "$(os server show "$NAME" -f value -c status)" = SHUTOFF ] && break
+      local status=ACTIVE
+      for _ in $(seq 1 100); do
+        status="$(os server show "$NAME" -f value -c status)"
+        [ "$status" = SHUTOFF ] && break
         sleep 3
       done
+      if [ "$status" != SHUTOFF ] && [ "$discard" != discard ]; then
+        die "$NAME is still '$status' after five minutes; not deleting it, so /home is not cut off mid-write. Run \`down\` again once it has stopped."
+      fi
     fi
     log "deleting server $NAME (the data volume is kept)"
     os server delete "$NAME" --wait
@@ -387,8 +492,8 @@ do_down() {
 }
 
 do_destroy() {
-  do_down
-  if [ -n "$(os_id volume "$VOLUME")" ]; then
+  do_down discard
+  if exists volume "$VOLUME"; then
     log "deleting volume $VOLUME"
     for _ in $(seq 1 60); do
       [ "$(os volume show "$VOLUME" -f value -c status)" = available ] && break
@@ -396,15 +501,15 @@ do_destroy() {
     done
     os volume delete "$VOLUME"
   fi
-  if [ -n "$(os_id router "$ROUTER")" ]; then
+  if exists router "$ROUTER"; then
     log "deleting router $ROUTER"
     os router remove subnet "$ROUTER" "$SUBNET" 2>/dev/null || true
     os router unset --external-gateway "$ROUTER" 2>/dev/null || true
     os router delete "$ROUTER"
   fi
-  [ -n "$(os_id subnet "$SUBNET")" ] && { log "deleting subnet $SUBNET"; os subnet delete "$SUBNET"; }
-  [ -n "$(os_id network "$NET")" ] && { log "deleting network $NET"; os network delete "$NET"; }
-  [ -n "$(os_id security group "$SECGROUP")" ] && { log "deleting security group $SECGROUP"; os security group delete "$SECGROUP"; }
+  if exists subnet "$SUBNET"; then log "deleting subnet $SUBNET"; os subnet delete "$SUBNET"; fi
+  if exists network "$NET"; then log "deleting network $NET"; os network delete "$NET"; fi
+  if exists security group "$SECGROUP"; then log "deleting security group $SECGROUP"; os security group delete "$SECGROUP"; fi
   os keypair show "$KEYPAIR" >/dev/null 2>&1 && { log "deleting keypair $KEYPAIR"; os keypair delete "$KEYPAIR"; }
   # The image is shared by every box; remove it only when no server uses it.
   local image_id
@@ -427,11 +532,15 @@ do_grow() {
   [ "$VOLUME_SIZE" -gt "$current" ] || die "$VOLUME is already ${current} GB; pass a larger --volume-size (volumes cannot shrink)"
   log "extending $VOLUME from ${current} GB to ${VOLUME_SIZE} GB"
   os --os-volume-api-version 3.42 volume set --size "$VOLUME_SIZE" "$VOLUME"
+  local size status
   for _ in $(seq 1 60); do
-    [ "$(os volume show "$VOLUME" -f value -c size)" = "$VOLUME_SIZE" ] && \
-      [ "$(os volume show "$VOLUME" -f value -c status)" != extending ] && break
+    size="$(os volume show "$VOLUME" -f value -c size)"
+    status="$(os volume show "$VOLUME" -f value -c status)"
+    [ "$size" = "$VOLUME_SIZE" ] && [ "$status" != extending ] && break
     sleep 3
   done
+  [ "$size" = "$VOLUME_SIZE" ] || die "$VOLUME is still ${size} GB ('$status') after three minutes; not growing the filesystem"
+  case "$status" in available|in-use) ;; *) die "$VOLUME reached ${size} GB but is '$status'; not growing the filesystem" ;; esac
   local ip
   ip="$(floating_ip)"
   if [ -n "$ip" ]; then
@@ -445,15 +554,14 @@ do_grow() {
 do_status() {
   require_cloud
   local what id
-  printf '%-16s %s\n' image "$( [ -n "$(os_id image "$IMAGE_NAME")" ] && echo "$IMAGE_NAME" || echo -)"
-  for what in "network:$NET" "subnet:$SUBNET" "router:$ROUTER" "security group:$SECGROUP" "volume:$VOLUME"; do
+  for what in "image:$IMAGE_NAME" "network:$NET" "subnet:$SUBNET" "router:$ROUTER" "security group:$SECGROUP" "volume:$VOLUME"; do
     id="$(os_id "${what%%:*}" "${what#*:}")"
     printf '%-16s %s\n' "${what%%:*}" "$( [ -n "$id" ] && echo "${what#*:}" || echo -)"
   done
   printf '%-16s %s\n' keypair "$(os keypair show "$KEYPAIR" >/dev/null 2>&1 && echo "$KEYPAIR" || echo -)"
   printf '%-16s %s\n' server "$(os server show "$NAME" -f value -c status 2>/dev/null || echo -)"
   printf '%-16s %s\n' "public IP" "$(floating_ip || true)"
-  [ -n "$(os_id security group "$SECGROUP")" ] && \
+  exists security group "$SECGROUP" && \
     printf '%-16s %s\n' "allowed from" "$(os security group rule list "$SECGROUP" --ingress --protocol tcp -f value -c 'IP Range' | sort -u | paste -sd' ')"
   return 0
 }
@@ -474,7 +582,7 @@ case "$ACTION" in
   ip)       require_cloud; floating_ip ;;
   ssh)      do_ssh "$@" ;;
   grow)     do_grow ;;
-  allow-ip) require_cloud; [ -n "$(os_id security group "$SECGROUP")" ] || die "no security group $SECGROUP"; set_allowed_cidrs ;;
+  allow-ip) require_cloud; exists security group "$SECGROUP" || die "no security group $SECGROUP"; set_allowed_cidrs ;;
   -h|--help|help) usage ;;
   *)        die "unknown action: $ACTION (try --help)" ;;
 esac
