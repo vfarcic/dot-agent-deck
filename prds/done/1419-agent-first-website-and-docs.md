@@ -1,6 +1,6 @@
 # PRD #1419: Agent-first website and docs
 
-**Status**: Draft — not started
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-09-29
 **Issue**: [#1419](https://github.com/vfarcic/dot-agent-deck/issues/1419)
@@ -18,7 +18,7 @@ The agent cannot pick that work up reliably today, for two reasons:
 
 Make the website a landing page for people and make the docs a reference for the user's agent.
 
-1. **A single landing page** for people, ported from the product page #1021 designed and PR #1155 shipped: what the tool is, why it is useful, a short demo, the one-line install, and a copy-paste prompt that hands the user's agent a concrete starting point ("Read https://agent-deck.devopstoolkit.ai/llms.txt, then help me install and set up dot-agent-deck").
+1. **A single landing page** for people, ported from the product page #1021 designed and PR #1155 shipped: what the tool is, why it is useful, a short demo, the one-line install, and a copy-paste prompt that hands the user's agent a concrete starting point ("Read https://agent-deck.devopstoolkit.ai/llms.txt, then install dot-agent-deck and set it up for me so that: <your goal>. Once it is installed, `dot-agent-deck docs` has the docs for the installed version.").
 2. **Docs published as raw Markdown**, linked from the landing page with a plain `<a href>` in the served HTML. A person can still read them; they are not designed for that.
 3. **`llms.txt` and `llms-full.txt`**, generated from `docs/` at build time: an index an agent can follow, and the whole corpus in one fetch.
 4. **`dot-agent-deck docs [topic]`**, a subcommand that prints docs embedded in the binary at build time, so an agent working with an installed deck reads the docs **for that version**, with no network access needed.
@@ -111,13 +111,13 @@ The maintainer reviews it all at once, so that the landing page, the content, `l
 
 ## Milestones
 
-- [ ] **Site replaced**: Docusaurus removed; the #1155 landing page ported to static HTML/CSS with its own header and footer, light and dark mode, an agent prompt and a plain-HTML docs link; cleaned screenshots in place; Markdown served as `text/markdown` on both nginx and Netlify, every old `/docs` URL form redirected (generated from the manifest and tested against the last Docusaurus build's URL list), and a link check in place of Docusaurus's.
-- [ ] **Docs rewritten for the agent reader** per Decision 3: task-oriented, full config/CLI reference, internals only where diagnosis needs them, with removed internals moved to `docs/develop/` where not already there.
-- [ ] **Manifest and generation**: `docs/published.toml`, and a `cargo xtask` that builds the site output (Markdown, `llms.txt`, `llms-full.txt`, images, landing page) from it.
-- [ ] **`dot-agent-deck docs [topic]` subcommand** printing embedded, version-matched docs, with tests.
-- [ ] **Publication boundary enforced**: tests that `docs/develop/` is absent from the build output, the `llms` files and the embedded topics.
-- [ ] **Repo rules and skills updated**: CLAUDE.md rule 11, `publish-docs` skill, `CONTRIBUTING.md`, plus a changelog fragment.
-- [ ] **Validated with a fresh agent**: in a sandbox, an agent given only the landing-page prompt installs dot-agent-deck and sets up a three-role orchestration without other help. A second run starts from `dot-agent-deck docs` alone. Record both transcripts' outcomes in the PR.
+- [x] **Site replaced**: Docusaurus removed; the #1155 landing page ported to static HTML/CSS with its own header and footer, light and dark mode, an agent prompt and a plain-HTML docs link; cleaned screenshots in place; Markdown served as `text/markdown` on both nginx and Netlify, every old `/docs` URL form redirected (generated from the manifest and tested against the last Docusaurus build's URL list), and a link check in place of Docusaurus's.
+- [x] **Docs rewritten for the agent reader** per Decision 3: task-oriented, full config/CLI reference, internals only where diagnosis needs them, with removed internals moved to `docs/develop/` where not already there.
+- [x] **Manifest and generation**: `docs/published.toml`, and a `cargo xtask` that builds the site output (Markdown, `llms.txt`, `llms-full.txt`, images, landing page) from it.
+- [x] **`dot-agent-deck docs [topic]` subcommand** printing embedded, version-matched docs, with tests.
+- [x] **Publication boundary enforced**: tests that `docs/develop/` is absent from the build output, the `llms` files and the embedded topics.
+- [x] **Repo rules and skills updated**: CLAUDE.md rule 11, `publish-docs` skill, `CONTRIBUTING.md`, plus a changelog fragment.
+- [x] **Validated with a fresh agent**: in a sandbox, an agent given only the landing-page prompt installs dot-agent-deck and sets up a three-role orchestration without other help. A second run starts from `dot-agent-deck docs` alone. Record both transcripts' outcomes in the PR.
 
 ## Validation
 
@@ -136,10 +136,11 @@ The maintainer reviews it all at once, so that the landing page, the content, `l
 
 ## Open Questions
 
-- Keep an explicit light/dark toggle, or follow the OS setting only?
+- ~~Keep an explicit light/dark toggle, or follow the OS setting only?~~ Answered: the page follows the OS setting by default, plus an explicit toggle whose choice is saved in `localStorage`.
 
 ## Work Log
 
 - **2026-09-29**: PRD created. Decisions from discussion with the maintainer: landing page for people plus Markdown docs for agents, linked from the landing page; `llms.txt`; version-matched `docs` subcommand; docs remain user-facing and cover internals only where diagnosis needs them; dev docs out of scope; one PRD and one PR with one commit per piece; no experimental flag; work in a worktree.
 - **2026-09-29**: Decided with the maintainer: drop Docusaurus and port the #1155 landing page to static HTML/CSS (its only Docusaurus dependencies are the layout wrapper and `Link`); replace front matter with a `docs/published.toml` manifest shared by the site, `llms.txt` and the `docs` subcommand; use the `.landing-assets/` screenshots after cleaning (busy deck on the landing page, dispatch in the dispatcher-mode doc).
 - **2026-09-29**: Review of PR #1421 (Greptile). Specified how relative links in `dot-agent-deck docs` output resolve (topics are file-path slugs, a stated preamble rule, a resolution test, plus `--all`), and widened the redirect requirement to every URL form Docusaurus serves (slashless, trailing slash, nested desktop pages, the `/docs/desktop` category index, `/docs`). Corrected the page count from 15 to 20: the first draft was counted from a stale checkout that predated `docs/desktop/`.
+- **2026-09-29**: Shipped in one PR, one commit per piece: `6b48c1a0` manifest and site generator; `fe8f3ed0` the `docs` subcommand; `1ae9f5bb` Docusaurus replaced by a static landing page and raw Markdown; `17c4c964` publication-boundary tests; `11b4ace4` docs rewritten for the agent reader; `21ccea31` repo rules, skills and changelog fragment; `b2a6127c` boundary-test speedup; `35f0afd5` review, audit and validation fixes; `795a148a` image-directory boundary fix; `35d8064f` final nits; `ffc816ad` link check covers reference-style links (Greptile finding); `40f9ea1d` `docs_005` covers reference-style links. `/docs/workspace-modes` redirects to `configuration.md`. Fresh-agent validation: the first run 1 failed, the fixes in `35f0afd5` addressed why, and the rerun of both runs (landing-page prompt, and `dot-agent-deck docs` alone) succeeded; details are in the PR body. One item is left for after merge: check `.md` returns `text/markdown` on Netlify with `curl -I`, because the PR's own preview deploys with `main`'s `docs-preview.yml`.
