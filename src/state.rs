@@ -3119,6 +3119,51 @@ fn release_undelivered_commission(
     }
 }
 
+/// Issue #1423: the counterpart to [`release_undelivered_commission`] for the
+/// idle-worker record (PRD #126), and the single place that invariant is
+/// spelled out:
+///
+/// > **Every path that arms a delegation's idle-worker record and then fails to
+/// > deliver its task pointer must retire it.**
+///
+/// The record is armed in `handle_delegate`'s synchronous fan-out, beside the
+/// commission and for the same delegation, so it outlives every exit that
+/// delivers nothing. Left armed, the only things that retire it are its own
+/// timeout, a pane close, or the agent-exit sweep — and the sweep needs a bound
+/// worker agent id, which the exits taken before the identity resolves never
+/// bind. So `worker_response_timeout_minutes` later the orchestrator was told a
+/// worker had gone idle on a task that never reached it.
+///
+/// Conditional on the delegation's generation, never an unconditional remove:
+/// a newer delegate to the same worker replaces the record while this dispatch
+/// is queued, and taking that one would disarm a live watch. `None` — the
+/// detector was off, or arming was refused — has nothing to retire.
+///
+/// Routed through one helper for [`release_undelivered_commission`]'s reason:
+/// the retirement sites are exactly the callers of this function. The audit of
+/// `dispatch_one_owned`'s exits is recorded at the top of that function.
+fn retire_undelivered_idle_worker_record(
+    registry: &AgentPtyRegistry,
+    worker_pane_id: &str,
+    delegation_seq: Option<u64>,
+    reason: &'static str,
+) {
+    let Some(seq) = delegation_seq else {
+        return;
+    };
+    if registry
+        .take_outstanding_delegation_if(worker_pane_id, seq)
+        .is_some()
+    {
+        tracing::debug!(
+            pane_id = %worker_pane_id,
+            seq,
+            reason,
+            "delegate: retired the idle-worker record for an undelivered task pointer"
+        );
+    }
+}
+
 /// Issue #687: the counterpart to [`release_undelivered_commission`] for the
 /// silent-worker watch a `clear = true` respawn arms EARLY, and the single place
 /// that invariant is spelled out:
@@ -7346,6 +7391,29 @@ async fn bind_dispatched_commission(
 ///    an unresolved identity, `WrongSession`, `Stale`, `NoLiveTarget` (a draft
 ///    wait that ended on a replaced worker among them), refused user input, or
 ///    `Err`.
+///
+/// # The idle-worker record's no-delivery invariant
+///
+/// Issue #1423. The PRD #126 record `handle_delegate` armed for this delegation
+/// (`delegation_seq`) is retired through
+/// [`retire_undelivered_idle_worker_record`], by generation, on every exit that
+/// releases the commission, numbered as the noted delivery's are:
+///
+/// 1. **The pi-native `clear = true` return** — keeps it: the seed is a
+///    delivery, so a `work-done` is owed.
+/// 2. **The dead-replacement return** — retires.
+/// 3. **The readiness-buffer close return** — retires, belt-and-braces:
+///    `begin_pane_close` drained the pane's records already.
+/// 4. **The respawn-error return** — retires.
+/// 5. **The tail** — retires whenever the send did not deliver, as the
+///    commission's exit 5 releases; `Ambiguous` keeps it for the same reason.
+///
+/// One cost, accepted: a delegation armed over an older one that was still
+/// owed (`--supersede`) replaced that older record, and retiring the newer one
+/// leaves the older unwatched. Where the worker was respawned or replaced the
+/// older task died with it; the residue is a refused send to the same live
+/// worker, where a watch that fires on the undelivered task instead is the
+/// false report this invariant exists to stop.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_one_owned(
     registry: Arc<AgentPtyRegistry>,
@@ -8099,6 +8167,15 @@ async fn dispatch_one_owned(
                         &target_role,
                         "the clear=true replacement worker never became live",
                     );
+                    // Issue #1423, idle-worker audit exit 2: the same debt, as
+                    // the PRD #126 watch holds it. The EOF sweep cannot retire
+                    // it: the worker id is bound only after this exit.
+                    retire_undelivered_idle_worker_record(
+                        &registry,
+                        &pane_id,
+                        delegation_seq,
+                        "the clear=true replacement worker never became live",
+                    );
                     // Issue #687, silence audit exit 2: the generation this
                     // watch was armed for is not the pane's live agent any more
                     // and will never be handed a pointer, so its record must not
@@ -8368,6 +8445,15 @@ async fn dispatch_one_owned(
                                 reserved_silence.take(),
                                 "the worker pane began closing during the readiness buffer",
                             );
+                            // Issue #1423, idle-worker audit exit 3: likewise
+                            // already drained by `begin_pane_close`, and retired
+                            // anyway for the same reason.
+                            retire_undelivered_idle_worker_record(
+                                &registry,
+                                &pane_id,
+                                delegation_seq,
+                                "the worker pane began closing during the readiness buffer",
+                            );
                             // Noted-delivery audit exit 3: the close keeps an
                             // unbound delivery for the dispatch in flight
                             // (`forget_pane`), so this dispatch drops it.
@@ -8573,6 +8659,15 @@ async fn dispatch_one_owned(
                     &registry,
                     &pane_id,
                     &target_role,
+                    "respawn failed for clear=true",
+                );
+                // Issue #1423, idle-worker audit exit 4: and the PRD #126
+                // watch's copy of that debt. No worker id is ever bound on this
+                // exit, so the EOF sweep can never retire it.
+                retire_undelivered_idle_worker_record(
+                    &registry,
+                    &pane_id,
+                    delegation_seq,
                     "respawn failed for clear=true",
                 );
                 // Skip the post-respawn prompt write — there is
@@ -9062,6 +9157,14 @@ async fn dispatch_one_owned(
             &registry,
             &pane_id,
             &target_role,
+            "the identity gate refused the task pointer",
+        );
+        // Issue #1423, idle-worker audit exit 5: the pointer reached no one, so
+        // the worker owes no `work-done` and must not be reported idle for one.
+        retire_undelivered_idle_worker_record(
+            &registry,
+            &pane_id,
+            delegation_seq,
             "the identity gate refused the task pointer",
         );
         // Noted-delivery audit exit 5: the pointer reached no one, whether the
@@ -18161,6 +18264,10 @@ mod tests {
     /// delegated to a pane with no agent; once the dispatch gives up, an ack of
     /// the id written into the task file, from a stranger or an unidentified
     /// sender, is answered `Unknown` and nothing is kept for the pane.
+    ///
+    /// Issue #1423: the delegation's idle-worker record goes with it. Left
+    /// armed, it reported the worker idle `worker_response_timeout_minutes`
+    /// later, on a task the worker was never given.
     #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_one_owned_drops_its_noted_delivery_when_the_respawn_fails() {
@@ -18178,6 +18285,15 @@ mod tests {
         let cwd_str = cwd.path().to_string_lossy().into_owned();
         let registry = Arc::new(AgentPtyRegistry::new());
         let (event_tx, _event_rx) = broadcast::channel(16);
+        let armed = registry
+            .arm_outstanding_delegation(
+                WORKER_PANE,
+                "coder",
+                "respawn-fails-orch",
+                "orch-agent",
+                None,
+            )
+            .expect("arm the delegation's idle-worker record");
 
         dispatch_one_owned(
             registry.clone(),
@@ -18192,7 +18308,7 @@ mod tests {
             "probe task".to_string(),
             Some(cwd_str),
             None,
-            PointerQueueClock::new(registry.clone(), WORKER_PANE.to_string(), None),
+            PointerQueueClock::new(registry.clone(), WORKER_PANE.to_string(), Some(armed.seq)),
             None,
             None,
             None,
@@ -18202,6 +18318,12 @@ mod tests {
         assert!(
             registry.agent_records().is_empty(),
             "precondition: the respawn must have failed"
+        );
+        assert_eq!(
+            registry.outstanding_delegation_seq(WORKER_PANE),
+            None,
+            "issue #1423: a delegation whose respawn failed delivered nothing, so its \
+             idle-worker record must not stay armed to report the worker idle later"
         );
         let task_file = tokio::fs::read_to_string(
             cwd.path()
@@ -18315,7 +18437,14 @@ mod tests {
             armed.seq
         };
 
-        delegate().await;
+        let first = delegate().await;
+        // Issue #1423 control: a DELIVERED delegation keeps its idle-worker
+        // record — only the no-delivery exits retire it.
+        assert_eq!(
+            registry.outstanding_delegation_seq(WORKER_PANE),
+            Some(first),
+            "a delivered delegation's idle-worker record must stay armed"
+        );
         assert_eq!(settled(2).await, 2, "the first delegation was not reported");
         let second = delegate().await;
         assert_eq!(
@@ -18354,37 +18483,51 @@ mod tests {
     /// that actually completed. Pin the fix by confirming nothing is left in
     /// the map: a `retire_silence_watch` on the same pane immediately after
     /// the refusal must see `Nothing`, not a record to spend a retirement on.
+    ///
+    /// Issue #1423: the same holds for the delegation's idle-worker record,
+    /// which `handle_delegate` armed before this dispatch ran and which would
+    /// otherwise report the worker idle on a task it was never given. Only
+    /// THIS delegation's record goes: a newer delegation to the same worker
+    /// keeps its own.
     #[tokio::test]
     async fn dispatch_one_owned_cancels_silence_watch_when_worker_identity_is_unresolved() {
         let registry = Arc::new(AgentPtyRegistry::new());
         let (event_tx, _event_rx) = broadcast::channel(16);
         let worker_pane = "worker-pane-no-agent-silence-watch";
+        let dispatch = |seq: u64| {
+            dispatch_one_owned(
+                registry.clone(),
+                event_tx.clone(),
+                None,
+                "orch-pane".to_string(),
+                "worker-role".to_string(),
+                worker_pane.to_string(),
+                "probe task".to_string(),
+                None,
+                Some(SilenceWatch {
+                    window: std::time::Duration::from_secs(60),
+                    target: SilenceReportTarget {
+                        pane_id: "orch-pane".to_string(),
+                        agent_id: None,
+                        orchestration: None,
+                    },
+                    redeliveries: None,
+                    retry_done: None,
+                }),
+                PointerQueueClock::new(registry.clone(), worker_pane.to_string(), Some(seq)),
+                None,
+                None,
+                None,
+            )
+        };
+        let arm = || {
+            registry
+                .arm_outstanding_delegation(worker_pane, "worker-role", "orch-pane", "orch", None)
+                .expect("arm the delegation's idle-worker record")
+        };
 
-        dispatch_one_owned(
-            registry.clone(),
-            event_tx,
-            None,
-            "orch-pane".to_string(),
-            "worker-role".to_string(),
-            worker_pane.to_string(),
-            "probe task".to_string(),
-            None,
-            Some(SilenceWatch {
-                window: std::time::Duration::from_secs(60),
-                target: SilenceReportTarget {
-                    pane_id: "orch-pane".to_string(),
-                    agent_id: None,
-                    orchestration: None,
-                },
-                redeliveries: None,
-                retry_done: None,
-            }),
-            PointerQueueClock::new(registry.clone(), worker_pane.to_string(), None),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let armed = arm();
+        dispatch(armed.seq).await;
 
         assert!(
             matches!(
@@ -18393,6 +18536,24 @@ mod tests {
             ),
             "an identity-unresolved refusal must cancel the silence watch it armed, not leave a \
              taskless record behind to inflate the next watch's `superseded` counter"
+        );
+        assert_eq!(
+            registry.outstanding_delegation_seq(worker_pane),
+            None,
+            "issue #1423: the identity gate refused the task pointer, so the delegation's \
+             idle-worker record must not stay armed to report the worker idle later"
+        );
+
+        // Control: a newer delegation armed over this one while it was queued
+        // owns the record now, and an older dispatch's refusal must leave it.
+        let older = arm();
+        let newer = arm();
+        dispatch(older.seq).await;
+        assert_eq!(
+            registry.outstanding_delegation_seq(worker_pane),
+            Some(newer.seq),
+            "issue #1423: an older delegation's undelivered exit must not retire a newer \
+             delegation's idle-worker record"
         );
     }
 
