@@ -195,6 +195,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dot_agent_deck::daemon_client::{Endpoint, RemoteEndpoint};
+use dot_agent_deck::deck_list::DeckName;
 use dot_agent_deck::platform::fsperm;
 use dot_agent_deck::platform::paths::config_dir;
 // PRD #741 M6: the validating ssh-argument newtypes ARE this section's schema.
@@ -1530,6 +1531,7 @@ impl EndpointSettings {
             .map(|deck| UnconfiguredDeck {
                 id: deck.id.clone(),
                 label: deck.describe(),
+                name: deck.name.clone(),
             })
             .collect()
     }
@@ -1550,6 +1552,9 @@ pub struct UnconfiguredDeck {
     pub id: EndpointId,
     /// `user@host[:port]`, from [`RemoteEndpointSettings::describe`].
     pub label: String,
+    /// The row's name in the shared deck list, when it has a usable one
+    /// ([`RemoteEndpointSettings::name`], issue #1426).
+    pub name: Option<DeckName>,
 }
 
 /// One remote deck: a row of the shared deck list, stored as **references**
@@ -1578,13 +1583,14 @@ pub struct UnconfiguredDeck {
 /// settings form applies. Their charsets and bounds are also the ssh-argument
 /// validation nothing in this tree performed before PRD #741 M5.
 ///
-/// # There is no display name, deliberately
+/// # The name is the shared deck list's, and it is a slug
 ///
-/// A user-chosen label would be exactly the arbitrary `String` the field-type
-/// guard refuses, and it would need its own bidi and control-character handling
-/// before anything rendered it. [`RemoteEndpoint::describe`] derives the label
-/// from the address instead, and every byte of that came through a validated
-/// ASCII charset.
+/// [`Self::name`] is the name `dot-agent-deck connect <name>` takes (issue
+/// #1426). It is not a free-form label: a [`DeckName`] is ASCII letters,
+/// digits, `.`, `-` and `_`, validated by the same rule `remote add` applies,
+/// so nothing rendering it needs bidi or control-character handling. It is
+/// changed only through [`crate::decks::rename`]; a save that carries a
+/// different name for an existing row does not rename it.
 ///
 /// # `host` and `id` are required; everything else defaults
 ///
@@ -1635,6 +1641,20 @@ pub struct RemoteEndpointSettings {
     /// and key stay in that config rather than being copied here.
     #[serde(default)]
     pub jump: Option<HostAlias>,
+    /// The deck's name in the shared deck list — what `dot-agent-deck connect
+    /// <name>` takes (issue #1426).
+    ///
+    /// `None` in two cases, and neither is an error. A row the webview is
+    /// **adding** without one gets a name derived from its host
+    /// ([`dot_agent_deck::deck_list::derive_deck_name`]). A row whose stored
+    /// name predates the slug rule ([`DeckName`] refuses it) is shown by its
+    /// address and can be renamed to a valid name.
+    ///
+    /// On an existing row the value is **read-only through a save**: the
+    /// shared library's rename ([`crate::decks::rename`]) is the one way to
+    /// change it, so a stale window cannot rename a deck back.
+    #[serde(default)]
+    pub name: Option<DeckName>,
     /// The ssh port.
     ///
     /// An [`SshPort`] rather than a `u16` (PRD #741, Greptile P2 on #1035): a
@@ -1710,6 +1730,7 @@ impl RemoteEndpointSettings {
             id,
             identity: None,
             jump: None,
+            name: None,
             port: default_ssh_port(),
             socket: None,
             user: None,
@@ -3192,6 +3213,15 @@ pub(crate) fn save_at(
         crate::decks::apply(remotes, &edits).map_err(|error| match error {
             crate::decks::ApplyError::Config(error) => SaveFailure::from(deck_list_error(error)),
             crate::decks::ApplyError::Conflict => SaveFailure::conflict(remotes),
+            // Issue #1426: the name the user chose for a new deck is taken.
+            // Nothing was written, and the sentence names no path — it is the
+            // add form's own message.
+            error @ crate::decks::ApplyError::DuplicateName { .. } => {
+                SaveFailure::from(SettingsWriteError {
+                    detail: format!("the deck list {}: {error}", remotes.display()),
+                    public: error.to_string(),
+                })
+            }
         })?;
         decks_saved = !edits.is_empty();
     }
@@ -3310,7 +3340,9 @@ pub(crate) fn migrate_legacy_decks_at(path: &Path, remotes: &Path) {
 /// error's quotes the offending line.
 ///
 /// [`RemoteConfigError`]: dot_agent_deck::remote::RemoteConfigError
-fn deck_list_error(error: dot_agent_deck::remote::RemoteConfigError) -> SettingsWriteError {
+pub(crate) fn deck_list_error(
+    error: dot_agent_deck::remote::RemoteConfigError,
+) -> SettingsWriteError {
     use dot_agent_deck::remote::RemoteConfigError;
     let public = match &error {
         RemoteConfigError::Io { source, .. } => format!("could not save the deck list: {source}"),
@@ -8048,6 +8080,7 @@ forms it is.";
                     id: EndpointId::parse("deck1").unwrap(),
                     identity: Some(KeyPath::parse("~/.ssh/id_ed25519").unwrap()),
                     jump: Some(HostAlias::parse("bastion").unwrap()),
+                    name: Some(DeckName::parse("build-box").unwrap()),
                     port: SshPort::parse(2222).unwrap(),
                     socket: Some(
                         RemoteSocketPath::parse("/run/user/1000/dot-agent-deck-attach.sock")
@@ -8961,6 +8994,7 @@ host = \"build-box.example.com\"
 id = \"deck1\"
 identity = \"~/.ssh/id_ed25519\"
 jump = \"bastion\"
+name = \"build-box\"
 port = 2222
 socket = \"/run/user/1000/dot-agent-deck-attach.sock\"
 user = \"dev\"
@@ -9396,6 +9430,7 @@ level = 1.0
             vec![UnconfiguredDeck {
                 id: halfway,
                 label: "relay.example.com".to_string(),
+                name: None,
             }],
             "the socketless row is a fleet member, labelled by its address"
         );
@@ -9956,6 +9991,103 @@ level = 1.0
         );
         assert_eq!(endpoints.remote[1].host.as_str(), "fresh.example");
         assert!(!std::fs::read_to_string(&path).unwrap().contains("remote"));
+    }
+
+    /// Scenario: `remote add prod` wrote a connectable deck with no `id`, and
+    /// the desktop selected it (selection `n-prod`, the id its name derives).
+    /// Renaming it from the desktop must leave the selection naming the same
+    /// deck, the same endpoint, and the same fleet key — and the same holds for
+    /// a deck the desktop added with an id of its own, under All Decks.
+    #[test]
+    fn renaming_a_deck_keeps_the_selection_and_the_fleet_keys() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let remotes = dir.path().join("remotes.toml");
+        std::fs::write(
+            &remotes,
+            format!(
+                "{CLI_DECK}socket = \"/run/user/1000/dot-agent-deck-attach.sock\"\n\n\
+                 [[remotes]]\nname = \"lab\"\ntype = \"ssh\"\nhost = \"lab.example.com\"\n\
+                 port = 22\nversion = \"unmanaged\"\nadded_at = \"2026-01-01T00:00:00Z\"\n\
+                 id = \"0123456789abcdef\"\n"
+            ),
+        )
+        .unwrap();
+        let keys = |settings: &DesktopSettings| {
+            let endpoints = settings.endpoints.as_ref().unwrap();
+            (
+                endpoints.selection.clone(),
+                settings.resolve_endpoint().endpoint.identity(),
+                settings
+                    .connectable_endpoints()
+                    .iter()
+                    .map(Endpoint::identity)
+                    .collect::<Vec<_>>(),
+                settings
+                    .unconfigured_decks()
+                    .into_iter()
+                    .map(|deck| deck.id)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let names = |settings: &DesktopSettings| {
+            settings
+                .endpoints
+                .as_ref()
+                .unwrap()
+                .remote
+                .iter()
+                .map(|row| row.name.as_ref().map(|name| name.as_str().to_string()))
+                .collect::<Vec<_>>()
+        };
+
+        for selection in ["n-prod", "all"] {
+            std::fs::write(
+                &path,
+                format!("version = 1\n\n[endpoints]\nselection = \"{selection}\"\n"),
+            )
+            .unwrap();
+            let before = load_snapshot_at(&path, &remotes).settings;
+            assert_eq!(row_ids(&before), ["n-prod", "0123456789abcdef"]);
+
+            let prod = EndpointId::parse("n-prod").unwrap();
+            let lab = EndpointId::parse("0123456789abcdef").unwrap();
+            let suffix = if selection == "all" { "-2" } else { "" };
+            crate::decks::rename(&remotes, &prod, &format!("production{suffix}")).unwrap();
+            crate::decks::rename(&remotes, &lab, &format!("bench{suffix}")).unwrap();
+
+            let after = load_snapshot_at(&path, &remotes).settings;
+            assert_eq!(row_ids(&after), row_ids(&before), "{selection}");
+            assert_eq!(keys(&after), keys(&before), "{selection}");
+            assert_eq!(
+                names(&after),
+                [
+                    Some(format!("production{suffix}")),
+                    Some(format!("bench{suffix}"))
+                ],
+                "{selection}"
+            );
+            if selection == "n-prod" {
+                assert!(
+                    after.resolve_endpoint().fallback.is_none(),
+                    "the renamed deck is still the selected one"
+                );
+            } else {
+                assert_eq!(
+                    after.unconfigured_decks()[0]
+                        .name
+                        .as_ref()
+                        .map(DeckName::as_str),
+                    Some("bench-2"),
+                    "the fleet's socketless deck carries its new name"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "version = 1\n\n[endpoints]\nselection = \"all\"\n",
+            "a rename never touches desktop.toml"
+        );
     }
 
     /// Issue #1350's review: the voice poll's settings read skips the shared

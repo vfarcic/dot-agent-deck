@@ -132,7 +132,7 @@ const DESKTOP_SRC: &str = "desktop/src";
 /// layer. That is why `Option<String>` and `Vec<String>` still have no way in —
 /// they resolve to `String`, which is absent — and why there is no row for each
 /// container shape.
-const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 25] = [
+const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 26] = [
     (
         "u32",
         FieldKind::Scalar,
@@ -218,6 +218,18 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 25] = [
          sun_path limits — restricted to ASCII alphanumerics, '.', '-', '_' and \
          '/', and required to be absolute; ':' is refused because ssh parses \
          its -L forward specification by splitting on it",
+    ),
+    // Issue #1426: the deck's name in the shared deck list, the one the CLI's
+    // `connect <name>` takes.
+    (
+        "DeckName",
+        FieldKind::Scalar,
+        "a newtype over String whose deserializer runs deck_list's \
+         validate_deck_name — the rule `remote add` applies: at most 64 bytes, \
+         ASCII letters, digits, '.', '-' and '_', starting with a letter or \
+         digit. Too narrow for a PEM block, a base64 blob with padding, or \
+         anything with whitespace. It names a deck the user typed into a shell \
+         as `connect <name>`, and reaches no authentication surface as text",
     ),
     // PRD #741 M6: the endpoint list's own identity and selection tokens.
     (

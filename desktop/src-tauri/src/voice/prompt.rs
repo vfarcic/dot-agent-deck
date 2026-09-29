@@ -687,12 +687,14 @@ pub(crate) mod tests {
             crate::voice::VoiceDeck {
                 id: "deck-0000000000000001".to_string(),
                 label: "Local deck".to_string(),
+                address: None,
                 local: true,
                 unavailable: None,
             },
             crate::voice::VoiceDeck {
                 id: "deck-0000000000000002".to_string(),
                 label: "deploy@build-box".to_string(),
+                address: None,
                 local: false,
                 unavailable: None,
             },
