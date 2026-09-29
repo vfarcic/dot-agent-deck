@@ -44,7 +44,7 @@ const LONG_LIVED_CONFIG: &str = "[[orchestrations]]\n\
      clear = false\n";
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
-/// `pane-restart-live` fixture. With no `[[modes]]` defined the Mode chip
+/// `pane-restart-live` fixture. The Mode chip
 /// row is `[No mode] [Orch: restart-orch] [schedule]`, so ONE Right selects
 /// the orchestration; selecting an orchestration HIDES the Command field, so
 /// a second Enter submits the form. Mirrors

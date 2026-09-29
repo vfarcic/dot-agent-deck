@@ -16,7 +16,7 @@
 //! different text into the same kind of agent. So both call the `compose_*`
 //! functions below and neither formats a seed of its own.
 //!
-//! What stays out: the TUI's `ModeConfig` wrappers and its blank-command
+//! What stays out: the TUI's `BuiltinOption` wrapper and its blank-command
 //! fallback (`ui::resolve_authoring_command`). The fallback is deliberately
 //! client-side — the daemon gives an empty `command` the meaning it always had
 //! (its default shell) whatever the authoring kind.

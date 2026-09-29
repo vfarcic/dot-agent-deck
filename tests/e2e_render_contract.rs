@@ -5,15 +5,15 @@
 //!
 //! Each test spawns the real `dot-agent-deck` binary inside an isolated PTY,
 //! drives a layout-changing event (terminal enlarge, layout toggle, pane
-//! close, mode switch), and asserts a render-contract invariant on the
+//! close), and asserts a render-contract invariant on the
 //! settled grid through the `vt100` parser. No LLM tokens are spent — panes
-//! run `sleep` or open the fixture's empty `demo` mode pane.
+//! run `sleep` or the fixture's synthetic orchestration roles.
 //!
 //! IMPORTANT (PRD #84, and the PRD's own "race-y resize timing" note): these
 //! reproducers were written against the PRE-M4 (pre-rework) code, which
 //! resized every embedded pane's PTY on *every* layout-change path
 //! (`Event::Resize`, `Action::ToggleLayout` → `resize_*_panes`, tab
-//! open/close, mode switch). In that pre-rework state the scramble /
+//! open/close). In that pre-rework state the scramble /
 //! empty-band symptoms were transient one-frame races that self-healed once
 //! the path's resize fired, and so were NOT deterministically observable
 //! through a PTY+vt100 harness that reads the settled grid. These tests are
@@ -32,21 +32,16 @@ mod common;
 use common::TuiDeck;
 use spec::spec;
 
-/// Open a Mode tab (mirrors `e2e_mouse_tabstrip::open_second_tab`): Ctrl+N →
-/// directory picker → choose current dir → new-pane form → pick the fixture's
-/// `demo` mode → submit. Synchronizes on observable screen state at each step.
-/// Leaves the deck with ≥2 tabs (Dashboard + the active Mode tab), so the tab
-/// strip's `Dashboard` header is rendered.
-fn open_mode_tab(deck: &TuiDeck) {
+/// Open the fixture's orchestration through the New Agent form.
+fn open_orchestration_tab(deck: &TuiDeck) {
     deck.wait_for_string("No active agents");
     deck.send_bytes(b"\x0e"); // Ctrl+N → directory picker
     deck.wait_for_string("Select Directory");
     deck.send_bytes(b" "); // Space: choose current dir → new-pane form
     deck.wait_for_string("Mode:"); // form ready (Mode field present)
-    deck.send_bytes(b"\x1b[C"); // Right: move Mode selection off "No mode" to `demo`
-    deck.wait_for_string("demo mode"); // selection reflected in the title
-    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
-    deck.click(scol, srow);
+    deck.send_bytes(b"\x1b[C"); // Right: select the first orchestration
+    deck.wait_for_string("demo-orch");
+    deck.send_bytes(b"\r\r"); // Mode → Name → submit
     deck.wait_for_string("Dashboard"); // tab strip appears only with ≥2 tabs
 }
 
@@ -130,12 +125,12 @@ fn layout_001_toggle_layout_keeps_pane_intact() {
     });
 }
 
-/// Scenario: Launch the deck against the `modes` fixture, open a Mode tab
-/// (creating an embedded `demo`-mode pane), return to command mode with Ctrl+D,
+/// Scenario: Launch the deck against `orch-deck`, open its orchestration tab,
+/// return to command mode with Ctrl+D,
 /// request the close with Ctrl+W, move from Cancel to Close, and press Enter,
 /// tearing the pane down and returning to a lone Dashboard. After the replace the
 /// dashboard must render cleanly: the tab strip collapses (no `×` close glyph
-/// remains) and no stale `demo mode` fragment from the closed pane lingers.
+/// remains) and no stale `demo-orch` fragment from the closed tab lingers.
 /// This pins the "no stale fragment after replace" invariant; GREEN target at
 /// M4/M5.
 #[spec("render/layout/002")]
@@ -143,10 +138,10 @@ fn layout_001_toggle_layout_keeps_pane_intact() {
 fn layout_002_pane_close_leaves_no_stale_fragment() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 32)
-        .launch_with_fixture("modes");
-    open_mode_tab(&deck);
+        .launch_with_fixture("orch-deck");
+    open_orchestration_tab(&deck);
 
-    // Return from PaneInput to command mode, request the active Mode tab's
+    // Return from PaneInput to command mode, request the active orchestration tab's
     // close, and deliberately accept the safety confirmation.
     deck.send_bytes(b"\x04"); // Ctrl+D → command mode
     deck.send_bytes(b"\x17"); // Ctrl+W → arm close confirmation
@@ -154,33 +149,9 @@ fn layout_002_pane_close_leaves_no_stale_fragment() {
     deck.send_bytes(b"\x1b[B"); // Down → select Close
     deck.send_bytes(b"\r"); // Enter → confirm close tab
 
-    // Invariant: the tab strip collapses and no stale mode fragment remains.
+    // Invariant: the tab strip collapses and no stale tab fragment remains.
     deck.wait_for_absence("×");
-    deck.wait_until_grid("no stale mode fragment after pane close", |g| {
-        !g.contains("demo mode")
-    });
-}
-
-/// Scenario: Launch the deck against the `modes` fixture and open a Mode tab,
-/// switching the active view through the `render_mode_tab` path. After the
-/// transition settles the destination mode view must render cleanly — the tab
-/// strip's `Dashboard` header is present, and the dashboard-only empty-state
-/// line (`No active agents`, never shown on a Mode tab) is NOT bleeding
-/// through from the source layout. Invariant guard: short-lived mode-switch
-/// artefacts are transient (the switch resizes panes via
-/// `resize_mode_tab_panes`), so this pins the "destination renders cleanly,
-/// no source bleed-through" invariant; GREEN target at M4/M5.
-#[spec("render/layout/003")]
-#[test]
-fn layout_003_mode_switch_renders_cleanly() {
-    let deck = TuiDeck::builder()
-        .with_pty_size(120, 32)
-        .launch_with_fixture("modes");
-    open_mode_tab(&deck);
-
-    // Invariant: the Mode tab view is clean — tab strip present, no dashboard
-    // empty-state line bleeding through from the pre-switch layout.
-    deck.wait_until_grid("mode view renders without dashboard bleed-through", |g| {
-        g.contains("Dashboard") && !g.contains("No active agents")
+    deck.wait_until_grid("no stale orchestration fragment after pane close", |g| {
+        !g.contains("demo-orch")
     });
 }

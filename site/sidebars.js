@@ -33,7 +33,7 @@ const sidebars = {
       type: 'category',
       label: 'Terminal UI',
       collapsed: false,
-      items: ['keyboard-shortcuts', 'workspace-modes'],
+      items: ['keyboard-shortcuts'],
     },
     {
       type: 'category',

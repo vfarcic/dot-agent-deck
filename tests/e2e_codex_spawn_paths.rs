@@ -117,30 +117,6 @@ fn spawn_001_plain_restore_wraps_codex() {
     assert_only_wrapped(&record);
 }
 
-/// Scenario: Select a configured workload mode through the normal new-pane UI
-/// while the form's bare command is `codex`. The mode shell-injection path must
-/// transform that command through the Wrapper strategy before launch.
-#[spec("codex/spawn/002")]
-#[test]
-#[cfg(unix)]
-fn spawn_002_mode_pane_wraps_codex() {
-    let fixture = common::harness_tempdir().expect("mode record dir");
-    let record = fixture.path().join("mode.log");
-    let (_bin, path, wrap_bin) = recorder_path(&record);
-    let deck = TuiDeck::builder()
-        .with_env("PATH", path)
-        .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
-        .launch_with_fixture("codex-spawn-paths");
-    open_form(&deck);
-    deck.send_keys(b"\x1b[C");
-    deck.send_keys(b"\r");
-    deck.send_keys(b"\r");
-    deck.send_keys(b"codex");
-    deck.send_keys(b"\r");
-    assert_only_wrapped(&record);
-}
-
 /// Scenario: Select a configured orchestration through the normal new-pane UI
 /// whose start role command is bare `codex`. The orchestration role spawn must
 /// execute the registry Wrapper command rather than launching Codex directly.
@@ -157,29 +133,10 @@ fn spawn_003_orchestration_role_wraps_codex() {
         .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
         .launch_with_fixture("codex-spawn-paths");
     open_form(&deck);
-    deck.send_keys(b"\x1b[C\x1b[C");
+    deck.send_keys(b"\x1b[C");
     deck.wait_for_absence("Command:");
     deck.send_keys(b"\r");
     deck.send_keys(b"\r");
-    assert_only_wrapped(&record);
-}
-
-/// Scenario: Restore a persisted mode-backed pane whose saved user-facing
-/// command is bare `codex`. Rebuilding the mode tab must wrap that command
-/// before injecting it into the restored mode agent pane.
-#[spec("codex/spawn/004")]
-#[test]
-#[cfg(unix)]
-fn spawn_004_mode_restore_wraps_codex() {
-    let fixture = common::harness_tempdir().expect("mode restore record dir");
-    let record = fixture.path().join("mode-restore.log");
-    let (_bin, path, wrap_bin) = recorder_path(&record);
-    let _deck = TuiDeck::builder()
-        .with_env("PATH", path)
-        .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
-        .with_continue_mode_session("restored-mode-codex", "codex", "wrapped-mode")
-        .launch_with_fixture("codex-spawn-paths");
     assert_only_wrapped(&record);
 }
 
@@ -228,52 +185,6 @@ fn spawn_009_declared_orchestration_launcher_wraps_and_badges_codex() {
     assert!(
         launched == ["WRAPPED wrap --agent codex -- devbox run codex-big"] && codex_badge,
         "a declared Codex role must wrap its non-inferable launcher exactly once and render a Codex badge before any delegate or hook event; launches={launched:?}, codex_badge={codex_badge}\nFinal grid:\n{grid}"
-    );
-}
-
-/// Scenario: Select a configured mode whose agent pane declares Codex, then
-/// enter a non-inferable launcher in the form. The shell-injected command must
-/// be wrapped exactly once and the pane's Dashboard card must read Codex.
-#[spec("codex/spawn/011")]
-#[test]
-#[cfg(unix)]
-fn spawn_011_declared_mode_launcher_wraps_and_badges_codex() {
-    let fixture = common::harness_tempdir().expect("declared mode record dir");
-    let record = fixture.path().join("declared-mode.log");
-    let (_bin, path, wrap_bin) = recorder_path(&record);
-    let deck = TuiDeck::builder()
-        .with_pty_size(160, 42)
-        .with_env("PATH", path)
-        .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
-        .launch_with_fixture("minimal");
-    deck.wait_for_string("No active agents");
-    std::fs::write(
-        deck.workdir().join(".dot-agent-deck.toml"),
-        "[[modes]]\n\
-         name = \"declared-codex-mode\"\n\
-         agent = \"codex\"\n\
-         reactive_panes = 0\n",
-    )
-    .expect("write declared mode config");
-
-    open_form(&deck);
-    deck.send_keys(b"\x1b[C");
-    deck.send_keys(b"\r");
-    deck.send_keys(b"\r");
-    deck.send_keys(b"devbox run codex-big");
-    deck.send_keys(b"\r");
-
-    let launched = wait_for_declared_launcher(&record);
-    deck.send_bytes(b"\x04");
-    deck.send_bytes(b"\x1b[D");
-    deck.wait_for_string("agent(s)");
-    let codex_badge = deck.wait_for_grid_string_within("Codex ·", Duration::from_secs(5));
-    let grid = deck.snapshot_grid();
-
-    assert!(
-        launched == ["WRAPPED wrap --agent codex -- devbox run codex-big"] && codex_badge,
-        "a declared Codex mode pane must wrap its shell-injected non-inferable launcher exactly once and render a Codex Dashboard badge; launches={launched:?}, codex_badge={codex_badge}\nFinal grid:\n{grid}"
     );
 }
 

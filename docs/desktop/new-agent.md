@@ -43,7 +43,7 @@ The form stays disabled until a directory is chosen; **Dir** then shows it.
 | **schedule: issues** | An agent that helps you write an issue-dispatch schedule. Shown only when the chosen daemon has the `experimental` flag on. |
 | **dispatcher** | A dispatcher agent. See [Dispatcher Mode](../dispatcher-mode.md). |
 
-The TUI also offers the project's workspace modes (`[[modes]]`) as Mode choices; the desktop app does not. A daemon too old to offer the schedule and dispatcher chips gets a sentence saying why they are missing instead.
+A daemon too old to offer the schedule and dispatcher chips gets a sentence saying why they are missing instead.
 
 **Name** names the agent, or the orchestration run. For an orchestration, a name a live orchestration already uses on that daemon is refused, and if the directory already runs an orchestration on that daemon you are warned that the two share its role files and working tree.
 

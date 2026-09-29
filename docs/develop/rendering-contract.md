@@ -28,8 +28,7 @@ compute_frame_layout(frame_area, &TabView, &TabBarInfo, pane_ids) -> FrameLayout
 
 - `compute_frame_layout(...)` (new; in `src/ui.rs` or a new `src/layout.rs`) — the sole producer of `FrameLayout`.
 - `render_frame` (`src/ui.rs`, ~`fn render_frame`) — consumes `FrameLayout` instead of splitting the frame into tab bar + main + hints and computing per-variant dashboard/pane sub-splits inline.
-- `render_mode_tab` (`src/ui.rs`, ~`fn render_mode_tab`) — consumes `FrameLayout` instead of computing its own layout.
-- `ui.side_pane_rects` and `ui.agent_pane_rect` (used for mouse hit-testing) are populated **from** `FrameLayout` after computation, not assembled inline during render. This keeps hit-testing reading the same rects the widgets drew into.
+- `ui.focused_pane_rect` (used for mouse hit-testing) is the rect `render_terminal_panes` drew the focused pane into this frame, so hit-testing reads the same rect the widget drew into.
 
 ### 2. PTY size is REQUESTED from the layout rect, not pushed by event handlers
 
@@ -50,14 +49,12 @@ Two consequences follow, and both are load-bearing:
 
 **Enforced by:**
 
-- `resize_panes_to_layout(...)` (new) — the **only** caller of `resize_pane_pty` in the steady-state render loop. Replaces the per-tab-variant helpers `resize_dashboard_panes` / `resize_mode_tab_panes` / `resize_mode_tab_panes_for` (`src/ui.rs`, ~1320–1430), which go away.
+- `resize_panes_to_layout(...)` (new) — the **only** caller of `resize_pane_pty` in the steady-state render loop. It replaced the per-tab-variant resize helpers, which are gone.
 - `resize_pane_pty` (`src/embedded_pane.rs`, ~`fn resize_pane_pty`) — remains the one resize primitive; it is now driven from one place.
 
 **Removed** — every ad hoc `embedded.resize_pane_pty(...)` call that computed its own dimensions from a local view of the layout:
 
 - Tab open / close paths (`src/ui.rs`, around the `resize_pane_pty` calls near ~1348, ~1354, ~1423, ~1510).
-- Reactive pane recreation (`src/ui.rs`, ~6196 and nearby).
-- Mode switch.
 - Orchestration role transitions.
 
 The next frame's layout-driven resize handles all of these.
@@ -87,7 +84,7 @@ Within a single frame, the order is always:
 
 1. **Compute layout** — `compute_frame_layout(...)`.
 2. **Commit PTY resizes to match** — `resize_panes_to_layout(...)`, before `terminal.draw`.
-3. **Render** — `render_frame` / `render_mode_tab` read from `FrameLayout`.
+3. **Render** — `render_frame` reads from `FrameLayout`.
 
 There is no path that renders before resizing, or resizes after rendering.
 
@@ -98,7 +95,7 @@ There is no path that renders before resizing, or resizes after rendering.
 
 ## Convergence
 
-Every trigger that changes the visible shape — terminal resize, tab open/close, mode switch, reactive pane recreation, orchestration role transition — converges to the same three steps:
+Every trigger that changes the visible shape — terminal resize, tab open/close, orchestration role transition — converges to the same three steps:
 
 ```text
 recompute layout  ->  resize PTYs to match  ->  render
@@ -119,6 +116,6 @@ The contract is measured against the M1 failure-mode catalog under `tests/` (one
 ## References
 
 - PRD #84 — `prds/done/84-rendering-layer-rework.md` (Problem, Solution, Milestones).
-- `src/ui.rs` — `render_frame`, `render_mode_tab`, the resize helpers, and the `Event::Resize` handler.
+- `src/ui.rs` — `render_frame`, the resize helpers, and the `Event::Resize` handler.
 - `src/terminal_widget.rs` — `TerminalWidget::render` (the clamp + row window to be removed).
 - `src/embedded_pane.rs` — `resize_pane_pty` (the one resize primitive).

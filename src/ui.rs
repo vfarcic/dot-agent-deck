@@ -28,7 +28,7 @@ use crate::issue_dispatch_run::KeptWorktree;
 use crate::keybindings::{Action as KbAction, KeybindingConfig};
 use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
-use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
+use crate::project_config::{OrchestrationConfig, load_project_config};
 use crate::prompt_delivery::{
     AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, ConfirmedSubmission,
     attempt_delivery_id, attempt_writes_payload, classify_prompt_submission,
@@ -358,22 +358,13 @@ pub(crate) enum PaneLayout {
 
 /// Describes which panes to render and how to lay them out, based on the active tab.
 enum ActiveTabView {
-    /// Dashboard tab: show all panes except those managed by mode tabs.
+    /// Dashboard tab: show all panes except those managed by orchestration tabs.
     Dashboard {
         exclude_pane_ids: Vec<String>,
         /// PRD #313: mirrors `Tab::Dashboard::zoomed`. Travels on the snapshot
         /// for the same reason the orchestration one does — `compute_frame_layout`
         /// stays a pure function of its inputs.
         zoomed: bool,
-    },
-    /// Mode tab: agent pane on left (50%), side panes stacked on right (50%).
-    Mode {
-        mode_name: String,
-        agent_pane_id: String,
-        side_pane_ids: Vec<String>,
-        /// PRD #83: which pane has visual focus, keyed by stable pane id
-        /// (`None` = agent pane). Mirrors `Tab::Mode::focused_pane_id`.
-        focused_pane_id: Option<String>,
     },
     /// Orchestration tab: same card layout as dashboard, scoped to role panes.
     Orchestration {
@@ -563,9 +554,9 @@ impl DirPickerState {
 // ---------------------------------------------------------------------------
 
 /// PRD #127 M3.2: display name of the built-in "schedule" authoring option in
-/// the new-deck dialog's Mode cycler. It is NOT a per-project `[[modes]]`
-/// entry — it is appended to the end of the cycle and spawns a throwaway
-/// authoring agent pre-seeded with [`SCHEDULE_AUTHORING_SEED_PROMPT`](crate::authoring_seeds::SCHEDULE_AUTHORING_SEED_PROMPT).
+/// the new-deck dialog's Mode cycler. It is appended to the end of the cycle
+/// and spawns a throwaway authoring agent pre-seeded with
+/// [`SCHEDULE_AUTHORING_SEED_PROMPT`](crate::authoring_seeds::SCHEDULE_AUTHORING_SEED_PROMPT).
 const SCHEDULE_MODE_NAME: &str = "schedule";
 
 /// PRD #120: display name of the flag-gated issue-dispatch authoring option in
@@ -615,22 +606,38 @@ fn resolve_authoring_command(default_command: &str) -> String {
 /// `dot-agent-deck dispatch <name>` verb.
 const DISPATCHER_MODE_NAME: &str = "dispatcher";
 
-/// PRD #220: build the dispatcher `ModeConfig` — a seeded single-agent mode that
-/// teaches the agent the `dispatch` verb (see [`DISPATCHER_SEED_PROMPT`](crate::authoring_seeds::DISPATCHER_SEED_PROMPT)).
+/// Issue #1199: the built-in options at the end of the New Agent form's Mode
+/// row. Each spawns a single seeded agent as a dashboard card; this carries the
+/// chip name and the modal title and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuiltinOption {
+    /// PRD #127: author a scheduled task.
+    Schedule,
+    /// PRD #120: author an issue-dispatch scheduled task (experimental-gated).
+    IssueDispatch,
+    /// PRD #220: an agent that knows the `dispatch` verb.
+    Dispatcher,
+}
+
+impl BuiltinOption {
+    /// The chip label, and the `<name>` in the modal title
+    /// `New Agent — <name> mode`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Schedule => SCHEDULE_MODE_NAME,
+            Self::IssueDispatch => ISSUE_DISPATCH_MODE_NAME,
+            Self::Dispatcher => DISPATCHER_MODE_NAME,
+        }
+    }
+}
+
+/// PRD #220: build the dispatcher seed — the prompt that teaches the agent the
+/// `dispatch` verb (see [`DISPATCHER_SEED_PROMPT`](crate::authoring_seeds::DISPATCHER_SEED_PROMPT)).
 ///
 /// Appends the pane's own `working_dir`, since the seed's `../<repo>-dispatch-…`
 /// layout is relative to it and the agent otherwise has to infer it.
-fn build_dispatcher_mode(working_dir: &std::path::Path) -> ModeConfig {
-    let seed = crate::authoring_seeds::compose_dispatcher_seed(working_dir);
-    ModeConfig {
-        agent: None,
-        name: DISPATCHER_MODE_NAME.to_string(),
-        init_command: None,
-        seed_prompt: Some(seed),
-        panes: Vec::new(),
-        rules: Vec::new(),
-        reactive_panes: 0,
-    }
+fn build_dispatcher_seed(working_dir: &std::path::Path) -> String {
+    crate::authoring_seeds::compose_dispatcher_seed(working_dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -667,7 +674,7 @@ fn schedule_next_fire_display(task: &crate::config::ScheduledTask) -> String {
     }
 }
 
-/// Build the "schedule" authoring `ModeConfig` for the manager's add/edit
+/// Build the "schedule" authoring seed for the manager's add/edit
 /// actions (PRD #127 M3.3). Both reuse the 3B-i seeded authoring agent. For
 /// **add**, the seed is the base [`SCHEDULE_AUTHORING_SEED_PROMPT`](crate::authoring_seeds::SCHEDULE_AUTHORING_SEED_PROMPT). For
 /// **edit**, the existing entry's current values are injected so the agent
@@ -684,20 +691,11 @@ fn schedule_next_fire_display(task: &crate::config::ScheduledTask) -> String {
 /// never conflict with the `working_dir DEFAULT:` line — re-picking a different
 /// directory wins, and an unchanged pick (the picker opens at the row's dir)
 /// reproduces the stored value.
-fn build_schedule_authoring_mode(
+fn build_schedule_authoring_seed(
     existing: Option<&crate::config::ScheduledTask>,
     working_dir: &std::path::Path,
-) -> ModeConfig {
-    let seed = crate::authoring_seeds::compose_schedule_seed(existing, working_dir);
-    ModeConfig {
-        agent: None,
-        name: SCHEDULE_MODE_NAME.to_string(),
-        init_command: None,
-        seed_prompt: Some(seed),
-        panes: Vec::new(),
-        rules: Vec::new(),
-        reactive_panes: 0,
-    }
+) -> String {
+    crate::authoring_seeds::compose_schedule_seed(existing, working_dir)
 }
 
 /// PRD #120: build the issue-dispatch authoring seed (base
@@ -998,35 +996,21 @@ struct NewPaneFormState {
     dir: PathBuf,
     name: String,
     command: String,
-    // Mode/orchestration selection fields
-    modes: Vec<ModeConfig>,
+    // Mode-row selection fields. Issue #1199: the row is `No mode`, then one
+    // chip per orchestration, then the built-in options ([`BuiltinOption`]) —
+    // `schedule`, the flag-gated `schedule: issues`, and `dispatcher`.
     orchestrations: Vec<OrchestrationConfig>,
-    /// PRD #127 M3.2: the built-in "schedule" authoring mode, appended to the
-    /// end of the Mode cycler (after the project's workload modes and
-    /// orchestrations). Carries the authoring seed prompt; selecting it spawns
-    /// a pre-seeded conversational agent via the same gated delivery path
-    /// modes use (Phase 3A).
-    schedule_authoring: ModeConfig,
-    /// PRD #120: the flag-gated issue-dispatch authoring option, appended AFTER
-    /// `schedule_authoring` in the cycler. Only the display `name` matters (the
-    /// seed is derived at submit time by [`build_issue_dispatch_authoring_seed`]);
-    /// it is offered only when `show_issue_dispatch` is true.
-    issue_dispatch_authoring: ModeConfig,
     /// PRD #120: snapshot of [`crate::features::show_issue_dispatch_authoring`]
     /// taken at form-construction time (the input seam). When true the cycler
     /// offers the `schedule: issues` option after `schedule`; when false it is
     /// hidden and the cycler shape is byte-for-byte the pre-feature baseline.
     show_issue_dispatch: bool,
-    /// PRD #220: the built-in "dispatcher" authoring mode, appended after
-    /// `schedule: issues` in the cycler. Carries the authoring seed prompt
-    /// that teaches the agent to decompose work and call `dispatch` per unit.
-    dispatcher_authoring: ModeConfig,
     /// PRD #220: when true the cycler offers the `dispatcher` option after
     /// `schedule: issues`. True for the ordinary `Ctrl+n` form (the feature has
     /// graduated out of the experimental flag); false only for the mode-locked
     /// form, which renders no cycler at all.
     show_dispatcher: bool,
-    selection_index: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations, then "schedule" [, "schedule: issues"]
+    selection_index: usize, // 0 = "No mode", 1..=O = orchestrations, then "schedule" [, "schedule: issues"] [, "dispatcher"]
     has_mode_field: bool,
     focused: FormField,
     /// PRD #170 (unify): when `true` the form is MODE-LOCKED to schedule
@@ -1081,8 +1065,8 @@ struct NewPaneFormState {
     /// The Name the form opened with — the directory basename
     /// `transition_after_dir_pick` pre-fills. Kept so that cycling AWAY from an
     /// orchestration can put it back: the `-orchestrator-N` suggestion belongs
-    /// to the orchestration selection, and a plain pane, a workload mode or the
-    /// built-in `schedule`/`dispatcher` options must not inherit it. Without
+    /// to the orchestration selection, and a plain pane or the built-in
+    /// `schedule`/`dispatcher` options must not inherit it. Without
     /// this, the suggestion was a one-way overwrite — and since the cycler
     /// orders orchestrations BEFORE `schedule`/`dispatcher`, merely passing
     /// over one on the way to them left every such pane named
@@ -1097,38 +1081,12 @@ impl NewPaneFormState {
         dir: PathBuf,
         name: String,
         command: String,
-        modes: Vec<ModeConfig>,
         orchestrations: Vec<OrchestrationConfig>,
     ) -> Self {
         // PRD #127 M3.2: the built-in "schedule" authoring option is always
         // available, so the Mode field always shows (at minimum "No mode" and
         // "schedule") and the form opens focused on it.
         let has_mode_field = true;
-        // PRD #170 round 2 (reviewer finding 7): the synthetic mode only supplies
-        // the cycler's display `name` — the authoring seed is derived at submit
-        // time by `build_schedule_authoring_mode` (threaded with the picked dir),
-        // so `seed_prompt` here is dead data; leave it `None`.
-        let schedule_authoring = ModeConfig {
-            agent: None,
-            name: SCHEDULE_MODE_NAME.to_string(),
-            init_command: None,
-            seed_prompt: None,
-            panes: Vec::new(),
-            rules: Vec::new(),
-            reactive_panes: 0,
-        };
-        // PRD #120: synthetic issue-dispatch authoring option (name only; seed
-        // derived at submit time). Whether it is offered is the flag snapshot.
-        let issue_dispatch_authoring = ModeConfig {
-            agent: None,
-            name: ISSUE_DISPATCH_MODE_NAME.to_string(),
-            init_command: None,
-            seed_prompt: None,
-            panes: Vec::new(),
-            rules: Vec::new(),
-            reactive_panes: 0,
-        };
-        let dispatcher_authoring = build_dispatcher_mode(&dir);
         // Remembered so leaving an orchestration can restore it — see
         // `name_prefill`.
         let name_prefill = name.clone();
@@ -1136,15 +1094,11 @@ impl NewPaneFormState {
             dir,
             name,
             command,
-            modes,
             orchestrations,
-            schedule_authoring,
-            issue_dispatch_authoring,
             // PRD #120: gate at the input seam (CLAUDE.md #9) — snapshot the
             // render wrapper once at construction so the count/name/cycler-cap
             // all observe one consistent value.
             show_issue_dispatch: crate::features::show_issue_dispatch_authoring(),
-            dispatcher_authoring,
             // PRD #220: GRADUATED — the `dispatcher` option is offered to everyone.
             // It shipped behind `features::show_dispatcher()`; that wrapper is gone
             // and this branch is inlined (CLAUDE.md #9). The field itself stays,
@@ -1228,9 +1182,8 @@ impl NewPaneFormState {
     /// path that can change `selection_index` (arrow keys, click).
     ///
     /// Landing on an orchestration suggests the next free
-    /// `<folder>-orchestrator-N`; landing on anything else (No mode, a
-    /// workload mode, the built-in `schedule` / `schedule: issues` /
-    /// `dispatcher` options) restores [`Self::name_prefill`], the directory
+    /// `<folder>-orchestrator-N`; landing on anything else (No mode, the
+    /// built-in `schedule` / `schedule: issues` / `dispatcher` options) restores [`Self::name_prefill`], the directory
     /// basename the form opened with.
     ///
     /// **Both directions matter.** This used to apply the suggestion and
@@ -1238,7 +1191,7 @@ impl NewPaneFormState {
     /// survived the selection that generated it. Because the cycler orders the
     /// orchestrations BEFORE the built-in `schedule`/`dispatcher` options,
     /// reaching those from "No mode" means passing over an orchestration — so
-    /// a plain pane, a `dev`-mode pane and a scheduled task could all end up
+    /// a plain pane and a scheduled task could both end up
     /// named `<folder>-orchestrator-N` without the user ever selecting an
     /// orchestration.
     ///
@@ -1263,7 +1216,7 @@ impl NewPaneFormState {
     /// `open_orchestration_tab` applies
     /// ([`crate::project_config::resolve_orchestration_name`],
     /// `src/tab.rs:846-849`). `None` when no orchestration is selected — a
-    /// plain mode/card/authoring option carries no identity uniqueness
+    /// plain card/authoring option carries no identity uniqueness
     /// constraint. [`Self::name_collision`] must compare THIS and not the raw
     /// field — an empty field is not "no title", it is the canonical title,
     /// and comparing `""` against the live titles can never match because
@@ -1283,7 +1236,7 @@ impl NewPaneFormState {
     /// Whether the title this submission will actually take (see
     /// [`Self::resolved_title`]) matches a name a live orchestration already
     /// holds. Only meaningful when an orchestration is selected — a plain
-    /// mode/card/authoring option carries no identity uniqueness constraint.
+    /// card/authoring option carries no identity uniqueness constraint.
     /// Drives the blocking refusal at submit and the `[Submit]`-button-gone
     /// render on the guard seam.
     ///
@@ -1300,8 +1253,8 @@ impl NewPaneFormState {
 
     /// PRD #140 M4.0: whether the form should render
     /// [`SAME_CWD_ORCHESTRATION_WARNING`] — an orchestration is selected AND its
-    /// directory already hosts a live one. Selecting "No mode", a plain mode, or
-    /// either authoring option never warns: the shared-resource risk is specific
+    /// directory already hosts a live one. Selecting "No mode" or a built-in
+    /// option never warns: the shared-resource risk is specific
     /// to a second orchestration's role files and workers.
     fn same_cwd_orchestration_warning(&self) -> bool {
         self.selected_orchestration().is_some() && self.live_orchestration_in_same_cwd
@@ -1310,7 +1263,7 @@ impl NewPaneFormState {
     /// PRD #170 (unify): build the new-pane form MODE-LOCKED to schedule
     /// authoring — the shape the Scheduled-Tasks manager's Add/Edit opens after
     /// the directory picker (reusing the `Ctrl+n` form instead of a bespoke
-    /// modal). `modes`/`orchestrations` are left empty so `schedule_index()` is
+    /// modal). `orchestrations` is left empty so `schedule_index()` is
     /// `1` and the selection is fixed there (`is_schedule_selected()` is already
     /// true), the card name is fixed to `SCHEDULE_MODE_NAME` (the schedule's own
     /// name is authored conversationally), focus opens on the free-text Command
@@ -1323,40 +1276,17 @@ impl NewPaneFormState {
         command: String,
         existing: Option<config::ScheduledTask>,
     ) -> Self {
-        // PRD #170 round 2 (reviewer finding 7): seed is derived at submit time by
-        // `build_schedule_authoring_mode`; the synthetic mode only carries `name`.
-        let schedule_authoring = ModeConfig {
-            agent: None,
-            name: SCHEDULE_MODE_NAME.to_string(),
-            init_command: None,
-            seed_prompt: None,
-            panes: Vec::new(),
-            rules: Vec::new(),
-            reactive_panes: 0,
-        };
-        let issue_dispatch_authoring = ModeConfig {
-            agent: None,
-            name: ISSUE_DISPATCH_MODE_NAME.to_string(),
-            init_command: None,
-            seed_prompt: None,
-            panes: Vec::new(),
-            rules: Vec::new(),
-            reactive_panes: 0,
-        };
-        let dispatcher_authoring = build_dispatcher_mode(&dir);
+        // PRD #170 round 2 (reviewer finding 7): the seed is derived at submit
+        // time by `build_schedule_authoring_seed`.
         let mut form = Self {
             dir,
             name: SCHEDULE_MODE_NAME.to_string(),
             command,
-            modes: Vec::new(),
             orchestrations: Vec::new(),
-            schedule_authoring,
-            issue_dispatch_authoring,
             // PRD #120: the manager's mode-locked form is plain-schedule authoring
             // only — the issue-dispatch option lives on the `Ctrl+n` cycler, and
             // the locked form hides the cycler entirely, so it never appears here.
             show_issue_dispatch: false,
-            dispatcher_authoring,
             show_dispatcher: false,
             selection_index: 0,
             has_mode_field: true,
@@ -1377,16 +1307,16 @@ impl NewPaneFormState {
             name_prefill: SCHEDULE_MODE_NAME.to_string(),
         };
         // Lock the selection onto the built-in schedule option (index 1 with no
-        // modes/orchestrations) so the existing schedule spawn branch fires.
+        // orchestrations) so the existing schedule spawn branch fires.
         form.selection_index = form.schedule_index();
         form
     }
 
     /// Cycler index of the built-in "schedule" authoring option — after the
-    /// project's workload modes and orchestrations (PRD #120: the optional
-    /// `schedule: issues` option, when shown, follows it).
+    /// project's orchestrations (PRD #120: the optional `schedule: issues`
+    /// option, when shown, follows it).
     fn schedule_index(&self) -> usize {
-        1 + self.modes.len() + self.orchestrations.len()
+        1 + self.orchestrations.len()
     }
 
     /// PRD #120: cycler index of the flag-gated `schedule: issues` option —
@@ -1424,10 +1354,10 @@ impl NewPaneFormState {
     /// PRD #220: `dispatcher` is deliberately NOT a member. The schedule options
     /// really are one-off — their own seeds tell the user the pane existed only to
     /// write the schedule and can be closed. A dispatcher pane has continued
-    /// purpose: the user keeps talking to it and may dispatch again, and it is a
-    /// real mode tab rather than a throwaway authoring card (see
-    /// `build_new_pane_request`). Labelling it "authoring (one-off)" told the user
-    /// the opposite.
+    /// purpose: the user keeps talking to it and may dispatch again, so although
+    /// it spawns as a dashboard card exactly like the schedule options (see
+    /// `build_new_pane_request`), it is not a throwaway one. Labelling it
+    /// "authoring (one-off)" told the user the opposite.
     fn is_authoring_selected(&self) -> bool {
         self.is_schedule_selected() || self.is_issue_dispatch_selected()
     }
@@ -1436,8 +1366,7 @@ impl NewPaneFormState {
         // +1 for the built-in "schedule" authoring option appended at the end,
         // +1 more for the flag-gated "schedule: issues" option when shown,
         // +1 more for the dispatcher option (PRD #220).
-        1 + self.modes.len()
-            + self.orchestrations.len()
+        1 + self.orchestrations.len()
             + 1
             + if self.show_issue_dispatch { 1 } else { 0 }
             + if self.show_dispatcher { 1 } else { 0 }
@@ -1459,51 +1388,38 @@ impl NewPaneFormState {
         self.resuggest_name_for_selection();
     }
 
-    fn selected_mode(&self) -> Option<&ModeConfig> {
-        // PRD #220: the dispatcher mode — checked first since it is appended
-        // after the schedule options in the cycler.
+    /// Issue #1199: the built-in option currently selected, if any — what the
+    /// modal title (`New Agent — <name> mode`) and the spawn read.
+    fn selected_builtin(&self) -> Option<BuiltinOption> {
+        // PRD #220: the dispatcher — checked first since it is appended after
+        // the schedule options in the cycler.
         if self.is_dispatcher_selected() {
-            return Some(&self.dispatcher_authoring);
-        }
-        // PRD #120: the flag-gated issue-dispatch authoring option — its synthetic
-        // mode supplies the cycler's title/chip ("schedule: issues mode"); the
-        // spawned request swaps in the issue-dispatch seed (see
-        // `build_new_pane_request`).
-        if self.is_issue_dispatch_selected() {
-            return Some(&self.issue_dispatch_authoring);
-        }
-        if self.is_schedule_selected() {
-            // The built-in authoring mode — spawns a seeded agent like any
-            // mode with a `seed_prompt`.
-            return Some(&self.schedule_authoring);
-        }
-        if self.selection_index == 0 || self.selection_index > self.modes.len() {
-            None
+            Some(BuiltinOption::Dispatcher)
+        } else if self.is_issue_dispatch_selected() {
+            Some(BuiltinOption::IssueDispatch)
+        } else if self.is_schedule_selected() {
+            Some(BuiltinOption::Schedule)
         } else {
-            self.modes.get(self.selection_index - 1)
+            None
         }
     }
 
     fn selected_orchestration(&self) -> Option<&OrchestrationConfig> {
-        let orch_start = 1 + self.modes.len();
-        if self.selection_index >= orch_start {
-            self.orchestrations.get(self.selection_index - orch_start)
+        if self.selection_index >= 1 {
+            self.orchestrations.get(self.selection_index - 1)
         } else {
             None
         }
     }
 
     /// PRD #80 M8: display name for the mode option at `idx` (0 = "No mode",
-    /// 1..=modes = mode names, then orchestrations, then the built-in
-    /// "schedule" authoring option at the end). Used to render one clickable
-    /// chip per option.
+    /// then orchestrations, then the built-in options at the end). Used to
+    /// render one clickable chip per option.
     fn mode_option_name(&self, idx: usize) -> String {
         if idx == 0 {
             "No mode".to_string()
-        } else if idx <= self.modes.len() {
-            self.modes[idx - 1].name.clone()
-        } else if idx <= self.modes.len() + self.orchestrations.len() {
-            let orch_idx = idx - 1 - self.modes.len();
+        } else if idx <= self.orchestrations.len() {
+            let orch_idx = idx - 1;
             let name = &self.orchestrations[orch_idx].name;
             if name.is_empty() {
                 "Orchestration".to_string()
@@ -1750,9 +1666,9 @@ fn spawn_time_fallback_ready_at(anchor: std::time::Instant) -> std::time::Instan
 /// be checked rather than assumed.** [`AppState::insert_placeholder_session`]
 /// takes an `Option<AgentType>` and would satisfy the first conjunct if handed a
 /// known one, but every site that enqueues a spawn-time prompt passes `None`:
-/// the `Action::SpawnPane` arm inserts its placeholder untyped for both the mode
-/// agent pane and the single-agent card (the two `pending_seed_prompts` pushes
-/// live in that same `Ok` arm), and all four orchestration-tab open paths —
+/// the `Action::SpawnPane` arm inserts its placeholder untyped for the
+/// single-agent card (its `pending_seed_prompts` push lives in that same `Ok`
+/// arm), and all four orchestration-tab open paths —
 /// interactive, restore, and the two dead-slot loops — do the same before
 /// `orchestration_prompt_anchor_at` is stamped. The restore paths that DO pass a
 /// type (`saved_pane` single panes) enqueue no spawn-time prompt, so they never
@@ -1888,7 +1804,8 @@ fn submit_debounce_duration(
     SUBMIT_DEBOUNCE.checked_sub(elapsed).unwrap_or_default()
 }
 
-/// PRD #127 M3.1: a mode's `seed_prompt` queued for delivery to its agent pane,
+/// PRD #127 M3.1: a single-agent card's `seed_prompt` (a built-in option — see
+/// `BuiltinOption`) queued for delivery to its pane,
 /// gated exactly like the orchestrator's spawn-time role prompt — agent-ready
 /// (SessionStart, fast path) or a 10s timeout (slow path), plus the
 /// `SPAWN_TIME_READINESS_BUFFER`, then an atomic `write_and_submit_to_pane`.
@@ -2085,9 +2002,8 @@ struct UiState {
     /// pane id as of the previous `reconcile_dashboard_selection` frame. The
     /// focused-pane sync (M4) reactivates the highlight only on a genuine focus
     /// *transition* — when the focused pane CHANGED to a visible dashboard card
-    /// — not on a steady-state focus the tab-switch restore leaves in place
-    /// (e.g. a Mode tab's agent pane, which is a dashboard card and stays
-    /// focused on return). Without this, switching away and back re-armed the
+    /// — not on a steady-state focus the tab-switch restore leaves in place.
+    /// Without this, switching away and back re-armed the
     /// highlight a tab switch had cleared (violating SC1).
     last_focused_pane_id: Option<String>,
     /// PRD #341 M6: which pane the user was typing into as of the previous
@@ -2153,14 +2069,14 @@ struct UiState {
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
     /// Issue #308: maps pane_id → the agent type its config DECLARED
-    /// (`agent = "…"` on the role or mode), for panes that made a declaration.
+    /// (`agent = "…"` on the role), for panes that made a declaration.
     ///
     /// Kept beside `SessionState.agent_type` rather than written into it,
     /// because the two answer different questions and only one of them may
     /// drive timing. `SessionState.agent_type` is the OBSERVED identity: it
     /// stays `AgentType::None` until something running in the pane reports, and
     /// two separate readiness gates read it — `agent_ready` in the
-    /// orchestrator-prompt and mode-seed paths, both of which route through
+    /// orchestrator-prompt and seed-prompt paths, both of which route through
     /// [`spawn_time_agent_ready`]. Seeding a declaration into that field would
     /// move both closer to firing at spawn and typing a prompt into a launcher
     /// that has not started its agent yet — which is precisely the population
@@ -2184,9 +2100,8 @@ struct UiState {
     /// (launch), one layer up.
     ///
     /// **Lifecycle.** Entries are removed on exactly the paths that remove
-    /// [`Self::pane_metadata`]: closing a pane (`Action::ClosePane`), closing a
-    /// tab, and the restore-failure / mode-activation-failure arms that retire
-    /// a pane id they just spawned. A stale entry would nonetheless be inert
+    /// [`Self::pane_metadata`]: closing a pane (`Action::ClosePane`) and
+    /// closing a tab. A stale entry would nonetheless be inert
     /// rather than a mislabelled card, because a pane id is never recycled
     /// within a daemon session — `EmbeddedPaneController::allocate_id`
     /// (`src/embedded_pane.rs`) hands out a monotonic counter and never reuses
@@ -2194,12 +2109,8 @@ struct UiState {
     /// rehydrated id before allocating again. So a leftover entry can only be
     /// looked up by the pane that put it there.
     ///
-    /// Only the two surfaces that can carry a declaration are ever inserted:
-    /// orchestration ROLE panes and MODE agent panes. In particular the mode's
-    /// reactive SIDE panes get no entry — `TabManager::route_reactive_commands`
-    /// (`src/tab.rs`) closes and re-creates those panes under fresh ids as
-    /// rules fire, so an entry keyed on one of them would be orphaned on every
-    /// rule that fires rather than on tab close.
+    /// Only orchestration ROLE panes can carry a declaration, so they are the
+    /// only panes ever inserted — at spawn and on session restore.
     pane_declared_agent: HashMap<String, AgentType>,
     /// Maps pane_id → launch metadata for auto-save/restore.
     pane_metadata: HashMap<String, config::SavedPane>,
@@ -2228,8 +2139,8 @@ struct UiState {
     /// why the state set moments ago does not apply here.
     ///
     /// What is deck-global is WHERE the value lives, not how far it reaches:
-    /// the gate still matches only [`Tab::Orchestration`], so Dashboard and
-    /// Mode tabs are never gated whatever this says. Not persisted — every
+    /// the gate still matches only [`Tab::Orchestration`], so the Dashboard is
+    /// never gated whatever this says. Not persisted — every
     /// deck starts locked.
     command_entry_locked: bool,
     /// Warnings collected during session save/restore, flushed after terminal restore.
@@ -2241,6 +2152,10 @@ struct UiState {
     /// [`TabId`], which `TabManager` allocates monotonically and never reuses,
     /// so an entry left behind by a closed tab can never mark a later one.
     config_drift_tabs: HashSet<TabId>,
+    /// Issue #1199: project directories whose leftover `[[modes]]` block the
+    /// user has already been warned about this session, so reopening the New
+    /// Agent form in the same directory does not repeat the warning.
+    legacy_modes_warned_dirs: HashSet<PathBuf>,
     /// PRD #89 review-fix G1: tracks whether the most recent periodic snapshot
     /// write (in `flush_session_snapshot_if_due`) failed. F10 keeps the
     /// coalescer dirty on failure so the next loop retries; on a *persistent*
@@ -2253,10 +2168,6 @@ struct UiState {
     selection: Option<TextSelection>,
     /// Screen rect of the focused pane (set during render, used for mouse mapping).
     focused_pane_rect: Option<Rect>,
-    /// Screen rects of side panes in mode tabs (set during render, used for scroll hit-testing).
-    side_pane_rects: Vec<(String, Rect)>,
-    /// Screen rect of the agent pane in mode tabs (set during render, used for click-to-focus).
-    agent_pane_rect: Option<Rect>,
     /// Tracks last click time and position for double/triple-click detection.
     last_click: Option<LastClick>, // PRD #80 review FIX 4: region-aware multi-click state
     /// PRD #80: screen rects of the clickable buttons rendered this frame,
@@ -2268,7 +2179,7 @@ struct UiState {
     #[allow(dead_code)]
     button_rects: Vec<(Action, Rect)>,
     /// PRD #80 M3: screen rects of each tab's `[×]` close affordance, paired
-    /// with the tab index to close (only closeable Mode/Orchestration tabs;
+    /// with the tab index to close (only closeable orchestration tabs;
     /// the Dashboard at index 0 is excluded). Populated each render, consulted
     /// on a mouse Down/Up AFTER `button_rects` but BEFORE `tab_header_rects`,
     /// so the `[×]` beats the surrounding header.
@@ -2311,7 +2222,8 @@ struct UiState {
     /// otherwise.
     form_field_rects: Vec<(FormField, Rect)>,
     /// PRD #80 M8: new-pane-form mode chips, paired with the mode-option index
-    /// each selects (0 = "No mode", 1.. = modes/orchestrations).
+    /// each selects (0 = "No mode", then the orchestrations, then the built-in
+    /// options — see `NewPaneFormState::mode_option_name`).
     form_chip_rects: Vec<(usize, Rect)>,
     /// PRD #80 M8: new-pane-form `[Submit]`/`[Cancel]` button rects, paired
     /// with the [`Action`] each fires.
@@ -2449,7 +2361,7 @@ struct UiState {
     /// submit-CR-aware mode on slower environments. Cleared when the
     /// prompt finally fires (entry never re-added).
     orchestration_ready_since: HashMap<TabId, std::time::Instant>,
-    /// PRD #127 M3.1: mode `seed_prompt`s waiting for their agent pane to be
+    /// PRD #127 M3.1: single-agent cards' `seed_prompt`s waiting for their pane to be
     /// ready before the gated atomic submit. Gated on the spawn-time readiness
     /// buffer, then delivered with `write_and_submit_to_pane`.
     pending_seed_prompts: Vec<PendingSeedPrompt>,
@@ -2627,11 +2539,10 @@ impl UiState {
             command_entry_locked: true,
             session_warnings: Vec::new(),
             config_drift_tabs: HashSet::new(),
+            legacy_modes_warned_dirs: HashSet::new(),
             session_snapshot_write_failed: false,
             selection: None,
             focused_pane_rect: None,
-            side_pane_rects: Vec::new(),
-            agent_pane_rect: None,
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
             config_gen_state: config::ConfigGenState::load(),
@@ -2683,7 +2594,7 @@ impl UiState {
     }
 
     /// PRD #89 M1.2/M1.3 — the single trigger every meaningful state-change and
-    /// detach call site invokes (new pane, rename, close, mode/orchestration tab
+    /// detach call site invokes (new pane, rename, close, orchestration tab
     /// open/close, agent restart, Ctrl+W close-pane). It only marks the
     /// saved-session snapshot dirty; the coalesced disk write happens in the
     /// main loop via `flush_session_snapshot_if_due`, so a burst of triggers
@@ -2697,10 +2608,9 @@ impl UiState {
     /// door only records a candidate for a plain INTERACTIVE spawn with a
     /// non-empty command (`None` for authoring-mode / empty-command submits),
     /// so those never overwrite the recorded value. Must be called ONLY after
-    /// the spawn genuinely succeeds — a plain card was created, or a mode tab
-    /// opened (`open_mode_tab` Ok). It is deliberately NOT called on the
-    /// `open_mode_tab` Err arm, so a failed mode-spawn never pollutes
-    /// `last_command` (the PRD's record-only-on-success rule).
+    /// the spawn genuinely succeeds — a plain card was created. It is
+    /// deliberately NOT called when the spawn fails, so a failed spawn never
+    /// pollutes `last_command` (the PRD's record-only-on-success rule).
     fn commit_pending_last_command(&mut self) {
         if let Some(cmd) = self.pending_last_command.take() {
             self.last_command = Some(cmd);
@@ -2731,24 +2641,6 @@ impl Default for UiState {
 // `compute_frame_layout`) the single owner of resize-time PTY sizing, so
 // these helpers are now spawn-time-only. All return `(rows, cols)` (=
 // `(height, width)` of the inner area inside the pane's border).
-
-/// Agent pane of a mode tab: left half × full height minus 3 rows of
-/// chrome (tab bar + hints bar). Mirrors the mode-tab render layout.
-pub(crate) fn mode_agent_pane_dims(area: Rect) -> (u16, u16) {
-    let half_width = (area.width / 2).saturating_sub(2);
-    let rows = area.height.saturating_sub(3);
-    (rows, half_width)
-}
-
-/// Side panes of a mode tab: right half divided equally by `side_count`,
-/// minus the per-pane border. `side_count` is clamped to ≥1 so the layout
-/// math doesn't divide by zero before the first side pane appears.
-pub(crate) fn mode_side_pane_dims(area: Rect, side_count: u16) -> (u16, u16) {
-    let half_width = (area.width / 2).saturating_sub(2);
-    let count = side_count.max(1);
-    let rows = (area.height / count).saturating_sub(2);
-    (rows, half_width)
-}
 
 /// Shared layout constants for the dashboard and orchestration tab
 /// renderers. Extracted into `const`s (rather than inlined at each
@@ -3081,18 +2973,6 @@ use crate::orchestrator_context::{
 // PRD #76 M2.12: hydration partition
 // ---------------------------------------------------------------------------
 
-/// One mode bucket from [`partition_hydrated_panes`]: the agent pane id
-/// captured from a single hydrated daemon record claiming
-/// `TabMembership::Mode { name }` for the given `cwd`. Multiple records
-/// matching the same `(cwd, mode_name)` are flagged as drift by the
-/// partition (only the first survives; the rest are dropped to dashboard).
-#[derive(Debug, Clone)]
-pub struct ModeHydrationBucket {
-    pub cwd: String,
-    pub mode_name: String,
-    pub agent_pane_id: String,
-}
-
 /// One orchestration bucket from [`partition_hydrated_panes`]:
 /// the role slots for a single `(cwd, orchestration_name)` pairing. Each
 /// entry carries the role's index, pane id, and the role identity
@@ -3307,6 +3187,89 @@ fn surface_orchestration_config_drift(ui: &mut UiState, tab: Option<&Tab>, warni
     ui.session_warnings.push(warning);
 }
 
+/// Issue #1199: the status-line summary shown when the New Agent form loads a
+/// project config that still declares `[[modes]]`. Short enough for one status
+/// row; the full text, naming the file, goes to `session_warnings`.
+pub const LEGACY_MODES_STATUS_MESSAGE: &str =
+    "Workspace modes were removed; [[modes]] ignored \u{2014} details on exit";
+
+/// Issue #1199: the full warning for a project config at `config_path` that
+/// still declares `[[modes]]` — what joins `session_warnings`, printed to
+/// stderr when the deck exits.
+fn legacy_modes_config_warning(config_path: &std::path::Path) -> String {
+    format!(
+        "{}: workspace modes were removed (#1199); its [[modes]] block is ignored and can be \
+         deleted. Use an orchestration, a scheduled task or dispatcher mode instead.",
+        config_path.display()
+    )
+}
+
+/// Issue #1199: tell the user, once per directory per session, that the project
+/// config the New Agent form just loaded still declares `[[modes]]`.
+///
+/// Called from the form's own load rather than from [`load_project_config`],
+/// which the daemon re-runs on every delegate and scheduled spawn — a warning
+/// there would repeat for as long as the block stays in the file. Two surfaces,
+/// as in [`surface_orchestration_config_drift`]: the status line says it at the
+/// moment the form opens, and `session_warnings` keeps the full text, with the
+/// file's path, for the exit report.
+fn surface_legacy_modes_warning(ui: &mut UiState, dir: &std::path::Path) {
+    if !ui.legacy_modes_warned_dirs.insert(dir.to_path_buf()) {
+        return;
+    }
+    ui.status_message = Some((
+        LEGACY_MODES_STATUS_MESSAGE.to_string(),
+        std::time::Instant::now(),
+    ));
+    ui.session_warnings.push(legacy_modes_config_warning(
+        &dir.join(crate::project_config::CONFIG_FILE_NAME),
+    ));
+}
+
+/// Issue #1199: the one `session_warnings` line for daemon panes an older TUI
+/// started as workspace-mode agent panes, which hydration placed on the
+/// dashboard. `None` when there were none.
+fn legacy_mode_hydration_warning(mode_names: &[&str]) -> Option<String> {
+    if mode_names.is_empty() {
+        return None;
+    }
+    let names = mode_names
+        .iter()
+        .map(|n| crate::config_validation::escape_id_for_log(n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "Workspace modes were removed (#1199): panes started under mode(s) {names} were placed \
+         on the dashboard as plain panes."
+    ))
+}
+
+/// Issue #1199: the repository-supplied fields of the hydration log line for a
+/// legacy workspace-mode pane, escaped for deck.log — `(cwd, mode)`.
+///
+/// The mode name comes from an older repository's `.dot-agent-deck.toml`, so it
+/// gets [`escape_id_for_log`](crate::config_validation::escape_id_for_log)'s
+/// control + bidi escaping and identifier clamp, the same as the
+/// `session_warnings` line above. The cwd is a filesystem path: it gets the same
+/// control + bidi escaping but no clamp, so a long path stays useful in the log.
+fn legacy_mode_hydration_log_fields(cwd: &str, mode_name: &str) -> (String, String) {
+    (
+        crate::config_validation::escape_for_terminal(cwd).into_owned(),
+        crate::config_validation::escape_id_for_log(mode_name),
+    )
+}
+
+/// Issue #1199: the one `session_warnings` line for a saved pane that belonged
+/// to a workspace-mode tab, which the restore brought back as a plain pane.
+fn legacy_mode_restore_warning(pane_name: &str, mode_name: &str) -> String {
+    format!(
+        "Workspace modes were removed (#1199): pane '{}' was saved in mode '{}' and was \
+         restored as a plain pane.",
+        crate::config_validation::escape_id_for_log(pane_name),
+        crate::config_validation::escape_id_for_log(mode_name)
+    )
+}
+
 /// Issue #554: what the TUI found when it looked for the project config of an
 /// orchestration it is about to rebuild — the input to
 /// [`orchestration_config_drift_warning`]. Three states rather than an
@@ -3514,15 +3477,16 @@ pub fn grown_orchestration_tab_drift_warning(
 ///
 /// Rejected panes are still routed to `dashboard_pane_ids`, so the
 /// rejection record is purely informational: the user sees the pane on
-/// the dashboard regardless. Today the only rejection reason is a
-/// duplicate `(cwd, mode_name)` claim, but the variant shape leaves
-/// room for future reasons without breaking call sites.
+/// the dashboard regardless. Today the only rejection reason is a legacy
+/// workspace-mode claim, but the variant shape leaves room for future
+/// reasons without breaking call sites.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HydrationRejection {
-    /// More than one hydrated pane claimed `Mode { name }` for the same
-    /// `cwd`. The first claimant won the bucket; this is the i-th
-    /// duplicate that got dropped to the dashboard instead.
-    DuplicateMode {
+    /// Issue #1199: the daemon echoed `TabMembership::Mode { name }` — a pane
+    /// an older TUI started as a workspace mode's agent pane. Workspace modes
+    /// were removed, so there is no mode tab to rebuild; the pane lands on the
+    /// dashboard as a plain card, and the hydration site tells the user why.
+    LegacyWorkspaceMode {
         cwd: String,
         mode_name: String,
         agent_id: String,
@@ -3532,36 +3496,34 @@ pub enum HydrationRejection {
 
 /// Output of [`partition_hydrated_panes`]: separates hydrated panes into
 /// "stays on dashboard" (`dashboard_pane_ids`) and "needs a tab rebuilt"
-/// (`mode_buckets`, `orchestration_buckets`). Panes that name a mode or
-/// orchestration that doesn't exist in the cwd's project config end up
+/// (`orchestration_buckets`). Panes that name an orchestration that
+/// doesn't exist in the cwd's project config end up
 /// here only via the dispatcher's fallback path — the partition itself
 /// is config-agnostic so it stays a pure function and can be unit-tested
 /// without spinning up a full TUI.
 ///
 /// `rejections` carries deferred diagnostics for panes that couldn't be
-/// bucketed cleanly (e.g. duplicate mode claims). The partition helper
+/// bucketed cleanly (e.g. a legacy workspace-mode claim). The partition helper
 /// stays pure — no I/O, no `tracing` — so the caller is responsible for
 /// logging each rejection at the hydration site (M2.12 fixup reviewer
 /// #3).
 #[derive(Debug, Clone, Default)]
 pub struct HydrationPartition {
     pub dashboard_pane_ids: Vec<String>,
-    pub mode_buckets: Vec<ModeHydrationBucket>,
     pub orchestration_buckets: Vec<OrchestrationHydrationBucket>,
     pub rejections: Vec<HydrationRejection>,
 }
 
-/// PRD #76 M2.12: partition hydrated daemon panes into dashboard / mode
-/// / orchestration buckets based on each agent's recorded
+/// PRD #76 M2.12: partition hydrated daemon panes into dashboard /
+/// orchestration buckets based on each agent's recorded
 /// `tab_membership`. Pure function for testability.
 ///
 /// Rules:
 /// - `tab_membership == None` → dashboard.
-/// - `Some(Mode { name })` → mode bucket keyed by `(cwd, mode_name)`.
-///   Cwd defaults to `""` when the daemon record omits it (older daemon
-///   shape). The first record claiming a `(cwd, mode_name)` wins; later
-///   duplicates from the same pairing are logged and dropped to the
-///   dashboard so a buggy daemon can't double-build a single mode tab.
+/// - `Some(Mode { name })` → dashboard, plus a
+///   [`HydrationRejection::LegacyWorkspaceMode`] record (issue #1199: the
+///   variant is deprecated and only an older TUI produces it). Cwd defaults
+///   to `""` when the daemon record omits it (older daemon shape).
 /// - `Some(Orchestration { name, role_index })` → orchestration bucket
 ///   keyed by the same [`crate::state::OrchestrationIdentity`] the daemon
 ///   routes on (PRD #140 M3.0): a per-tab `orchestration_id` token keys
@@ -3571,18 +3533,14 @@ pub struct HydrationPartition {
 ///   its agent died before the TUI reattached); the dispatcher expands
 ///   this to a `Vec<Option<String>>` of full role-count length.
 ///
-/// Ordering is stable: dashboard panes preserve input order, mode and
+/// Ordering is stable: dashboard panes preserve input order, and
 /// orchestration buckets preserve the order in which their (cwd, name)
 /// pairing was first seen so the user's mental "which tab opened first"
 /// model survives reconnect (TabManager appends in iteration order).
 pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition {
-    use std::collections::HashSet;
-
     let mut out = HydrationPartition::default();
     // Bucket lookup tables are local: in-memory only, only used during
-    // this partition pass. Index into `out.mode_buckets` /
-    // `out.orchestration_buckets` keyed by `(cwd, name)`.
-    let mut mode_keys: HashSet<(String, String)> = HashSet::new();
+    // this partition pass.
     // PRD #140 M3.0: orchestration buckets are keyed by the SAME identity the
     // daemon routes delegate / work-done on, so a reattach reconstructs exactly
     // the tabs the daemon considers distinct routing groups.
@@ -3596,26 +3554,18 @@ pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition
                 out.dashboard_pane_ids.push(h.pane_id.clone());
             }
             Some(TabMembership::Mode { name }) => {
-                let key = (cwd.clone(), name.clone());
-                if !mode_keys.insert(key) {
-                    // Duplicate `(cwd, mode_name)` claim. Pure helper:
-                    // record the rejection for the caller to log via
-                    // `tracing::error!`, then route the pane to the
-                    // dashboard. M2.12 fixup reviewer #3.
-                    out.rejections.push(HydrationRejection::DuplicateMode {
-                        cwd: cwd.clone(),
+                // Issue #1199: workspace modes were removed, so there is no
+                // tab to rebuild. Pure helper: record the reason for the
+                // caller to report, then route the pane to the dashboard as a
+                // plain card.
+                out.rejections
+                    .push(HydrationRejection::LegacyWorkspaceMode {
+                        cwd,
                         mode_name: name.clone(),
                         agent_id: h.agent_id.clone(),
                         pane_id: h.pane_id.clone(),
                     });
-                    out.dashboard_pane_ids.push(h.pane_id.clone());
-                    continue;
-                }
-                out.mode_buckets.push(ModeHydrationBucket {
-                    cwd,
-                    mode_name: name.clone(),
-                    agent_pane_id: h.pane_id.clone(),
-                });
+                out.dashboard_pane_ids.push(h.pane_id.clone());
             }
             Some(TabMembership::Orchestration {
                 name,
@@ -3851,12 +3801,12 @@ pub fn fill_dead_slots_with_placeholders(
     }
 }
 
-/// PRD #127 M3.1: deliver a mode's `seed_prompt` to its agent pane once the
+/// PRD #127 M3.1: deliver a single-agent card's `seed_prompt` to its pane once the
 /// agent is ready, gated exactly like the orchestrator's spawn-time role prompt
 /// (`SessionStart` fast path / 10s timeout slow path, then the
 /// `SPAWN_TIME_READINESS_BUFFER`, then an atomic `write_and_submit_to_pane`).
-/// A mode without a `seed_prompt` never enqueues one, so this is a no-op for
-/// plain modes (no regression).
+/// A card without a `seed_prompt` never enqueues one, so this is a no-op for
+/// ordinary panes (no regression).
 fn process_pending_seed_prompts(
     ui: &mut UiState,
     pane: &Arc<dyn PaneController>,
@@ -5369,27 +5319,6 @@ fn deliver_orchestrator_prompt(
     }
 }
 
-/// PRD #20 blocker-3: wrap a bare, about-to-be-TYPED launch command for a
-/// mode/restore agent shell (the one launch class that doesn't pass its command
-/// through the common `agent_pty::spawn` boundary — it spawns a shell and
-/// injects the command as keystrokes). Resolves the Wrapper-strategy identity
-/// and returns `dot-agent-deck wrap --agent <name> -- <cmd>` for a Wrapper
-/// agent (Codex); returns the command unchanged for native agents. Idempotent,
-/// so a re-typed already-wrapped command is never double-wrapped.
-///
-/// Issue #308: `declared` is the mode's `agent = "…"` key when it has one, and
-/// it wins over parsing the command — a mode agent pane running
-/// `devbox run codex-big` is otherwise typed in BARE, and an unwrapped Codex
-/// emits nothing until its first turn, so the pane reads "No agent" for as long
-/// as the user has not prompted it. `None` (every mode without the key) derives
-/// from the command exactly as before.
-fn wrap_agent_command(command: &str, declared: Option<AgentType>) -> String {
-    match declared.or_else(|| AgentType::from_command(Some(command))) {
-        Some(agent_type) => crate::wrap::wrap_launch_command(command, &agent_type),
-        None => command.to_string(),
-    }
-}
-
 /// PRD #20 blocker-5: a short human-readable reason a [`SendResult`] was not
 /// delivered, for the status-bar feedback shown when a seed / orchestrator
 /// prompt could not reach a live target.
@@ -5479,7 +5408,7 @@ fn process_pending_orchestration_surfaces(
 ///
 /// [`AppState::apply_daemon_pane_closed`] has already dropped the pane's
 /// sessions and registration, in broadcast order; this drops the pane's local
-/// attachment, its slot in a Mode/Orchestration tab, and its `UiState` maps. A
+/// attachment, its slot in an orchestration tab, and its `UiState` maps. A
 /// tab left with no live pane goes too — [`TabManager::forget_externally_closed_pane`]
 /// — together with its dead-slot placeholder cards, and focus follows
 /// [`close_tab_by_index`]: a user on that tab is returned to the Dashboard and
@@ -6112,15 +6041,12 @@ pub struct NewPaneRequest {
     dir: PathBuf,
     name: String,
     command: String,
-    mode_config: Option<ModeConfig>,
     orchestration_config: Option<OrchestrationConfig>,
-    /// PRD #127: a seed prompt to deliver (gated, like a mode's `seed_prompt`)
-    /// to the spawned single-agent CARD once its pane is ready. Set for the
-    /// built-in "schedule" authoring session, which is a throwaway single-agent
-    /// card (NOT a 50/50 mode tab), so its seed cannot ride on `mode_config` —
-    /// that field routes the spawn through `render_mode_tab`. Carrying the seed
-    /// here keeps the authoring session a dashboard card while still delivering
-    /// the authoring prompt.
+    /// PRD #127: a seed prompt to deliver (gated on the agent signalling
+    /// readiness) to the spawned single-agent CARD once its pane is ready. Set
+    /// for the built-in options ([`BuiltinOption`]) — schedule authoring,
+    /// issue-dispatch authoring and the dispatcher — each of which is a
+    /// dashboard card carrying its seed here.
     seed_prompt: Option<String>,
 }
 
@@ -6152,7 +6078,7 @@ pub enum Action {
     /// `[New Agent Ctrl+N]` button — distinct from [`Action::SpawnPane`], which
     /// is the *result* of submitting the new-pane form.
     NewPane,
-    /// PRD #80: close the selected pane — or the entire mode/orchestration tab
+    /// PRD #80: close the selected pane — or the entire orchestration tab
     /// it belongs to (Ctrl+W).
     ///
     /// PRD #241 M3: this is now a *request*, not the teardown itself. Both
@@ -6210,7 +6136,7 @@ pub enum Action {
     /// for the click that produced it.
     SelectTab(usize),
     /// PRD #80 M3: close the tab at this index — the outcome of clicking a
-    /// Mode/Orchestration tab's `[×]` affordance, reusing Ctrl+W's tab-teardown
+    /// orchestration tab's `[×]` affordance, reusing Ctrl+W's tab-teardown
     /// semantics for the clicked tab (not necessarily the active one).
     CloseTab(usize),
     /// PRD #80 M4: select the dashboard card at this index — the outcome of a
@@ -6291,16 +6217,6 @@ pub enum Action {
     FormCancel,
     /// PRD #80: Normal-mode digit `1`-`9` — jump to card N and focus its pane.
     FocusCard(usize),
-    /// PRD #80: on a mode tab, move the in-tab side-pane focus down (j/Down).
-    ModeTabSelectNext,
-    /// PRD #80: on a mode tab, move the in-tab side-pane focus up (k/Up).
-    ModeTabSelectPrev,
-    /// PRD #80: on a mode tab, enter `PaneInput` on the focused side/agent
-    /// pane (Enter).
-    ModeTabFocus,
-    /// PRD #80: on a mode tab, reset in-tab focus back to the agent pane
-    /// (Esc).
-    ModeTabReset,
     /// PRD #80: the new-pane form was submitted — spawn the requested pane.
     /// This is the *outcome* of the form, distinct from [`Action::NewPane`],
     /// which merely opens the picker that leads to the form.
@@ -6974,24 +6890,23 @@ pub struct CloseConfirmState {
 /// therefore which words the dialog is allowed to use.
 ///
 /// The dialog used to read `Close selected pane?` for every target, which is a
-/// lie on a Mode or Orchestration tab: that close takes the whole tab and every
+/// lie on an orchestration tab: that close takes the whole tab and every
 /// pane in it. Crucially the lie was NOT fixable by branching on
 /// [`CloseTarget`], because `CloseTarget::Session` does not mean "one card" —
 /// the confirmed close resolves the armed session, discovers its pane belongs to
-/// a Mode/Orchestration tab, and closes that entire tab. Only a plain dashboard
+/// an orchestration tab, and closes that entire tab. Only a plain dashboard
 /// pane reaches the one-pane branch. So the wording is derived from
 /// [`resolve_close_plan`], the single function the teardown itself branches on,
 /// and the two cannot disagree without the close changing shape.
 ///
 /// Deliberately carries no pane COUNT. A number here would have to be recomputed
-/// against a moving world (reactive pools grow and shrink, roles die into dead
-/// slots), and a confidently wrong "3 panes" is worse than no number at all.
+/// against a moving world (roles die into dead slots), and a confidently wrong "3 panes" is worse than no number at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CloseScope {
     /// Exactly one plain dashboard pane and its card.
     #[default]
     Pane,
-    /// A whole Mode / Orchestration tab: every pane it owns.
+    /// A whole orchestration tab: every pane it owns.
     Tab,
 }
 
@@ -7013,7 +6928,7 @@ pub enum CloseScope {
 /// confirmation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseTarget {
-    /// A Mode / Orchestration tab, keyed by its [`TabId`] (stable across
+    /// An orchestration tab, keyed by its [`TabId`] (stable across
     /// tab-strip reordering and index shifts, unlike the position).
     Tab(TabId),
     /// A dashboard card, keyed by its session id (stable across filtering,
@@ -7089,7 +7004,7 @@ fn tab_index_for_id(tab_manager: &TabManager, id: TabId) -> Option<usize> {
 /// closable, which is exactly the invariant `dashboard/pane/003` pins.
 fn tab_id_of(tab: &Tab) -> Option<TabId> {
     match tab {
-        Tab::Mode { id, .. } | Tab::Orchestration { id, .. } => Some(*id),
+        Tab::Orchestration { id, .. } => Some(*id),
         Tab::Dashboard { .. } => None,
     }
 }
@@ -7129,7 +7044,7 @@ const CLOSE_CONFIRM_OPTION_COUNT: usize = 2;
 /// [`Action::CloseSelected`] has two doors — the `close_pane` chord and the
 /// persistent `[Close]` button — and both must confirm. `has_target` is the
 /// caller's answer to "is anything actually armed?": an active
-/// Mode/Orchestration tab, or a selected dashboard card with a live pane. With
+/// orchestration tab, or a selected dashboard card with a live pane. With
 /// nothing armed the close stays the pre-existing no-op and no modal opens, so
 /// an unarmed dashboard can never be talked into closing card 0.
 pub fn close_confirmation_for_action(
@@ -7178,7 +7093,7 @@ fn arm_close_confirmation(
 /// teardown in `Action::ConfirmCloseSelected`, which matches directly on the
 /// returned plan. Before this existed the dialog inferred its copy from the
 /// [`CloseTarget`] variant, which is not the same question — a
-/// `CloseTarget::Session` whose pane belongs to a Mode/Orchestration tab closes
+/// `CloseTarget::Session` whose pane belongs to an orchestration tab closes
 /// that whole tab, so "Session" never implied "one pane".
 ///
 /// `None` means a confirmed close would do nothing: the armed tab or session is
@@ -7189,7 +7104,7 @@ fn resolve_close_plan(
     snapshot: &AppState,
 ) -> Option<ClosePlan> {
     match target {
-        // PR #151 (e2e layout_002 regression): a Mode/Orchestration TAB is a
+        // PR #151 (e2e layout_002 regression): an orchestration TAB is a
         // close target in its own right, independent of the dashboard selection
         // (which is `None` while such a tab is active). PRD #241 review F1:
         // resolve the ARMED tab's id back to its current index rather than
@@ -7220,14 +7135,11 @@ fn resolve_close_plan(
                 return None;
             }
             let pane_id = session.pane_id.clone()?;
-            // The armed card may be the face of a pane that lives inside a
-            // Mode/Orchestration tab. Closing it closes the tab — every pane in
+            // The armed card may be the face of a pane that lives inside an
+            // orchestration tab. Closing it closes the tab — every pane in
             // it — which is exactly why the dialog cannot read the target
             // variant and call it a day.
-            match tab_manager
-                .tab_index_for_agent_pane(&pane_id)
-                .or_else(|| tab_manager.tab_index_for_pane(&pane_id))
-            {
+            match tab_manager.tab_index_for_pane(&pane_id) {
                 Some(index) => Some(ClosePlan::Tab { index }),
                 None => Some(ClosePlan::Pane {
                     session_id: sid.clone(),
@@ -7252,8 +7164,8 @@ const CLOSE_PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
 
 /// Every pane a confirmed `plan` would tear down.
 ///
-/// One for a plain dashboard card; for a Mode/Orchestration tab, the agent pane
-/// plus every side or role pane it owns — because a multi-role orchestration
+/// One for a plain dashboard card; for an orchestration tab, every role pane it
+/// owns — because a multi-role orchestration
 /// shares ONE dispatched worktree across its role panes, and the daemon
 /// resolves that worktree from whichever of them it recognises. Dead-slot
 /// sentinels are skipped for the same reason [`TabManager::all_managed_pane_ids`]
@@ -7262,13 +7174,6 @@ fn close_plan_pane_ids(plan: &ClosePlan, tab_manager: &TabManager) -> Vec<String
     match plan {
         ClosePlan::Pane { pane_id, .. } => vec![pane_id.clone()],
         ClosePlan::Tab { index } => match tab_manager.tabs().get(*index) {
-            Some(Tab::Mode {
-                agent_pane_id,
-                mode_manager,
-                ..
-            }) => std::iter::once(agent_pane_id.clone())
-                .chain(mode_manager.managed_pane_ids())
-                .collect(),
             Some(Tab::Orchestration { role_pane_ids, .. }) => role_pane_ids
                 .iter()
                 .filter(|id| !id.is_empty() && !is_dead_slot_pane_id(id))
@@ -7384,7 +7289,7 @@ fn kept_worktree_headline(kept: &KeptWorktree) -> &'static str {
 /// [`resolve_close_plan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClosePlan {
-    /// Tear down the Mode/Orchestration tab at this index and every pane it
+    /// Tear down the orchestration tab at this index and every pane it
     /// owns.
     Tab { index: usize },
     /// Tear down exactly one plain dashboard pane and drop its card.
@@ -7407,7 +7312,7 @@ impl ClosePlan {
 /// close in `dispatch_action`, so the dialog can never be raised for a close
 /// that would then turn out to be a no-op:
 ///
-/// * an active Mode/Orchestration tab is closable regardless of the dashboard
+/// * an active orchestration tab is closable regardless of the dashboard
 ///   selection (PR #151 / `dashboard/selection/016`), and
 /// * otherwise the dashboard needs a REAL active selection whose session owns a
 ///   pane (PRD #113 finding 2 / `dashboard/selection/012` — no card-0
@@ -8108,8 +8013,6 @@ fn dispatch_normal_mode_key(
 ///   that card's session id; then resolve `selected_session_id` to its
 ///   index (clearing it and returning `0` when it's no longer present).
 /// - **Orchestration**: same, keyed by role pane id.
-/// - **Mode**: returns `None` — mode tabs render via a separate path, so
-///   `selected_index` must be left untouched.
 ///
 /// The caller passes the active tab, so a pane focused while another tab
 /// is active can never rewrite a different tab's selection — the gating
@@ -8179,7 +8082,6 @@ pub fn sync_and_derive_selection(
                 }
             }
         }
-        Tab::Mode { .. } => None,
     }
 }
 
@@ -8188,19 +8090,18 @@ pub fn sync_and_derive_selection(
 /// per-deck remembered Enter-restore selection so one deck can't leak its armed
 /// index into another's restore. There is only ever one Dashboard, so it needs
 /// no id; each Orchestration tab is keyed by its stable [`TabId`] so multiple
-/// orchestrations each keep their own remembered role. `Mode` tabs are not decks.
+/// orchestrations each keep their own remembered role.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum DeckKey {
     Dashboard,
     Orchestration(TabId),
 }
 
-/// The [`DeckKey`] for a tab, or `None` for a non-deck (`Mode`) tab.
+/// The [`DeckKey`] for a tab. Every tab kind is a deck.
 fn deck_key(tab: &Tab) -> Option<DeckKey> {
     match tab {
         Tab::Dashboard { .. } => Some(DeckKey::Dashboard),
         Tab::Orchestration { id, .. } => Some(DeckKey::Orchestration(*id)),
-        Tab::Mode { .. } => None,
     }
 }
 
@@ -8231,8 +8132,6 @@ fn dashboard_focus_target(ui: &UiState, total: usize) -> Option<usize> {
 /// each tab's own Enter/focus action already uses — so the chord lands exactly
 /// where the user would have landed the long way round:
 ///
-/// * **Mode tab** — the remembered focused pane, else the agent pane
-///   (`Action::ModeTabFocus`).
 /// * **Orchestration tab** — the remembered focused role pane, else the start
 ///   (orchestrator) role (`Action::OrchestrationFocus`).
 /// * **Dashboard** — the selected card's pane, but only when the session can
@@ -8249,15 +8148,6 @@ fn resume_pane_input_target(
     filtered: &[(&String, &SessionState)],
 ) -> Option<String> {
     match tab_manager.active_tab() {
-        Tab::Mode {
-            focused_pane_id,
-            agent_pane_id,
-            ..
-        } => Some(
-            focused_pane_id
-                .clone()
-                .unwrap_or_else(|| agent_pane_id.clone()),
-        ),
         Tab::Orchestration {
             focused_role_pane_id,
             role_pane_ids,
@@ -8292,7 +8182,7 @@ fn resume_pane_input_target(
 /// card never *looks* selected when nothing is armed — UNLESS a focused pane
 /// *transitions* to a visible dashboard card, in which case the highlight
 /// reactivates on that card (M4 focused-pane sync). When the selection is
-/// already active, or for the Orchestration/Mode tabs (whose selection is
+/// already active, or for Orchestration tabs (whose selection is
 /// separate, always-on state), the pre-existing `sync_and_derive_selection`
 /// derive is preserved.
 ///
@@ -8300,11 +8190,8 @@ fn resume_pane_input_target(
 /// TRANSITION — the focused pane id must have *changed* since the previous
 /// frame. The original code reactivated whenever the focused pane merely
 /// *mapped* to a card, which re-armed a just-cleared selection on tab return:
-/// a Mode tab's agent pane is a dashboard card (only its side panes are in
-/// `all_managed_pane_ids`, so the agent pane isn't filtered out), and switching
-/// to a Mode tab focuses that agent pane while the return to the Dashboard
-/// restores nothing — so the agent pane stays focused. That steady-state focus
-/// is not a transition, so it no longer reactivates the highlight. The cyan
+/// a steady-state focus restored on
+/// return is not a transition, so it no longer reactivates the highlight. The cyan
 /// focus border (driven by the controller's focus, not this function) is
 /// unaffected. Orchestration role panes are already excluded from the card
 /// list, which is why that path never exhibited the bug.
@@ -8327,14 +8214,12 @@ fn reconcile_dashboard_selection(
     // a tab-switch deactivation isn't undone by the per-frame sync (the restored
     // steady-state focus is not a transition). The guard expression itself is
     // unchanged from PR #151.
-    if let Tab::Dashboard { .. } | Tab::Orchestration { .. } = tab {
-        let focus_maps_to_card = focused_pane_id
-            .map(|fid| filtered.iter().any(|(_, pid)| *pid == Some(fid)))
-            .unwrap_or(false);
-        let focus_reactivates = focus_maps_to_card && focus_changed;
-        if ui.selected_index.is_none() && !focus_reactivates {
-            return;
-        }
+    let focus_maps_to_card = focused_pane_id
+        .map(|fid| filtered.iter().any(|(_, pid)| *pid == Some(fid)))
+        .unwrap_or(false);
+    let focus_reactivates = focus_maps_to_card && focus_changed;
+    if ui.selected_index.is_none() && !focus_reactivates {
+        return;
     }
     if let Some(idx) = sync_and_derive_selection(tab, focused_pane_id, filtered, ui.selected_index)
     {
@@ -8357,7 +8242,7 @@ fn reconcile_dashboard_selection(
 /// `(mode, focused pane)` pair — and not on `Action::DetachToNormal`, for the same
 /// reason [`CommandBannerState::sync_mode`] derives its edge from the mode rather
 /// than from a hand-listed set of actions: `Ctrl+D` is only one of ~50 sites that
-/// assign `ui.mode`, and `Action::Focus`, `ModeTabFocus`, `OrchestrationFocus`,
+/// assign `ui.mode`, and `Action::Focus`, `OrchestrationFocus`,
 /// the tab-switch focus restore and every dialog dismissal all reach `PaneInput`
 /// too. A reset wired to one action would be missing from all the others.
 ///
@@ -8374,14 +8259,10 @@ fn reconcile_dashboard_selection(
 /// satisfy.
 fn reconcile_pane_input_scrollback(ui: &mut UiState, pane: &dyn PaneController) {
     // PRD #341 (code-review finding 3): `PaneInput` with NOTHING focused is a
-    // state that LIES, and it is reachable — a focused reactive side pane can
-    // vanish with no successor (`remap_focus_after_reactive_change` clears the
-    // tab's remembered id and returns none, so the caller focuses nothing).
-    // `Action::ForwardToPane` then silently drops every keystroke for want of a
-    // `focused_pane_id`, while the chip says ` TYPING ` and a Mode tab's renderer
-    // can still paint the live cursor from its own visual fallback
-    // (`visual_focus_id`) — a cursor and a typing label over a pane that receives
-    // nothing. That is precisely the contradiction M1 removed in the other
+    // state that LIES: it arises when the focused pane vanishes with no
+    // successor and nothing is focused. `Action::ForwardToPane` then silently drops
+    // every keystroke for want of a `focused_pane_id` while the chip says
+    // ` TYPING ` — a typing label over a pane that receives nothing. That is precisely the contradiction M1 removed in the other
     // direction, so leave `PaneInput`: command mode is the honest answer AND the
     // safe resting state. Guessing a replacement pane to focus would be worse — a
     // wrong guess sends the user's keystrokes somewhere they did not intend.
@@ -8428,9 +8309,7 @@ fn reconcile_pane_input_scrollback(ui: &mut UiState, pane: &dyn PaneController) 
 /// highlight stays inactive because `reconcile_dashboard_selection` only
 /// reactivates on a focus *transition* and the pre-seed below makes the restored
 /// focus a steady state (no transition): a card never *looks* selected until the
-/// user re-arms it with Enter. (A Mode tab's agent pane stays focused on return
-/// and *is* a dashboard card, but the same transition guard keeps it from
-/// re-arming — see PR #151.)
+/// user re-arms it with Enter.
 fn switch_tab_with_focus(
     tab_manager: &mut TabManager,
     target_index: usize,
@@ -8525,8 +8404,8 @@ fn switch_tab_with_focus(
         // switch RESTORED focus to, so the next `reconcile_dashboard_selection`
         // frame computes `focus_changed == false` and the inactive-stays-inactive
         // guard early-returns — keeping `selected_index` None. This generalizes
-        // the steady-state fix (selection_013, where the same pane stays focused
-        // on return) to a tab switch that restores a DIFFERENT pane (orch A →
+        // the steady-state fix (the same pane staying focused on return) to a
+        // tab switch that restores a DIFFERENT pane (orch A →
         // orch B, where each orchestration tab restores its own role): without
         // it, the restored B role reads as a focus transition and re-arms the
         // highlight one frame after the switch cleared it. Only overwrite when
@@ -8695,7 +8574,7 @@ fn is_plain_printable(key: &KeyEvent) -> bool {
 ///
 /// `claimed_before_mode_handler` reports whether one of the dispatch loop's
 /// earlier resolution passes (jump-to-card, the global shortcuts, focused-pane
-/// scroll, tab cycling, mode-tab navigation) took the key. Those all resolve
+/// scroll, tab cycling) took the key. Those all resolve
 /// bindings, and some of them — the scroll keys — legitimately report
 /// `Action::Continue`, so the flag has to be carried rather than re-derived from
 /// `resolved`.
@@ -9216,8 +9095,8 @@ fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> Action {
 
 /// Build the form that follows a confirmed directory pick. For an ordinary
 /// `Ctrl+n` pick (`DirPickerIntent::NewPane`): check for `.dot-agent-deck.toml`
-/// in the selected directory and open the unified new-pane form, with the Mode
-/// field when modes are available. For a manager Add/Edit pick
+/// in the selected directory and open the unified new-pane form, offering its
+/// orchestrations on the Mode row. For a manager Add/Edit pick
 /// (`ScheduleAdd`/`ScheduleEdit`, PRD #170 unify): open the SAME form
 /// MODE-LOCKED to schedule authoring, with the Command pre-filled from the
 /// resolved `default_command` and (on Edit) the row carried for the seed
@@ -9245,9 +9124,14 @@ fn transition_after_dir_pick(ui: &mut UiState) {
             // (unchanged precedence) → recorded `last_command` → blank.
             let command =
                 resolve_seed_command(&ui.config.default_command, ui.last_command.as_deref());
-            let (modes, orchestrations) = match load_project_config(&dir) {
-                Ok(Some(config)) => (config.modes, config.orchestrations),
-                _ => (vec![], vec![]),
+            let orchestrations = match load_project_config(&dir) {
+                Ok(Some(config)) => {
+                    if config.legacy_modes_declared {
+                        surface_legacy_modes_warning(ui, &dir);
+                    }
+                    config.orchestrations
+                }
+                _ => vec![],
             };
             // PRD #140 M4.0: snapshot the daemon's live
             // orchestrations now — before any orchestration can be opened from
@@ -9265,7 +9149,7 @@ fn transition_after_dir_pick(ui: &mut UiState) {
             } else {
                 live_orchestration_cwds_and_titles()
             };
-            NewPaneFormState::new(dir, name, command, modes, orchestrations)
+            NewPaneFormState::new(dir, name, command, orchestrations)
                 .with_live_orchestration_cwds(live_orch_cwds)
                 .with_live_orchestration_names(live_orch_names)
         }
@@ -9325,105 +9209,59 @@ fn record_candidate(command: &str) -> Option<String> {
 /// PRD #80 M8: build the [`NewPaneRequest`] from the current form values.
 /// Shared by the Enter-submit key arm and the `[Submit]` button
 /// ([`Action::FormSubmit`]) so click and key spawn an identical pane.
+///
+/// Every built-in option ([`BuiltinOption`]) spawns a single seeded agent as a
+/// dashboard CARD, carrying its seed on `seed_prompt`; only the seed differs.
+/// (PRD #127 chose a card over a tab for the schedule options, and PRD #220 for
+/// the dispatcher: a single agent has nothing to put beside it.)
 fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> NewPaneRequest {
-    // PRD #220: the dispatcher option — a seeded single agent that knows the
-    // `dot-agent-deck dispatch <name>` verb.
-    //
-    // Spawned as a dashboard CARD (`mode_config: None`) carrying the seed via
-    // `seed_prompt`, exactly like the two schedule options below and for the
-    // same reason PRD #127 gave: a mode tab routes through `render_mode_tab`'s
-    // 50/50 split, so a mode declaring no side panes (which is what the
-    // dispatcher is — `panes: []`, `reactive_panes: 0`) renders the agent at
-    // half width with an empty column beside it. `mode_side_pane_dims` halves
-    // the width unconditionally, so there is no way to opt out of the split
-    // while remaining a mode tab.
-    //
-    // The synthetic `ModeConfig` is still built for the CYCLER (title + chip via
-    // `selected_mode`); only the spawn shape differs. Same split as
-    // `schedule: issues`, whose synthetic mode names the cycler while its seed
-    // rides on the request.
-    if form.is_dispatcher_selected() {
-        return NewPaneRequest {
-            dir: form.dir.clone(),
-            name: form.name.clone(),
-            command: if form.command.trim().is_empty() {
-                resolve_authoring_command(default_command)
-            } else {
-                form.command.clone()
-            },
-            mode_config: None,
-            orchestration_config: None,
-            seed_prompt: build_dispatcher_mode(&form.dir).seed_prompt,
-        };
-    }
-    // PRD #120: the flag-gated "schedule: issues" authoring option — like the
-    // plain "schedule" option it is a throwaway single-agent authoring CARD, but
-    // its seed authors an ISSUE-DISPATCH task (`schedule add --repo …`) instead
-    // of a single-spawn one. Spawn it as a dashboard card carrying the
-    // issue-dispatch seed; `selected_mode()` still returns its synthetic mode for
-    // the cycler title ("schedule: issues mode").
-    if form.is_issue_dispatch_selected() {
-        let command = if form.command.trim().is_empty() {
-            resolve_authoring_command(default_command)
-        } else {
-            form.command.clone()
-        };
-        return NewPaneRequest {
-            dir: form.dir.clone(),
-            name: form.name.clone(),
-            command,
-            mode_config: None,
-            orchestration_config: None,
-            seed_prompt: Some(build_issue_dispatch_authoring_seed(&form.dir)),
-        };
-    }
-    // PRD #127: the built-in "schedule" authoring option is NOT a workload mode
-    // tab — it is a throwaway single-agent authoring CARD that converses to
-    // build a schedule entry. Spawn it as a dashboard card (`mode_config` None)
-    // carrying the authoring seed prompt, so it routes to the dashboard like any
-    // single-agent card instead of through `render_mode_tab`'s 50/50 split. The
-    // form's `selected_mode()` still returns the synthetic mode for the Mode
-    // cycler's title/separator rendering — only the spawned request differs.
-    if form.is_schedule_selected() {
-        // PRD #170 M2.1: the authoring agent must be a real conversational agent
-        // (it has to act on the seed prompt and call the `schedule add` CLI), so
-        // default a blank command to the configured `default_command` (the same
-        // value the form opens pre-filled with) rather than spawning a bare
-        // $SHELL that can't author anything — replacing the former hardcoded
-        // `claude`. Applied HERE — not only in the Enter arm — so BOTH submit
-        // doors (Enter on the final field AND the [Submit] button, which calls
-        // this directly) apply the default.
+    if let Some(builtin) = form.selected_builtin() {
+        // PRD #170 M2.1: the seeded agent must be a real conversational agent
+        // (it has to act on the seed prompt and call the `schedule add` /
+        // `dispatch` CLI), so default a blank command to the configured
+        // `default_command` (the same value the form opens pre-filled with)
+        // rather than spawning a bare $SHELL that can't act on anything. Applied
+        // HERE — not only in the Enter arm — so BOTH submit doors (Enter on the
+        // final field AND the [Submit] button, which calls this directly) apply
+        // the default.
         //
         // PRD #170 round 2 (reviewer finding 1): `default_command` itself can be
         // blank/whitespace for an unconfigured user, so a SECOND-level fallback
         // resolves it to `claude` — `resolve_authoring_command` never returns a
-        // blank, so the schedule authoring agent is always a real agent.
+        // blank, so the seeded agent is always a real agent.
         let command = if form.command.trim().is_empty() {
             resolve_authoring_command(default_command)
         } else {
             form.command.clone()
         };
-        // PRD #170 (unify): derive the seed from `build_schedule_authoring_mode`
-        // threaded with the picked dir (and, on a manager Edit, the existing
-        // row) so the seed carries the working_dir DEFAULT and — for Edit — the
-        // row's current values pre-fill. For an unlocked `Ctrl+n` schedule
-        // selection `schedule_existing` is `None`, so this is the base seed plus
-        // the working_dir line.
+        let seed = match builtin {
+            // PRD #220: a seeded single agent that knows the
+            // `dot-agent-deck dispatch <name>` verb.
+            BuiltinOption::Dispatcher => build_dispatcher_seed(&form.dir),
+            // PRD #120: authors an ISSUE-DISPATCH task (`schedule add --repo …`)
+            // instead of a single-spawn one.
+            BuiltinOption::IssueDispatch => build_issue_dispatch_authoring_seed(&form.dir),
+            // PRD #170 (unify): threaded with the picked dir (and, on a manager
+            // Edit, the existing row) so the seed carries the working_dir
+            // DEFAULT and — for Edit — the row's current values pre-fill. For an
+            // unlocked `Ctrl+n` schedule selection `schedule_existing` is `None`,
+            // so this is the base seed plus the working_dir line.
+            BuiltinOption::Schedule => {
+                build_schedule_authoring_seed(form.schedule_existing.as_ref(), &form.dir)
+            }
+        };
         return NewPaneRequest {
             dir: form.dir.clone(),
             name: form.name.clone(),
             command,
-            mode_config: None,
             orchestration_config: None,
-            seed_prompt: build_schedule_authoring_mode(form.schedule_existing.as_ref(), &form.dir)
-                .seed_prompt,
+            seed_prompt: Some(seed),
         };
     }
     NewPaneRequest {
         dir: form.dir.clone(),
         name: form.name.clone(),
         command: form.command.clone(),
-        mode_config: form.selected_mode().cloned(),
         orchestration_config: form.selected_orchestration().cloned(),
         seed_prompt: None,
     }
@@ -9558,16 +9396,9 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
 }
 
 // ---------------------------------------------------------------------------
-// Reactive pane routing — extract new Bash commands from session events
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // TUI entry point
 // ---------------------------------------------------------------------------
 
-/// Tear down every non-dashboard tab (mode + orchestration) and unregister
-/// their pane IDs from `state`.
-///
 /// PRD #80: control-flow signal returned by [`dispatch_action`]. Most actions
 /// mutate state and yield [`Flow::Continue`]; the quit/stop/detach actions
 /// yield [`Flow::Break`] so the caller breaks the TUI's outer loop.
@@ -9789,10 +9620,7 @@ pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) 
 ///   keystroke would never reach the PTY. Un-resolving it here is what lets it
 ///   fall through to `ForwardToPane([0x1a])`, exactly as `Ctrl+l` stays
 ///   readline's clear-screen and `Ctrl+w` stays word-delete while you type.
-/// - **Tab type** — a Mode tab is two pane regions (agent left, side panes
-///   right), not sidebar-plus-panes, so "hide the sidebar and take the frame"
-///   has no meaning there and claiming the chord would be pure loss. The
-///   Dashboard and an Orchestration tab ARE the same shape — both are a card
+/// - **Tab type** — the Dashboard and an Orchestration tab ARE the same shape — both are a card
 ///   sidebar beside a stack of agent panes, and they even share
 ///   `right_column_pane_dims` — so both zoom.
 ///
@@ -9820,25 +9648,6 @@ fn cycle_tab_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
         return Some(Action::CycleTabPrev);
     }
     None
-}
-
-/// PRD #80 / #40: map an in-tab navigation key on a mode tab to its [`Action`].
-/// The configurable move_down/move_up actions (defaults `j`/`k`) drive
-/// selection, with the Down/Up arrows kept as non-configurable aliases;
-/// Enter/Esc are mode-fixed. The caller only invokes this when the active tab
-/// is a `Tab::Mode`, so the returned action is always meaningful there.
-fn mode_tab_nav_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
-    if kb.matches(KbAction::MoveDown, key) || key.code == KeyCode::Down {
-        return Some(Action::ModeTabSelectNext);
-    }
-    if kb.matches(KbAction::MoveUp, key) || key.code == KeyCode::Up {
-        return Some(Action::ModeTabSelectPrev);
-    }
-    match key.code {
-        KeyCode::Enter => Some(Action::ModeTabFocus),
-        KeyCode::Esc => Some(Action::ModeTabReset),
-        _ => None,
-    }
 }
 
 /// PRD #80: a clickable affordance that carries its keyboard shortcut inline
@@ -9968,7 +9777,7 @@ pub fn hit_test_button(button_rects: &[(Action, Rect)], col: u16, row: u16) -> O
 /// Deliberately an EXHAUSTIVE `match` with no `_` arm: this guard was originally
 /// a local `bool` in [`run_tui`], and `ScheduledTasks` — added long after — was
 /// simply forgotten, so wheeling over the Schedules dialog scrolled the
-/// mode-tab side pane behind it (issue #142). A wildcard arm would let the next
+/// pane behind it (issue #142). A wildcard arm would let the next
 /// new `UiMode` repeat that silently; without one, adding a variant fails to
 /// COMPILE until its modality is declared here.
 fn overlay_blocks_mouse(mode: &UiMode) -> bool {
@@ -10066,44 +9875,13 @@ fn hit_test_card(card_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<usi
         .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(*idx))
 }
 
-/// Unwind **every** per-pane registration a freshly spawned pane accumulated,
-/// for a spawn that succeeded and is then abandoned.
-///
-/// A pane that is created and then given up on (its mode tab failed to open)
-/// has already been recorded in six places by the time the failure is known.
-/// Removing them inline, arm by arm, is how issue #308's `pane_declared_agent`
-/// came to join a leak that five sibling maps were already in — and five of
-/// those are *card-visible*, including the placeholder session, which keeps
-/// rendering a dashboard card for a pane that no longer exists. Every abandon
-/// path routes through here so a future per-pane map is added once, rather
-/// than silently omitted from one caller.
-///
-/// Call this **only once the pane is genuinely gone**. A `close_pane` that
-/// FAILED leaves the pane live, and a live pane must keep its card and
-/// metadata so the user can still see it and retry (the same rule PRD #92 F4
-/// applies to an explicit close).
-fn rollback_abandoned_pane(pane_id: &str, ui: &mut UiState, state: &SharedState) {
-    {
-        let mut st = state.blocking_write();
-        // The placeholder session inserted right after the spawn — plus any
-        // session the daemon has already bound to this pane — would otherwise
-        // outlive the pane as a ghost card.
-        st.remove_sessions_for_pane(pane_id);
-        st.unregister_pane(pane_id);
-    }
-    ui.pane_metadata.remove(pane_id);
-    ui.pane_display_names.remove(pane_id);
-    ui.pane_names.remove(pane_id);
-    ui.pane_declared_agent.remove(pane_id);
-}
-
 /// PRD #80 M3: close the tab at `idx` and reconcile shared state — unregister
 /// every successfully-closed pane, drop the matching sessions (keeping any that
 /// failed to close so the user can retry), clean their metadata, and resweep the
 /// dashboard layout.
 ///
 /// PRD #241: the ONE tab teardown. Every door that destroys a tab — the `Ctrl+W`
-/// chord on an active Mode/Orchestration tab, a `[×]` click on the tab strip,
+/// chord on an active orchestration tab, a `[×]` click on the tab strip,
 /// and a confirmed close on a dashboard card whose pane lives inside such a tab
 /// — resolves to [`ClosePlan::Tab`] and lands here, so they cannot drift apart
 /// in what they remove or what they report.
@@ -10176,7 +9954,7 @@ fn close_tab_by_index(
             ));
         }
     }
-    // Closing the active mode/orchestration tab returns focus to the
+    // Closing the active orchestration tab returns focus to the
     // dashboard, so leave PaneInput just like the Ctrl+W path does.
     if ui.mode == UiMode::PaneInput {
         ui.mode = UiMode::Normal;
@@ -10186,7 +9964,7 @@ fn close_tab_by_index(
     {
         ui.selected_index = Some(idx - 1);
     }
-    // PRD #89 M1.2 — closing a mode/orchestration tab (via `[×]` click or the
+    // PRD #89 M1.2 — closing an orchestration tab (via `[×]` click or the
     // CloseTab action) is a meaningful state change; keep the snapshot fresh.
     ui.mark_session_dirty();
 }
@@ -10411,18 +10189,10 @@ fn dispatch_action(
         // Both card-shaped tab kinds are handled, because they are the same
         // shape: a card sidebar on the left and a stack of agent panes on the
         // right, differing only in the percentage (33/67 vs a `Ctrl+l`-toggled
-        // 34/66-or-25/75) and in which panes they scope to. A Mode tab is
-        // deliberately absent — it is two pane regions rather than
-        // sidebar-plus-panes, so "hide the sidebar" has no meaning there; see
-        // the follow-up issue referenced in the PRD.
-        //
-        // The `match` arm has the same job the split's `matches!` guard does —
-        // unreachable on a Mode tab (`scope_zoom` un-resolves the key there),
-        // but a no-op rather than a surprise if that ever changes.
+        // 34/66-or-25/75) and in which panes they scope to.
         Action::ToggleZoom => {
             let flag = match tab_manager.active_tab_mut() {
                 Tab::Orchestration { zoomed, .. } | Tab::Dashboard { zoomed, .. } => Some(zoomed),
-                Tab::Mode { .. } => None,
             };
             if let Some(zoomed) = flag {
                 *zoomed = !*zoomed;
@@ -10468,19 +10238,6 @@ fn dispatch_action(
         }
         // Ctrl+d from anywhere else: leave for command mode.
         Action::DetachToNormal => {
-            // Re-suppress the prompt in reactive panes when leaving PaneInput
-            // so automated output stays clean.
-            if ui.mode == UiMode::PaneInput
-                && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                && let Some(focused_id) = embedded.focused_pane_id()
-                && let Tab::Mode { mode_manager, .. } = tab_manager.active_tab_mut()
-                && mode_manager.is_reactive_pane(&focused_id)
-            {
-                let _ = pane.write_to_pane(
-                    &focused_id,
-                    "export PS1= PS2= PROMPT= && printf '\\x1b[3J\\x1b[2J\\x1b[H'",
-                );
-            }
             ui.mode = UiMode::Normal;
             ui.status_message = None;
         }
@@ -10572,8 +10329,7 @@ fn dispatch_action(
                         ));
                     }
                 }
-                // A whole Mode/Orchestration tab: the agent pane plus every side
-                // or role pane. Reached both from a tab that was active when the
+                // A whole orchestration tab: every role pane. Reached both from a tab that was active when the
                 // chord landed AND from a dashboard card whose pane turns out to
                 // live in such a tab — which is why the dialog said "this tab
                 // and all its panes" either way.
@@ -10636,7 +10392,7 @@ fn dispatch_action(
             }
             // PRD #89 M1.3 — Ctrl+W close-pane is a detach path; flush a fresh
             // snapshot reflecting the surviving workspace (every sub-path above:
-            // closable-tab close, mode/orchestration tab close, plain pane).
+            // orchestration tab close, plain pane).
             ui.mark_session_dirty();
         }
         // Ctrl+PageDown: next tab (clamped, gated on a visible tab bar).
@@ -10751,116 +10507,6 @@ fn dispatch_action(
             focus_deck(idx, ui, filtered, snapshot, state, pane);
             // PRD #84 M4: focusing a card can change which Stacked pane expands;
             // the pre-draw `resize_panes_to_layout` re-sizes it next frame.
-        }
-        // Mode tab in-tab navigation (j/Down): move side-pane focus down.
-        // PRD #83: focus is tracked by stable pane id (`focused_pane_id`), so
-        // translate it to a positional slot for the j/k arithmetic, step, then
-        // store the new id back.
-        Action::ModeTabSelectNext => {
-            if let Tab::Mode {
-                focused_pane_id,
-                mode_manager,
-                agent_pane_id,
-                ..
-            } = tab_manager.active_tab_mut()
-            {
-                let side_ids = mode_manager.managed_pane_ids();
-                let side_count = side_ids.len();
-                let cur: Option<usize> = focused_pane_id
-                    .as_ref()
-                    .and_then(|id| side_ids.iter().position(|s| s == id));
-                let next = match cur {
-                    None => {
-                        if side_count > 0 {
-                            Some(0)
-                        } else {
-                            None
-                        }
-                    }
-                    Some(i) if i + 1 < side_count => Some(i + 1),
-                    Some(_) => None, // wrap back to agent pane
-                };
-                *focused_pane_id = next.map(|i| side_ids[i].clone());
-                let focus_id = focused_pane_id
-                    .clone()
-                    .unwrap_or_else(|| agent_pane_id.clone());
-                let _ = pane.focus_pane(&focus_id);
-            }
-        }
-        // Mode tab in-tab navigation (k/Up): move side-pane focus up.
-        Action::ModeTabSelectPrev => {
-            if let Tab::Mode {
-                focused_pane_id,
-                mode_manager,
-                agent_pane_id,
-                ..
-            } = tab_manager.active_tab_mut()
-            {
-                let side_ids = mode_manager.managed_pane_ids();
-                let side_count = side_ids.len();
-                let cur: Option<usize> = focused_pane_id
-                    .as_ref()
-                    .and_then(|id| side_ids.iter().position(|s| s == id));
-                let next = match cur {
-                    None => {
-                        if side_count > 0 {
-                            Some(side_count - 1)
-                        } else {
-                            None
-                        }
-                    }
-                    Some(0) => None,
-                    Some(i) => Some(i - 1),
-                };
-                *focused_pane_id = next.map(|i| side_ids[i].clone());
-                let focus_id = focused_pane_id
-                    .clone()
-                    .unwrap_or_else(|| agent_pane_id.clone());
-                let _ = pane.focus_pane(&focus_id);
-            }
-        }
-        // Mode tab in-tab navigation (Enter): focus the selected side/agent pane.
-        Action::ModeTabFocus => {
-            if let Tab::Mode {
-                focused_pane_id,
-                mode_manager,
-                agent_pane_id,
-                ..
-            } = tab_manager.active_tab_mut()
-            {
-                let target_pane_id = focused_pane_id
-                    .clone()
-                    .unwrap_or_else(|| agent_pane_id.clone());
-                let is_reactive = mode_manager.is_reactive_pane(&target_pane_id);
-                if pane.focus_pane(&target_pane_id).is_ok() {
-                    ui.mode = UiMode::PaneInput;
-                    // Restore a minimal prompt so the user can interact with the
-                    // shell in this reactive pane.
-                    if is_reactive {
-                        let _ = pane
-                            .write_to_pane(&target_pane_id, "export PS1='$ ' PS2='> ' PROMPT='$ '");
-                    }
-                    ui.status_message = Some((
-                        format!(
-                            "PaneInput mode — type to interact, {} for dashboard",
-                            display_notation(&ui.keybindings, KbAction::Dashboard)
-                        ),
-                        std::time::Instant::now(),
-                    ));
-                }
-            }
-        }
-        // Mode tab in-tab navigation (Esc): reset focus back to the agent pane.
-        Action::ModeTabReset => {
-            if let Tab::Mode {
-                focused_pane_id,
-                agent_pane_id,
-                ..
-            } = tab_manager.active_tab_mut()
-            {
-                *focused_pane_id = None;
-                let _ = pane.focus_pane(agent_pane_id);
-            }
         }
         Action::Quit => return Flow::Break,
         Action::DetachAndQuit => {
@@ -11320,33 +10966,16 @@ fn dispatch_action(
                         }
                     }
                 } else {
-                    // For mode tabs, create the agent pane as an empty
-                    // shell so the PTY can be resized to the correct
-                    // dimensions before the command starts.  This avoids
-                    // the process seeing the default 80×24 size.
-                    let is_mode = req.mode_config.is_some();
                     // PRD #76 M2.13: infer agent_type from the form's command
-                    // (the canonical "what runs in this pane" hint) — use
-                    // `req.command` directly so it covers both the plain-card
-                    // flow and mode panes (which spawn empty and run the command
-                    // later via `write_to_pane`). The inferred type goes into the
-                    // daemon-bound spawn options so a remote reconnect's
-                    // hydration carries it; the local placeholder stays at `None`
-                    // until the first `SessionStart` hook fires (pre-M2.13
-                    // contract).
-                    //
-                    // Issue #308: for a MODE the command is typed in the form
-                    // while the identity may be declared in `[[modes]]`, so the
-                    // declaration answers first — that is the only thing that
-                    // can identify a `devbox run codex-big` agent pane, and it
-                    // drives the (daemon-side) wrap as well as the badge.
-                    let spawn_agent_type = match req.mode_config.as_ref() {
-                        Some(mode) if !req.command.is_empty() => {
-                            mode.resolved_agent_type(req.command.as_str())
-                        }
-                        Some(mode) => mode.declared_agent_type(),
-                        None if req.command.is_empty() => None,
-                        None => AgentType::from_command(Some(req.command.as_str())),
+                    // (the canonical "what runs in this pane" hint). The
+                    // inferred type goes into the daemon-bound spawn options so
+                    // a remote reconnect's hydration carries it; the local
+                    // placeholder stays at `None` until the first `SessionStart`
+                    // hook fires (pre-M2.13 contract).
+                    let spawn_agent_type = if req.command.is_empty() {
+                        None
+                    } else {
+                        AgentType::from_command(Some(req.command.as_str()))
                     };
                     // PRD #20 M8: Wrapper-strategy agents (Codex now; Gemini
                     // later) launch WRAPPED so their stdout is monitored
@@ -11364,11 +10993,8 @@ fn dispatch_action(
                     // build names ITSELF as the wrapper, a daemon of a different
                     // build cannot recognise that name and wraps a second time.
                     // Leaving the rewrite to the daemon means every daemon names
-                    // its own binary, in any TUI/daemon pairing. Mode panes do
-                    // not come through here (`cmd` is `None` for them): their
-                    // command is typed into a shell, which `wrap_agent_command`
-                    // still wraps TUI-side because no daemon rewrite follows.
-                    let cmd = if req.command.is_empty() || is_mode {
+                    // its own binary, in any TUI/daemon pairing.
+                    let cmd = if req.command.is_empty() {
                         None
                     } else {
                         Some(req.command.as_str())
@@ -11383,28 +11009,14 @@ fn dispatch_action(
                     // so the UI maps below mirror EXACTLY what the daemon has —
                     // no separate normalization helper to drift (M2.11 fixup 4).
                     let form_name = Some(req.name.as_str());
-                    // PRD #76 M2.12: tag the agent pane with its
-                    // mode-tab membership so the daemon-side
-                    // registry can echo it back via `list_agents`
-                    // on the next reconnect, letting the
-                    // hydration partition rebuild this mode tab
-                    // instead of stranding the agent on the
-                    // dashboard.
-                    let tab_membership = req.mode_config.as_ref().map(|m| TabMembership::Mode {
-                        name: m.name.clone(),
-                    });
                     // PRD #76 M2.15: pre-compute spawn dims via the
                     // shared layout helpers so the agent PTY opens
                     // at the eventual size (no 24×80 → resize
-                    // hiccup). Mode-tab panes use the mode-agent
-                    // layout (left half × height-minus-chrome);
-                    // dashboard panes use the dashboard right-67%
-                    // column layout with `is_focused=true` (this
-                    // path immediately focuses the new pane via
+                    // hiccup): the dashboard right-67% column
+                    // layout with `is_focused=true` (this path
+                    // immediately focuses the new pane via
                     // `focus_pane(&new_id)` below).
-                    let (spawn_rows, spawn_cols) = if req.mode_config.is_some() {
-                        mode_agent_pane_dims(frame_area)
-                    } else {
+                    let (spawn_rows, spawn_cols) = {
                         let embedded_pane_count = pane
                             .as_any()
                             .downcast_ref::<EmbeddedPaneController>()
@@ -11426,7 +11038,9 @@ fn dispatch_action(
                         Some(&dir_str),
                         AgentSpawnOptions {
                             display_name: form_name,
-                            tab_membership,
+                            // Issue #1199: a dashboard card has no tab
+                            // membership.
+                            tab_membership: None,
                             rows: spawn_rows,
                             cols: spawn_cols,
                             agent_type: spawn_agent_type,
@@ -11458,26 +11072,13 @@ fn dispatch_action(
                             ui.pane_display_names
                                 .insert(new_id.clone(), resolved_name.clone());
                             ui.pane_names.insert(new_id.clone(), resolved_name);
-                            // Issue #308: a mode may declare what its agent pane
-                            // runs, since that pane's command is typed in this
-                            // form rather than written in the config. A plain
-                            // dashboard card declares nothing and is unchanged.
-                            if let Some(declared) = req
-                                .mode_config
-                                .as_ref()
-                                .and_then(|mode| mode.declared_agent_type())
-                            {
-                                ui.pane_declared_agent.insert(new_id.clone(), declared);
-                            }
-                            let mode_name_for_save =
-                                req.mode_config.as_ref().map(|m| m.name.clone());
                             ui.pane_metadata.insert(
                                 new_id.clone(),
                                 config::SavedPane {
                                     dir: dir_str.clone(),
                                     name: req.name.clone(),
                                     command: req.command,
-                                    mode: mode_name_for_save,
+                                    mode: None,
                                     // PRD #89 M2b.2: capture is a later step
                                     // (M2b.3); the schema field exists now so
                                     // older/newer snapshots round-trip.
@@ -11485,198 +11086,67 @@ fn dispatch_action(
                                 },
                             );
                             // PRD #196: this is a successful INTERACTIVE spawn
-                            // (the orchestration path has its own branch above).
-                            // DEFER committing the submit candidate into
-                            // `last_command` until the spawn GENUINELY succeeds.
-                            // The plain-card path always creates its pane here, but
-                            // a mode spawn can still fail in `open_mode_tab` below —
-                            // so each genuine-success path calls
-                            // `commit_pending_last_command()`, and the
-                            // `open_mode_tab` Err arm deliberately does NOT, so a
-                            // failed mode-spawn never pollutes `last_command`.
-                            // `pending_last_command` is `None` for authoring-mode /
-                            // empty-command submits, so those never overwrite it.
-                            // PRD #89 M1.2 — a new dashboard pane / mode tab is a
+                            // (the orchestration path has its own branch above);
+                            // the plain card was genuinely created, so commit the
+                            // submit candidate into `last_command` below.
+                            // `pending_last_command` is `None` for empty-command
+                            // submits, so those never overwrite it.
+                            // PRD #89 M1.2 — a new dashboard pane is a
                             // meaningful state change; keep the snapshot fresh.
                             ui.mark_session_dirty();
 
-                            if let Some(mode_config) = req.mode_config {
-                                // Mode selected — open a mode tab.
-                                let mode_name = mode_config.name.clone();
-                                // PRD #76 M2.15 fixup pass 2 G1 — compute
-                                // side-pane dims so the side panes spawn
-                                // at the viewport-derived size, not the
-                                // 24×80 default.
-                                let total_side_count =
-                                    (mode_config.panes.len() + mode_config.reactive_panes) as u16;
-                                let side_pane_dims =
-                                    mode_side_pane_dims(frame_area, total_side_count);
-                                match tab_manager.open_mode_tab(
-                                    &mode_config,
-                                    &dir_str,
-                                    new_id.clone(),
-                                    side_pane_dims,
-                                ) {
-                                    Ok((_tab_idx, side_ids)) => {
-                                        for id in &side_ids {
-                                            state.blocking_write().register_pane(id.clone());
-                                        }
-                                        let _ = pane.focus_pane(&new_id);
-                                        ui.mode = UiMode::PaneInput;
-                                        // PRD #84 M4: the agent + side panes were
-                                        // already spawned at the mode-tab dims
-                                        // (above), so commands start at the right
-                                        // PTY size; the pre-draw
-                                        // `resize_panes_to_layout` reconciles the
-                                        // exact rect next frame. No resize here.
-                                        let _ = tab_manager.start_mode_commands();
-                                        // Send the agent pane command after resize
-                                        // so it starts at the correct PTY dimensions.
-                                        if let Some(ref init_cmd) = mode_config.init_command {
-                                            let _ = pane.write_to_pane(&new_id, init_cmd);
-                                        }
-                                        // PRD #127 M3.1: a mode carrying a
-                                        // `seed_prompt` enqueues it for GATED
-                                        // delivery to the agent pane — drained by
-                                        // `process_pending_seed_prompts` once the
-                                        // agent signals readiness (SessionStart)
-                                        // plus the spawn-time buffer, unlike
-                                        // `init_command` (written immediately
-                                        // above). A mode without `seed_prompt`
-                                        // enqueues nothing (no-op for plain modes).
-                                        if let Some(ref seed) = mode_config.seed_prompt {
-                                            ui.pending_seed_prompts.push(PendingSeedPrompt {
-                                                pane_id: new_id.clone(),
-                                                prompt: seed.clone(),
-                                                created_at: std::time::Instant::now(),
-                                                ready_since: None,
-                                            });
-                                            // PRD #20 R20-003/004: capture the
-                                            // queued-for agent identity NOW so a
-                                            // respawn/rebind before delivery is
-                                            // caught daemon-side, and stamp a stable
-                                            // delivery id for idempotent retries.
-                                            capture_prompt_delivery(ui, &new_id, pane);
-                                        }
-                                        if let Some(saved) = ui.pane_metadata.get(&new_id) {
-                                            let agent_cmd = saved.command.clone();
-                                            if !agent_cmd.is_empty() {
-                                                // PRD #20 blocker-3: this mode path
-                                                // spawns a bare shell then TYPES the
-                                                // command in, so it bypasses the
-                                                // common spawn-boundary wrap — apply
-                                                // the Wrapper strategy to the typed
-                                                // launch line here. The persisted
-                                                // `saved.command` stays bare (only
-                                                // the injected line is transformed).
-                                                let launch = wrap_agent_command(
-                                                    &agent_cmd,
-                                                    mode_config.declared_agent_type(),
-                                                );
-                                                let _ = pane.write_to_pane(&new_id, &launch);
-                                            }
-                                        }
-                                        ui.status_message = Some((
-                                            format!("Activated mode: {mode_name}"),
-                                            std::time::Instant::now(),
-                                        ));
-                                        // PRD #196: the mode tab genuinely opened —
-                                        // only now commit the submit candidate as
-                                        // the global last-command (the Err arm below
-                                        // must never reach this).
-                                        ui.commit_pending_last_command();
-                                    }
-                                    Err(e) => {
-                                        // Issue #308 follow-up: the spawn SUCCEEDED
-                                        // and registered this pane id in six places
-                                        // before `open_mode_tab` failed. Unwind all
-                                        // six together via the shared helper — a
-                                        // user who retries a broken mode used to
-                                        // grow every one of those maps by an entry
-                                        // per attempt for the life of the session,
-                                        // and the placeholder session left a card
-                                        // for a pane that no longer existed.
-                                        //
-                                        // Gated on the close actually succeeding: if
-                                        // `close_pane` fails the pane is still live,
-                                        // so its card and metadata must stay visible
-                                        // and recoverable rather than being purged
-                                        // out from under it (PRD #92 F4).
-                                        match pane.close_pane(&new_id) {
-                                            Ok(()) => rollback_abandoned_pane(&new_id, ui, state),
-                                            Err(close_err) => tracing::warn!(
-                                                pane_id = %new_id,
-                                                error = %close_err,
-                                                "mode activation failed and the pane could not be \
-                                                 closed — pane state preserved"
-                                            ),
-                                        }
-                                        // PRD #196: the mode-tab spawn FAILED — do
-                                        // NOT commit the submit candidate, so a
-                                        // failed mode-spawn never pollutes
-                                        // `last_command`. `pending_last_command`
-                                        // stays untouched and is (re)set before the
-                                        // next `Action::SpawnPane`.
-                                        ui.status_message = Some((
-                                            format!("Mode activation failed: {e}"),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
-                                }
-                            } else {
-                                // No mode — regular dashboard card. The card lives on the Dashboard
-                                // (tab 0), so make the Dashboard active before focusing/selecting it —
-                                // otherwise, when launched from an orchestration/mode tab, the new card
-                                // lands on a tab the user isn't viewing. (Orchestration/mode creation
-                                // already switch to their own new tab via open_*_tab.)
-                                //
-                                // Capture the leaving tab's live focus before the switch, mirroring
-                                // the established switch-out invariant (every other production
-                                // `switch_to` — src/ui.rs:3059, 4074, 4625, and the
-                                // `switch_tab_with_focus` helper — is preceded by
-                                // `capture_focus_on_switch_out`). Without it, a card created from a
-                                // non-Dashboard tab never snapshots that tab's `focused_pane_id`, so
-                                // its prior focus goes stale and fails to restore on return. Safe
-                                // here: focus is still the leaving tab's pane at this point, and the
-                                // `pane.focus_pane(&new_id)` below then moves focus to the new card.
-                                tab_manager.capture_focus_on_switch_out();
-                                tab_manager.switch_to(0);
-                                let _ = pane.focus_pane(&new_id);
-                                ui.mode = UiMode::PaneInput;
-                                // PRD #113: the freshly-created card is active.
-                                ui.selected_index = Some(filtered.len());
-                                // PRD #84 M4: the pane was spawned at the
-                                // dashboard layout dims (above); the pre-draw
-                                // `resize_panes_to_layout` reconciles it to the
-                                // exact rect next frame. No resize here.
-                                // PRD #127: a single-agent card carrying a
-                                // `seed_prompt` (the built-in "schedule"
-                                // authoring session) enqueues it for the SAME
-                                // gated delivery modes use — drained by
-                                // `process_pending_seed_prompts` once the agent
-                                // signals readiness (SessionStart) plus the
-                                // spawn-time buffer. A card without a seed
-                                // enqueues nothing (no-op for ordinary panes).
-                                if let Some(seed) = req.seed_prompt {
-                                    ui.pending_seed_prompts.push(PendingSeedPrompt {
-                                        pane_id: new_id.clone(),
-                                        prompt: seed,
-                                        created_at: std::time::Instant::now(),
-                                        ready_since: None,
-                                    });
-                                    // PRD #20 R20-003/004: capture the queued-for
-                                    // agent identity + a stable delivery id now.
-                                    capture_prompt_delivery(ui, &new_id, pane);
-                                }
-                                ui.status_message = Some((
-                                    format!("Created agent {new_id} in {dir_str}"),
-                                    std::time::Instant::now(),
-                                ));
-                                // PRD #196: the plain card was genuinely created on
-                                // this path — commit the submit candidate as the
-                                // global last-command.
-                                ui.commit_pending_last_command();
+                            // A regular dashboard card. The card lives on the Dashboard
+                            // (tab 0), so make the Dashboard active before focusing/selecting it —
+                            // otherwise, when launched from an orchestration tab, the new card
+                            // lands on a tab the user isn't viewing. (Orchestration creation
+                            // already switches to its own new tab via open_*_tab.)
+                            //
+                            // Capture the leaving tab's live focus before the switch, mirroring
+                            // the established switch-out invariant (every other production
+                            // `switch_to` — src/ui.rs:3059, 4074, 4625, and the
+                            // `switch_tab_with_focus` helper — is preceded by
+                            // `capture_focus_on_switch_out`). Without it, a card created from a
+                            // non-Dashboard tab never snapshots that tab's `focused_pane_id`, so
+                            // its prior focus goes stale and fails to restore on return. Safe
+                            // here: focus is still the leaving tab's pane at this point, and the
+                            // `pane.focus_pane(&new_id)` below then moves focus to the new card.
+                            tab_manager.capture_focus_on_switch_out();
+                            tab_manager.switch_to(0);
+                            let _ = pane.focus_pane(&new_id);
+                            ui.mode = UiMode::PaneInput;
+                            // PRD #113: the freshly-created card is active.
+                            ui.selected_index = Some(filtered.len());
+                            // PRD #84 M4: the pane was spawned at the
+                            // dashboard layout dims (above); the pre-draw
+                            // `resize_panes_to_layout` reconciles it to the
+                            // exact rect next frame. No resize here.
+                            // PRD #127: a single-agent card carrying a
+                            // `seed_prompt` (a built-in option — see
+                            // `BuiltinOption`) enqueues it for GATED
+                            // delivery — drained by
+                            // `process_pending_seed_prompts` once the agent
+                            // signals readiness (SessionStart) plus the
+                            // spawn-time buffer. A card without a seed
+                            // enqueues nothing (no-op for ordinary panes).
+                            if let Some(seed) = req.seed_prompt {
+                                ui.pending_seed_prompts.push(PendingSeedPrompt {
+                                    pane_id: new_id.clone(),
+                                    prompt: seed,
+                                    created_at: std::time::Instant::now(),
+                                    ready_since: None,
+                                });
+                                // PRD #20 R20-003/004: capture the queued-for
+                                // agent identity + a stable delivery id now.
+                                capture_prompt_delivery(ui, &new_id, pane);
                             }
+                            ui.status_message = Some((
+                                format!("Created agent {new_id} in {dir_str}"),
+                                std::time::Instant::now(),
+                            ));
+                            // PRD #196: the plain card was genuinely created on
+                            // this path — commit the submit candidate as the
+                            // global last-command.
+                            ui.commit_pending_last_command();
                         }
                         Err(e) => {
                             ui.status_message =
@@ -12099,7 +11569,7 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
     // last_command is set, so closing every pane doesn't discard the recorded
     // command; clear only when BOTH are empty (today's no-state behavior).
     // Issue #949: the remembered position joins that condition, so a deck whose
-    // panes all live in mode/orchestration tabs (no `pane_metadata` entry of
+    // panes all live in orchestration tabs (no `pane_metadata` entry of
     // their own) does not have its position deleted by the very same write that
     // was meant to record it. `capture_focus_snapshot` answers `None` for a
     // Dashboard-only deck, so a genuinely stateless deck still clears the file.
@@ -12184,8 +11654,7 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
 ///   exists as saved.
 ///
 /// On `Err`, the caller surfaces the reason via `session_warnings` and falls
-/// back to a PLAIN dashboard pane (never a half-broken orchestration tab),
-/// mirroring the mode-tab drift Path D/E fallback (PRD #69).
+/// back to a PLAIN dashboard pane (never a half-broken orchestration tab).
 ///
 /// On `Ok`, returns the resolved config AND the validated start-role index to
 /// honor (the SAVED cursor, bounds-checked — PRD #89 review-fix F2/F3), so the
@@ -12698,17 +12167,6 @@ fn handle_key_event(
         .and_then(|i| filtered.get(i))
         .map(|(id, _)| (*id).clone());
 
-    // On a mode tab in Normal mode, move_down/move_up (defaults j/k,
-    // plus Down/Up arrows) navigate side panes, Enter focuses, Esc
-    // resets. `is_ctrl_c` excluded for the same safety-net reason.
-    if action.is_none()
-        && !is_ctrl_c
-        && ui.mode == UiMode::Normal
-        && matches!(tab_manager.active_tab(), Tab::Mode { .. })
-    {
-        action = mode_tab_nav_action(&kb, &key);
-    }
-
     // PRD #341 M3: did one of the resolution passes above claim the key?
     // Recorded here, at the boundary between "a binding took it" and "the
     // per-mode handler gets it", because some of those passes report
@@ -13025,9 +12483,7 @@ pub fn run_tui(
     // Issue #949 — the pane ids the DAEMON supplied on this startup, which is
     // exactly the set whose ids are a stable identity across processes (the
     // daemon captured each into its agent's `DOT_AGENT_DECK_PANE_ID` and echoed
-    // it back on `list_agents`). Empty on the daemon-empty path, and it
-    // deliberately excludes a Mode tab's SIDE panes, which the hydration block
-    // below spawns fresh from the project config rather than adopting. Consumed
+    // it back on `list_agents`). Empty on the daemon-empty path. Consumed
     // by `SavedFocus::retain_pane_ids` at the restore seam after both blocks.
     let mut daemon_pane_ids: HashSet<String> = HashSet::new();
 
@@ -13090,15 +12546,6 @@ pub fn run_tui(
                 .insert(h.pane_id.clone(), display_name.clone());
             ui.pane_names.insert(h.pane_id.clone(), display_name);
             if let Some(dir) = h.cwd.clone() {
-                // Mode buckets need a `SavedPane.mode` hint for the
-                // existing tab-restore path elsewhere in the UI; the
-                // hydration dispatcher below also reads this map for
-                // mode tab rebuild, so populate `.mode` from
-                // tab_membership rather than leaving it None.
-                let mode_hint = match &h.tab_membership {
-                    Some(TabMembership::Mode { name }) => Some(name.clone()),
-                    _ => None,
-                };
                 ui.pane_metadata.insert(
                     h.pane_id.clone(),
                     config::SavedPane {
@@ -13109,7 +12556,7 @@ pub fn run_tui(
                             .cloned()
                             .unwrap_or_else(|| h.agent_id.clone()),
                         command: String::new(),
-                        mode: mode_hint,
+                        mode: None,
                         // PRD #89 M2b.2: schema-only; orchestration capture
                         // from a warm daemon is handled by hydration, not the
                         // snapshot, so leave None here.
@@ -13120,8 +12567,8 @@ pub fn run_tui(
         }
 
         // PRD #76 M2.12: partition hydrated panes by tab_membership and
-        // rebuild mode/orchestration tabs from the project config. Panes
-        // claiming a mode/orchestration that the cwd's project config
+        // rebuild orchestration tabs from the project config. Panes
+        // claiming an orchestration that the cwd's project config
         // doesn't know about (config-drift case from design decision 5)
         // get logged loudly and left on the dashboard rather than getting
         // a limbo tab.
@@ -13129,29 +12576,36 @@ pub fn run_tui(
         // Emit deferred diagnostics from the pure partition helper
         // (M2.12 fixup reviewer #3: partition stays I/O-free; logging
         // lives at the hydration call site).
+        let mut legacy_mode_names: Vec<&str> = Vec::new();
         for rejection in &partition.rejections {
             match rejection {
-                HydrationRejection::DuplicateMode {
+                HydrationRejection::LegacyWorkspaceMode {
                     cwd,
                     mode_name,
                     agent_id,
                     pane_id,
                 } => {
-                    tracing::error!(
-                        cwd = %cwd,
-                        mode = %mode_name,
+                    let (safe_cwd, safe_mode) = legacy_mode_hydration_log_fields(cwd, mode_name);
+                    tracing::warn!(
+                        cwd = %safe_cwd,
+                        mode = %safe_mode,
                         agent_id = %agent_id,
                         pane_id = %pane_id,
-                        "hydration: duplicate Mode tab_membership for (cwd, name); dropping to dashboard"
+                        "hydration: pane was started as a workspace mode's agent pane; workspace modes were removed (#1199), placing it on the dashboard"
                     );
+                    if !legacy_mode_names.contains(&mode_name.as_str()) {
+                        legacy_mode_names.push(mode_name);
+                    }
                 }
             }
+        }
+        if let Some(warning) = legacy_mode_hydration_warning(&legacy_mode_names) {
+            ui.session_warnings.push(warning);
         }
         // Cache cwd → project config so the lookup happens once per
         // distinct cwd regardless of how many buckets share it. A load error
         // is kept as `Err` (issue #554, Qodo on PR #1281) so the orchestration
-        // loop can tell it apart from an absent file; mode tabs still treat
-        // both as "no config".
+        // loop can tell it apart from an absent file.
         type ConfigLookup = Result<Option<crate::project_config::ProjectConfig>, String>;
         let mut config_cache: std::collections::HashMap<String, ConfigLookup> =
             std::collections::HashMap::new();
@@ -13165,58 +12619,13 @@ pub fn run_tui(
                 tracing::error!(
                     cwd = %cwd,
                     error = %e,
-                    "hydration: failed to load project config; mode tabs drop to dashboard, orchestration tabs rebuild from daemon roles"
+                    "hydration: failed to load project config; orchestration tabs rebuild from daemon roles"
                 );
                 e.to_string()
             });
             cache.insert(cwd.to_string(), loaded.clone());
             loaded
         };
-
-        // PRD #76 M2.15 fixup pass 2 G1 — compute side-pane dims for
-        // hydration mode-tab rebuilds. Side panes spawn fresh from the
-        // project config (they're not daemon-tracked), so they need
-        // viewport-aware dims at create time. PRD #84 M4: the per-frame
-        // `resize_panes_to_layout` pass reconciles the exact rects once a tab
-        // is active, but spawning at the right size avoids the 24×80 hiccup.
-        let hydration_frame_area = terminal.get_frame().area();
-        for bucket in &partition.mode_buckets {
-            let cfg = lookup_config(&mut config_cache, &bucket.cwd).ok().flatten();
-            let mode_config = cfg
-                .as_ref()
-                .and_then(|c| c.modes.iter().find(|m| m.name == bucket.mode_name).cloned());
-            let Some(mode_config) = mode_config else {
-                tracing::error!(
-                    cwd = %bucket.cwd,
-                    mode = %bucket.mode_name,
-                    agent_pane_id = %bucket.agent_pane_id,
-                    "hydration: hydrated agent claims mode that is not in project config; dropping to dashboard"
-                );
-                continue;
-            };
-            let total_side_count = (mode_config.panes.len() + mode_config.reactive_panes) as u16;
-            let side_pane_dims = mode_side_pane_dims(hydration_frame_area, total_side_count);
-            match tab_manager.open_mode_tab_with_existing_agent_pane(
-                &mode_config,
-                &bucket.cwd,
-                bucket.agent_pane_id.clone(),
-                side_pane_dims,
-            ) {
-                Ok((_idx, side_ids)) => {
-                    for id in &side_ids {
-                        state.blocking_write().register_pane(id.clone());
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        cwd = %bucket.cwd,
-                        mode = %bucket.mode_name,
-                        error = %e,
-                        "hydration: failed to rebuild mode tab; agent pane stays on dashboard"
-                    );
-                }
-            }
-        }
 
         // PRD #111: remember the first successfully-rebuilt orchestration
         // tab so the post-loop active-tab snap-back can land on it
@@ -13454,7 +12863,7 @@ pub fn run_tui(
         // PRD #84 M4: the post-hydration resize sweep is gone. The panes were
         // rebuilt from the daemon's existing PTYs (or seeded at 24×80), and the
         // per-frame `resize_panes_to_layout` (invariant 2) sizes the active tab
-        // on the very first frame; a background mode/orchestration tab is sized
+        // on the very first frame; a background orchestration tab is sized
         // the frame it becomes active — before it is ever rendered — so no tab
         // is shown at the wrong dims.
     }
@@ -13479,9 +12888,6 @@ pub fn run_tui(
         // into the unconditional read without entangling the gate. Two loads by
         // design; see the note at the top-of-function read.
         let saved = config::SavedSession::load();
-        // Collect deferred mode pane restores — we need the terminal ready
-        // before we can resize PTYs, so mode tabs are opened after the loop.
-        let mut deferred_mode_panes: Vec<(config::SavedPane, ModeConfig)> = Vec::new();
         // PRD #89 M2b.3 — the first orchestration tab rebuilt from the snapshot,
         // so we can land on it (start cursor) after the loop rather than snapping
         // back to the dashboard — mirroring the hydration block's landing logic.
@@ -13503,8 +12909,7 @@ pub fn run_tui(
             // success we `continue`; on drift (config gone, orchestration
             // renamed/removed, role set changed) we push a clear warning NAMING
             // the orchestration and fall through to the plain-pane restore below
-            // — never a half-broken tab (mirrors the mode-tab Path D/E fallback,
-            // PRD #69). Unlike warm-daemon hydration (session/restore/007), this
+            // — never a half-broken tab. Unlike warm-daemon hydration (session/restore/007), this
             // path REPLAYS the saved `orchestrator_prompt` to the start role —
             // there is no live agent with the prompt already in scrollback.
             if let Some(ref orch_snap) = saved_pane.orchestration {
@@ -13667,35 +13072,12 @@ pub fn run_tui(
                     }
                 }
             }
-            // If the pane belonged to a mode tab, defer it so we can open a
-            // full mode tab (with side panes) instead of a plain dashboard pane.
+            // Issue #1199: a pane saved as a workspace mode's agent pane (by a
+            // build from before the removal) restores as a plain dashboard
+            // pane, with one warning saying why its mode tab did not come back.
             if let Some(ref mode_name) = saved_pane.mode {
-                match load_project_config(dir) {
-                    Ok(Some(cfg)) => {
-                        if let Some(mode_cfg) =
-                            cfg.modes.iter().find(|m| m.name == *mode_name).cloned()
-                        {
-                            deferred_mode_panes.push((saved_pane.clone(), mode_cfg));
-                            continue;
-                        }
-                        ui.session_warnings.push(format!(
-                            "Warning: mode '{}' not found in {}, restoring as plain pane",
-                            mode_name, saved_pane.dir
-                        ));
-                    }
-                    Ok(None) => {
-                        ui.session_warnings.push(format!(
-                            "Warning: no project config in {}, restoring as plain pane",
-                            saved_pane.dir
-                        ));
-                    }
-                    Err(e) => {
-                        ui.session_warnings.push(format!(
-                            "Warning: failed to load project config from {}: {e}",
-                            saved_pane.dir
-                        ));
-                    }
-                }
+                ui.session_warnings
+                    .push(legacy_mode_restore_warning(&saved_pane.name, mode_name));
             }
             let cmd = if saved_pane.command.is_empty() {
                 None
@@ -13759,288 +13141,21 @@ pub fn run_tui(
                             &saved_pane.name,
                         );
                     }
-                    ui.pane_metadata.insert(new_id, saved_pane.clone());
+                    // Issue #1199: drop any legacy mode name — the pane is a
+                    // plain pane now, and the warning above already said so.
+                    ui.pane_metadata.insert(
+                        new_id,
+                        config::SavedPane {
+                            mode: None,
+                            ..saved_pane.clone()
+                        },
+                    );
                 }
                 Err(e) => {
                     ui.session_warnings.push(format!(
                         "Warning: failed to restore pane '{}': {e}",
                         saved_pane.name
                     ));
-                }
-            }
-        }
-        // Restore mode tabs — create agent pane (empty shell), open mode tab,
-        // resize PTYs, then send init + agent commands at the right size.
-        for (saved_pane, mode_config) in deferred_mode_panes {
-            // M2.12: tag the daemon-side agent with this mode tab's
-            // membership so the next reconnect can rebuild this tab
-            // from `list_agents` rather than dropping the agent to the
-            // dashboard. `create_pane_with_options` is the only path
-            // that reaches `StartAgent.tab_membership` on the wire.
-            let mode_tab_membership = Some(TabMembership::Mode {
-                name: mode_config.name.clone(),
-            });
-            // PRD #76 M2.15: open the daemon-side PTY at the mode-tab agent
-            // layout (left half × full height minus chrome) so the agent's
-            // first frame paints at the eventual size. The resize call
-            // below this match arm still runs and reconciles any rounding;
-            // this just removes the visible 24×80 hiccup.
-            let frame_area = terminal.get_frame().area();
-            let (rows, cols) = mode_agent_pane_dims(frame_area);
-            // PRD #76 M2.13: mode-tab agent panes spawn as empty shells
-            // (the agent command is sent later via `write_to_pane`), so
-            // infer agent_type from the saved command rather than from
-            // the spawn command (which is `None` here).
-            // Issue #308: the mode's `agent = "…"` declaration answers first, so
-            // a restored declared agent pane badges immediately instead of
-            // waiting for a hook that a launcher-hidden Codex will not send
-            // until its first turn.
-            let mode_agent_type = if saved_pane.command.is_empty() {
-                mode_config.declared_agent_type()
-            } else {
-                mode_config.resolved_agent_type(saved_pane.command.as_str())
-            };
-            match pane.create_pane_with_options(
-                None,
-                Some(&saved_pane.dir),
-                AgentSpawnOptions {
-                    display_name: None,
-                    tab_membership: mode_tab_membership,
-                    rows,
-                    cols,
-                    agent_type: mode_agent_type,
-                    // PRD #201: mode agent pane, not a Pi orchestrator — no seed.
-                    seed: None,
-                },
-            ) {
-                Ok((new_id, _resolved)) => {
-                    state.blocking_write().register_pane(new_id.clone());
-                    if !saved_pane.name.is_empty() {
-                        let _ = pane.rename_pane(&new_id, &saved_pane.name);
-                        mirror_saved_pane_name(
-                            &mut ui.pane_display_names,
-                            &mut ui.pane_names,
-                            &new_id,
-                            &saved_pane.name,
-                        );
-                    }
-                    ui.pane_metadata.insert(new_id.clone(), saved_pane.clone());
-                    // Issue #308: mirror the orchestration-restore insert above
-                    // (`role.declared_agent_type()`), so a restored mode badges
-                    // from the SAME source a freshly-activated one does. The
-                    // spawn above also passes `mode_agent_type` into
-                    // `AgentSpawnOptions`, so `session.agent_type` usually comes
-                    // back hydrated from the daemon and this entry is never
-                    // read — the map is consulted only while that field is
-                    // `AgentType::None`. That makes this insert harmless today
-                    // and load-bearing tomorrow: the fresh path deliberately
-                    // leaves `session.agent_type` at `None` and badges from the
-                    // map, so without this the restored badge would be the one
-                    // display path with no map fallback, and a future rework of
-                    // `create_pane_with_options`'s `agent_type` wiring would
-                    // silently revert restored declared-launcher modes to
-                    // "No agent" — the exact regression this issue exists to
-                    // prevent. The `Err` arm below removes it again.
-                    if let Some(declared) = mode_config.declared_agent_type() {
-                        ui.pane_declared_agent.insert(new_id.clone(), declared);
-                    }
-                    // PRD #76 M2.15 fixup pass 2 G1 — compute side-pane
-                    // dims so the restored mode's side panes spawn at the
-                    // viewport-derived size, not the 24×80 default.
-                    let total_side_count =
-                        (mode_config.panes.len() + mode_config.reactive_panes) as u16;
-                    let side_pane_dims = mode_side_pane_dims(frame_area, total_side_count);
-                    match tab_manager.open_mode_tab(
-                        &mode_config,
-                        &saved_pane.dir,
-                        new_id.clone(),
-                        side_pane_dims,
-                    ) {
-                        Ok((_tab_idx, side_ids)) => {
-                            for id in &side_ids {
-                                state.blocking_write().register_pane(id.clone());
-                            }
-                            // PRD #84 M4: the restored agent + side panes were
-                            // spawned at the mode-tab dims (above), so commands
-                            // start at the right PTY size; the per-frame
-                            // `resize_panes_to_layout` reconciles the exact rect
-                            // once this tab is active. No resize here.
-                            let _ = tab_manager.start_mode_commands();
-                            if let Some(ref init_cmd) = mode_config.init_command {
-                                let _ = pane.write_to_pane(&new_id, init_cmd);
-                            }
-                            if !saved_pane.command.is_empty() {
-                                // PRD #20 blocker-3: mode RESTORE also spawns a
-                                // bare shell then types the saved command — wrap
-                                // a Wrapper-strategy command at this type site
-                                // (the persisted `saved_pane.command` stays bare).
-                                let _ = pane.write_to_pane(
-                                    &new_id,
-                                    &wrap_agent_command(
-                                        &saved_pane.command,
-                                        mode_config.declared_agent_type(),
-                                    ),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            // Same unwind as the activation arm, through the same
-                            // helper, so the two paths cannot drift apart as
-                            // per-pane maps are added.
-                            //
-                            // Deliberately NOT gated on the close succeeding, unlike
-                            // activation: this arm goes on to substitute a fallback
-                            // dashboard pane for the same saved pane (PRD #69), so
-                            // preserving the abandoned pane's card here would leave
-                            // the user with two cards for one restored pane. That
-                            // trade-off is this path's own, and predates #308.
-                            let _ = pane.close_pane(&new_id);
-                            rollback_abandoned_pane(&new_id, &mut ui, &state);
-                            ui.session_warnings.push(format!(
-                                "Warning: failed to restore mode '{}': {e}",
-                                mode_config.name
-                            ));
-                            // Fallback: plain dashboard pane so the user still
-                            // gets a usable pane (PRD #69 acceptance criterion).
-                            let cmd = if saved_pane.command.is_empty() {
-                                None
-                            } else {
-                                Some(saved_pane.command.as_str())
-                            };
-                            // PRD #76 M2.15 fixup F1: real viewport dims via
-                            // SSOT helper so the fallback dashboard pane
-                            // opens at the dashboard layout, not 24×80.
-                            let (fb_rows, fb_cols) = dashboard_restore_pane_dims(
-                                &*pane,
-                                &tab_manager,
-                                terminal.get_frame().area(),
-                            );
-                            // PRD #76 M2.13: infer agent_type from the
-                            // saved command for the fallback path too — and,
-                            // since issue #308, prefer the mode's declaration:
-                            // the mode failed to restore, but what its agent
-                            // pane runs did not change.
-                            let fb_agent_type = mode_config
-                                .declared_agent_type()
-                                .or_else(|| AgentType::from_command(cmd));
-                            match pane.create_pane_with_options(
-                                cmd,
-                                Some(&saved_pane.dir),
-                                AgentSpawnOptions {
-                                    display_name: None,
-                                    tab_membership: None,
-                                    rows: fb_rows,
-                                    cols: fb_cols,
-                                    agent_type: fb_agent_type.clone(),
-                                    // PRD #201: restore fallback spawn — no seed.
-                                    seed: None,
-                                },
-                            ) {
-                                Ok((fb_id, _resolved)) => {
-                                    // PRD #110 followup: see other create-
-                                    // pane sites — placeholder needs the
-                                    // daemon agent_id.
-                                    let fb_agent_id = pane.pane_agent_id(&fb_id);
-                                    {
-                                        let mut st = state.blocking_write();
-                                        st.register_pane(fb_id.clone());
-                                        st.insert_placeholder_session(
-                                            fb_id.clone(),
-                                            Some(saved_pane.dir.clone()),
-                                            fb_agent_type,
-                                            fb_agent_id,
-                                        );
-                                    }
-                                    if !saved_pane.name.is_empty() {
-                                        let _ = pane.rename_pane(&fb_id, &saved_pane.name);
-                                        mirror_saved_pane_name(
-                                            &mut ui.pane_display_names,
-                                            &mut ui.pane_names,
-                                            &fb_id,
-                                            &saved_pane.name,
-                                        );
-                                    }
-                                    ui.pane_metadata.insert(fb_id, saved_pane.clone());
-                                }
-                                Err(fb_err) => {
-                                    ui.session_warnings.push(format!(
-                                        "Warning: also failed to create fallback plain pane for '{}': {fb_err}",
-                                        saved_pane.name
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    ui.session_warnings.push(format!(
-                        "Warning: failed to restore mode pane '{}': {e}",
-                        saved_pane.name
-                    ));
-                    let cmd = if saved_pane.command.is_empty() {
-                        None
-                    } else {
-                        Some(saved_pane.command.as_str())
-                    };
-                    // PRD #76 M2.15 fixup F1: real viewport dims via SSOT
-                    // helper so the outer-error fallback also opens at the
-                    // dashboard layout instead of 24×80.
-                    let (fb_rows, fb_cols) = dashboard_restore_pane_dims(
-                        &*pane,
-                        &tab_manager,
-                        terminal.get_frame().area(),
-                    );
-                    // PRD #76 M2.13: infer agent_type from saved command
-                    // for this outer-error fallback as well, with the mode's
-                    // issue-#308 declaration taking precedence as above.
-                    let fb_agent_type = mode_config
-                        .declared_agent_type()
-                        .or_else(|| AgentType::from_command(cmd));
-                    match pane.create_pane_with_options(
-                        cmd,
-                        Some(&saved_pane.dir),
-                        AgentSpawnOptions {
-                            display_name: None,
-                            tab_membership: None,
-                            rows: fb_rows,
-                            cols: fb_cols,
-                            agent_type: fb_agent_type.clone(),
-                            // PRD #201: restore fallback spawn — no seed.
-                            seed: None,
-                        },
-                    ) {
-                        Ok((fb_id, _resolved)) => {
-                            // PRD #110 followup: outer-error fallback —
-                            // same agent_id plumbing as the inner fallback.
-                            let fb_agent_id = pane.pane_agent_id(&fb_id);
-                            {
-                                let mut st = state.blocking_write();
-                                st.register_pane(fb_id.clone());
-                                st.insert_placeholder_session(
-                                    fb_id.clone(),
-                                    Some(saved_pane.dir.clone()),
-                                    fb_agent_type,
-                                    fb_agent_id,
-                                );
-                            }
-                            if !saved_pane.name.is_empty() {
-                                let _ = pane.rename_pane(&fb_id, &saved_pane.name);
-                                mirror_saved_pane_name(
-                                    &mut ui.pane_display_names,
-                                    &mut ui.pane_names,
-                                    &fb_id,
-                                    &saved_pane.name,
-                                );
-                            }
-                            ui.pane_metadata.insert(fb_id, saved_pane.clone());
-                        }
-                        Err(fb_err) => {
-                            ui.session_warnings.push(format!(
-                                "Warning: also failed to create fallback plain pane for '{}': {fb_err}",
-                                saved_pane.name
-                            ));
-                        }
-                    }
                 }
             }
         }
@@ -14081,8 +13196,7 @@ pub fn run_tui(
     // later Tab-away-and-back from dumping the user on that tab's start role.
     //
     // Only the ids the DAEMON supplied survive into the restore. Every other
-    // pane on screen — all of them on the daemon-empty rebuild path, and a Mode
-    // tab's locally-spawned side panes on the warm one — carries a fresh
+    // pane on screen — all of them on the daemon-empty rebuild path — carries a fresh
     // `allocate_id` counter that matches a remembered number by coincidence
     // rather than by identity, so honouring one can focus the WRONG terminal
     // instead of merely failing to restore. `SavedFocus::retain_pane_ids` has
@@ -14171,60 +13285,6 @@ pub fn run_tui(
 
         let snapshot = state.blocking_read().clone();
 
-        // PRD #76 M2.15 fixup pass 2 G1 — refresh each Mode tab's cached
-        // side-pane dims from the current frame area so the reactive
-        // replacement spawn inside `ModeManager::handle_command` opens
-        // the daemon-side PTY at the right size, not the legacy 24×80
-        // default. `handle_command` is invoked from
-        // `route_reactive_commands` below, which doesn't have
-        // `frame_area` in scope — caching on the manager keeps the
-        // routing API clean while still tracking viewport changes.
-        {
-            let frame_area = terminal.get_frame().area();
-            for tab in tab_manager.tabs_mut() {
-                if let Tab::Mode { mode_manager, .. } = tab {
-                    let side_count = mode_manager.managed_pane_ids().len() as u16;
-                    let dims = mode_side_pane_dims(frame_area, side_count);
-                    mode_manager.set_side_pane_dims(dims);
-                }
-            }
-        }
-
-        // Route new Bash commands through mode tabs for reactive panes.
-        let pane_changes = tab_manager.route_reactive_commands(&snapshot.sessions);
-        for (old_id, new_id) in &pane_changes {
-            let mut st = state.blocking_write();
-            st.unregister_pane(old_id);
-            st.register_pane(new_id.clone());
-            drop(st);
-            // PRD #84 M4: the recreated pane's PTY is sized by the pre-draw
-            // `resize_panes_to_layout` on the next iteration (it was already
-            // spawned at the cached side-pane dims above), so no ad hoc resize
-            // is pushed here.
-        }
-
-        // PRD #83 M4 — remap every tab's focused pane after a reactive
-        // pane-pool change. `route_reactive_commands` recreates reactive
-        // panes across ALL tabs (active and background), returning
-        // `(closed_id, new_id)` pairs, so each tab whose remembered focus
-        // was recreated follows the successor; a focus that vanished with
-        // no successor is cleared (fall back to the default pane on
-        // switch-in). Only the active tab's remapped id comes back here,
-        // and only it needs the live pane re-focused on the controller.
-        if !pane_changes.is_empty()
-            && let Some(new_id) = tab_manager.remap_focus_after_reactive_change(&pane_changes)
-        {
-            let _ = pane.focus_pane(&new_id);
-        }
-        // PRD #89 M1.2 — `route_reactive_commands` recreates Mode-tab reactive
-        // SIDE panes, swapping their live pane ids (`pane_changes`); keep the
-        // snapshot fresh so the new ids are reflected. NOTE: this covers only
-        // reactive side-pane swaps — it does NOT broadly cover an agent /clear
-        // restart, whose dirtying flows through other reactive seams.
-        if !pane_changes.is_empty() {
-            ui.mark_session_dirty();
-        }
-
         // Pick up version-check result once
         if ui.update_available.is_none() {
             ui.update_available = snapshot.update_available.clone();
@@ -14292,7 +13352,6 @@ pub fn run_tui(
                 });
                 orch_filtered
             }
-            _ => all_filtered,
         };
         let total = filtered.len();
 
@@ -14315,8 +13374,6 @@ pub fn run_tui(
         // longer snap the selection of another (the cross-tab leak this
         // PRD fixes). A remembered id that's no longer in the filtered
         // list is cleared and the selection falls back to the first card.
-        // Mode tabs render via the early-return path below, so
-        // `selected_index` is irrelevant there and left as clamped.
         let focused_pane_now = pane.focused_pane_id();
         let filtered_ids: Vec<(&str, Option<&str>)> = filtered
             .iter()
@@ -14354,18 +13411,6 @@ pub fn run_tui(
             Tab::Dashboard { zoomed, .. } => ActiveTabView::Dashboard {
                 exclude_pane_ids: tab_manager.all_managed_pane_ids(),
                 zoomed: *zoomed,
-            },
-            Tab::Mode {
-                name,
-                agent_pane_id,
-                mode_manager,
-                focused_pane_id,
-                ..
-            } => ActiveTabView::Mode {
-                mode_name: name.clone(),
-                agent_pane_id: agent_pane_id.clone(),
-                side_pane_ids: mode_manager.managed_pane_ids(),
-                focused_pane_id: focused_pane_id.clone(),
             },
             Tab::Orchestration {
                 role_pane_ids,
@@ -14478,15 +13523,6 @@ pub fn run_tui(
             .iter()
             .map(|tab| match tab {
                 Tab::Dashboard { .. } => "Dashboard".to_string(),
-                Tab::Mode {
-                    name,
-                    agent_pane_id,
-                    ..
-                } => ui
-                    .pane_metadata
-                    .get(agent_pane_id)
-                    .map(|m| m.name.clone())
-                    .unwrap_or_else(|| name.clone()),
                 Tab::Orchestration {
                     id, name, status, ..
                 } => orchestration_tab_label(name, status, ui.config_drift_tabs.contains(id)),
@@ -14560,7 +13596,7 @@ pub fn run_tui(
         // actual height up front (the layout pass feeds both the PTY resize and the
         // render this frame). "A second row" was only ever true of the 120-column
         // reference width `render/layout/004` pins.
-        let bar_rows = bottom_bar_rows(&ui, frame_area.width, frame_area.height, &tab_view);
+        let bar_rows = bottom_bar_rows(&ui, frame_area.width, frame_area.height);
         let frame_layout = compute_frame_layout(
             frame_area,
             &tab_view,
@@ -14956,7 +13992,7 @@ pub fn run_tui(
         // here used to credit it with ferrying the orchestrator's *initial*
         // prompt across the agent-ready gate, which is the job of
         // `deliver_orchestrator_prompt`, called a few lines above.
-        // PRD #127 M3.1: deliver any mode `seed_prompt`s whose agent pane has
+        // PRD #127 M3.1: deliver any single-agent card `seed_prompt`s whose pane has
         // become ready (gated, like orchestrations).
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
 
@@ -15142,7 +14178,7 @@ pub fn run_tui(
                 // Issue #142: the Schedules manager owns the wheel while
                 // it is open — handled BEFORE the generic overlay swallow below
                 // so the wheel scrolls the manager's own list instead of merely
-                // being eaten (and instead of leaking to the side pane the
+                // being eaten (and instead of leaking to the pane the
                 // centered dialog covers). The manager has no independent list
                 // offset: one wheel notch moves `scheduled_selected` by one row
                 // exactly like `j`/`k`, and the rendered viewport follows it
@@ -15539,91 +14575,19 @@ pub fn run_tui(
                     continue;
                 }
 
-                // Side pane scroll: works in any UI mode by hit-testing rects
-                let mut side_scrolled = false;
-                if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-                    let side_rects = ui.side_pane_rects.clone();
-                    let scroll_delta = match mouse.kind {
-                        crossterm::event::MouseEventKind::ScrollUp => Some(3_isize),
-                        crossterm::event::MouseEventKind::ScrollDown => Some(-3_isize),
-                        _ => None,
-                    };
-                    if let Some(delta) = scroll_delta {
-                        for (side_id, rect) in &side_rects {
-                            if mouse.column >= rect.x
-                                && mouse.column < rect.x + rect.width
-                                && mouse.row >= rect.y
-                                && mouse.row < rect.y + rect.height
-                            {
-                                embedded.scroll_pane(side_id, delta);
-                                side_scrolled = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // Click-to-focus for mode tab panes (Normal mode only).
-                if ui.mode == UiMode::Normal
-                    && matches!(
-                        mouse.kind,
-                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
-                    )
-                {
-                    let mut clicked_focus = false;
-                    // Check side panes.
-                    for (side_id, rect) in ui.side_pane_rects.iter() {
-                        if mouse.column >= rect.x
-                            && mouse.column < rect.x + rect.width
-                            && mouse.row >= rect.y
-                            && mouse.row < rect.y + rect.height
-                        {
-                            let side_id = side_id.clone();
-                            if let Tab::Mode {
-                                focused_pane_id, ..
-                            } = tab_manager.active_tab_mut()
-                            {
-                                *focused_pane_id = Some(side_id.clone());
-                                clicked_focus = true;
-                            }
-                            let _ = pane.focus_pane(&side_id);
-                            break;
-                        }
-                    }
-                    // Check agent pane area.
-                    if !clicked_focus
-                        && let Some(rect) = ui.agent_pane_rect
-                        && mouse.column >= rect.x
-                        && mouse.column < rect.x + rect.width
-                        && mouse.row >= rect.y
-                        && mouse.row < rect.y + rect.height
-                        && let Tab::Mode {
-                            focused_pane_id,
-                            agent_pane_id,
-                            ..
-                        } = tab_manager.active_tab_mut()
-                    {
-                        *focused_pane_id = None;
-                        let _ = pane.focus_pane(agent_pane_id);
-                    }
-                }
-
-                if !side_scrolled
-                    && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
                     && let Some(pane_id) = embedded.focused_pane_id()
                 {
                     match mouse.kind {
                         // PRD #341 M5: the wheel scrolls the focused agent pane in
-                        // ANY mode — matching the side panes above, which have
-                        // always hit-tested without consulting `ui.mode`. Whether
-                        // the event reaches the child is the ONE decision
-                        // `scroll_focused_agent_pane` owns; it is command mode's
-                        // job never to.
+                        // ANY mode. Whether the event reaches the child is the ONE
+                        // decision `scroll_focused_agent_pane` owns; it is command
+                        // mode's job never to.
                         //
                         // Issue #362: *whether this pane is the target at all* is
                         // the separate decision `wheel_over_focused_pane` owns, and
-                        // it is made from the pointer — matching the side panes
-                        // above and every other pointer affordance in the deck.
+                        // it is made from the pointer — matching every other
+                        // pointer affordance in the deck.
                         crossterm::event::MouseEventKind::ScrollUp
                         | crossterm::event::MouseEventKind::ScrollDown => {
                             let up =
@@ -15934,11 +14898,7 @@ pub fn run_tui(
         } // end inner event-drain loop
     }
 
-    // Snapshot the session for auto-restore *before* tearing down mode
-    // tabs. The teardown loop unregisters every mode-tab pane id from
-    // `state.managed_pane_ids`; if the snapshot ran after teardown, the
-    // `retain` step would drop the mode-tab agent pane (which carries
-    // `mode = Some(...)`) and the mode field would never reach disk (PRD #69).
+    // Snapshot the session for auto-restore on exit.
     {
         let live_panes = state.blocking_read().managed_pane_ids.clone();
 
@@ -16171,7 +15131,7 @@ fn render_tab_strip(
         );
         x = after;
 
-        // Close affordance for Mode/Orchestration tabs (never the Dashboard).
+        // Close affordance for orchestration tabs (never the Dashboard).
         if *closeable.get(i).unwrap_or(&false) && x < end {
             let glyph_start = x;
             let (after, _) = buf.set_span(x, area.y, &Span::styled("[×]", style), end - x);
@@ -16206,7 +15166,7 @@ fn render_tab_strip(
 /// PRD #84 M3/M4 — the result of the single per-frame layout pass. Holds every
 /// structural rect the render path draws into: the optional tab-bar row, the
 /// hints/button-bar row, and the per-tab-variant content rects. `render_frame`
-/// and `render_mode_tab` read their rects from here instead of splitting layout
+/// reads its rects from here instead of splitting layout
 /// inline (contract invariant 1: one layout pass per frame). M4: it also
 /// carries each terminal pane's OUTER rect so `resize_panes_to_layout` can
 /// derive PTY size from the layout (invariant 2). See
@@ -16236,17 +15196,6 @@ enum FrameContent {
         pane_ids: Vec<String>,
         pane_rects: Vec<(String, Rect)>,
         pane_layout: PaneLayout,
-    },
-    /// Mode tab: single agent pane (left 50%) and stacked side panes
-    /// (right 50%). `side_pane_rects` is the per-side-pane OUTER rect keyed by
-    /// pane id, in render order — the source for `ui.side_pane_rects` (scroll +
-    /// click hit-testing) and (M4) the side-pane PTY-resize targets.
-    /// `agent_pane_id` keys the agent pane, whose OUTER rect is `agent_area`.
-    Mode {
-        agent_area: Rect,
-        side_area: Rect,
-        agent_pane_id: String,
-        side_pane_rects: Vec<(String, Rect)>,
     },
 }
 
@@ -16333,21 +15282,6 @@ impl FrameLayout {
                     out.push((id.as_str(), rows, cols));
                 }
             }
-            FrameContent::Mode {
-                agent_area,
-                agent_pane_id,
-                side_pane_rects,
-                ..
-            } => {
-                if !agent_pane_id.is_empty() {
-                    let (rows, cols) = dims(*agent_area);
-                    out.push((agent_pane_id.as_str(), rows, cols));
-                }
-                for (id, rect) in side_pane_rects {
-                    let (rows, cols) = dims(*rect);
-                    out.push((id.as_str(), rows, cols));
-                }
-            }
         }
         out
     }
@@ -16358,7 +15292,7 @@ impl FrameLayout {
 /// the active `PaneLayout`, and the controller's focused pane, produce every
 /// structural rect the render path draws into — including each terminal pane's
 /// OUTER rect (M4, used to size PTYs). The split math mirrors
-/// `render_frame` / `render_mode_tab` / `render_terminal_panes` exactly, so the
+/// `render_frame` / `render_terminal_panes` exactly, so the
 /// rendered output and the resize target agree by construction.
 fn compute_frame_layout(
     frame_area: Rect,
@@ -16389,35 +15323,6 @@ fn compute_frame_layout(
     };
 
     let content = match tab_view {
-        ActiveTabView::Mode {
-            agent_pane_id,
-            side_pane_ids,
-            ..
-        } => {
-            // 50/50 horizontal split: agent pane left, side panes right.
-            let chunks =
-                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .split(main_area);
-            let agent_area = chunks[0];
-            let side_area = chunks[1];
-            // Side-pane rects: the same Tiled vertical split
-            // `render_terminal_panes` draws the side panes into (and the source
-            // for `ui.side_pane_rects`). Skipped when there are no side panes
-            // (the old code only pushed these inside its non-empty guard).
-            let side_pane_rects: Vec<(String, Rect)> = if side_pane_ids.is_empty() {
-                Vec::new()
-            } else {
-                let chunks =
-                    pane_stack_rects(side_area, side_pane_ids, PaneLayout::Tiled, focused_pane_id);
-                side_pane_ids.iter().cloned().zip(chunks).collect()
-            };
-            FrameContent::Mode {
-                agent_area,
-                side_area,
-                agent_pane_id: agent_pane_id.clone(),
-                side_pane_rects,
-            }
-        }
         ActiveTabView::Dashboard {
             exclude_pane_ids,
             zoomed,
@@ -16619,8 +15524,8 @@ fn pane_stack_rects(
 /// PRD #84 M4 (invariant 2) — derive each local pane's PTY size from its layout
 /// rect and commit only the deltas. Runs once per frame, after
 /// `compute_frame_layout` and before `terminal.draw`, so every layout-changing
-/// path (resize, tab open/close, mode switch, reactive pane recreation,
-/// orchestration role transition) converges here instead of pushing its own
+/// path (resize, tab open/close, mode switch, orchestration role
+/// transition) converges here instead of pushing its own
 /// `resize_pane_pty` from a private dimension calculation.
 ///
 /// A pane whose target inner area has a zero dimension (a `Tiled` pane with no
@@ -17016,23 +15921,16 @@ fn render_frame(
     // the PTY sizing it drives, sits above the footer) and the footer itself is
     // drawn there in the same `terminal.draw` — see the gating block around the
     // `compute_frame_layout` call. So there is nothing footer-related to do here.
-    ui.side_pane_rects.clear();
-    ui.agent_pane_rect = None;
     // PRD #80 M4: rebuilt below only for the dashboard card grid; clearing here
     // means non-dashboard views (and the zero-card dashboard) leave no stale
     // card rects for the mouse hit-test.
     ui.card_rects.clear();
 
-    let active_mode_name = match tab_view {
-        ActiveTabView::Dashboard { .. } | ActiveTabView::Orchestration { .. } => None,
-        ActiveTabView::Mode { mode_name, .. } => Some(mode_name.as_str()),
-    };
-
     // PRD #313: is this frame's tab zoomed? Resolved once here and threaded into
     // every `render_terminal_panes` call below, so the three Cards paths (no
     // sessions / all filtered out / the normal grid) cannot disagree about
     // whether the focused pane wears the indicator. Both card-shaped tabs can be
-    // zoomed — a Mode tab cannot; the geometry each implies was already resolved
+    // zoomed; the geometry each implies was already resolved
     // by `compute_frame_layout`, so all this decides is the border title.
     let zoomed = matches!(
         tab_view,
@@ -17044,7 +15942,7 @@ fn render_frame(
     // draw, then read its decay state ONCE and thread that one value into every
     // pane-rendering path below. Doing it here — rather than at each
     // `render_terminal_panes` call — means every tab type asks the same question
-    // at the same instant, so a Dashboard pane and a Mode-tab pane can never
+    // at the same instant, so a Dashboard pane and an orchestration pane can never
     // disagree about whether the banner is up. `visibility` latches the TTL
     // collapse, which is why it takes `&mut`.
     //
@@ -17114,8 +16012,8 @@ fn render_frame(
     // source the deck cards read (`state.sessions[*].status`), so an embedded
     // pane's border encodes its status with the SAME centralized-palette color
     // the deck card uses — closing the deck/pane consistency gap (criterion #2).
-    // Built once and threaded into every `render_terminal_panes` call below (and
-    // into `render_mode_tab`). Extracted into `build_pane_status` so the join can
+    // Built once and threaded into every `render_terminal_panes` call below.
+    // Extracted into `build_pane_status` so the join can
     // be unit-tested without a live daemon.
     let pane_status: HashMap<&str, SessionStatus> = build_pane_status(state);
 
@@ -17128,47 +16026,11 @@ fn render_frame(
     // one `if zoomed` in the layout, and no second one here. Issue #749: it is
     // bound in the SAME destructure as the rects it has to agree with, so no
     // other layout value is in scope for this function to reach for by
-    // accident — the single source is compiler-enforced, not conventional. A
-    // Mode tab carries no pane layout of its own and returns before the binding
-    // exists, which is why this cannot be resolved above the branch.
+    // accident — the single source is compiler-enforced, not conventional.
     //
-    // Branch on the content the layout pass resolved. Mode tabs render and
-    // return here; dashboard / orchestration fall through to the card grid.
+    // Destructure the content the layout pass resolved: dashboard and
+    // orchestration tabs both render as the card grid.
     let (dashboard_area, panes_area, pane_ids, pane_rects, pane_layout) = match &layout.content {
-        FrameContent::Mode {
-            agent_area,
-            side_area,
-            side_pane_rects,
-            ..
-        } => {
-            let ActiveTabView::Mode {
-                agent_pane_id,
-                side_pane_ids,
-                focused_pane_id,
-                ..
-            } = tab_view
-            else {
-                unreachable!("FrameContent::Mode is produced only for ActiveTabView::Mode")
-            };
-            render_mode_tab(
-                frame,
-                ui,
-                embedded,
-                agent_pane_id,
-                side_pane_ids,
-                *agent_area,
-                *side_area,
-                side_pane_rects,
-                hints_area,
-                has_pane_control,
-                active_mode_name,
-                focused_pane_id.as_deref(),
-                &pane_status,
-                banner_visibility,
-                now,
-            );
-            return;
-        }
         FrameContent::Cards {
             dashboard_area,
             panes_area,
@@ -17239,7 +16101,7 @@ fn render_frame(
             );
         }
 
-        render_overlays(frame, ui, active_mode_name);
+        render_overlays(frame, ui);
         return;
     }
 
@@ -17274,12 +16136,7 @@ fn render_frame(
             .split(vertical[1]);
             frame.render_widget(msg, inner[1]);
 
-            render_stats_bar(
-                frame,
-                &state.aggregate_stats(),
-                vertical[2],
-                active_mode_name,
-            );
+            render_stats_bar(frame, &state.aggregate_stats(), vertical[2]);
         }
         let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
@@ -17302,7 +16159,7 @@ fn render_frame(
                 zoomed,
             );
         }
-        render_overlays(frame, ui, active_mode_name);
+        render_overlays(frame, ui);
         return;
     }
 
@@ -17317,12 +16174,7 @@ fn render_frame(
             tick,
             wall_now,
         );
-        render_stats_bar(
-            frame,
-            &state.aggregate_stats(),
-            stats_area,
-            active_mode_name,
-        );
+        render_stats_bar(frame, &state.aggregate_stats(), stats_area);
     }
 
     // Full-width hints bar
@@ -17349,10 +16201,10 @@ fn render_frame(
         );
     }
 
-    render_overlays(frame, ui, active_mode_name);
+    render_overlays(frame, ui);
 }
 
-fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option<&str>) {
+fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
     // PRD #80 M5/M7: rebuilt below for whichever modal/overlay is shown;
     // cleared here so a click can't hit an affordance from a prior frame once
     // the overlay closes.
@@ -17364,7 +16216,7 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option
     ui.form_chip_rects.clear();
     ui.form_button_rects.clear();
     if ui.mode == UiMode::Help {
-        ui.modal_button_rects = render_help_overlay(frame, &ui.keybindings, active_mode_name);
+        ui.modal_button_rects = render_help_overlay(frame, &ui.keybindings);
     }
     if ui.mode == UiMode::DirPicker {
         // Capture the picker's row/button rects after the `dir_picker` borrow
@@ -18010,7 +16862,7 @@ fn render_terminal_panes(
     //   Cyan `focused` accent and the painted cursor appear ONLY when the pane is
     //   actually live; in command mode the border falls through to the agent's
     //   status colour and thickens instead, which is what makes the mode visible
-    //   on a full-screen mode tab where nothing else on screen changes.
+    //   on the pane itself.
     // * command mode (`mode == Normal`) — should the focused pane be dimmed and
     //   the banner drawn? Every OTHER mode (a modal, an inline filter/rename row)
     //   is also not `PaneInput`, but those already cover the screen or own the
@@ -18024,8 +16876,9 @@ fn render_terminal_panes(
     // PRD #84: per-pane OUTER rects (aligned 1:1 with `pane_ids`) precomputed by
     // `compute_frame_layout` — the SAME rects `resize_panes_to_layout` sized the
     // PTYs to this frame. `Some` => draw into exactly those; `None` => recompute
-    // via `pane_stack_rects` (used by callers without a `FrameLayout` rect list,
-    // e.g. the mode-tab agent / side panes).
+    // via `pane_stack_rects` (used by callers without a `FrameLayout` rect list —
+    // the L1 render seams in this file's tests; every production caller passes
+    // `Some`).
     precomputed_rects: Option<&[Rect]>,
     // Injected by L1 notice-lifecycle coverage; live frames pass the same `now`
     // used for every other transient render state in that frame.
@@ -18098,8 +16951,8 @@ fn render_terminal_panes(
     let mut focused_screen: Option<std::sync::Arc<std::sync::Mutex<vt100::Parser>>> = None;
     // PRD #611 M2: outer rects of panes whose cannot-scroll notice is still
     // live, collected per pane as they are drawn. Keyed by the pane that armed
-    // it rather than by focus — this is the ONE shared path the dashboard, the
-    // orchestrator pane and the mode tabs all render through, so no tab-type or
+    // it rather than by focus — this is the ONE shared path the dashboard and
+    // the orchestration tabs render through, so no tab-type or
     // agent-name branch is needed to scope it (PRD #611: worker panes need no
     // exclusion because a pane nobody scrolls never arms one).
     let mut notice_rects: Vec<Rect> = Vec::new();
@@ -18305,121 +17158,7 @@ fn render_terminal_panes(
     focused_pane_rect
 }
 
-/// Render a mode tab: agent pane on left 50%, side panes stacked on right 50%.
-///
-/// PRD #84 M3: the 50/50 split and the side-pane hit-test rects are computed by
-/// `compute_frame_layout` and passed in (`agent_area`, `side_area`,
-/// `side_pane_rects`); this function no longer splits layout itself.
-#[allow(clippy::too_many_arguments)]
-fn render_mode_tab(
-    frame: &mut Frame,
-    ui: &mut UiState,
-    embedded: Option<&EmbeddedPaneController>,
-    agent_pane_id: &str,
-    side_pane_ids: &[String],
-    agent_area: Rect,
-    side_area: Rect,
-    side_pane_rects: &[(String, Rect)],
-    hints_area: Rect,
-    has_pane_control: bool,
-    active_mode_name: Option<&str>,
-    focused_pane_id: Option<&str>,
-    // PRD #155 (M3): per-pane agent status (pane_id → status) forwarded from
-    // `render_frame` into both `render_terminal_panes` calls below, so mode-tab
-    // panes get the same status-colored borders as the dashboard's panes.
-    pane_status: &HashMap<&str, SessionStatus>,
-    // PRD #341 M3: the banner decay state `render_frame` read once for this
-    // frame, forwarded rather than re-derived so a Mode tab and a Dashboard pane
-    // cannot disagree about whether the banner is up.
-    banner: CommandBannerVisibility,
-    now: std::time::Instant,
-) {
-    // PRD #83: `focused_pane_id` is keyed by stable pane id. `None` (or an
-    // id that isn't one of this tab's side panes) means the agent pane is
-    // focused; otherwise the matching side pane is the visually focused one.
-    let side_visual_focus: Option<String> = focused_pane_id
-        .filter(|id| side_pane_ids.iter().any(|s| s == id))
-        .map(|id| id.to_string());
-    let agent_visual_focus: Option<&str> = if side_visual_focus.is_none() {
-        Some(agent_pane_id)
-    } else {
-        None
-    };
-
-    // Track agent pane rect for click-to-focus (sourced from FrameLayout).
-    ui.agent_pane_rect = Some(agent_area);
-
-    // Left side: single agent pane
-    if !agent_pane_id.is_empty() {
-        let agent_ids = vec![agent_pane_id.to_string()];
-        let rect = render_terminal_panes(
-            frame,
-            embedded,
-            agent_area,
-            &agent_ids,
-            PaneLayout::Stacked,
-            &ui.pane_display_names,
-            pane_status,
-            &ui.selection,
-            agent_visual_focus,
-            ui.mode,
-            banner,
-            // Mode-tab panes recompute their rects (out of the Cards finding's
-            // scope); the agent pane is a single Stacked pane filling agent_area.
-            None,
-            now,
-            // PRD #313: zoom is an orchestration-tab view state; a mode tab
-            // has no sidebar to reclaim and can never be zoomed.
-            false,
-        );
-        if rect.is_some() {
-            ui.focused_pane_rect = rect;
-        }
-    }
-
-    // Right side: side panes stacked (all visible simultaneously)
-    if !side_pane_ids.is_empty() {
-        let rect = render_terminal_panes(
-            frame,
-            embedded,
-            side_area,
-            side_pane_ids,
-            PaneLayout::Tiled,
-            &ui.pane_display_names,
-            pane_status,
-            &ui.selection,
-            side_visual_focus.as_deref(),
-            ui.mode,
-            banner,
-            // Mode side panes recompute via pane_stack_rects (Tiled) — same
-            // split as the `side_pane_rects` above; out of the Cards finding's scope.
-            None,
-            now,
-            false,
-        );
-        // Use side pane rect when a side pane is visually focused, or as fallback.
-        if side_visual_focus.is_some() || ui.focused_pane_rect.is_none() {
-            ui.focused_pane_rect = rect;
-        }
-
-        // Track side pane rects for scroll / click hit-testing — sourced from
-        // the FrameLayout pass (same vertical split that draws them).
-        ui.side_pane_rects.extend(side_pane_rects.iter().cloned());
-    }
-
-    // Full-width hints bar — mode tabs show only the global buttons (no
-    // dashboard context buttons).
-    render_bottom_bar(frame, ui, hints_area, has_pane_control, &[]);
-
-    render_overlays(frame, ui, active_mode_name);
-}
-
-fn render_stats_bar(
-    frame: &mut Frame,
-    stats: &DashboardStats,
-    area: Rect,
-    active_mode_name: Option<&str>,
-) {
+fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
 
     // Always show active count
@@ -18497,16 +17236,6 @@ fn render_stats_bar(
         format!("{} tools", stats.total_tools),
         text_primary(),
     ));
-
-    if let Some(name) = active_mode_name {
-        spans.push(Span::styled("  \u{2502}  ", text_dim()));
-        spans.push(Span::styled(
-            format!("mode: {name}"),
-            Style::default()
-                .fg(Color::LightMagenta)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -18935,15 +17664,13 @@ fn render_mode_chip(frame: &mut Frame, mode: UiMode, area: Rect) -> Rect {
 /// rows. The reservation is therefore capped at `frame_height - 1` so at least
 /// one content row always remains (Layout doesn't panic, but content vanishing
 /// is a usability bug).
-fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16, tab_view: &ActiveTabView) -> u16 {
+fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16) -> u16 {
     let rows = match ui.mode {
         UiMode::Filter | UiMode::Rename | UiMode::PaneInput => 1,
         _ if ui.status_message.is_some() => 1,
         _ => {
             let mut buttons = global_bar_buttons(&ui.keybindings, ui.mode, true);
-            if !matches!(tab_view, ActiveTabView::Mode { .. }) {
-                buttons.extend(dashboard_context_buttons(&ui.keybindings, true));
-            }
+            buttons.extend(dashboard_context_buttons(&ui.keybindings, true));
             let widths: Vec<u16> = buttons
                 .iter()
                 .map(|b| b.display_label().chars().count() as u16)
@@ -18969,8 +17696,8 @@ fn render_bottom_bar(
     extra_buttons: &[Button],
 ) {
     // PRD #341 M2: the mode chip owns cell 0 of the bar wherever the bar has one
-    // — the context-rich Cards path (Dashboard / Orchestration), the global-only
-    // Mode-tab path, and the PaneInput row alike — so the current mode is stated
+    // — the context-rich Cards path (Dashboard / Orchestration) and the
+    // PaneInput row alike — so the current mode is stated
     // in words in the SAME screen position on every tab, in both modes.
     // Everything else in the bar draws into what it leaves.
     //
@@ -19549,7 +18276,7 @@ fn render_config_gen_prompt(frame: &mut Frame, selected: usize) -> Vec<(Action, 
 
     let mut text = vec![
         Line::from(""),
-        Line::styled("  No workspace modes config found for this", text_primary()),
+        Line::styled("  No orchestration config found for this", text_primary()),
         Line::styled("  project. Want to instruct your agent to", text_primary()),
         Line::styled("  analyze the project and create one?", text_primary()),
         Line::from(""),
@@ -19712,7 +18439,6 @@ fn dashboard_hints_string(keybindings: &KeybindingConfig, mode: UiMode) -> Strin
 /// default-bindings PRD #80 seam is [`render_help_overlay_to_buffer`].)
 pub fn render_help_overlay_with_bindings_to_buffer(
     keybindings: &KeybindingConfig,
-    active_mode_name: Option<&str>,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -19727,7 +18453,7 @@ pub fn render_help_overlay_with_bindings_to_buffer(
         .draw(|frame| {
             // The live overlay returns its clickable button rects; the
             // snapshot path doesn't need them.
-            let _ = render_help_overlay(frame, keybindings, active_mode_name);
+            let _ = render_help_overlay(frame, keybindings);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -19781,11 +18507,7 @@ pub fn render_hints_bar_for_mode_to_buffer(
     terminal.backend().buffer().clone()
 }
 
-fn render_help_overlay(
-    frame: &mut Frame,
-    keybindings: &KeybindingConfig,
-    active_mode_name: Option<&str>,
-) -> Vec<(Action, Rect)> {
+fn render_help_overlay(frame: &mut Frame, keybindings: &KeybindingConfig) -> Vec<(Action, Rect)> {
     let cyan = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
@@ -19890,22 +18612,12 @@ fn render_help_overlay(
         help_key_line(&n(KbAction::Help), "Toggle this help"),
     ];
 
-    let mut right: Vec<Line> = vec![
-        Line::styled("  Mode Tab (in-tab navigation)", cyan),
+    let right: Vec<Line> = vec![
+        // These two lines describe every pane.
+        Line::styled("  Mouse", cyan),
         Line::from(""),
-        help_key_line(
-            &format!("{} / Down", n(KbAction::MoveDown)),
-            "Focus next pane",
-        ),
-        help_key_line(
-            &format!("{} / Up", n(KbAction::MoveUp)),
-            "Focus previous pane",
-        ),
-        Line::from("  Enter           Enter PaneInput on selected"),
-        Line::from("  Esc             Deselect side pane"),
         Line::from("  Mouse click     Focus pane"),
         Line::from("  Ctrl+click      Open hyperlink"),
-        help_key_line(&n(KbAction::Dashboard), "Return to command mode"),
         Line::from(""),
         Line::styled("  New Agent Form", cyan),
         Line::from(""),
@@ -19930,11 +18642,6 @@ fn render_help_overlay(
         Line::from("  Panes auto-saved continuously."),
         Line::from("  Restored automatically on launch."),
     ];
-
-    if let Some(name) = active_mode_name {
-        right.push(Line::from(""));
-        right.push(Line::styled(format!("  Active mode: {name}"), cyan));
-    }
 
     let area = frame.area();
     let column_width: u16 = 50;
@@ -20669,9 +19376,9 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         }
         lines.push(Line::from(""));
     } else if !form.schedule_locked {
-        // No .dot-agent-deck.toml or no modes — show a contextual hint.
+        // No Mode row — show a contextual hint.
         lines.push(Line::styled(
-            "  Tip: press g on dashboard to create modes",
+            "  Tip: press g on dashboard to create a config",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::ITALIC),
@@ -20780,8 +19487,8 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
             " New Schedule ".to_string()
         }
     } else {
-        match form.selected_mode() {
-            Some(cfg) => format!(" New Agent \u{2014} {} mode ", cfg.name),
+        match form.selected_builtin() {
+            Some(builtin) => format!(" New Agent \u{2014} {} mode ", builtin.name()),
             None => " New Agent ".to_string(),
         }
     };
@@ -21087,9 +19794,7 @@ fn scroll_focused_agent_pane(
 /// Two earlier layers in the same arm keep their own precedence and are not
 /// affected: the Schedules manager takes the wheel for its own list and
 /// [`overlay_blocks_mouse`] swallows it behind every other modal, both before
-/// this is reached; and the mode-tab side panes hit-test their own rects through
-/// the `side_scrolled` short-circuit, so "the pane under the pointer" holds there
-/// too.
+/// this is reached.
 ///
 /// ## Why route by pointer and not by focus
 ///
@@ -21726,7 +20431,6 @@ where
 #[doc(hidden)]
 pub fn render_stats_bar_to_buffer(
     stats: &DashboardStats,
-    active_mode_name: Option<&str>,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -21735,7 +20439,7 @@ pub fn render_stats_bar_to_buffer(
         // are the caller's raw arguments, and `draw_to_buffer` bounds them
         // (issue #748), so the frame is the only thing that knows the real size.
         let area = frame.area();
-        render_stats_bar(frame, stats, area, active_mode_name);
+        render_stats_bar(frame, stats, area);
     })
 }
 
@@ -22385,7 +21089,7 @@ pub fn render_orchestration_frame_to_buffer(
     };
     // The same order the main loop uses: measure the bottom bar, lay the frame
     // out once, size every PTY from that layout, then draw from it.
-    let bar_rows = bottom_bar_rows(&ui, width, height, &tab_view);
+    let bar_rows = bottom_bar_rows(&ui, width, height);
     let layout = compute_frame_layout(
         frame_area,
         &tab_view,
@@ -23169,7 +21873,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
         height,
     };
     let pane_ids = vec![pane_id.clone()];
-    let bar_rows = bottom_bar_rows(&ui, width, height, &tab_view);
+    let bar_rows = bottom_bar_rows(&ui, width, height);
     let layout = compute_frame_layout(
         frame_area,
         &tab_view,
@@ -24077,7 +22781,7 @@ fn render_overlay_to_buffer(
 pub fn render_help_overlay_to_buffer(width: u16, height: u16) -> ratatui::buffer::Buffer {
     let keybindings = KeybindingConfig::default();
     render_overlay_to_buffer(width, height, |frame| {
-        let _ = render_help_overlay(frame, &keybindings, None);
+        let _ = render_help_overlay(frame, &keybindings);
     })
 }
 
@@ -24097,34 +22801,32 @@ pub fn render_dir_picker_to_buffer(
     })
 }
 
-/// PRD #80 M8 L1 seam: render the new-pane form with the given `modes` as
-/// selectable mode options into a `Buffer`. Drives the production
-/// `render_new_pane_form` through a `TestBackend`; after M8 the form renders
-/// clickable mode chips and `[Submit]` / `[Cancel]` buttons, which this
+/// PRD #80 M8 L1 seam: render the new-pane form into a `Buffer`, offering one
+/// orchestration per name in `orchestration_names` (each renders as an
+/// `Orch: <name>` chip) alongside `No mode` and the built-in options. Drives the
+/// production `render_new_pane_form` through a `TestBackend`; after M8 the form
+/// renders clickable mode chips and `[Submit]` / `[Cancel]` buttons, which this
 /// seam's buffer then shows. Mirrors [`render_button_bar_to_buffer`].
+///
+/// An orchestration is the only project-defined chip the row can carry.
 pub fn render_new_pane_form_to_buffer(
-    mode_names: &[&str],
+    orchestration_names: &[&str],
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
-    let modes: Vec<ModeConfig> = mode_names
+    let orchestrations: Vec<OrchestrationConfig> = orchestration_names
         .iter()
-        .map(|n| ModeConfig {
-            agent: None,
+        .map(|n| OrchestrationConfig {
+            default: false,
             name: (*n).to_string(),
-            init_command: None,
-            seed_prompt: None,
-            panes: Vec::new(),
-            rules: Vec::new(),
-            reactive_panes: 0,
+            roles: Vec::new(),
         })
         .collect();
     let form = NewPaneFormState::new(
         std::path::PathBuf::from("/tmp/project"),
         "myname".to_string(),
         "mycmd".to_string(),
-        modes,
-        Vec::new(),
+        orchestrations,
     );
     render_overlay_to_buffer(width, height, |frame| {
         render_new_pane_form(frame, &form);
@@ -24166,7 +22868,6 @@ pub fn render_new_pane_orchestration_guard_to_buffer(
         std::path::PathBuf::from(form_cwd),
         "myname".to_string(),
         "mycmd".to_string(),
-        Vec::new(),
         orchestrations,
     )
     .with_live_orchestration_cwds(
@@ -24175,8 +22876,8 @@ pub fn render_new_pane_orchestration_guard_to_buffer(
             .map(|c| (*c).to_string())
             .collect(),
     );
-    // Select the single orchestration option (index 0 is "No mode"; there are no
-    // plain modes) — the state the guard applies to.
+    // Select the single orchestration option (index 0 is "No mode") — the state
+    // the guard applies to.
     form.selection_index = 1;
     render_overlay_to_buffer(width, height, |frame| {
         render_new_pane_form(frame, &form);
@@ -24214,7 +22915,6 @@ pub fn render_new_pane_orchestration_name_collision_to_buffer(
         std::path::PathBuf::from("/work/collision-check"),
         typed_name.to_string(),
         "mycmd".to_string(),
-        Vec::new(),
         orchestrations,
     )
     .with_live_orchestration_names(
@@ -24572,45 +23272,11 @@ mod tests {
     }
 
     // PRD #76 M2.15: pin the layout-math helpers so a future change to the
-    // mode-tab / dashboard render layout can't silently divorce spawn-time
+    // orchestration / dashboard render layout can't silently divorce spawn-time
     // dims from resize-time dims. The helpers are the single source of
     // truth for both `AgentSpawnOptions.rows/cols` (spawn) and
     // `resize_pane_pty` (resize); if one diverges from the render, the
     // agent draws into a mismatched buffer.
-
-    #[test]
-    fn mode_agent_pane_dims_uses_left_half_minus_chrome() {
-        // 80×24 terminal: half_width = 80/2 - 2 = 38; rows = 24 - 3 = 21.
-        // The -2 accounts for the agent pane's borders; the -3 covers tab
-        // bar + hints bar chrome around the mode-tab content area.
-        let (rows, cols) = mode_agent_pane_dims(Rect::new(0, 0, 80, 24));
-        assert_eq!((rows, cols), (21, 38));
-    }
-
-    #[test]
-    fn mode_agent_pane_dims_saturates_on_tiny_viewport() {
-        // height < 3 must not underflow into u16::MAX rows — saturating
-        // arithmetic keeps the inner dims at 0 so `resize_pane_pty`
-        // skips the call (rows == 0) rather than handing the daemon a
-        // pathological dimension.
-        let (rows, cols) = mode_agent_pane_dims(Rect::new(0, 0, 2, 1));
-        assert_eq!((rows, cols), (0, 0));
-    }
-
-    #[test]
-    fn mode_side_pane_dims_divides_height_by_side_count() {
-        // 100×30 terminal with 3 side panes: half_width = 100/2 - 2 = 48,
-        // rows per side = 30/3 - 2 = 8.
-        let (rows, cols) = mode_side_pane_dims(Rect::new(0, 0, 100, 30), 3);
-        assert_eq!((rows, cols), (8, 48));
-    }
-
-    #[test]
-    fn mode_side_pane_dims_clamps_zero_count_to_one() {
-        // side_count == 0 must clamp to 1 to dodge a division-by-zero.
-        let (rows, cols) = mode_side_pane_dims(Rect::new(0, 0, 100, 30), 0);
-        assert_eq!((rows, cols), (28, 48));
-    }
 
     #[test]
     fn dashboard_pane_dims_tiled_divides_main_height() {
@@ -24840,10 +23506,7 @@ mod tests {
             pane_ids: laid_out_ids,
             pane_rects,
             ..
-        } = layout.content
-        else {
-            panic!("Dashboard tab must produce FrameContent::Cards");
-        };
+        } = layout.content;
 
         // Main area (rows 1..39, height 38) splits 33% / 67% horizontally: the
         // card grid on the left, the pane column on the right, together
@@ -24862,62 +23525,6 @@ mod tests {
             vec![
                 ("p0".to_string(), Rect::new(33, 1, 67, 19)),
                 ("p1".to_string(), Rect::new(33, 20, 67, 19)),
-            ]
-        );
-    }
-
-    #[test]
-    fn compute_frame_layout_mode_geometry() {
-        // 100x40 frame, tab bar shown, agent pane + 2 stacked side panes.
-        let frame_area = Rect::new(0, 0, 100, 40);
-        let tab_view = ActiveTabView::Mode {
-            mode_name: "demo".to_string(),
-            agent_pane_id: "agent".to_string(),
-            side_pane_ids: vec!["s0".to_string(), "s1".to_string()],
-            focused_pane_id: None,
-        };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Dashboard".into(), "demo".into()],
-            active_index: 1,
-            orchestration_statuses: vec![],
-        };
-        let layout = compute_frame_layout(
-            frame_area,
-            &tab_view,
-            &tab_bar,
-            &[],
-            PaneLayout::Tiled,
-            None,
-            1,
-        );
-
-        assert_eq!(layout.tab_bar, Some(Rect::new(0, 0, 100, 1)));
-        assert_eq!(layout.hints, Rect::new(0, 39, 100, 1));
-
-        let FrameContent::Mode {
-            agent_area,
-            side_area,
-            agent_pane_id,
-            side_pane_rects,
-        } = layout.content
-        else {
-            panic!("Mode tab must produce FrameContent::Mode");
-        };
-
-        // 50 / 50 horizontal split of the main area: agent pane left, side
-        // panes right.
-        assert_eq!(agent_area, Rect::new(0, 1, 50, 38));
-        assert_eq!(side_area, Rect::new(50, 1, 50, 38));
-        assert_eq!(agent_pane_id, "agent");
-
-        // Side panes: equal vertical division of the right half, keyed in
-        // order — the source for `ui.side_pane_rects`.
-        assert_eq!(
-            side_pane_rects,
-            vec![
-                ("s0".to_string(), Rect::new(50, 1, 50, 19)),
-                ("s1".to_string(), Rect::new(50, 20, 50, 19)),
             ]
         );
     }
@@ -24988,10 +23595,7 @@ mod tests {
                     panes_area: this_panes_area,
                     pane_rects,
                     ..
-                } = &layout.content
-                else {
-                    panic!("Orchestration tab must produce FrameContent::Cards");
-                };
+                } = &layout.content;
                 panes_area = Some(this_panes_area.expect("7 role panes => a right pane column"));
                 expanded_rect = pane_rects
                     .iter()
@@ -25069,10 +23673,7 @@ mod tests {
             dashboard_area,
             panes_area,
             ..
-        } = layout.content
-        else {
-            panic!("Orchestration tab must produce FrameContent::Cards");
-        };
+        } = layout.content;
         (
             dashboard_area.width,
             panes_area.expect("role panes => a right column").width,
@@ -25204,7 +23805,7 @@ mod tests {
     }
 
     /// Issue #317: build a plain dashboard card — one session owning a pane
-    /// that belongs to no Mode/Orchestration tab, so it reaches
+    /// that belongs to no orchestration tab, so it reaches
     /// `resolve_close_plan`'s one-pane branch.
     fn state_with_card(session_id: &str, pane_id: &str, agent_id: Option<&str>) -> AppState {
         let mut state = AppState::default();
@@ -25496,7 +24097,6 @@ mod tests {
                 dir: tmp.path().to_path_buf(),
                 name: name.to_string(),
                 command: String::new(),
-                mode_config: None,
                 orchestration_config: Some(cfg(name)),
                 seed_prompt: None,
             };
@@ -25743,8 +24343,9 @@ mod tests {
             "a card-sidebar tab in command mode must claim the zoom toggle"
         );
 
-        // No card sidebar (a Mode tab), any mode -> un-resolved, so `Ctrl+Z`
-        // reaches the PTY.
+        // No card sidebar, any mode -> un-resolved, so `Ctrl+Z` reaches the
+        // PTY. (Every current tab kind has a sidebar; this pins `scope_zoom`'s
+        // own contract.)
         for mode in [UiMode::Normal, UiMode::PaneInput] {
             assert!(
                 scope_zoom(zoom(), false, mode).is_none(),
@@ -25839,10 +24440,7 @@ mod tests {
             panes_area,
             pane_rects,
             ..
-        } = layout.content
-        else {
-            panic!("Dashboard tab must produce FrameContent::Cards");
-        };
+        } = layout.content;
         assert_eq!(
             pane_rects.len(),
             pane_ids.len(),
@@ -25918,10 +24516,7 @@ mod tests {
             panes_area,
             pane_rects,
             ..
-        } = layout.content
-        else {
-            panic!("Dashboard tab must produce FrameContent::Cards");
-        };
+        } = layout.content;
         let rect = |id: &str| {
             pane_rects
                 .iter()
@@ -26223,9 +24818,7 @@ mod tests {
             Some(role_pane_ids[1].as_str()),
             1,
         );
-        let FrameContent::Cards { pane_rects, .. } = &layout.content else {
-            panic!("Orchestration tab must produce FrameContent::Cards");
-        };
+        let FrameContent::Cards { pane_rects, .. } = &layout.content;
         let focused_rect = pane_rects
             .iter()
             .find(|(id, _)| id == &role_pane_ids[1])
@@ -26661,10 +25254,7 @@ mod tests {
                 panes_area,
                 pane_rects,
                 ..
-            } = layout.content
-            else {
-                panic!("Orchestration tab must produce FrameContent::Cards");
-            };
+            } = layout.content;
             (
                 panes_area.expect("role panes => a right pane column"),
                 pane_rects,
@@ -26839,15 +25429,11 @@ mod tests {
     #[test]
     fn bottom_bar_rows_caps_to_leave_a_content_row() {
         let ui = UiState::default();
-        let tab_view = ActiveTabView::Dashboard {
-            exclude_pane_ids: Vec::new(),
-            zoomed: false,
-        };
         // 8 cols is narrower than any single full button label, so every button
         // wraps onto its own row — the uncapped count (9) exceeds each of these
         // tiny frame heights, exercising the cap.
         for frame_height in 2u16..=9 {
-            let rows = bottom_bar_rows(&ui, 8, frame_height, &tab_view);
+            let rows = bottom_bar_rows(&ui, 8, frame_height);
             assert!(
                 rows < frame_height,
                 "bottom_bar_rows at frame_height={frame_height} reserved {rows} \
@@ -26859,7 +25445,7 @@ mod tests {
 
     // PRD #76 M2.12: pin the hydration partition's bucket semantics so
     // a future tweak to `partition_hydrated_panes` can't silently strand
-    // mode/orchestration panes on the dashboard or double-build a tab.
+    // orchestration panes on the dashboard or double-build a tab.
 
     fn hydrated(
         pane_id: &str,
@@ -26886,12 +25472,17 @@ mod tests {
         ];
         let p = partition_hydrated_panes(&panes);
         assert_eq!(p.dashboard_pane_ids, vec!["1".to_string(), "2".to_string()]);
-        assert!(p.mode_buckets.is_empty());
         assert!(p.orchestration_buckets.is_empty());
+        assert!(p.rejections.is_empty());
     }
 
+    /// Issue #1199: a daemon record an older TUI tagged `TabMembership::Mode`
+    /// has no mode tab to rebuild — workspace modes were removed — so it lands
+    /// on the dashboard as a plain card, in input order, and each such pane is
+    /// recorded for the hydration site to report. The deprecated variant still
+    /// decodes; it just no longer builds anything.
     #[test]
-    fn partition_groups_mode_membership_by_cwd_and_name() {
+    fn partition_routes_legacy_mode_membership_to_the_dashboard() {
         let panes = vec![
             hydrated(
                 "1",
@@ -26901,63 +25492,136 @@ mod tests {
                     name: "k8s-ops".into(),
                 }),
             ),
+            hydrated("2", "a-2", Some("/work"), None),
             hydrated(
-                "2",
-                "a-2",
-                Some("/work2"),
+                "3",
+                "a-3",
+                None,
                 Some(TabMembership::Mode {
                     name: "k8s-ops".into(),
                 }),
             ),
         ];
         let p = partition_hydrated_panes(&panes);
-        assert!(p.dashboard_pane_ids.is_empty());
-        assert_eq!(p.mode_buckets.len(), 2);
-        assert_eq!(p.mode_buckets[0].cwd, "/work");
-        assert_eq!(p.mode_buckets[0].mode_name, "k8s-ops");
-        assert_eq!(p.mode_buckets[0].agent_pane_id, "1");
-        assert_eq!(p.mode_buckets[1].cwd, "/work2");
-        assert_eq!(p.mode_buckets[1].agent_pane_id, "2");
-    }
-
-    #[test]
-    fn partition_duplicate_mode_bucket_drops_extras_to_dashboard() {
-        // Two agents claim the same (cwd, mode_name) — that's a logic
-        // error (mode tabs have one agent each), so the first wins and
-        // the rest end up on the dashboard rather than getting a doubled
-        // mode tab. M2.12 fixup reviewer #3: the helper is pure, so the
-        // duplicate is surfaced via `rejections` for the caller to log.
-        let panes = vec![
-            hydrated(
-                "1",
-                "a-1",
-                Some("/work"),
-                Some(TabMembership::Mode {
-                    name: "k8s-ops".into(),
-                }),
-            ),
-            hydrated(
-                "2",
-                "a-2",
-                Some("/work"),
-                Some(TabMembership::Mode {
-                    name: "k8s-ops".into(),
-                }),
-            ),
-        ];
-        let p = partition_hydrated_panes(&panes);
-        assert_eq!(p.mode_buckets.len(), 1);
-        assert_eq!(p.mode_buckets[0].agent_pane_id, "1");
-        assert_eq!(p.dashboard_pane_ids, vec!["2".to_string()]);
+        assert_eq!(
+            p.dashboard_pane_ids,
+            vec!["1".to_string(), "2".to_string(), "3".to_string()],
+            "every legacy mode pane is a plain dashboard card, in input order"
+        );
+        assert!(p.orchestration_buckets.is_empty());
         assert_eq!(
             p.rejections,
-            vec![HydrationRejection::DuplicateMode {
-                cwd: "/work".into(),
-                mode_name: "k8s-ops".into(),
-                agent_id: "a-2".into(),
-                pane_id: "2".into(),
-            }]
+            vec![
+                HydrationRejection::LegacyWorkspaceMode {
+                    cwd: "/work".into(),
+                    mode_name: "k8s-ops".into(),
+                    agent_id: "a-1".into(),
+                    pane_id: "1".into(),
+                },
+                HydrationRejection::LegacyWorkspaceMode {
+                    cwd: String::new(),
+                    mode_name: "k8s-ops".into(),
+                    agent_id: "a-3".into(),
+                    pane_id: "3".into(),
+                },
+            ]
         );
+    }
+
+    /// Issue #1199: the hydration site turns those records into ONE
+    /// `session_warnings` line naming the mode(s), and none when there were none.
+    #[test]
+    fn legacy_mode_hydration_warning_is_one_line_naming_the_modes() {
+        assert_eq!(legacy_mode_hydration_warning(&[]), None);
+        let line = legacy_mode_hydration_warning(&["k8s-ops", "dev"])
+            .expect("a warning when any pane was a legacy mode pane");
+        assert!(!line.contains('\n'), "one line: {line:?}");
+        assert!(line.contains("Workspace modes were removed"), "{line}");
+        assert!(line.contains("#1199"), "{line}");
+        assert!(line.contains("k8s-ops") && line.contains("dev"), "{line}");
+        assert!(line.contains("dashboard"), "{line}");
+    }
+
+    /// Issue #1199: the hydration log line's repository-supplied fields reach
+    /// deck.log escaped — a mode name carrying ESC and a newline, and a cwd
+    /// carrying a newline, cannot forge or repaint a log record — and the cwd is
+    /// not clamped the way an identifier is.
+    #[test]
+    fn legacy_mode_hydration_log_fields_escape_control_characters() {
+        let long_dir = "d".repeat(300);
+        let cwd = format!("/work/{long_dir}\nFORGED cwd");
+        let (safe_cwd, safe_mode) =
+            legacy_mode_hydration_log_fields(&cwd, "k8s\u{1b}[2J\nFORGED mode");
+
+        assert!(!safe_mode.contains('\u{1b}'), "{safe_mode:?}");
+        assert!(!safe_mode.contains('\n'), "{safe_mode:?}");
+        assert_eq!(safe_mode, "k8s\\u{1b}[2J\\nFORGED mode");
+
+        assert!(!safe_cwd.contains('\n'), "{safe_cwd:?}");
+        assert_eq!(safe_cwd, format!("/work/{long_dir}\\nFORGED cwd"));
+    }
+
+    /// Issue #1199: a saved session pane that belonged to a workspace-mode tab
+    /// still deserializes (older `session.toml` files carry `mode = "…"`), is
+    /// never written back with it, and restores as a plain pane with one warning
+    /// line naming the pane and the mode.
+    #[test]
+    fn saved_pane_with_legacy_mode_restores_as_plain_pane_with_warning() {
+        let saved: config::SavedPane = toml::from_str(
+            "dir = \"/work\"\nname = \"agent\"\ncommand = \"claude\"\nmode = \"x\"\n",
+        )
+        .expect("a saved pane carrying a legacy mode still parses");
+        assert_eq!(saved.mode.as_deref(), Some("x"));
+        assert!(saved.orchestration.is_none());
+
+        let written = toml::to_string(&saved).expect("serializes");
+        assert!(
+            !written.contains("mode"),
+            "the legacy mode key is read but never written again: {written}"
+        );
+
+        let line = legacy_mode_restore_warning(&saved.name, "x");
+        assert!(!line.contains('\n'), "one line: {line:?}");
+        assert!(line.contains("Workspace modes were removed"), "{line}");
+        assert!(line.contains("'agent'") && line.contains("'x'"), "{line}");
+        assert!(line.contains("plain pane"), "{line}");
+    }
+
+    /// Issue #1199: the New Agent form's legacy-`[[modes]]` warning fires once
+    /// per directory per session — the status line on the first load, and one
+    /// `session_warnings` line naming the config file — and not again when the
+    /// form reopens on the same directory.
+    #[test]
+    fn legacy_modes_warning_surfaces_once_per_directory() {
+        let mut ui = default_ui();
+        let dir = std::path::Path::new("/work/legacy");
+        surface_legacy_modes_warning(&mut ui, dir);
+        let (status, _) = ui.status_message.clone().expect("a status-line warning");
+        assert_eq!(status, LEGACY_MODES_STATUS_MESSAGE);
+        assert!(status.contains("Workspace modes were removed"));
+        assert_eq!(ui.session_warnings.len(), 1);
+        let full = &ui.session_warnings[0];
+        let expected = dir
+            .join(crate::project_config::CONFIG_FILE_NAME)
+            .display()
+            .to_string();
+        assert!(full.contains(&expected), "{full}");
+        assert!(
+            full.contains("ignored") && full.contains("deleted"),
+            "{full}"
+        );
+
+        ui.status_message = None;
+        surface_legacy_modes_warning(&mut ui, dir);
+        assert!(
+            ui.status_message.is_none(),
+            "no repeat for the same directory"
+        );
+        assert_eq!(ui.session_warnings.len(), 1);
+
+        surface_legacy_modes_warning(&mut ui, std::path::Path::new("/work/other"));
+        assert!(ui.status_message.is_some(), "a different directory warns");
+        assert_eq!(ui.session_warnings.len(), 2);
     }
 
     /// Round-12 reviewer #1: a 3-role orchestration whose workers
@@ -27879,7 +26543,8 @@ mod tests {
 
     #[test]
     fn partition_mixed_input_preserves_order() {
-        // dashboard pane, then mode, then orchestration in input order.
+        // dashboard pane, then a legacy mode pane (issue #1199: also a
+        // dashboard card), then orchestration, in input order.
         let panes = vec![
             hydrated("1", "a-1", Some("/w"), None),
             hydrated(
@@ -27904,9 +26569,7 @@ mod tests {
             ),
         ];
         let p = partition_hydrated_panes(&panes);
-        assert_eq!(p.dashboard_pane_ids, vec!["1".to_string()]);
-        assert_eq!(p.mode_buckets.len(), 1);
-        assert_eq!(p.mode_buckets[0].agent_pane_id, "2");
+        assert_eq!(p.dashboard_pane_ids, vec!["1".to_string(), "2".to_string()]);
         assert_eq!(p.orchestration_buckets.len(), 1);
         assert_eq!(p.orchestration_buckets[0].role_slots.len(), 1);
         let slot = &p.orchestration_buckets[0].role_slots[0];
@@ -29122,7 +27785,7 @@ mod tests {
         out
     }
 
-    /// Scenario: open the ordinary `Ctrl+n` new-pane form (two modes, a Name
+    /// Scenario: open the ordinary `Ctrl+n` new-pane form (two orchestrations, a Name
     /// and a Command) and render it into an 80x24 `TestBackend`. It shows the
     /// Mode chips, `Name:` and `Command:` and NO `Agent:` row — no `[auto]`
     /// chip and no click target for one — and Tab visits Mode → Name →
@@ -29133,24 +27796,19 @@ mod tests {
     /// the real binary.
     #[test]
     fn new_pane_form_has_no_agent_row() {
-        let modes = ["demo", "demo2"]
+        let orchestrations = ["demo", "demo2"]
             .iter()
-            .map(|name| ModeConfig {
-                agent: None,
+            .map(|name| OrchestrationConfig {
+                default: false,
                 name: (*name).to_string(),
-                init_command: None,
-                seed_prompt: None,
-                panes: Vec::new(),
-                rules: Vec::new(),
-                reactive_panes: 0,
+                roles: Vec::new(),
             })
             .collect();
         let mut form = NewPaneFormState::new(
             PathBuf::from("/tmp/project"),
             "myname".to_string(),
             "claude".to_string(),
-            modes,
-            Vec::new(),
+            orchestrations,
         );
         let mut targets = None;
         let rendered = buffer_to_string(&render_overlay_to_buffer(80, 24, |frame| {
@@ -29703,7 +28361,7 @@ mod tests {
         assert_eq!(ui.mode, UiMode::NewPaneForm);
         assert!(ui.new_pane_form.is_some());
         let form = ui.new_pane_form.as_ref().unwrap();
-        assert!(form.modes.is_empty());
+        assert!(form.orchestrations.is_empty());
         // PRD #127 M3.2: the built-in "schedule" authoring option is always
         // available, so the Mode field always shows and the form opens on it.
         assert!(form.has_mode_field);
@@ -30769,32 +29427,11 @@ mod tests {
         (0..area.width).map(|x| buf[(x, y)].symbol()).collect()
     }
 
-    /// A minimal mode config with `side_pane_count` persistent side panes —
-    /// enough to open a real second tab so a tab-switch can be exercised.
-    /// Mirrors the verified helper in `tab.rs`'s test module (private there).
-    fn mode_config_local(name: &str, side_pane_count: usize) -> ModeConfig {
-        ModeConfig {
-            agent: None,
-            name: name.to_string(),
-            init_command: None,
-            seed_prompt: None,
-            panes: (0..side_pane_count)
-                .map(|i| crate::project_config::ModePersistentPane {
-                    command: format!("echo side-{i}"),
-                    name: Some(format!("side-{i}")),
-                    watch: false,
-                })
-                .collect(),
-            rules: Vec::new(),
-            reactive_panes: 0,
-        }
-    }
-
-    /// Pane controller that hands out UNIQUE pane ids (so `open_mode_tab`'s
-    /// `activate_mode` registers distinct side panes) and records every
+    /// Pane controller that hands out UNIQUE pane ids (so an opened tab's panes
+    /// are distinct) and records every
     /// `focus_pane` target. Ported from `tab.rs`'s `MockPaneController`
     /// (private to that module); the existing `RecordingFocusPC` returns an
-    /// empty id from `create_pane`, which can't back a real mode tab.
+    /// empty id from `create_pane`, which can't back a real tab.
     struct OpenTabPC {
         next: std::sync::Mutex<u32>,
         focused: std::sync::Mutex<Vec<String>>,
@@ -31029,7 +29666,7 @@ mod tests {
         assert!(!entered, "a failed attach must not enter PaneInput mode");
     }
 
-    /// Scenario: Open a second (Mode) tab so a tab switch is possible, arm the
+    /// Scenario: Open a second (Orchestration) tab so a tab switch is possible, arm the
     /// Dashboard's highlight on card 2 (active selection), then drive the real
     /// tab-switch path — `Action::CycleTabNext` away from the Dashboard and
     /// `Action::CycleTabPrev` back. After the round-trip the dashboard
@@ -31044,14 +29681,9 @@ mod tests {
         let pc = Arc::new(OpenTabPC::new());
         let mut tab_manager = TabManager::new(pc.clone());
         tab_manager
-            .open_mode_tab(
-                &mode_config_local("m", 1),
-                "/work",
-                "agent-m".to_string(),
-                (24, 80),
-            )
+            .open_orchestration_tab(&orch_config_local("m"), "/work", None, None, (24, 80))
             .expect("open a second tab");
-        // open_mode_tab leaves the mode tab active — return to the Dashboard.
+        // Opening the tab leaves it active — return to the Dashboard.
         assert!(tab_manager.switch_to(0));
 
         let snapshot = dashboard_snapshot(3);
@@ -31173,9 +29805,9 @@ mod tests {
     /// active highlight (e.g. just after returning from another tab), Enter must
     /// RESTORE the previously-selected card, not jump to card 0. Arm the
     /// dashboard highlight on a NON-first card (index 1), drive a REAL tab
-    /// round-trip (Dashboard → Mode → Dashboard via `switch_tab_with_focus`,
-    /// using a Mode tab as a non-deck intermediate so only the Dashboard-leave
-    /// records the prior selection) which clears the live highlight but must
+    /// round-trip (Dashboard → Orchestration → Dashboard via
+    /// `switch_tab_with_focus`; the intermediate deck keeps its own remembered
+    /// selection, keyed by its tab id) which clears the live highlight but must
     /// REMEMBER index 1, then assert Enter still maps to `Action::Focus` and the
     /// focus target (`dashboard_focus_target`) is the remembered card (index 1),
     /// NOT card 0. The active-selection and no-cards targets are unchanged.
@@ -31184,15 +29816,10 @@ mod tests {
     fn selection_008_enter_restores_previous_selection() {
         let pc = Arc::new(OpenTabPC::new());
         let mut tab_manager = TabManager::new(pc.clone());
-        let (mode_idx, _side_ids) = tab_manager
-            .open_mode_tab(
-                &mode_config_local("m", 1),
-                "/work",
-                "agent-m".to_string(),
-                (24, 80),
-            )
-            .expect("open a second (mode) tab");
-        // open_mode_tab leaves the mode tab active — start on the Dashboard.
+        let (other_idx, _other_roles) = tab_manager
+            .open_orchestration_tab(&orch_config_local("m"), "/work", None, None, (24, 80))
+            .expect("open a second (orchestration) tab");
+        // Opening the tab leaves it active — start on the Dashboard.
         assert!(tab_manager.switch_to(0));
 
         let snapshot = dashboard_snapshot(3);
@@ -31208,11 +29835,11 @@ mod tests {
             *selected_session_id = Some("s1".to_string());
         }
 
-        // Real round-trip: Dashboard → Mode → Dashboard. Leaving the Dashboard
-        // clears the live highlight but must REMEMBER the prior selection
-        // (index 1). The Mode tab is a non-deck intermediate, so the return leg
-        // does not overwrite the remembered selection.
-        switch_tab_with_focus(&mut tab_manager, mode_idx, &*pc, &snapshot, &mut ui);
+        // Real round-trip: Dashboard → Orchestration → Dashboard. Leaving the
+        // Dashboard clears the live highlight but must REMEMBER the prior
+        // selection (index 1); the intermediate deck's own memory is keyed
+        // separately, so the return leg does not overwrite it.
+        switch_tab_with_focus(&mut tab_manager, other_idx, &*pc, &snapshot, &mut ui);
         switch_tab_with_focus(&mut tab_manager, 0, &*pc, &snapshot, &mut ui);
 
         // SC1 still holds: no live highlight on return (selection_011/013/015).
@@ -31508,7 +30135,7 @@ mod tests {
     /// only on Dashboard-LEAVE, so the return into the Dashboard does not clear
     /// it. This drives the REAL switch path (`switch_tab_with_focus`) AND the
     /// REAL per-frame `reconcile_dashboard_selection` on each frame — which is
-    /// why `selection_005` (Mode tab + direct `dispatch_action`, no per-frame
+    /// why `selection_005` (second tab + direct `dispatch_action`, no per-frame
     /// reconcile) cannot catch this. After the round-trip `selected_index` must
     /// be `None` (SC1: switching to ANY other tab and back leaves no card armed).
     #[spec("dashboard/selection/011")]
@@ -31622,12 +30249,11 @@ mod tests {
     }
 
     /// Scenario: PR #151 e2e regression (e2e_render_contract::layout_002) — the
-    /// inactive-selection close no-op (selection_012) must NOT suppress closing a
-    /// Mode/Orchestration TAB via Ctrl+W. With a Mode tab active and
-    /// `selected_index == None` (the real condition on a Mode tab — nothing armed
-    /// on the dashboard), `Action::CloseSelected` must arm the PRD #241
-    /// confirmation and the follow-up `Action::ConfirmCloseSelected` must close
-    /// that tab; likewise for an active Orchestration tab. Bounds
+    /// inactive-selection close no-op (selection_012) must NOT suppress closing an
+    /// Orchestration TAB via Ctrl+W. With an Orchestration tab active and
+    /// `selected_index == None` (nothing armed on the dashboard),
+    /// `Action::CloseSelected` must arm the PRD #241 confirmation and the
+    /// follow-up `Action::ConfirmCloseSelected` must close that tab. Bounds
     /// `dashboard/selection/012`: an unarmed dashboard CARD stays a no-op, but an
     /// active tab remains a valid confirmation target.
     #[spec("dashboard/selection/016")]
@@ -31646,64 +30272,7 @@ mod tests {
 
         let mut ui = default_ui();
 
-        // --- Mode tab: the exact case the e2e (layout_002) caught. ---
-        tab_manager
-            .open_mode_tab(
-                &mode_config_local("m", 1),
-                "/work",
-                "agent-m".to_string(),
-                (24, 80),
-            )
-            .expect("open a mode tab");
-        // open_mode_tab leaves the Mode tab active.
-        assert_eq!(tab_manager.tab_count(), 2, "Dashboard + Mode tab");
-
-        ui.selected_index = None; // inactive — nothing armed on the dashboard
-        dispatch_action(
-            Action::CloseSelected,
-            &mut ui,
-            &*pc,
-            &state,
-            &mut tab_manager,
-            &snapshot,
-            &filtered,
-            None,
-            area,
-        );
-        // PRD #241 M3: an active tab IS a target, so the request confirms
-        // rather than no-ops — but nothing is torn down until the user says so.
-        assert_eq!(
-            ui.mode,
-            UiMode::CloseConfirm,
-            "an active Mode tab must arm the close confirmation"
-        );
-        assert_eq!(
-            tab_manager.tab_count(),
-            2,
-            "opening the confirmation must not close anything yet"
-        );
-        dispatch_action(
-            Action::ConfirmCloseSelected,
-            &mut ui,
-            &*pc,
-            &state,
-            &mut tab_manager,
-            &snapshot,
-            &filtered,
-            None,
-            area,
-        );
-        assert_eq!(
-            tab_manager.tab_count(),
-            1,
-            "Ctrl+W must close the active MODE tab even when the dashboard selection is inactive (None)"
-        );
-        assert!(
-            matches!(tab_manager.active_tab(), Tab::Dashboard { .. }),
-            "after the Mode tab closes the lone Dashboard is active"
-        );
-
-        // --- Orchestration tab: same contract (same gate). ---
+        // --- Orchestration tab: the case the e2e (layout_002) caught. ---
         tab_manager
             .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
             .expect("open an orchestration tab");
@@ -31865,9 +30434,9 @@ mod tests {
     /// `selected_session_id` is cleared on leave and `restore_focus_on_switch_in`
     /// returns `None`), reverting to the first card; the Orchestration deck
     /// already re-focuses its remembered role pane. Pins the unified fix: the
-    /// Dashboard leave/return is symmetric with Orchestration. Consistent with
-    /// selection_013 (focused pane present on return, highlight `None`). RED today
-    /// for the Dashboard (no pane re-focused).
+    /// Dashboard leave/return is symmetric with Orchestration (focused pane
+    /// present on return, highlight `None`). RED today for the Dashboard (no pane
+    /// re-focused).
     #[spec("dashboard/selection/018")]
     #[test]
     fn selection_018_return_refocuses_remembered_pane_both_decks() {
@@ -31875,14 +30444,9 @@ mod tests {
         {
             let pc = Arc::new(OpenTabPC::new());
             let mut tab_manager = TabManager::new(pc.clone());
-            let (mode_idx, _side_ids) = tab_manager
-                .open_mode_tab(
-                    &mode_config_local("m", 1),
-                    "/work",
-                    "agent-m".to_string(),
-                    (24, 80),
-                )
-                .expect("open a mode tab");
+            let (other_idx, _other_roles) = tab_manager
+                .open_orchestration_tab(&orch_config_local("m"), "/work", None, None, (24, 80))
+                .expect("open a second tab");
             assert!(tab_manager.switch_to(0)); // start on the Dashboard
 
             let snapshot = dashboard_snapshot(3);
@@ -31899,7 +30463,7 @@ mod tests {
             }
 
             // Round-trip Dashboard -> Mode -> Dashboard.
-            switch_tab_with_focus(&mut tab_manager, mode_idx, &*pc, &snapshot, &mut ui);
+            switch_tab_with_focus(&mut tab_manager, other_idx, &*pc, &snapshot, &mut ui);
             switch_tab_with_focus(&mut tab_manager, 0, &*pc, &snapshot, &mut ui);
 
             // The remembered card's pane is re-focused on return (symmetry with
@@ -31926,14 +30490,9 @@ mod tests {
             let (orch_idx, role_pane_ids) = tab_manager
                 .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
                 .expect("open an orchestration tab");
-            let (mode_idx, _side_ids) = tab_manager
-                .open_mode_tab(
-                    &mode_config_local("m", 1),
-                    "/work",
-                    "agent-m".to_string(),
-                    (24, 80),
-                )
-                .expect("open a mode tab");
+            let (other_idx, _other_roles) = tab_manager
+                .open_orchestration_tab(&orch_config_local("m"), "/work", None, None, (24, 80))
+                .expect("open a second tab");
             assert!(tab_manager.switch_to(orch_idx)); // start on the Orchestration deck
 
             let snapshot = AppState::default();
@@ -31949,7 +30508,7 @@ mod tests {
                 *focused_role_pane_id = Some(r1.clone());
             }
 
-            switch_tab_with_focus(&mut tab_manager, mode_idx, &*pc, &snapshot, &mut ui);
+            switch_tab_with_focus(&mut tab_manager, other_idx, &*pc, &snapshot, &mut ui);
             switch_tab_with_focus(&mut tab_manager, orch_idx, &*pc, &snapshot, &mut ui);
 
             assert_eq!(
@@ -31962,84 +30521,6 @@ mod tests {
                 "the highlight stays inactive on return"
             );
         }
-    }
-
-    /// Scenario: PRD #113 / PR #151 real-app regression — the blue highlight must
-    /// NOT reappear after a Dashboard → Mode → Dashboard round-trip when the
-    /// restored focus is steady. A Mode tab's AGENT pane is also a Dashboard card
-    /// (only its side panes are in `all_managed_pane_ids`), and switching to a
-    /// Mode tab focuses that agent pane while the return to the Dashboard restores
-    /// nothing — so the agent pane STAYS focused. This drives the REAL per-frame
-    /// `reconcile_dashboard_selection` on both the mode frame and the return
-    /// dashboard frame with that SAME focused pane id (no transition); because the
-    /// focus did not change, the inactive selection stays inactive (`None`).
-    /// `selection_005`/`selection_011` cannot catch this (they drive
-    /// `dispatch_action` directly or pass `focused = None`, so the per-frame
-    /// reconcile never sees a steady-state focused dashboard card).
-    #[spec("dashboard/selection/013")]
-    #[test]
-    fn selection_013_steady_state_focus_does_not_reactivate() {
-        let pc = Arc::new(OpenTabPC::new());
-        let mut tab_manager = TabManager::new(pc.clone());
-        // A Mode tab whose AGENT pane id ("agent-m") is also a Dashboard card.
-        let (mode_idx, _side_ids) = tab_manager
-            .open_mode_tab(
-                &mode_config_local("m", 1),
-                "/work",
-                "agent-m".to_string(),
-                (24, 80),
-            )
-            .expect("open a mode tab");
-        // open_mode_tab leaves the mode tab active — start on the Dashboard.
-        assert!(tab_manager.switch_to(0));
-
-        let snapshot = AppState::default();
-        // Dashboard cards INCLUDE the Mode agent pane "agent-m" (card index 1) —
-        // exactly the real-app condition (the agent pane isn't filtered out).
-        let dash_filtered: [(&str, Option<&str>); 3] = [
-            ("s0", Some("p0")),
-            ("agent-sess", Some("agent-m")),
-            ("s2", Some("p2")),
-        ];
-
-        let mut ui = default_ui();
-        // Arm the highlight on the Dashboard (what the user sees before leaving).
-        ui.selected_index = Some(1);
-        if let Tab::Dashboard {
-            selected_session_id,
-            ..
-        } = tab_manager.active_tab_mut()
-        {
-            *selected_session_id = Some("agent-sess".to_string());
-        }
-
-        // Switch Dashboard → Mode (leaving the Dashboard deactivates the highlight).
-        switch_tab_with_focus(&mut tab_manager, mode_idx, &*pc, &snapshot, &mut ui);
-        // Mode frame: the agent pane "agent-m" is focused; the per-frame reconcile
-        // records it as the focus baseline (a Mode tab doesn't touch the dashboard
-        // selection).
-        reconcile_dashboard_selection(
-            &mut ui,
-            tab_manager.active_tab_mut(),
-            Some("agent-m"),
-            &dash_filtered,
-        );
-
-        // Switch Mode → Dashboard. Nothing is restored, so "agent-m" STAYS focused.
-        switch_tab_with_focus(&mut tab_manager, 0, &*pc, &snapshot, &mut ui);
-        // Return dashboard frame: SAME focused pane "agent-m" as the mode frame —
-        // no focus TRANSITION — so the highlight must NOT reappear.
-        reconcile_dashboard_selection(
-            &mut ui,
-            tab_manager.active_tab_mut(),
-            Some("agent-m"),
-            &dash_filtered,
-        );
-
-        assert_eq!(
-            ui.selected_index, None,
-            "a steady-state restored focus (no transition) must not reactivate the highlight on tab return"
-        );
     }
 
     /// Scenario: PRD #113 M4 guard — the focus-transition fix must NOT
@@ -32193,8 +30674,8 @@ mod tests {
     /// Scenario: PRD #113 design revision (2026-06-13) Change 2 — Enter restores
     /// the previously-selected role on the Orchestration deck. The orchestration
     /// deck routes Enter through the same `dashboard_focus_target` SSOT as the
-    /// Dashboard. Arm role 1, drive a REAL round-trip via a Mode tab (a non-deck
-    /// intermediate: Orchestration → Mode → Orchestration) which clears the live
+    /// Dashboard. Arm role 1, drive a REAL round-trip via a second orchestration
+    /// tab (Orchestration → Orchestration → Orchestration) which clears the live
     /// highlight but must REMEMBER role 1, then assert the Enter focus target is
     /// the remembered role (index 1), NOT role 0.
     #[spec("tabs/orchestration/004")]
@@ -32205,14 +30686,9 @@ mod tests {
         let (orch_idx, role_pane_ids) = tab_manager
             .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
             .expect("open an orchestration tab");
-        let (mode_idx, _side_ids) = tab_manager
-            .open_mode_tab(
-                &mode_config_local("m", 1),
-                "/work",
-                "agent-m".to_string(),
-                (24, 80),
-            )
-            .expect("open a mode tab");
+        let (other_idx, _other_roles) = tab_manager
+            .open_orchestration_tab(&orch_config_local("m"), "/work", None, None, (24, 80))
+            .expect("open a second tab");
         // Start on the Orchestration deck.
         assert!(tab_manager.switch_to(orch_idx));
 
@@ -32231,9 +30707,9 @@ mod tests {
             *focused_role_pane_id = Some(r1.clone());
         }
 
-        // Round-trip via a Mode tab (a non-deck intermediate, so only the
-        // Orchestration-leave records the prior selection): Orch → Mode → Orch.
-        switch_tab_with_focus(&mut tab_manager, mode_idx, &*pc, &snapshot, &mut ui);
+        // Round-trip via a second orchestration tab (its own remembered
+        // selection is keyed by its own tab id): Orch → Orch 2 → Orch.
+        switch_tab_with_focus(&mut tab_manager, other_idx, &*pc, &snapshot, &mut ui);
         switch_tab_with_focus(&mut tab_manager, orch_idx, &*pc, &snapshot, &mut ui);
 
         // SC1 still holds for the orchestration deck: no live highlight on return.
@@ -34100,18 +32576,6 @@ mod tests {
     // Unified NewPaneFormState tests
     // -----------------------------------------------------------------------
 
-    fn make_mode(name: &str) -> ModeConfig {
-        ModeConfig {
-            agent: None,
-            name: name.to_string(),
-            init_command: None,
-            seed_prompt: None,
-            panes: vec![],
-            rules: vec![],
-            reactive_panes: 2,
-        }
-    }
-
     fn make_orchestration(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
             default: false,
@@ -34145,79 +32609,46 @@ mod tests {
             PathBuf::from("/tmp"),
             String::new(),
             String::new(),
-            vec![make_mode("a")],
-            vec![],
+            vec![make_orchestration("a")],
         );
         // PRD #127 M3.2: + the built-in "schedule" authoring option.
         // PRD #220: + the built-in "dispatcher" option, which graduated out of the
         // experimental flag and is now offered on every `Ctrl+n` form.
-        assert_eq!(f.mode_option_count(), 4); // "No mode" + 1 mode + "schedule" + "dispatcher"
+        assert_eq!(f.mode_option_count(), 4); // "No mode" + 1 orch + "schedule" + "dispatcher"
 
-        let f = NewPaneFormState::new(
-            PathBuf::from("/tmp"),
-            String::new(),
-            String::new(),
-            vec![],
-            vec![],
-        );
+        let f = NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
         assert_eq!(f.mode_option_count(), 3); // "No mode" + "schedule" + "dispatcher"
     }
 
+    /// Issue #1199: the Mode row's built-in options carry their own chip names
+    /// and the modal-title name.
     #[test]
-    fn unified_form_mode_cycling() {
+    fn unified_form_selected_builtin() {
         let mut f = NewPaneFormState::new(
             PathBuf::from("/tmp"),
             String::new(),
             String::new(),
-            vec![make_mode("alpha"), make_mode("beta")],
-            vec![],
-        );
-        assert_eq!(f.selection_index, 0);
-
-        // Can't go below 0
-        f.select_previous_mode();
-        assert_eq!(f.selection_index, 0);
-
-        f.select_next_mode();
-        assert_eq!(f.selection_index, 1);
-        f.select_next_mode();
-        assert_eq!(f.selection_index, 2);
-        // PRD #127 M3.2: index 3 is the built-in "schedule" authoring option.
-        f.select_next_mode();
-        assert_eq!(f.selection_index, 3);
-        assert!(f.is_schedule_selected());
-
-        // PRD #220: index 4 is the built-in "dispatcher" option, now the LAST slot
-        // (it graduated out of the experimental flag, so every form offers it).
-        f.select_next_mode();
-        assert_eq!(f.selection_index, 4);
-        assert!(f.is_dispatcher_selected());
-
-        // Can't go past last (dispatcher)
-        f.select_next_mode();
-        assert_eq!(f.selection_index, 4);
-    }
-
-    #[test]
-    fn unified_form_selected_mode() {
-        let mut f = NewPaneFormState::new(
-            PathBuf::from("/tmp"),
-            String::new(),
-            String::new(),
-            vec![make_mode("k8s"), make_mode("rust-tdd")],
-            vec![],
+            vec![make_orchestration("tdd")],
         );
 
-        // Index 0 = "No mode"
-        assert!(f.selected_mode().is_none());
+        // Index 0 = "No mode", 1 = the orchestration: neither is a built-in.
+        assert_eq!(f.selected_builtin(), None);
         assert_eq!(f.mode_option_name(f.selection_index), "No mode");
-
         f.selection_index = 1;
-        assert_eq!(f.selected_mode().unwrap().name, "k8s");
-        assert_eq!(f.mode_option_name(f.selection_index), "k8s");
+        assert_eq!(f.selected_builtin(), None);
 
-        f.selection_index = 2;
-        assert_eq!(f.selected_mode().unwrap().name, "rust-tdd");
+        f.selection_index = f.schedule_index();
+        assert_eq!(f.selected_builtin(), Some(BuiltinOption::Schedule));
+        assert_eq!(f.mode_option_name(f.selection_index), "schedule");
+        assert_eq!(BuiltinOption::Schedule.name(), SCHEDULE_MODE_NAME);
+
+        f.selection_index = f.dispatcher_index();
+        assert_eq!(f.selected_builtin(), Some(BuiltinOption::Dispatcher));
+        assert_eq!(f.mode_option_name(f.selection_index), "dispatcher");
+        assert_eq!(
+            BuiltinOption::IssueDispatch.name(),
+            ISSUE_DISPATCH_MODE_NAME
+        );
     }
 
     #[test]
@@ -34226,26 +32657,26 @@ mod tests {
             PathBuf::from("/tmp"),
             String::new(),
             String::new(),
-            vec![make_mode("dev")],
             vec![make_orchestration("tdd"), make_orchestration("review")],
         );
 
-        // Index 0 = "No mode", 1 = mode "dev", 2+ = orchestrations
+        // Index 0 = "No mode", 1+ = orchestrations
         assert!(f.selected_orchestration().is_none());
-        assert!(f.selected_mode().is_none());
+        assert!(f.selected_builtin().is_none());
 
         f.selection_index = 1;
-        assert!(f.selected_orchestration().is_none());
-        assert_eq!(f.selected_mode().unwrap().name, "dev");
-
-        f.selection_index = 2;
-        assert!(f.selected_mode().is_none());
+        assert!(f.selected_builtin().is_none());
         assert_eq!(f.selected_orchestration().unwrap().name, "tdd");
         assert_eq!(f.mode_option_name(f.selection_index), "Orch: tdd");
 
-        f.selection_index = 3;
+        f.selection_index = 2;
         assert_eq!(f.selected_orchestration().unwrap().name, "review");
         assert_eq!(f.mode_option_name(f.selection_index), "Orch: review");
+
+        // The first built-in after them is not an orchestration.
+        f.selection_index = 3;
+        assert!(f.selected_orchestration().is_none());
+        assert!(f.is_schedule_selected());
     }
 
     #[test]
@@ -34254,71 +32685,43 @@ mod tests {
             PathBuf::from("/tmp"),
             String::new(),
             String::new(),
-            vec![make_mode("dev")],
             vec![make_orchestration("tdd")],
         );
-        // 0=No mode, 1=dev, 2=tdd, 3=schedule (PRD #127 M3.2 built-in),
-        // 4=dispatcher (PRD #220, graduated out of the experimental flag).
-        assert_eq!(f.mode_option_count(), 5);
+        // 0=No mode, 1=tdd, 2=schedule (PRD #127 M3.2 built-in),
+        // 3=dispatcher (PRD #220, graduated out of the experimental flag).
+        assert_eq!(f.mode_option_count(), 4);
+
+        // Can't go below 0
+        f.select_previous_mode();
+        assert_eq!(f.selection_index, 0);
 
         f.select_next_mode();
-        f.select_next_mode();
-        assert_eq!(f.selection_index, 2);
+        assert_eq!(f.selection_index, 1);
         assert_eq!(f.selected_orchestration().unwrap().name, "tdd");
 
-        // Index 3 is the built-in "schedule" authoring option.
+        // Index 2 is the built-in "schedule" authoring option.
         f.select_next_mode();
-        assert_eq!(f.selection_index, 3);
+        assert_eq!(f.selection_index, 2);
         assert!(f.is_schedule_selected());
         assert!(f.selected_orchestration().is_none());
 
-        // PRD #220: index 4 is the built-in "dispatcher" option, now the LAST slot.
+        // PRD #220: index 3 is the built-in "dispatcher" option, now the LAST slot.
         f.select_next_mode();
-        assert_eq!(f.selection_index, 4);
+        assert_eq!(f.selection_index, 3);
         assert!(f.is_dispatcher_selected());
 
         // Can't go past last (dispatcher)
         f.select_next_mode();
-        assert_eq!(f.selection_index, 4);
-    }
-
-    #[test]
-    fn unified_form_tab_cycles_with_mode() {
-        let mut f = NewPaneFormState::new(
-            PathBuf::from("/tmp"),
-            String::new(),
-            String::new(),
-            vec![make_mode("a")],
-            vec![],
-        );
-        assert_eq!(f.focused, FormField::Mode);
-
-        f.focused = f.next_field();
-        assert_eq!(f.focused, FormField::Name);
-
-        f.focused = f.next_field();
-        assert_eq!(f.focused, FormField::Command);
-
-        f.focused = f.next_field();
-        assert_eq!(f.focused, FormField::Mode); // wraps
-
-        // Reverse
-        f.focused = f.prev_field();
-        assert_eq!(f.focused, FormField::Command);
+        assert_eq!(f.selection_index, 3);
     }
 
     // PRD #127 M3.2: with the built-in "schedule" authoring option, the Mode
-    // field is always present even when the project declares no modes — so the
-    // field cycle always includes Mode.
+    // field is always present even when the project declares no orchestration —
+    // so the field cycle always includes Mode.
     #[test]
-    fn unified_form_tab_cycles_with_builtin_schedule_when_no_project_modes() {
-        let mut f = NewPaneFormState::new(
-            PathBuf::from("/tmp"),
-            String::new(),
-            String::new(),
-            vec![],
-            vec![],
-        );
+    fn unified_form_tab_cycles_with_builtin_schedule_when_no_project_options() {
+        let mut f =
+            NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
         assert!(f.has_mode_field);
         assert_eq!(f.focused, FormField::Mode);
 
@@ -34351,12 +32754,8 @@ mod tests {
     }
 
     #[test]
-    fn build_dispatcher_mode_produces_correct_config() {
-        let mode = build_dispatcher_mode(std::path::Path::new("/tmp/test-repo"));
-        assert_eq!(mode.name, DISPATCHER_MODE_NAME);
-        let seed = mode
-            .seed_prompt
-            .expect("dispatcher mode must have a seed prompt");
+    fn build_dispatcher_seed_carries_the_working_dir() {
+        let seed = build_dispatcher_seed(std::path::Path::new("/tmp/test-repo"));
         assert!(
             seed.starts_with(DISPATCHER_SEED_PROMPT),
             "seed must start with the constant prompt, got:\n{seed}"
@@ -34541,14 +32940,13 @@ mod tests {
             PathBuf::from("/tmp"),
             String::new(),
             String::new(),
-            vec![make_mode("a")],
-            vec![],
+            vec![make_orchestration("a")],
         );
         // Both experimental options on, independent of the ambient env flag.
         f.show_issue_dispatch = true;
         f.show_dispatcher = true;
 
-        // "No mode" + 1 mode + schedule + schedule: issues + dispatcher.
+        // "No mode" + 1 orchestration + schedule + schedule: issues + dispatcher.
         assert_eq!(f.mode_option_count(), 5);
         let last = f.mode_option_count() - 1;
         assert_eq!(
@@ -34560,15 +32958,12 @@ mod tests {
 
         f.selection_index = last;
         assert!(f.is_dispatcher_selected());
-        assert_eq!(
-            f.selected_mode().map(|m| m.name.as_str()),
-            Some(DISPATCHER_MODE_NAME)
-        );
+        assert_eq!(f.selected_builtin(), Some(BuiltinOption::Dispatcher));
         // PRD #220: a dispatcher pane has continued purpose, so it must NOT be
         // labelled "↳ authoring (one-off)" the way the schedule options are.
         assert!(
             !f.is_authoring_selected(),
-            "dispatcher is a real mode tab, not throwaway authoring"
+            "dispatcher is not throwaway authoring"
         );
 
         // Flag off: the cycler shape is the pre-feature baseline and the
@@ -34579,23 +32974,14 @@ mod tests {
         assert!(!f.is_dispatcher_selected());
     }
 
-    /// PRD #220: submitting the dispatcher option must spawn a dashboard CARD,
-    /// never a mode tab.
-    ///
-    /// A mode tab routes through `render_mode_tab`'s 50/50 split, and
-    /// `mode_side_pane_dims` halves the width unconditionally — so a mode with no
-    /// side panes (which the dispatcher is) renders the agent at half width beside
-    /// an empty column. PRD #127 hit this first and fixed it the same way for the
-    /// `schedule` option. This pins the spawn shape so it cannot regress: the
-    /// synthetic mode is for the cycler's title/chip only, and the seed must ride
-    /// on the REQUEST.
+    /// PRD #220: submitting the dispatcher option must spawn a dashboard CARD
+    /// carrying its seed on the REQUEST.
     #[test]
-    fn dispatcher_submits_as_a_dashboard_card_not_a_mode_tab() {
+    fn dispatcher_submits_as_a_dashboard_card() {
         let mut f = NewPaneFormState::new(
             PathBuf::from("/tmp/repo"),
             String::new(),
             String::new(),
-            vec![],
             vec![],
         );
         f.show_issue_dispatch = true;
@@ -34607,10 +32993,6 @@ mod tests {
         );
 
         let req = build_new_pane_request(&f, "claude");
-        assert!(
-            req.mode_config.is_none(),
-            "the dispatcher must NOT spawn a mode tab — that is the 50/50-split bug"
-        );
         assert!(req.orchestration_config.is_none());
         let seed = req
             .seed_prompt
@@ -34625,9 +33007,9 @@ mod tests {
             "the seed must still be dir-qualified, got:\n{seed}"
         );
 
-        // The cycler still names it, via the synthetic mode.
+        // The cycler still names it.
         assert_eq!(
-            f.selected_mode().map(|m| m.name.as_str()),
+            f.selected_builtin().map(BuiltinOption::name),
             Some(DISPATCHER_MODE_NAME)
         );
     }
@@ -34680,8 +33062,7 @@ mod tests {
     #[test]
     fn each_authoring_option_seeds_the_text_the_daemon_composes_for_its_kind() {
         let dir = PathBuf::from("/tmp/picked repo");
-        let mut form =
-            NewPaneFormState::new(dir.clone(), String::new(), String::new(), vec![], vec![]);
+        let mut form = NewPaneFormState::new(dir.clone(), String::new(), String::new(), vec![]);
         form.show_issue_dispatch = true;
         form.show_dispatcher = true;
         let cases = [
@@ -34708,10 +33089,9 @@ mod tests {
     }
 
     #[test]
-    fn manager_add_authoring_mode_is_blank_base_seed() {
-        let mode = build_schedule_authoring_mode(None, std::path::Path::new("/tmp/picked"));
-        assert_eq!(mode.name, SCHEDULE_MODE_NAME);
-        let seed = mode.seed_prompt.as_deref().unwrap();
+    fn manager_add_authoring_seed_is_blank_base_seed() {
+        let seed = build_schedule_authoring_seed(None, std::path::Path::new("/tmp/picked"));
+        let seed = seed.as_str();
         // Add starts from the base seed (invokes `schedule add`, no edit block) —
         // PRD #170 appends the picked-dir working_dir DEFAULT line.
         assert!(
@@ -34727,16 +33107,15 @@ mod tests {
     }
 
     #[test]
-    fn manager_edit_authoring_mode_prefills_and_forbids_rename() {
+    fn manager_edit_authoring_seed_prefills_and_forbids_rename() {
         // PRD #170 finding 3: the row's stored dir (A) and the re-picked dir (B)
         // are distinct, non-overlapping paths so the assertions below can tell the
         // stale current-value from the picked default.
         let mut existing = make_scheduled_task("digest", true);
         existing.working_dir = "/row/dir/alpha".to_string();
-        let mode =
-            build_schedule_authoring_mode(Some(&existing), std::path::Path::new("/pick/dir/bravo"));
-        assert_eq!(mode.name, SCHEDULE_MODE_NAME);
-        let seed = mode.seed_prompt.as_deref().unwrap();
+        let seed =
+            build_schedule_authoring_seed(Some(&existing), std::path::Path::new("/pick/dir/bravo"));
+        let seed = seed.as_str();
         // PRD #170: the picked dir is threaded in as the working_dir DEFAULT.
         assert!(
             seed.contains("working_dir DEFAULT: /pick/dir/bravo"),
@@ -34789,7 +33168,7 @@ mod tests {
 
     // Issue #142 — every `UiMode`'s wheel modality is declared explicitly. The
     // bug was an OMISSION: `ScheduledTasks` was missing from the wheel-blocking
-    // guard, so wheeling over the manager dialog scrolled the mode-tab side pane
+    // guard, so wheeling over the manager dialog scrolled the pane
     // behind it. Listing all variants here (paired with the exhaustive `match` in
     // `overlay_blocks_mouse`, which has no `_` arm) makes a repeat of that
     // omission fail loudly rather than silently leak.
@@ -34965,11 +33344,9 @@ mod tests {
     }
 
     // PRD #127 M3.2: the new-deck dialog's Mode cycler always ends with a
-    // built-in "schedule" authoring option (after the project modes and
-    // orchestrations). PRD #170 finding 7: the seed no longer rides on the
-    // synthetic mode (that field is dead data, left `None`) — it is derived at
-    // submit time by `build_schedule_authoring_mode`, so the SPAWN REQUEST is what
-    // carries it. This test pins both: the option is last/selectable, and
+    // built-in "schedule" authoring option (after the project's orchestrations).
+    // PRD #170 finding 7: the seed is derived at submit time by
+    // `build_schedule_authoring_seed`, so the SPAWN REQUEST is what carries it. This test pins both: the option is last/selectable, and
     // submitting it produces a seeded request.
     #[test]
     fn unified_form_builtin_schedule_option_is_offered_and_seeded() {
@@ -34977,12 +33354,11 @@ mod tests {
             PathBuf::from("/tmp"),
             String::new(),
             String::new(),
-            vec![make_mode("build")],
             vec![make_orchestration("review")],
         );
-        // 0=No mode, 1=build, 2=review, 3=schedule, 4=dispatcher.
-        assert_eq!(f.schedule_index(), 3);
-        assert_eq!(f.mode_option_count(), 5);
+        // 0=No mode, 1=review, 2=schedule, 3=dispatcher.
+        assert_eq!(f.schedule_index(), 2);
+        assert_eq!(f.mode_option_count(), 4);
 
         // PRD #220: `schedule` is no longer the LAST slot — the graduated
         // `dispatcher` option now sits after it, so cycling to the cap lands
@@ -34998,14 +33374,8 @@ mod tests {
         f.selection_index = f.schedule_index();
         assert!(f.is_schedule_selected());
 
-        // It is a real (synthetic) mode named `schedule`, NOT misread as an
-        // orchestration. Finding 7: the synthetic mode no longer carries the seed.
-        let seeded = f.selected_mode().expect("schedule yields a mode");
-        assert_eq!(seeded.name, "schedule");
-        assert!(
-            seeded.seed_prompt.is_none(),
-            "finding 7: the synthetic mode's seed_prompt is dead data — left None"
-        );
+        // It is the built-in `schedule` option, NOT misread as an orchestration.
+        assert_eq!(f.selected_builtin(), Some(BuiltinOption::Schedule));
         assert!(f.selected_orchestration().is_none());
 
         // The seed is delivered through the spawn request derived at submit time.
@@ -35036,7 +33406,6 @@ mod tests {
             String::new(),
             String::new(), // blank command
             vec![],
-            vec![],
         );
         f.select_next_mode(); // index 0 -> 1 = the built-in "schedule" option
         assert!(f.is_schedule_selected());
@@ -35060,7 +33429,6 @@ mod tests {
             String::new(),
             String::new(), // blank command
             vec![],
-            vec![],
         ));
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         handle_new_pane_form_key(right, &mut ui); // select the schedule option
@@ -35079,29 +33447,22 @@ mod tests {
     }
 
     #[test]
-    fn unified_form_initial_focus_with_modes() {
+    fn unified_form_initial_focus_with_orchestrations() {
         let f = NewPaneFormState::new(
             PathBuf::from("/tmp"),
             String::new(),
             String::new(),
-            vec![make_mode("a")],
-            vec![],
+            vec![make_orchestration("a")],
         );
         assert_eq!(f.focused, FormField::Mode);
     }
 
     // PRD #127 M3.2: the built-in "schedule" authoring option makes the Mode
     // field always present, so the form opens focused on Mode even with no
-    // project modes.
+    // project orchestrations.
     #[test]
-    fn unified_form_initial_focus_without_project_modes() {
-        let f = NewPaneFormState::new(
-            PathBuf::from("/tmp"),
-            String::new(),
-            String::new(),
-            vec![],
-            vec![],
-        );
+    fn unified_form_initial_focus_without_project_options() {
+        let f = NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
         assert_eq!(f.focused, FormField::Mode);
     }
 
@@ -35113,8 +33474,7 @@ mod tests {
             PathBuf::from("/tmp"),
             String::new(),
             String::new(),
-            vec![make_mode("a"), make_mode("b")],
-            vec![],
+            vec![make_orchestration("a"), make_orchestration("b")],
         ));
 
         // Right arrow cycles forward
@@ -35136,8 +33496,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "agent".to_string(),
             "claude".to_string(),
-            vec![make_mode("a")],
-            vec![],
+            vec![make_orchestration("a")],
         ));
 
         // Enter on Mode → Name
@@ -35160,41 +33519,6 @@ mod tests {
     }
 
     #[test]
-    fn unified_form_submit_with_mode() {
-        let mut ui = default_ui();
-        ui.mode = UiMode::NewPaneForm;
-        ui.new_pane_form = Some(NewPaneFormState::new(
-            PathBuf::from("/tmp/proj"),
-            "agent".to_string(),
-            "claude".to_string(),
-            vec![make_mode("k8s-ops")],
-            vec![],
-        ));
-
-        // Select mode "k8s-ops" (index 1)
-        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
-        handle_new_pane_form_key(right, &mut ui);
-
-        // Navigate to Command field and submit
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        handle_new_pane_form_key(enter, &mut ui); // Mode → Name
-        handle_new_pane_form_key(enter, &mut ui); // Name → Command
-        let result = handle_new_pane_form_key(enter, &mut ui); // submit
-
-        match result {
-            Action::SpawnPane(req) => {
-                assert_eq!(req.dir, PathBuf::from("/tmp/proj"));
-                assert!(
-                    req.mode_config
-                        .as_ref()
-                        .is_some_and(|c| c.name == "k8s-ops")
-                );
-            }
-            other => panic!("Expected NewPane, got {:?}", other),
-        }
-    }
-
-    #[test]
     fn unified_form_submit_no_mode() {
         let mut ui = default_ui();
         ui.mode = UiMode::NewPaneForm;
@@ -35202,8 +33526,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "agent".to_string(),
             "claude".to_string(),
-            vec![make_mode("a")],
-            vec![],
+            vec![make_orchestration("a")],
         ));
 
         // Stay on "No mode" (index 0), navigate through fields
@@ -35214,7 +33537,8 @@ mod tests {
 
         match result {
             Action::SpawnPane(req) => {
-                assert!(req.mode_config.is_none());
+                assert!(req.orchestration_config.is_none());
+                assert!(req.seed_prompt.is_none());
             }
             other => panic!("Expected NewPane, got {:?}", other),
         }
@@ -35236,7 +33560,6 @@ mod tests {
             PathBuf::from("/tmp/proj"),
             String::new(),
             String::new(),
-            vec![],
             vec![make_orchestration("config-name")],
         ));
 
@@ -35298,7 +33621,6 @@ mod tests {
             PathBuf::from("/tmp/proj"),
             String::new(),
             String::new(),
-            vec![],
             vec![make_orchestration("config-name")],
         ));
 
@@ -35344,8 +33666,7 @@ mod tests {
             PathBuf::from("/tmp"),
             String::new(),
             String::new(),
-            vec![make_mode("a")],
-            vec![],
+            vec![make_orchestration("a")],
         ));
 
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -35363,8 +33684,7 @@ mod tests {
             PathBuf::from("/tmp"),
             String::new(),
             String::new(),
-            vec![make_mode("a")],
-            vec![],
+            vec![make_orchestration("a")],
         ));
 
         // Move to Name field
@@ -35390,8 +33710,7 @@ mod tests {
             PathBuf::from("/tmp"),
             String::new(),
             String::new(),
-            vec![make_mode("a")],
-            vec![],
+            vec![make_orchestration("a")],
         ));
 
         // Move to Name field
@@ -35417,20 +33736,19 @@ mod tests {
             PathBuf::from("/tmp"),
             String::new(),
             String::new(),
-            vec![make_mode("dev")],
             vec![make_orchestration("tdd")],
         );
 
         // 0 = No mode → command visible
         assert!(f.command_visible());
 
-        // 1 = workspace mode → command visible
+        // 1 = orchestration → command hidden
         f.selection_index = 1;
-        assert!(f.command_visible());
-
-        // 2 = orchestration → command hidden
-        f.selection_index = 2;
         assert!(!f.command_visible());
+
+        // 2 = the built-in schedule option → command visible
+        f.selection_index = 2;
+        assert!(f.command_visible());
 
         // Toggling back restores it.
         f.selection_index = 0;
@@ -35443,7 +33761,6 @@ mod tests {
             PathBuf::from("/tmp"),
             String::new(),
             String::new(),
-            vec![],
             vec![make_orchestration("tdd")],
         );
         // Select the orchestration (index 1).
@@ -35470,29 +33787,6 @@ mod tests {
     }
 
     #[test]
-    fn tab_visits_command_when_workspace_mode_selected() {
-        // Regression guard: with a workspace mode (not an orchestration),
-        // Tab cycling must still pass through the Command field.
-        let mut f = NewPaneFormState::new(
-            PathBuf::from("/tmp"),
-            String::new(),
-            String::new(),
-            vec![make_mode("dev")],
-            vec![make_orchestration("tdd")],
-        );
-        f.selection_index = 1; // workspace mode
-        assert!(f.command_visible());
-
-        f.focused = FormField::Mode;
-        f.focused = f.next_field();
-        assert_eq!(f.focused, FormField::Name);
-        f.focused = f.next_field();
-        assert_eq!(f.focused, FormField::Command);
-        f.focused = f.next_field();
-        assert_eq!(f.focused, FormField::Mode);
-    }
-
-    #[test]
     fn enter_on_name_submits_when_orchestration_selected() {
         let mut ui = default_ui();
         ui.mode = UiMode::NewPaneForm;
@@ -35500,7 +33794,6 @@ mod tests {
             PathBuf::from("/tmp/proj"),
             String::new(),
             String::new(),
-            vec![],
             vec![make_orchestration("tdd")],
         ));
 
@@ -35520,7 +33813,6 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
         if let Action::SpawnPane(req) = result {
             assert!(req.orchestration_config.is_some());
-            assert!(req.mode_config.is_none());
         }
     }
 
@@ -35535,7 +33827,6 @@ mod tests {
             PathBuf::from("/tmp"),
             String::new(),
             String::new(),
-            vec![make_mode("dev")],
             vec![make_orchestration("tdd")],
         ));
 
@@ -35553,9 +33844,8 @@ mod tests {
         handle_new_pane_form_key(backtab, &mut ui);
         assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Mode);
 
-        // Right-arrow twice to land on the orchestration (0 → 1 → 2).
+        // Right-arrow once to land on the orchestration (0 → 1).
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
-        handle_new_pane_form_key(right, &mut ui);
         handle_new_pane_form_key(right, &mut ui);
         assert!(
             ui.new_pane_form
@@ -35632,17 +33922,16 @@ mod tests {
 
     #[test]
     fn enter_on_name_still_advances_to_command_without_orchestration() {
-        // Regression guard for the non-orchestration flow: with a workspace
-        // mode (or "No mode") selected, Enter on Name must still advance to
-        // the Command field rather than submit.
+        // Regression guard for the non-orchestration flow: with "No mode"
+        // selected, Enter on Name must still advance to the Command field
+        // rather than submit.
         let mut ui = default_ui();
         ui.mode = UiMode::NewPaneForm;
         ui.new_pane_form = Some(NewPaneFormState::new(
             PathBuf::from("/tmp"),
             "agent".to_string(),
             "claude".to_string(),
-            vec![make_mode("dev")],
-            vec![],
+            vec![make_orchestration("dev")],
         ));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
@@ -36117,7 +34406,6 @@ mod tests {
             dir: cwd.clone(),
             name: FORM_TITLE.to_string(),
             command: String::new(),
-            mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
         };
@@ -36186,7 +34474,6 @@ mod tests {
             // The bare basename `transition_after_dir_pick` pre-fills today.
             "myproj".to_string(),
             String::new(),
-            vec![],
             vec![make_orchestration("review")],
         ));
 
@@ -36240,7 +34527,6 @@ mod tests {
             PathBuf::from("/tmp/myproj"),
             "myproj".to_string(),
             String::new(),
-            vec![],
             vec![make_orchestration("review")],
         ));
 
@@ -36283,7 +34569,6 @@ mod tests {
             PathBuf::from("/tmp/myproj"),
             "myproj".to_string(),
             String::new(),
-            vec![],
             vec![make_orchestration("review")],
         ));
 
@@ -36320,7 +34605,6 @@ mod tests {
                 PathBuf::from("/tmp/myproj"),
                 "myproj".to_string(),
                 String::new(),
-                vec![],
                 vec![make_orchestration("review")],
             )
             .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]),
@@ -36384,13 +34668,11 @@ mod tests {
             PathBuf::from("/tmp/myproj"),
             "myproj".to_string(),
             String::new(),
-            vec![make_mode("chat")],
             vec![make_orchestration("review")],
         ));
 
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
-        handle_new_pane_form_key(right, &mut ui); // "No mode" -> chat
-        handle_new_pane_form_key(right, &mut ui); // chat -> the orchestration
+        handle_new_pane_form_key(right, &mut ui); // "No mode" -> the orchestration
         let orchestration_idx = ui.new_pane_form.as_ref().unwrap().selection_index;
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
@@ -36440,12 +34722,12 @@ mod tests {
             "re-clicking the already-selected chip must not clobber a typed name"
         );
 
-        // Case 2: arrow off the orchestration onto a mode and back — a
+        // Case 2: arrow off the orchestration onto "No mode" and back — a
         // genuine selection change, which an `idx != selection_index` guard
         // would miss.
         let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
-        handle_new_pane_form_key(left, &mut ui); // orchestration -> chat mode
-        handle_new_pane_form_key(right, &mut ui); // chat mode -> orchestration
+        handle_new_pane_form_key(left, &mut ui); // orchestration -> "No mode"
+        handle_new_pane_form_key(right, &mut ui); // "No mode" -> orchestration
         assert_eq!(
             ui.new_pane_form.as_ref().unwrap().name,
             "my-custom-name",
@@ -36473,7 +34755,6 @@ mod tests {
                 PathBuf::from("/tmp/myproj"),
                 "myproj".to_string(),
                 String::new(),
-                vec![],
                 vec![make_orchestration("review")],
             )
             .with_live_orchestration_names(vec!["review".to_string()]),
@@ -36644,7 +34925,6 @@ mod tests {
             dir,
             "myproj".to_string(),
             String::new(),
-            vec![],
             vec![make_orchestration("review")],
         ));
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
@@ -36783,7 +35063,6 @@ mod tests {
             dir: tmp.path().to_path_buf(),
             name: "capture-at-creation".to_string(),
             command: String::new(),
-            mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
         };
@@ -36844,7 +35123,6 @@ mod tests {
             dir: std::path::PathBuf::from(dir),
             name: "card".to_string(),
             command: "echo hi".to_string(),
-            mode_config: None,
             orchestration_config: None,
             seed_prompt: None,
         }
@@ -36922,71 +35200,6 @@ mod tests {
         );
     }
 
-    /// Scenario: Open a REAL mode tab and leave it active, then dispatch the
-    /// single-agent-card `Action::SpawnPane` (no mode, no orchestration).
-    /// Afterward the active tab must be the Dashboard (tab 0) with the new card
-    /// selected and focused — the card must not land on the mode tab the user
-    /// launched from (PRD #154; same rule as the orchestration case).
-    #[spec("tabs/spawn/002")]
-    #[test]
-    fn spawn_002_card_from_mode_lands_on_dashboard() {
-        use tokio::sync::RwLock;
-
-        let pc = Arc::new(OpenTabPC::new());
-        let mut tab_manager = TabManager::new(pc.clone());
-        tab_manager
-            .open_mode_tab(
-                &mode_config_local("m", 1),
-                "/work",
-                "agent-m".to_string(),
-                (24, 80),
-            )
-            .expect("open a real mode tab");
-        // open_mode_tab leaves the mode tab active — the non-Dashboard launch
-        // precondition.
-        assert_ne!(
-            tab_manager.active_index(),
-            0,
-            "precondition: the mode tab is active (not the Dashboard) before the spawn"
-        );
-
-        let snapshot = dashboard_snapshot(3);
-        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
-        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
-        filtered.sort_by(|a, b| a.0.cmp(b.0));
-
-        let mut ui = default_ui();
-        let _ = dispatch_action(
-            Action::SpawnPane(Box::new(plain_card_request("/work/card"))),
-            &mut ui,
-            &*pc,
-            &state,
-            &mut tab_manager,
-            &snapshot,
-            &filtered,
-            None,
-            Rect::new(0, 0, 80, 24),
-        );
-
-        assert_eq!(
-            tab_manager.active_index(),
-            0,
-            "a single-agent card belongs to the Dashboard (tab 0): the active tab \
-             must switch back to the Dashboard, not stay on the mode tab"
-        );
-        assert_eq!(
-            ui.selected_index,
-            Some(filtered.len()),
-            "the new card must be the active selection on the Dashboard"
-        );
-        let new_card = last_created_pane(&pc);
-        assert_eq!(
-            pc.focused.lock().unwrap().last().map(String::as_str),
-            Some(new_card.as_str()),
-            "the new card's pane must be focused after the spawn"
-        );
-    }
-
     /// Scenario: With only the Dashboard tab present (already active), dispatch
     /// the single-agent-card `Action::SpawnPane`. This is the no-regression
     /// guard: the active tab must stay on the Dashboard (tab 0) and the new
@@ -37043,562 +35256,13 @@ mod tests {
         );
     }
 
-    /// Pane controller that hands out unique ids but FAILS every `create_pane`
-    /// after the first. The first (successful) call backs the interactive AGENT
-    /// pane created by the `Action::SpawnPane` handler; the second call — the
-    /// mode side pane created inside `TabManager::open_mode_tab` →
-    /// `ModeManager::activate_mode` — returns `Err`, so `open_mode_tab` fails
-    /// and the handler takes its Err arm. This lets an in-process test drive the
-    /// failed-mode-spawn path without a real daemon/PTY.
-    struct FailSidePanePC {
-        calls: std::sync::Mutex<u32>,
-    }
-    impl FailSidePanePC {
-        fn new() -> Self {
-            Self {
-                calls: std::sync::Mutex::new(0),
-            }
-        }
-    }
-    impl crate::pane::PaneController for FailSidePanePC {
-        fn create_pane(
-            &self,
-            _cmd: Option<&str>,
-            _cwd: Option<&str>,
-        ) -> Result<String, crate::pane::PaneError> {
-            let mut n = self.calls.lock().unwrap();
-            let idx = *n;
-            *n += 1;
-            if idx == 0 {
-                Ok(format!("mock-pane-{idx}"))
-            } else {
-                Err(crate::pane::PaneError::CommandFailed(
-                    "side pane spawn failed".to_string(),
-                ))
-            }
-        }
-        fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
-            Ok(())
-        }
-        fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
-            Ok(())
-        }
-        fn rename_pane(
-            &self,
-            _id: &str,
-            name: &str,
-        ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
-            Ok(crate::pane::RenameOutcome::applied(name))
-        }
-        fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
-            Ok(())
-        }
-        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
-            Ok(Vec::new())
-        }
-        fn resize_pane(
-            &self,
-            _id: &str,
-            _direction: crate::pane::PaneDirection,
-            _amount: u16,
-        ) -> Result<(), crate::pane::PaneError> {
-            Ok(())
-        }
-        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
-            Ok(())
-        }
-        fn name(&self) -> &str {
-            "fail-side-pane-mock"
-        }
-        fn is_available(&self) -> bool {
-            true
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
-    fn mode_card_request(dir: &str, command: &str, mode: ModeConfig) -> NewPaneRequest {
-        NewPaneRequest {
-            dir: std::path::PathBuf::from(dir),
-            name: "card".to_string(),
-            command: command.to_string(),
-            mode_config: Some(mode),
-            orchestration_config: None,
-            seed_prompt: None,
-        }
-    }
-
-    /// PRD #196 (Greptile P1 regression): a mode spawn whose `open_mode_tab`
-    /// FAILS must NOT persist the submit candidate into the global
-    /// `last_command`. Seed `pending_last_command`, dispatch a mode
-    /// `Action::SpawnPane` through the real handler against a controller that
-    /// fails the side-pane creation, and assert `last_command` is still `None`
-    /// afterward (record-only-on-success). Guards against the earlier bug where
-    /// the commit fired unconditionally before `open_mode_tab` was attempted.
-    #[test]
-    fn spawn_failed_mode_does_not_persist_last_command() {
-        use tokio::sync::RwLock;
-
-        let pc = Arc::new(FailSidePanePC::new());
-        let mut tab_manager = TabManager::new(pc.clone());
-
-        let snapshot = dashboard_snapshot(1);
-        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
-        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
-        filtered.sort_by(|a, b| a.0.cmp(b.0));
-
-        let mut ui = default_ui();
-        // The submit door records the candidate right before dispatch.
-        ui.pending_last_command = Some("claude --model haiku".to_string());
-        assert_eq!(ui.last_command, None, "precondition: nothing recorded yet");
-
-        let _ = dispatch_action(
-            Action::SpawnPane(Box::new(mode_card_request(
-                "/work/mode-card",
-                "claude --model haiku",
-                mode_config_local("m", 1),
-            ))),
-            &mut ui,
-            &*pc,
-            &state,
-            &mut tab_manager,
-            &snapshot,
-            &filtered,
-            None,
-            Rect::new(0, 0, 80, 24),
-        );
-
-        // The mode-tab creation failed, so the handler must have taken the Err
-        // arm (status reflects it) and must NOT have committed the candidate.
-        assert!(
-            ui.status_message
-                .as_ref()
-                .is_some_and(|(m, _)| m.contains("Mode activation failed")),
-            "precondition: the mode spawn actually failed (Err arm), got {:?}",
-            ui.status_message.as_ref().map(|(m, _)| m)
-        );
-        assert_eq!(
-            ui.last_command, None,
-            "a FAILED mode-spawn must not persist last_command"
-        );
-    }
-
-    /// PRD #196 companion: a mode spawn whose `open_mode_tab` SUCCEEDS DOES
-    /// commit the submit candidate into `last_command`. Locks the other
-    /// direction of the success-only rule so the Err-arm guard above can't be
-    /// satisfied by simply never committing on the mode path.
-    #[test]
-    fn spawn_successful_mode_persists_last_command() {
-        use tokio::sync::RwLock;
-
-        let pc = Arc::new(OpenTabPC::new());
-        let mut tab_manager = TabManager::new(pc.clone());
-
-        let snapshot = dashboard_snapshot(1);
-        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
-        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
-        filtered.sort_by(|a, b| a.0.cmp(b.0));
-
-        let mut ui = default_ui();
-        ui.pending_last_command = Some("claude --model haiku".to_string());
-
-        let _ = dispatch_action(
-            Action::SpawnPane(Box::new(mode_card_request(
-                "/work/mode-card",
-                "claude --model haiku",
-                mode_config_local("m", 1),
-            ))),
-            &mut ui,
-            &*pc,
-            &state,
-            &mut tab_manager,
-            &snapshot,
-            &filtered,
-            None,
-            Rect::new(0, 0, 80, 24),
-        );
-
-        assert_eq!(
-            ui.last_command.as_deref(),
-            Some("claude --model haiku"),
-            "a SUCCESSFUL mode-spawn must persist last_command"
-        );
-    }
-
-    /// A mode config that DECLARES the agent its agent pane launches (issue
-    /// #308), so the `pane_declared_agent` entry the rollback has to unwind
-    /// actually gets registered. Everything else matches
-    /// [`mode_config_local`].
-    fn declared_mode_config_local(name: &str, side_pane_count: usize, agent: &str) -> ModeConfig {
-        ModeConfig {
-            agent: Some(agent.to_string()),
-            ..mode_config_local(name, side_pane_count)
-        }
-    }
-
-    /// Pane controller for the mode-activation FAILURE path that survives a
-    /// RETRY: on every attempt the agent pane succeeds with a fresh
-    /// `mock-pane-N` id and its single side pane fails, so `open_mode_tab`
-    /// returns `Err` on attempt one, attempt two, and every attempt after.
-    /// `FailSidePanePC` above cannot do this — it succeeds exactly once and
-    /// then fails the AGENT pane too, so a second attempt dies before the
-    /// registration block and never reaches the `open_mode_tab` Err arm.
-    ///
-    /// Pair it with a `mode_config_local(_, 1)`-shaped config: one persistent
-    /// side pane and no reactive panes means exactly two `create_pane` calls
-    /// per attempt, so the even/odd split IS the agent-pane/side-pane split.
-    ///
-    /// `close_fails` drives the other half of the rollback guard: a pane whose
-    /// `close_pane` failed is still LIVE, so its registrations must survive.
-    struct ModeRetryPC {
-        calls: std::sync::Mutex<u32>,
-        created: std::sync::Mutex<Vec<String>>,
-        close_fails: bool,
-    }
-    impl ModeRetryPC {
-        fn new(close_fails: bool) -> Self {
-            Self {
-                calls: std::sync::Mutex::new(0),
-                created: std::sync::Mutex::new(Vec::new()),
-                close_fails,
-            }
-        }
-        /// Every agent-pane id handed out, in order — one per activation
-        /// attempt that genuinely got as far as registering a pane.
-        fn created(&self) -> Vec<String> {
-            self.created.lock().unwrap().clone()
-        }
-    }
-    impl crate::pane::PaneController for ModeRetryPC {
-        fn create_pane(
-            &self,
-            _cmd: Option<&str>,
-            _cwd: Option<&str>,
-        ) -> Result<String, crate::pane::PaneError> {
-            let mut n = self.calls.lock().unwrap();
-            let idx = *n;
-            *n += 1;
-            if idx.is_multiple_of(2) {
-                let id = format!("mock-pane-{idx}");
-                self.created.lock().unwrap().push(id.clone());
-                Ok(id)
-            } else {
-                Err(crate::pane::PaneError::CommandFailed(
-                    "side pane spawn failed".to_string(),
-                ))
-            }
-        }
-        fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
-            Ok(())
-        }
-        fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
-            if self.close_fails {
-                Err(crate::pane::PaneError::CommandFailed(
-                    "pane is still live".to_string(),
-                ))
-            } else {
-                Ok(())
-            }
-        }
-        fn rename_pane(
-            &self,
-            _id: &str,
-            name: &str,
-        ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
-            Ok(crate::pane::RenameOutcome::applied(name))
-        }
-        fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
-            Ok(())
-        }
-        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
-            Ok(Vec::new())
-        }
-        fn resize_pane(
-            &self,
-            _id: &str,
-            _direction: crate::pane::PaneDirection,
-            _amount: u16,
-        ) -> Result<(), crate::pane::PaneError> {
-            Ok(())
-        }
-        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
-            Ok(())
-        }
-        fn name(&self) -> &str {
-            "mode-retry-mock"
-        }
-        fn is_available(&self) -> bool {
-            true
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
-    /// Dispatch one mode `Action::SpawnPane` whose `open_mode_tab` fails, and
-    /// assert the handler really took the Err arm. Shared by the three
-    /// `rollback_abandoned_pane` tests below so each one asserts only its own
-    /// property.
-    fn dispatch_failing_mode_activation(
-        pc: &ModeRetryPC,
-        ui: &mut UiState,
-        state: &SharedState,
-        tab_manager: &mut TabManager,
-        snapshot: &AppState,
-        filtered: &[(&String, &SessionState)],
-    ) {
-        let _ = dispatch_action(
-            Action::SpawnPane(Box::new(mode_card_request(
-                "/work/mode-card",
-                "claude --model haiku",
-                declared_mode_config_local("m", 1, "claude"),
-            ))),
-            ui,
-            pc,
-            state,
-            tab_manager,
-            snapshot,
-            filtered,
-            None,
-            Rect::new(0, 0, 80, 24),
-        );
-        assert!(
-            ui.status_message
-                .as_ref()
-                .is_some_and(|(m, _)| m.contains("Mode activation failed")),
-            "precondition: the mode activation actually failed (Err arm), got {:?}",
-            ui.status_message.as_ref().map(|(m, _)| m)
-        );
-    }
-
-    /// Issue #308 follow-up: a mode spawn that SUCCEEDS and is then abandoned
-    /// because `open_mode_tab` failed must leave NO trace of its pane. Dispatch
-    /// a mode `Action::SpawnPane` against a controller that fails the side pane
-    /// (so the agent pane is created and registered, then given up on) and
-    /// assert all six per-pane registrations are gone: `managed_pane_ids`, the
-    /// placeholder session, `pane_display_names`, `pane_names`, `pane_metadata`
-    /// and `pane_declared_agent`. The session is the user-visible half — a
-    /// surviving placeholder renders a dashboard card for a pane that no longer
-    /// exists. The `close_pane`-fails sibling below is the positive control
-    /// that these six really are registered on this path, so the absences here
-    /// are not vacuous.
-    #[test]
-    fn mode_activation_failure_unwinds_every_pane_registration() {
-        use tokio::sync::RwLock;
-
-        let pc = Arc::new(ModeRetryPC::new(false));
-        let mut tab_manager = TabManager::new(pc.clone());
-
-        let snapshot = dashboard_snapshot(1);
-        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
-        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
-        filtered.sort_by(|a, b| a.0.cmp(b.0));
-
-        let mut ui = default_ui();
-        dispatch_failing_mode_activation(
-            &pc,
-            &mut ui,
-            &state,
-            &mut tab_manager,
-            &snapshot,
-            &filtered,
-        );
-
-        let pane_id = pc
-            .created()
-            .first()
-            .cloned()
-            .expect("the agent pane was created before the mode tab failed");
-
-        let st = state.blocking_read();
-        assert!(
-            !st.managed_pane_ids.contains(&pane_id),
-            "the abandoned pane must be unregistered"
-        );
-        assert!(
-            !st.sessions.contains_key(&format!("pane-{pane_id}")),
-            "the placeholder session must go — it renders a card for a pane that is gone"
-        );
-        assert!(
-            st.sessions
-                .values()
-                .all(|s| s.pane_id.as_deref() != Some(pane_id.as_str())),
-            "no session may still point at the abandoned pane"
-        );
-        assert!(
-            st.sessions.contains_key("s0"),
-            "unrelated sessions must survive the rollback"
-        );
-        drop(st);
-
-        assert!(
-            !ui.pane_display_names.contains_key(&pane_id),
-            "pane_display_names must not keep the abandoned pane"
-        );
-        assert!(
-            !ui.pane_names.contains_key(&pane_id),
-            "pane_names must not keep the abandoned pane"
-        );
-        assert!(
-            !ui.pane_metadata.contains_key(&pane_id),
-            "pane_metadata must not keep the abandoned pane"
-        );
-        assert!(
-            !ui.pane_declared_agent.contains_key(&pane_id),
-            "pane_declared_agent must not keep the abandoned pane"
-        );
-    }
-
-    /// Issue #308 follow-up, the other side of the guard: when the abandoned
-    /// pane's `close_pane` FAILS the pane is still live, so nothing may be
-    /// rolled back — a running agent behind no card at all is strictly worse
-    /// than a stale one, and PRD #92 F4 already draws that line for an explicit
-    /// `Ctrl+W` close. Same dispatch as the sibling above but with a controller
-    /// whose `close_pane` returns `Err`, asserting all six registrations
-    /// SURVIVE. Flipping the handler's `match pane.close_pane(..)` back to an
-    /// unconditional `rollback_abandoned_pane` fails every one of them.
-    #[test]
-    fn mode_activation_failure_with_unclosable_pane_preserves_every_registration() {
-        use tokio::sync::RwLock;
-
-        let pc = Arc::new(ModeRetryPC::new(true));
-        let mut tab_manager = TabManager::new(pc.clone());
-
-        let snapshot = dashboard_snapshot(1);
-        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
-        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
-        filtered.sort_by(|a, b| a.0.cmp(b.0));
-
-        let mut ui = default_ui();
-        dispatch_failing_mode_activation(
-            &pc,
-            &mut ui,
-            &state,
-            &mut tab_manager,
-            &snapshot,
-            &filtered,
-        );
-
-        let pane_id = pc
-            .created()
-            .first()
-            .cloned()
-            .expect("the agent pane was created before the mode tab failed");
-
-        let st = state.blocking_read();
-        assert!(
-            st.managed_pane_ids.contains(&pane_id),
-            "a pane that could not be closed is still live and must stay registered"
-        );
-        assert!(
-            st.sessions.contains_key(&format!("pane-{pane_id}")),
-            "a still-live pane must keep its card — the placeholder session must survive"
-        );
-        drop(st);
-
-        assert_eq!(
-            ui.pane_display_names.get(&pane_id).map(String::as_str),
-            Some("card"),
-            "a still-live pane must keep its display name"
-        );
-        assert_eq!(
-            ui.pane_names.get(&pane_id).map(String::as_str),
-            Some("card"),
-            "a still-live pane must keep its name"
-        );
-        assert_eq!(
-            ui.pane_metadata
-                .get(&pane_id)
-                .map(|saved| saved.dir.as_str()),
-            Some("/work/mode-card"),
-            "a still-live pane must keep its metadata so it stays recoverable"
-        );
-        assert_eq!(
-            ui.pane_declared_agent.get(&pane_id),
-            Some(&AgentType::ClaudeCode),
-            "a still-live pane must keep its declared agent, so its badge is still right"
-        );
-    }
-
-    /// Issue #308 follow-up: the original leak symptom. Retrying a broken mode
-    /// used to grow every per-pane map by an entry per attempt for the life of
-    /// the session. Two failed activations in a row — each one a genuinely
-    /// distinct pane id, asserted below — must leave the maps exactly as they
-    /// were before the first, which is also what catches a rollback that
-    /// unwinds five of the six maps.
-    #[test]
-    fn repeated_mode_activation_failures_do_not_accumulate_pane_state() {
-        use tokio::sync::RwLock;
-
-        let pc = Arc::new(ModeRetryPC::new(false));
-        let mut tab_manager = TabManager::new(pc.clone());
-
-        let snapshot = dashboard_snapshot(1);
-        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
-        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
-        filtered.sort_by(|a, b| a.0.cmp(b.0));
-
-        let mut ui = default_ui();
-        let sessions_before = state.blocking_read().sessions.len();
-        assert!(
-            ui.pane_display_names.is_empty()
-                && ui.pane_names.is_empty()
-                && ui.pane_metadata.is_empty()
-                && ui.pane_declared_agent.is_empty(),
-            "precondition: zero activations means zero per-pane entries"
-        );
-
-        for _ in 0..2 {
-            dispatch_failing_mode_activation(
-                &pc,
-                &mut ui,
-                &state,
-                &mut tab_manager,
-                &snapshot,
-                &filtered,
-            );
-        }
-
-        assert_eq!(
-            pc.created(),
-            vec!["mock-pane-0".to_string(), "mock-pane-2".to_string()],
-            "precondition: both attempts registered a DISTINCT pane before failing, \
-             so a leak would show up as two entries rather than one"
-        );
-
-        let st = state.blocking_read();
-        assert!(
-            st.managed_pane_ids.is_empty(),
-            "two failed activations must leave no registered panes, got {:?}",
-            st.managed_pane_ids
-        );
-        assert_eq!(
-            st.sessions.len(),
-            sessions_before,
-            "two failed activations must leave no extra session cards"
-        );
-        drop(st);
-
-        assert!(
-            ui.pane_display_names.is_empty(),
-            "pane_display_names leaked"
-        );
-        assert!(ui.pane_names.is_empty(), "pane_names leaked");
-        assert!(ui.pane_metadata.is_empty(), "pane_metadata leaked");
-        assert!(
-            ui.pane_declared_agent.is_empty(),
-            "pane_declared_agent leaked"
-        );
-    }
-
     /// Pane controller like `OpenTabPC` (unique `mock-pane-N` ids, records every
     /// `focus_pane`) but it ALSO reports the last-focused pane back through
     /// `focused_pane_id()` — the live process-wide focus a real controller
     /// exposes. `OpenTabPC` leaves `focused_pane_id()` at the trait default
     /// (`None`), which makes `TabManager::capture_focus_on_switch_out` a no-op
-    /// (it returns early on `None`), so it can't exercise the switch-out focus
-    /// capture under test in `tabs/spawn/004`. This mock can.
+    /// (it returns early on `None`), so it can't exercise a switch-out focus
+    /// capture. This mock can.
     struct FocusEchoPC {
         next: std::sync::Mutex<u32>,
         focused: std::sync::Mutex<Vec<String>>,
@@ -37667,89 +35331,6 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-    }
-
-    /// Scenario: Open a REAL Mode tab, focus one of its side panes, then create
-    /// a single-agent card from that Mode tab (the plain-card `Action::SpawnPane`
-    /// that switches to the Dashboard). Switch back to the Mode tab and restore
-    /// its focus: the side pane that was focused at create-time must be
-    /// re-focused. Without `capture_focus_on_switch_out()` before the
-    /// switch-to-Dashboard, the Mode tab's `focused_pane_id` is never captured,
-    /// so restore falls back to the agent pane and the user's prior focus is
-    /// lost (PRD #154 follow-up; mirrors the round-trip in `tabs/selection/002`).
-    #[spec("tabs/spawn/004")]
-    #[test]
-    fn spawn_004_card_from_mode_preserves_mode_focus_on_return() {
-        use tokio::sync::RwLock;
-
-        let pc = Arc::new(FocusEchoPC::new());
-        let mut tab_manager = TabManager::new(pc.clone());
-        let (mode_idx, side_ids) = tab_manager
-            .open_mode_tab(
-                &mode_config_local("m", 2),
-                "/work",
-                "agent-m".to_string(),
-                (24, 80),
-            )
-            .expect("open a real mode tab");
-        // open_mode_tab leaves the mode tab active — the non-Dashboard launch
-        // precondition.
-        assert_eq!(
-            tab_manager.active_index(),
-            mode_idx,
-            "precondition: the mode tab is active before the spawn"
-        );
-        assert!(
-            side_ids.len() >= 2,
-            "precondition: the mode tab has at least two managed side panes"
-        );
-
-        // The user focuses a specific (non-default) side pane on the mode tab —
-        // this is the live focus that must survive the round-trip.
-        let target = side_ids[1].clone();
-        pc.focus_pane(&target).unwrap();
-
-        let snapshot = dashboard_snapshot(2);
-        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
-        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
-        filtered.sort_by(|a, b| a.0.cmp(b.0));
-
-        let mut ui = default_ui();
-        let _ = dispatch_action(
-            Action::SpawnPane(Box::new(plain_card_request("/work/card"))),
-            &mut ui,
-            &*pc,
-            &state,
-            &mut tab_manager,
-            &snapshot,
-            &filtered,
-            None,
-            Rect::new(0, 0, 80, 24),
-        );
-
-        // The card spawn switched the active tab to the Dashboard (tabs/spawn/002)
-        // — i.e. we genuinely LEFT the mode tab, which is what should have
-        // captured its focus.
-        assert_eq!(
-            tab_manager.active_index(),
-            0,
-            "the single-agent card spawn must switch to the Dashboard (so the \
-             mode tab is left behind)"
-        );
-
-        // Return to the mode tab and restore its remembered focus.
-        assert!(tab_manager.switch_to(mode_idx));
-        tab_manager.restore_focus_on_switch_in();
-
-        assert_eq!(
-            pc.focused.lock().unwrap().last().map(String::as_str),
-            Some(target.as_str()),
-            "switching back to the mode tab must restore the side pane that was \
-             focused when the card was created; without \
-             `capture_focus_on_switch_out()` before the switch-to-Dashboard, the \
-             mode tab's focused_pane_id was never captured, so restore falls back \
-             to the agent pane (`agent-m`) and the user's prior focus is lost"
-        );
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -40025,7 +37606,7 @@ mod tests {
         let inside_buffer = SPAWN_TIME_READINESS_TIMEOUT + std::time::Duration::from_millis(1);
         let past_buffer = SPAWN_TIME_READINESS_TIMEOUT + SPAWN_TIME_READINESS_BUFFER;
 
-        // --- `process_pending_seed_prompts` (a mode's seed). -----------------
+        // --- `process_pending_seed_prompts` (a single-agent card's seed). ----
         const SEED_PANE: &str = "fallback-buffer-seed-pane";
         let seed_controller = Arc::new(RecordingPaneController::default());
         let seed_writes = seed_controller.writes.clone();
@@ -41720,7 +39301,6 @@ mod tests {
             dir: tmp_dir.to_path_buf(),
             name: name.to_string(),
             command: String::new(),
-            mode_config: None,
             orchestration_config: Some(lock_test_orch_config(name)),
             seed_prompt: None,
         };
@@ -42035,19 +39615,15 @@ mod tests {
     /// Scenario: Deck-global storage moves WHERE the lock value lives, not WHERE
     /// it reaches. Set the deck-global lock ENGAGED (the strongest case) and
     /// confirm `gate_pane_input_key` passes an `Action::ForwardToPane` through
-    /// UNCHANGED on the always-present Dashboard tab and on a freshly opened
-    /// Mode tab — the gate must still match only `Tab::Orchestration`, never
-    /// widening onto other tab types now that the lock it reads is deck-global.
+    /// UNCHANGED on the always-present Dashboard tab — the gate must still match
+    /// only `Tab::Orchestration`, never widening onto other tab types now that
+    /// the lock it reads is deck-global.
     #[spec("orchestration/lock/005")]
     #[test]
-    fn lock_005_dashboard_and_mode_tabs_stay_ungated_when_deck_locked() {
-        let frame_area = Rect::new(0, 0, 200, 50);
-        let tmp = tempdir().expect("tempdir");
+    fn lock_005_dashboard_stays_ungated_when_deck_locked() {
         let pc = Arc::new(CapturingPaneController::new());
-        let mut tm = TabManager::new(pc.clone()); // tab 0 = Dashboard, always present
+        let tm = TabManager::new(pc.clone()); // tab 0 = Dashboard, always present
         let mut ui = default_ui();
-        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
-        let snapshot = AppState::default();
 
         // The strongest case: the deck-global lock is engaged.
         ui.command_entry_locked = true;
@@ -42079,47 +39655,6 @@ mod tests {
             other => panic!(
                 "expected ForwardToPane to pass through unchanged on a \
                  Dashboard tab, got {other:?}"
-            ),
-        }
-
-        // Open a Mode tab and repeat: same never-gated guarantee.
-        let req = mode_card_request(
-            tmp.path().to_str().expect("utf8 tmp path"),
-            "cat",
-            mode_config_local("lock-mode", 1),
-        );
-        let _ = dispatch_action(
-            Action::SpawnPane(Box::new(req)),
-            &mut ui,
-            pc.as_ref(),
-            &state,
-            &mut tm,
-            &snapshot,
-            &[],
-            None,
-            frame_area,
-        );
-        assert!(
-            matches!(tm.active_tab(), Tab::Mode { .. }),
-            "expected the Mode tab to be active after spawning it"
-        );
-        let gated = gate_pane_input_key(
-            Action::ForwardToPane(vec![b'x']),
-            &ui,
-            &tm,
-            pc.as_ref(),
-            &no_status,
-        );
-        match gated {
-            Action::ForwardToPane(bytes) => assert_eq!(
-                bytes,
-                vec![b'x'],
-                "a Mode tab must never gate ForwardToPane, even while the \
-                 deck-global lock is engaged"
-            ),
-            other => panic!(
-                "expected ForwardToPane to pass through unchanged on a Mode \
-                 tab, got {other:?}"
             ),
         }
     }

@@ -594,10 +594,7 @@ fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
         total_tools: 42,
     };
     vec![
-        (
-            "stats",
-            render_stats_bar_to_buffer(&stats, Some("plan"), 140, 1),
-        ),
+        ("stats", render_stats_bar_to_buffer(&stats, 140, 1)),
         ("quit", render_quit_confirm_to_buffer(0, 80, 24)),
         ("stop", render_stop_confirm_to_buffer(0, 2, 80, 24)),
         ("star", render_star_prompt_to_buffer(80, 24)),
@@ -1026,7 +1023,7 @@ fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
         "all 22 mixed-agent sessions count as active"
     );
 
-    let buffer = render_stats_bar_to_buffer(&stats, None, 60, 1);
+    let buffer = render_stats_bar_to_buffer(&stats, 60, 1);
     let rendered = buffer_to_text(&buffer);
     assert!(
         rendered.contains("22 active") && rendered.contains("tools"),
@@ -1043,7 +1040,7 @@ fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
         waiting: 1,
         ..DashboardStats::default()
     };
-    let waiting_bar = buffer_to_text(&render_stats_bar_to_buffer(&waiting_stats, None, 80, 1));
+    let waiting_bar = buffer_to_text(&render_stats_bar_to_buffer(&waiting_stats, 80, 1));
     assert!(
         waiting_bar.contains("1 needs input"),
         "waiting agent must be labeled like its card in the stats bar:\n{waiting_bar}"
@@ -1193,7 +1190,7 @@ fn status_badge_002_blocked_card_snapshot() {
         blocked: 1,
         ..DashboardStats::default()
     };
-    let stats_buffer = render_stats_bar_to_buffer(&stats, None, 80, 1);
+    let stats_buffer = render_stats_bar_to_buffer(&stats, 80, 1);
     let stats_text = buffer_to_text(&stats_buffer);
     let blocked_byte = stats_text
         .find("1 blocked")
@@ -1627,7 +1624,7 @@ fn palette_005_command_mode_focused_pane_drops_cyan_accent() {
     );
 
     // FOCUS SURVIVES: thickness takes over the job colour just gave up, so a
-    // multi-pane mode tab still shows which pane `Ctrl+D` / `Enter` returns to.
+    // multi-pane orchestration tab still shows which pane `Ctrl+D` / `Enter` returns to.
     let live_glyph = border_glyph_at_mid(&live);
     let parked_glyph = border_glyph_at_mid(&parked);
     assert_eq!(

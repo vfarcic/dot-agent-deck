@@ -209,7 +209,7 @@ test.describe("the overview at fifteen agents", () => {
 
     // DOM-shape: exactly one badge per orchestration, on the row the daemon
     // marked as the start role, and none at all outside an orchestration —
-    // there is no agent to message on a mode tab or a loose pane.
+    // there is no agent to message in a legacy mode group or a loose pane.
     const badgedRows = groups.map((group) => group.rows.findIndex((row) => row.coordinator !== null));
     expect(badgedRows).toEqual(EXPECTED.map((expected) => expected.coordinatorRow ?? -1));
     expect(groups.map((group) => group.rows.filter((row) => row.coordinator !== null).length)).toEqual([0, 1, 1, 0]);

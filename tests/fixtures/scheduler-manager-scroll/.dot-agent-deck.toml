@@ -1,11 +1,12 @@
-# Synthetic mode-tab fixture for scheduler/manager/016. The persistent side
-# pane writes more rows than its PTY can display and then stays alive, providing
-# deterministic scrollback behind the Scheduled Tasks dialog without an LLM.
-[[modes]]
+# The start role fills its pane with deterministic scrollback behind Schedules.
+[[orchestrations]]
 name = "scroll"
-reactive_panes = 0
 
-[[modes.panes]]
+[[orchestrations.roles]]
+name = "orchestrator"
 command = "i=1; while [ \"$i\" -le 120 ]; do printf 'SIDE_SCROLL_LINE_%03d\\n' \"$i\"; i=$((i + 1)); done; sleep 600"
-name = "Scrollback sentinel"
-watch = false
+start = true
+
+[[orchestrations.roles]]
+name = "worker"
+command = "cat"

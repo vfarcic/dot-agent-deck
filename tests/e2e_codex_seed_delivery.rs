@@ -13,7 +13,9 @@ use common::TuiDeck;
 use serde_json::json;
 use spec::spec;
 
-const SEED_MARKER: &str = "CODEXSEEDMARKER559";
+// A unique span of the built-in dispatcher seed, delivered through the same
+// new-pane seed path formerly exercised by a workspace mode.
+const SEED_MARKER: &str = "You are an ordinary assistant with one extra effector available:";
 
 /// The deck's own `pre_tool_use` and `user_prompt_submit` hooks as Codex lists
 /// them, prompt hook switched on. `__DECK_COMMAND__` because the harness HOME —
@@ -55,8 +57,8 @@ fn deck_hook_response() -> String {
     .to_string()
 }
 
-/// Launch a deck whose one mode declares Codex and carries a seed prompt, spawn
-/// that mode around a recorder, and return how many copies of the seed the
+/// Launch a deck, select the built-in dispatcher seed in the New Agent form,
+/// spawn a wrapped Codex recorder, and return how many copies of the seed the
 /// recorder received once a retry would have had time to land.
 ///
 /// `codex_on_path` is the whole difference between the two runs: with the
@@ -87,17 +89,6 @@ fn seed_copies(codex_on_path: bool) -> (usize, String) {
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
     let work = deck.workdir().to_path_buf();
-    std::fs::write(
-        work.join(".dot-agent-deck.toml"),
-        format!(
-            "[[modes]]\n\
-             name = \"codex-seeded\"\n\
-             agent = \"codex\"\n\
-             reactive_panes = 0\n\
-             seed_prompt = \"{SEED_MARKER}\"\n"
-        ),
-    )
-    .expect("write Codex seeded mode");
     // Paints one line, as Codex's composer does, so the wrapper's classifier
     // gives the pane a producer; then records every submission and reports
     // none of them, as a Codex whose prompt hook never runs would not.
@@ -119,16 +110,20 @@ fn seed_copies(codex_on_path: bool) -> (usize, String) {
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.send_keys(b" "); // confirm cwd → new-pane form
     deck.wait_for_string("No mode");
-    deck.send_keys(b"\x1b[C"); // Right → `codex-seeded`
+    // Select by the rendered label: workspace modes no longer occupy chips,
+    // and the number of orchestration chips can differ by fixture.
+    let (col, row) = deck.wait_for_in_grid("[dispatcher]");
+    deck.click(col, row);
+    deck.wait_for_string("dispatcher mode");
     deck.send_keys(b"\r"); // Mode → Name
     deck.send_keys(b"\r"); // Name → Command
     deck.send_keys(&[0x7fu8; 64]); // clear any pre-filled command
-    deck.send_keys(b"./codex-standin.sh");
+    deck.send_keys(b"dot-agent-deck wrap --agent codex -- ./codex-standin.sh");
     deck.send_keys(b"\r");
 
     assert!(
         common::wait_for_path(&work.join("started.log"), Duration::from_secs(15)),
-        "the Codex mode pane never ran its command (codex_on_path={codex_on_path}):\n{}",
+        "the wrapped Codex pane never ran its command (codex_on_path={codex_on_path}):\n{}",
         deck.snapshot_grid()
     );
     let record = work.join("record.log");
@@ -146,7 +141,10 @@ fn seed_copies(codex_on_path: bool) -> (usize, String) {
     (recorded.matches(SEED_MARKER).count(), deck.snapshot_grid())
 }
 
-/// Scenario: Launch the deck with a mode that declares Codex and carries a seed prompt, and spawn it around a stand-in that paints a composer line and records every submission while reporting none. With a `codex` app-server stand-in on the deck's PATH the wrapper records trust for Codex's prompt hook, so the unconfirmed seed is typed in a second time after the retry floor; with no `codex` on the PATH at all, as on a host where it lives only inside `devbox run codex-big`, the same pane must receive the seed exactly once.
+/// Scenario: Select the built-in dispatcher seed from the New Agent form and
+/// spawn a wrapped Codex stand-in that records submissions without confirming
+/// them. With `codex` on PATH the wrapper trusts the prompt hook and retries
+/// the seed; without it, the pane must receive the seed exactly once.
 #[spec("codex/wrap/007")]
 #[test]
 fn codex_wrap_007_untrusted_codex_pane_receives_its_seed_once() {

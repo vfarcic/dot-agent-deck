@@ -3514,10 +3514,10 @@ async fn run_hook_loop_with_idle_timeout(
                                     // Phase 1: resolve the caller's (agent id, cwd)
                                     // from ONE `AgentRecord` in the PTY registry, not
                                     // from AppState::pane_cwd_map. pane_cwd_map is only
-                                    // populated for orchestration panes; mode panes
-                                    // (including the dispatcher mode) never get an entry
-                                    // there, which would make every dispatch from a mode
-                                    // pane a silent no-op.
+                                    // populated for orchestration panes; dashboard panes
+                                    // (including a dispatcher pane) never get an entry
+                                    // there, which would make every dispatch from a
+                                    // dispatcher pane a silent no-op.
                                     //
                                     // Issue #617 (finding 3): the agent id is captured
                                     // HERE, from the same record as the cwd, and carried

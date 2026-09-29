@@ -136,4 +136,4 @@ The unit's branch (`agent/dispatch-<name>`) always survives, since it may hold c
 ## See also
 
 - [Orchestration](orchestration.md) — configuring the multi-role teams a unit can start as
-- [Workspace Modes](workspace-modes.md) — the other built-in and project-defined modes on the `Ctrl+n` cycler
+- [Scheduled Tasks](scheduled-tasks.md) — the built-in `schedule` option on the same `Ctrl+n` **Mode** field

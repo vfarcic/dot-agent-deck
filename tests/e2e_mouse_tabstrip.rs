@@ -3,11 +3,11 @@
 //! PRD #80 M3 — L2 synthetic tests for tab-strip mouse parity.
 //!
 //! Spawns the real `dot-agent-deck` binary inside an isolated PTY, opens a
-//! second tab (a Mode tab) so the tab strip renders, then drives the mouse
+//! second tab (an orchestration tab) so the tab strip renders, then drives the mouse
 //! via SGR reports through the `TuiDeck::click` / `wait_for_in_grid` helpers:
 //!   - mouse/tabstrip/001 — clicking a non-active tab header switches to it
 //!     (same outcome as Tab / Ctrl+PageDown).
-//!   - mouse/tabstrip/002 (click→close half) — clicking a Mode tab's `[×]`
+//!   - mouse/tabstrip/002 (click→close half) — clicking an orchestration tab's `[×]`
 //!     opens the shared confirmation, whose Close choice closes it (same outcome
 //!     as Ctrl+W). The presence/absence of `[×]`
 //!     across tab kinds is pinned by the L1 spec in `render_tab_strip.rs`.
@@ -20,70 +20,67 @@ mod common;
 use common::TuiDeck;
 use spec::spec;
 
-/// Open a second tab (a Mode tab) so the deck has ≥2 tabs and the tab strip
+/// Open a second tab (an orchestration tab) so the deck has ≥2 tabs and the tab strip
 /// renders. Drives Ctrl+N → directory picker → select current dir →
-/// new-pane form → pick the fixture's `demo` mode → submit. Synchronizes on
+/// new-pane form → pick the fixture's orchestration → submit. Synchronizes on
 /// observable screen state at each step. The tab strip only renders when
 /// ≥2 tabs exist, so waiting for the `Dashboard` header to appear confirms
 /// the second tab was created (the strip is hidden with a lone Dashboard).
-fn open_mode_tab(deck: &TuiDeck, right_presses: usize, selected_mode: &str) {
+fn open_orchestration_tab(deck: &TuiDeck, right_presses: usize, selected: &str) {
     deck.send_bytes(b"\x0e"); // Ctrl+N → directory picker
     deck.wait_for_string("Select Directory");
     deck.send_bytes(b" "); // Space: choose current dir → new-pane form
-    deck.wait_for_string("Mode:"); // form ready (Mode field present with modes)
+    deck.wait_for_string("Mode:");
     for _ in 0..right_presses {
         deck.send_bytes(b"\x1b[C");
     }
-    deck.wait_for_string(selected_mode); // selection reflected in the title
-    // Submit via the [Submit] button (deterministic — a mode pane still shows
-    // the Command field, so an Enter-count would be fragile).
-    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
-    deck.click(scol, srow);
+    deck.wait_for_string(selected);
+    deck.send_bytes(b"\r\r"); // Mode → Name → submit
     deck.wait_for_string("Dashboard"); // tab strip appears only with ≥2 tabs
 }
 
 fn open_second_tab(deck: &TuiDeck) {
     deck.wait_for_string("No active agents");
-    open_mode_tab(deck, 1, "demo mode");
+    open_orchestration_tab(deck, 1, "demo-orch");
 }
 
-/// Scenario: With a Dashboard tab and a Mode tab open (the Mode tab is
+/// Scenario: With a Dashboard tab and an orchestration tab open (the latter is
 /// active after creation), click the inactive `Dashboard` tab header in the
 /// top strip. The deck must switch to the Dashboard view — the same outcome
 /// as pressing Tab / Ctrl+PageUp — so the dashboard's session-count title
 /// (`dot-agent-deck — N agent(s)`, shown only on the Dashboard tab, not on
-/// a Mode tab) appears, proving click-to-switch funnels through the shared
+/// an orchestration tab) appears, proving click-to-switch funnels through the shared
 /// tab-switch action.
 #[spec("mouse/tabstrip/001")]
 #[test]
 fn tabstrip_001_click_header_switches_tab() {
-    let deck = TuiDeck::launch_with_fixture("modes");
+    let deck = TuiDeck::launch_with_fixture("orch-deck");
     open_second_tab(&deck);
 
     // The Dashboard header sits in the top strip and is currently inactive
-    // (the freshly-opened Mode tab is active). Click it.
+    // (the freshly-opened orchestration tab is active). Click it.
     let (col, row) = deck
         .find_in_grid("Dashboard")
         .expect("tab strip should render a Dashboard header");
     deck.click(col + 1, row);
 
     // Switching to the Dashboard tab shows the dashboard's session-count title
-    // (the Mode tab view does not render it).
+    // (the orchestration tab view does not render it).
     deck.wait_for_string("dot-agent-deck \u{2014}");
 }
 
-/// Scenario: With a Dashboard tab and a Mode tab open, click the `[×]`
-/// close glyph on the Mode tab's header. The tab must remain until the shared
+/// Scenario: With a Dashboard tab and an orchestration tab open, click the `[×]`
+/// close glyph on the orchestration tab's header. The tab must remain until the shared
 /// confirmation appears and Close is explicitly chosen, then close — the same
 /// outcome as Ctrl+W on that tab — leaving only the Dashboard, so the tab strip
 /// collapses and no `×` glyph remains on screen.
 #[spec("mouse/tabstrip/002")]
 #[test]
 fn tabstrip_002_click_close_glyph_closes_tab() {
-    let deck = TuiDeck::launch_with_fixture("modes");
+    let deck = TuiDeck::launch_with_fixture("orch-deck");
     open_second_tab(&deck);
 
-    // Click the Mode tab's close affordance.
+    // Click the orchestration tab's close affordance.
     let (col, row) = deck.wait_for_in_grid("×");
     deck.click(col, row);
 
@@ -107,9 +104,9 @@ fn tabstrip_003_inactive_close_binds_target_and_modal_suppresses_navigation() {
 
     let deck = TuiDeck::launch_with_fixture("tab-close-targets");
     deck.wait_for_string("No active agents");
-    open_mode_tab(&deck, 1, "alpha mode");
+    open_orchestration_tab(&deck, 1, "alpha");
     deck.wait_for_string("ALPHA_TAB_SENTINEL");
-    open_mode_tab(&deck, 2, "beta mode");
+    open_orchestration_tab(&deck, 2, "beta");
     deck.wait_for_string("BETA_TAB_SENTINEL");
 
     // `wait_for_in_grid` returns the first ×: alpha's, while beta remains active.

@@ -2798,7 +2798,8 @@ pub fn compose_idle_worker_prompt(role: &str, elapsed: std::time::Duration) -> S
 /// The rules, in the order they are decided:
 ///
 /// * **Either side unknown → match.** A pane with no orchestration
-///   `tab_membership` (dashboard/mode pane, or one spawned without membership
+///   `tab_membership` (a dashboard pane, a legacy `TabMembership::Mode` pane
+///   from an older TUI, or one spawned without membership
 ///   metadata) legitimately reports `None`, and the `write_and_submit_guarded`
 ///   agent-id gate is the primary identity guard — this check is defense in
 ///   depth, so it must not refuse on absence.
@@ -15637,7 +15638,8 @@ mod tests {
         ));
 
         // Absence is never a mismatch: a pane with no orchestration membership
-        // (dashboard/mode pane, or one spawned without membership metadata)
+        // (a dashboard pane, a legacy `TabMembership::Mode` pane, or one spawned
+        // without membership metadata)
         // legitimately reports `None`, and the guarded send's agent-id gate is
         // the primary identity guard.
         assert!(orchestration_still_matches(Some(&armed_under), None));

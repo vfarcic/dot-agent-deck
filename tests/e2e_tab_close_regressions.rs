@@ -28,7 +28,6 @@ use tokio::net::{UnixListener, UnixStream};
 
 #[derive(Clone)]
 enum StopScript {
-    Succeed,
     FailOnce { agent_id: String },
     AlreadyGone,
     DoneUnverified,
@@ -277,14 +276,31 @@ fn fixture_path(name: &str) -> String {
         .into_owned()
 }
 
-fn mode_record(fixture: &str, mode: &str, agent_id: &str, pane_id: &str) -> AgentRecord {
+fn orchestration_record(
+    fixture: &str,
+    orchestration: &str,
+    role_index: usize,
+    agent_id: &str,
+    pane_id: &str,
+) -> AgentRecord {
+    let role_name = if role_index == 0 {
+        "orchestrator"
+    } else {
+        "worker"
+    };
     AgentRecord {
         id: agent_id.to_string(),
         pane_id_env: Some(pane_id.to_string()),
-        display_name: Some(format!("{mode}-agent")),
+        display_name: Some(format!("{orchestration}-{role_name}")),
         cwd: Some(fixture_path(fixture)),
-        tab_membership: Some(TabMembership::Mode {
-            name: mode.to_string(),
+        tab_membership: Some(TabMembership::Orchestration {
+            name: orchestration.to_string(),
+            role_index,
+            role_name: role_name.to_string(),
+            is_start_role: role_index == 0,
+            orchestration_cwd: Some(fixture_path(fixture)),
+            display_title: Some(orchestration.to_string()),
+            orchestration_id: Some(format!("{orchestration}-scripted")),
         }),
         agent_type: None,
         rows: 24,
@@ -311,67 +327,29 @@ fn confirm_close(deck: &TuiDeck) {
     deck.send_bytes(b"\r");
 }
 
-/// Scenario: Hydrate a Mode tab whose agent pane is also a dashboard card, then arm Ctrl+W while that card is selected on the Dashboard. The modal must promise a whole-tab close, and confirming must remove both the visible agent pane and the Mode tab's side pane from the daemon before removing the tab.
-#[spec("prompt/close-confirm/006")]
-#[test]
-fn close_confirm_006_dashboard_card_uses_resolved_tab_blast_radius() {
-    let daemon = ScriptedDaemon::spawn(
-        vec![mode_record(
-            "tab-close-targets",
-            "alpha",
-            "mode-agent",
-            "100",
-        )],
-        StopScript::Succeed,
-    );
-    let deck = launch_against(&daemon, "tab-close-targets");
-    deck.wait_for_string("alpha-agent");
-    assert!(
-        daemon.wait_for_record_count(2, Duration::from_secs(5)),
-        "hydrating alpha must create its persistent side pane: {:?}",
-        daemon.records()
-    );
-
-    // The active view is the Dashboard, and `j` makes the dashboard Session
-    // target explicit. That Session's pane secretly belongs to the Mode tab.
-    deck.send_bytes(b"j");
-    deck.wait_for_string("\u{25b8}");
-    deck.send_bytes(b"\x17");
-    deck.wait_for_string("Close this tab and all its agents?");
-    let modal = deck.snapshot_grid();
-    assert!(!modal.contains("Close selected agent?"), "{modal}");
-
-    confirm_close(&deck);
-    deck.wait_for_absence("×");
-    assert!(
-        daemon.wait_for_record_count(0, Duration::from_secs(5)),
-        "the confirmed blast radius must remove every daemon pane: {:?}",
-        daemon.records()
-    );
+fn request_close_alpha_tab(deck: &TuiDeck) {
+    let (col, row) = deck.wait_for_in_grid("alpha [×]");
+    deck.click(col + "alpha [".len() as u16, row);
 }
 
-/// Scenario: Hydrate a two-pane Mode tab whose side pane refuses its first stop, then confirm its close from the Dashboard. The tab and failed pane must remain with a visible retry status while the successful pane disappears; a second confirmed close after the scripted failure clears must remove the retained tab.
+/// Scenario: Hydrate a two-role orchestration whose worker refuses its first stop, then confirm its close. The tab and failed role must remain with a retry status while the successful role disappears; a second close removes the retained tab.
 #[spec("lifecycle/stop/017")]
 #[test]
 fn stop_017_partial_tab_close_is_retained_and_retryable() {
     let daemon = ScriptedDaemon::spawn(
-        vec![mode_record(
-            "tab-close-targets",
-            "alpha",
-            "mode-agent",
-            "100",
-        )],
+        vec![
+            orchestration_record("tab-close-targets", "alpha", 0, "orch-agent", "100"),
+            orchestration_record("tab-close-targets", "alpha", 1, "spawned-1", "101"),
+        ],
         StopScript::FailOnce {
             agent_id: "spawned-1".to_string(),
         },
     );
     let deck = launch_against(&daemon, "tab-close-targets");
-    deck.wait_for_string("alpha-agent");
+    deck.wait_for_string("alpha-orchestrator");
     assert!(daemon.wait_for_record_count(2, Duration::from_secs(5)));
 
-    deck.send_bytes(b"j");
-    deck.wait_for_string("\u{25b8}");
-    deck.send_bytes(b"\x17");
+    request_close_alpha_tab(&deck);
     deck.wait_for_string("Close this tab and all its agents?");
     let first_started = Instant::now();
     confirm_close(&deck);
@@ -390,12 +368,9 @@ fn stop_017_partial_tab_close_is_retained_and_retryable() {
         "the retained tab must keep a close affordance for retry"
     );
 
-    // Move from Dashboard to the retained Mode tab and retry through the same
-    // user-visible close flow. The scripted one-shot failure is now cleared.
-    deck.send_bytes(b"\x1b[C");
-    deck.wait_for_absence("agent(s)");
+    // Retry on the retained orchestration tab after the one-shot failure clears.
     let retry_started = Instant::now();
-    deck.send_bytes(b"\x17");
+    request_close_alpha_tab(&deck);
     deck.wait_for_string("Close this tab and all its agents?");
     confirm_close(&deck);
     deck.wait_for_absence("×");
@@ -411,19 +386,24 @@ fn stop_017_partial_tab_close_is_retained_and_retryable() {
     );
 }
 
-/// Scenario: Close one hydrated Mode tab after exact id-scoped NotFound proves its agent already gone, then repeat with daemon verification unavailable. Both tabs must be removed; the proven-gone case stays warning-free, while the unverified case renders exactly one unattended-agent warning on the status line.
+/// Scenario: Close a hydrated orchestration after exact id-scoped NotFound proves its start role already gone, then repeat with daemon verification unavailable. Both tabs must be removed; the proven-gone case stays warning-free, while the unverified case renders one unattended-agent warning.
 #[spec("lifecycle/stop/018")]
 #[test]
 fn stop_018_already_gone_and_unverified_success_remove_tab() {
     {
         let daemon = ScriptedDaemon::spawn(
-            vec![mode_record("modes", "demo", "ghost-agent", "200")],
+            vec![orchestration_record(
+                "tab-close-targets",
+                "alpha",
+                0,
+                "ghost-agent",
+                "200",
+            )],
             StopScript::AlreadyGone,
         );
-        let deck = launch_against(&daemon, "modes");
-        deck.wait_for_string("demo-agent");
-        deck.send_bytes(b"j");
-        deck.send_bytes(b"\x17");
+        let deck = launch_against(&daemon, "tab-close-targets");
+        deck.wait_for_string("alpha-orchestrator");
+        request_close_alpha_tab(&deck);
         deck.wait_for_string("Close this tab and all its agents?");
         confirm_close(&deck);
         deck.wait_for_absence("×");
@@ -435,13 +415,18 @@ fn stop_018_already_gone_and_unverified_success_remove_tab() {
 
     {
         let daemon = ScriptedDaemon::spawn(
-            vec![mode_record("modes", "demo", "unverified-agent", "300")],
+            vec![orchestration_record(
+                "tab-close-targets",
+                "alpha",
+                0,
+                "unverified-agent",
+                "300",
+            )],
             StopScript::DoneUnverified,
         );
-        let deck = launch_against(&daemon, "modes");
-        deck.wait_for_string("demo-agent");
-        deck.send_bytes(b"j");
-        deck.send_bytes(b"\x17");
+        let deck = launch_against(&daemon, "tab-close-targets");
+        deck.wait_for_string("alpha-orchestrator");
+        request_close_alpha_tab(&deck);
         deck.wait_for_string("Close this tab and all its agents?");
         confirm_close(&deck);
         deck.wait_for_absence("×");

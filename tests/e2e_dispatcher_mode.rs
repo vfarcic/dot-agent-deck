@@ -507,7 +507,7 @@ fn wait_for_delegate_pointer(
 /// orchestration against the deck's CURRENT directory — the "normal" way a user
 /// starts one, and the CONTROL for the dispatched path.
 ///
-/// With no `[[modes]]` in the `orch-deck` fixture the Mode chip row is
+/// In the `orch-deck` fixture the Mode chip row is
 /// `[No mode] [Orch: demo-orch] [schedule]`, so ONE Right selects the
 /// orchestration; selecting one HIDES the Command field, so the second Enter
 /// submits. Mirrors `e2e_orchestration_route_isolation::open_orchestration_tab`.
@@ -639,13 +639,10 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     // Submitting closes the form and spawns the dispatcher CARD.
     deck.wait_for_absence("[Submit]");
 
-    // The dispatcher must surface live as a DASHBOARD CARD, not a mode tab.
+    // The dispatcher must surface live as a DASHBOARD CARD.
     //
-    // This is the PRD #127 card shape (`mode_config: None` + `seed_prompt`), and
-    // asserting it is the point: a mode tab routes through `render_mode_tab`'s
-    // 50/50 split, so the dispatcher — which declares no side panes — rendered at
-    // half width beside an empty column. `1 agent(s)` with no tab strip is what
-    // distinguishes the fixed shape from the broken one.
+    // This is the PRD #127 card shape (a seeded single agent). `1 agent(s)`
+    // with no tab strip is what identifies the card shape.
     // Asserted on the GRID, not the raw stream: this is redrawn dashboard chrome,
     // so the bytes carrying it are interleaved with cursor-positioning escapes and
     // the text never appears contiguously in the stream. The rendered grid is the
@@ -661,8 +658,7 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     assert!(
         common::wait_until(SURFACE_WAIT, || deck.snapshot_grid().contains("1 agent(s)")),
         "the dispatcher never surfaced a LIVE dashboard card within {}s — expected a \
-         single-agent card on the dashboard (NOT a mode tab, which would split the pane \
-         50/50 with an empty side column).\n\
+         single-agent card on the dashboard.\n\
          Final grid:\n{}",
         SURFACE_WAIT.as_secs(),
         deck.snapshot_grid()

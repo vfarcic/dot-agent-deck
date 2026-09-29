@@ -49,12 +49,9 @@ import styles from './index.module.css';
 /**
  * The pages the closing panel hands the visitor, in the order to read them.
  *
- * "Workspace modes" was the third of these and is now "Dispatcher mode".
- * Modes are being removed (issue #1199) and the page dropped its modes
- * principle in the same pass, so leaving a door onto the modes reference would
- * have pointed the one visitor who followed the page's argument at the one
- * feature it deliberately stopped making. Dispatching, meanwhile, is the
- * story's fourth step and had no door at all.
+ * Each door follows the page's argument: "Dispatcher mode" is the door onto
+ * the story's fourth step, so a visitor who followed the arc lands on the
+ * feature it ended on.
  */
 const doorPages = [
   {

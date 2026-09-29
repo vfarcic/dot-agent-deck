@@ -29,13 +29,14 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
     out
 }
 
-/// Scenario: Render the new-pane form (with two modes, `demo` and `demo2`)
-/// into an 80×24 `TestBackend` buffer. The form must render a clickable chip
-/// for each mode option (`demo`, `demo2`) and `[Submit]` / `[Cancel]`
-/// buttons, AND still render its existing field chrome (the `Name:` field and
-/// the ` New Agent ` title). Before M8 the form showed only the single
-/// currently-selected mode in a `◀ … ▶` cycler (so the non-selected chip labels
-/// were absent) and had no Submit/Cancel buttons; M8 added the chips + buttons.
+/// Scenario: Render the new-pane form (with two orchestrations, `demo` and
+/// `demo2`) into an 80×24 `TestBackend` buffer. The form must render a
+/// clickable chip for each Mode-row option (`Orch: demo`, `Orch: demo2`, and
+/// the built-in `schedule`) and `[Submit]` / `[Cancel]` buttons, AND still
+/// render its existing field chrome (the `Name:` field and the ` New Agent `
+/// title). Before M8 the form showed only the single currently-selected option
+/// in a `◀ … ▶` cycler (so the non-selected chip labels were absent) and had no
+/// Submit/Cancel buttons; M8 added the chips + buttons.
 #[spec("mouse/form/001")]
 #[test]
 fn form_001_renders_mode_chips_and_submit_cancel() {
@@ -51,8 +52,8 @@ fn form_001_renders_mode_chips_and_submit_cancel() {
         "form must still render its Name field, got:\n{buf}"
     );
 
-    // Clickable mode chips — one per mode option.
-    for chip in ["demo", "demo2"] {
+    // Clickable Mode-row chips — one per option.
+    for chip in ["Orch: demo", "Orch: demo2", "schedule"] {
         assert!(
             buf.contains(chip),
             "form must render a clickable {chip} mode chip, got:\n{buf}"

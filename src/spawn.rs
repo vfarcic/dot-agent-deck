@@ -2677,9 +2677,10 @@ fn surface_spawned_pane(
 ///   attach start carries one role, so the daemon cannot know the whole set;
 ///   the TUI's surface consumer builds the tab from the first role and GROWS it
 ///   from each later one by the orchestration's identity (issue #868's path);
-/// * a mode pane, or a role with no role name — nothing. A mode tab is built
-///   from local `ModeConfig` and there is no live mode surface to publish, so a
-///   synthetic dashboard card would misfile the pane rather than surface it.
+/// * a mode pane (the deprecated `TabMembership::Mode`, only from an older
+///   TUI), or a role with no role name — nothing. There is no live mode surface
+///   to publish, so a synthetic dashboard card would misfile the pane rather
+///   than surface it.
 ///
 /// Idempotent against the sending TUI, which has already built its own card
 /// or tab: the `SessionStart` lands on that TUI's placeholder card under the

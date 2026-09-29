@@ -42,16 +42,13 @@ fn send_session_start(deck: &TuiDeck, session_id: &str, pane_id: &str, cwd: &str
 /// away, the detach would not return us to the global bar. Should be GREEN
 /// (asserts existing behavior). DEFERRED, with reasons, in the body:
 /// explicit double-click-to-focus from the dashboard (covered by
-/// mouse/dashboard/001), mode-tab side/agent click-to-focus, text-selection
+/// mouse/dashboard/001), text-selection
 /// drag/multi-click, Ctrl+click hyperlink, and child-app mouse forwarding.
 #[spec("mouse/preserve/001")]
 #[test]
 fn preserve_001_existing_pane_mouse_behavior_intact() {
     // DEFERRED sub-behaviors (not asserted here) and why:
     //  - Explicit double-click-to-focus a card: covered by mouse/dashboard/001.
-    //  - Mode-tab side/agent pane click-to-focus: focus there is visual-only
-    //    (border highlight, no PaneInput status), not robustly readable via
-    //    vt100, and needs heavy mode-tab setup; same `pane.focus_pane` path.
     //  - Text selection (drag / double-click word / triple-click): the
     //    harness sends discrete clicks; driving a Drag sequence and reading
     //    the selection highlight from the grid is not robust. The
@@ -225,7 +222,7 @@ fn preserve_disabled_button_is_inert() {
 
     let grid = deck.snapshot_grid();
     assert!(
-        !grid.contains("No workspace modes config found"),
+        !grid.contains("No orchestration config found"),
         "clicking the disabled Generate button must not open the config-gen prompt:\n{grid}"
     );
     assert!(

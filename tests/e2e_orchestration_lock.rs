@@ -37,8 +37,8 @@ use spec::spec;
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
 /// `orch-deck` / `orch-lock-*` fixtures. Mirrors
-/// `e2e_orchestration_pane_column.rs::open_orchestration` — with no
-/// `[[modes]]` defined the Mode chip row is `[No mode] [Orch: …] [schedule]`,
+/// `e2e_orchestration_pane_column.rs::open_orchestration` — the
+/// Mode chip row is `[No mode] [Orch: …] [schedule]`,
 /// so ONE Right selects the orchestration; selecting an orchestration hides
 /// the Command field, so a second Enter submits the form. Lands with the
 /// orchestrator (start) role focused in `PaneInput` mode.

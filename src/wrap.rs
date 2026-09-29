@@ -30,8 +30,8 @@
 //! `run_wrap` is a compiling stub (a ConPTY port is #163/#164, matching the
 //! daemon/attach story). The PURE detection layer ([`classify_line`],
 //! [`Detector`], [`RuleSet`], [`CODEX`]) and the pure command rewrite
-//! ([`wrap_launch_command`], called by the cross-platform `agent_pty`/`ui` spawn
-//! seams) stay cross-platform. On non-Unix the Unix-only helpers compile out, so
+//! ([`wrap_launch_command`], called by the cross-platform `agent_pty` spawn
+//! seam) stay cross-platform. On non-Unix the Unix-only helpers compile out, so
 //! the pure helpers they alone consume are dead there — hence the conditional
 //! `allow` below (Unix keeps full linting).
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
@@ -541,9 +541,9 @@ fn deck_binary_for_wrap() -> String {
 /// [`crate::platform::paths::binary_name`] takes it.
 ///
 /// The name check was standing in for "is this process the deck binary", and
-/// in production it always is: the callers of [`wrap_launch_command`] are the
-/// daemon's spawn seam (`agent_pty`) and the TUI (`ui`), both subcommands of
-/// the one `dot-agent-deck` binary. The process that is NOT the deck is a cargo
+/// in production it always is: the caller of [`wrap_launch_command`] is the
+/// daemon's spawn seam (`agent_pty`), a subcommand of the one `dot-agent-deck`
+/// binary. The process that is NOT the deck is a cargo
 /// test harness, and that is now recognised by cargo's own signature for one:
 /// it lives in a `deps` directory (`target/<profile>/deps/`) AND its file stem
 /// ends in cargo's `-<16 hex digits>` metadata hash (`dot_agent_deck-3f…`).

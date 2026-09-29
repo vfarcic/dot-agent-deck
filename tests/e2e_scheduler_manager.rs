@@ -729,7 +729,7 @@ fn visible_side_scroll_markers(grid: &str) -> Vec<String> {
         .collect()
 }
 
-/// Scenario: Open an output-filled mode tab, scroll its right-hand side pane into history, then open Schedules and wheel down and up over the dialog where it overlaps that pane. The visible side-pane lines must remain unchanged while the dialog handles the wheel events instead of leaking them to the pane behind it.
+/// Scenario: Open an output-filled orchestration tab, prove its start-role pane scrolls, then open Schedules and wheel down and up where the dialog covers that same pane. The visible pane lines must remain unchanged while the dialog handles the wheel events.
 #[spec("scheduler/manager/016")]
 #[test]
 fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
@@ -756,20 +756,18 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
         .launch_with_fixture("scheduler-manager-scroll");
     deck.wait_for_string("No active agents");
 
-    // Open the fixture's `scroll` mode. Its persistent side pane occupies the
-    // right half of the active mode tab, registering the rect that currently
-    // receives wheel events leaked through the manager dialog.
+    // Open the fixture's `scroll` orchestration. Its start-role pane carries
+    // enough output for scrollback behind the manager dialog.
     deck.send_bytes(b"\x0e"); // Ctrl+N -> directory picker
     deck.wait_for_string("Select Directory");
     deck.send_bytes(b" "); // choose current dir -> new-pane form
     deck.wait_for_string("Mode:");
-    deck.send_bytes(b"\x1b[C"); // No mode -> scroll
-    deck.wait_for_string("scroll mode");
-    let (submit_col, submit_row) = deck.wait_for_in_grid("[Submit]");
-    deck.click(submit_col, submit_row);
+    deck.send_bytes(b"\x1b[C"); // No mode -> Orch: scroll
+    deck.wait_for_string("Orch: scroll");
+    deck.send_bytes(b"\r\r"); // Mode → Name → submit
     deck.wait_for_string("SIDE_SCROLL_LINE_119");
     deck.wait_for_string("[Command Mode Ctrl+D]");
-    deck.send_bytes(b"\x04"); // detach to Normal mode on the active mode tab
+    deck.send_bytes(b"\x04"); // detach to Normal mode on the orchestration tab
     deck.wait_for_absence("[Command Mode Ctrl+D]");
 
     // Move the side pane away from the bottom so both wheel directions have
@@ -777,12 +775,24 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
     let bottom_markers = visible_side_scroll_markers(&deck.snapshot_grid());
     assert!(
         !bottom_markers.is_empty(),
-        "precondition: the mode side pane must visibly contain synthetic scrollback"
+        "precondition: the start-role pane must visibly contain synthetic scrollback"
     );
     deck.scroll_n(100, 10, false, 8);
     deck.wait_until_grid("side pane scrolled into its history", |grid| {
         visible_side_scroll_markers(grid) != bottom_markers
     });
+    let scrollable_rows = deck.capture_screen_when(
+        "the start-role pane's scrollback to finish painting",
+        |screen| {
+            let rows: Vec<_> = screen
+                .contents()
+                .lines()
+                .enumerate()
+                .filter_map(|(row, line)| line.contains("SIDE_SCROLL_LINE_").then_some(row))
+                .collect();
+            (rows.len() >= 34).then_some(rows)
+        },
+    );
 
     deck.send_keys(b"s");
     deck.wait_for_string("NEXT FIRE");
@@ -798,15 +808,18 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
         "precondition: several side-pane markers must remain visible around the centered dialog.\nGrid:\n{before_grid}"
     );
 
-    // NEXT FIRE sits inside the visible dialog and, in this mode-tab layout,
-    // inside the right-half side-pane rect behind it.
+    // NEXT FIRE sits inside the visible dialog and over the role pane behind it.
     let (dialog_col, dialog_row) = deck
         .find_in_grid("NEXT FIRE")
         .expect("manager dialog must render the NEXT FIRE header");
     let wheel_col = dialog_col + "NEXT FIRE".len() as u16 + 2;
     assert!(
         wheel_col >= 60,
-        "precondition: the wheel target must overlap the right-half side pane (col {wheel_col})"
+        "precondition: the wheel target must overlap the role pane (col {wheel_col})"
+    );
+    assert!(
+        scrollable_rows.contains(&(dialog_row as usize)),
+        "precondition: the wheel target row must cross the scrollable start-role pane, not the empty worker pane.\nWheel: ({wheel_col}, {dialog_row})\nScrollable rows before dialog: {scrollable_rows:?}"
     );
 
     deck.scroll(wheel_col, dialog_row, true);
@@ -836,11 +849,11 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
 
     assert_eq!(
         after_down, before,
-        "wheel-down over the Schedules dialog leaked into the mode side pane behind it; the visible side-pane scrollback must remain unchanged.\nBefore: {before:?}\nAfter wheel-down: {after_down:?}\nBaseline grid (settled, before the wheel):\n{before_grid}\nGrid after wheel-down:\n{after_down_grid}"
+        "wheel-down over the Schedules dialog leaked into the orchestration role pane behind it; the visible scrollback must remain unchanged.\nBefore: {before:?}\nAfter wheel-down: {after_down:?}\nBaseline grid (settled, before the wheel):\n{before_grid}\nGrid after wheel-down:\n{after_down_grid}"
     );
     assert_eq!(
         after_up, before,
-        "wheel-up over the Schedules dialog leaked into the mode side pane behind it; the visible side-pane scrollback must remain unchanged.\nBefore: {before:?}\nAfter wheel-up: {after_up:?}\nBaseline grid (settled, before the wheel):\n{before_grid}\nGrid after wheel-up:\n{after_up_grid}"
+        "wheel-up over the Schedules dialog leaked into the orchestration role pane behind it; the visible scrollback must remain unchanged.\nBefore: {before:?}\nAfter wheel-up: {after_up:?}\nBaseline grid (settled, before the wheel):\n{before_grid}\nGrid after wheel-up:\n{after_up_grid}"
     );
     drop(scratch);
 }

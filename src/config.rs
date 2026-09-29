@@ -340,9 +340,13 @@ pub struct SavedPane {
     pub dir: String,
     pub name: String,
     pub command: String,
-    /// When set, this pane was the agent pane of a mode tab.
-    /// The value is the mode name from the project config.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Deprecated by issue #1199 (workspace modes were removed). A
+    /// `session.toml` written by an older build may still name the mode tab
+    /// this pane was the agent pane of, so the key keeps DEserializing — an
+    /// unknown key would otherwise be a silent drop, and the restore path needs
+    /// to know to warn — but it is never written again. A pane that carries one
+    /// restores as a plain dashboard pane with one session warning.
+    #[serde(default, skip_serializing)]
     pub mode: Option<String>,
     /// When set, this pane was the orchestrator pane of an orchestration
     /// tab; the snapshot carries enough metadata to rebuild the whole tab
@@ -472,8 +476,8 @@ pub struct SavedFocus {
     pub dashboard_active: bool,
     /// The pane focused in the tab that was ACTIVE, which doubles as the
     /// locator for which tab that was. Taken from the pane controller rather
-    /// than from the tab's own field, because a `Tab::Mode` stores `None` to
-    /// mean "the agent pane is focused" and a locator has to be a concrete id.
+    /// than from the tab's own field, because an orchestration tab stores `None`
+    /// to mean "the start role's pane" and a locator has to be a concrete id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_pane: Option<String>,
     /// The remembered focused pane of every tab that had one, the active tab's
@@ -495,23 +499,15 @@ impl SavedFocus {
     /// `EmbeddedPaneController::hydrate_from_daemon` reuses the very same value
     /// the previous TUI had. Every OTHER pane's id comes from `allocate_id`, a
     /// bare counter, and is reused across processes by coincidence rather than
-    /// by identity. Two such panes exist, and both were reported as one class:
-    ///
-    /// - on the daemon-EMPTY rebuild path, EVERY restored pane (pass an empty
-    ///   set there, and nothing id-shaped is honoured);
-    /// - on the warm-reattach path, a `Tab::Mode`'s SIDE panes, which are not
-    ///   daemon-tracked — `open_mode_tab_with_existing_agent_pane` adopts the
-    ///   hydrated agent pane and spawns the side panes fresh from the project
-    ///   config. The agent pane is daemon-supplied and survives this filter; its
-    ///   side panes do not.
+    /// by identity. That is EVERY restored pane on the daemon-EMPTY rebuild
+    /// path (pass an empty set there, and nothing id-shaped is honoured).
     ///
     /// Reusing a counter is worse than useless rather than merely unhelpful: a
     /// startup that recreates the same panes in the same order happens to
     /// reproduce the same numbers, but one that does not — a pane closed and
-    /// another created before the snapshot was written, or a mode's side-pane
-    /// list edited between runs — reassigns a remembered number to a DIFFERENT
-    /// pane, and restores focus, and every keystroke after it, to the wrong
-    /// terminal instead of failing to restore. A silent wrong answer is the one
+    /// another created before the snapshot was written — reassigns a
+    /// remembered number to a DIFFERENT pane, and restores focus, and every
+    /// keystroke after it, to the wrong terminal instead of failing to restore. A silent wrong answer is the one
     /// outcome worth engineering against here.
     ///
     /// [`crate::tab::TabManager::apply_focus_snapshot`] then still honours a
@@ -664,12 +660,11 @@ impl SavedSession {
 
     /// Build a `SavedSession` snapshot from the live UI state.
     ///
-    /// Must be called *before* tearing down mode/orchestration tabs — i.e., while
+    /// Must be called *before* tearing down orchestration tabs — i.e., while
     /// `live_panes` (the authoritative `state.managed_pane_ids`) still contains
-    /// every pane, including mode-tab agent panes that carry `mode = Some(...)`.
-    /// `retain` here only prunes panes the user externally closed before exit;
-    /// running it after teardown would also drop the mode-tab agent pane and lose
-    /// the mode field, breaking auto-restore of the mode tab (PRD #69).
+    /// every pane. `retain` here only prunes panes the user externally closed
+    /// before exit; running it after teardown would also drop the tabs' panes
+    /// and lose their metadata, breaking auto-restore of those tabs (PRD #69).
     pub fn snapshot(
         pane_metadata: &mut HashMap<String, SavedPane>,
         pane_display_names: &HashMap<String, String>,
@@ -1408,7 +1403,7 @@ pub(crate) fn config_dir() -> PathBuf {
 pub const EXPERIMENTAL_ENV: &str = "DOT_AGENT_DECK_EXPERIMENTAL";
 
 /// Internal mirror of the `.dot-agent-deck.toml` shape for the `[features]`
-/// table only. Every other key (`[[modes]]`, `[[orchestrations]]`, …) is
+/// table only. Every other key (`[[orchestrations]]`, …) is
 /// ignored, so this loader is decoupled from `ProjectConfig`'s schema and an
 /// absent `[features]` table deserializes to the default (experimental =
 /// false).

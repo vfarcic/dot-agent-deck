@@ -46,8 +46,6 @@ error/config/002
 error/socket/001
 error/socket/002
 focus/dashboard/001
-focus/mode-tab/001
-focus/mode-tab/002
 focus/orchestration/001
 focus/orchestration/002
 hooks/delivery/002
@@ -101,8 +99,6 @@ resize/layout/001
 resize/sigwinch/001
 resize/sigwinch/002
 resize/sigwinch/003
-session/restore/002
-session/restore/003
 session/restore/004
 status/badge/001
 status/transition/001
@@ -112,9 +108,6 @@ status/transition/004
 status/transition/005
 status/transition/006
 status/transition/007
-tabs/mode/002
-tabs/mode/003
-tabs/mode/004
 tabs/navigation/001
 tabs/navigation/002
 tabs/navigation/003

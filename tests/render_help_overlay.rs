@@ -34,8 +34,9 @@ fn buffer_text_lower(buffer: &ratatui::buffer::Buffer) -> String {
 /// the canonical shortcut set: the five global commands the button bar
 /// advertises (New Agent Ctrl+N, Close Ctrl+W, Toggle Layout Ctrl+T, Help ?,
 /// Quit Ctrl+C) and the key dashboard / navigation actions (filter `/`,
-/// rename, generate, tab switching, card nav). The labels must name agents,
-/// the schedule manager, and the command mode destination consistently.
+/// rename, generate, tab switching, card nav). The labels must name agents
+/// and the schedule manager consistently. Ctrl+D is documented under Global as
+/// "Toggle command / pane".
 /// Substring checks are
 /// case-insensitive so a `Ctrl+n` vs `Ctrl+N` casing difference between the
 /// overlay and the buttons does not fail the test — it pins that each
@@ -78,7 +79,6 @@ fn help_001_overlay_documents_canonical_shortcut_set() {
         "rename agent",
         "jump to card n",
         "close selected agent (confirms)",
-        "return to command mode",
         "schedules manager",
     ] {
         assert!(

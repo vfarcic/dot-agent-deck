@@ -47,7 +47,7 @@ use dot_agent_deck::agent_pty::TabMembership;
 use spec::spec;
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
-/// `pane-spawn-live` fixture. With no `[[modes]]` defined the Mode chip row
+/// `pane-spawn-live` fixture. The Mode chip row
 /// is `[No mode] [Orch: spawn-orch] [schedule]`, so ONE Right selects the
 /// orchestration; selecting an orchestration HIDES the Command field, so a
 /// second Enter submits the form. Mirrors `e2e_dashboard_selection.rs`'s own

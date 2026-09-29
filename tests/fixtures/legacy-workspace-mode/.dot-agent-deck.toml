@@ -1,11 +1,12 @@
-default_command = "codex"
+[[modes]]
+name = "legacy-mode-xyz"
 
 [[orchestrations]]
-name = "wrapped-orchestration"
+name = "keep-orch"
 
 [[orchestrations.roles]]
 name = "orchestrator"
-command = "codex"
+command = "cat"
 start = true
 
 [[orchestrations.roles]]
