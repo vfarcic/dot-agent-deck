@@ -18417,7 +18417,7 @@ mod tests {
         };
         assert_eq!(
             ack("some-older-generation"),
-            crate::event::AckDelivery::NotPending
+            crate::event::AckDelivery::Unknown
         );
         assert_eq!(
             registry

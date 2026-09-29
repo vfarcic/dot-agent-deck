@@ -573,12 +573,13 @@ pub enum AckOutcome {
     /// silent-worker watch bound to that delivery for the caller to cancel, as
     /// [`Self::Stopped`] does (Qodo, PR #1414): with the retry off no record
     /// holds that seq, and the watch would otherwise report an acknowledged
-    /// worker as never having got its task. `None` once taken, and for an ack
-    /// whose sender is not the delivery's worker.
+    /// worker as never having got its task. `None` once taken. Once the
+    /// delivery is bound to its worker, only that worker is answered this way.
     NotPending { silence_seq: Option<u64> },
-    /// The id is not the pane's current delivery: mistyped, an earlier
-    /// delegation's, or one presented by another agent on the pane while its
-    /// retry is pending. A no-op, so a pending retry keeps running.
+    /// The id is not the pane's current delivery (mistyped, or an earlier
+    /// delegation's), or it is but was presented by an agent other than the
+    /// worker the delivery is bound to, or by one that could not be identified.
+    /// A no-op, so a pending retry keeps running and the watch stays armed.
     Unknown,
 }
 
@@ -799,7 +800,9 @@ impl PendingDeliveries {
     /// worker — an older generation's ack cannot stop a newer generation's
     /// loop. `agent_id` is who sent the ack; `None` means the sender could not
     /// be identified, and never matches a pending record (Qodo, #1414), so the
-    /// retry keeps running. Idempotent. The outcome is what the `ack` CLI
+    /// retry keeps running. The same holds once nothing is pending: a delivery
+    /// bound to its worker answers any other sender [`AckOutcome::Unknown`].
+    /// Idempotent. The outcome is what the `ack` CLI
     /// reports to the worker; see [`AckOutcome::matched`].
     pub fn acknowledge(
         &self,
@@ -834,6 +837,20 @@ impl PendingDeliveries {
         if inner.records.contains_key(pane_id) {
             return AckOutcome::Unknown;
         }
+        // The same rule once nothing is pending (Qodo, PR #1414): a delivery
+        // bound to its worker is acknowledged only by that worker. Anyone else
+        // — an older generation that read the overwritten role file, or a
+        // sender that could not be identified — is answered `Unknown`, never
+        // told its ack was recorded, and changes nothing.
+        if let Some(current) = inner.current.get(pane_id)
+            && current.delivery_id == delivery_id
+            && current
+                .worker_agent_id
+                .as_deref()
+                .is_some_and(|worker| agent_id != Some(worker))
+        {
+            return AckOutcome::Unknown;
+        }
         if inner
             .last_acked
             .get(pane_id)
@@ -844,17 +861,10 @@ impl PendingDeliveries {
         if let Some(current) = inner.current.get_mut(pane_id)
             && current.delivery_id == delivery_id
         {
-            let from_worker = current
-                .worker_agent_id
-                .as_deref()
-                .is_some_and(|worker| agent_id == Some(worker));
-            // A watch is cancelled only by the delivery's own worker, the rule a
-            // pending record applies. Any other sender is answered as before,
-            // but is not recorded as the acknowledgement while the watch is
-            // still armed, so the worker's own ack still reaches it.
-            if current.silence_seq.is_some() && !from_worker {
-                return AckOutcome::NotPending { silence_seq: None };
-            }
+            // Bound to this sender, or not bound yet: an ack that lands between
+            // `note_delivery` and `bind_current` has no worker to check against
+            // and is taken as the pane's (an accepted residual,
+            // docs/develop/delegate-delivery.md).
             let silence_seq = current.silence_seq.take();
             inner
                 .last_acked
@@ -2430,12 +2440,12 @@ mod tests {
         assert!(store.bind_current("p1", "d-11111111", "a1", Some(9)));
         assert_eq!(
             store.acknowledge("p1", "d-11111111", Some("a0")),
-            AckOutcome::NotPending { silence_seq: None },
+            AckOutcome::Unknown,
             "an older generation's ack must not cancel this delivery's watch"
         );
         assert_eq!(
             store.acknowledge("p1", "d-11111111", None),
-            AckOutcome::NotPending { silence_seq: None },
+            AckOutcome::Unknown,
             "an unidentified sender must not cancel the watch"
         );
         assert_eq!(
@@ -2455,6 +2465,60 @@ mod tests {
         assert_eq!(
             store.acknowledge("p1", "d-22222222", Some("a1")),
             AckOutcome::NotPending { silence_seq: None }
+        );
+    }
+
+    /// Qodo, PR #1414: with nothing pending, a delivery bound to its worker is
+    /// never reported as recorded to anyone else — before the worker's ack,
+    /// after it, or after the retry loop ended — and such an ack changes
+    /// nothing the worker's own ack then depends on.
+    #[test]
+    fn pending_deliveries_ack_of_a_bound_delivery_from_another_sender_is_unknown() {
+        let store = PendingDeliveries::default();
+        // Retry off: bound, never armed.
+        store.note_delivery("p1", "d-11111111");
+        assert!(store.bind_current("p1", "d-11111111", "a1", Some(4)));
+        for sender in [Some("a0"), None] {
+            let outcome = store.acknowledge("p1", "d-11111111", sender);
+            assert_eq!(outcome, AckOutcome::Unknown, "sender {sender:?}");
+            assert!(
+                !outcome.matched(),
+                "sender {sender:?} was told Acknowledged"
+            );
+        }
+        assert_eq!(
+            store.current_for_test("p1"),
+            Some(("d-11111111".to_string(), Some(4))),
+            "another sender's ack must leave the watch bound"
+        );
+        assert_eq!(
+            store.acknowledge("p1", "d-11111111", Some("a1")),
+            AckOutcome::NotPending {
+                silence_seq: Some(4)
+            }
+        );
+        // After the worker's ack, a repeat from anyone else is still not its.
+        assert_eq!(
+            store.acknowledge("p1", "d-11111111", Some("a0")),
+            AckOutcome::Unknown
+        );
+        assert_eq!(
+            store.acknowledge("p1", "d-11111111", Some("a1")),
+            AckOutcome::AlreadyAcknowledged
+        );
+
+        // Retry on, loop already ended: the record's worker still decides.
+        let armed = store.arm("p1", "d-22222222", "a1", Some(5), RetypePolicy::Allowed);
+        assert!(store.finish("p1", armed.seq));
+        assert_eq!(
+            store.acknowledge("p1", "d-22222222", Some("a0")),
+            AckOutcome::Unknown
+        );
+        assert_eq!(
+            store.acknowledge("p1", "d-22222222", Some("a1")),
+            AckOutcome::NotPending {
+                silence_seq: Some(5)
+            }
         );
     }
 

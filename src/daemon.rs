@@ -7313,6 +7313,37 @@ mod hook_ingestion_tests {
     const PROV_ORCH_PANE: &str = "prov-orchestrator-pane";
     const PROV_WORKER_PANE: &str = "prov-worker-pane";
 
+    /// Held by every test here that sets `DOT_AGENT_DECK_HOOK_PROVENANCE` and
+    /// by every one that relies on it being unset (enforce): the hook loop
+    /// reads it per message, and `cargo test` runs these on shared threads.
+    static HOOK_PROVENANCE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Sets `DOT_AGENT_DECK_HOOK_PROVENANCE` for one test and restores what was
+    /// there. Hold [`HOOK_PROVENANCE_ENV_LOCK`] for its whole life.
+    struct HookProvenanceEnv(Option<std::ffi::OsString>);
+
+    impl HookProvenanceEnv {
+        fn set(value: &str) -> Self {
+            let var = crate::hook_provenance::DOT_AGENT_DECK_HOOK_PROVENANCE;
+            let previous = std::env::var_os(var);
+            // SAFETY: every test that reads or writes this variable holds
+            // `HOOK_PROVENANCE_ENV_LOCK`.
+            unsafe { std::env::set_var(var, value) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for HookProvenanceEnv {
+        fn drop(&mut self) {
+            let var = crate::hook_provenance::DOT_AGENT_DECK_HOOK_PROVENANCE;
+            // SAFETY: as in `set`.
+            match self.0.take() {
+                Some(previous) => unsafe { std::env::set_var(var, previous) },
+                None => unsafe { std::env::remove_var(var) },
+            }
+        }
+    }
+
     impl ProvenanceFixture {
         async fn start() -> Self {
             use crate::state::OrchestrationIdentity;
@@ -7465,11 +7496,22 @@ mod hook_ingestion_tests {
             token: Option<&str>,
             delivery_id: &str,
         ) -> Option<crate::event::SignalAck> {
+            self.ack_as(claimed_pane, token, delivery_id, None).await
+        }
+
+        /// [`Self::ack`] with the payload's own, sender-chosen `agent_id`.
+        async fn ack_as(
+            &self,
+            claimed_pane: &str,
+            token: Option<&str>,
+            delivery_id: &str,
+            agent_id: Option<&str>,
+        ) -> Option<crate::event::SignalAck> {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let msg = crate::event::DaemonMessage::Ack(crate::event::AckSignal {
                 pane_id: claimed_pane.to_string(),
                 delivery_id: delivery_id.to_string(),
-                agent_id: None,
+                agent_id: agent_id.map(str::to_string),
                 token: token.map(str::to_string),
             });
             let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
@@ -7563,6 +7605,7 @@ mod hook_ingestion_tests {
     /// must not write anything into the worker's PTY.
     #[tokio::test]
     async fn hook_provenance_refuses_a_delegate_with_no_token() {
+        let _enforce = HOOK_PROVENANCE_ENV_LOCK.lock().await;
         let fx = ProvenanceFixture::start().await;
         let resp = fx.delegate(PROV_ORCH_PANE, None).await;
         let err = resp
@@ -7667,6 +7710,7 @@ mod hook_ingestion_tests {
     /// told, and the report must still not reach the orchestrator.
     #[tokio::test]
     async fn hook_provenance_tells_the_sender_a_work_done_was_refused() {
+        let _enforce = HOOK_PROVENANCE_ENV_LOCK.lock().await;
         let fx = ProvenanceFixture::start().await;
         let ack = fx
             .work_done(PROV_WORKER_PANE, None, "WORKDONE-FORGED-2b7e")
@@ -7849,6 +7893,68 @@ mod hook_ingestion_tests {
                 .pending_deliveries()
                 .is_current(PROV_WORKER_PANE, armed.seq),
             "an older generation's ack stopped the newer generation's retry"
+        );
+        fx.stop().await;
+    }
+
+    /// Scenario: PR #1414 review (Qodo) — the daemon runs with
+    /// `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`. The worker pane's current delivery
+    /// has no retry pending (the retry is off) and is bound to the pane's
+    /// current worker and its silent-worker watch. An older generation of that
+    /// pane, which read the overwritten role file, acks the new delivery id
+    /// with no token and a self-chosen `agent_id`. The gate admits it, and the
+    /// daemon must answer UNKNOWN — not "Acknowledged" — and leave the watch
+    /// armed for the worker's own ack, which is then recorded.
+    #[tokio::test]
+    async fn delivery_ack_from_an_older_generation_under_warn_is_unknown_with_nothing_pending() {
+        let _provenance = HOOK_PROVENANCE_ENV_LOCK.lock().await;
+        let _warn = HookProvenanceEnv::set("warn");
+        let fx = ProvenanceFixture::start().await;
+        let silence = fx
+            .registry
+            .arm_silence_watch(PROV_WORKER_PANE, PROV_ORCH_PANE, Some(&fx.worker_agent))
+            .expect("arm silence watch");
+        let deliveries = fx.registry.pending_deliveries();
+        deliveries.note_delivery(PROV_WORKER_PANE, "d-1383abcd");
+        assert!(deliveries.bind_current(
+            PROV_WORKER_PANE,
+            "d-1383abcd",
+            &fx.worker_agent,
+            Some(silence.seq),
+        ));
+        assert!(!deliveries.is_pending(PROV_WORKER_PANE));
+
+        let ack = fx
+            .ack_as(
+                PROV_WORKER_PANE,
+                None,
+                "d-1383abcd",
+                Some("agent-older-generation"),
+            )
+            .await
+            .expect("an ack admitted under warn is answered");
+        assert!(ack.is_signal_ack() && ack.accepted, "{ack:?}");
+        assert_eq!(
+            ack.delivery,
+            Some(crate::event::AckDelivery::Unknown),
+            "an older generation must not be told its ack of the new delivery was recorded"
+        );
+        assert_eq!(
+            deliveries.current_for_test(PROV_WORKER_PANE),
+            Some(("d-1383abcd".to_string(), Some(silence.seq))),
+            "the older generation's ack must leave the watch bound"
+        );
+
+        let token = fx.worker_token.clone();
+        let ack = fx
+            .ack(PROV_WORKER_PANE, Some(&token), "d-1383abcd")
+            .await
+            .expect("answered");
+        assert_eq!(ack.delivery, Some(crate::event::AckDelivery::NotPending));
+        assert!(
+            !fx.registry
+                .cancel_silence_watch_if(PROV_WORKER_PANE, silence.seq),
+            "the worker's own ack must cancel the watch"
         );
         fx.stop().await;
     }
