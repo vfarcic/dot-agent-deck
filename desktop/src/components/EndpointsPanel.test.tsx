@@ -222,6 +222,23 @@ describe("EndpointsPanel", () => {
     expect(onSave.mock.calls[0][0].endpoints.remote[0].name).toBe("production");
   });
 
+  /// Scenario: Clearing the suggested name still lets a user add the deck, leaving its name for the library to derive.
+  it("saves no name when the suggested name is cleared", async () => {
+    const { onSave } = renderPanel({}, { defaultDeckName: vi.fn(async () => "build") });
+    fireEvent.click(screen.getByTestId("add-deck"));
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    await waitFor(() => expect(screen.getByLabelText("Deck name")).toHaveValue("build"));
+
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "" } });
+    expect(screen.getByTestId("save-new-deck")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("save-new-deck"));
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    const saved = onSave.mock.calls[0][0] as DesktopSettingsDto;
+    expect(saved.endpoints?.remote[0]).not.toHaveProperty("name");
+    expect(saved.endpoints?.selection).toBe(saved.endpoints?.remote[0].id);
+  });
+
   /// Scenario: Invalid and already-taken names show the library's refusal and cannot be saved.
   it("blocks a new deck name when the shared name check refuses it", async () => {
     const checkDeckName = vi.fn(async (name: string) => name === "taken"
@@ -442,6 +459,22 @@ describe("EndpointsPanel", () => {
     expect(screen.getByTestId(`deck-choice-${row.id}`)).toHaveTextContent("production");
     expect(screen.getByTestId(`deck-choice-${row.id}`).querySelector("input")).toBeChecked();
     expect(onSave).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: A name refused for a selected deck shows the shared validation message before Rename can be pressed.
+  it("pre-validates a rename with the selected deck id", async () => {
+    const row = { ...deck(), name: "build" };
+    const refusal = "A deck named 'taken' already exists.";
+    const checkDeckName = vi.fn(async () => refusal);
+    const renameDeck = vi.fn(async () => DEFAULT_DESKTOP_SETTINGS);
+    renderPanel({ endpoints: { remote: [row], selection: row.id } }, { checkDeckName, renameDeck });
+
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "taken" } });
+
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(refusal));
+    expect(checkDeckName).toHaveBeenCalledWith("taken", row.id);
+    expect(screen.getByTestId("rename-deck")).toBeDisabled();
+    expect(renameDeck).not.toHaveBeenCalled();
   });
 
   /// Scenario: A refused rename shows the bridge's exact sentence and leaves the stored deck selected.
