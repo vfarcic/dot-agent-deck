@@ -352,7 +352,7 @@ DOT_AGENT_DECK_LOG=1 dot-agent-deck
 
 `daemon restart` refuses while agents are running; see [Recycling the local daemon](installation.md#recycling-the-local-daemon).
 
-You may also find a `daemon.log` in `~/.local/state/dot-agent-deck/` (on Windows, `%LOCALAPPDATA%\dot-agent-deck`). It is not the debug log: it holds only what a daemon running in the background prints when something fails badly, such as a crash, and it stays empty otherwise. Attach it as well if it has anything in it.
+You may also find a `daemon.log` in `~/.local/state/dot-agent-deck/` (on Windows, `%LOCALAPPDATA%\dot-agent-deck`). It is not the debug log: it holds what a daemon running in the background prints rather than logs, such as a crash message or the notices [schedules](scheduled-tasks.md) print as they run (an issue dispatched or skipped, a run that failed, a configuration error). Without schedules it is often empty. Attach it as well if it has anything in it.
 
 ### With the desktop app
 
