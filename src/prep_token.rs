@@ -42,7 +42,8 @@
 //! `orchestrator-context.md` is still refreshed after each publish, as a
 //! best-effort compatibility mirror for readers that predate #1233; no binding
 //! covers it. One reader in this build still takes its task from it — the TUI's
-//! re-arm of a tab whose own path it does not know — with the pre-#1233 race.
+//! re-arm of a tab whose own file it does not know or cannot use — with the
+//! pre-#1233 race.
 //! Retiring it is follow-up #1395.
 //!
 //! # What a token is, and what it is NOT

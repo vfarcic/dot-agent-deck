@@ -613,11 +613,12 @@ pub fn prepare_orchestrator_prompt(
 /// arrangement before PRD #819 M4 split the composer out.
 const TASK_SECTION_MARKER: &str = "\n## Your task\n\n";
 
-/// Read an existing orchestrator context file's own `## Your task` section and
-/// its attendance back off disk.
+/// Recover an orchestrator context's own `## Your task` section and its
+/// attendance from the file's `content`.
 ///
-/// A `None` task covers every case where there is nothing to carry forward: the
-/// file does not exist yet, cannot be read, or was written with no task (the
+/// A `None` task covers every case where there is nothing to carry forward:
+/// no file could be read (`content` is `None` — see [`reassert_orchestrator_prompt`]
+/// for which files are tried and how), or it was written with no task (the
 /// interactive `Ctrl+n` path, which never carries one).
 ///
 /// Exists so a re-assertion (compaction or `/clear`) can re-supply the SAME
@@ -633,15 +634,11 @@ const TASK_SECTION_MARKER: &str = "\n## Your task\n\n";
 /// because the composer always writes three more sections after the template and
 /// the task always follows the marker. Two degradations remain, both toward
 /// `Attended`, which is the direction that keeps a gate rather than removing
-/// one: a context file pruned before the re-arm, and a `prompt_template`
+/// one: no readable context file at the re-arm, and a `prompt_template`
 /// containing the literal `## Your task` marker (which already misdirects the
 /// task read today).
-///
-/// `file_path` is the context the re-arming tab was published with, or the
-/// compatibility mirror when the tab does not know its own (issue #1233; see
-/// [`reassert_orchestrator_prompt`]).
-fn read_back_context(file_path: &std::path::Path) -> (Option<String>, Attendance) {
-    let Ok(content) = std::fs::read_to_string(file_path) else {
+fn read_back_context(content: Option<&str>) -> (Option<String>, Attendance) {
+    let Some(content) = content else {
         return (None, Attendance::Attended);
     };
     let (before_task, task) = match content.split_once(TASK_SECTION_MARKER) {
@@ -649,7 +646,7 @@ fn read_back_context(file_path: &std::path::Path) -> (Option<String>, Attendance
             let task = after.trim();
             (before, (!task.is_empty()).then(|| task.to_string()))
         }
-        None => (content.as_str(), None),
+        None => (content, None),
     };
     let attendance = if before_task.ends_with(&composer_tail(task.is_some())) {
         Attendance::Unattended
@@ -657,6 +654,83 @@ fn read_back_context(file_path: &std::path::Path) -> (Option<String>, Attendance
         Attendance::Attended
     };
     (task, attendance)
+}
+
+/// The file name of `context_path` when it is exactly
+/// `<project_dir>/.dot-agent-deck/orchestrator-context-<32 hex>.md`, compared
+/// **lexically** (issue #1395 audit round 2).
+///
+/// Component-wise [`std::path::Path`] equality, so a doubled or trailing
+/// separator does not matter and a `..` does: `/p/x/../.dot-agent-deck/…` is not
+/// under `/p`. Nothing is resolved, so a symlink anywhere in the path is neither
+/// followed nor detected here — the read that uses the name
+/// ([`read_context_file`]) opens it relative to `project_dir`, which is what
+/// keeps a link from choosing the file. The [`CONTEXT_FILE_NAME`] mirror is
+/// never accepted: [`is_unique_context_file_name`] refuses it.
+pub(crate) fn own_context_file_name<'a>(
+    project_dir: &std::path::Path,
+    context_path: &'a std::path::Path,
+) -> Option<&'a str> {
+    let name = context_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| is_unique_context_file_name(n))?;
+    (context_path.parent() == Some(context_dir_of(project_dir).as_path())).then_some(name)
+}
+
+/// Read `<project_dir>/.dot-agent-deck/<name>` for a re-arm, **bounded, never
+/// following a link at the last two components, and never blocking on a
+/// non-regular file** (issue #1395 audit round 2).
+///
+/// On Unix: the project directory is opened once ([`open_project_dir`], which
+/// follows a symlinked project path as every other publish step does),
+/// `.dot-agent-deck` is opened relative to it with `O_NOFOLLOW | O_DIRECTORY`
+/// ([`open_context_dir`]), and `name` relative to that with
+/// `O_NOFOLLOW | O_NONBLOCK` — the flags [`crate::project_resolve`]'s own
+/// published-context read uses. `O_NONBLOCK` makes the open of a FIFO return
+/// at once instead of waiting for a writer; the `fstat` of the opened
+/// descriptor then refuses anything but a regular file, before a byte is read.
+/// The read is capped at [`MAX_CONTEXT_BYTES`], the bound every publish
+/// enforces, so a file this process or the daemon wrote always fits.
+///
+/// Off Unix the same checks are separate `symlink_metadata` lookups ahead of a
+/// path open, so an entry swapped between the two is not caught — the narrower
+/// guarantee [`open_context_dir`] already states for that platform. The size
+/// cap holds on both.
+fn read_context_file(project_dir: &std::path::Path, name: &str) -> std::io::Result<String> {
+    let max = MAX_CONTEXT_BYTES as u64;
+    let project = open_project_dir(project_dir)?;
+    let dir = open_context_dir(&project).map_err(|e| match e {
+        ContextPublishError::ContextDirUnusable(e) => e,
+        other => std::io::Error::other(other.detail()),
+    })?;
+    #[cfg(unix)]
+    let file = openat_file(
+        &dir,
+        &single_component(name)?,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    )?;
+    #[cfg(not(unix))]
+    let file = {
+        let _ = dir;
+        let path = context_dir_of(project_dir).join(name);
+        if !std::fs::symlink_metadata(&path)?.file_type().is_file() {
+            return Err(std::io::Error::other("not a regular file"));
+        }
+        std::fs::File::open(path)?
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    if metadata.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("longer than {max} bytes"),
+        ));
+    }
+    read_bounded(file, max)
 }
 
 /// Re-run `prepare_orchestrator_prompt` for a re-assertion (compaction or
@@ -684,26 +758,53 @@ fn read_back_context(file_path: &std::path::Path) -> (Option<String>, Attendance
 /// instead would re-arm this orchestration with whatever task another
 /// preparation in the same project last left there. The re-arm then publishes a
 /// **new** file — published files are never rewritten — and returns its path,
-/// which the tab keeps in place of `known`. A tab re-hydrated after a reattach
-/// gets its path from the daemon's record of its start role (issue #1395).
-/// `None` covers a tab whose path is still unknown — hydrated from an older
-/// daemon, or built from a live orchestration surface, which carries none; it
-/// falls back to the compatibility mirror, which is exactly the pre-#1233
-/// behaviour and races as it did.
+/// which the tab keeps in place of `known`. A tab re-hydrated after a reattach,
+/// or built from a live surface, gets its path from the daemon's record of its
+/// start role (issue #1395).
+///
+/// **Issue #1395 audit round 2: `known` is used only when it names a
+/// per-publish file directly under THIS tab's `cwd`** ([`own_context_file_name`]),
+/// and it is read through [`read_context_file`] — bounded, `O_NOFOLLOW`,
+/// regular files only — so neither a path naming another project's file nor a
+/// link or FIFO planted under the right name can supply the task. The mirror is
+/// read through the same function.
+///
+/// The compatibility mirror is the fallback in three cases: `known` is `None`
+/// (an older daemon, or a TUI-launched tab whose publish failed), `known` names
+/// anything other than this tab's own per-publish file, or reading it fails for
+/// any reason — missing (pruned by the 14-day sweep or by hand) included. That
+/// is exactly the pre-#1233 behaviour, and it races as it did: the mirror may
+/// hold another preparation's task. With no readable mirror either, the re-arm
+/// carries no task and degrades to `Attended` ([`read_back_context`]).
 pub fn reassert_orchestrator_prompt(
     config: &OrchestrationConfig,
     cwd: &str,
     known: Option<&std::path::Path>,
 ) -> Option<PublishedPrompt> {
-    let mirror;
-    let source = match known {
-        Some(path) => path,
-        None => {
-            mirror = context_dir_of(std::path::Path::new(cwd)).join(CONTEXT_FILE_NAME);
-            mirror.as_path()
-        }
-    };
-    let (task, attendance) = read_back_context(source);
+    let project_dir = std::path::Path::new(cwd);
+    let own = known.and_then(|path| {
+        let Some(name) = own_context_file_name(project_dir, path) else {
+            tracing::warn!(
+                path = %path.display(),
+                cwd,
+                "re-arm: the tab's context path is not a context file of its own project; \
+                 reading the compatibility mirror instead"
+            );
+            return None;
+        };
+        read_context_file(project_dir, name)
+            .inspect_err(|e| {
+                tracing::warn!(
+                    path = %path.display(),
+                    reason = %e,
+                    "re-arm: could not read the tab's own context file; \
+                     reading the compatibility mirror instead"
+                );
+            })
+            .ok()
+    });
+    let content = own.or_else(|| read_context_file(project_dir, CONTEXT_FILE_NAME).ok());
+    let (task, attendance) = read_back_context(content.as_deref());
     prepare_orchestrator_prompt(config, cwd, task.as_deref(), attendance)
 }
 
@@ -736,8 +837,9 @@ pub const CONTEXT_DIR_NAME: &str = ".dot-agent-deck";
 /// bytes, best effort ([`mirror_orchestrator_context`]), for readers that
 /// predate #1233: an older TUI's compaction re-arm reads the task back from here,
 /// and so do role commands and templates that hard-code the path. So does this
-/// build's re-arm of a tab whose own path it does not know
-/// ([`reassert_orchestrator_prompt`] with `known: None`). Within one process
+/// build's re-arm of a tab whose own file it does not know or cannot use
+/// ([`reassert_orchestrator_prompt`]: `known` is `None`, names a file outside
+/// the tab's project, or cannot be read). Within one process
 /// it holds the latest publish mirrored into it — a mirror write never lands
 /// over a later publish's from the same process ([`mirror_into`]) — but the
 /// daemon, a TUI's `Ctrl+n` and `dispatch --orchestration` each mirror from
@@ -2091,8 +2193,8 @@ pub fn remove_ended_orchestration_context(
 /// bytes. A failure logs a `warn!` and is not returned: the launch's own
 /// coordinator is pointed at its own file, not at the mirror, so it is no
 /// reason to fail a launch whose own file is already published — though a
-/// reader of the mirror, this build's re-arm of a tab whose path it does not
-/// know included, then gets an older publish's task. See [`CONTEXT_FILE_NAME`] for who still reads it.
+/// reader of the mirror, this build's re-arm of a tab whose own file it does
+/// not know or cannot use included, then gets an older publish's task. See [`CONTEXT_FILE_NAME`] for who still reads it.
 ///
 /// **Blocking.** Async callers go through [`crate::project_resolve::run_bounded`].
 pub fn mirror_orchestrator_context(project_dir: &std::path::Path, content: &str) {
@@ -3014,7 +3116,6 @@ pub(crate) fn git_common_dir(project_dir: &std::path::Path) -> Option<std::path:
 /// The length is checked on the raw bytes before they are decoded, so an
 /// over-cap file reports as over-cap even when the `max + 1`-th byte splits a
 /// UTF-8 sequence; only a file within the cap can fail as invalid UTF-8.
-#[cfg(unix)]
 fn read_bounded(file: impl std::io::Read, max: u64) -> std::io::Result<String> {
     use std::io::Read as _;
     let mut raw = Vec::new();
@@ -3729,6 +3830,177 @@ mod tests {
             a.context_path.is_file(),
             "the re-arm does not delete the file it read, and neither does the tab (PR #1407 review)"
         );
+    }
+
+    /// A per-publish name no publish in these tests mints, so a test can plant
+    /// whatever it likes under it.
+    const PLANTED_NAME: &str = "orchestrator-context-0123456789abcdef0123456789abcdef.md";
+
+    /// A context file carrying `task`, in the shape the composer writes.
+    fn context_with_task(task: &str) -> String {
+        format!("# Orchestrator{TASK_SECTION_MARKER}{task}\n")
+    }
+
+    /// Run a re-arm on its own thread with a deadline, so a read that blocks
+    /// (a FIFO opened without `O_NONBLOCK`) fails the test instead of hanging
+    /// it.
+    fn reassert_within_deadline(cwd: &str, known: &std::path::Path) -> PublishedPrompt {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cwd, known) = (cwd.to_string(), known.to_path_buf());
+        std::thread::spawn(move || {
+            let _ = tx.send(reassert_orchestrator_prompt(&config(), &cwd, Some(&known)));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the re-arm must not block")
+            .expect("re-armed")
+    }
+
+    /// Issue #1395 audit round 2: a known path is honoured only when it names a
+    /// per-publish file directly under the tab's own project — lexically, with
+    /// no `..` detour and never the mirror.
+    #[test]
+    fn own_context_file_name_accepts_only_a_file_directly_under_the_project() {
+        let project = std::path::Path::new("/work/a");
+        let own = format!("/work/a/.dot-agent-deck/{PLANTED_NAME}");
+        assert_eq!(
+            own_context_file_name(project, std::path::Path::new(&own)),
+            Some(PLANTED_NAME)
+        );
+        assert_eq!(
+            own_context_file_name(std::path::Path::new("/work/a/"), std::path::Path::new(&own)),
+            Some(PLANTED_NAME),
+            "a trailing separator on the project is the same project"
+        );
+        for bad in [
+            format!("/work/b/.dot-agent-deck/{PLANTED_NAME}"),
+            format!("/work/a/sub/../.dot-agent-deck/{PLANTED_NAME}"),
+            format!("/work/a/.dot-agent-deck/../../b/.dot-agent-deck/{PLANTED_NAME}"),
+            format!("/work/a/sub/.dot-agent-deck/{PLANTED_NAME}"),
+            format!("/work/a/{PLANTED_NAME}"),
+            "/work/a/.dot-agent-deck/orchestrator-context.md".to_string(),
+        ] {
+            assert_eq!(
+                own_context_file_name(project, std::path::Path::new(&bad)),
+                None,
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// Issue #1395 audit round 2 (blocker): a known path into ANOTHER project
+    /// must not supply the task. Project B holds a real published context with
+    /// its own task; A's re-arm handed B's path reads A's mirror instead.
+    #[test]
+    fn reassert_with_a_foreign_projects_path_reads_its_own_mirror() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let cwd_a = a.path().to_string_lossy().to_string();
+        let cwd_b = b.path().to_string_lossy().to_string();
+        prepare_orchestrator_prompt(&config(), &cwd_a, Some("TASK-ALPHA"), Attendance::Attended)
+            .expect("A published");
+        let foreign = prepare_orchestrator_prompt(
+            &config(),
+            &cwd_b,
+            Some("TASK-BRAVO"),
+            Attendance::Attended,
+        )
+        .expect("B published");
+        let dotted = a
+            .path()
+            .join("sub/../.dot-agent-deck")
+            .join(foreign.context_path.file_name().unwrap());
+        for known in [foreign.context_path.clone(), dotted] {
+            let rearmed = reassert_within_deadline(&cwd_a, &known);
+            let c = std::fs::read_to_string(&rearmed.context_path).unwrap();
+            assert!(c.contains("TASK-ALPHA"), "{known:?}: A's mirror task:\n{c}");
+            assert!(
+                !c.contains("TASK-BRAVO"),
+                "{known:?}: B's task leaked:\n{c}"
+            );
+        }
+    }
+
+    /// Issue #1395 audit round 2: the tab's own file is read with
+    /// `O_NOFOLLOW | O_NONBLOCK`, regular files only, bounded — so a symlink, a
+    /// FIFO, a directory or an over-cap file planted under the tab's own name
+    /// is refused (without blocking) and the re-arm falls back to the mirror.
+    #[cfg(unix)]
+    #[test]
+    fn reassert_refuses_an_unsafe_own_context_file_and_falls_back_to_the_mirror() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("elsewhere.md");
+        std::fs::write(&target, context_with_task("TASK-EVIL")).unwrap();
+
+        for case in ["symlink", "fifo", "directory", "over-cap"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let cwd = tmp.path().to_string_lossy().to_string();
+            prepare_orchestrator_prompt(&config(), &cwd, Some("TASK-MIRROR"), Attendance::Attended)
+                .expect("mirror published");
+            let own = tmp.path().join(CONTEXT_DIR_NAME).join(PLANTED_NAME);
+            match case {
+                "symlink" => std::os::unix::fs::symlink(&target, &own).unwrap(),
+                "fifo" => {
+                    let c = std::ffi::CString::new(own.as_os_str().as_encoded_bytes()).unwrap();
+                    // SAFETY: a NUL-terminated path.
+                    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+                }
+                "directory" => std::fs::create_dir(&own).unwrap(),
+                "over-cap" => {
+                    std::fs::write(&own, context_with_task("TASK-EVIL")).unwrap();
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&own)
+                        .unwrap()
+                        .set_len(MAX_CONTEXT_BYTES as u64 + 1)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                read_context_file(tmp.path(), PLANTED_NAME).is_err(),
+                "{case}: the read must refuse it"
+            );
+            let rearmed = reassert_within_deadline(&cwd, &own);
+            let c = std::fs::read_to_string(&rearmed.context_path).unwrap();
+            assert!(
+                c.contains("TASK-MIRROR"),
+                "{case}: falls back to the mirror:\n{c}"
+            );
+            assert!(!c.contains("TASK-EVIL"), "{case}: the planted task leaked");
+        }
+    }
+
+    /// The cap is inclusive: a file exactly [`MAX_CONTEXT_BYTES`] long is read.
+    #[test]
+    fn read_context_file_reads_a_file_at_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(CONTEXT_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+        let mut content = context_with_task("TASK-AT-CAP");
+        content.push_str(&" ".repeat(MAX_CONTEXT_BYTES - content.len()));
+        std::fs::write(dir.join(PLANTED_NAME), &content).unwrap();
+        let read = read_context_file(tmp.path(), PLANTED_NAME).expect("at the cap");
+        assert_eq!(read.len(), MAX_CONTEXT_BYTES);
+    }
+
+    /// The mirror goes through the same read, so a symlinked mirror supplies no
+    /// task either: the re-arm degrades to the no-task, attended text.
+    #[cfg(unix)]
+    #[test]
+    fn reassert_refuses_a_symlinked_mirror() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("elsewhere.md");
+        std::fs::write(&target, context_with_task("TASK-EVIL")).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let dir = tmp.path().join(CONTEXT_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(CONTEXT_FILE_NAME)).unwrap();
+
+        let line = reassert_orchestrator_prompt(&config(), &cwd, None)
+            .expect("re-armed")
+            .prompt;
+        assert!(line.contains("wait for instructions"), "got {line:?}");
     }
 
     /// Issue #1233 item 4's withdrawal removes the file it published, and

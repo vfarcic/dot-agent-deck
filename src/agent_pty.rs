@@ -792,16 +792,41 @@ pub fn is_windows_absolute_path(value: &str) -> bool {
     bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && is_sep(bytes[2])
 }
 
-/// Issue #1395: whether an [`OrchestrationSurface::context_path`] is shaped
-/// like what the daemon records — an absolute, control-free path whose last
-/// component is a per-publish `orchestrator-context-<32 hex>.md`. Never the
-/// fixed-path mirror, which the TUI already falls back to without being told.
-fn is_valid_surface_context_path(value: &str) -> bool {
-    is_valid_orchestration_cwd(value)
-        && std::path::Path::new(value)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(crate::orchestrator_context::is_unique_context_file_name)
+/// Issue #1395: whether a daemon-supplied orchestrator context path is one the
+/// TUI may re-arm an orchestration rooted at `project_dir` from — exactly
+/// `<project_dir>/.dot-agent-deck/orchestrator-context-<32 hex>.md`.
+///
+/// The one check both intake paths apply: a live
+/// [`OrchestrationSurface::context_path`] ([`validate_orchestration_surface`],
+/// against the surface's own `cwd`) and a hydrated
+/// [`AgentRecord::orchestrator_context_path`] (`partition_hydrated_panes` in
+/// `src/ui.rs`, against the bucket's orchestration cwd). Audit round 2: shape
+/// alone was not enough — a surface for project A naming project B's context
+/// file was adopted, and A's re-arm then republished B's task to A's
+/// coordinator.
+///
+/// Both values must be absolute and control-free
+/// ([`is_valid_orchestration_cwd`]) and carry no `.` or `..` segment, and the
+/// path must then match [`crate::orchestrator_context::own_context_file_name`]'s
+/// lexical rule. Never the fixed-path mirror, which the TUI already falls back
+/// to without being told. Nothing is resolved on disk: a symlink in the path is
+/// kept from choosing the file by the re-arm's read, which opens the name
+/// relative to the project instead of following this path.
+pub fn is_own_context_path(project_dir: &str, context_path: &str) -> bool {
+    let has_dot_segment = |value: &str| {
+        value
+            .split(std::path::is_separator)
+            .any(|segment| segment == "." || segment == "..")
+    };
+    is_valid_orchestration_cwd(project_dir)
+        && is_valid_orchestration_cwd(context_path)
+        && !has_dot_segment(project_dir)
+        && !has_dot_segment(context_path)
+        && crate::orchestrator_context::own_context_file_name(
+            std::path::Path::new(project_dir),
+            std::path::Path::new(context_path),
+        )
+        .is_some()
 }
 
 /// PRD #120 (H1/M1/L2): wire-boundary validation for the live
@@ -876,12 +901,12 @@ pub fn validate_orchestration_surface(
     }
     // Issue #1395: the context path is read back by the tab's re-arm, and its
     // absence has a defined fallback (the fixed-path mirror), so a value that
-    // is not an absolute, control-free path naming a per-publish context file
-    // is nulled out rather than dropping the tab.
+    // is not a per-publish context file of THIS surface's own project is
+    // nulled out rather than dropping the tab. `cwd` was validated above.
     if surface
         .context_path
         .as_deref()
-        .is_some_and(|p| !is_valid_surface_context_path(p))
+        .is_some_and(|p| !is_own_context_path(&surface.cwd, p))
     {
         surface.context_path = None;
     }
@@ -14451,29 +14476,62 @@ mod spawn_tests {
         assert!(validated.roles.iter().all(|r| r.role_name != "\x1b[31mpwn"));
     }
 
-    /// Issue #1395: a well-formed per-publish context path survives; anything
-    /// else — relative, control bytes, the fixed-path mirror, any other name —
-    /// is nulled out without dropping the surface.
+    /// Issue #1395: a per-publish context path directly under the surface's
+    /// own `cwd` survives; anything else — relative, control bytes, the
+    /// fixed-path mirror, any other name, another project's file (audit round
+    /// 2), a `.`/`..` detour — is nulled out without dropping the surface.
     #[test]
     fn validate_orchestration_surface_nulls_a_malformed_context_path() {
-        let good = "/work/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        const NAME: &str = "orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        let cwd = well_formed_surface().cwd;
+        let good = format!("{cwd}/.dot-agent-deck/{NAME}");
         let mut surface = well_formed_surface();
-        surface.context_path = Some(good.into());
+        surface.context_path = Some(good.clone());
         let validated = validate_orchestration_surface(surface).expect("valid surface");
-        assert_eq!(validated.context_path.as_deref(), Some(good));
+        assert_eq!(validated.context_path.as_deref(), Some(good.as_str()));
 
         for bad in [
-            ".dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md",
-            "/work\x1b[31m/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md",
-            "/work/.dot-agent-deck/orchestrator-context.md",
-            "/etc/passwd",
-            "",
+            format!(".dot-agent-deck/{NAME}"),
+            format!("{cwd}\x1b[31m/.dot-agent-deck/{NAME}"),
+            format!("{cwd}/.dot-agent-deck/orchestrator-context.md"),
+            format!("/work/other-project/.dot-agent-deck/{NAME}"),
+            format!("{cwd}/sub/../.dot-agent-deck/{NAME}"),
+            format!("{cwd}/./.dot-agent-deck/{NAME}"),
+            format!("{cwd}/.dot-agent-deck/../../issue-2/.dot-agent-deck/{NAME}"),
+            "/etc/passwd".to_string(),
+            String::new(),
         ] {
             let mut surface = well_formed_surface();
-            surface.context_path = Some(bad.into());
+            surface.context_path = Some(bad.clone());
             let validated =
                 validate_orchestration_surface(surface).expect("a bad path keeps the surface");
             assert_eq!(validated.context_path, None, "{bad:?} must be nulled");
+        }
+    }
+
+    /// Issue #1395 audit round 2: the shared intake check. A project with a
+    /// `.`/`..` segment, or a relative one, has no own context path at all.
+    #[test]
+    fn is_own_context_path_requires_a_clean_absolute_project() {
+        const NAME: &str = "orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        assert!(is_own_context_path(
+            "/p",
+            &format!("/p/.dot-agent-deck/{NAME}")
+        ));
+        assert!(is_own_context_path(
+            "/p/",
+            &format!("/p/.dot-agent-deck/{NAME}")
+        ));
+        for (project, path) in [
+            ("/p/../q", format!("/p/../q/.dot-agent-deck/{NAME}")),
+            ("/p/.", format!("/p/./.dot-agent-deck/{NAME}")),
+            ("p", format!("p/.dot-agent-deck/{NAME}")),
+            ("/p", format!("/q/.dot-agent-deck/{NAME}")),
+        ] {
+            assert!(
+                !is_own_context_path(project, &path),
+                "{project:?} / {path:?} must be refused"
+            );
         }
     }
 

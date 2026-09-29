@@ -2380,7 +2380,9 @@ pub struct OrchestrationSurface {
     /// client-supplied value. Present only on a surface that carries the start
     /// role; the TUI sets it on the tab so compaction and `/clear` re-arm from
     /// the tab's own file, and a later surface without it leaves the tab's path
-    /// alone.
+    /// alone. The TUI accepts it only when it names a per-publish file directly
+    /// under this surface's own `cwd` (`agent_pty::is_own_context_path`) and
+    /// otherwise treats it as `None`.
     ///
     /// `None` from a daemon predating the field, for a surface of non-start
     /// roles, and for a start the daemon holds no file for — the TUI then keeps

@@ -3071,9 +3071,12 @@ pub struct OrchestrationHydrationBucket {
     pub orchestration_id: Option<String>,
     pub role_slots: Vec<OrchestrationRoleSlot>,
     /// Issue #1395 item 1: the per-publish context file the daemon recorded for
-    /// this orchestration, read off its start-role pane's record. Set on the
-    /// rebuilt tab so its re-arm reads the tab's own file; `None` (an older
-    /// daemon, a live surface, a TUI-launched tab) keeps the mirror fallback.
+    /// this orchestration, read off its start-role pane's record or its start
+    /// role's live surface, and kept only when it names a file directly under
+    /// this bucket's `cwd` ([`crate::agent_pty::is_own_context_path`]). Set on
+    /// the rebuilt tab so its re-arm reads the tab's own file; `None` (an older
+    /// daemon, a non-start surface, a path into another project) keeps the
+    /// mirror fallback.
     pub context_path: Option<std::path::PathBuf>,
 }
 
@@ -3726,10 +3729,16 @@ pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition
                 if out.orchestration_buckets[idx].display_title.is_none() {
                     out.orchestration_buckets[idx].display_title = display_title.clone();
                 }
-                // Issue #1395: only the start role's record carries it.
-                if out.orchestration_buckets[idx].context_path.is_none() {
-                    out.orchestration_buckets[idx].context_path =
-                        h.orchestrator_context_path.clone();
+                // Issue #1395: only the start role's record carries it, and it
+                // is adopted only when it names a context file of THIS
+                // orchestration's own project — a path into another project
+                // would re-arm this tab with that project's task.
+                let bucket = &mut out.orchestration_buckets[idx];
+                if bucket.context_path.is_none() {
+                    bucket.context_path = h.orchestrator_context_path.clone().filter(|p| {
+                        p.to_str()
+                            .is_some_and(|p| crate::agent_pty::is_own_context_path(&bucket.cwd, p))
+                    });
                 }
                 out.orchestration_buckets[idx]
                     .role_slots
@@ -26077,6 +26086,52 @@ mod tests {
         assert_eq!(bucket.cwd, orch_cwd);
         assert_eq!(bucket.orchestration_name, "tdd-cycle");
         assert_eq!(bucket.role_slots.len(), 3);
+    }
+
+    /// Issue #1395 audit round 2: a hydrated start role's context path is kept
+    /// only when it names a per-publish file directly under the bucket's own
+    /// orchestration cwd; another project's file, a `..` detour or the mirror
+    /// leaves the bucket on the mirror fallback.
+    #[test]
+    fn partition_keeps_only_a_context_path_under_the_orchestrations_own_project() {
+        const NAME: &str = "orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        let start = |path: &str| {
+            let mut pane = hydrated(
+                "1",
+                "a-1",
+                Some("/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/proj".into()),
+                    display_title: None,
+                    orchestration_id: None,
+                }),
+            );
+            pane.orchestrator_context_path = Some(PathBuf::from(path));
+            pane
+        };
+        let own = format!("/proj/.dot-agent-deck/{NAME}");
+        let p = partition_hydrated_panes(&[start(&own)]);
+        assert_eq!(
+            p.orchestration_buckets[0].context_path.as_deref(),
+            Some(Path::new(&own))
+        );
+        for bad in [
+            format!("/other/.dot-agent-deck/{NAME}"),
+            format!("/proj/sub/../.dot-agent-deck/{NAME}"),
+            format!("/proj/.dot-agent-deck/../../other/.dot-agent-deck/{NAME}"),
+            format!("/proj/sub/.dot-agent-deck/{NAME}"),
+            "/proj/.dot-agent-deck/orchestrator-context.md".to_string(),
+        ] {
+            let p = partition_hydrated_panes(&[start(&bad)]);
+            assert_eq!(
+                p.orchestration_buckets[0].context_path, None,
+                "{bad:?} must not be adopted"
+            );
+        }
     }
 
     /// Scenario: Hydrate two tabs with the same orchestration name and cwd,

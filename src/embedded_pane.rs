@@ -66,8 +66,11 @@ pub struct HydratedPane {
     /// for this pane's orchestration — present only on a start-role pane
     /// ([`crate::agent_pty::AgentRecord::orchestrator_context_path`]). The
     /// rebuilt tab carries it so compaction and `/clear` re-arm from the tab's
-    /// own file; `None` (any other pane, or an older daemon) keeps the
-    /// fixed-path mirror fallback.
+    /// own file — when it names a per-publish file directly under that
+    /// orchestration's own cwd ([`crate::agent_pty::is_own_context_path`],
+    /// checked where the tab is partitioned). `None` (any other pane, or an
+    /// older daemon), or a path that fails that check, keeps the fixed-path
+    /// mirror fallback.
     pub orchestrator_context_path: Option<std::path::PathBuf>,
 }
 

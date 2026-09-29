@@ -193,11 +193,14 @@ pub enum Tab {
         /// `/clear` re-arm reads the task back from this orchestration's own
         /// file (`orchestrator_context::reassert_orchestrator_prompt`). Set when
         /// the TUI's `Ctrl+n` opens the tab and replaced by every re-arm.
-        /// `None` for a tab rebuilt from the daemon's records
-        /// ([`TabManager::open_orchestration_tab_with_existing_role_panes`]):
-        /// the daemon does not record the path yet, so such a tab re-arms from
-        /// the project's compatibility mirror, as before #1233 — follow-up
-        /// #1395.
+        /// A tab rebuilt from the daemon's records
+        /// ([`TabManager::open_orchestration_tab_with_existing_role_panes`]) or
+        /// from a live surface opens with `None` and is then given the path the
+        /// daemon recorded for its start role
+        /// ([`TabManager::set_orchestration_context_path`], issue #1395) — only
+        /// when that path names a per-publish file directly under the tab's own
+        /// project (`agent_pty::is_own_context_path`). Left `None`, the tab
+        /// re-arms from the project's compatibility mirror, as before #1233.
         context_path: Option<std::path::PathBuf>,
     },
 }
