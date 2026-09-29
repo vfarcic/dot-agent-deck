@@ -16,9 +16,9 @@
 //! **The first cut of this module recorded `(token, issued_at)` and nothing
 //! else, and that is not enough — the audit of PRD #819's finished branch found
 //! it, and it is a design defect rather than an implementation slip.** The
-//! published artifact lives at a path that is **fixed per project**
+//! published artifact then lived at a path that was **fixed per project**
 //! (`<project>/.dot-agent-deck/orchestrator-context.md`), so two ordinary
-//! clients preparing in the same project interleave with no attacker involved:
+//! clients preparing in the same project interleaved with no attacker involved:
 //!
 //! 1. preparation A publishes context A and receives token A;
 //! 2. preparation B replaces the same fixed file with context B;
@@ -31,6 +31,19 @@
 //! ([`crate::project_resolve::revalidate_preparation`]). Deleting and recreating
 //! the project directory, or changing its config after the preparation, is the
 //! same class of mismatch and is refused by the same check.
+//!
+//! **The binding alone left a window, and issue #1233 closed it by removing the
+//! shared path.** The re-validation runs at each role's start, so a second
+//! preparation published *after* the last role started still replaced the file
+//! the first coordinator was about to read. Each publish now writes its own
+//! never-rewritten `orchestrator-context-<32 hex>.md`, and the coordinator prompt
+//! a binding records ([`PrepBinding::coordinator_prompt`]) names that file, so a
+//! later preparation cannot replace what an earlier launch reads. The fixed
+//! `orchestrator-context.md` is still refreshed after each publish, as a
+//! best-effort compatibility mirror for readers that predate #1233; no binding
+//! covers it. One reader in this build still takes its task from it — the TUI's
+//! re-arm of a tab whose own path it does not know — with the pre-#1233 race.
+//! Retiring it is follow-up #1395.
 //!
 //! # What a token is, and what it is NOT
 //!
@@ -127,11 +140,11 @@ pub const MAX_LIVE_PREP_TOKENS: usize = 64;
 /// The point of carrying it alongside a path is that a path is a *name* and a
 /// name can be re-pointed. A `.dot-agent-deck` deleted and recreated, or a
 /// project directory replaced between the preparation and the spawn, keeps the
-/// same string and gets a new inode — and `rename(2)`, which is how
-/// [`crate::orchestrator_context::publish_orchestrator_context`] publishes,
-/// *always* installs a new inode over the destination. So for the published
-/// context this comparison catches every republish structurally, whatever the
-/// bytes say.
+/// same string and gets a new inode. Since issue #1233 each
+/// [`crate::orchestrator_context::publish_orchestrator_context`] creates a fresh
+/// file under a fresh name, so a published context is never republished at all;
+/// what this comparison catches for it is a file deleted and recreated under
+/// that name by something other than the deck, whatever the bytes say.
 ///
 /// **An inode number is reusable, and the claim is narrowed accordingly.** A
 /// directory deleted and recreated at the same path can be handed the number
@@ -148,7 +161,7 @@ pub const MAX_LIVE_PREP_TOKENS: usize = 64;
 /// silent degradation of the launch verb's guarantee, because the verb itself is
 /// refused there — see
 /// [`crate::daemon_protocol::PROJECT_ERR_UNSUPPORTED_PLATFORM`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InodeIdentity {
     pub dev: u64,
     pub ino: u64,
@@ -264,6 +277,16 @@ impl PrepTokens {
             .map(|r| r.binding.clone())
     }
 
+    /// Forget `token`, so it no longer identifies a preparation — for a
+    /// preparation withdrawn after its token was minted (issue #1233: its
+    /// deadline passed, or the reply had already gone out as expired). `true`
+    /// when this store held it.
+    pub fn revoke(&mut self, token: &str) -> bool {
+        let before = self.live.len();
+        self.live.retain(|r| r.token != token);
+        self.live.len() != before
+    }
+
     /// How many unexpired tokens the store holds. Test-facing.
     pub fn len(&self) -> usize {
         self.live.len()
@@ -308,6 +331,26 @@ pub fn binding(token: &str) -> Option<PrepBinding> {
     guard.binding(token, Instant::now())
 }
 
+/// Revoke `token` in the daemon-wide store ([`PrepTokens::revoke`]).
+pub fn revoke(token: &str) -> bool {
+    let mut guard = store().lock().unwrap_or_else(|p| p.into_inner());
+    guard.revoke(token)
+}
+
+/// Whether the daemon-wide store holds a live token whose binding names
+/// `project_dir`. Test-facing: a withdrawn preparation's token is not visible
+/// to the test that provoked the withdrawal, so this is how it proves none
+/// stayed live.
+#[cfg(test)]
+pub(crate) fn any_live_for(project_dir: &std::path::Path) -> bool {
+    let mut guard = store().lock().unwrap_or_else(|p| p.into_inner());
+    guard.prune(Instant::now());
+    guard
+        .live
+        .iter()
+        .any(|r| r.binding.project_dir == project_dir)
+}
+
 /// Mint 128 bits of token value.
 ///
 /// [`std::hash::RandomState`] is seeded from the operating system's randomness
@@ -318,6 +361,16 @@ pub fn binding(token: &str) -> Option<PrepBinding> {
 /// two tokens never collide, and a random 128-bit value delivers that without a
 /// new dependency.
 fn mint() -> String {
+    format!("prep-{}", random_hex128())
+}
+
+/// 128 bits as 32 lowercase hex digits, minted the way [`mint`] mints a token.
+///
+/// Shared with the per-preparation coordinator-context file name (issue #1233,
+/// `crate::orchestrator_context::publish_orchestrator_context`), which needs the
+/// same property for the same reason: two values must never collide, and a name
+/// of hex digits only is shell-safe without quoting.
+pub(crate) fn random_hex128() -> String {
     use std::hash::{BuildHasher, Hasher, RandomState};
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -329,7 +382,7 @@ fn mint() -> String {
     let mut low = RandomState::new().build_hasher();
     low.write_u64(high);
     low.write_u64(seq);
-    format!("prep-{high:016x}{:016x}", low.finish())
+    format!("{high:016x}{:016x}", low.finish())
 }
 
 #[cfg(test)]
@@ -342,10 +395,13 @@ mod tests {
             project_identity: Some(InodeIdentity { dev: 1, ino: 2 }),
             config_revision: "fnv1a128-00".to_string(),
             orchestration: "loop".to_string(),
-            context_path: PathBuf::from(dir).join(".dot-agent-deck/orchestrator-context.md"),
+            context_path: PathBuf::from(dir)
+                .join(".dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md"),
             context_identity: Some(InodeIdentity { dev: 1, ino: 3 }),
             context_digest: "ctx-fnv1a128-00".to_string(),
-            coordinator_prompt: "Read .dot-agent-deck/orchestrator-context.md".to_string(),
+            coordinator_prompt:
+                "Read .dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md"
+                    .to_string(),
         }
     }
 
@@ -381,6 +437,20 @@ mod tests {
                 .is_none()
         );
         assert!(tokens.is_empty(), "an expired token is dropped, not kept");
+    }
+
+    /// Issue #1233: a revoked token is refused exactly like one never issued,
+    /// and revoking leaves every other token live.
+    #[test]
+    fn a_revoked_token_is_refused_and_the_others_stay_live() {
+        let mut tokens = PrepTokens::new();
+        let now = Instant::now();
+        let kept = tokens.issue(now, binding_for("/p"));
+        let revoked = tokens.issue(now, binding_for("/q"));
+        assert!(tokens.revoke(&revoked));
+        assert!(tokens.binding(&revoked, now).is_none());
+        assert!(tokens.binding(&kept, now).is_some());
+        assert!(!tokens.revoke(&revoked), "a second revoke finds nothing");
     }
 
     #[test]

@@ -61,14 +61,15 @@ fn path_with_binary_dir() -> String {
 }
 
 /// Scenario: Restore a pane running `dot-agent-deck wrap --agent codex` around
-/// a deterministic shell stand-in that emits realistic Codex JSONL turn-start
-/// and turn-completed records. Subscribe to the real daemon event stream and
-/// detach to the dashboard; events must carry the Codex identity and schema
-/// version while the visible card moves Thinking → Idle and reads `Codex`.
-/// Send identity-bound input and require it to reach the wrapped child exactly once.
+/// a deterministic shell stand-in that paints interactive-Codex-shaped text and
+/// ends its turn through Codex's native `Stop` hook, as real Codex does.
+/// Subscribe to the real daemon event stream and detach to the dashboard;
+/// events must carry the Codex identity and schema version while the visible
+/// card moves Thinking → Idle and reads `Codex`. Send identity-bound input and
+/// require it to reach the wrapped child exactly once.
 #[spec("codex/wrap/001")]
 #[test]
-fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
+fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
     let command = "dot-agent-deck wrap --agent codex -- /bin/sh codex-standin.sh";
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
@@ -140,7 +141,15 @@ fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
         |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Idle,
         Duration::from_secs(15),
     );
-    assert_eq!(idle.schema_version, Some(AGENT_EVENT_SCHEMA_VERSION));
+    // Issue #540: the turn ends through Codex's native `Stop` hook, as it does
+    // for real Codex — the wrapper's classifier reads no printed line as Idle,
+    // because the interactive TUI prints none that means it. The hook path
+    // stamps no wrapper schema version; the wrapper's own events are checked
+    // for that above.
+    assert!(
+        !idle.is_wrapper_output_classified() && idle.pane_id.as_deref() == Some(pane_id),
+        "the Idle must be the native hook's, on this pane: {idle:?}"
+    );
     assert!(
         deck.wait_for_grid_string_within("Idle", Duration::from_secs(10)),
         "the wrapped Codex card never visibly completed its turn:\n{}",

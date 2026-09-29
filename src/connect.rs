@@ -1123,14 +1123,13 @@ fn exit_code_from_status(status: &std::process::ExitStatus) -> i32 {
 /// (the entry could have been removed concurrently — better to skip than to
 /// crash the post-session bookkeeping).
 fn touch_last_connected(name: &str, path: &Path) -> Result<Option<String>, RemoteConfigError> {
-    let mut registry = RemotesFile::load(path)?;
-    let Some(idx) = registry.remotes.iter().position(|r| r.name == name) else {
-        return Ok(None);
-    };
     let now = chrono::Utc::now().to_rfc3339();
-    registry.remotes[idx].last_connected = Some(now.clone());
-    registry.save(path)?;
-    Ok(Some(now))
+    // One row against a fresh read (issue #1350), so a session that ran for
+    // hours does not write back the registry it loaded when it started.
+    let touched = crate::deck_list::update(path, crate::deck_list::DeckRef::Name(name), |entry| {
+        entry.last_connected = Some(now.clone());
+    })?;
+    Ok(touched.map(|_| now))
 }
 
 /// PRD #148: classify a probe error as the "host not reachable *yet*" class
@@ -2261,6 +2260,10 @@ mod tests {
             last_connected: None,
             install: None,
             binary: None,
+            id: None,
+            user: None,
+            jump_host: None,
+            socket: None,
         }
     }
 

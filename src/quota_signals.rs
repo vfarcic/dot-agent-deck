@@ -10,6 +10,8 @@
 //!   body and an allow-list of response headers ([`classify_opencode_error`]).
 //! * Codex — the rollout JSONL's `task_complete` record for an armed turn,
 //!   with the kind from that turn's last `token_count` ([`CodexTurnWatch`]).
+//!   Any other failed turn it records is an `Error` (issue #1359), since Codex
+//!   runs no hook at all for one.
 //!
 //! Every marker is a JSON key compared for string equality. No free text is
 //! matched, and no screen or PTY output is read: a signal that exists only as
@@ -310,12 +312,12 @@ pub fn classify_opencode_error(fields: &OpenCodeErrorFields, now_ms: i64) -> Fai
 pub enum CodexLineOutcome {
     /// Nothing that ends the watched turn.
     Nothing,
-    /// The watched turn completed without a quota failure; stop watching.
+    /// The watched turn completed without an error; stop watching.
     TurnEnded,
-    /// The watched turn failed on the provider's usage limit.
-    Blocked {
-        kind: BlockedKind,
-        resets_at_ms: Option<i64>,
+    /// The watched turn ended on an error: `Blocked` for the provider's usage
+    /// limit, `Error` for anything else (issue #1359).
+    Failed {
+        outcome: FailureOutcome,
         /// The `task_complete` error message, unscrubbed.
         message: Option<String>,
     },
@@ -348,9 +350,17 @@ struct CodexRateLimits {
 /// | `workspace_{owner,member}_usage_limit_reached`, `rate_limit_reached` | usage limit; reset from the windows |
 /// | none | unknown (the API-key quota case) |
 ///
+/// Every other `task_complete` for that turn whose `error` is an object —
+/// `codex_error_info` `other`, `bad_request`, `server_overloaded`,
+/// `rate_limit_exceeded` and the rest, or none at all — is a failed turn and
+/// ends as [`FailureOutcome::Error`] (issue #1359): Codex runs no `Stop` hook
+/// for an errored turn, so without it the card would keep its last status.
+///
 /// Never a block: `rate_limits.credits.has_credits: false` (it appears on
 /// healthy sessions), any other `codex_error_info`, a `task_complete` for any
-/// other turn, and a line that is not JSON.
+/// other turn, and a line that is not JSON. Never an error: a `task_complete`
+/// whose `error` is absent or `null`, and every other record type — an
+/// interrupted turn is a `turn_aborted`, not a `task_complete`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexTurnWatch {
     turn_id: String,
@@ -410,25 +420,27 @@ impl CodexTurnWatch {
                 CodexLineOutcome::Nothing
             }
             Some("task_complete") if turn == Some(self.turn_id.as_str()) => {
-                let error = payload.get("error").filter(|e| e.is_object());
-                let info = error.and_then(|e| e.get("codex_error_info"));
-                let usage_limit = match info {
+                let Some(error) = payload.get("error").filter(|e| e.is_object()) else {
+                    return CodexLineOutcome::TurnEnded;
+                };
+                let usage_limit = match error.get("codex_error_info") {
                     Some(Value::String(s)) => s == "usage_limit_exceeded",
                     Some(Value::Object(map)) => map.contains_key("usage_limit_exceeded"),
                     _ => false,
                 };
-                if !usage_limit {
-                    return CodexLineOutcome::TurnEnded;
-                }
-                let (kind, resets_at_ms) = self
-                    .rate_limits
-                    .as_ref()
-                    .map_or((BlockedKind::Unknown, None), codex_kind_and_reset);
-                CodexLineOutcome::Blocked {
-                    kind,
-                    resets_at_ms,
+                let outcome = if usage_limit {
+                    let (kind, resets_at_ms) = self
+                        .rate_limits
+                        .as_ref()
+                        .map_or((BlockedKind::Unknown, None), codex_kind_and_reset);
+                    FailureOutcome::blocked(kind, resets_at_ms)
+                } else {
+                    FailureOutcome::Error
+                };
+                CodexLineOutcome::Failed {
+                    outcome,
                     message: error
-                        .and_then(|e| e.get("message"))
+                        .get("message")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
                 }
@@ -647,19 +659,29 @@ mod tests {
             .collect()
     }
 
+    /// The `task_complete` real Codex 0.156.1 wrote for a turn that asked for
+    /// a model the account cannot use, verbatim from a rollout on the
+    /// development machine (2026-09-27, issue #1359) with only its turn id
+    /// replaced by the `{turn}` placeholder.
+    const OBSERVED_CODEX_MODEL_ERROR_RECORD: &str = r#"{"timestamp":"2026-09-27T21:02:00.696Z","ordinal":8,"type":"event_msg","payload":{"type":"task_complete","turn_id":"{turn}","last_agent_message":null,"error":{"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-nonexistent-model-1359' model is not supported when using Codex with a ChatGPT account.\"}}","codex_error_info":"other"},"started_at":1790542918,"completed_at":1790542920,"duration_ms":2466}}"#;
+
     /// Scenario: Feed a watch armed for one Codex turn the rollout records a
-    /// usage-limit failure produces. It blocks only on that turn's
-    /// `task_complete` with `usage_limit_exceeded`, takes the kind and reset
-    /// from the turn's last `token_count`, and never blocks on another turn,
-    /// on `has_credits:false`, on another error, or on malformed JSON.
+    /// failed turn produces. It blocks only on that turn's `task_complete` with
+    /// `usage_limit_exceeded`, taking the kind and reset from the turn's last
+    /// `token_count`; any other error on that turn — the real invalid-model
+    /// record included — is an Error; and it never reports another turn,
+    /// `has_credits:false`, a clean completion, or malformed JSON.
     #[spec("status/blocked/012")]
     #[test]
     fn status_blocked_012_codex_rollout_records_block_only_the_armed_turn() {
         let turn = "01a0dbf0-839e-7d71-b4cb-b06e1dea7067";
-        let blocked = |kind, resets_at_ms| CodexLineOutcome::Blocked {
-            kind,
-            resets_at_ms,
+        let blocked = |kind, resets_at_ms| CodexLineOutcome::Failed {
+            outcome: FailureOutcome::blocked(kind, resets_at_ms),
             message: Some("You've hit your usage limit.".to_string()),
+        };
+        let error = |message: &str| CodexLineOutcome::Failed {
+            outcome: FailureOutcome::Error,
+            message: Some(message.to_string()),
         };
 
         let mut w = CodexTurnWatch::new(turn);
@@ -731,13 +753,62 @@ mod tests {
             vec![CodexLineOutcome::TurnEnded],
             "has_credits:false on a healthy turn is not a block"
         );
+
+        // Issue #1359: every other failed turn is an Error, never a block —
+        // whatever the quota state its token counts reported.
+        let observed = OBSERVED_CODEX_MODEL_ERROR_RECORD.replace("{turn}", turn);
+        let mut w = CodexTurnWatch::new(turn);
+        assert_eq!(
+            run(&mut w, &[task_started(turn), observed.clone()]),
+            vec![error(
+                r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-nonexistent-model-1359' model is not supported when using Codex with a ChatGPT account."}}"#
+            )],
+            "the real invalid-model record is an Error"
+        );
+        for info in [
+            "context_window_exceeded",
+            "rate_limit_exceeded",
+            "server_overloaded",
+            "unauthorized",
+            "bad_request",
+            "other",
+        ] {
+            let mut w = CodexTurnWatch::new(turn);
+            assert_eq!(
+                run(
+                    &mut w,
+                    &[
+                        task_started(turn),
+                        token_count(Some(turn), Some("rate_limit_reached"), false),
+                        task_complete(turn, Some(info)),
+                    ]
+                ),
+                vec![error("You've hit your usage limit.")],
+                "{info} is an Error, not a block"
+            );
+        }
+        let mut w = CodexTurnWatch::new(turn);
+        assert_eq!(
+            w.observe_line(
+                format!(
+                    r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"{turn}","error":{{"codex_error_info":{{"response_stream_disconnected":{{"http_status_code":502}}}}}}}}}}"#
+                )
+                .as_bytes()
+            ),
+            CodexLineOutcome::Failed {
+                outcome: FailureOutcome::Error,
+                message: None
+            },
+            "an object-valued codex_error_info is an Error too"
+        );
         let mut w = CodexTurnWatch::new(turn);
         assert_eq!(
             run(
                 &mut w,
-                &[task_complete(turn, Some("context_window_exceeded"))]
+                &[OBSERVED_CODEX_MODEL_ERROR_RECORD.replace("{turn}", "other-turn")]
             ),
-            vec![CodexLineOutcome::TurnEnded]
+            vec![],
+            "another turn's failure is not an Error for this one"
         );
         let mut w = CodexTurnWatch::new(turn);
         let truncated = task_complete(turn, Some("usage_limit_exceeded"));

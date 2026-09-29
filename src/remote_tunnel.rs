@@ -156,7 +156,9 @@ trait SshArgumentRules {
 }
 
 /// Describe one refused byte without letting it reach the reader's terminal.
-fn describe_byte(byte: u8) -> String {
+/// `pub(crate)` so [`crate::deck_list`]'s key-path check names a byte the same
+/// way every other field's refusal does.
+pub(crate) fn describe_byte(byte: u8) -> String {
     match byte {
         0 => "a NUL byte".to_string(),
         b if b.is_ascii_whitespace() => format!("ASCII whitespace (0x{b:02x})"),

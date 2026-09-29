@@ -6251,10 +6251,21 @@ start = true
         )
         .await;
         let after_refusal = named_records(&local);
-        let context = project
-            .join(".dot-agent-deck")
-            .join("orchestrator-context.md");
-        let published_after_refusal = context.exists();
+        // Issue #1233: a publish writes its own `orchestrator-context-<id>.md`
+        // and refreshes the fixed-name mirror, so any entry matching the prefix
+        // is a publish.
+        let context_dir = project.join(".dot-agent-deck");
+        let published = || {
+            std::fs::read_dir(&context_dir).is_ok_and(|entries| {
+                entries.filter_map(Result::ok).any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("orchestrator-context")
+                })
+            })
+        };
+        let published_after_refusal = published();
         let solo = crate::start_orchestration_action(
             &state,
             &local_wire,
@@ -6270,7 +6281,7 @@ start = true
         .await;
         // Read before the shutdown, which takes the deck's scratch tree — and
         // the project inside it — with it.
-        let published_after_solo = context.exists();
+        let published_after_solo = published();
         local.shutdown();
 
         match offered.expect("the deck answers the orchestrations query") {

@@ -31,13 +31,22 @@
 //!     the live agent unseen); it falls back to `list_agents()`, sees the
 //!     agent, and shows the consent prompt. Declining then keeps the existing
 //!     daemon with the agent reachable (FIX 1; D2/D4 never-strand).
+//!   - 009 — PROTOCOL SKEW + agents + TTY + DECLINE: a daemon advertising
+//!     another attach protocol is never attached to (issue #405). Declining
+//!     exits non-zero with a refusal naming both protocol numbers, and the
+//!     daemon and its agent keep running.
+//!   - 010 — PROTOCOL SKEW + MATCHING build id + no agents: the build-id match
+//!     does not wave the skew through; the daemon is restarted silently.
 //!
 //! Skew is simulated without rebuilding the binary via
 //! `DOT_AGENT_DECK_BUILD_ID_OVERRIDE` (honoured by both the daemon's `hello`
 //! reply and the laptop's comparison under `cfg(debug_assertions)`): the
 //! external daemon is started at `OLD_BUILD` and the TUI is launched at
 //! `NEW_BUILD`, pointed at the daemon's sockets so it reuses that older daemon
-//! and the handshake observes a mismatch.
+//! and the handshake observes a mismatch. Protocol skew (009/010) is simulated
+//! the same way through the test-only (`e2e` feature + debug build)
+//! `DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE`, which changes only the
+//! number the daemon's `hello` reply advertises.
 //!
 //! Gated behind the `e2e` feature so CI (`cargo test-fast`) never compiles it
 //! (PRD #77 Decision 6). All polling lives in `common` helpers so these bodies
@@ -377,5 +386,92 @@ fn handshake_007_omitted_running_agents_falls_back_no_silent_kill() {
         "the live agent must remain reachable on the existing daemon after \
          declining the restart, even though its summary was omitted from the \
          handshake (never-strand, D4)"
+    );
+}
+
+/// Start an external `daemon serve` pinned to `build_id` whose `Hello` reply
+/// advertises attach protocol `protocol` instead of this build's own, via the test-only
+/// (`e2e` feature + debug build) `DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE` seam (issue
+/// #405). The daemon and the TUI here are one compiled binary, so this is the
+/// only way a PTY test can put a protocol skew between them.
+fn spawn_daemon_at_build_and_protocol(build_id: &str, protocol: u32) -> DaemonProc {
+    spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE", build_id),
+            (
+                "DOT_AGENT_DECK_TEST_PROTOCOL_VERSION_OVERRIDE",
+                &protocol.to_string(),
+            ),
+        ],
+    )
+}
+
+/// Scenario: Start a daemon that speaks a NEWER attach protocol than the TUI,
+/// with one live agent, and attach the TUI in a TTY. The restart prompt appears
+/// and says this binary cannot attach to that daemon; pressing `Esc` must NOT
+/// attach (which would leave a normal-looking dashboard silently dropping every
+/// event it cannot decode) but exit non-zero with a refusal naming both protocol
+/// numbers and how to keep the agents, and the daemon and its agent stay alive.
+#[spec("lifecycle/handshake/009")]
+#[test]
+fn handshake_009_protocol_skew_decline_refuses_and_keeps_daemon() {
+    let newer = dot_agent_deck::daemon_protocol::PROTOCOL_VERSION + 1;
+    let mut daemon = spawn_daemon_at_build_and_protocol(OLD_BUILD, newer);
+    start_live_agent(&daemon);
+    let mut deck = launch_tui_against(&daemon, NEW_BUILD);
+
+    wait_for_restart_prompt(&deck);
+    deck.send_keys(b"\x1b");
+
+    let exited = deck.wait_for_exit_within(Duration::from_secs(15));
+    assert_eq!(
+        exited,
+        Some(false),
+        "declining the restart of a daemon on another attach protocol must exit non-zero \
+         instead of attaching to it (None = still running, i.e. it attached)"
+    );
+    // The prompt already names the skew, so these two lines are the refusal's
+    // own: its header, and the way out that keeps the agents.
+    deck.wait_for_string(&format!(
+        "error: daemon speaks attach protocol v{newer}, but this binary speaks v{}",
+        dot_agent_deck::daemon_protocol::PROTOCOL_VERSION
+    ));
+    deck.wait_for_string(&format!(
+        "To keep them: attach with the daemon's own build ({OLD_BUILD})"
+    ));
+
+    assert!(
+        daemon.is_alive_public(),
+        "the refusal must leave the daemon running, agents and all"
+    );
+    assert!(
+        wait_for_agent_display_name(
+            &daemon.attach_socket,
+            LIVE_AGENT_NAME,
+            true,
+            Duration::from_secs(5),
+        ),
+        "the live agent must remain reachable on the refused daemon"
+    );
+}
+
+/// Scenario: Start a daemon with the SAME build id as the TUI but a different
+/// attach protocol and no agents, then launch the TUI in a TTY. A matching build
+/// id must not wave the skew through: with nothing to lose the old daemon is
+/// restarted silently and the TUI lands in the empty dashboard on a fresh one.
+#[spec("lifecycle/handshake/010")]
+#[test]
+fn handshake_010_protocol_skew_with_matching_build_restarts_silently() {
+    let older = dot_agent_deck::daemon_protocol::PROTOCOL_VERSION - 1;
+    let mut daemon = spawn_daemon_at_build_and_protocol(NEW_BUILD, older);
+    let deck = launch_tui_against(&daemon, NEW_BUILD);
+
+    deck.wait_for_string("No active agents");
+    assert!(
+        daemon.wait_for_exit(Duration::from_secs(10)),
+        "a daemon on another attach protocol must be restarted, not attached to, even when \
+         its build id matches"
     );
 }

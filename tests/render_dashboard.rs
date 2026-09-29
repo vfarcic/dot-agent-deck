@@ -100,6 +100,7 @@ fn pane_004_card_title_row() {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     };
     // The 80-cell buffer leaves ample room for the full bottom-border stats
     // title. Height comes from the density tier itself so the snapshot's
@@ -147,6 +148,7 @@ fn card_stats_session(cwd: &str) -> SessionState {
         display_name: Some("api-svc".to_string()),
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     }
 }
 
@@ -626,6 +628,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     };
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
@@ -817,6 +820,7 @@ fn pane_007_pi_card_shows_pi_identity() {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -880,6 +884,7 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1136,6 +1141,7 @@ fn palette_session(status: SessionStatus) -> SessionState {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     }
 }
 
@@ -1940,6 +1946,7 @@ fn pane_005_highlight_follows_selected_session_id() {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     };
     let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
     let s2 = make("sess-beta", "pane-2", "2", "/home/dev/beta");
@@ -2141,6 +2148,7 @@ fn filled_session() -> SessionState {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     }
 }
 
@@ -2898,6 +2906,7 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         display_name: Some("reviewer".to_string()),
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     };
     let density = CardDensityKind::Normal;
     let render = |session: &SessionState, declared_agent_type: Option<&AgentType>| {
@@ -3242,6 +3251,7 @@ fn role_session(index: usize, role: &str) -> SessionState {
         display_name: Some(role.to_string()),
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     }
 }
 

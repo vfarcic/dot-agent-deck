@@ -205,6 +205,26 @@ path = "junit.xml"
 filter = 'test(route_001_two_tabs_same_cwd_do_not_cross_deliver)'
 slow-timeout = { period = "60s", terminate-after = 8 }
 
+# Issue #699: `opencode_auto_submits_daemon_injected_prompt` now waits in named
+# phases, each with its own bound: the OpenCode preflight probe (60s), the
+# composer paint (90s), the injected prompt rendering (20s) and the reply (90s).
+# Each fails with a message naming what was not ready, but their sum is 260s,
+# past the default 3 x 60s kill window, and under load the phases really do
+# stretch — measured 2026-09-28 with 64 CPU hogs on 16 cores on top of ~40-50 of
+# ambient load, the preflight took up to 67s, the composer painted up to 43s
+# after spawn, and a passing run took up to 149s. Being killed there costs
+# exactly the message this issue added, so a slow run would read as a hang
+# again. 6 x 60s leaves ~100s over the phase bounds for spawn, teardown and the
+# preflight overrunning its own figure as it did above. Scoped by name; still
+# bounded.
+#
+# The filter tracks the TEST FUNCTION name, so it must be updated in lockstep
+# with any rename — a stale filter matches nothing and silently drops this test
+# back to the 3 x 60s default.
+[[profile.default.overrides]]
+filter = 'test(opencode_auto_submits_daemon_injected_prompt)'
+slow-timeout = { period = "60s", terminate-after = 6 }
+
 # PRD #220: `prompt/new-pane/016` drives a REAL interactive agent through a
 # dispatch turn, then waits for the daemon's `git worktree add` to land on disk.
 # An agent that answers instead of acting is re-nudged on a 70s cadence (up to 3

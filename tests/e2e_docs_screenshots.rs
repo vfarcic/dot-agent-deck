@@ -59,13 +59,20 @@ fn launch() -> TuiDeck {
 /// environment is read back to prove it, since the harness would otherwise
 /// pass that key through by default.
 fn launch_with(customize: impl FnOnce(TuiDeckBuilder) -> TuiDeckBuilder) -> TuiDeck {
+    launch_fixture_with("minimal", customize)
+}
+
+fn launch_fixture_with(
+    fixture: &str,
+    customize: impl FnOnce(TuiDeckBuilder) -> TuiDeckBuilder,
+) -> TuiDeck {
     let deck = customize(
         TuiDeck::builder()
             .with_pty_size(COLS, ROWS)
             .without_success_recording()
             .without_agent_credentials(),
     )
-    .launch_with_fixture("minimal");
+    .launch_with_fixture(fixture);
     #[cfg(target_os = "linux")]
     {
         let pid = deck
@@ -117,9 +124,28 @@ fn capture_unless(
             give_up().then_some(None)
         }
     });
-    let Some(page) = page else {
+    let Some(mut page) = page else {
         return false;
     };
+    if scenario == "new-agent" {
+        // The form shows the harness's random temp path. Replace only its
+        // visible Dir field, before the HTML becomes a published PNG, while
+        // keeping the same cell width and the rest of the real frame intact.
+        let start = page
+            .find("Dir: /")
+            .expect("New Agent form has an absolute Dir field");
+        let end = start
+            + page[start..]
+                .find("</span>")
+                .expect("Dir field ends in a rendered span");
+        let width = page[start..end].chars().count();
+        let display = "Dir: /home/dev/demo-project";
+        assert!(
+            display.len() <= width,
+            "Dir field is too narrow for the docs path"
+        );
+        page.replace_range(start..end, &format!("{display:<width$}"));
+    }
     let dir = html_dir();
     std::fs::create_dir_all(&dir).expect("create the TUI HTML dir");
     let path = dir.join(format!("{scenario}-tui.html"));
@@ -288,6 +314,7 @@ const FOCUSED_PANE_LINES: &[&str] = &[
 /// offers and the panes run in. Named like the hook events' `cwd` so the
 /// cards' `Dir:` reads the same whichever of the two it shows.
 const LAUNCH_DIR: &str = "storefront";
+const DOCS_PROJECT_DIR: &str = "demo-project";
 
 /// The script every stand-in pane runs, the same text for every agent: it
 /// takes the file to record its environment's variable names in as `$1` and
@@ -629,5 +656,205 @@ fn docs_screenshot_dashboard_empty() {
     let deck = launch();
     capture(&deck, "dashboard-empty", |grid| {
         grid.contains("No active agents") && grid.contains("[New Agent Ctrl+N]")
+    });
+}
+
+/// Scenario: Choose the sandbox project's directory through Ctrl+N and show
+/// the New Agent form before starting any command.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_new_agent() {
+    html_dir();
+    let deck = launch_fixture_with("docs-screenshots", |builder| {
+        builder.with_launch_subdir(DOCS_PROJECT_DIR)
+    });
+    deck.wait_for_string("No active agents");
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" ");
+    capture(&deck, "new-agent", |grid| {
+        grid.contains("┌ New Agent") && grid.contains(DOCS_PROJECT_DIR) && grid.contains("No mode")
+    });
+}
+
+/// Scenario: Activate the project's demo-loop orchestration with two stand-in
+/// roles, then address synthetic working events to their real pane IDs. Capture
+/// its active tab only when both role cards show their work and fixed ages.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_orchestration() {
+    html_dir();
+    for attempt in 1..=DASHBOARD_ATTEMPTS {
+        let scene = stage_orchestration();
+        let ready = |grid: &str| {
+            grid.contains("demo-loop [×]")
+                && grid.contains("planner")
+                && grid.contains("builder")
+                && grid.contains("Planning the checkout retry flow")
+                && grid.contains("Plan the checkout retry flow.")
+                && grid.contains("Implement the checkout retry flow.")
+                && grid.contains("src/checkout/flow.ts")
+                && grid.contains("src/checkout/RetryPayment.tsx")
+                && grid.contains("Last: 2s ")
+                && grid.contains("Last: 3s ")
+                && grid.matches("Working").count() == 2
+                && grid.matches('●').count() == 2
+                && !grid.contains("No agent")
+                && !grid.contains("Launch an agent to get started")
+                && !grid.contains("Activated orchestration")
+        };
+        let last_attempt = attempt == DASHBOARD_ATTEMPTS;
+        let missed = || !last_attempt && Utc::now().timestamp() >= scene.capture_at + 2;
+        if capture_unless(&scene.deck, "orchestration", ready, missed) {
+            return;
+        }
+        eprintln!(
+            "docs_screenshot_orchestration: attempt {attempt} of {DASHBOARD_ATTEMPTS} \
+             missed its capture second; building the scene again"
+        );
+    }
+    unreachable!("the last attempt either captures or panics");
+}
+
+/// A fresh orchestration whose role hooks are stamped for one capture second.
+fn stage_orchestration() -> DashboardScene {
+    let deck = launch_fixture_with("docs-screenshots", |builder| {
+        builder
+            .with_launch_subdir(DOCS_PROJECT_DIR)
+            .impersonating_pane_signals()
+    });
+    deck.wait_for_string("No active agents");
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" ");
+    deck.wait_for_string("┌ New Agent");
+    deck.send_keys(b"\x1b[C");
+    deck.wait_for_string("Orch: demo-loop");
+    deck.send_keys(b"\r");
+    deck.send_keys(&vec![0x7f; "demo-project-orchestrator-1".len()]);
+    deck.send_keys(b"demo-loop");
+    deck.send_keys(b"\r");
+    wait_for_record(&deck, "planner", |_| true);
+    wait_for_record(&deck, "builder", |_| true);
+
+    // A role card's last activity starts at its pane's spawn. Stamp both
+    // status events after both panes exist, on whole seconds, so their Last:
+    // labels roll over together and the ready check captures exactly one
+    // second. Rebuild the scene if that second is missed.
+    let now = Utc::now();
+    // The activation banner has a 15-second TTL. Its lifetime starts before
+    // this clock sample, so 18 seconds leaves room for its next redraw to
+    // clear it before the capture second.
+    let capture_at = now.timestamp() + 18;
+    for (role, agent_type, session, prompt, tool, detail, quiet_for_secs) in [
+        (
+            "planner",
+            "claude_code",
+            "docs-orch-planner",
+            "Plan the checkout retry flow.",
+            "Read",
+            "src/checkout/flow.ts",
+            2,
+        ),
+        (
+            "builder",
+            "codex",
+            "docs-orch-builder",
+            "Implement the checkout retry flow.",
+            "Edit",
+            "src/checkout/RetryPayment.tsx",
+            3,
+        ),
+    ] {
+        let record = wait_for_record(&deck, role, |_| true);
+        let pane_id = record
+            .pane_id_env
+            .clone()
+            .unwrap_or_else(|| panic!("{role}'s pane has no pane id"));
+        send(
+            &deck,
+            serde_json::json!({
+                "session_id": session,
+                "agent_type": agent_type,
+                "event_type": "session_start",
+                "timestamp": (now - ChronoDuration::minutes(30)).to_rfc3339(),
+                "cwd": "/home/dev/demo-project",
+                "pane_id": pane_id,
+                "agent_id": record.id,
+                "metadata": { "display_name": role },
+            }),
+        );
+        let expected_type = serde_json::Value::from(agent_type);
+        wait_for_record(&deck, role, |r| {
+            r.live.as_ref().is_some_and(|live| {
+                live.agent_type.as_ref().map(|t| serde_json::json!(t))
+                    == Some(expected_type.clone())
+            })
+        });
+        send(
+            &deck,
+            serde_json::json!({
+                "session_id": session,
+                "agent_type": agent_type,
+                "event_type": "tool_start",
+                "timestamp": chrono::DateTime::from_timestamp(capture_at - quiet_for_secs, 0)
+                    .expect("a representable instant")
+                    .to_rfc3339(),
+                "cwd": "/home/dev/demo-project",
+                "pane_id": pane_id,
+                "agent_id": record.id,
+                "user_prompt": prompt,
+                "tool_name": tool,
+                "tool_detail": detail,
+            }),
+        );
+        wait_for_record(&deck, role, |r| {
+            r.live
+                .as_ref()
+                .is_some_and(|live| live.last_user_prompt.as_deref() == Some(prompt))
+        });
+    }
+    DashboardScene { deck, capture_at }
+}
+
+/// Scenario: Open the Schedules manager over an empty dashboard with one
+/// disabled nightly-triage task. Its longer name leaves a visible gap between
+/// the NAME and STATUS headers while keeping the next-fire field stable.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_schedules() {
+    html_dir();
+    let scratch = common::harness_tempdir().expect("schedules scratch directory");
+    let schedules = scratch.path().join("schedules.toml");
+    std::fs::write(
+        &schedules,
+        "[[scheduled_tasks]]\nname = \"nightly-triage\"\ncron = \"0 9 * * *\"\nworking_dir = \"/home/dev/storefront\"\ncommand = \"cat\"\nprompt = \"Summarize checkout changes.\"\nenabled = false\n",
+    )
+    .expect("write docs schedule");
+    let deck = launch_with(|builder| {
+        builder.with_env("DOT_AGENT_DECK_SCHEDULES", schedules.to_string_lossy())
+    });
+    deck.wait_for_string("No active agents");
+    deck.send_keys(b"S");
+    capture(&deck, "schedules", |grid| {
+        grid.lines()
+            .any(|line| line.contains("NAME ") && line.contains("STATUS"))
+            && grid.contains("NEXT FIRE")
+            && grid.contains("nightly-triage")
+            && grid.contains("disabled")
+    });
+}
+
+/// Scenario: Open the dashboard's question-mark help overlay so the keyboard
+/// shortcuts and their plain-English actions are visible.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_help() {
+    html_dir();
+    let deck = launch();
+    deck.wait_for_string("No active agents");
+    deck.send_keys(b"?");
+    capture(&deck, "help", |grid| {
+        grid.contains("Create new agent") && grid.contains("┌ Help")
     });
 }

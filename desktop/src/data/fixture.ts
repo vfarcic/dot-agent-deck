@@ -43,7 +43,7 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet";
 
 export const DEFAULT_PROFILES: AgentProfile[] = [
   {
@@ -684,12 +684,52 @@ const DOCS_UP_MINUTES = {
   verify: 80,
 } as const;
 const DOCS_QUIET_MINUTES = 0;
+/**
+ * What the docs `agent-pane` screenshot shows in the open agent's terminal.
+ * The browser fixture has no PTY, so the pane shows the transcript the
+ * terminal writes on mount; without one the image is a blank terminal. Fixed
+ * text only: no timestamps, pids or host paths, so the capture is stable.
+ */
+const DOCS_IMPL_TRANSCRIPT = [
+  "\u001b[1m›\u001b[0m Add the retry action to the checkout view.",
+  "",
+  "\u001b[36m•\u001b[0m Read src/components/CheckoutView.tsx",
+  "\u001b[36m•\u001b[0m Read src/api/payments.ts",
+  "\u001b[36m•\u001b[0m Edit src/components/RetryPayment.tsx",
+  "    \u001b[32m+ export function RetryPayment({ onRetry, pending }: RetryPaymentProps) {\u001b[0m",
+  "    \u001b[32m+   return <button disabled={pending} onClick={onRetry}>Retry payment</button>;\u001b[0m",
+  "    \u001b[32m+ }\u001b[0m",
+  "\u001b[36m•\u001b[0m Ran npm test -- checkout",
+  "    \u001b[32mPASS\u001b[0m  src/components/RetryPayment.test.tsx (3 tests)",
+  "",
+  "The retry button renders and disables itself while a payment is pending.",
+  "Next: wire it into CheckoutView and cover the failed-payment path.",
+  "",
+].join("\r\n");
 const docsAgents: AgentSession[] = [
   crowdedAgent({ id: "1", displayName: "Plan / architecture", role: "Claude code", cli: "claude", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.plan, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Map the checkout flow and propose a retry design.", tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "2", displayName: "Desktop implementation", role: "Codex", cli: "codex", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.impl, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Edit", activeToolDetail: "src/components/RetryPayment.tsx", lastUserPrompt: "Add the retry action to the checkout view.", tab: { kind: "dashboard" } }),
+  { ...crowdedAgent({ id: "2", displayName: "Desktop implementation", role: "Codex", cli: "codex", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.impl, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Edit", activeToolDetail: "src/components/RetryPayment.tsx", lastUserPrompt: "Add the retry action to the checkout view.", tab: { kind: "dashboard" } }), transcript: DOCS_IMPL_TRANSCRIPT },
   crowdedAgent({ id: "3", displayName: "Contract review", role: "Claude code", cli: "claude", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.review, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Bash", activeToolDetail: "cargo test checkout_retry", lastUserPrompt: "Check the payment API for breaking changes.", tab: { kind: "dashboard" } }),
   crowdedAgent({ id: "4", displayName: "User-path verification", role: "Open code", cli: "opencode", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.verify, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Walk the checkout path and report failures.", tab: { kind: "dashboard" } }),
 ];
+
+/** Two answering daemons with synthetic projects and no demo-run paths. */
+function docsFleet(): DeckSnapshot[] {
+  const local = createFixtureSnapshot("docs");
+  const remote: DeckSnapshot = {
+    ...createFixtureSnapshot("docs"),
+    runId: "run_docs_service",
+    repo: "service-api",
+    worktree: "/home/dev/service-api",
+    connection: { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+    agents: [
+      crowdedAgent({ id: "1", displayName: "API implementation", role: "Codex", cli: "codex", status: "running", cwd: "/home/dev/service-api", toolCount: 2, upForMinutes: 44, quietForMinutes: 0, activeTool: "Edit", activeToolDetail: "src/routes.rs", lastUserPrompt: "Add the checkout endpoint.", tab: { kind: "dashboard" } }),
+      crowdedAgent({ id: "2", displayName: "API review", role: "Claude code", cli: "claude", status: "waiting", cwd: "/home/dev/service-api", toolCount: 0, upForMinutes: 19, quietForMinutes: 0, lastUserPrompt: "Review the endpoint contract.", tab: { kind: "dashboard" } }),
+    ].map((agent) => ({ ...agent, daemonId: FIXTURE_REMOTE_DAEMON_ID })),
+    totalNodes: 2,
+  };
+  return [local, remote];
+}
 
 /**
  * `empty` means CONNECTED WITH ZERO AGENTS — the first-run experience — and
@@ -843,6 +883,7 @@ function fleetDeck(
  * this milestone changes. `fleet` is the one that needs the array to exist.
  */
 export function createFixtureFleet(state: FixtureState = "connected"): DeckSnapshot[] {
+  if (state === "docs-fleet") return docsFleet();
   if (state !== "fleet") return [createFixtureSnapshot(state)];
   return [
     fleetDeck(
@@ -907,7 +948,7 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
   // `fleet` is a THREE-deck scenario and has no single snapshot, so a caller
   // asking for one gets the deck the single-deck screens are on — never the
   // disconnected fall-through an unlisted state would otherwise land in.
-  if (state === "fleet") return createFixtureFleet(state)[0];
+  if (state === "fleet" || state === "docs-fleet") return createFixtureFleet(state)[0];
   const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs";
   const connection = connected
     ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding" }

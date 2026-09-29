@@ -138,6 +138,7 @@ fn selected_card_fixture() -> SessionState {
         display_name: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
+        prompt_reports_unavailable: false,
     }
 }
 
