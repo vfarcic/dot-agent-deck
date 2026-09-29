@@ -661,7 +661,8 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
 
 /// `pi` on PATH, nothing else: `pi/live/003` sends no prompt, so pi makes no
 /// model call and needs no credential — its `session_start` fires at boot
-/// whether or not it is authenticated.
+/// whether or not it is authenticated. Unix-only, like the one test using it.
+#[cfg(unix)]
 fn check_pi_installed() -> Result<(), String> {
     let ok = std::process::Command::new("pi")
         .arg("--version")
@@ -689,6 +690,7 @@ fn check_pi_installed() -> Result<(), String> {
 /// deck, so the card takes the `Pi ·` identity that only an `agent-event` from
 /// the extension can give it, and the decoy is never run.
 #[spec("pi/live/003")]
+#[cfg(unix)]
 #[test]
 fn pi_live_003_extension_shells_the_spawning_deck_not_the_path() {
     use std::os::unix::fs::PermissionsExt;
