@@ -78,6 +78,78 @@ test.describe("voice control through the browser fixture", () => {
   });
 });
 
+test.describe("numbered voice choices through the browser fixture", () => {
+  const choicePath = "/?fixture=1&state=connected&voice=open%20the%20agent";
+  const firstLabel = "1. Plan / architecture";
+  const secondLabel = "2. Desktop implementation";
+
+  async function offerChoice(page: Page) {
+    await openWithSpeech(page, choicePath);
+    await voiceButton(page).click();
+    const choice = page.getByTestId("voice-choice");
+    await expect(choice.getByRole("button", { name: firstLabel })).toBeVisible();
+    await expect(choice.getByRole("button", { name: secondLabel })).toBeVisible();
+    return choice;
+  }
+
+  for (const [label, agentId, report] of [
+    [firstLabel, "planner", "Opening Plan / architecture."],
+    [secondLabel, "builder", "Opening Desktop implementation."],
+  ] as const) {
+    /** Scenario: the numbered entries are real browser controls. Clicking one
+     * opens its own agent pane and reports the chosen agent's name. */
+    test(`clicking ${label} opens that agent`, async ({ page }) => {
+      const choice = await offerChoice(page);
+      const entry = choice.getByRole("button", { name: label });
+      await entry.click({ trial: true });
+      await entry.click();
+      await expect(page.getByText(report)).toBeVisible();
+      await expect(page.getByTestId("agent-pane-overlay").getByTestId(`terminal-${agentId}`)).toBeVisible();
+      await expect(choice).toHaveCount(0);
+    });
+  }
+
+  /** Scenario: a keyboard user can tab between numbered entries and activate
+   * the second one with Enter, opening its pane without a pointer. */
+  test("numbered entries are tabbable and keyboard-activatable", async ({ page }) => {
+    const choice = await offerChoice(page);
+    const first = choice.getByRole("button", { name: firstLabel });
+    const second = choice.getByRole("button", { name: secondLabel });
+    await first.focus();
+    await expect(first).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(second).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(page.getByText("Opening Desktop implementation.")).toBeVisible();
+    await expect(page.getByTestId("agent-pane-overlay").getByTestId("terminal-builder")).toBeVisible();
+    await expect(choice).toHaveCount(0);
+  });
+
+  /** Scenario: Cancel dismisses an offered choice; it opens neither pane and
+   * leaves voice listening for another utterance. */
+  test("Cancel dismisses the choice without opening an agent", async ({ page }) => {
+    const choice = await offerChoice(page);
+    const cancel = choice.getByRole("button", { name: "Cancel" });
+    await cancel.click({ trial: true });
+    await cancel.click();
+    await expect(choice).toHaveCount(0);
+    await expect(page.getByTestId("agent-pane-overlay")).toHaveCount(0);
+    await expect(page.getByTestId("voice-report")).toContainText(/cancelled/i);
+    await expect(voiceButton(page)).toHaveAttribute("aria-pressed", "true");
+  });
+
+  /** Scenario: the fixture hears a second utterance, "two", while its list is
+   * open; that spoken answer opens the second pane and closes the list. */
+  test("a spoken number answers the pending choice", async ({ page }) => {
+    await openWithSpeech(page, `${choicePath}&voice=two`);
+    await voiceButton(page).click();
+    await expect(page.getByText("Opening Desktop implementation.")).toBeVisible();
+    await expect(page.getByTestId("agent-pane-overlay").getByTestId("terminal-builder")).toBeVisible();
+    await expect(page.getByTestId("voice-choice")).toHaveCount(0);
+    await expect(voiceButton(page)).toHaveAttribute("aria-pressed", "true");
+  });
+});
+
 /**
  * The reserved bottom row (PRD #802, the product owner's real-microphone
  * review).

@@ -336,14 +336,15 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
   const entry = (number: number, label: string) => screen.getByRole("button", { name: `${number}. ${label}` });
 
   function setup(voice: ReturnType<typeof microphone>, answer: (utterance: string) => VoiceResultDto = selected,
-    configure?: (snapshot: ReturnType<typeof createFixtureSnapshot>) => void) {
+    configure?: (snapshot: ReturnType<typeof createFixtureSnapshot>) => void,
+    answerVoiceChoice?: NonNullable<DeckRuntimeState["answerVoiceChoice"]>) {
     const snapshot = createFixtureSnapshot("connected");
     configure?.(snapshot);
     for (const id of [first.value, second.value]) {
       if (!snapshot.agents.find((agent) => agent.id === id)) throw new Error(`fixture agent ${id} missing`);
     }
     const resolveVoice: ResolveVoice = vi.fn(async (utterance) => utterance === "open the agent" ? choice() : answer(utterance));
-    render(<DeckShell runtime={runtime(resolveVoice, voice, { snapshot, fleet: [snapshot] })} initialView={{ kind: "overview" }} />);
+    render(<DeckShell runtime={runtime(resolveVoice, voice, { snapshot, fleet: [snapshot], answerVoiceChoice })} initialView={{ kind: "overview" }} />);
     return { resolveVoice, snapshot };
   }
 
@@ -366,7 +367,7 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
    * openAgent command with the selected ID and closes the list. */
   it.each(["two", "Desktop implementation"])("dispatches the offered value when the answer is %s", async (answer) => {
     const voice = microphone(["open the agent"]);
-    setup(voice);
+    const { resolveVoice } = setup(voice);
     await turnVoiceOn();
     await completeUtterance();
     expect(entry(2, second.label)).toBeVisible();
@@ -374,6 +375,23 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     await completeUtterance();
     expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId(`terminal-${second.value}`)).toBeVisible();
     expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
+    expect(resolveVoice).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: when the runtime provides a choice answer, the panel uses that
+   * answer to open the offered agent without resolving a second command. */
+  it("uses the runtime answer for a spoken choice", async () => {
+    const voice = microphone(["open the agent"]);
+    const answerVoiceChoice = vi.fn(async () => ({ kind: "selected" as const, candidate: second }));
+    const { resolveVoice } = setup(voice, selected, undefined, answerVoiceChoice);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(2, second.label)).toBeVisible();
+    voice.deliver("two");
+    await completeUtterance();
+    expect(answerVoiceChoice).toHaveBeenCalledExactlyOnceWith("two", "open_agent", candidates);
+    expect(resolveVoice).toHaveBeenCalledTimes(1);
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId(`terminal-${second.value}`)).toBeVisible();
   });
 
   /** Scenario: a different utterance closes the offer and is resolved in its own

@@ -1,4 +1,4 @@
-//! RED tests for PRD #1261's local answer to a numbered voice choice.
+//! Tests for PRD #1261's local answer to a numbered voice choice.
 
 use super::choice::{ChoiceAnswer, ChoiceLive, answer};
 use super::outcome::ResolvedParam;
@@ -142,7 +142,7 @@ fn choice_refuses_an_offered_value_that_is_no_longer_live() {
     };
     for offered in [&agent, &deck, &run] {
         assert_eq!(
-            answer("one", &[offered.clone()], &absent),
+            answer("one", std::slice::from_ref(offered), &absent),
             ChoiceAnswer::Refused,
             "{}",
             offered.label
@@ -163,11 +163,11 @@ fn choice_refuses_an_offered_value_that_is_no_longer_live() {
         new_agent: None,
     };
     assert_eq!(
-        answer("one", &[agent.clone()], &live),
+        answer("one", std::slice::from_ref(&agent), &live),
         ChoiceAnswer::Selected(agent)
     );
     assert_eq!(
-        answer("one", &[deck.clone()], &live),
+        answer("one", std::slice::from_ref(&deck), &live),
         ChoiceAnswer::Selected(deck)
     );
 }

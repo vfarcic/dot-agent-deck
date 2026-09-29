@@ -57,10 +57,6 @@ pub mod wake;
 
 #[cfg(test)]
 #[path = "choice_tests.rs"]
-// The tests build a one-entry offer with `&[candidate.clone()]`, which reads
-// as the list the panel holds; `std::slice::from_ref` would say the same less
-// plainly.
-#[allow(clippy::cloned_ref_to_slice_refs)]
 mod choice_tests;
 
 use std::fmt;
