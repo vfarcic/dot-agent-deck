@@ -21,7 +21,11 @@ The [reference section](#reference) below documents the on-disk file the agent w
 
 ### The Schedules dialog
 
+*The Schedules dialog is in the TUI only. The desktop app has no schedule manager: it can start the authoring agent from **New agent** (below), and schedules it creates are listed and changed from the TUI or with `dot-agent-deck schedule`.*
+
 Press **`s`** on the dashboard (lowercase; the legacy uppercase **`S`** also works) to open the **Schedules** manager — your one place to see and manage every schedule. Its **`[Schedules s]`** button is **always present on the dashboard**: it doesn't wait for a schedule to exist, because the manager's **`[Add]`** action is itself how you create the first one. You never type field values into the dialog itself — **`[Add]`** and **`[Edit]`** hand you to the authoring agent described below, which does the writing for you.
+
+![The TUI's Schedules manager with one schedule: its row shows the name, the status disabled and a next fire of —, above the Add, Edit, Delete, Run now and Toggle buttons](/img/schedules-tui.png)
 
 Rows are **click-selectable**. Each row shows the task **name**, a **status** indicator, and its **next-fire** time:
 
@@ -51,10 +55,10 @@ Actions — the footer buttons mirror the keys, shown as `[Add a]` `[Edit e]` `[
 
 ### What the authoring agent does
 
-Both doors below open the same guided authoring agent:
+Both doors below open the same guided authoring agent (the desktop app has only the second):
 
 - **From the Schedules dialog** — press **`s`** on the dashboard, then **`a`** / **`[Add]`** to author a new one (or **`e`** / **`[Edit]`** to start from an existing row's values). First a **directory picker** (the dir you choose becomes the authoring agent's working directory, and is pre-seeded as the schedule's own working directory), then a small **New Schedule** / **Edit Schedule** form with a **Dir** and a free-text **Command** field (pre-filled from your `default_command`). Confirm to start the authoring agent in that directory running that command; **`Esc`** / **`[Cancel]`** returns you to the dialog.
-- **From the New Agent form** — open it (`Ctrl+n`), confirm a directory, and cycle the **Mode** field to the end — past your project's workload modes — to the built-in **`schedule`** option (marked `authoring (one-off)`).
+- **From the New Agent form** — open it (`Ctrl+n`), confirm a directory, and cycle the **Mode** field to the end — past your project's workload modes — to the built-in **`schedule`** option (marked `authoring (one-off)`). In the desktop app, open **New agent**, choose a directory and pick the **schedule** chip under **Mode**.
 
 Either way a throwaway authoring agent opens — running your chosen agent command, which defaults to your configured [`default_command`](configuration.md#default-command) and falls back to `claude` when that is unset — and walks you through it. It:
 

@@ -1494,7 +1494,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     if (!snapshot.connection.buildStampMismatchOnly) return;
     setConfirm({
       title: "Connect to a differently-built daemon?",
-      body: "The wire protocol matched on both sides, so this daemon and this app agree on the shape of everything they exchange. They were built from different commits, and a stamp difference can still mean divergent behaviour behind an identical wire — a field whose meaning changed while its shape did not. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
+      body: "The wire protocol matched on both sides, so this daemon and this app agree on the shape of everything they exchange. But a declared compatibility break separates the two builds — a field whose meaning changed while its shape did not — so some of what this daemon reports can be read with the wrong meaning. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
       label: "Connect anyway",
       busyLabel: "Connecting…",
       action: async () => {

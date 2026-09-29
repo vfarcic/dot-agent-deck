@@ -128,6 +128,7 @@ fn card(orphaned: bool) -> SessionState {
         display_name: Some("orchestrator".to_string()),
         shell_synthetic_working: false,
         orchestration_orphaned: orphaned,
+        prompt_reports_unavailable: false,
     }
 }
 

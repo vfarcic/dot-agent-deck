@@ -3,6 +3,9 @@ sidebar_position: 5.6
 title: Dispatcher Mode
 ---
 
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
 # Dispatcher Mode
 
 ## What it is
@@ -27,10 +30,24 @@ If you just want an agent to do something for you right now, in front of you, yo
 
 ## Starting a dispatcher pane
 
+<Tabs groupId="client">
+<TabItem value="tui" label="TUI">
+
 1. Press `Ctrl+n`
 2. Navigate to the project directory and confirm it
 3. Cycle the **Mode** field to `dispatcher`
 4. Press `Enter`
+
+</TabItem>
+<TabItem value="desktop" label="Desktop">
+
+1. Open **New agent** from the Dashboard (or press `Ctrl+N` / `⌘N`) and choose the daemon
+2. Browse to the project directory and press **Use this directory**
+3. Pick the **dispatcher** chip under **Mode**, and check **Command** names the agent you want (empty starts your `default_command`, or `claude`)
+4. Press **Create agent**; the new agent's terminal opens when the daemon lists it
+
+</TabItem>
+</Tabs>
 
 Then talk to it: *"Start work on the login timeout bug."*
 
@@ -67,7 +84,7 @@ Any other turn beginning `dispatch:` is a failure — a name already in use, an 
 
 A command that fails (non-zero exit status) never reached that point. Either no deck was reachable, the deck refused the request, or the command itself was unusable: it was run outside a deck pane, or its `--task-file` could not be read. The command prints which.
 
-If the unit's agent never reports submitting its task, the deck gives up after a minute and puts a notice on **the unit's own card** saying the task may never have arrived. That notice is not sent to your dispatcher, and a unit that never got its task has nothing to report back — so a unit that stays quiet for a long time is worth opening. Do not wait for the notice, though: it is not the only way a task goes missing, and not every way leaves one. Some agents cannot report a submitted prompt at all; the deck types the task into those once, has nothing to check, and shows no notice either way. And if the deck could not type the task in at all — the pane went away, or its agent was replaced, before the write — it records that in its log and not on the card, and the dispatcher is still told the unit started. A notice does appear when the write is held back because someone had started typing into the unit's pane. The command's exit status is 0 in all of these cases: it was decided before any of them could happen.
+If the unit's agent never reports submitting its task, the deck gives up after a minute and puts a notice on **the unit's own card** saying the task may never have arrived. That notice is not sent to your dispatcher, and a unit that never got its task has nothing to report back — so a unit that stays quiet for a long time is worth opening. Do not wait for the notice, though: it is not the only way a task goes missing, and not every way leaves one. Some agents cannot report a submitted prompt at all; the deck types the task into those once, has nothing to check, and shows no notice either way. That is always true of **Pi**. The deck treats **Codex** the same way when it knows Codex will not run the deck's prompt hook for that unit — because you switched that hook off in Codex's `/hooks` list, or, most often, because `codex` is reachable only inside a launcher such as `devbox run codex-big` and not on the deck's own `PATH` (see [Codex events not showing](troubleshooting.md#codex-events-not-showing)). And if the deck could not type the task in at all — the pane went away, or its agent was replaced, before the write — it records that in its log and not on the card, and the dispatcher is still told the unit started. A notice does appear when the write is held back because someone had started typing into the unit's pane. The command's exit status is 0 in all of these cases: it was decided before any of them could happen.
 
 ## Hearing back from a unit
 

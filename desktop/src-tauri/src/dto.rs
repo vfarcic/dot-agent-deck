@@ -733,6 +733,43 @@ pub enum DesktopActionError {
     LaunchCleanup(DesktopLaunchCleanupFailure),
 }
 
+/// What `desktop_set_settings` rejects with (issue #1350's review).
+///
+/// A plain sentence — exactly what every failure rejected with before — except
+/// for a save that failed **after** its deck edits reached the shared
+/// `remotes.toml`: that rejects with `{ message, written }`, where `written` is
+/// the settings as both files now hold them, so the webview can show what is
+/// actually on disk instead of either the edit it asked for or the document it
+/// had before. A save refused because the deck list changed outside the app
+/// (`SaveFailure::deck_list_conflict`) wrote nothing and rejects the same way,
+/// for the same reason: the window's copy is stale.
+/// `desktop/src/lib/settingsError.ts` is the webview's half.
+///
+/// Serialize-only, like [`DesktopActionError`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum DesktopSettingsSaveError {
+    Message(String),
+    Partial(DesktopPartialSettingsSave),
+}
+
+/// A save whose deck edits landed and whose `desktop.toml` write did not, or
+/// one refused as a deck-list conflict — see [`DesktopSettingsSaveError`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopPartialSettingsSave {
+    /// The whole error, naming which half was saved, through [`safe_message`].
+    pub message: String,
+    /// The settings re-read from disk after the failure.
+    pub written: crate::settings::DesktopSettings,
+}
+
+impl From<String> for DesktopSettingsSaveError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
 /// A failed launch that could not confirm its cleanup — see
 /// [`DesktopActionError`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -3645,6 +3682,32 @@ mod tests {
                 "unconfirmedStops": ["reviewer", "planner"],
             }),
             "each role name goes through safe_message"
+        );
+    }
+
+    /// Issue #1350's review: `desktop_set_settings` rejects with a plain
+    /// string, as it always did, except for a save whose deck edits landed and
+    /// whose `desktop.toml` write did not — that one carries the settings as
+    /// they are on disk, for the webview to show.
+    #[test]
+    fn a_settings_rejection_is_a_string_unless_the_save_was_partial() {
+        assert_eq!(
+            serde_json::to_value(DesktopSettingsSaveError::from("disk full".to_string())).unwrap(),
+            serde_json::json!("disk full")
+        );
+        let written = crate::settings::DesktopSettings::default();
+        assert_eq!(
+            serde_json::to_value(DesktopSettingsSaveError::Partial(
+                DesktopPartialSettingsSave {
+                    message: "the deck list was saved".into(),
+                    written: written.clone(),
+                }
+            ))
+            .unwrap(),
+            serde_json::json!({
+                "message": "the deck list was saved",
+                "written": serde_json::to_value(&written).unwrap(),
+            })
         );
     }
 

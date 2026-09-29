@@ -246,7 +246,71 @@ pub struct SynthesisRoleSlot {
     pub is_start_role: bool,
 }
 
+/// Issue #523: THE rule for which role of an orchestration is its orchestrator
+/// — the pane that is focused when the tab opens, receives the orchestrator
+/// context and prompt, is registered in `AppState::orchestrator_pane_ids` and
+/// so may `delegate`, and is marked `(orchestrator)` in `daemon status`.
+///
+/// The first role with `start = true`, else the role NAMED `orchestrator`,
+/// else role 0. `roles` empty answers 0, which indexes nothing; callers only
+/// ask it of an orchestration with roles.
+///
+/// The flag outranks the name because the flag is the declaration: the docs,
+/// `validate` and the desktop's launch all say `start = true` marks the
+/// orchestrator, so for every config `validate` accepts (exactly one flag) the
+/// answer is simply that role. The name is only a fallback for a config that
+/// sets no flag at all.
+///
+/// Every caller reads this one function. Before #523 there were three answers
+/// — the daemon's dispatched spawn tried the name FIRST, the `Ctrl+n` tab read
+/// the bare flag for delegate permission, and the same tab fell back to role 0
+/// with no name fallback for focus and prompt delivery — so one toml opened
+/// with a different orchestrator depending on which path started it. Taking
+/// the roles through two accessors lets the config's roles and the spawn
+/// path's `RoleSpawn`s share it.
+pub fn orchestrator_index<T>(
+    roles: &[T],
+    name: impl Fn(&T) -> &str,
+    is_start: impl Fn(&T) -> bool,
+) -> usize {
+    roles
+        .iter()
+        .position(&is_start)
+        .or_else(|| roles.iter().position(|r| name(r) == "orchestrator"))
+        .unwrap_or(0)
+}
+
 impl OrchestrationConfig {
+    /// Index into `roles` of this orchestration's orchestrator — see
+    /// [`orchestrator_index`], the one rule every path reads.
+    pub fn orchestrator_role_index(&self) -> usize {
+        orchestrator_index(&self.roles, |r| r.name.as_str(), |r| r.start)
+    }
+
+    /// The orchestrator role itself; `None` only for an orchestration with no
+    /// roles.
+    pub fn orchestrator_role(&self) -> Option<&OrchestrationRoleConfig> {
+        self.roles.get(self.orchestrator_role_index())
+    }
+
+    /// Issue #523 review: the seat of a LIVE orchestration being rebuilt from
+    /// the daemon's role memberships (reconnect hydration, the live surface).
+    /// `flagged` are the `role_index`es whose membership carries
+    /// `is_start_role` — what the daemon actually registered as the
+    /// orchestrator. The first of them in range wins; with none, the config's
+    /// rule ([`Self::orchestrator_role_index`]).
+    ///
+    /// The daemon's answer outranks the config's because it is the one
+    /// `delegate` is checked against: a tab seated anywhere else would focus,
+    /// and TUI-side mirror, one role while the daemon lets a different one
+    /// delegate.
+    pub fn live_orchestrator_seat(&self, flagged: impl IntoIterator<Item = usize>) -> usize {
+        flagged
+            .into_iter()
+            .find(|index| *index < self.roles.len())
+            .unwrap_or_else(|| self.orchestrator_role_index())
+    }
+
     /// PRD #111: synthesise a minimal `OrchestrationConfig` from
     /// daemon-supplied bucket metadata when the local
     /// `.dot-agent-deck.toml` cannot be loaded (laptop TUI reconnecting
@@ -964,6 +1028,45 @@ pub fn load_project_config(dir: &Path) -> Result<Option<ProjectConfig>, ProjectC
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #523 review (Qodo, PR #1388): a live orchestration rebuilt from
+    /// the daemon's memberships is seated where the DAEMON registered its
+    /// orchestrator, which can differ from what the config would seat (a
+    /// restored tab honouring a saved cursor, PRD #89 F3). The config's rule
+    /// is only the fallback for memberships that flag nothing in range.
+    #[test]
+    fn live_orchestrator_seat_follows_the_daemons_memberships() {
+        let role = |name: &str, start: bool| OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: "cat".to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        };
+        let config = OrchestrationConfig {
+            name: "team".to_string(),
+            default: false,
+            roles: vec![role("orchestrator", true), role("coder", false)],
+        };
+        assert_eq!(
+            config.live_orchestrator_seat([1]),
+            1,
+            "the daemon seated `coder`"
+        );
+        assert_eq!(
+            config.live_orchestrator_seat([]),
+            0,
+            "nothing flagged: the config's rule"
+        );
+        assert_eq!(
+            config.live_orchestrator_seat([7]),
+            0,
+            "out of range: the config's rule"
+        );
+    }
+
     use super::*;
 
     // --- Issue #704: which orchestration a run opens when none was named ---

@@ -443,17 +443,17 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
         }
 
         // Issue #1243: a role whose agent the deck cannot identify at all.
-        let named_orchestrator = orch.roles.iter().any(|r| r.name == "orchestrator");
-        for role in &orch.roles {
-            let seat = OrchestratorSeat::of(role, named_orchestrator);
-            if let Some(issue) = unidentified_role_agent_issue(&orch.name, role, seat) {
+        // Issue #523: one seat, whichever path opens the tab.
+        let orch_idx = orch.orchestrator_role_index();
+        for (idx, role) in orch.roles.iter().enumerate() {
+            if let Some(issue) = unidentified_role_agent_issue(&orch.name, role, idx == orch_idx) {
                 issues.push(issue);
             }
         }
 
         // Warn about worker roles without descriptions (helps orchestrator know capabilities).
-        for role in &orch.roles {
-            if !role.start && role.description.is_none() {
+        for (idx, role) in orch.roles.iter().enumerate() {
+            if idx != orch_idx && role.description.is_none() {
                 issues.push(ValidationIssue {
                     severity: Severity::Warning,
                     scope: orch.name.clone(),
@@ -501,38 +501,6 @@ fn unknown_agent_issue(scope: &str, declared: Option<&str>) -> Option<Validation
     })
 }
 
-/// Issue #1243: whether an orchestration role is the tab's orchestrator — the
-/// one pane `AppState::delegate_targets` never routes a delegation to.
-///
-/// Not always one answer: the two ways the daemon registers a tab's
-/// orchestrator disagree (issue #523). The daemon's `spawn` registers
-/// [`crate::spawn::orchestrator_role_index`] — the role named `orchestrator`,
-/// else the start role — while the `Ctrl+N` path registers the raw `start`
-/// flag. Validation already demands exactly one `start = true` role, so the two
-/// agree precisely when that role is itself named `orchestrator` or no role is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OrchestratorSeat {
-    /// The orchestrator whichever path opened the tab.
-    Always,
-    /// A worker whichever path opened the tab.
-    Never,
-    /// The `start = true` role beside a different role named `orchestrator`,
-    /// or that named role itself: each is the orchestrator on one path and a
-    /// worker on the other.
-    DependsOnPath,
-}
-
-impl OrchestratorSeat {
-    fn of(role: &crate::project_config::OrchestrationRoleConfig, named_orchestrator: bool) -> Self {
-        let is_named = role.name == "orchestrator";
-        match (role.start, is_named, named_orchestrator) {
-            (true, true, _) | (true, false, false) => Self::Always,
-            (true, false, true) | (false, true, _) => Self::DependsOnPath,
-            (false, false, _) => Self::Never,
-        }
-    }
-}
-
 /// Issue #1243: the warning for a role whose `command` resolves to no agent and
 /// which declares none, or `None` when the deck can identify it (or when the
 /// command is empty, which is an error of its own).
@@ -565,20 +533,23 @@ impl OrchestratorSeat {
 /// (`spawn` resolves the wrapper from the same type), but the message says that
 /// instead of a wait they never pay.
 ///
-/// Which role is the orchestrator is not always one answer, which is why the
-/// caller passes an [`OrchestratorSeat`] rather than this reading `role.start`.
+/// `is_orchestrator` is the caller's answer from
+/// [`crate::project_config::OrchestrationConfig::orchestrator_role_index`] —
+/// the one rule both spawn paths seat by (issue #523) — rather than this
+/// reading `role.start`, which is false for every role of a config that flags
+/// none.
 fn unidentified_role_agent_issue(
     scope: &str,
     role: &crate::project_config::OrchestrationRoleConfig,
-    seat: OrchestratorSeat,
+    is_orchestrator: bool,
 ) -> Option<ValidationIssue> {
     if role.command.trim().is_empty() || role.resolved_agent_type().is_some() {
         return None;
     }
     let command = bound_chars(role.command.trim(), MAX_QUOTED_VALUE_CHARS);
-    let consequence = if seat == OrchestratorSeat::Always {
+    let consequence = if is_orchestrator {
         "the card gets no agent from the config, and if the agent behind it is Codex it runs \
-         without the deck's wrapper. It is the start role, which is never a delegate target, so \
+         without the deck's wrapper. It is the orchestrator, which is never a delegate target, so \
          it never waits on the readiness timeout"
     } else if role.clear {
         "the card gets no agent from the config, and a Codex, Pi or OpenCode worker behind it \
@@ -588,19 +559,12 @@ fn unidentified_role_agent_issue(
          without the deck's wrapper. It keeps its process across delegations (`clear = false`), \
          so no delegation waits on the readiness timeout"
     };
-    let seat_note = if seat == OrchestratorSeat::DependsOnPath {
-        ". Whether it receives delegations at all depends on how the tab is opened, because the \
-         `start = true` role is not the one named `orchestrator`; give `start = true` to the role \
-         named `orchestrator`, or rename that role, to make it one answer"
-    } else {
-        ""
-    };
     Some(ValidationIssue {
         severity: Severity::Warning,
         scope: scope.to_string(),
         message: format!(
             "role '{}': the deck cannot tell which agent `{command}` launches and the role \
-             declares no `agent` — {consequence}{seat_note}. Declare the agent, e.g. \
+             declares no `agent` — {consequence}. Declare the agent, e.g. \
              `agent = \"codex\"`; known agents: {}",
             bound_chars(&role.name, MAX_QUOTED_VALUE_CHARS),
             crate::agent_registry::declarable_agent_names().join(", ")
@@ -1126,7 +1090,17 @@ mod tests {
     #[test]
     fn unidentified_role_warning_claims_the_timeout_only_for_a_respawned_worker() {
         let warning_for = |role: OrchestrationRoleConfig| -> String {
-            let config = make_orch_config(vec![make_orchestration("orch", vec![role])]);
+            // A companion whose agent the deck CAN identify, so it warns about
+            // nothing itself: the flagged orchestrator beside a worker under
+            // test, or a worker beside a flagged one. Alone, a role is its
+            // orchestration's orchestrator by the role-0 fallback (issue #523),
+            // whatever its flag.
+            let companion = if role.start {
+                make_role("coder", false)
+            } else {
+                make_role("lead", true)
+            };
+            let config = make_orch_config(vec![make_orchestration("orch", vec![companion, role])]);
             let warned: Vec<String> = validate_config(&config)
                 .into_iter()
                 .filter(|i| {
@@ -1184,11 +1158,12 @@ mod tests {
             "the persistent-worker warning names the setting that makes it so"
         );
 
-        // Qodo on PR #1331: which role is the orchestrator depends on the path
-        // that opened the tab (issue #523) — `spawn` takes the role NAMED
-        // `orchestrator` first, `Ctrl+N` the `start = true` one. A start role
-        // that is not named `orchestrator` is the orchestrator on both paths
-        // only when no other role carries that name.
+        // Issue #523: which role is the orchestrator is ONE answer whichever
+        // path opens the tab — the `start = true` role, else the role named
+        // `orchestrator` — so the warning names the seat without hedging. (Before
+        // #523 it could not: `spawn` took the NAME first and `Ctrl+N` the flag,
+        // and the warning said "depends on how the tab is opened", Qodo on PR
+        // #1331.)
         let messages = |roles: Vec<OrchestrationRoleConfig>| -> Vec<String> {
             validate_config(&make_orch_config(vec![make_orchestration("orch", roles)]))
                 .into_iter()
@@ -1206,36 +1181,48 @@ mod tests {
         assert!(
             unambiguous
                 .iter()
-                .any(|w| w.starts_with("role 'planner':") && w.contains("start role")),
+                .any(|w| w.starts_with("role 'planner':") && w.contains("It is the orchestrator")),
             "with no role named `orchestrator`, the start role is never delegated to; \
              got {unambiguous:?}"
         );
 
-        let split = messages(vec![
+        let is_seated = |warnings: &[String], role: &str| -> bool {
+            warnings
+                .iter()
+                .find(|w| w.starts_with(&format!("role '{role}':")))
+                .unwrap_or_else(|| panic!("no warning for '{role}'; got {warnings:?}"))
+                .contains("It is the orchestrator")
+        };
+
+        // Flagged beside a role merely NAMED `orchestrator`: the flag wins.
+        let flagged = messages(vec![
             launcher("planner", true),
             launcher("orchestrator", false),
             launcher("coder", false),
         ]);
-        assert_eq!(split.len(), 3, "every launcher role warns; got {split:?}");
-        for role in ["planner", "orchestrator"] {
-            let warning = split
-                .iter()
-                .find(|w| w.starts_with(&format!("role '{role}':")))
-                .unwrap_or_else(|| panic!("no warning for '{role}'; got {split:?}"));
-            assert!(
-                !warning.contains("start role") && warning.contains("depends on how the tab"),
-                "beside a role named `orchestrator`, '{role}' is the orchestrator on one path and \
-                 a worker on the other, so it is told exactly that; got {warning}"
-            );
-        }
-        let coder = split
-            .iter()
-            .find(|w| w.starts_with("role 'coder':"))
-            .expect("a warning for 'coder'");
-        assert!(
-            !coder.contains("depends on how the tab"),
-            "a worker on every path carries no seat note; got {coder}"
+        assert_eq!(
+            flagged.len(),
+            3,
+            "every launcher role warns; got {flagged:?}"
         );
+        assert!(is_seated(&flagged, "planner"), "got {flagged:?}");
+        assert!(!is_seated(&flagged, "orchestrator"), "got {flagged:?}");
+        assert!(!is_seated(&flagged, "coder"), "got {flagged:?}");
+        assert!(
+            flagged
+                .iter()
+                .all(|w| !w.contains("depends on how the tab")),
+            "no path-dependent seat is left to warn about; got {flagged:?}"
+        );
+
+        // No flag at all: the NAMED role is the orchestrator (issue #523's
+        // config), even though it is not first.
+        let unflagged = messages(vec![
+            launcher("coder", false),
+            launcher("orchestrator", false),
+        ]);
+        assert!(is_seated(&unflagged, "orchestrator"), "got {unflagged:?}");
+        assert!(!is_seated(&unflagged, "coder"), "got {unflagged:?}");
     }
 
     /// Issue #308 audit (MEDIUM): every control character a `.dot-agent-deck.toml`

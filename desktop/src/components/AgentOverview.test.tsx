@@ -1714,14 +1714,24 @@ describe("AgentOverview", () => {
    * a daemon it refuses for a stamp difference alone has to offer the same way
    * out the daemon does — not a pointer to another screen.
    */
-  /** Scenario: Offers Connect anyway on the overview when only the build stamps differ. */
-  it("offers Connect anyway on the overview when only the build stamps differ", async () => {
+  /**
+   * Scenario: Opens the overview against a daemon one declared contract break
+   * behind this app, and offers Connect anyway without claiming that only the
+   * build stamps differ.
+   *
+   * The message is the sentence `contract_refusal` in `daemon_bridge.rs`
+   * actually produces: since #801 that is the only thing that sets
+   * `buildStampMismatchOnly`, so the hint beside the button must describe a
+   * declared break, not a stamp difference. Reported against v0.43.0, whose
+   * hint read "Only the build stamps differ" under a contract mismatch.
+   */
+  it("offers Connect anyway on the overview across a declared contract break", async () => {
     const snapshot = createFixtureSnapshot("error");
     snapshot.connection = {
       ...snapshot.connection,
       daemonDetected: true,
       runningAgentCount: 9,
-      message: "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. The deck reports 9 live agents; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
+      message: "contract mismatch: the daemon is behind this app across 708-worker-failure-reports-submitted. Protocol 10 matched on both sides, so the frames decode — but a declared compatibility break sits between these two builds, so a field can be read with the wrong meaning rather than failing outright. Builds: desktop is 0.43.0, daemon is 0.42.0. The daemon reports 9 live agents; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
       buildStampMismatchOnly: true,
     };
     const runAction = vi.fn(async () => ({ ok: true }) as import("../types").DeckActionResult);
@@ -1730,9 +1740,14 @@ describe("AgentOverview", () => {
     render(<AgentOverview runtime={deck} onNavigate={vi.fn()} />);
 
     expect(screen.getByTestId("overview-incompatible")).toBeVisible();
+    const hint = within(screen.getByTestId("overview-incompatible")).getByText(/reports 9 running agents/);
+    expect(hint).not.toHaveTextContent("Only the build stamps differ");
+    expect(hint).toHaveTextContent("a declared compatibility break separates this daemon from this app");
     fireEvent.click(screen.getByTestId("overview-connect-anyway"));
     expect(runAction).not.toHaveBeenCalled();
     expect(screen.getByRole("alertdialog")).toHaveTextContent("The wire protocol matched on both sides");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("a declared compatibility break separates the two builds");
+    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("stamp difference");
     fireEvent.click(screen.getAllByRole("button", { name: "Connect anyway" }).at(-1)!);
 
     await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch" }));

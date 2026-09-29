@@ -3,25 +3,47 @@ sidebar_position: 4
 title: Session Management
 ---
 
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
 # Session Management
 
 ## Session Statuses
 
-Each session card shows the agent's current state:
+The daemon tracks each agent's state from the events its hooks report, and both clients show it: the TUI on each agent's card, the desktop app in the **Status** column of the [Dashboard](desktop/dashboard.md).
 
-| Status | Meaning |
-|---|---|
-| **Thinking** | Agent is reasoning before acting |
-| **Working** | Agent is executing a tool (tool name shown) |
-| **Compacting** | Context window is being compressed |
-| **WaitingForInput** | Agent needs user approval or input |
-| **Idle** | Agent is between tasks |
-| **Error** | Something went wrong |
-| **Blocked** | The agent reported that its provider refused it because a usage limit or credit pool is exhausted. A line under `Dir:` says which limit and, when the provider says, when it resets. It clears only when the agent works again (a new prompt, a tool, a permission prompt) or when its pane restarts. Work done by a subagent does not count, since the card describes the main agent, and a subagent that hits a limit does not turn the card Blocked either: the main agent reports its own limit when it meets one. There is no timer, because a spent credit pool does not reset on its own. Covered: **Claude Code** 2.1.78 or newer (its `StopFailure` hook), **Codex** (its session log, read while a turn is running) and **OpenCode** (the structured fields of its `session.error` event). While OpenCode is still retrying a refused request, its card shows `Thinking`; it turns Blocked once OpenCode gives up and reports the error. **Not covered:** Pi and Devin report no structured quota signal, so their cards never show Blocked; neither does an Anthropic "credit balance is too low" error reached through OpenCode, which carries no machine-readable marker. |
+<Tabs groupId="client">
+<TabItem value="tui" label="TUI">
+
+![The TUI with four agent cards, each with its status in the card's title row: Idle, Working, Working and Needs Input](/img/dashboard-tui.png)
+
+</TabItem>
+<TabItem value="desktop" label="Desktop">
+
+![The desktop app's dashboard with four agents, each row starting with its status: waiting or running](/img/dashboard-desktop.png)
+
+</TabItem>
+</Tabs>
+
+The TUI shows seven statuses. The desktop app folds them into four, shown in the last column:
+
+| TUI status | Meaning | Desktop |
+|---|---|---|
+| **Thinking** | Agent is reasoning before acting | RUNNING |
+| **Working** | Agent is executing a tool (tool name shown) | RUNNING |
+| **Compacting** | Context window is being compressed | RUNNING |
+| **Needs Input** | Agent needs user approval or input (`WaitingForInput` in `dot-agent-deck daemon status`) | WAITING |
+| **Idle** | Agent is between tasks | WAITING |
+| **Error** | Something went wrong. That includes a turn the provider rejected for a reason other than a usage limit, such as an API error or a model the account cannot use. Covered: **Claude Code** 2.1.78 or newer (its `StopFailure` hook), **Codex** (its session log, read while a turn is running, since Codex runs no hook for a failed turn; the card turns Error a few seconds after the failure) and **OpenCode** (its `session.error` event). A usage-limit refusal shows **Blocked** instead. **Not covered:** Pi and Devin give the deck no signal for a failed provider turn (Pi's `agent-event` has no error state, and the deck installs no failure hook for Devin), so such a failure does not turn their cards Error. | FAILED |
+| **Blocked** | The agent reported that its provider refused it because a usage limit or credit pool is exhausted. In the TUI, a line under `Dir:` says which limit and, when the provider says, when it resets. It clears only when the agent works again (a new prompt, a tool, a permission prompt) or when its pane restarts. Work done by a subagent does not count, since the card describes the main agent, and a subagent that hits a limit does not turn the card Blocked either: the main agent reports its own limit when it meets one. There is no timer, because a spent credit pool does not reset on its own. Covered: **Claude Code** 2.1.78 or newer (its `StopFailure` hook), **Codex** (its session log, read while a turn is running) and **OpenCode** (the structured fields of its `session.error` event). While OpenCode is still retrying a refused request, its card shows `Thinking`; it turns Blocked once OpenCode gives up and reports the error. **Not covered:** Pi and Devin report no structured quota signal, so their cards never show Blocked; neither does an Anthropic "credit balance is too low" error reached through OpenCode, which carries no machine-readable marker. In the desktop app, the reason is shown in the agent's pane. | BLOCKED |
 
 The Claude Code hook and the OpenCode plugin that report Blocked are installed when the TUI or the deck's background daemon starts, so the desktop app gets them too, but only into configuration that already exists: the Claude Code hook when `~/.claude` exists, and the OpenCode plugin when `~/.config/opencode` (or `$XDG_CONFIG_HOME/opencode`) or `~/.opencode` exists. If that directory did not exist yet when the deck started, for example because the agent had never run on this machine, nothing was installed for that agent: run `dot-agent-deck hooks install` (or `dot-agent-deck hooks install --agent opencode`), which creates it, or restart the daemon once the directory exists. An agent that was already running may need a restart to pick them up. The Claude Code hook is installed only when `claude --version` reports 2.1.78 or newer, because the older Claude Code releases we tested ignore every hook in the settings file when this one is present. A daemon still running from before an upgrade installs them the next time it starts; to install them without waiting, on this machine or on a remote host, run `dot-agent-deck hooks install` there (and `dot-agent-deck hooks install --agent opencode` for OpenCode).
 
 When a worker that still owes a `work-done` turns Blocked, the daemon submits a one-time report to its orchestrator, which can then reassign the task to a role on another provider or account, or notify you. The delegation stays outstanding.
+
+### What a TUI card shows
+
+*This section is about the TUI. The desktop app's rows and columns are described on [Desktop app → Dashboard](desktop/dashboard.md#rows-and-columns).*
 
 Cards also display:
 
@@ -47,6 +69,8 @@ The more agents you run in parallel, the more cards Agent Deck has to fit on the
 
 ## Resuming Sessions
 
+*This section is about the TUI. The desktop app keeps no workspace of its own: it shows whatever agents the daemon has, and closing it leaves them running.*
+
 Agent Deck restores your workspace automatically. There is no flag to pass and no decision to make: every time you launch the TUI — `dot-agent-deck` locally or `dot-agent-deck connect <name>` for a remote machine — your previous panes, names, directories, commands, and tabs come back. If you would rather start from an empty dashboard, see [Starting Fresh](#starting-fresh) below.
 
 What you get back depends on whether your agents are still running — and that is usually settled on the way out. `Ctrl+C` from command mode opens the quit dialog:
@@ -57,7 +81,7 @@ What you get back depends on whether your agents are still running — and that 
 
 That leaves two cases when you come back:
 
-- **They're still running.** When you close the TUI or disconnect, your agents keep running in the background (see [How it runs](getting-started.md#how-it-runs)), so coming back brings them up exactly as they were, with their live output. Each card is restored with the agent's *real, current* state as well — its status (Working, Thinking, WaitingForInput, Idle, and so on), its agent label, the tool it is mid-run on, its tool count, and its recent prompts — so the reconnected dashboard matches what you saw before you disconnected. It does **not** reset every card to Idle (or show "No agent") and then wait for each agent to emit its next event to become correct. If you reopen your laptop to an agent that has been quietly waiting for input, its card reads **WaitingForInput** straight away. This is the everyday case.
+- **They're still running.** When you close the TUI or disconnect, your agents keep running in the background (see [How it runs](getting-started.md#how-it-runs)), so coming back brings them up exactly as they were, with their live output. Each card is restored with the agent's *real, current* state as well — its status (Working, Thinking, Needs Input, Idle, and so on), its agent label, the tool it is mid-run on, its tool count, and its recent prompts — so the reconnected dashboard matches what you saw before you disconnected. It does **not** reset every card to Idle (or show "No agent") and then wait for each agent to emit its next event to become correct. If you reopen your laptop to an agent that has been quietly waiting for input, its card reads **Needs Input** straight away. This is the everyday case.
 - **They're gone.** On a fresh machine, the first launch after a reboot, or after an unexpected shutdown, Agent Deck rebuilds your workspace — panes, names, directories, commands, and tabs — and starts the agents fresh. It restores the *shape* of your workspace, not an agent's in-progress work; each agent picks its own conversation back up through its own command (for example, `claude --continue`).
 
 If there's nothing to bring back, you start on a clean, empty dashboard. If a saved directory no longer exists, that pane is skipped with a warning.

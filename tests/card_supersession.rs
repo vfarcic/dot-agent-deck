@@ -1,6 +1,7 @@
 use chrono::{Duration, Utc};
 use dot_agent_deck::event::{
-    AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType, LiveTarget, TargetKind, Writable,
+    AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType, GenerationVerdict, LiveTarget,
+    PANE_GENERATION_METADATA_KEY, TargetKind, Writable,
 };
 use dot_agent_deck::state::{AppState, SessionSnapshot, SessionStatus};
 
@@ -1335,5 +1336,226 @@ fn status_supersede_018_a_future_stamped_snapshot_cannot_pin_the_reconnected_car
         tui.pane_writable(PANE_ID),
         Writable::Live,
         "pane_writable must follow the successor, not the pinned history-only card"
+    );
+}
+
+/// Issue #320: `event` as an attached TUI receives it from a daemon that has
+/// stamped its registry's generation verdict on it.
+fn stamped(mut event: AgentEvent, verdict: GenerationVerdict) -> AgentEvent {
+    event.metadata.insert(
+        PANE_GENERATION_METADATA_KEY.to_string(),
+        verdict.metadata_value().to_string(),
+    );
+    event
+}
+
+/// The agent id of every card on [`PANE_ID`], sorted.
+fn owners_on_pane(state: &AppState) -> Vec<Option<String>> {
+    let mut owners: Vec<Option<String>> = state
+        .sessions
+        .values()
+        .filter(|s| s.pane_id.as_deref() == Some(PANE_ID))
+        .map(|s| s.agent_id.clone())
+        .collect();
+    owners.sort();
+    owners
+}
+
+/// Scenario: A TUI shows the incoming agent's live card after a takeover. Two late frames from the OUTGOING agent then arrive, each marked by the daemon as coming from a displaced generation: a `SessionStart`, and a `Thinking` stamped an hour in the future. Neither may retire the live card or add a card beside it, even though both pass the old type-and-timestamp test; the same frames without the daemon's mark, as an older daemon relays them, are still ordered by that old test.
+#[spec("status/supersede/019")]
+#[test]
+fn status_supersede_019_a_displaced_generation_cannot_retire_the_live_card() {
+    let now = Utc::now();
+    let live = || {
+        let mut tui = AppState::default();
+        tui.register_pane(PANE_ID.to_string());
+        tui.apply_event(stamped(
+            event(
+                "incoming-session",
+                AgentType::ClaudeCode,
+                EventType::SessionStart,
+                Some("incoming-agent"),
+                now,
+            ),
+            GenerationVerdict::Current,
+        ));
+        assert_eq!(
+            owners_on_pane(&tui),
+            vec![Some("incoming-agent".to_string())],
+            "precondition: the incoming generation's card is the pane's only card"
+        );
+        tui
+    };
+    let late_frames = [
+        (EventType::SessionStart, now - Duration::seconds(30)),
+        (EventType::Thinking, now + Duration::hours(1)),
+    ];
+
+    for (event_type, stamp) in late_frames.clone() {
+        let mut tui = live();
+        tui.apply_event(stamped(
+            event(
+                "outgoing-session",
+                AgentType::ClaudeCode,
+                event_type.clone(),
+                Some("outgoing-agent"),
+                stamp,
+            ),
+            GenerationVerdict::Displaced,
+        ));
+        assert_eq!(
+            owners_on_pane(&tui),
+            vec![Some("incoming-agent".to_string())],
+            "a late {event_type:?} from a generation the daemon marked displaced retired \
+             the live card or stacked a second one"
+        );
+    }
+
+    // Control: without the mark the old ordering still applies, so it is the
+    // daemon's verdict, not the frames' shape, that the live card owes its
+    // survival to.
+    for (event_type, stamp) in late_frames {
+        let mut tui = live();
+        tui.apply_event(event(
+            "outgoing-session",
+            AgentType::ClaudeCode,
+            event_type.clone(),
+            Some("outgoing-agent"),
+            stamp,
+        ));
+        assert_eq!(
+            owners_on_pane(&tui),
+            vec![Some("outgoing-agent".to_string())],
+            "an unmarked late {event_type:?} is ordered by type and timestamp, as before"
+        );
+    }
+}
+
+/// Scenario: A Pi agent (which sends no `SessionStart`) is respawned on a pane, and its first frame reaches the TUI stamped EARLIER than the outgoing card's last activity, marked by the daemon as the pane's current generation. It must still retire the outgoing card, leaving one card owned by the new agent, because the daemon's generation verdict and not the producer clock orders the takeover. The same frame unmarked is still held back by the timestamp.
+#[spec("status/supersede/020")]
+#[test]
+fn status_supersede_020_the_current_generation_supersedes_whatever_it_is_stamped() {
+    let now = Utc::now();
+    let outgoing_card = || {
+        let mut tui = AppState::default();
+        tui.register_pane(PANE_ID.to_string());
+        tui.apply_event(event(
+            "outgoing-session",
+            AgentType::Pi,
+            EventType::Idle,
+            Some("outgoing-agent"),
+            now,
+        ));
+        tui
+    };
+    let first_frame = event(
+        "incoming-session",
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("incoming-agent"),
+        now - Duration::seconds(30),
+    );
+
+    let mut tui = outgoing_card();
+    tui.apply_event(stamped(first_frame.clone(), GenerationVerdict::Current));
+    assert_eq!(
+        owners_on_pane(&tui),
+        vec![Some("incoming-agent".to_string())],
+        "the pane's current generation must supersede the outgoing card however its \
+         first frame is stamped"
+    );
+
+    // Control: the unmarked frame is judged by its stamp and keeps both.
+    let mut tui = outgoing_card();
+    tui.apply_event(first_frame);
+    assert_eq!(
+        owners_on_pane(&tui),
+        vec![
+            Some("incoming-agent".to_string()),
+            Some("outgoing-agent".to_string())
+        ],
+        "an unmarked older-stamped frame is held back by the timestamp, as before"
+    );
+}
+
+/// Scenario: A pane's successor has reserved it but not reported yet, so the outgoing agent's card is still the one on screen when that agent's own `SessionEnd` arrives, marked by the daemon as coming from a displaced generation. The end must still end that card: the displaced mark refuses a frame's claim to a generation, and a `SessionEnd` makes none, so the card must not linger showing an agent that has finished.
+#[spec("status/supersede/021")]
+#[test]
+fn status_supersede_021_a_displaced_generation_still_ends_its_own_card() {
+    let now = Utc::now();
+    let mut tui = AppState::default();
+    tui.register_pane(PANE_ID.to_string());
+    tui.apply_event(event(
+        "outgoing-session",
+        AgentType::ClaudeCode,
+        EventType::SessionStart,
+        Some("outgoing-agent"),
+        now - Duration::seconds(30),
+    ));
+    assert_eq!(
+        owners_on_pane(&tui),
+        vec![Some("outgoing-agent".to_string())],
+        "precondition: the outgoing generation's card is the pane's card"
+    );
+
+    tui.apply_event(stamped(
+        event(
+            "outgoing-session",
+            AgentType::ClaudeCode,
+            EventType::SessionEnd,
+            Some("outgoing-agent"),
+            now,
+        ),
+        GenerationVerdict::Displaced,
+    ));
+    assert!(
+        !tui.sessions.contains_key("outgoing-session"),
+        "the outgoing agent's own SessionEnd must still end its card; the pane shows {:?}",
+        owners_on_pane(&tui)
+    );
+
+    // But only its OWN card. Pi reports every generation under the pane-derived
+    // `{pane_id}-session` key, so the successor's card can sit under the very
+    // key the outgoing agent's late end names — and the terminal branch removes
+    // by key. A displaced end that has no card of its own on the pane ends
+    // nothing.
+    let shared_key = format!("{PANE_ID}-session");
+    let mut tui = AppState::default();
+    tui.register_pane(PANE_ID.to_string());
+    tui.apply_event(stamped(
+        event(
+            &shared_key,
+            AgentType::Pi,
+            EventType::Thinking,
+            Some("incoming-agent"),
+            now,
+        ),
+        GenerationVerdict::Current,
+    ));
+    tui.apply_event(stamped(
+        event(
+            &shared_key,
+            AgentType::Pi,
+            EventType::SessionEnd,
+            Some("outgoing-agent"),
+            now + Duration::seconds(1),
+        ),
+        GenerationVerdict::Displaced,
+    ));
+    // Asserted on the card itself, not on the owners: the terminal branch
+    // rebuilds a bare placeholder carrying the removed card's `agent_id`, so a
+    // wiped successor still reads as "incoming-agent" by owner.
+    let successor = tui.sessions.get(&shared_key).unwrap_or_else(|| {
+        panic!(
+            "a displaced SessionEnd under the successor's session key removed the successor's \
+             card; the pane now holds {:?}",
+            tui.sessions.keys().collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(successor.agent_id.as_deref(), Some("incoming-agent"));
+    assert_eq!(
+        successor.status,
+        SessionStatus::Thinking,
+        "the successor's card must keep its own status"
     );
 }

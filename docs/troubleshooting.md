@@ -5,7 +5,11 @@ title: Troubleshooting
 
 # Troubleshooting
 
+Most of this page applies to both clients, the TUI and the [desktop app](desktop/index.md), because the problems live in the daemon or the agents they share. A section that applies to only one client says so under its heading. For a desktop app that shows **Daemon disconnected**, see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon).
+
 ## Shift+Enter Submits Instead of Inserting a Newline
+
+*Applies to the TUI.*
 
 Inside an embedded agent pane, **Shift+Enter** inserts a newline into the agent's draft and plain **Enter** submits it — the same behavior you get running the agent directly. This works with **no terminal configuration** on any terminal that implements the enhanced ("kitty") keyboard protocol, which the deck negotiates for you at startup.
 
@@ -28,7 +32,7 @@ Hooks are **auto-installed on every startup** — most users never need to think
 
 Auto-install is idempotent and best-effort — if an agent directory is missing the step is silently skipped, and errors are logged without blocking startup.
 
-The daemon half is what covers the desktop app: it starts only the daemon bundled inside it, never a dashboard, so a machine with the desktop app and no CLI installed gets the same hooks as one running the dashboard. Where there is no CLI install to point at, those hooks name the daemon bundled in the app, so moving or deleting the app leaves them pointing at nothing until the deck next starts and repairs them (below). The install runs when the daemon **starts**, so after upgrading the desktop app from a version that did not install these hooks, a daemon still running from before the upgrade keeps serving the app without them; they appear the next time the daemon starts.
+The daemon half is what covers the desktop app: the app never starts a dashboard, and the daemon it connects to installs the hooks whichever way that daemon was started (see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)), so a machine with the desktop app and no CLI installed gets the same hooks as one running the dashboard. When that daemon is the copy bundled in the app and there is no CLI install to point at, those hooks name the daemon bundled in the app, so moving or deleting the app leaves them pointing at nothing until the deck next starts and repairs them (below). The install runs when the daemon **starts**, so after upgrading the desktop app from a version that did not install these hooks, a daemon still running from before the upgrade keeps serving the app without them; they appear the next time the daemon starts.
 
 ### A hook fails with `not found` and names a path you never typed
 
@@ -60,6 +64,8 @@ If a Codex card still shows only coarse status with no tool or prompt detail, ch
 2. **Does your launcher re-export `CODEX_HOME`?** The deck pins the home it prepared onto the process it starts, but a script can override that before running `codex` — and the deck's hooks and trust records live in the *original* home. Drop the re-export, or point it at the same home the deck uses (`$CODEX_HOME`, else `~/.codex`).
 3. **Re-run the install manually** to see any error the silent startup step swallowed: `dot-agent-deck hooks install --agent codex`.
 4. **Approve them by hand as a fallback:** run Codex once and approve the deck's hooks in its interactive `/hooks` review. Codex remembers that trust for subsequent runs.
+
+While those hooks are not trusted — or if you switch the deck's `UserPromptSubmit` hook off in Codex's `/hooks` list — Codex also cannot tell the deck that it received an automatic prompt — a mode's seed, an orchestration role's first task, a dispatched unit's task. The deck then types such a prompt in **once** and does not retry it, rather than risk giving Codex the same task twice. If a Codex pane's automatic prompt sometimes goes missing, fixing the trust step above is also the fix for that.
 
 Trust is pinned to each hook's exact content, so it deliberately fails *closed*: if a definition changes underneath a trust record, Codex refuses to run it and the card falls back to coarse status rather than running something unreviewed. Re-running the install re-records trust for the new content.
 
@@ -124,6 +130,8 @@ If `command -v` finds the command in your login shell but a pane still can't spa
 After upgrading the `dot-agent-deck` binary, the new TUI can keep talking to a daemon that was spawned by the *previous* version. The wire format stays compatible, but newer features (delegate role maps, orchestration tab fields, and similar internal refactors) silently no-op because the older daemon doesn't know about the newer shape.
 
 This only happens when you are **deliberately** still on the older daemon. The common cause: you upgraded while agents were running, the launch prompt warned that restarting would stop them, and you **declined the restart to keep your agents** — which leaves the new TUI attached to the older daemon on purpose. (It can also happen with a very old, pre-handshake binary that attached without any version check.) With no agents running, the handshake restarts the daemon silently, so a fresh daemon at the new version is the normal outcome.
+
+When the upgrade changed the wire format itself — the attach protocol — declining does not leave you attached at all: the TUI refuses with `error: daemon speaks attach protocol vN, but this binary speaks vM` and exits, leaving the daemon and its agents running. See [Upgrading](installation.md#upgrading) for the two ways on from there.
 
 ### Symptom
 
@@ -238,6 +246,8 @@ There is no in-place recovery for a pane that is already orphaned — re-dispatc
 
 ## A pane says "disconnected" and ignores what you type
 
+*Applies to the TUI.*
+
 A pane whose title ends in `— disconnected` is no longer connected to an agent. Its last output stays on screen so you can read what happened, but the pane cannot accept input again — typing into it reports that it is disconnected rather than sending anything. Close the pane and start a new one; there is nothing to recover in place.
 
 The deck reaches this state only after it has already tried to reconnect and failed. When an agent goes away — a crash, an external `kill`, or a restart that never comes back — the deck looks the agent up again and re-attaches, which is what makes a normal respawn invisible to you. It gives up in two cases, and the status message tells you which:
@@ -308,6 +318,8 @@ Switching between the desktop app and a TUI that show the same agent changes its
 The agent's own output fills the history back in as it keeps working.
 
 ## The deck is missing cards — a role or agent I know is running has no card
+
+*Applies to the TUI.*
 
 Check the deck's title row first. If it reads something like `dot-agent-deck — 7 agent(s)  (↓2)`, nothing is wrong with the agents: the count is right, and the `(↓2)` says two cards are below the bottom of the window. `(↑2)` means two are above it, and both appear together when you are scrolled into the middle. Move the selection with `j` / `k` (or the arrow keys) to bring them into view, or give the terminal a few more rows and they all fit again.
 

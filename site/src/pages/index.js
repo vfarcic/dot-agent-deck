@@ -5,7 +5,7 @@ import {
   agents,
   agentsNote,
   audience,
-  desktop,
+  clients,
   docLinks,
   installCommand,
   installRoutes,
@@ -13,6 +13,7 @@ import {
   principles,
   product,
   screenshots,
+  verify,
   why,
   workflow,
 } from '@site/src/data/landing-content';
@@ -59,7 +60,7 @@ const doorPages = [
   {
     to: docLinks.gettingStarted,
     title: 'Getting started',
-    body: 'Install it, open your first pane, and read the card it gives you.',
+    body: 'Install it, start your first agent, and read what the deck shows you about it.',
   },
   {
     to: docLinks.orchestration,
@@ -72,9 +73,14 @@ const doorPages = [
     body: 'Start isolated work in its own copy of the repo, just by asking for it.',
   },
   {
+    to: docLinks.desktop,
+    title: 'Desktop app',
+    body: 'The dashboard over several daemons, New agent, Settings and voice control.',
+  },
+  {
     to: docLinks.keyboard,
     title: 'Keyboard shortcuts',
-    body: 'The full key map, and the TOML that rebinds most of it.',
+    body: 'The terminal UI’s full key map, and the TOML that rebinds most of it.',
   },
   {
     to: docLinks.remote,
@@ -97,22 +103,38 @@ const doorPages = [
 const COUNT_WORDS = ['No', 'One', 'Two', 'Three', 'Four', 'Five', 'Six'];
 
 /**
- * Which layout a story row takes. A step with no frame stands alone;
- * everything else alternates sides down the page.
- *
- * A `wide` flag used to take a third branch here, stacking the text over a
- * full-measure frame for the old row 04 band. That frame is gone and the flag
- * went with it, so no row leaves the alternation any more. The surviving
- * `tall` flag is read below, on the <figure> rather than on the row: it caps
- * how wide a frame runs inside its own column and does not change which
- * layout the row takes. `landing-content.js` carries the arithmetic.
+ * The frames a story step shows, in order: the terminal UI's, then the desktop
+ * app's (PRD #1321). The home page shows both clients at once rather than
+ * asking the reader to choose one, so each frame carries its client's name as
+ * a label above it. A step missing one client's frame shows the other alone,
+ * and row 04, which has no desktop frame, adds `desktopNote` to its caption to
+ * say what the desktop app does there instead.
  */
-function storyRowClass(step, index) {
-  if (!step.shot) {
-    return styles.storyRowSolo;
+const STORY_CLIENTS = [
+  {key: 'tui', label: 'Terminal UI'},
+  {key: 'desktop', label: 'Desktop app'},
+];
+
+function storyFrames(step) {
+  if (!step.shots) {
+    return [];
   }
-  return index % 2 === 0 ? styles.storyRow : styles.storyRowFlip;
+  return STORY_CLIENTS.filter((c) => step.shots[c.key]).map((c) => ({
+    key: c.key,
+    label: c.label,
+    shot: step.shots[c.key],
+  }));
 }
+
+/**
+ * The hero's two windows, terminal UI first. The title in each window bar is
+ * what that client's own window is called: the binary for the terminal UI,
+ * the app's product name for the desktop app.
+ */
+const HERO_FRAMES = [
+  {label: 'Terminal UI', title: product.binary, shot: screenshots.hero},
+  {label: 'Desktop app', title: product.name, shot: screenshots.heroDesktop},
+];
 
 /*
  * The command is emitted one word per inline-block rather than as one string,
@@ -172,20 +194,36 @@ export default function Home() {
 
         <main>
           <section className={styles.showcase}>
-            <figure className={styles.device}>
-              <div className={styles.deviceBar} aria-hidden="true">
-                <span className={styles.light} />
-                <span className={styles.light} />
-                <span className={styles.light} />
-                <span className={styles.deviceTitle}>{product.binary}</span>
-              </div>
-              <img
-                className={styles.deviceImage}
-                src={screenshots.hero.src}
-                alt={screenshots.hero.alt}
-              />
-            </figure>
-            <p className={styles.showcaseCaption}>{screenshots.hero.caption}</p>
+            {/*
+              * Both clients, side by side (PRD #1321): each column's width is
+              * its frame's aspect ratio, so the two windows stand the same
+              * height. They stack on narrow screens.
+              */}
+            <div
+              className={styles.showcasePair}
+              style={{
+                '--hero-columns': HERO_FRAMES.map(
+                  (f) => `minmax(0, ${f.shot.aspect}fr)`,
+                ).join(' '),
+              }}>
+              {HERO_FRAMES.map((f) => (
+                <figure key={f.label} className={styles.device}>
+                  <div className={styles.deviceBar} aria-hidden="true">
+                    <span className={styles.light} />
+                    <span className={styles.light} />
+                    <span className={styles.light} />
+                    <span className={styles.deviceTitle}>{f.title}</span>
+                    <span className={styles.deviceLabel}>{f.label}</span>
+                  </div>
+                  <img
+                    className={styles.deviceImage}
+                    src={f.shot.src}
+                    alt={f.shot.alt}
+                  />
+                </figure>
+              ))}
+            </div>
+            <p className={styles.showcaseCaption}>{screenshots.heroCaption}</p>
           </section>
 
           <section className={styles.agentStrip}>
@@ -200,6 +238,25 @@ export default function Home() {
               ))}
             </ul>
             <p className={styles.agentStripNote}>{agentsNote}</p>
+          </section>
+
+          <section className={styles.clients} aria-labelledby="clients-title">
+            <h2 id="clients-title" className={styles.sectionTitle}>
+              {clients.heading}
+            </h2>
+            <p className={styles.clientsIntro}>{clients.intro}</p>
+            <div className={styles.clientGrid}>
+              {clients.items.map((c) => (
+                <article key={c.title} className={styles.clientCard}>
+                  <img src={c.shot.src} alt={c.shot.alt} loading="lazy" />
+                  <h3>{c.title}</h3>
+                  <p>{c.body}</p>
+                  <p className={styles.clientLink}>
+                    <Link to={c.link.to}>{c.link.label}</Link>
+                  </p>
+                </article>
+              ))}
+            </div>
           </section>
 
           <section className={styles.why}>
@@ -222,30 +279,45 @@ export default function Home() {
             <h2 id="story-title" className={styles.visuallyHidden}>
               How it works
             </h2>
-            {workflow.map((step, i) => (
-              <div key={step.step} className={storyRowClass(step, i)}>
-                <div className={styles.storyText}>
-                  <span className={styles.storyStep}>{step.step}</span>
-                  <h3>{step.title}</h3>
-                  <p>{step.body}</p>
+            {workflow.map((step) => {
+              const frames = storyFrames(step);
+              return (
+                <div key={step.step} className={styles.storyRow}>
+                  <div className={styles.storyText}>
+                    <span className={styles.storyStep}>{step.step}</span>
+                    <h3>{step.title}</h3>
+                    <p>{step.body}</p>
+                  </div>
+                  {frames.length > 0 ? (
+                    <div
+                      className={
+                        frames.length === 1
+                          ? `${styles.storyFigures} ${styles.storyFiguresSingle}`
+                          : styles.storyFigures
+                      }>
+                      {frames.map((f) => (
+                        <figure key={f.key} className={styles.storyFigure}>
+                          <span className={styles.storyFigureLabel}>
+                            {f.label}
+                          </span>
+                          <img
+                            src={f.shot.src}
+                            alt={f.shot.alt}
+                            loading="lazy"
+                          />
+                          <figcaption>
+                            {f.shot.caption}
+                            {f.key === 'tui' && !step.shots.desktop && step.desktopNote
+                              ? ` ${step.desktopNote}`
+                              : null}
+                          </figcaption>
+                        </figure>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
-                {step.shot ? (
-                  <figure
-                    className={
-                      step.shot.tall
-                        ? `${styles.storyFigure} ${styles.storyFigureTall}`
-                        : styles.storyFigure
-                    }>
-                    <img
-                      src={step.shot.src}
-                      alt={step.shot.alt}
-                      loading="lazy"
-                    />
-                    <figcaption>{step.shot.caption}</figcaption>
-                  </figure>
-                ) : null}
-              </div>
-            ))}
+              );
+            })}
           </section>
 
           <section className={styles.audience}>
@@ -279,35 +351,6 @@ export default function Home() {
                   <p>{p.description}</p>
                 </article>
               ))}
-            </div>
-          </section>
-
-          <section className={styles.desktop}>
-            <div className={styles.desktopInner}>
-              <span className={styles.alphaBadge}>Alpha</span>
-              <h2 className={styles.sectionTitle}>{desktop.heading}</h2>
-              <p className={styles.desktopLede}>{desktop.intro}</p>
-              <div className={styles.desktopGrid}>
-                {desktop.caveats.map((c) => (
-                  <div key={c.title} className={styles.desktopCaveat}>
-                    <h3>{c.title}</h3>
-                    <p>{c.body}</p>
-                  </div>
-                ))}
-              </div>
-              <p className={styles.desktopFiles}>
-                {desktop.artifacts.map((a) => (
-                  <code key={a.file}>{a.file}</code>
-                ))}
-              </p>
-              <p className={styles.desktopProvenance}>{desktop.provenanceNote}</p>
-              <InstallPill command={desktop.provenanceCommand} />
-              <p className={styles.desktopProvenanceScope}>
-                {desktop.provenanceScope}
-              </p>
-              <p className={styles.desktopLink}>
-                <Link href={product.releases}>Get it from the latest release →</Link>
-              </p>
             </div>
           </section>
 
@@ -350,6 +393,20 @@ export default function Home() {
                         {r.code ? (
                           <code className={styles.routeCode}>{r.code}</code>
                         ) : null}
+                        {r.files ? (
+                          <span className={styles.routeFiles}>
+                            {r.files.map((f) => (
+                              <code key={f} className={styles.routeCode}>
+                                {f}
+                              </code>
+                            ))}
+                          </span>
+                        ) : null}
+                        {r.link ? (
+                          <span className={styles.routeLink}>
+                            <Link to={r.link.to}>{r.link.label}</Link>
+                          </span>
+                        ) : null}
                       </li>
                     ))}
                   </ul>
@@ -359,6 +416,12 @@ export default function Home() {
                     </Link>
                   </p>
                 </div>
+              </div>
+              <div className={styles.verify}>
+                <h3 className={styles.installHeading}>{verify.heading}</h3>
+                <p className={styles.verifyNote}>{verify.note}</p>
+                <InstallPill command={verify.command} />
+                <p className={styles.verifyScope}>{verify.scope}</p>
               </div>
             </div>
           </section>

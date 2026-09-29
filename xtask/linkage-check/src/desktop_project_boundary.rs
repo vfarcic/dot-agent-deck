@@ -136,6 +136,22 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     "daemon_client",
     "daemon_protocol",
     "daemon_stop",
+    // Issue #1350, argued rather than added quietly. `deck_list` reads and
+    // edits `remotes.toml`, the user's list of WHICH daemons to connect to —
+    // the CLI's `connect` registry, which the desktop now shares as its deck
+    // list. That list is the client's by definition: it names the daemons, so
+    // no daemon can be asked for it, and a daemon holding it would have to be
+    // reached before the client knew where it was. It is not a project either:
+    // the file is a per-user config file resolved from the user's config
+    // directory (or `DOT_AGENT_DECK_REMOTES`), never from a project directory.
+    //
+    // CLAUDE.md rule 18 and #1350 put the format in ONE library in the root
+    // crate so the two clients cannot drift; a desktop-side copy of it would be
+    // the second list this rule's neighbours exist to prevent. Checked against
+    // this rule's lines: the module resolves no project, reads no project state
+    // file, names no FORBIDDEN_SYMBOL or project-state literal, and contains no
+    // `std::env::current_dir` — all zero for it.
+    "deck_list",
     "event",
     // Issue #1198, argued rather than added quietly. The desktop names two
     // things here: the five `show_desktop_*` wrappers, one per surface the
