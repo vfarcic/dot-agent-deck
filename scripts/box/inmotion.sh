@@ -148,9 +148,15 @@ resolve_cidrs() {
     [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "unexpected public IP answer: $ip"
     ALLOW_CIDRS=("$ip/32")
   fi
-  local cidr
+  # Every CIDR is checked as a real IPv4 network before any rule changes, so
+  # OpenStack cannot reject one after the rules for the earlier ones are in.
+  local cidr octet
   for cidr in "${ALLOW_CIDRS[@]}"; do
-    [[ "$cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] || die "not an IPv4 CIDR: $cidr"
+    [[ "$cidr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] || die "not an IPv4 CIDR: $cidr"
+    for octet in "${BASH_REMATCH[@]:1:4}"; do
+      [ $((10#$octet)) -le 255 ] || die "not an IPv4 CIDR (octet $octet > 255): $cidr"
+    done
+    [ $((10#${BASH_REMATCH[5]})) -le 32 ] || die "not an IPv4 CIDR (prefix /${BASH_REMATCH[5]} > 32): $cidr"
   done
 }
 
