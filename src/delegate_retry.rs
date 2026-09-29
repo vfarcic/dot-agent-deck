@@ -1721,6 +1721,7 @@ async fn redeliver(
             std::time::Instant::now(),
             &mut dispatch_hold,
             SubmitGate::Delay,
+            || {},
         )
         .await
         .map(|sent| sent.detail);

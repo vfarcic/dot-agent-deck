@@ -4061,6 +4061,10 @@ impl std::io::Write for PaneWriter {
     }
 }
 
+/// See [`AgentPtyRegistry::pause_next_echo_watch_for_test`].
+#[cfg(test)]
+type EchoWatchPause = Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>;
+
 /// In-process registry of agent PTYs owned by the daemon. M1.1 only exposed
 /// the in-process API; M1.2 wires it to the streaming attach protocol via
 /// [`AgentBus`] and [`AttachHandle`].
@@ -4246,6 +4250,11 @@ pub struct AgentPtyRegistry {
     codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms,
     /// Issue #1383: see [`Self::pending_deliveries`].
     pending_deliveries: crate::delegate_retry::PendingDeliveries,
+    /// Issue #1383 test seam: when set, the next [`Self::echo_watch`] reports
+    /// that it reached its setup and waits there for the release — see
+    /// [`Self::pause_next_echo_watch_for_test`].
+    #[cfg(test)]
+    echo_watch_pause: EchoWatchPause,
 }
 
 /// PRD #1105 — the shortest gap between two focus passes, and so the bound on
@@ -5744,6 +5753,8 @@ impl AgentPtyRegistry {
             focus_applied: tokio::sync::watch::Sender::new(0),
             codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms::default(),
             pending_deliveries: crate::delegate_retry::PendingDeliveries::default(),
+            #[cfg(test)]
+            echo_watch_pause: Mutex::new(None),
         }
     }
 
@@ -7840,6 +7851,20 @@ impl AgentPtyRegistry {
             .await
     }
 
+    /// Issue #1383 test seam: hold the next echo-gated write inside its echo
+    /// watch's setup — under the pane's writer, after `revalidate`, before the
+    /// payload. The first receiver resolves once the write is parked there;
+    /// dropping or sending on the returned sender lets it go on.
+    #[cfg(test)]
+    pub(crate) fn pause_next_echo_watch_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.echo_watch_pause.lock().unwrap() = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
     /// Issue #542 test seam: does any pane-keyed clock hold `pane_id_env`?
     #[cfg(test)]
     fn pane_input_tracks(&self, pane_id_env: &str) -> bool {
@@ -9042,6 +9067,7 @@ impl AgentPtyRegistry {
             revalidate,
             FirstWrite::Immediate,
             None,
+            || {},
         )
         .await
         .map(|sent| sent.detail)
@@ -9131,6 +9157,7 @@ impl AgentPtyRegistry {
                 cap_ceiling: None,
             },
             None,
+            || {},
         )
         .await
     }
@@ -9147,6 +9174,13 @@ impl AgentPtyRegistry {
     /// in. The delegate pointer passes [`SubmitGate::Echo`], so it is deferred
     /// behind the worker's draft FIRST and only then echo-gated: the watch is
     /// subscribed under the writer on the pass that writes, after the wait.
+    ///
+    /// Issue #1383 × #544: `before_payload` runs under the writer on the pass
+    /// that writes, after `revalidate` and the echo watch's setup and
+    /// immediately before the payload's first byte — the latest point at which
+    /// a caller can still subscribe to what the worker does next without
+    /// missing anything the payload causes. Not called for a write refused
+    /// before that point.
     #[allow(clippy::too_many_arguments)]
     pub async fn write_and_submit_guarded_first_write_parking<Fut>(
         &self,
@@ -9157,6 +9191,7 @@ impl AgentPtyRegistry {
         started: Instant,
         hold: &mut PaneDispatchHold,
         gate: SubmitGate,
+        before_payload: impl FnOnce(),
     ) -> Result<FirstWriteSend, AgentPtyError>
     where
         Fut: std::future::Future<Output = bool>,
@@ -9174,6 +9209,7 @@ impl AgentPtyRegistry {
                 cap_ceiling: None,
             },
             Some(hold),
+            before_payload,
         )
         .await
     }
@@ -9212,6 +9248,7 @@ impl AgentPtyRegistry {
                 cap_ceiling: Some(cap_ceiling),
             },
             None,
+            || {},
         )
         .await
         .map(|sent| sent.detail.outcome())
@@ -9261,6 +9298,7 @@ impl AgentPtyRegistry {
                 cap_ceiling: None,
             },
             None,
+            || {},
         )
         .await
     }
@@ -9329,6 +9367,7 @@ impl AgentPtyRegistry {
             revalidate,
             FirstWrite::Immediate,
             None,
+            || {},
         )
         .await
         .map(|sent| sent.detail.outcome())
@@ -9362,6 +9401,7 @@ impl AgentPtyRegistry {
             revalidate,
             FirstWrite::Immediate,
             None,
+            || {},
         )
         .await
         .map(|sent| sent.detail)
@@ -9388,6 +9428,13 @@ impl AgentPtyRegistry {
             (Arc::clone(&agent.bus), agent.pty_rows, agent.pty_cols)
         };
         let payload = payload.to_vec();
+        #[cfg(test)]
+        let pause = self.echo_watch_pause.lock().unwrap().take();
+        #[cfg(test)]
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
         tokio::task::spawn_blocking(move || {
             let (snapshot, rx) = bus.subscribe();
             crate::submit_echo::EchoWatch::new(&snapshot, rx, rows, cols, &payload)
@@ -9414,6 +9461,7 @@ impl AgentPtyRegistry {
         revalidate: impl FnOnce() -> Fut,
         first_write: FirstWrite,
         mut park: Option<&mut PaneDispatchHold>,
+        before_payload: impl FnOnce(),
     ) -> Result<FirstWriteSend, AgentPtyError>
     where
         Fut: std::future::Future<Output = bool>,
@@ -9695,6 +9743,14 @@ impl AgentPtyRegistry {
             }
             _ => None,
         };
+        // Issue #1383 × #544: the caller's write-time sample, taken HERE rather
+        // than in `revalidate` because the echo watch's setup above awaits a
+        // blocking-pool snapshot and parse. The writer keeps input out of the
+        // pane meanwhile but not the agent's events, so a receiver subscribed
+        // before that await could read one the worker emitted in the gap — its
+        // turn on the user's just-submitted draft, typically — as caused by
+        // bytes not yet written.
+        before_payload();
         let delivery = match mode {
             SubmitMode::Submit => deliver_payload_and_submit(&mut w.daemon(), &payload, echo).await,
             SubmitMode::Notice => deliver_payload_as_notice(&mut w.daemon(), &payload).await,

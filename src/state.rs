@@ -8626,6 +8626,10 @@ async fn dispatch_one_owned(
     // means the pointer went into a live conversation, so the write's own submit
     // CR began a turn, so the loop sees proof of delivery and returns before it
     // ever probes.
+    //
+    // Issue #1383 × #544: like the retry's and the silence watch's, this one is
+    // only the fallback now — the recovery reads one subscribed as the pointer
+    // goes in, after any wait for the worker's draft ([`PointerWriteSample`]).
     let late_readiness_rx = late_readiness_rearm.as_ref().map(|_| event_tx.subscribe());
     // Issue #1383: decide BEFORE the write whether this delivery may be retried in
     // place, and if so register it and subscribe now. The silent-worker watch's
@@ -8748,14 +8752,16 @@ async fn dispatch_one_owned(
     // worker's draft — non-zero means the dispatch lock was set down, so a
     // `pane restart` may have replaced the worker meanwhile.
     let mut pointer_deferred = std::time::Duration::ZERO;
-    // Issue #1383 × #544: what the retry loop and the silent-worker watch need
-    // from the moment the pointer goes in, sampled by `revalidate` — which runs
-    // once, under the worker's writer, on the pass that writes: after any wait
-    // for the worker's draft, immediately before the payload. See
-    // [`PointerWriteSample`].
+    // Issue #1383 × #544: what the retry loop, the silent-worker watch and
+    // #1031's late-readiness recovery need from the moment the pointer goes in,
+    // sampled by the write's `before_payload` hook — which runs once, under the
+    // worker's writer, on the pass that writes: after any wait for the worker's
+    // draft and after the echo watch's setup, immediately before the payload.
+    // See [`PointerWriteSample`].
     let write_sample = Arc::new(std::sync::Mutex::new(PointerWriteSample::default()));
     let sample_retry = pending_retry.is_some();
     let sample_silence = silence.is_some();
+    let sample_late_readiness = late_readiness_rx.is_some();
     let outcome = if let Some(worker_agent_id) = expected_worker_agent_id.as_deref() {
         // Issue #544: the idle-worker watch armed in `handle_delegate` must
         // not count the time this write waits for the worker's draft.
@@ -8766,18 +8772,10 @@ async fn dispatch_one_owned(
                 &one_liner,
                 worker_agent_id,
                 {
-                    let write_sample = Arc::clone(&write_sample);
-                    let sample_agent = worker_agent_id.to_string();
-                    let sample_tx = event_tx.clone();
                     || async move {
                         if revalidate_registry.is_pane_closing(&revalidate_pane) {
                             return false;
                         }
-                        *write_sample.lock().unwrap() = PointerWriteSample {
-                            epoch: revalidate_registry.geometry_changes_of(&sample_agent),
-                            retry_rx: sample_retry.then(|| sample_tx.subscribe()),
-                            silence_rx: sample_silence.then(|| sample_tx.subscribe()),
-                        };
                         orchestration_still_matches(
                             expected_orchestration.as_ref(),
                             revalidate_registry
@@ -8789,6 +8787,20 @@ async fn dispatch_one_owned(
                 std::time::Instant::now(),
                 &mut dispatch_hold,
                 crate::agent_pty::SubmitGate::Echo,
+                {
+                    let write_sample = Arc::clone(&write_sample);
+                    let sample_registry = Arc::clone(&registry);
+                    let sample_agent = worker_agent_id.to_string();
+                    let sample_tx = event_tx.clone();
+                    move || {
+                        *write_sample.lock().unwrap() = PointerWriteSample {
+                            epoch: sample_registry.geometry_changes_of(&sample_agent),
+                            retry_rx: sample_retry.then(|| sample_tx.subscribe()),
+                            silence_rx: sample_silence.then(|| sample_tx.subscribe()),
+                            late_readiness_rx: sample_late_readiness.then(|| sample_tx.subscribe()),
+                        };
+                    }
+                },
             )
             .await;
         // PR #1398 review: a refusal reached while waiting for the draft comes
@@ -9019,10 +9031,17 @@ async fn dispatch_one_owned(
     // A refusal (`Stale`, `WrongSession`, `NoLiveTarget`, `RefusedUserInput`) wrote
     // nothing at all, so there is likewise nothing a later submit could submit, and
     // the commission has already been released above.
+    //
+    // Issue #1383 × #544: and on the receiver subscribed as the pointer went in
+    // ([`PointerWriteSample`]), not the one from before the draft wait — which
+    // could have fallen behind the bus during that wait, ending the recovery on
+    // its first read, or be holding a `SessionStart` from the wait that it would
+    // read as having followed the write.
+    let mut at_write = std::mem::take(&mut *write_sample.lock().unwrap());
     if outcome_leaves_the_whole_pointer_for_a_later_submit(submit_outcome)
         && let (Some(rearm), Some(rx), Some(worker_agent_id)) = (
             late_readiness_rearm,
-            late_readiness_rx,
+            at_write.late_readiness_rx.take().or(late_readiness_rx),
             expected_worker_agent_id.as_deref(),
         )
     {
@@ -9042,8 +9061,8 @@ async fn dispatch_one_owned(
     // Only over an `Applied` first write, the same line #1031 draws: an
     // `Ambiguous` write may have left a PREFIX of the pointer in the composer, and
     // a retype would submit that prefix and the pointer as one turn.
-    // Empty unless `revalidate` ran, which every `Applied` write did.
-    let mut at_write = std::mem::take(&mut *write_sample.lock().unwrap());
+    // `at_write` is empty unless the write reached its payload, which every
+    // `Applied` write did.
     let redeliveries = Arc::new(crate::delegate_retry::RedeliveryCounts::default());
     let mut retry_done = None;
     if let Some((armed_retry, retry_rx)) = pending_retry {
@@ -9136,7 +9155,8 @@ async fn dispatch_one_owned(
 
 /// Issue #1383 × #544: what a delegate pointer's write samples at the moment it
 /// goes in — under the worker's writer, on the pass that writes, so after any
-/// wait for the worker's unsent draft and immediately before the payload.
+/// wait for the worker's unsent draft and after the echo watch's setup,
+/// immediately before the payload's first byte.
 ///
 /// Before #544 "just before the write" and "when the dispatch reached its
 /// write" were microseconds apart, and both the retry loop and the silent-worker
@@ -9152,9 +9172,16 @@ async fn dispatch_one_owned(
 /// So the loop and the watch take receivers subscribed here instead, and the
 /// retry loop takes its geometry epoch here too: a resize during the wait is
 /// not one the pointer's bytes were typed across, and counting it would read
-/// every later screen as unreadable and withhold every retype. The receivers
-/// the dispatch subscribed earlier are kept only as the fallback for a write
-/// whose `revalidate` never ran, which no `Applied` write is.
+/// every later screen as unreadable and withhold every retype. #1031's
+/// late-readiness recovery takes its receiver here as well, for both reasons.
+/// The receivers the dispatch subscribed earlier are kept only as the fallback
+/// for a write that never reached its payload, which no `Applied` write is.
+///
+/// Sampled by the write's `before_payload` hook rather than in `revalidate`,
+/// because the echo watch is set up between the two, and its setup awaits a
+/// blocking-pool snapshot and parse. The writer keeps input out of the pane
+/// meanwhile, not the worker's events, so an event emitted in that gap would
+/// otherwise count as caused by a pointer not yet typed.
 #[derive(Default)]
 struct PointerWriteSample {
     /// The worker's PTY geometry epoch
@@ -9164,6 +9191,9 @@ struct PointerWriteSample {
     retry_rx: Option<broadcast::Receiver<BroadcastMsg>>,
     /// For the silent-worker watch, when one is armed.
     silence_rx: Option<broadcast::Receiver<BroadcastMsg>>,
+    /// For #1031's late-readiness recovery, when this delivery has standing
+    /// for one.
+    late_readiness_rx: Option<broadcast::Receiver<BroadcastMsg>>,
 }
 
 /// PRD #20 blocker-4: build an inert [`AgentEvent`] that carries only a
@@ -18421,6 +18451,325 @@ mod tests {
             "an event from before the pointer went in stopped its retry"
         );
         assert!(registry.pending_deliveries().supersede(WORKER_PANE));
+        registry.shutdown_all();
+    }
+
+    /// Issue #1383 × #544 (audit, high): the echo watch is set up under the
+    /// worker's writer but before the payload, and its setup awaits a
+    /// blocking-pool snapshot and parse. The writer keeps input out of the
+    /// pane, not the worker's events, so a `Thinking` emitted in that gap — its
+    /// turn on the draft the user just submitted, in practice — is not proof of
+    /// the pointer, which has not been typed yet. The retry loop's receiver is
+    /// subscribed after that setup, immediately before the payload.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_retry_ignores_an_event_from_the_echo_watch_setup_before_its_pointer() {
+        const ORCH_PANE: &str = "echo-setup-orch";
+        const WORKER_PANE: &str = "echo-setup-worker";
+
+        // The default schedule: its first re-send is 20 s out, so a loop still
+        // pending after the write is one that no event has stopped.
+        let _schedule = RETRY_SCHEDULE_ENV_LOCK.lock().await;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn = |pane: &str, agent_type: crate::event::AgentType| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )]),
+                    agent_type: Some(agent_type),
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn stand-in")
+        };
+        let worker = spawn(WORKER_PANE, crate::event::AgentType::OpenCode);
+        let _orch = spawn(ORCH_PANE, crate::event::AgentType::ClaudeCode);
+        let (event_tx, _event_rx) = broadcast::channel(64);
+
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let (reached, release) = registry.pause_next_echo_watch_for_test();
+        let dispatch = tokio::spawn(dispatch_one_owned(
+            registry.clone(),
+            event_tx.clone(),
+            None,
+            ORCH_PANE.to_string(),
+            "coder".to_string(),
+            WORKER_PANE.to_string(),
+            "do the task".to_string(),
+            // A task directory, so the pointer is the short line the echo gate
+            // watches rather than the whole task inlined.
+            Some(cwd.path().to_string_lossy().into_owned()),
+            None,
+            PointerQueueClock::new(registry.clone(), WORKER_PANE.to_string(), None),
+            None,
+            None,
+            None,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(30), reached)
+            .await
+            .expect("the pointer's write never reached its echo watch")
+            .expect("the paused echo watch was dropped");
+        assert!(
+            registry.pending_deliveries().is_pending(WORKER_PANE),
+            "precondition: the retry is armed"
+        );
+        assert!(
+            !registry
+                .snapshot(&worker)
+                .map(|screen| String::from_utf8_lossy(&screen)
+                    .contains(".dot-agent-deck/worker-task"))
+                .unwrap_or(false),
+            "precondition: the pointer is not in the pane yet"
+        );
+        event_tx
+            .send(BroadcastMsg::Event(
+                serde_json::from_value(serde_json::json!({
+                    "session_id": "s",
+                    "agent_type": "open_code",
+                    "event_type": "thinking",
+                    "timestamp": "2026-09-29T00:00:00Z",
+                    "pane_id": WORKER_PANE,
+                    "agent_id": worker,
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        drop(release);
+        tokio::time::timeout(std::time::Duration::from_secs(30), dispatch)
+            .await
+            .expect("the dispatch finishes once the echo watch is released")
+            .expect("the dispatch does not panic");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            registry.pending_deliveries().is_pending(WORKER_PANE),
+            "an event from before the pointer's first byte stopped its retry"
+        );
+        assert!(registry.pending_deliveries().supersede(WORKER_PANE));
+        registry.shutdown_all();
+    }
+
+    /// Issue #1383 × #544 (audit, medium): #1031's late-readiness recovery
+    /// reads a receiver subscribed as the pointer goes in, not the one the
+    /// dispatch took before the worker's draft wait. That earlier receiver sat
+    /// unread through the wait, so a busy bus could leave it more than the bus
+    /// holds behind, and the recovery ended on its first read — the late
+    /// `SessionStart` that should submit a pointer whose Enter was swallowed was
+    /// never seen.
+    ///
+    /// The fixture is `orchestration/delegate/035`'s — a `clear = true` worker
+    /// whose `claude`-named stub swallows its first submit, so the readiness gate
+    /// times out and the pointer parks unsubmitted — with a pending draft in
+    /// the worker pane delaying the pointer, and more events than the bus holds
+    /// sent during that delay.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_late_readiness_recovery_reads_a_receiver_from_the_pointer_write() {
+        const ORCH_PANE: &str = "late-draft-orch";
+        const WORKER_PANE: &str = "late-draft-worker";
+        const SUBMITTED: &str = "SWALLOW-STUB-SUBMITTED:Read .dot-agent-deck/worker-task-coder.md";
+        use std::os::unix::fs::PermissionsExt;
+
+        // No in-place retry, so nothing but the recovery can submit the pointer.
+        let _schedule = RETRY_SCHEDULE_ENV_LOCK.lock().await;
+        let _env = RetryScheduleEnv::set("0");
+        let cwd = tempfile::tempdir().expect("tempdir");
+        // The BASENAME gives the pane its launch identity (fact S).
+        let stub = cwd.path().join("claude");
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import os, sys, termios
+fd = sys.stdin.fileno()
+new = termios.tcgetattr(fd)
+new[0] &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP
+            | termios.INLCR | termios.IGNCR | termios.ICRNL | termios.IXON)
+new[1] &= ~termios.OPOST
+new[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG | termios.IEXTEN)
+termios.tcsetattr(fd, termios.TCSANOW, new)
+os.write(1, b'SWALLOW-STUB-READY')
+buf = bytearray()
+swallowed = False
+while True:
+    data = os.read(fd, 4096)
+    if not data:
+        break
+    for byte in data:
+        if byte in (13, 10):
+            if swallowed:
+                os.write(1, b'SWALLOW-STUB-SUBMITTED:' + bytes(buf))
+                buf.clear()
+            else:
+                swallowed = True
+                os.write(1, b'SWALLOW-STUB-SWALLOWED')
+        else:
+            buf.append(byte)
+            os.write(1, bytes([byte]))
+"#,
+        )
+        .expect("write stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stub");
+        std::fs::write(
+            cwd.path().join(".dot-agent-deck.toml"),
+            format!(
+                "[[orchestrations]]\nname = \"test-orchestration\"\n\n\
+                 [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"true\"\nstart = true\n\n\
+                 [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"{}\"\nclear = true\n",
+                stub.display()
+            ),
+        )
+        .expect("write config");
+        let cwd_str = cwd.path().to_string_lossy().into_owned();
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let old_agent = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/bin/cat"),
+                cwd: Some(&cwd_str),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    WORKER_PANE.to_string(),
+                )]),
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn the first occupant");
+        let (event_tx, _event_rx) = broadcast::channel::<BroadcastMsg>(64);
+        let mut state = AppState::default();
+        let orchestration = OrchestrationIdentity::NameCwd {
+            name: "test-orchestration".to_string(),
+            cwd: cwd_str.clone(),
+        };
+        state
+            .pane_role_map
+            .insert(ORCH_PANE.to_string(), "orchestrator".to_string());
+        state
+            .pane_role_map
+            .insert(WORKER_PANE.to_string(), "coder".to_string());
+        state.orchestrator_pane_ids.insert(ORCH_PANE.to_string());
+        state
+            .pane_orchestration_map
+            .insert(ORCH_PANE.to_string(), orchestration.clone());
+        state
+            .pane_orchestration_map
+            .insert(WORKER_PANE.to_string(), orchestration);
+        state
+            .pane_cwd_map
+            .insert(WORKER_PANE.to_string(), cwd_str.clone());
+        state
+            .handle_delegate(
+                DelegateSignal {
+                    pane_id: ORCH_PANE.to_string(),
+                    task: "List the files in the current directory.".to_string(),
+                    to: vec!["coder".to_string()],
+                    supersede: false,
+                    timestamp: Utc::now(),
+                    token: None,
+                },
+                &registry,
+                &event_tx,
+            )
+            .await;
+
+        let screen = |agent: &str| {
+            registry
+                .snapshot(agent)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let worker = loop {
+            if let Some(record) = registry.agent_records().into_iter().find(|record| {
+                record.pane_id_env.as_deref() == Some(WORKER_PANE) && record.id != old_agent
+            }) && screen(&record.id).contains("SWALLOW-STUB-READY")
+            {
+                break record.id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the replacement stub never entered raw mode"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        // A bracketed paste left open in the worker pane: the pointer will wait
+        // for it once the readiness gate lets it go.
+        registry.note_deck_bytes_for_test(WORKER_PANE, b"\x1b[200~");
+        // Past the 30 s `SessionStart` wait on a paused clock, as `/035` does:
+        // a gate that times out is what gives the delivery its standing (fact U).
+        tokio::time::pause();
+        tokio::time::advance(
+            std::time::Duration::from_secs(30) + std::time::Duration::from_millis(2),
+        )
+        .await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while registry.pane_dispatch_lock(WORKER_PANE).try_lock().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pointer never parked on the worker's draft"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !screen(&worker).contains("SWALLOW-STUB-SWALLOWED"),
+            "precondition: the pointer waits for the draft"
+        );
+        // More than the bus holds, while the pointer waits.
+        for _ in 0..200 {
+            let _ = event_tx.send(BroadcastMsg::Event(
+                serde_json::from_value(serde_json::json!({
+                    "session_id": "elsewhere",
+                    "agent_type": "open_code",
+                    "event_type": "thinking",
+                    "timestamp": "2026-09-29T00:00:00Z",
+                    "pane_id": "late-draft-elsewhere",
+                    "agent_id": "elsewhere",
+                }))
+                .unwrap(),
+            ));
+        }
+        registry.note_deck_bytes_for_test(WORKER_PANE, b"\x1b[201~");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !screen(&worker).contains("SWALLOW-STUB-SWALLOWED") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pointer never reached the stub after the draft ended: {:?}",
+                screen(&worker)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!screen(&worker).contains(SUBMITTED), "precondition: parked");
+
+        // The late start, after the pointer went in.
+        event_tx
+            .send(BroadcastMsg::Event(
+                serde_json::from_value(serde_json::json!({
+                    "session_id": "late",
+                    "agent_type": "claude_code",
+                    "event_type": "session_start",
+                    "timestamp": "2026-09-29T00:00:00Z",
+                    "pane_id": WORKER_PANE,
+                    "agent_id": worker,
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !screen(&worker).contains(SUBMITTED) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a late SessionStart after the pointer went in did not submit it; the recovery \
+                 read a receiver that fell behind during the draft wait: {:?}",
+                screen(&worker)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         registry.shutdown_all();
     }
 
