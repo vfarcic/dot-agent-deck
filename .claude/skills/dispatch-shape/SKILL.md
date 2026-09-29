@@ -76,7 +76,7 @@ Since issue #705 this repo defines **three** orchestrations rather than one: `mi
 - **Shape** (single vs team) is a property of **the work** — is it divisible? You decide it per unit, from the criteria above.
 - **Provider** (`mixed` / `anthropic` / `GPT`) is a property of **the session** — which credits are healthy today, which stack the user wants exercised. It does not vary with the task at all.
 
-**Default to `mixed` and do not ask**, because it is the repo's default and exercises the most providers. Say which you used. Re-ask only if the user raises it, or if a dispatch fails on that provider's credentials — a credential failure is a session fact, so carry the new answer forward to every later unit rather than re-deciding each time.
+**Default to `mixed` and do not ask** — wherever this skill decides the shape; the skills listed at the end keep their own provider step — because it is the repo's default and exercises the most providers. Say which you used. Re-ask only if the user raises it, or if a dispatch fails on that provider's credentials — a credential failure is a session fact, so carry the new answer forward to every later unit rather than re-deciding each time.
 
 **Pass the name explicitly, always: `--orchestration 'mixed'`, never a bare `--orchestration=`.** The bare form opens whichever orchestration the repo declares as its default, which is currently `mixed` (`default = true` in `.dot-agent-deck.toml`) — a fact about the config file, not a choice the user made in this conversation. `--list-targets` shows which one that is with a `[default]` marker; that marker is there to inform the question, not to answer it.
 
@@ -84,9 +84,9 @@ If the user has no preference, say which one you are taking and why (`mixed` is 
 
 ## Where this skill does not decide the shape
 
-Two dispatching skills in this repo carry a shape step of their own, and **inside them that step governs, not this skill**:
+Two dispatching skills in this repo carry a shape step of their own, and **inside them their own steps govern — the shape and which orchestration to name — not this skill**, so neither the criteria nor the `mixed` default above applies there:
 
-- **`/prd-queue`** asks the shape once per PRD (its step 7), because there the shape also decides which of two task documents its step 8 writes — `/prd-full` for a single agent, the orchestrator role template for a team. Issue #1425 left it unchanged on purpose; whether it should use this skill instead is an open question, not a settled one.
-- **`/pr-review-queue`** asks the shape once per PR (its step 2b). Issue #1425 did not revisit it.
+- **`/prd-queue`** asks the shape once per PRD (its step 7), because there the shape also decides which of two task documents its step 8 writes — `/prd-full` for a single agent, the orchestrator role template for a team. It also asks the provider once per session, the first time a PRD wants a team (the same step), rather than defaulting to `mixed`. Issue #1425 left it unchanged on purpose; whether it should use this skill instead is an open question, not a settled one.
+- **`/pr-review-queue`** asks the shape once per PR (its step 2b), showing the `--list-targets` output, so the answer names the orchestration too. Issue #1425 did not revisit it.
 
 Everywhere else in this repo — an ad-hoc dispatch, `/issue-queue`, or a skill written later without a shape step of its own — this skill decides.
