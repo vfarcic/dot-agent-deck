@@ -61,5 +61,5 @@ The design constraints the mark was chosen against, and what to look at if you c
 ## Where the change becomes visible
 
 - **Desktop app:** the icon set is compiled in by `tauri-build` (the window icon) and read by the bundler (`.icns`, `.ico`, PNGs) at packaging time, so a rebuild picks it up. The rail badge is a normal Vite asset.
-- **Website:** `site/static/img/` is copied into the site by `cargo xtask site`, and the site goes live on a release or a `/publish-docs` run, not on merge.
+- **Website:** `site/static/img/` is copied into the site at `/img/` by `cargo xtask site`, and the site goes live on a release or a `/publish-docs` run, not on merge. Only image files are copied (the extensions in `IMAGE_EXTENSIONS`, `src/published_docs.rs`); any other file there fails the build, so a new asset type means adding its extension to that list.
 - **README:** immediately, on GitHub.

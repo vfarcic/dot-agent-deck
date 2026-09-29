@@ -245,6 +245,44 @@ fn images_are_published_at_both_image_locations() {
     assert!(!site.files.contains_key("docs/img/shot.png"));
 }
 
+/// Scenario: `docs/img` is repointed from `site/static/img` at another
+/// directory beside `docs/` (a `prds/` holding a PRD). The build fails naming
+/// the allowed target, and nothing from `prds/` is published.
+#[cfg(unix)]
+#[test]
+fn generator_rejects_an_image_dir_pointing_at_another_sibling_directory() {
+    use std::os::unix::fs::symlink;
+
+    let fx = Fixture::new();
+    let root = fx.docs().parent().unwrap().to_path_buf();
+    fs::create_dir_all(root.join("site/static")).unwrap();
+    fs::rename(fx.docs().join("img"), root.join("site/static/img")).unwrap();
+    symlink("../site/static/img", fx.docs().join("img")).unwrap();
+    // The repository layout builds.
+    let site = build(&fx.config).unwrap();
+    assert_eq!(site.files["img/shot.png"], b"PNG-shot");
+
+    fs::create_dir_all(root.join("prds")).unwrap();
+    fs::write(root.join("prds/1-plan.md"), "# Private plan\n").unwrap();
+    fs::write(root.join("prds/shot.png"), b"PNG-shot").unwrap();
+    fs::write(root.join("prds/rel.png"), b"PNG-rel").unwrap();
+    fs::remove_file(fx.docs().join("img")).unwrap();
+    symlink("../prds", fx.docs().join("img")).unwrap();
+    let err = build(&fx.config).unwrap_err();
+    assert!(err.contains("site/static/img"), "{err}");
+}
+
+/// Scenario: A non-image file (a Markdown note) sits in the image directory.
+/// The build fails naming the file instead of publishing it at `/img/`.
+#[test]
+fn generator_refuses_a_non_image_file_in_the_image_dir() {
+    let fx = Fixture::new();
+    fs::write(fx.docs().join("img/notes.md"), "# Notes\n").unwrap();
+    let err = build(&fx.config).unwrap_err();
+    assert!(err.contains("notes.md"), "{err}");
+    assert!(err.contains("image extension"), "{err}");
+}
+
 #[test]
 fn generator_rejects_a_manifest_page_with_no_file() {
     let fx = Fixture::new();
@@ -380,6 +418,15 @@ fn the_real_site_builds_without_anything_from_develop() {
         pages.len()
     );
     assert!(!llms.contains("/docs/develop/"));
+    // Every goal in the "start here" list names a real page, so none is
+    // dropped from llms.txt.
+    for (goal, slug) in START_BY_GOAL {
+        assert!(
+            pages.iter().any(|p| p.slug == *slug),
+            "START_BY_GOAL `{goal}` names `{slug}`, which is not in the manifest"
+        );
+        assert!(llms.contains(&format!("- {goal}: read [")), "{goal}");
+    }
     assert!(
         !site
             .text("llms-full.txt")
@@ -572,22 +619,78 @@ fn the_real_redirects_cover_the_legacy_urls_and_every_url_in_the_repository() {
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
+/// The environment variables through which git's location discovery can be
+/// steered from outside the process, each of which outranks `-C`. The same
+/// list, for the same reason, as `AMBIENT_LOCATION_VARS` in
+/// `xtask/linkage-check/src/repo_state.rs` (issue #834), copied because that
+/// one is private to a test module of a crate this one does not depend on.
+const AMBIENT_GIT_LOCATION_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
+
+/// A read-only git command against the checkout at `root`, with the ambient
+/// git environment switched off the way `repo_state.rs`'s `Sandbox::git()`
+/// switches it off: global and system configuration pointed at a path that
+/// does not exist (and configuration injected through the environment
+/// cleared), the location-discovery variables above cleared, and
+/// `GIT_CEILING_DIRECTORIES` set to `root`'s parent, so git reads `root`'s own
+/// repository or none, never an enclosing or ambient one.
+fn checkout_git(root: &Path, args: &[&str]) -> std::process::Output {
+    let no_config = root.join("target/no-such-gitconfig");
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", &no_config)
+        .env("GIT_CONFIG_SYSTEM", &no_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CEILING_DIRECTORIES", root.parent().unwrap_or(root));
+    for var in AMBIENT_GIT_LOCATION_VARS {
+        cmd.env_remove(var);
+    }
+    cmd.output()
+        .unwrap_or_else(|e| panic!("failed to invoke `git {}`: {e}", args.join(" ")))
+}
+
 /// Every `agent-deck.devopstoolkit.ai/docs…` URL path in the repository's
 /// tracked files, with the file it was found in. Tracked files, because that
 /// is the list the PRD asks for and it keeps build output and local scratch
 /// out; `git ls-files` is the one reliable way to name them, so this is a
-/// read-only git call with git's location discovery pinned to the checkout.
+/// read-only git call pinned to the checkout by [`checkout_git`], which also
+/// confirms the repository git found is the one at `root`.
 fn repository_site_doc_urls(root: &Path) -> Vec<(String, String)> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-files", "-z"])
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .expect("run git ls-files");
-    assert!(output.status.success(), "git ls-files failed");
+    let root = root.canonicalize().expect("resolve the workspace root");
+    let root = root.as_path();
+    let toplevel = checkout_git(root, &["rev-parse", "--show-toplevel"]);
+    assert!(
+        toplevel.status.success(),
+        "git rev-parse --show-toplevel failed: {}",
+        String::from_utf8_lossy(&toplevel.stderr)
+    );
+    let toplevel = String::from_utf8_lossy(&toplevel.stdout);
+    assert_eq!(
+        Path::new(toplevel.trim_end_matches('\n'))
+            .canonicalize()
+            .expect("resolve git's top level"),
+        root,
+        "git read a repository other than the workspace root"
+    );
+    let output = checkout_git(root, &["ls-files", "-z"]);
+    assert!(
+        output.status.success(),
+        "git ls-files failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let host = "agent-deck.devopstoolkit.ai";
     let mut found = Vec::new();
     for name in output.stdout.split(|b| *b == 0) {
@@ -779,11 +882,37 @@ fn the_real_landing_page_hands_off_to_the_docs_in_plain_html() {
     let config = SiteConfig::from_workspace(&workspace_root());
     let site = build(&config).unwrap();
     let html = site.text("index.html").unwrap();
-    // The agent prompt, and the visible pointer to /llms.txt.
+    // The agent prompt, with the user's goal in a marked slot, and the
+    // visible pointer to /llms.txt. The slot is markup only: with the tags
+    // stripped, the prompt is one line of plain text naming the goal.
+    let start = html
+        .find("<pre id=\"agent-prompt-text\">")
+        .expect("landing page lost the agent prompt");
+    let end = start + html[start..].find("</pre>").unwrap();
+    let prompt = &html[start..end];
     assert!(
-        html.contains("Read https://agent-deck.devopstoolkit.ai/llms.txt, then help me install and set up dot-agent-deck"),
-        "landing page lost the agent prompt"
+        prompt.contains("<mark class=\"promptSlot\">"),
+        "the prompt has no goal slot: {prompt}"
     );
+    let mut plain = String::new();
+    let mut in_tag = false;
+    for c in prompt.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => plain.push(c),
+            _ => {}
+        }
+    }
+    assert!(
+        plain.starts_with(
+            "Read https://agent-deck.devopstoolkit.ai/llms.txt, then install dot-agent-deck \
+             and set it up for me so that: "
+        ),
+        "{plain}"
+    );
+    assert!(plain.contains("an orchestrator"), "{plain}");
+    assert!(!plain.contains('\n'), "the prompt is not one line: {plain}");
     assert!(html.contains("dot-agent-deck docs"));
     assert!(html.contains("An AI agent should start at <a href=\"/llms.txt\">/llms.txt</a>"));
     // Every published page is linked with a plain <a href> in the served HTML.

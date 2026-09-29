@@ -11,8 +11,10 @@
 //!   `dot-agent-deck docs [topic]` subcommand.
 //! - `llms-full.txt` — every page concatenated in manifest order.
 //! - `img/…` — the whole image directory (`docs/img`, a symlink to
-//!   `site/static/img`), at the `/img/` paths Docusaurus served it at, so
-//!   root-absolute `/img/x.png` references and existing image URLs resolve.
+//!   `site/static/img`, the one target it may have outside `docs/`), at the
+//!   `/img/` paths Docusaurus served it at, so root-absolute `/img/x.png`
+//!   references and existing image URLs resolve. Only files with an image
+//!   extension are published; any other file there fails the build.
 //! - `docs/<path>` for each image a page references by a RELATIVE path, so
 //!   `img/x.png` in a top-level page (or `../img/x.png` in a desktop page)
 //!   resolves on the site exactly as it does on disk.
@@ -58,6 +60,43 @@ pub const DEFAULT_BASE_URL: &str = "https://agent-deck.devopstoolkit.ai";
 const SUMMARY: &str = "dot-agent-deck is a dashboard for running several AI coding agents in \
 parallel, in a terminal UI (the `dot-agent-deck` binary) or a desktop app. A background daemon \
 owns the agents, so both clients show and control the same ones.";
+
+/// The "start here, by goal" list at the top of `llms.txt`: what the user
+/// wants, and the manifest slug of the page that sets it up. An agent handed
+/// only "install and set it up" used to stop at Getting Started's one running
+/// agent; this tells it where each larger goal lives. [`llms_txt`] lists only
+/// the entries whose slug is in the manifest, and a test pins every slug to
+/// the real one.
+pub const START_BY_GOAL: &[(&str, &str)] = &[
+    (
+        "Install, upgrade or uninstall dot-agent-deck",
+        "installation",
+    ),
+    (
+        "Start a first agent and check that the deck shows it",
+        "getting-started",
+    ),
+    (
+        "Several agents working together, for example a coder, a reviewer and an orchestrator \
+         that hands them work",
+        "orchestration",
+    ),
+    (
+        "Isolated background work, each task in its own copy of the repository",
+        "dispatcher-mode",
+    ),
+    (
+        "Run a prompt on a schedule, or put agents on open GitHub issues",
+        "scheduled-tasks",
+    ),
+    (
+        "Run the agents on another machine over ssh",
+        "remote-environments",
+    ),
+    ("Use the desktop app", "desktop/index"),
+    ("Settings and environment variables", "configuration"),
+    ("Something is not working", "troubleshooting"),
+];
 
 /// The page the legacy `/docs` and `/docs/` URLs redirect to: the index an
 /// agent starts from. Docusaurus served nothing there.
@@ -651,6 +690,26 @@ pub fn llms_txt(config: &SiteConfig, pages: &[Page]) -> String {
         "Every page in one file: [llms-full.txt]({}/llms-full.txt)\n\n",
         config.base_url
     ));
+    let by_goal: Vec<String> = START_BY_GOAL
+        .iter()
+        .filter_map(|(goal, slug)| {
+            let page = pages.iter().find(|p| p.slug == *slug)?;
+            Some(format!(
+                "- {goal}: read [{}]({})\n",
+                page.title,
+                config.page_url(page)
+            ))
+        })
+        .collect();
+    if !by_goal.is_empty() {
+        out.push_str("## Start here, by goal\n\n");
+        out.push_str(
+            "Getting Started ends with one running agent. When the user wants more than that, \
+             read the page for their goal as well:\n\n",
+        );
+        out.extend(by_goal);
+        out.push('\n');
+    }
     out.push_str("## Docs\n\n");
     for page in pages {
         out.push_str(&format!(
@@ -914,8 +973,11 @@ fn normalize(base: &Path, rel: &str) -> Option<String> {
 
 /// Copy every regular file under `dir` into `site` below `prefix`. A symlink
 /// inside the tree is refused rather than followed, so nothing outside it can
-/// be published through one. (`dir` is the canonical image directory from
-/// [`published_docs::image_dir`], which resolves the `docs/img` symlink.)
+/// be published through one, and so is a file without one of the
+/// [`published_docs::IMAGE_EXTENSIONS`]: the build fails naming it rather than
+/// publishing it or dropping it silently. (`dir` is the canonical image
+/// directory from [`published_docs::image_dir`], which resolves the `docs/img`
+/// symlink.)
 fn copy_tree(dir: &Path, prefix: &str, site: &mut Site) -> Result<(), String> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
@@ -940,6 +1002,14 @@ fn copy_tree(dir: &Path, prefix: &str, site: &mut Site) -> Result<(), String> {
         } else if kind.is_dir() {
             copy_tree(&path, &target, site)?;
         } else if kind.is_file() {
+            if !published_docs::is_image_file(&path) {
+                return Err(format!(
+                    "{} is in the image directory but does not have an image extension ({}); \
+                     only images are published at /img/",
+                    path.display(),
+                    published_docs::IMAGE_EXTENSIONS.join(", ")
+                ));
+            }
             let bytes =
                 std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
             site.insert(target, bytes)?;

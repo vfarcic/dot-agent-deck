@@ -94,11 +94,18 @@
     <section class="agentPrompt" aria-labelledby="agent-prompt-title">
       <div class="agentPromptInner">
         <h2 id="agent-prompt-title" class="agentPromptTitle">Or hand it to your agent</h2>
-        <p class="agentPromptLede">Paste this into the coding agent you already use and let it do the installing and the configuring:</p>
+        <p class="agentPromptLede">Paste this into the coding agent you already use and let it do the installing and the configuring. Replace the <mark class="promptSlot">highlighted goal</mark> with what you want the deck to do for you.</p>
+        <!--
+          The highlighted part is the user's goal, and the example is a real
+          one: an agent given only "install and set it up" stops at one running
+          agent. The <mark> is styling only, so the prompt copies (by hand or
+          with the button) as one line of plain text.
+        -->
         <div class="promptBox">
-          <pre id="agent-prompt-text">Read https://agent-deck.devopstoolkit.ai/llms.txt, then help me install and set up dot-agent-deck. Once it is installed, run `dot-agent-deck docs` to read the documentation for the installed version.</pre>
+          <pre id="agent-prompt-text">Read https://agent-deck.devopstoolkit.ai/llms.txt, then install dot-agent-deck and set it up for me so that: <mark class="promptSlot">three agents work on this repository together, a coder that implements changes, a reviewer that checks them, and an orchestrator that hands out the work and coordinates the two</mark>. Once it is installed, `dot-agent-deck docs` has the docs for the installed version.</pre>
           <button type="button" class="copyButton" id="copy-prompt" hidden>Copy</button>
         </div>
+        <p class="agentPromptNote">Other goals work the same way, for example: <q>each issue I pick gets its own agent in its own copy of the repository</q>, or <q>an agent reviews the open pull requests every morning</q>.</p>
         <p class="agentPromptNote">An AI agent should start at <a href="/llms.txt">/llms.txt</a>: it indexes every page of the <a href="#docs">documentation</a>, which is published as plain Markdown, and <a href="/llms-full.txt">/llms-full.txt</a> holds all of it in one file. Once the deck is installed, <code>dot-agent-deck docs</code> prints the same pages as they are for that version, with no network access.</p>
       </div>
     </section>

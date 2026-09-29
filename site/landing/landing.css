@@ -407,6 +407,19 @@ code {
   border-color: var(--c-teal);
 }
 
+/*
+ * The user's goal inside the prompt: the one part meant to be rewritten, so
+ * it is marked where the eye lands, in the prompt and in the lede that names
+ * it. A <mark> adds no text, so the prompt still copies as plain text.
+ */
+.promptSlot {
+  color: inherit;
+  background: var(--c-teal-soft);
+  border-bottom: 2px dashed var(--c-teal);
+  border-radius: 3px;
+  padding: 0 0.15rem;
+}
+
 /* ---------- 3. the docs index (PRD #1419) ---------- */
 
 .doorLede {
@@ -1374,8 +1387,22 @@ code {
  * `--c-teal` is #0a7c73 on the light background (5.07:1) and #4ecdc4 on the
  * dark one (10.01:1), so the ring clears WCAG's 3:1 for non-text in both.
  */
-.page a:focus-visible {
+.page a:focus-visible,
+.navbar a:focus-visible,
+.themeToggle:focus-visible,
+.copyButton:focus-visible {
   outline: 2px solid var(--c-teal);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+/*
+ * The footer is dark in both themes, where the light theme's #0a7c73 would be
+ * about 2.3:1 against --c-footer-bg; the dark theme's #4ecdc4 is about 6:1
+ * there, so the footer uses that teal in both.
+ */
+.footer a:focus-visible {
+  outline: 2px solid #4ecdc4;
   outline-offset: 3px;
   border-radius: 4px;
 }

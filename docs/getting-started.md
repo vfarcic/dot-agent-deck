@@ -116,6 +116,8 @@ About 30 seconds after the last client disconnects, if no agent is running and n
 
 ## Next steps
 
+This page stops at one running agent. Most setups want more than that, so if the goal is larger, continue with the page for it: several agents working together (for example a coder, a reviewer and an orchestrator that hands them work) is [Orchestration](orchestration.md).
+
 | Goal | Where |
 |---|---|
 | Run a team of agents where one coordinates the others | [Orchestration](orchestration.md). In the TUI, select an agent's card in command mode and press `g` to have that agent draft a `.dot-agent-deck.toml` for its directory. |

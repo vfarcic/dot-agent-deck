@@ -31,8 +31,26 @@ pub const UNPUBLISHED_DIR: &str = "develop";
 
 /// The image directory under `docs/`, and the ONE place a published file may
 /// resolve outside `docs/`: in this repository `docs/img` is a symlink to
-/// `../site/static/img`, the images Docusaurus used to serve.
+/// `../site/static/img`, the images Docusaurus used to serve. It may resolve
+/// to exactly that directory ([`IMAGE_TARGET`]) or be a real directory inside
+/// `docs/`, and nowhere else.
 pub const IMAGE_DIR: &str = "img";
+
+/// Where `docs/img` may point, relative to the directory holding `docs/` (the
+/// workspace root), the same way the landing page's `site/landing/` is found.
+pub const IMAGE_TARGET: &str = "site/static/img";
+
+/// The file extensions (lowercase) an image or web asset may have to be
+/// published: what `site/static/img` holds (screenshots, the logo and the
+/// favicon) plus the other common image formats. Anything else is refused.
+pub const IMAGE_EXTENSIONS: &[&str] = &["avif", "gif", "ico", "jpeg", "jpg", "png", "svg", "webp"];
+
+/// Whether `path` has one of the [`IMAGE_EXTENSIONS`], case-insensitively.
+pub fn is_image_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
 
 /// One published page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,21 +244,30 @@ impl Boundary {
         self.develop.iter().any(|d| real.starts_with(d))
     }
 
-    /// The canonical image directory, refused if it resolves under
-    /// `docs/develop/` or to `docs/` itself or one of its ancestors (either of
-    /// which would put `docs/develop/` inside the image tree).
+    /// The canonical image directory. It must be either a real directory at
+    /// `docs/img` (inside the published tree already) or resolve to exactly
+    /// the canonical `<workspace>/site/static/img`, where `<workspace>` is the
+    /// directory holding `docs/`. Any other target is refused, because the
+    /// generator publishes the whole image directory: `docs/img -> ../prds`
+    /// would otherwise publish the PRDs.
     fn image_dir(&self) -> Result<PathBuf, BoundaryError> {
         let lexical = self.docs.join(IMAGE_DIR);
         let real = lexical
             .canonicalize()
             .map_err(|e| BoundaryError(format!("cannot resolve {}: {e}", lexical.display())))?;
-        if self.is_unpublished(&real) || self.docs.starts_with(&real) {
-            return Err(BoundaryError(format!(
-                "docs/{IMAGE_DIR} resolves to {}, which is or contains docs/{UNPUBLISHED_DIR}/",
-                real.display()
-            )));
+        let expected = self
+            .docs
+            .parent()
+            .map(|workspace| workspace.join(IMAGE_TARGET))
+            .and_then(|target| target.canonicalize().ok());
+        if real == lexical || Some(&real) == expected.as_ref() {
+            return Ok(real);
         }
-        Ok(real)
+        Err(BoundaryError(format!(
+            "docs/{IMAGE_DIR} resolves to {}; it must be a directory inside docs/ or resolve \
+             to {IMAGE_TARGET} beside docs/",
+            real.display()
+        )))
     }
 
     /// Resolve `docs/<relative>` and refuse it unless its canonical path is
@@ -312,16 +339,28 @@ pub fn page_source(docs_dir: &Path, page: &Page) -> Result<PathBuf, BoundaryErro
 /// Canonicalized and refused unless it resolves inside `docs/` outside
 /// `docs/develop/`, or inside [`image_dir`] — the one directory allowed to
 /// live outside `docs/`.
+/// Also refused unless the file has one of the [`IMAGE_EXTENSIONS`], so an
+/// image reference cannot publish a page or a config file.
 pub fn image_source(
     docs_dir: &Path,
     page: &Page,
     relative: &str,
 ) -> Result<PathBuf, BoundaryError> {
-    Boundary::new(docs_dir)?.resolve(docs_dir, relative, &page.slug, "image", true)
+    let real = Boundary::new(docs_dir)?.resolve(docs_dir, relative, &page.slug, "image", true)?;
+    if !is_image_file(&real) {
+        return Err(BoundaryError(format!(
+            "page `{}`: image docs/{relative} resolves to {}, which does not have an image \
+             extension ({})",
+            page.slug,
+            real.display(),
+            IMAGE_EXTENSIONS.join(", ")
+        )));
+    }
+    Ok(real)
 }
 
-/// The canonical image directory (`docs/img`), refused if it resolves under
-/// `docs/develop/` or to `docs/` or an ancestor of it.
+/// The canonical image directory (`docs/img`): a real directory inside
+/// `docs/`, or a symlink resolving to exactly [`IMAGE_TARGET`] beside `docs/`.
 pub fn image_dir(docs_dir: &Path) -> Result<PathBuf, BoundaryError> {
     Boundary::new(docs_dir)?.image_dir()
 }
@@ -441,5 +480,42 @@ mod tests {
         fs::remove_file(docs.join("img")).unwrap();
         symlink("..", docs.join("img")).unwrap();
         assert!(image_dir(&docs).is_err());
+    }
+
+    /// Scenario: `docs/img` is repointed at a sibling directory of the
+    /// workspace (here `prds/`, and a directory that merely sits inside
+    /// `site/static/`). The image directory is refused, so the generator
+    /// cannot publish that directory's files at `/img/`.
+    #[test]
+    fn image_dir_refuses_any_target_but_site_static_img() {
+        let (root, docs) = tree();
+        fs::create_dir_all(root.path().join("prds")).unwrap();
+        fs::write(root.path().join("prds/1-plan.md"), "# Plan\n").unwrap();
+        fs::remove_file(docs.join("img")).unwrap();
+        symlink("../prds", docs.join("img")).unwrap();
+        let err = image_dir(&docs).unwrap_err().to_string();
+        assert!(err.contains("site/static/img"), "{err}");
+        fs::remove_file(docs.join("img")).unwrap();
+        symlink("../site/static", docs.join("img")).unwrap();
+        assert!(image_dir(&docs).is_err());
+        // A real directory at docs/img is inside the published tree already.
+        fs::remove_file(docs.join("img")).unwrap();
+        fs::create_dir(docs.join("img")).unwrap();
+        assert_eq!(
+            image_dir(&docs).unwrap(),
+            docs.canonicalize().unwrap().join("img")
+        );
+    }
+
+    #[test]
+    fn image_source_refuses_a_file_without_an_image_extension() {
+        let (root, docs) = tree();
+        fs::write(root.path().join("site/static/img/notes.md"), "# N\n").unwrap();
+        let err = image_source(&docs, &page("start"), "img/notes.md")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("image extension"), "{err}");
+        assert!(is_image_file(Path::new("a/B.PNG")));
+        assert!(!is_image_file(Path::new("a/b")));
     }
 }

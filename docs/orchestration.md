@@ -45,7 +45,7 @@ file paths, the spec, and the previous worker's findings.
 name = "coder"
 command = "claude"
 description = "Implements features, fixes bugs, refactors code"
-prompt_template = "Implement the requested change. Run the project's tests before reporting completion. Commit your changes before you report."
+prompt_template = "Implement the requested change. Run the project's tests before reporting completion. If the project is a Git repository, commit your changes before you report."
 
 [[orchestrations.roles]]
 name = "reviewer"
@@ -53,6 +53,8 @@ command = "claude"
 description = "Reviews code changes for correctness, style, and edge cases"
 prompt_template = "Review the change. Report findings only; do not modify code."
 ```
+
+The example works in any directory. In a Git repository (`git rev-parse --is-inside-work-tree` prints `true`), the coder also commits each change, which gives the reviewer a commit to read; outside one it leaves the changes in the working tree.
 
 `dot-agent-deck init` writes a two-role starter file with the same shape if you prefer to start from it; it refuses to overwrite an existing `.dot-agent-deck.toml`. Every key is described in the [configuration reference](#configuration-reference).
 
