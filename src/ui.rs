@@ -20505,31 +20505,18 @@ fn render_session_card(
         )));
     }
 
-    let mut prompt_lines: Vec<Line<'_>> = Vec::new();
-    if is_placeholder {
-        prompt_lines.push(Line::from(Span::styled(
-            "Launch an agent to get started",
-            text_primary(),
-        )));
+    let prompts = if is_placeholder {
+        vec!["Launch an agent to get started".to_string()]
     } else {
-        let prompts = collect_recent_prompts(session, density.max_prompts());
-        for (i, prompt) in prompts.iter().enumerate() {
-            let prefix = if i == 0 { "Prmt: " } else { "      " };
-            let max_prompt = w.saturating_sub(6);
-            let display = truncate_with_ellipsis(prompt, max_prompt);
-            prompt_lines.push(Line::from(vec![
-                Span::styled(prefix, text_primary()),
-                Span::raw(display),
-            ]));
-        }
-    }
+        collect_recent_prompts(session, density.max_prompts())
+    };
 
     let tool_lines = recent_tool_lines(session, density.max_tools());
 
     let plan = fit_card_rows(
         inner.height as usize,
         status_lines.len(),
-        prompt_lines.len(),
+        prompts.len(),
         density != CardDensity::Compact,
         tool_lines.len(),
     );
@@ -20538,8 +20525,21 @@ fn render_session_card(
         lines.push(dir_line);
     }
     lines.extend(status_lines);
-    let skip_prompts = prompt_lines.len() - plan.prompts;
-    lines.extend(prompt_lines.into_iter().skip(skip_prompts));
+    let skip_prompts = prompts.len() - plan.prompts;
+    // The `Prmt:` label goes on the first prompt that survives shedding, not on
+    // the oldest one collected, or a card that shed its oldest prompt loses it.
+    for (i, prompt) in prompts.iter().skip(skip_prompts).enumerate() {
+        if is_placeholder {
+            lines.push(Line::from(Span::styled(prompt.clone(), text_primary())));
+            continue;
+        }
+        let prefix = if i == 0 { "Prmt: " } else { "      " };
+        let display = truncate_with_ellipsis(prompt, w.saturating_sub(6));
+        lines.push(Line::from(vec![
+            Span::styled(prefix, text_primary()),
+            Span::raw(display),
+        ]));
+    }
     if plan.separator {
         lines.push(Line::from(""));
     }
@@ -20587,6 +20587,9 @@ fn fit_card_rows(
     if used(&plan) > budget {
         plan.separator = false;
     }
+    // Prompts go before `Dir:`: `Dir:` is the card's identity and every card in
+    // the grid leads with it, while the prompt is the least time-sensitive row —
+    // the status reason and the newest tool already tell the current story.
     while used(&plan) > budget && plan.prompts > 0 {
         plan.prompts -= 1;
     }

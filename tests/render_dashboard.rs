@@ -1152,7 +1152,9 @@ fn palette_session(status: SessionStatus) -> SessionState {
 /// Scenario: Render a dashboard card whose agent is blocked because its credits
 /// are depleted, then render a stats bar with one blocked agent. The card must
 /// show a Blocked badge and credit reason, and both surfaces must use the error colour.
-/// A full Blocked card must also keep its last tool line visible at every density.
+/// A full Blocked card must keep its last tool line visible at every density.
+/// When it is also orphaned, both status rows survive and any visible prompt
+/// history starts with the `Prmt:` label.
 #[spec("status/badge/002")]
 #[test]
 fn status_badge_002_blocked_card_snapshot() {
@@ -1249,6 +1251,38 @@ fn status_badge_002_blocked_card_snapshot() {
             blocked.contains("Bash — cargo test"),
             "Blocked card clipped its last tool line at {density:?}:\n{blocked}"
         );
+
+        full.orchestration_orphaned = true;
+        let orphaned_blocked = render(&full);
+        for status in ["Orphaned — delegation unavailable", "Credits"] {
+            assert!(
+                orphaned_blocked.contains(status),
+                "Orphaned+Blocked card lost {status} at {density:?}:\n{orphaned_blocked}"
+            );
+        }
+        assert!(
+            orphaned_blocked.contains("Bash — cargo test"),
+            "Orphaned+Blocked card clipped its newest tool at {density:?}:\n{orphaned_blocked}"
+        );
+        let first_visible_prompt = orphaned_blocked.lines().find(|row| {
+            ["first prompt", "second prompt", "third prompt"]
+                .iter()
+                .any(|prompt| row.contains(prompt))
+        });
+        if density == CardDensityKind::Spacious {
+            assert!(
+                orphaned_blocked.contains("second prompt")
+                    && orphaned_blocked.contains("third prompt"),
+                "Spacious Orphaned+Blocked card must retain its two newest prompts:\n{orphaned_blocked}"
+            );
+        }
+        if let Some(row) = first_visible_prompt {
+            assert!(
+                row.contains("Prmt: "),
+                "first visible prompt lost its Prmt: label at {density:?}:\n{orphaned_blocked}"
+            );
+        }
+        full.orchestration_orphaned = false;
         full.status = SessionStatus::Working;
         full.blocked = None;
     }
