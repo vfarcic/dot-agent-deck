@@ -1988,11 +1988,33 @@ struct IssuedPromptSend {
 /// [`crate::submit_echo::SUBMIT_ECHO_BOUND`], so the render loop issues the
 /// write and polls for its outcome instead of waiting on its own thread.
 /// While one is in flight nothing else happens for that pane's delivery — no
-/// confirmation check, deadline, retry or second write — so the outcome is
-/// applied to the state it was issued from.
+/// confirmation check, retry or second write — so the outcome is applied to
+/// the state it was issued from.
+///
+/// The one exception is [`AUTOMATIC_PROMPT_DEADLINE`], which is still checked
+/// on every frame: a daemon that stays connected but never answers would
+/// otherwise hold the delivery forever. A write still unanswered when the
+/// deadline passes is treated as ambiguous — it may or may not have landed —
+/// and not counted as an attempt, exactly like a transport error: the handle is
+/// dropped (a late answer then has nowhere to go) and the delivery reaches the
+/// ordinary deadline handling in the same frame, which ends it without a second
+/// write.
 struct InFlightPromptSend {
     pending: crate::pane::PendingSubmit,
     issued: IssuedPromptSend,
+}
+
+/// Issue #1383: warn-level record that a prompt write was still unanswered by
+/// the daemon when [`AUTOMATIC_PROMPT_DEADLINE`] passed, so its handle was
+/// dropped. See [`InFlightPromptSend`].
+fn log_prompt_send_unanswered(path: &str, pane_id: &str, issued: &IssuedPromptSend) {
+    tracing::warn!(
+        path,
+        pane_id,
+        delivery_id = issued.delivery_id.as_deref().unwrap_or_default(),
+        attempt = issued.attempt,
+        "prompt write unanswered by the daemon at the deadline; giving up on it"
+    );
 }
 
 /// Issue #1383: whether `issued` still belongs to the delivery now held for
@@ -3875,35 +3897,43 @@ fn process_pending_seed_prompts(
     let mut in_flight = std::mem::take(&mut ui.in_flight_prompt_sends);
     prompts.retain_mut(|sp| {
         // Issue #1383: a write the daemon has not answered yet holds this
-        // seed's whole delivery — confirmation, deadline, retry — until its
-        // outcome arrives, and that outcome is applied first. See
-        // [`InFlightPromptSend`].
+        // seed's delivery — confirmation, retry — until its outcome arrives,
+        // and that outcome is applied first. Only the deadline still runs: a
+        // write still unanswered when it passes is given up on here and the
+        // seed falls through to the deadline below, which ends it without a
+        // second write. See [`InFlightPromptSend`].
         if let Some(sending) = in_flight.get_mut(&sp.pane_id) {
-            let Some(outcome) = sending.pending.poll() else {
+            let polled = sending.pending.poll();
+            if polled.is_none() && sp.created_at.elapsed() <= AUTOMATIC_PROMPT_DEADLINE {
                 return true;
-            };
+            }
             let issued = in_flight
                 .remove(&sp.pane_id)
                 .expect("the entry polled above")
                 .issued;
-            if !issued_for_current_delivery(&deliveries, &sp.pane_id, &issued) {
-                tracing::debug!(
-                    pane_id = %sp.pane_id,
-                    delivery_id = issued.delivery_id.as_deref().unwrap_or_default(),
-                    "seed write answered after its delivery was dropped; outcome discarded"
-                );
-                return true;
+            match polled {
+                None => log_prompt_send_unanswered("seed", &sp.pane_id, &issued),
+                Some(_) if !issued_for_current_delivery(&deliveries, &sp.pane_id, &issued) => {
+                    tracing::debug!(
+                        pane_id = %sp.pane_id,
+                        delivery_id = issued.delivery_id.as_deref().unwrap_or_default(),
+                        "seed write answered after its delivery was dropped; outcome discarded"
+                    );
+                    return true;
+                }
+                Some(outcome) => {
+                    return apply_seed_send_outcome(
+                        outcome,
+                        &issued,
+                        &sp.pane_id,
+                        snapshot,
+                        now,
+                        &mut backoff,
+                        &mut deliveries,
+                        &mut feedback,
+                    );
+                }
             }
-            return apply_seed_send_outcome(
-                outcome,
-                &issued,
-                &sp.pane_id,
-                snapshot,
-                now,
-                &mut backoff,
-                &mut deliveries,
-                &mut feedback,
-            );
         }
         // Issue #424: CONFIRMATION FIRST. A previous frame's `Applied`/`Queued`
         // only proved the PTY accepted bytes, so the seed is still here; if the
@@ -5109,39 +5139,58 @@ fn deliver_orchestrator_prompt(
 ) {
     let start_pane_id = role_pane_ids[start_role_index].clone();
 
-    // Issue #1383: a write the daemon has not answered yet holds the whole
-    // delivery — confirmation, deadline, retry — until its outcome arrives, and
-    // that outcome is applied first. See [`InFlightPromptSend`].
+    // PRD #20 R20-005: whether the hard timeout has passed. Read here because
+    // an unanswered write consults it too (below), then again at the DEADLINE
+    // FIRST check.
+    let deadline_passed = ui
+        .orchestration_prompt_anchor_at
+        .get(&tab_id)
+        .is_some_and(|t| now.duration_since(*t) > AUTOMATIC_PROMPT_DEADLINE);
+
+    // Issue #1383: a write the daemon has not answered yet holds the delivery
+    // — confirmation, retry — until its outcome arrives, and that outcome is
+    // applied first. Only the deadline still runs: a write still unanswered
+    // when it passes is given up on here and the delivery falls through to the
+    // deadline below, which ends it without a second write. See
+    // [`InFlightPromptSend`].
     if let Some(sending) = ui.in_flight_prompt_sends.get_mut(start_pane_id.as_str()) {
-        let Some(outcome) = sending.pending.poll() else {
+        let polled = sending.pending.poll();
+        if polled.is_none() && !deadline_passed {
             return;
-        };
+        }
         let issued = ui
             .in_flight_prompt_sends
             .remove(start_pane_id.as_str())
             .expect("the entry polled above")
             .issued;
-        if !issued_for_current_delivery(&ui.prompt_delivery, &start_pane_id, &issued) {
-            tracing::debug!(
-                pane_id = %start_pane_id,
-                delivery_id = issued.delivery_id.as_deref().unwrap_or_default(),
-                "orchestrator write answered after its delivery was dropped; outcome discarded"
-            );
-            return;
+        match polled {
+            None => log_prompt_send_unanswered("orchestrator", &start_pane_id, &issued),
+            Some(_)
+                if !issued_for_current_delivery(&ui.prompt_delivery, &start_pane_id, &issued) =>
+            {
+                tracing::debug!(
+                    pane_id = %start_pane_id,
+                    delivery_id = issued.delivery_id.as_deref().unwrap_or_default(),
+                    "orchestrator write answered after its delivery was dropped; outcome discarded"
+                );
+                return;
+            }
+            Some(outcome) => {
+                apply_orchestrator_send_outcome(
+                    ui,
+                    outcome,
+                    &issued,
+                    snapshot,
+                    now,
+                    tab_id,
+                    &start_pane_id,
+                    start_role_index,
+                    role_statuses,
+                    orchestrator_prompt,
+                );
+                return;
+            }
         }
-        apply_orchestrator_send_outcome(
-            ui,
-            outcome,
-            &issued,
-            snapshot,
-            now,
-            tab_id,
-            &start_pane_id,
-            start_role_index,
-            role_statuses,
-            orchestrator_prompt,
-        );
-        return;
     }
 
     // Issue #424: CONFIRMATION FIRST. A previous frame's `Applied`/`Queued`
@@ -5215,11 +5264,7 @@ fn deliver_orchestrator_prompt(
     // backoff / delivery branches — so the hard timeout is actually reachable.
     // The old block had no orchestrator deadline at all, so a permanent
     // non-delivery retried one RPC every ~2s forever.
-    if ui
-        .orchestration_prompt_anchor_at
-        .get(&tab_id)
-        .is_some_and(|t| now.duration_since(*t) > AUTOMATIC_PROMPT_DEADLINE)
-    {
+    if deadline_passed {
         // Issue #424: the same warn this always emitted, now carrying the
         // delivery identity and how many submissions were made — the two facts
         // that tell "never written" apart from "written N times and never
@@ -10099,6 +10144,19 @@ fn hit_test_card(card_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<usi
         .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(*idx))
 }
 
+/// Issue #1383: drop every piece of automatic-prompt delivery state held for a
+/// pane the user closed — its queued seed, its delivery identity, its retry
+/// backoff and any write still waiting on the daemon (whose handle is dropped,
+/// so a late answer has nowhere to go). An orchestrator role prompt is only
+/// ever delivered for a tab that still exists, so without this a pane closed
+/// with its tab kept those entries for the rest of the session.
+fn forget_prompt_delivery_for_pane(ui: &mut UiState, pane_id: &str) {
+    ui.pending_seed_prompts.retain(|sp| sp.pane_id != pane_id);
+    ui.prompt_delivery.remove(pane_id);
+    ui.send_retry_backoff.remove(pane_id);
+    ui.in_flight_prompt_sends.remove(pane_id);
+}
+
 /// PRD #80 M3: close the tab at `idx` and reconcile shared state — unregister
 /// every successfully-closed pane, drop the matching sessions (keeping any that
 /// failed to close so the user can retry), clean their metadata, and resweep the
@@ -10134,6 +10192,7 @@ fn close_tab_by_index(
             for id in &outcome.closed {
                 ui.pane_metadata.remove(id);
                 ui.pane_declared_agent.remove(id);
+                forget_prompt_delivery_for_pane(ui, id);
             }
             if outcome.is_clean() {
                 ui.status_message = Some(("Closed tab".to_string(), std::time::Instant::now()));
@@ -10580,6 +10639,7 @@ fn dispatch_action(
                             drop(st);
                             ui.pane_metadata.remove(&pane_id);
                             ui.pane_declared_agent.remove(&pane_id);
+                            forget_prompt_delivery_for_pane(ui, &pane_id);
                             ui.status_message = Some((
                                 format!("Closed agent {pane_id}"),
                                 std::time::Instant::now(),
@@ -36240,6 +36300,196 @@ mod tests {
             "an answer for a replaced delivery must not be applied to anything"
         );
         assert_eq!(controller.started(), 2);
+    }
+
+    /// Scenario: a card's seed prompt and an orchestration's role prompt are
+    /// each written, but the daemon stays connected and never answers either
+    /// write. Before the automatic-prompt deadline the deck keeps waiting;
+    /// once it passes, the deck gives up on the unanswered write, ends the
+    /// delivery as it does any delivery that reaches its deadline, and never
+    /// writes a second time. A late answer then has nowhere to go.
+    #[test]
+    fn a_prompt_write_the_daemon_never_answers_ends_at_the_deadline_without_rewriting() {
+        const PANE_ID: &str = "unanswered-pane";
+        const AGENT_ID: &str = "unanswered-agent";
+        const PROMPT: &str = "Read the dispatch seed and begin";
+        let past_deadline = AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_millis(1);
+
+        // The seed path.
+        let controller = Arc::new(HeldSubmitPaneController::new());
+        let pane: Arc<dyn PaneController> = controller.clone();
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(ready_seed_prompt(PANE_ID, PROMPT));
+        let snapshot = announced_prompt_snapshot(PANE_ID, AGENT_ID);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(controller.started(), 1, "the seed write must be started");
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert!(
+            ui.in_flight_prompt_sends.contains_key(PANE_ID),
+            "before the deadline an unanswered write is still waited for"
+        );
+
+        ui.pending_seed_prompts[0].created_at = std::time::Instant::now()
+            .checked_sub(past_deadline)
+            .expect("backdated seed");
+        for _ in 0..3 {
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        }
+        assert!(
+            !ui.in_flight_prompt_sends.contains_key(PANE_ID),
+            "an unanswered write must be given up on once the deadline passes"
+        );
+        assert!(
+            ui.pending_seed_prompts.is_empty()
+                && !ui.prompt_delivery.contains_key(PANE_ID)
+                && !ui.send_retry_backoff.contains_key(PANE_ID),
+            "the seed must end as any delivery at its deadline does"
+        );
+        assert_eq!(controller.started(), 1, "and must never be written twice");
+        assert!(
+            controller.started.lock().unwrap()[0]
+                .send(Ok(crate::event::SendResult::Applied))
+                .is_err(),
+            "the unanswered write's handle must have been dropped"
+        );
+
+        // The orchestrator path.
+        let tab_id: TabId = 13830;
+        let controller = Arc::new(HeldSubmitPaneController::new());
+        let now = std::time::Instant::now();
+        let mut ui = default_ui();
+        ui.orchestration_prompt_anchor_at.insert(tab_id, now);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some(PROMPT.to_string());
+        let mut frame = |ui: &mut UiState, prompt: &mut Option<String>, at| {
+            deliver_orchestrator_prompt(
+                ui,
+                controller.as_ref(),
+                &snapshot,
+                at,
+                tab_id,
+                &[PANE_ID.to_string()],
+                0,
+                &mut role_statuses,
+                prompt,
+            )
+        };
+        frame(&mut ui, &mut prompt, now);
+        assert_eq!(controller.started(), 1, "the role prompt must be started");
+        frame(&mut ui, &mut prompt, now + AUTOMATIC_PROMPT_DEADLINE);
+        assert!(
+            ui.in_flight_prompt_sends.contains_key(PANE_ID),
+            "at the deadline, not past it, the write is still waited for"
+        );
+
+        for _ in 0..3 {
+            frame(&mut ui, &mut prompt, now + past_deadline);
+        }
+        assert!(!ui.in_flight_prompt_sends.contains_key(PANE_ID));
+        assert!(
+            prompt.is_none() && ui.orchestration_remit_abandoned.contains(&tab_id),
+            "the role prompt must be abandoned as any delivery at its deadline is"
+        );
+        assert!(
+            !ui.prompt_delivery.contains_key(PANE_ID)
+                && !ui.send_retry_backoff.contains_key(PANE_ID)
+        );
+        assert_eq!(controller.started(), 1, "and must never be written twice");
+        assert!(
+            controller.started.lock().unwrap()[0]
+                .send(Ok(crate::event::SendResult::Applied))
+                .is_err(),
+            "the unanswered write's handle must have been dropped"
+        );
+    }
+
+    /// Scenario: an orchestration tab's role pane has a seed prompt queued, a
+    /// delivery under way with a write the daemon has not answered, and a
+    /// retry scheduled, and so does a pane on another tab. Closing the
+    /// orchestration tab must drop all of that for the closed pane and leave
+    /// the other pane's delivery alone.
+    #[test]
+    fn closing_a_tab_drops_the_prompt_delivery_state_of_its_panes() {
+        const SURVIVOR: &str = "survivor-pane";
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let cfg = OrchestrationConfig {
+            default: false,
+            name: "team".to_string(),
+            roles: vec![OrchestrationRoleConfig {
+                agent: None,
+                name: "orchestrator".to_string(),
+                command: "cat".to_string(),
+                start: true,
+                description: None,
+                prompt_template: None,
+                clear: false,
+            }],
+        };
+        tm.open_orchestration_tab(
+            &cfg,
+            tmp.path().to_str().expect("utf-8 tmp path"),
+            None,
+            None,
+            (24, 80),
+        )
+        .expect("open orchestration tab");
+        let closed = match &tm.tabs()[1] {
+            Tab::Orchestration { role_pane_ids, .. } => role_pane_ids[0].clone(),
+            _ => panic!("tab 1 should be an orchestration tab"),
+        };
+
+        let held = Arc::new(HeldSubmitPaneController::new());
+        let writer: Arc<dyn PaneController> = held.clone();
+        let mut ui = default_ui();
+        for pane_id in [closed.as_str(), SURVIVOR] {
+            ui.pending_seed_prompts
+                .push(ready_seed_prompt(pane_id, "Read the seed and begin"));
+            let snapshot = announced_prompt_snapshot(pane_id, &format!("{pane_id}-agent"));
+            process_pending_seed_prompts(&mut ui, &writer, &snapshot);
+            schedule_send_retry(
+                &mut ui.send_retry_backoff,
+                pane_id,
+                std::time::Instant::now(),
+            );
+        }
+        assert_eq!(held.started(), 2);
+        for pane_id in [closed.as_str(), SURVIVOR] {
+            assert!(ui.in_flight_prompt_sends.contains_key(pane_id));
+            assert!(ui.prompt_delivery.contains_key(pane_id));
+            assert!(ui.send_retry_backoff.contains_key(pane_id));
+        }
+
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        close_tab_by_index(1, &mut ui, &state, &mut tm);
+
+        assert!(
+            !ui.in_flight_prompt_sends.contains_key(&closed)
+                && !ui.prompt_delivery.contains_key(&closed)
+                && !ui.send_retry_backoff.contains_key(&closed)
+                && ui
+                    .pending_seed_prompts
+                    .iter()
+                    .all(|sp| sp.pane_id != closed),
+            "a closed pane must keep no prompt delivery state"
+        );
+        assert!(
+            ui.in_flight_prompt_sends.contains_key(SURVIVOR)
+                && ui.prompt_delivery.contains_key(SURVIVOR)
+                && ui.send_retry_backoff.contains_key(SURVIVOR)
+                && ui
+                    .pending_seed_prompts
+                    .iter()
+                    .any(|sp| sp.pane_id == SURVIVOR),
+            "a pane on another tab must keep its delivery"
+        );
     }
 
     /// Scenario: Write an orchestrator's spawn-time prompt to a ready pane and have the controller report Applied or Queued without an agent hook. The prompt, identity, retry, and non-Working role must remain provisional until a matching UserPromptSubmit-derived event arrives, after which all delivery state clears and the role becomes Working.

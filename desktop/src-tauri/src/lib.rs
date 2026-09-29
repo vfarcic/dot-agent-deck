@@ -92,7 +92,7 @@ const WATCH_RETRY_DELAY: Duration = Duration::from_secs(1);
 ///
 /// Issue #1383: the daemon holds a submit's Enter until the payload has
 /// rendered on the agent's screen, for up to
-/// [`dot_agent_deck::submit_echo::SUBMIT_ECHO_BOUND`] on a pane that never
+/// [`dot_agent_deck::daemon_protocol::WRITE_AND_SUBMIT_ECHO_BOUND`] on a pane that never
 /// shows it, and the answer comes after that Enter — behind the capability
 /// probe and any wait for the pane's writer. The old 2 s equalled the bound, so
 /// it could fire while the daemon was still holding the Enter. That does not
@@ -101,10 +101,11 @@ const WATCH_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// reports a failure for a write that went ahead and spends a retry on it.
 /// Hence the bound plus 2 s of margin.
 const COORDINATOR_DELIVERY_RPC_TIMEOUT: Duration =
-    dot_agent_deck::submit_echo::SUBMIT_ECHO_BOUND.saturating_add(Duration::from_secs(2));
+    dot_agent_deck::daemon_protocol::WRITE_AND_SUBMIT_ECHO_BOUND
+        .saturating_add(Duration::from_secs(2));
 const _: () = assert!(
     COORDINATOR_DELIVERY_RPC_TIMEOUT.as_millis()
-        > dot_agent_deck::submit_echo::SUBMIT_ECHO_BOUND.as_millis(),
+        > dot_agent_deck::daemon_protocol::WRITE_AND_SUBMIT_ECHO_BOUND.as_millis(),
     "a coordinator-seed write must be given longer than the daemon may hold its Enter"
 );
 /// How long the post-failure lookup of a role's start may take. It shared
@@ -7785,7 +7786,7 @@ command = "configured-planner"
         // write that is still going ahead.
         for submission in submissions.iter() {
             assert!(
-                submission.timeout > dot_agent_deck::submit_echo::SUBMIT_ECHO_BOUND,
+                submission.timeout > dot_agent_deck::daemon_protocol::WRITE_AND_SUBMIT_ECHO_BOUND,
                 "a seed attempt must outlast the daemon's echo wait: {:?}",
                 submission.timeout
             );
