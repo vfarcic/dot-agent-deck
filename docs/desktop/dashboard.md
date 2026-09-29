@@ -61,7 +61,7 @@ What each status means, and which agents can report Blocked, is on [Session Mana
 
 ## The agent pane
 
-Click a row, or its open control (`Open <name> agent`), to open that agent's live terminal in a full-window pane over the Dashboard. Type into it as you would into the TUI's pane. Press `Escape`, or **Back to dashboard**, to close the pane; the agent keeps running.
+Click a row, or its open control (`Open <name> agent`), to open that agent's live terminal in a full-window pane over the Dashboard. Type into it as you would into the TUI's pane. To copy the agent's output, select it with the mouse and press `Ctrl+Shift+C` (`⌘C` on macOS); plain `Ctrl+C` still goes to the agent as an interrupt. The TUI copies differently: a mouse drag in a pane copies when you release the button, and whether that reaches your clipboard depends on your terminal. Press `Escape`, or **Back to dashboard**, to close the pane; the agent keeps running.
 
 Besides **Terminal**, the pane has **Diff**, **Checks**, **Delegations** and **Artifacts** tabs. The daemon does not provide that data today, so against a real daemon each of them says so (for example "Diff data is not exposed by the daemon").
 

@@ -1,6 +1,6 @@
 // Issue #953 — the driver tier's WebDriver client.
 //
-// A W3C WebDriver session is plain JSON over HTTP, and this suite needs eight
+// A W3C WebDriver session is plain JSON over HTTP, and this suite needs twelve
 // of its endpoints, so it speaks the protocol directly with Node's own `fetch`
 // rather than pulling in WebdriverIO: no new dependency to pin, audit or bump,
 // and nothing between a failing assertion and the wire it came from.
@@ -21,6 +21,10 @@ function elementOf(value: Record<string, string>): Element {
 
 /** The Enter key, as WebDriver's key table spells it. */
 export const ENTER = "";
+/** The modifier keys, by the same table, for `Session.chord`. */
+export const SHIFT = "\uE008";
+export const CONTROL = "\uE009";
+export const META = "\uE03D";
 
 export class WebDriverError extends Error {
   readonly code: string;
@@ -139,6 +143,52 @@ export class Session {
   /** Real key events into `element`, which is what a React-controlled input and xterm's textarea both need. */
   async type(element: Element, text: string): Promise<void> {
     await this.request("POST", `/element/${element.id}/value`, { text });
+  }
+
+  /**
+   * Issue #1403 — press `keys` together and release them in reverse, as W3C
+   * key actions: modifiers first, then the key. Element Send Keys cannot hold a
+   * modifier across a keystroke in a way every native driver agrees on, and a
+   * chord is exactly that. The events go to whatever has focus, so focus the
+   * target first (`type` into it, or click it).
+   */
+  async chord(keys: string[]): Promise<void> {
+    const down = keys.map((value) => ({ type: "keyDown", value }));
+    const up = [...keys].reverse().map((value) => ({ type: "keyUp", value }));
+    await this.perform([{ type: "key", id: "keyboard", actions: [...down, ...up] }]);
+  }
+
+  /**
+   * Issue #1403 — a real left-button drag between two viewport points, which is
+   * how a person selects text in xterm: the selection service listens for the
+   * press on the terminal's screen and follows the pointer until release.
+   */
+  async drag(from: { x: number; y: number }, to: { x: number; y: number }): Promise<void> {
+    const at = (point: { x: number; y: number }, duration: number) => ({
+      type: "pointerMove",
+      duration,
+      origin: "viewport",
+      x: Math.round(point.x),
+      y: Math.round(point.y),
+    });
+    await this.perform([
+      {
+        type: "pointer",
+        id: "mouse",
+        parameters: { pointerType: "mouse" },
+        actions: [at(from, 0), { type: "pointerDown", button: 0 }, at(to, 150), { type: "pointerUp", button: 0 }],
+      },
+    ]);
+  }
+
+  private async perform(actions: unknown[]): Promise<void> {
+    try {
+      await this.request("POST", "/actions", { actions });
+    } finally {
+      // Release Actions, so a chord or a drag that failed half way cannot leave
+      // a modifier or the button held down under every later step.
+      await this.request("DELETE", "/actions");
+    }
   }
 
   /** The element's DOM property (`value` for an input), not its attribute. */

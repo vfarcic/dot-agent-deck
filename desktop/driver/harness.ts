@@ -37,6 +37,7 @@ const paths = {
   daemon: process.env.DAD_DRIVER_DAEMON ?? join(REPO_ROOT, "target", "debug", "dot-agent-deck"),
   tauriDriver: process.env.DAD_DRIVER_TAURI_DRIVER ?? "tauri-driver",
   nativeDriver: process.env.DAD_DRIVER_NATIVE_DRIVER ?? "WebKitWebDriver",
+  xclip: process.env.DAD_DRIVER_XCLIP ?? "xclip",
   results: process.env.DAD_DRIVER_RESULTS ?? join(REPO_ROOT, "desktop", "driver-results"),
 };
 
@@ -329,6 +330,55 @@ export class Deck {
       throw new Error("the bundle carries no driver seam: build it with VITE_DAD_DRIVER_SEAM=1 (docs/develop/desktop-gui.md)");
     }
     return texts;
+  }
+
+  /**
+   * Issue #1403 — two viewport points on the first visible row, of any mounted
+   * terminal, whose text is exactly `text`: `from` in its first cell and `to`
+   * at the screen's right edge, so a drag between them selects the whole row.
+   * The drag runs to the edge rather than to the last character because
+   * xterm rounds a pointer to a cell boundary — measured, a drag ending on the
+   * last character's centre left that character out — and a selection past
+   * the end of a row's text copies no trailing blanks. Read through the same
+   * build-time seam as `terminalTexts`, since the WebGL renderer leaves no row
+   * text in the DOM to measure instead.
+   */
+  async rowSpan(text: string): Promise<{ from: { x: number; y: number }; to: { x: number; y: number } } | undefined> {
+    type Screen = {
+      cols: number;
+      rows: number;
+      lines: string[];
+      rect: { left: number; top: number; width: number; height: number } | null;
+    };
+    const screens = await this.session.execute<Screen[] | null>(
+      "return window.__dadDriver ? window.__dadDriver.terminalScreens() : null",
+    );
+    if (screens === null) {
+      throw new Error("the bundle carries no driver seam: build it with VITE_DAD_DRIVER_SEAM=1 (docs/develop/desktop-gui.md)");
+    }
+    for (const { cols, rows, lines, rect } of screens) {
+      const row = lines.findIndex((line) => line === text);
+      if (row < 0 || !rect || cols < 1 || rows < 1) continue;
+      const cell = { width: rect.width / cols, height: rect.height / rows };
+      const y = rect.top + (row + 0.5) * cell.height;
+      return {
+        from: { x: rect.left + 0.5 * cell.width, y },
+        to: { x: rect.left + rect.width - 1, y },
+      };
+    }
+    return undefined;
+  }
+
+  /**
+   * Issue #1403 — the SYSTEM clipboard's text, read by `xclip` from outside
+   * the app, on the display the window is on. Not `navigator.clipboard` in the
+   * page: that would ask the same webview whose clipboard path is under test,
+   * and a read there needs a permission this app never grants. `null` when
+   * nothing owns the clipboard yet, which `xclip` reports as a failure.
+   */
+  async clipboardText(): Promise<string | null> {
+    const { code, stdout } = await run(paths.xclip, ["-selection", "clipboard", "-o"], this.env);
+    return code === 0 ? stdout : null;
   }
 
   /** The daemon's own view of its agents, from the CLI rather than the window. */

@@ -188,10 +188,26 @@ export function stripAnsi(raw: string): string {
 // then constant-false in any other build and the minifier drops it, and
 // `desktop-web` greps its own `pnpm build` output for `__dadDriver` so a bundle
 // built the ordinary way cannot quietly start carrying it. It exposes the same
-// text the Reader overlay already shows a user, and it writes nothing.
+// text the Reader overlay already shows a user, where that text is painted, and
+// it writes nothing.
 if (import.meta.env.VITE_DAD_DRIVER_SEAM === "1") {
   (window as Window & { __dadDriver?: unknown }).__dadDriver = {
     terminalTexts: () =>
       [...terminals.entries()].map(([key, terminal]) => ({ key, text: terminalSnapshotText(terminal) })),
+    // Issue #1403 — where each terminal's visible rows are painted, so a
+    // scenario can drag across a row the way a person selects text. One entry
+    // per viewport row (not re-joined like the snapshot above, so row `i` is
+    // screen row `i`), plus the grid and the screen's box in viewport pixels.
+    terminalScreens: () =>
+      [...terminals.entries()].map(([key, terminal]) => {
+        const buffer = terminal.buffer.active;
+        const lines: string[] = [];
+        for (let row = 0; row < terminal.rows; row += 1) {
+          lines.push(buffer.getLine(buffer.viewportY + row)?.translateToString(true) ?? "");
+        }
+        const box = terminal.element?.querySelector(".xterm-screen")?.getBoundingClientRect();
+        const rect = box ? { left: box.left, top: box.top, width: box.width, height: box.height } : null;
+        return { key, cols: terminal.cols, rows: terminal.rows, lines, rect };
+      }),
   };
 }
