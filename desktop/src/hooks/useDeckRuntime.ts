@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createFixtureSnapshot } from "../data/fixture";
 import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
-import type { DesktopSettingsDto, EndpointSettingsDto, VoiceDictationTargetDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
+import type { DesktopSettingsDto, EndpointSettingsDto, VoiceDictationTargetDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceResolvedParamDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
 import { voiceDeckStep } from "../lib/newAgent";
 import { agentKey } from "../lib/agentKey";
 import { LaunchCleanupError } from "../lib/actionError";
@@ -396,6 +396,7 @@ export function useDeckRuntime(): DeckRuntimeState {
      what the dialog preselects are judged against one list. */
   const declareVoiceScreen = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto) => bridge.declareVoiceScreen(screen, directories, newAgent, voiceDeckStep(fleetRef.current), endpoints, dictation), [bridge]);
   const resolveVoice = useCallback((utterance: string) => bridge.resolveVoice(utterance), [bridge]);
+  const answerVoiceChoice = useCallback((utterance: string, action: string, offered: VoiceResolvedParamDto[]) => bridge.answerVoiceChoice(utterance, action, offered), [bridge]);
   const voiceCommands = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto) => bridge.voiceCommands(screen, directories, newAgent), [bridge]);
   const voiceStart = useCallback(() => bridge.voiceStart(), [bridge]);
   const voiceStop = useCallback(() => bridge.voiceStop(), [bridge]);
@@ -488,6 +489,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     forgetSecret,
     declareVoiceScreen,
     resolveVoice,
+    answerVoiceChoice,
     voiceCommands,
     voiceStart,
     voiceStop,

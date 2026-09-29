@@ -40,8 +40,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use super::choice::MAX_CHOICES;
 use super::dictation::{
     DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS, SUBMIT_PHRASES,
     VOICE_OFF_PHRASES, opening_with, strip_opening,
@@ -97,7 +98,7 @@ const VOICE_OFF_ROW: &str = "voice_off";
 pub const SWITCH_DECK_ROW: &str = "switch_deck";
 
 /// One param, resolved against live state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedParam {
     pub name: String,
@@ -120,7 +121,7 @@ pub struct ResolvedParam {
     /// can refuse a row whose address changed under the same id during the
     /// round trip. `None` everywhere else, including a switch to the local
     /// deck, which has no remote address to change.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deck_identity: Option<VoiceDeckIdentity>,
 }
 
@@ -132,7 +133,7 @@ pub struct ResolvedParam {
 /// the second). Serialized in the webview's `RemoteEndpointDto` spelling, with
 /// the optional fields absent rather than `null`, so it compares field for
 /// field with the row the selector reads.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceDeckIdentity {
     pub host: String,
@@ -250,9 +251,26 @@ pub enum VoiceOutcome {
     ParamAmbiguous {
         transcript: Transcript,
         action: String,
+        /// The row's `invoke`, which a chosen candidate completes (PRD #1261).
+        invoke: String,
         param: String,
         spoken: String,
+        /// The labels the sentence names — every candidate's, in order.
         matches: Vec<String>,
+        /// PRD #1261 — the tie as something to choose from: each candidate as
+        /// the [`ResolvedParam`] a dispatch of it would carry, in the order
+        /// offered. **Empty unless this is a genuine tie on the row's last
+        /// REQUIRED param** ([`VoiceOutcome::offered_beside`]): a safety refusal is never a
+        /// tie, and never reaches this variant at all.
+        candidates: Vec<ResolvedParam>,
+        /// The params resolved before the tied one, which a chosen candidate
+        /// is dispatched beside. Empty for every row shipped today, which each
+        /// declare one param.
+        params: Vec<ResolvedParam>,
+        /// The report a dispatch of each candidate would render, aligned with
+        /// `candidates` — rendered here, like every other sentence, so the
+        /// chooser never composes one.
+        reports: Vec<String>,
         sentence: String,
     },
     /// The intent backend could not answer.
@@ -287,6 +305,48 @@ impl VoiceOutcome {
     /// Whether this outcome asks the frontend to run something.
     pub fn is_dispatch(&self) -> bool {
         matches!(self, VoiceOutcome::Dispatch { .. })
+    }
+
+    /// PRD #1261 — a [`VoiceOutcome::ParamAmbiguous`] completed for the row it
+    /// came from: `resolved` are the params before the tied one, and `last`
+    /// whether the tied one is the row's last param. A tie anywhere else is
+    /// not offered, because a chosen candidate would be dispatched without the
+    /// params after it — it keeps its sentence and loses its candidates. Every
+    /// other outcome is returned as it was.
+    fn offered_beside(mut self, row: &CommandRow, resolved: &[ResolvedParam], last: bool) -> Self {
+        if let VoiceOutcome::ParamAmbiguous {
+            candidates, params, ..
+        } = &mut self
+        {
+            if !last {
+                candidates.clear();
+            }
+            *params = resolved.to_vec();
+        }
+        self.with_reports(row)
+    }
+
+    /// PRD #1261 — each candidate's report, as a dispatch of it would render
+    /// it ([`report`]), so the chooser shows the table's own sentence for the
+    /// one chosen rather than composing one.
+    fn with_reports(mut self, row: &CommandRow) -> Self {
+        if let VoiceOutcome::ParamAmbiguous {
+            candidates,
+            params,
+            reports,
+            ..
+        } = &mut self
+        {
+            *reports = candidates
+                .iter()
+                .map(|candidate| {
+                    let mut all = params.clone();
+                    all.push(candidate.clone());
+                    report(row, &all)
+                })
+                .collect();
+        }
+        self
     }
 
     /// Speech could not be turned into text (M7's seam).
@@ -879,7 +939,14 @@ pub async fn handle_utterance_with_dictation(
                 notes.push(unmet.dropped_note(spec.kind, spoken, &transcript, implied.as_ref()));
                 resolved.extend(implied);
             }
-            Err(unmet) => return finish(unmet.refusal(transcript, row, spec, spoken)),
+            Err(unmet) => {
+                // PRD #1261: a tie is offered as a choice only on the row's
+                // LAST param, where everything a chosen candidate is
+                // dispatched beside has already resolved.
+                let last = row.params.last().is_some_and(|last| last.name == spec.name);
+                let refusal = unmet.refusal(transcript, row, spec, spoken);
+                return finish(refusal.offered_beside(row, &resolved, last));
+            }
         }
     }
 
@@ -910,8 +977,9 @@ enum Unmet {
     /// A mode chip the form withholds, named by the label the form knows it by
     /// ([`withheld_mode_named`]).
     WithheldChoice(String),
-    /// More than one thing matches; the labels of each, as the screen shows them.
-    Ambiguous(Vec<String>),
+    /// More than one thing matches; each one's value and the label the screen
+    /// shows for it, in the resolver's order (PRD #1261).
+    Ambiguous(Vec<Candidate>),
     /// The voice settings withhold observed names from the model, so nothing it
     /// supplies for one is resolved (PRD #1223, audit finding A1).
     LabelsWithheld,
@@ -930,8 +998,9 @@ enum Unmet {
     /// The transcript names more than one deck — "the build box, not the
     /// staging box", "X or Y", or two decks whose names overlap — so which one
     /// the user meant is not something the model's pick can settle
-    /// ([`switch_target`]). The labels of each, as the screen shows them.
-    NamedSeveral(Vec<String>),
+    /// ([`switch_target`]). Each deck's key and the label the screen shows for
+    /// it, in the fleet's order (PRD #1261).
+    NamedSeveral(Vec<Candidate>),
     /// The transcript names exactly one deck, by this label, and the model's
     /// value resolves to a different one ([`switch_target`]).
     NamedOther(String),
@@ -963,14 +1032,22 @@ impl Unmet {
         match self {
             Unmet::NoMatch => unresolved(spec.kind.unresolved_phrase(spoken)),
             Unmet::WithheldChoice(label) => unresolved(spec.kind.unresolved_phrase(&label)),
-            Unmet::Ambiguous(matches) => VoiceOutcome::ParamAmbiguous {
-                sentence: heard(&transcript, &spec.kind.ambiguous_phrase(spoken, &matches)),
-                transcript,
-                action: row.id.clone(),
-                param: spec.name.clone(),
-                spoken: spoken.to_string(),
-                matches,
-            },
+            Unmet::Ambiguous(candidates) => {
+                let matches = labels_of(&candidates);
+                VoiceOutcome::ParamAmbiguous {
+                    sentence: heard(&transcript, &spec.kind.ambiguous_phrase(spoken, &matches)),
+                    transcript,
+                    action: row.id.clone(),
+                    invoke: row.invoke.clone(),
+                    param: spec.name.clone(),
+                    spoken: spoken.to_string(),
+                    matches,
+                    candidates: offered(spec, spoken, &candidates),
+                    params: Vec::new(),
+                    reports: Vec::new(),
+                }
+                .with_reports(row)
+            }
             Unmet::LabelsWithheld => VoiceOutcome::labels_withheld(transcript, row),
             Unmet::NotSaid => unresolved(format!("I did not catch which {}", spec.kind.noun())),
             // `ParamAmbiguous` rather than `ParamUnresolved`: it is the outcome
@@ -979,21 +1056,34 @@ impl Unmet {
             // USER named them, and never quotes the model's value, which here
             // is only one of them — `"staging box" matches more than one deck`
             // would be false.
-            Unmet::NamedSeveral(matches) => VoiceOutcome::ParamAmbiguous {
-                sentence: heard(
-                    &transcript,
-                    &format!(
-                        "you named more than one {}: {}",
-                        spec.kind.noun(),
-                        listed(&matches)
+            //
+            // It offers a choice among the decks named (PRD #1261), which is
+            // safe where the model's pick was not: the user picks one of the
+            // decks they themselves named, and an explicit answer is exactly
+            // what settles which one they meant.
+            Unmet::NamedSeveral(candidates) => {
+                let matches = labels_of(&candidates);
+                VoiceOutcome::ParamAmbiguous {
+                    sentence: heard(
+                        &transcript,
+                        &format!(
+                            "you named more than one {}: {}",
+                            spec.kind.noun(),
+                            listed(&matches)
+                        ),
                     ),
-                ),
-                transcript,
-                action: row.id.clone(),
-                param: spec.name.clone(),
-                spoken: spoken.to_string(),
-                matches,
-            },
+                    transcript,
+                    action: row.id.clone(),
+                    invoke: row.invoke.clone(),
+                    param: spec.name.clone(),
+                    spoken: spoken.to_string(),
+                    matches,
+                    candidates: offered(spec, spoken, &candidates),
+                    params: Vec::new(),
+                    reports: Vec::new(),
+                }
+                .with_reports(row)
+            }
             Unmet::NamedOther(label) => unresolved(format!(
                 "you named {}, but I resolved a different {}",
                 safe_message(&label),
@@ -1053,7 +1143,7 @@ impl Unmet {
                         "\u{201c}{}\u{201d} matches more than one {noun}",
                         safe_message(spoken)
                     ),
-                    Some(listed(matches)),
+                    Some(listed(&labels_of(matches))),
                 ),
                 Unmet::LabelsWithheld => (
                     format!("Settings \u{2192} Voice \u{2192} Names withholds {noun} names"),
@@ -1071,7 +1161,7 @@ impl Unmet {
                 // and so never dropped; spelled out for the same reason.
                 Unmet::NamedSeveral(matches) => (
                     format!("You named more than one {noun}"),
-                    Some(listed(matches)),
+                    Some(listed(&labels_of(matches))),
                 ),
                 Unmet::NamedOther(label) => (
                     format!(
@@ -1264,7 +1354,10 @@ fn switch_target(
     let named = decks_named(transcript.text(), decks);
     if named.len() > 1 {
         return Err(Unmet::NamedSeveral(
-            named.iter().map(|deck| deck.label.clone()).collect(),
+            named
+                .iter()
+                .map(|deck| Candidate::new(&deck.id, &deck.label))
+                .collect(),
         ));
     }
     if let Some(marker) = contrast_marker(transcript.text(), decks, &named) {
@@ -2116,7 +2209,7 @@ const WHOLE_UTTERANCE_POLITENESS: [&str; 9] = [
 /// The transcript's [`spoken_words`] — case and punctuation already gone —
 /// less any [`WHOLE_UTTERANCE_POLITENESS`] word at either end. What a
 /// `heard_as_whole` entry is compared against, by equality.
-fn whole_utterance(transcript: &str) -> Vec<String> {
+pub(super) fn whole_utterance(transcript: &str) -> Vec<String> {
     let words = spoken_words(transcript);
     let polite = |word: &String| WHOLE_UTTERANCE_POLITENESS.contains(&word.as_str());
     let start = words
@@ -2372,12 +2465,65 @@ fn listed(matches: &[String]) -> String {
     }
 }
 
+/// One of several things a spoken name matched (PRD #1261): what a dispatch of
+/// it would carry, and what the screen shows for it.
+///
+/// **The value, not only the label.** Two agents can display alike — the
+/// phrase fixtures' fleet has two called Atlas — so a label is not something a
+/// choice can act on. The value is what [`ResolvedParam::value`] would be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub value: String,
+    pub label: String,
+}
+
+impl Candidate {
+    fn new(value: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            label: label.into(),
+        }
+    }
+}
+
+/// The labels of `candidates`, in order — what an ambiguity sentence names.
+fn labels_of(candidates: &[Candidate]) -> Vec<String> {
+    candidates
+        .iter()
+        .map(|candidate| candidate.label.clone())
+        .collect()
+}
+
+/// `candidates` as the params a dispatch of each would carry, or none when
+/// there are more than [`MAX_CHOICES`]: a longer list is not offered, and its
+/// sentence already summarises the rest (PRD #1261).
+fn offered(
+    spec: &super::table::ParamSpec,
+    spoken: &str,
+    candidates: &[Candidate],
+) -> Vec<ResolvedParam> {
+    if candidates.len() > MAX_CHOICES {
+        return Vec::new();
+    }
+    candidates
+        .iter()
+        .map(|candidate| ResolvedParam {
+            name: spec.name.clone(),
+            kind: spec.kind,
+            spoken: spoken.to_string(),
+            value: candidate.value.clone(),
+            label: candidate.label.clone(),
+            deck_identity: None,
+        })
+        .collect()
+}
+
 /// What a spoken agent reference resolved to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRefMatch {
     One { id: String, label: String },
     None,
-    Ambiguous(Vec<String>),
+    Ambiguous(Vec<Candidate>),
 }
 
 /// Resolve a spoken reference against the live agent snapshot.
@@ -2424,7 +2570,7 @@ pub fn resolve_agent_ref(spoken: &str, agents: &[DesktopAgent]) -> AgentRefMatch
         },
         _ => AgentRefMatch::Ambiguous(
             hits.iter()
-                .map(|agent| display_label(agent, agents))
+                .map(|agent| Candidate::new(&agent.id, display_label(agent, agents)))
                 .collect(),
         ),
     }
@@ -2436,7 +2582,7 @@ pub fn resolve_agent_ref(spoken: &str, agents: &[DesktopAgent]) -> AgentRefMatch
 pub enum DeckRefMatch {
     One { id: String, label: String },
     None,
-    Ambiguous(Vec<String>),
+    Ambiguous(Vec<Candidate>),
 }
 
 /// Resolve a spoken reference against the observed fleet (PRD #1223).
@@ -2541,7 +2687,11 @@ fn deck_ref_match(hits: &[&VoiceDeck]) -> DeckRefMatch {
             id: hits[0].id.clone(),
             label: hits[0].label.clone(),
         },
-        _ => DeckRefMatch::Ambiguous(hits.iter().map(|deck| deck.label.clone()).collect()),
+        _ => DeckRefMatch::Ambiguous(
+            hits.iter()
+                .map(|deck| Candidate::new(&deck.id, &deck.label))
+                .collect(),
+        ),
     }
 }
 
@@ -2583,20 +2733,18 @@ fn decks_called<'a>(spoken: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDeck> 
 /// survives Settings editing any of that row's address fields — so without it
 /// a switch resolved against one machine, or one route to it, would write a
 /// selection that now reaches another.
+///
+/// **A tie's candidates are addressed the same way** (PRD #1261): a switch
+/// offered as a choice dispatches the chosen candidate as it stands, so each
+/// carries its token and identity from here. A tie with a candidate the
+/// selector has no token for is not offered at all — its candidates and
+/// reports are cleared and its sentence stands — rather than listing an entry
+/// that could only be refused.
 pub fn address_deck_switch(
     outcome: &mut VoiceOutcome,
     selection_of: impl Fn(&str) -> Option<VoiceDeckSelection>,
 ) {
-    let VoiceOutcome::Dispatch { action, params, .. } = outcome else {
-        return;
-    };
-    if action != SWITCH_DECK_ROW {
-        return;
-    }
-    for param in params
-        .iter_mut()
-        .filter(|param| param.kind == ParamKind::DeckRef)
-    {
+    let address = |param: &mut ResolvedParam| {
         let selection = selection_of(&param.value);
         param.deck_identity = selection
             .as_ref()
@@ -2604,6 +2752,30 @@ pub fn address_deck_switch(
         param.value = selection
             .map(|selection| selection.token)
             .unwrap_or_default();
+    };
+    match outcome {
+        VoiceOutcome::Dispatch { action, params, .. } if action == SWITCH_DECK_ROW => {
+            params
+                .iter_mut()
+                .filter(|param| param.kind == ParamKind::DeckRef)
+                .for_each(address);
+        }
+        VoiceOutcome::ParamAmbiguous {
+            action,
+            candidates,
+            reports,
+            ..
+        } if action == SWITCH_DECK_ROW => {
+            candidates
+                .iter_mut()
+                .filter(|param| param.kind == ParamKind::DeckRef)
+                .for_each(address);
+            if candidates.iter().any(|param| param.value.is_empty()) {
+                candidates.clear();
+                reports.clear();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2671,7 +2843,7 @@ pub enum DirRefMatch {
         name: String,
     },
     None,
-    Ambiguous(Vec<String>),
+    Ambiguous(Vec<Candidate>),
 }
 
 /// Resolve a spoken reference against the directories the New agent dialog's
@@ -2741,7 +2913,11 @@ pub fn resolve_dir_ref(spoken: &str, directories: Option<&VoiceDirectories>) -> 
             path: hits[0].path.clone(),
             name: hits[0].name.clone(),
         },
-        _ => DirRefMatch::Ambiguous(hits.iter().map(|entry| entry.name.clone()).collect()),
+        _ => DirRefMatch::Ambiguous(
+            hits.iter()
+                .map(|entry| Candidate::new(&entry.path, &entry.name))
+                .collect(),
+        ),
     }
 }
 
@@ -2764,7 +2940,7 @@ pub enum ChoiceMatch {
         label: String,
     },
     None,
-    Ambiguous(Vec<String>),
+    Ambiguous(Vec<Candidate>),
 }
 
 /// Resolve a spoken mode against the Mode chips the New agent form OFFERS
@@ -2942,7 +3118,11 @@ fn resolve_choice(
             id: hits[0].id.clone(),
             label: hits[0].label.clone(),
         },
-        _ => ChoiceMatch::Ambiguous(hits.iter().map(|choice| choice.label.clone()).collect()),
+        _ => ChoiceMatch::Ambiguous(
+            hits.iter()
+                .map(|choice| Candidate::new(&choice.id, &choice.label))
+                .collect(),
+        ),
     }
 }
 
@@ -3042,9 +3222,12 @@ pub fn resolve_orchestration_ref(spoken: &str, agents: &[DesktopAgent]) -> Choic
                 id: card.member_id.clone(),
                 label: card.title.clone(),
             },
-            several => {
-                ChoiceMatch::Ambiguous(several.iter().map(|card| card.title.clone()).collect())
-            }
+            several => ChoiceMatch::Ambiguous(
+                several
+                    .iter()
+                    .map(|card| Candidate::new(&card.member_id, &card.title))
+                    .collect(),
+            ),
         };
     }
     resolve_choice(&reference, &choices, |choice| {
@@ -3134,7 +3317,7 @@ fn remote_host(deck: &VoiceDeck) -> Option<String> {
 }
 
 /// Every name this agent answers to.
-fn spoken_names(agent: &DesktopAgent) -> Vec<String> {
+pub(super) fn spoken_names(agent: &DesktopAgent) -> Vec<String> {
     let mut names = Vec::new();
     if let Some(display_name) = agent
         .display_name
@@ -3260,6 +3443,26 @@ fn word_subset(reference_words: &BTreeSet<String>, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The labels of an ambiguous resolver answer, or `None` for any other —
+    /// what the assertions written before PRD #1261 carried candidates as.
+    trait AmbiguousLabels {
+        fn ambiguous_labels(&self) -> Option<Vec<String>>;
+    }
+
+    macro_rules! ambiguous_labels {
+        ($($kind:ident),*) => {$(
+            impl AmbiguousLabels for $kind {
+                fn ambiguous_labels(&self) -> Option<Vec<String>> {
+                    match self {
+                        $kind::Ambiguous(candidates) => Some(labels_of(candidates)),
+                        _ => None,
+                    }
+                }
+            }
+        )*};
+    }
+    ambiguous_labels!(AgentRefMatch, DeckRefMatch, DirRefMatch, ChoiceMatch);
     use crate::voice::resolver::{IntentAnswer, StubResolver};
     use crate::voice::table::table;
 
@@ -3427,8 +3630,8 @@ mod tests {
     #[test]
     fn voice_outcome_deck_ref_is_ambiguous_when_two_decks_match() {
         assert_eq!(
-            resolve_deck_ref("build", &decks()),
-            DeckRefMatch::Ambiguous(vec![
+            resolve_deck_ref("build", &decks()).ambiguous_labels(),
+            Some(vec![
                 "deploy@build-box.example.com:2222".to_string(),
                 "ci@build-farm".to_string(),
             ])
@@ -3761,15 +3964,103 @@ mod tests {
     fn voice_outcome_dir_ref_is_ambiguous_when_two_directories_match() {
         let level = listing(&["docs-site", "docs-api", "src"], true);
         assert_eq!(
-            resolve_dir_ref("docs", Some(&level)),
-            DirRefMatch::Ambiguous(vec!["docs-site".to_string(), "docs-api".to_string()])
+            resolve_dir_ref("docs", Some(&level)).ambiguous_labels(),
+            Some(vec!["docs-site".to_string(), "docs-api".to_string()])
         );
         // `.config` and `config` are both EXACT for "config" — each answers to
         // it — so the honest answer names both rather than picking one.
         let dotted = listing(&[".config", "config"], true);
         assert_eq!(
-            resolve_dir_ref("config", Some(&dotted)),
-            DirRefMatch::Ambiguous(vec![".config".to_string(), "config".to_string()])
+            resolve_dir_ref("config", Some(&dotted)).ambiguous_labels(),
+            Some(vec![".config".to_string(), "config".to_string()])
+        );
+    }
+
+    /// Scenario: every ambiguous resolver preserves the ordered target values beside
+    /// its displayed labels. Two agents can both be called Atlas, so a label
+    /// alone must never be used as the target of a numbered choice.
+    #[test]
+    fn voice_outcome_ambiguous_resolvers_keep_ordered_values_even_for_equal_labels() {
+        let agents = [
+            role_agent("atlas-a", "Atlas"),
+            role_agent("atlas-b", "Atlas"),
+        ];
+        let AgentRefMatch::Ambiguous(agent_candidates) = resolve_agent_ref("Atlas", &agents) else {
+            panic!("two Atlas agents must be ambiguous");
+        };
+        assert_eq!(
+            agent_candidates
+                .iter()
+                .map(|c| (c.value.as_str(), c.label.as_str()))
+                .collect::<Vec<_>>(),
+            [("atlas-a", "Atlas"), ("atlas-b", "Atlas")]
+        );
+
+        let DeckRefMatch::Ambiguous(deck_candidates) = resolve_deck_ref("build", &decks()) else {
+            panic!("two build decks must be ambiguous");
+        };
+        assert_eq!(
+            deck_candidates
+                .iter()
+                .map(|c| c.value.as_str())
+                .collect::<Vec<_>>(),
+            ["deck-build", "deck-build-two"]
+        );
+
+        let level = listing(&["docs-site", "docs-api"], true);
+        let DirRefMatch::Ambiguous(dir_candidates) = resolve_dir_ref("docs", Some(&level)) else {
+            panic!("two docs directories must be ambiguous");
+        };
+        assert_eq!(
+            dir_candidates
+                .iter()
+                .map(|c| c.value.as_str())
+                .collect::<Vec<_>>(),
+            ["/home/dev/code/docs-site", "/home/dev/code/docs-api"]
+        );
+
+        let modes = [
+            choice("mode-fast", "Review fast"),
+            choice("mode-slow", "Review slow"),
+        ];
+        let ChoiceMatch::Ambiguous(mode_candidates) = resolve_mode_ref("review", &modes) else {
+            panic!("two review modes must be ambiguous");
+        };
+        assert_eq!(
+            mode_candidates
+                .iter()
+                .map(|c| c.value.as_str())
+                .collect::<Vec<_>>(),
+            ["mode-fast", "mode-slow"]
+        );
+
+        let types = [
+            choice("agent-fast", "Coder fast"),
+            choice("agent-slow", "Coder slow"),
+        ];
+        let ChoiceMatch::Ambiguous(type_candidates) = resolve_agent_type_ref("coder", &types)
+        else {
+            panic!("two coder types must be ambiguous");
+        };
+        assert_eq!(
+            type_candidates
+                .iter()
+                .map(|c| c.value.as_str())
+                .collect::<Vec<_>>(),
+            ["agent-fast", "agent-slow"]
+        );
+
+        let ChoiceMatch::Ambiguous(run_candidates) =
+            resolve_orchestration_ref("review", &two_runs())
+        else {
+            panic!("two review runs must be ambiguous");
+        };
+        assert_eq!(
+            run_candidates
+                .iter()
+                .map(|c| c.value.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "3"]
         );
     }
 
@@ -3873,6 +4164,8 @@ mod tests {
         );
     }
 
+    /// Scenario: an ambiguous required directory offers dispatchable paths in
+    /// the same order as the unchanged names and sentence shown to the user.
     #[tokio::test]
     async fn voice_outcome_open_dir_names_the_candidates_of_an_ambiguous_name() {
         let resolver = StubResolver::new().answering(
@@ -3888,7 +4181,10 @@ mod tests {
         )
         .await;
         let VoiceOutcome::ParamAmbiguous {
-            matches, sentence, ..
+            matches,
+            candidates,
+            sentence,
+            ..
         } = outcome
         else {
             panic!("expected an ambiguity, got {outcome:?}");
@@ -3896,6 +4192,16 @@ mod tests {
         assert_eq!(
             matches,
             vec!["docs-site".to_string(), "docs-api".to_string()]
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| (c.kind, c.value.as_str(), c.label.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (ParamKind::DirRef, "/home/dev/code/docs-site", "docs-site"),
+                (ParamKind::DirRef, "/home/dev/code/docs-api", "docs-api")
+            ]
         );
         assert_eq!(
             sentence,
@@ -4337,8 +4643,8 @@ mod tests {
     #[test]
     fn voice_outcome_a_category_reference_among_several_orchestrations_is_ambiguous() {
         assert_eq!(
-            resolve_orchestration_ref("the orchestration", &two_runs()),
-            ChoiceMatch::Ambiguous(vec![
+            resolve_orchestration_ref("the orchestration", &two_runs()).ambiguous_labels(),
+            Some(vec![
                 "docs-orchestrator-1".to_string(),
                 "api-orchestrator-1".to_string(),
                 "billing".to_string(),
@@ -4969,8 +5275,8 @@ mod tests {
             choice("claude-next", "Claude Next"),
         ];
         assert_eq!(
-            resolve_agent_type_ref("claude", &agent_types),
-            ChoiceMatch::Ambiguous(vec!["Claude Code".to_string(), "Claude Next".to_string()])
+            resolve_agent_type_ref("claude", &agent_types).ambiguous_labels(),
+            Some(vec!["Claude Code".to_string(), "Claude Next".to_string()])
         );
     }
 
@@ -5357,8 +5663,8 @@ mod tests {
         // Two runs of one config are two cards, so the config name alone is
         // ambiguous and the answer names both titles.
         assert_eq!(
-            resolve_orchestration_ref("review", &agents),
-            ChoiceMatch::Ambiguous(vec![
+            resolve_orchestration_ref("review", &agents).ambiguous_labels(),
+            Some(vec![
                 "docs-orchestrator-1".to_string(),
                 "api-orchestrator-1".to_string()
             ])
@@ -5371,8 +5677,8 @@ mod tests {
         // (changed 2026-09-24 with reference grounding's removal: with one
         // card it is that card, with several it asks which).
         assert_eq!(
-            resolve_orchestration_ref("the orchestration", &agents),
-            ChoiceMatch::Ambiguous(vec![
+            resolve_orchestration_ref("the orchestration", &agents).ambiguous_labels(),
+            Some(vec![
                 "docs-orchestrator-1".to_string(),
                 "api-orchestrator-1".to_string(),
                 "billing".to_string(),
@@ -6224,7 +6530,11 @@ mod tests {
                 action: row.id.clone(),
                 param: "agent".to_string(),
                 spoken: "tester".to_string(),
+                invoke: row.invoke.clone(),
                 matches: vec!["a".to_string(), "b".to_string()],
+                candidates: Vec::new(),
+                params: Vec::new(),
+                reports: Vec::new(),
                 sentence: heard(
                     &transcript,
                     &ParamKind::AgentRef
@@ -6345,8 +6655,8 @@ mod tests {
     fn voice_outcome_agent_ref_is_ambiguous_when_two_agents_match() {
         let agents = vec![role_agent("1", "tester one"), role_agent("2", "tester two")];
         assert_eq!(
-            resolve_agent_ref("tester", &agents),
-            AgentRefMatch::Ambiguous(vec!["tester one".to_string(), "tester two".to_string()])
+            resolve_agent_ref("tester", &agents).ambiguous_labels(),
+            Some(vec!["tester one".to_string(), "tester two".to_string()])
         );
     }
 
@@ -7854,6 +8164,135 @@ mod tests {
     /// Scenario: a `switch_deck` dispatch leaves the pipeline carrying the
     /// fleet key it resolved; the app swaps in the Deck selector's token, and
     /// a key with no token becomes empty rather than passing through. The row's
+    /// Scenario: "switch to build or staging" names two decks and is offered
+    /// as a choice. Each candidate is addressed with the Deck selector's token
+    /// and its row's address, like a dispatch; a tie holding a deck the
+    /// selector has no token for offers no choice at all, and keeps its
+    /// sentence.
+    #[tokio::test]
+    async fn voice_outcome_a_switch_choice_carries_the_selector_tokens() {
+        let pair = [
+            deck("deck-build", "ops@build-box", false),
+            deck("deck-staging", "ops@staging-box", false),
+        ];
+        let identity = VoiceDeckIdentity {
+            host: "build-box".to_string(),
+            user: Some("ops".to_string()),
+            port: 22,
+            socket: None,
+            identity: None,
+            jump: None,
+        };
+        let token = |key: &str| match key {
+            "deck-build" => Some(VoiceDeckSelection {
+                token: "row-build".to_string(),
+                identity: Some(identity.clone()),
+            }),
+            "deck-staging" => Some(VoiceDeckSelection {
+                token: "row-staging".to_string(),
+                identity: None,
+            }),
+            _ => None,
+        };
+        let mut named = switched_over(&pair, "switch to build or staging", "build").await;
+        address_deck_switch(&mut named, token);
+        let VoiceOutcome::ParamAmbiguous {
+            candidates,
+            invoke,
+            reports,
+            ..
+        } = &named
+        else {
+            panic!("expected a choice, got {named:?}");
+        };
+        assert_eq!(invoke, "switchDeck");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| (c.value.as_str(), c.deck_identity.as_ref()))
+                .collect::<Vec<_>>(),
+            [("row-build", Some(&identity)), ("row-staging", None)]
+        );
+        assert_eq!(reports.len(), 2);
+
+        let mut unknown = switched_over(&pair, "switch to build or staging", "build").await;
+        address_deck_switch(&mut unknown, |key| {
+            (key == "deck-build").then(|| VoiceDeckSelection {
+                token: "row-build".to_string(),
+                identity: None,
+            })
+        });
+        let VoiceOutcome::ParamAmbiguous {
+            candidates,
+            reports,
+            matches,
+            ..
+        } = &unknown
+        else {
+            panic!("expected an ambiguity, got {unknown:?}");
+        };
+        assert!(candidates.is_empty() && reports.is_empty());
+        assert_eq!(matches, &["ops@build-box", "ops@staging-box"]);
+    }
+
+    /// Scenario: "open atlas" with ten Atlas agents on screen. The sentence
+    /// still names three and counts the rest, and no choice is offered: past
+    /// `MAX_CHOICES` a list is not something to say a single digit to. With
+    /// two, each candidate carries the report a dispatch of it would render.
+    #[tokio::test]
+    async fn voice_outcome_a_tie_past_the_cap_offers_no_choice() {
+        let resolver = StubResolver::new().answering(
+            "open atlas",
+            IntentAnswer::new("open_agent").with_param("agent", "atlas"),
+        );
+        let many: Vec<DesktopAgent> = (1..=MAX_CHOICES + 1)
+            .map(|at| role_agent(&format!("atlas-{at}"), "Atlas"))
+            .collect();
+        let outcome = run(&resolver, Screen::Overview, &many, "open atlas").await;
+        let VoiceOutcome::ParamAmbiguous {
+            candidates,
+            matches,
+            sentence,
+            ..
+        } = &outcome
+        else {
+            panic!("expected an ambiguity, got {outcome:?}");
+        };
+        assert!(candidates.is_empty());
+        assert_eq!(matches.len(), MAX_CHOICES + 1);
+        assert!(sentence.contains("and 7 more"), "{sentence}");
+
+        let two = [
+            role_agent("atlas-a", "Atlas"),
+            role_agent("atlas-b", "Atlas"),
+        ];
+        let outcome = run(&resolver, Screen::Overview, &two, "open atlas").await;
+        let VoiceOutcome::ParamAmbiguous {
+            candidates,
+            params,
+            reports,
+            invoke,
+            ..
+        } = &outcome
+        else {
+            panic!("expected an ambiguity, got {outcome:?}");
+        };
+        assert_eq!(invoke, "openAgent");
+        assert!(params.is_empty());
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.value.as_str())
+                .collect::<Vec<_>>(),
+            ["atlas-a", "atlas-b"]
+        );
+        assert_eq!(reports.len(), 2);
+        assert!(
+            reports.iter().all(|report| report.starts_with("Opening ")),
+            "{reports:?}"
+        );
+    }
+
     /// address rides along for the webview to compare. Any other dispatch,
     /// including one with a `deck_ref`, is untouched.
     #[test]
@@ -7938,6 +8377,79 @@ mod tests {
         )
         .await
         .outcome
+    }
+
+    /// Scenario: naming two decks for a required switch offers exactly those
+    /// deck values. Safety refusals are not ties and never carry candidates.
+    #[tokio::test]
+    async fn voice_outcome_only_a_required_genuine_tie_offers_a_choice() {
+        let pair = [
+            deck("deck-build", "ops@build-box", false),
+            deck("deck-staging", "ops@staging-box", false),
+        ];
+        let named = switched_over(&pair, "switch to build or staging", "build").await;
+        let VoiceOutcome::ParamAmbiguous {
+            candidates,
+            matches,
+            ..
+        } = named
+        else {
+            panic!("two named decks must offer a choice: {named:?}");
+        };
+        assert_eq!(matches, ["ops@build-box", "ops@staging-box"]);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.value.as_str())
+                .collect::<Vec<_>>(),
+            ["deck-build", "deck-staging"]
+        );
+
+        let row = table().row("switch_deck").expect("switch row present");
+        let spec = row
+            .params
+            .iter()
+            .find(|param| param.name == "deck")
+            .expect("required deck param");
+        assert!(!spec.optional);
+        for unmet in [
+            Unmet::Contrast("not".to_string()),
+            Unmet::NotSaid,
+            Unmet::NamedOther("ops@build-box".to_string()),
+            Unmet::WithheldChoice("hidden".to_string()),
+            Unmet::DeckUnavailable {
+                label: "ops@build-box".to_string(),
+                local: false,
+                reason: "offline".to_string(),
+            },
+            Unmet::LabelsWithheld,
+        ] {
+            let refusal = unmet.refusal(Transcript::new("switch deck"), row, spec, "build");
+            assert!(!refusal.is_dispatch(), "{refusal:?}");
+            assert!(
+                serde_json::to_value(&refusal)
+                    .expect("serializable refusal")
+                    .get("candidates")
+                    .is_none(),
+                "{refusal:?}"
+            );
+        }
+
+        let resolver = StubResolver::new().answering(
+            "new agent on build",
+            IntentAnswer::new("open_new_agent").with_param("deck", "build"),
+        );
+        let optional = run(&resolver, Screen::Overview, &fleet(), "new agent on build").await;
+        assert!(
+            matches!(optional, VoiceOutcome::Dispatch { .. }),
+            "optional deck must be dropped: {optional:?}"
+        );
+        assert!(
+            serde_json::to_value(&optional)
+                .expect("serializable dispatch")
+                .get("candidates")
+                .is_none()
+        );
     }
 
     /// Scenario: the switch target is grounded from the transcript's side too
@@ -8686,8 +9198,8 @@ mod tests {
         // "daemon" is no evidence for any deck, so "daemon build" is the
         // two build hosts, not the local daemon.
         assert_eq!(
-            resolve_deck_ref("daemon build", &fleet),
-            DeckRefMatch::Ambiguous(vec![
+            resolve_deck_ref("daemon build", &fleet).ambiguous_labels(),
+            Some(vec![
                 "deploy@build-box.example.com:2222".to_string(),
                 "ci@build-farm".to_string(),
             ])
@@ -8873,8 +9385,8 @@ mod tests {
             deck("deck-daemon-ci", "ci@daemon:2222", false),
         ];
         assert_eq!(
-            resolve_deck_ref("daemon", &twice),
-            DeckRefMatch::Ambiguous(vec!["ops@daemon".to_string(), "ci@daemon:2222".to_string()])
+            resolve_deck_ref("daemon", &twice).ambiguous_labels(),
+            Some(vec!["ops@daemon".to_string(), "ci@daemon:2222".to_string()])
         );
     }
 

@@ -8,6 +8,7 @@ import { DISPLAY_LIMITS, displayText } from "./displayText";
 import { describeEndpoint } from "./endpoints";
 import { ambiguousOrchestrationReason } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
+import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBlocked,
@@ -854,15 +855,20 @@ export interface VoiceDeckIdentityDto extends Pick<RemoteEndpointDto, RemoteAddr
  * field and would refuse every switch to that row.
  */
 function withDeckIdentityKeys(result: VoiceResultDto): VoiceResultDto {
-  if (result.outcome.kind !== "dispatch") return result;
-  const params = result.outcome.params.map((param) => {
+  const keyed = (param: VoiceResolvedParamDto): VoiceResolvedParamDto => {
     const identity = param.deckIdentity;
     if (!identity) return param;
     const sent = identity as Partial<Record<RemoteAddressField, unknown>>;
     const deckIdentity = Object.fromEntries(REMOTE_ADDRESS_FIELDS.map((field) => [field, sent[field] ?? undefined])) as unknown as VoiceDeckIdentityDto;
     return { ...param, deckIdentity };
-  });
-  return { ...result, outcome: { ...result.outcome, params } };
+  };
+  /* PRD #1261 — a switch offered as a choice carries each candidate's
+     identity too, and the chosen one reaches the same guard. */
+  if (result.outcome.kind === "param_ambiguous" && result.outcome.candidates) {
+    return { ...result, outcome: { ...result.outcome, candidates: result.outcome.candidates.map(keyed) } };
+  }
+  if (result.outcome.kind !== "dispatch") return result;
+  return { ...result, outcome: { ...result.outcome, params: result.outcome.params.map(keyed) } };
 }
 
 /**
@@ -884,7 +890,14 @@ export type VoiceOutcomeDto =
   | { kind: "action_ungrounded"; transcript: string; action: string; sentence: string }
   | { kind: "param_missing"; transcript: string; action: string; param: string; sentence: string }
   | { kind: "param_unresolved"; transcript: string; action: string; param: string; spoken: string; sentence: string }
-  | { kind: "param_ambiguous"; transcript: string; action: string; param: string; spoken: string; matches: string[]; sentence: string }
+  /*
+    PRD #1261 — `candidates` is the tie as something to choose from, in the
+    order offered, and `params`, `invoke` and `reports` are what a chosen one is
+    dispatched with and reported as. Empty `candidates` means no choice is
+    offered (a tie beyond `VOICE_CHOICE_MAX`), and the four are optional
+    because a fixture written before them carries none.
+  */
+  | { kind: "param_ambiguous"; transcript: string; action: string; invoke?: string; param: string; spoken: string; matches: string[]; candidates?: VoiceResolvedParamDto[]; params?: VoiceResolvedParamDto[]; reports?: string[]; sentence: string }
   | { kind: "resolution_failed"; transcript: string; detail: string; sentence: string }
   | { kind: "transcription_failed"; detail: string; sentence: string };
 
@@ -1605,6 +1618,19 @@ export interface DeckBridge {
    * call itself could not be made.
    */
   resolveVoice(utterance: string): Promise<VoiceResultDto>;
+  /**
+   * PRD #1261 — answer a pending numbered choice (`desktop_voice_choice`):
+   * `offered` is the list on screen, `action` the row it completes. Judged
+   * against the declaration {@link declareVoiceScreen} last stated, so the
+   * panel declares immediately before, exactly as it does for a resolve.
+   *
+   * **No Commands backend call**: the answer is a cancel phrase, an ordinal or
+   * a name among the offered entries, decided by `voice::choice::answer`, and
+   * a selected entry is re-checked against what the app observes now. What
+   * runs is the panel's to dispatch, through the same checks a resolved
+   * dispatch meets.
+   */
+  answerVoiceChoice(utterance: string, action: string, offered: VoiceResolvedParamDto[]): Promise<VoiceChoiceAnswerDto>;
   /**
    * Every row of the command table, annotated for `screen`
    * (`desktop_voice_commands`).
@@ -2608,6 +2634,12 @@ class FixtureDeckBridge implements DeckBridge {
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     await Promise.resolve();
     return resolveFixtureVoice(utterance, this.voiceScreen, this.voiceDictation !== undefined);
+  }
+
+  /** PRD #1261 — the preview has no Rust side, so the webview's own port answers. */
+  async answerVoiceChoice(utterance: string, _action: string, offered: VoiceResolvedParamDto[]): Promise<VoiceChoiceAnswerDto> {
+    await Promise.resolve();
+    return answerChoiceLocally(utterance, offered);
   }
 
   /**
@@ -4138,6 +4170,16 @@ export class TauriDeckBridge implements DeckBridge {
     this.voiceDeckStep = deckStep;
     this.voiceEndpoints = endpoints;
     this.voiceDictation = dictation;
+  }
+
+  async answerVoiceChoice(utterance: string, action: string, offered: VoiceResolvedParamDto[]): Promise<VoiceChoiceAnswerDto> {
+    const invoke = await this.getInvoke();
+    const answer = await invoke<VoiceChoiceAnswerDto>("desktop_voice_choice", { utterance, action, offered, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null });
+    /* Rust hands back the entry exactly as offered; the offered one is
+       returned, so its identity keeps the keys it was given on the way in. */
+    if (answer.kind !== "selected") return answer;
+    const candidate = offered.find((entry) => entry.value === answer.candidate.value);
+    return candidate ? { kind: "selected", candidate } : { kind: "refused" };
   }
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {

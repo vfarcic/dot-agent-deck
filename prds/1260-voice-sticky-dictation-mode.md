@@ -38,7 +38,7 @@ This section is the one state model for #1260, #1261 and #1184. The other two PR
 | --- | --- | --- | --- |
 | `Idle` | one-shot commands — today's behaviour | #802 | resolved through the Commands backend as today |
 | `Dictating` | every utterance is typed into one agent's prompt | this PRD | matched locally against the reserved set; otherwise typed; **never** sent to the Commands backend |
-| `AwaitingChoice` | a numbered choice is on offer | [#1261](1261-voice-numbered-choice.md) | matched locally as an answer (ordinal, offered name) or a cancel; see #1261 for a non-answer |
+| `AwaitingChoice` | a numbered choice is on offer | [#1261](1261-voice-numbered-choice.md) | matched locally as an answer (ordinal, offered name) or a cancel; anything else first **closes** the choice, then is resolved as in `Idle` (#1261's non-answer rule) |
 | D5 confirmation | a stop or orchestration close is waiting to be answered by hand | #802 D5, #1223 | as today: the confirmation is answered by clicking; a second spoken stop is refused (`CONFIRMATION_ALREADY_OPEN`) |
 | the existing pending answers | the New agent dialog's form and directory browser, and a pending dictation send (`Pending` + countdown in `VoiceControlPanel.tsx`) | #802, #1223 | as today |
 
@@ -51,7 +51,7 @@ This section is the one state model for #1260, #1261 and #1184. The other two PR
 **D5 confirmation > `AwaitingChoice` > `Dictating` > `Idle`**, and only one of the first three at a time.
 
 - **Entering a higher state ends a lower one**, and the report says so: a D5 confirmation opening (by click or by voice) cancels an open choice; a choice cannot open while dictating, because the Commands backend is not consulted and nothing can come back ambiguous.
-- **A lower state cannot start while a higher one is pending.** "type on" while a choice is open is answered by #1261's non-answer rule, not by entering the mode; while a D5 confirmation is open, an ambiguity renders as today's sentence rather than opening a chooser.
+- **A lower state cannot start while a higher one is pending.** While a D5 confirmation is open, an ambiguity renders as today's sentence rather than opening a chooser. For `AwaitingChoice` this holds in a specific sense, and it is not a trap: an utterance that is not an answer or a cancel **closes the pending choice first** — the report says "Choice closed." — and is then resolved as an ordinary utterance from `Idle`. So "type on" while a choice is open does enter `Dictating`, but only after the choice has ended: the two are never pending together, and the choice does not come back when the mode ends.
 - **Ending a state returns to `Idle`, never to a state that was pre-empted.** Dictation cancelled by a confirmation does not silently resume when the confirmation is answered; the user says "type on" again. A mode that comes back by itself is a mode the user did not see start.
 - **The existing pending answers are orthogonal and unchanged.** The New agent dialog is a surface the resolver reads through its declaration, not a panel state; a pending dictation send is a countdown `Idle` already carries. `Dictating` does not arm that countdown (below), and entering `Dictating` cancels a countdown already running rather than sending it.
 

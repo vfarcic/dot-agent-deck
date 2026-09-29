@@ -434,6 +434,31 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Scenario (PRD #1261): answering a numbered choice sends the utterance, the
+   * row it completes and the offered list to `desktop_voice_choice` with the
+   * declaration last stated — and hands back the OFFERED entry Rust selected,
+   * so the deck identity keeps the keys it was given on the way in.
+   */
+  it("answers a numbered choice through desktop_voice_choice", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const offered = [
+      { name: "agent", kind: "agent_ref", spoken: "atlas", value: "atlas-a", label: "Atlas" },
+      { name: "agent", kind: "agent_ref", spoken: "atlas", value: "atlas-b", label: "Atlas" },
+    ];
+    invoke.mockResolvedValue({ kind: "selected", candidate: { ...offered[1] } });
+
+    bridge.declareVoiceScreen("overview");
+    const answer = await bridge.answerVoiceChoice("two", "open_agent", offered);
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_choice", { utterance: "two", action: "open_agent", offered, directories: null, newAgent: null, deckStep: null, endpoints: null });
+    expect(answer).toEqual({ kind: "selected", candidate: offered[1] });
+    expect(answer.kind === "selected" && answer.candidate).toBe(offered[1]);
+
+    invoke.mockResolvedValue({ kind: "not_answer" });
+    expect(await bridge.answerVoiceChoice("open the tester", "open_agent", offered)).toEqual({ kind: "not_answer" });
+  });
+
+  /**
    * Scenario (PRD #1195): Rust resolves "switch deck to the build box", whose
    * row reaches it through a jump host, and omits the row's absent SSH user,
    * socket and key from the deck identity. The bridge hands the webview every

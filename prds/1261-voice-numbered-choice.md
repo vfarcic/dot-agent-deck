@@ -1,6 +1,6 @@
 # PRD #1261: Offer a numbered choice when a voice command names several things
 
-**Status**: Draft — not started. Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1260](1260-voice-sticky-dictation-mode.md) and [PRD #1184](1184-voice-command-chains.md).
+**Status**: In progress — M1 and M2 implemented; M3 (fixtures, docs, changelog) next. Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1260](1260-voice-sticky-dictation-mode.md) and [PRD #1184](1184-voice-command-chains.md).
 **Priority**: Medium
 **Created**: 2026-09-29
 **Issue**: [#1261](https://github.com/vfarcic/dot-agent-deck/issues/1261)
@@ -80,7 +80,7 @@ A refusal says the list moved and nothing ran; the choice closes.
 
 ### Not an answer
 
-**Decision: an utterance that is not an answer, a cancel or an ordinal closes the choice, says so, and is then resolved as an ordinary utterance.** That is how the existing pending things behave: a new utterance cancels a pending dictation send and is resolved normally (`takeUtterance`'s unconditional `cancelPendingSend`), and an utterance that is not about the New agent dialog is resolved normally while it is open. Holding the choice open and refusing everything else would make the chooser a trap — the opposite of what #1260's state model asks of every state — while one extra utterance is all a mis-parse costs. The report shows both: "Choice closed." and the new utterance's own outcome.
+**Decision: an utterance that is not an answer, a cancel or an ordinal closes the choice, says so, and is then resolved as an ordinary utterance** — from `Idle`, because the choice has already ended by then. That is how "type on" enters `Dictating` from `AwaitingChoice` without the two ever being pending together ([#1260's precedence](1260-voice-sticky-dictation-mode.md#precedence)). That is how the existing pending things behave: a new utterance cancels a pending dictation send and is resolved normally (`takeUtterance`'s unconditional `cancelPendingSend`), and an utterance that is not about the New agent dialog is resolved normally while it is open. Holding the choice open and refusing everything else would make the chooser a trap — the opposite of what #1260's state model asks of every state — while one extra utterance is all a mis-parse costs. The report shows both: "Choice closed." and the new utterance's own outcome.
 
 ### Expiry and cancellation
 
@@ -145,8 +145,8 @@ Answers are local, so the fixtures cover only the first utterance (reaching `par
 
 ## Milestones
 
-- [ ] **M1 — Candidates carry values.** Resolver arms, `Unmet`, `ParamAmbiguous.candidates`, the cause-keyed eligibility; no UI change. Rust tests.
-- [ ] **M2 — The chooser.** `voice::choice::answer`, the panel state, rendering, click/ordinal/name answers, staleness through the existing layers, expiry, cancel, the non-answer rule, the D5 hand-off, `refusedRef` coverage. Rust, vitest and Playwright tests.
+- [x] **M1 — Candidates carry values.** Resolver arms, `Unmet`, `ParamAmbiguous.candidates`, the cause-keyed eligibility; no UI change. Rust tests.
+- [x] **M2 — The chooser.** `voice::choice::answer`, the panel state, rendering, click/ordinal/name answers, staleness through the existing layers, expiry, cancel, the non-answer rule, the D5 hand-off, `refusedRef` coverage. Rust, vitest and Playwright tests.
 - [ ] **M3 — Fixtures, docs, changelog.** Fixture run (local, credentialed); `docs/desktop/voice.md` (what the user sees and says — rule 21), `docs/develop/voice-first-design.md` (the offered-list check as distinct from grounding; the "genuine ties" note; the list of refusals that never become a choice), `docs/develop/desktop-gui.md`; `changelog.d/1261.feature.md`. Run `docs-screenshots-review`.
 
 **Deferred.**
@@ -172,3 +172,12 @@ Answers are local, so the fixtures cover only the first utterance (reaching `par
 ### 2026-09-29 — Created
 
 Written from issue #1261 by a dispatched unit, alongside PRDs #1260 and #1184, against the state model in #1260. Decisions recorded above — value ambiguity only, action ambiguity deferred until #1184's schema can express it, the non-answer rule matching the pending dictation send, and the list of safety refusals that must never become a choice — are this document's, open to revision with a recorded reason.
+
+### 2026-09-29 — M1 and M2 implemented
+
+- **Candidates carry values.** Every resolver's ambiguous arm is now a list of `Candidate { value, label }` in the resolver's order, and so are `Unmet::Ambiguous` and `Unmet::NamedSeveral`. `ParamAmbiguous` gained `invoke`, `candidates`, `params` and `reports` (each candidate's report, rendered in Rust so the chooser composes no sentence); `matches` and the sentence are unchanged. The safety refusals are `ParamUnresolved` and carry no candidates.
+- **Where a tie is offered.** Only on the row's LAST param (every shipped row has one), so a chosen candidate is never dispatched without params after it; a tie past `MAX_CHOICES` (9) is sent with no candidates and renders as its sentence. The cap is also enforced in the webview (`VOICE_CHOICE_MAX`). A `switch_deck` tie has its candidates addressed with the Deck selector's token and identity by `address_deck_switch`, and one with a deck the selector has no token for offers no choice.
+- **The answer.** `voice::choice::answer` (cancel phrase → whole-utterance ordinal → a name resolved among the offered, still-live candidates with the kind's own resolver), reached through a new `desktop_voice_choice` Tauri command that reads the agents and decks as `desktop_voice_resolve` does. A name that resolves to nothing offered is **refused** only when the whole utterance is, word for word, the name of something on screen or of an offered entry that has gone; a sentence merely containing a name ("open the tester") is a non-answer and goes on to the endpoint. A runtime with no Rust behind it (the browser preview, vitest) answers with `answerChoiceLocally` in `desktop/src/lib/voiceChoice.ts`, the same order and closed lists matched against labels and with no liveness check — a second copy of the rule, kept deliberately small, because the tests' runtimes have no bridge to reach Rust through.
+- **Refused answers close the choice.** An out-of-range ordinal or a name matching several entries closes the choice with a refusal rather than keeping it open for another try; the user says the command again.
+- **The browser preview** answers "open the agent" on the Daemons screen or the dashboard with a canned tie between the `connected` state's two agents (`?fixture=1&state=connected&voice=open%20the%20agent`, then e.g. `&voice=two`), so the browser tier can drive the chooser.
+

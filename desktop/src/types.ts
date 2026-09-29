@@ -1297,6 +1297,13 @@ export interface DeckRuntimeState {
   declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen, directories?: import("./lib/bridge").VoiceDirectoriesDto, newAgent?: import("./lib/bridge").VoiceNewAgentDto, endpoints?: import("./lib/bridge").EndpointSettingsDto, dictation?: import("./lib/bridge").VoiceDictationTargetDto) => void;
   resolveVoice?: (utterance: string) => Promise<import("./lib/bridge").VoiceResultDto>;
   /**
+   * PRD #1261 — answer a pending numbered choice, locally
+   * (`DeckBridge.answerVoiceChoice`). Optional like the rest: a panel on a
+   * runtime without it answers with `answerChoiceLocally`, the webview's port
+   * of the same rule.
+   */
+  answerVoiceChoice?: (utterance: string, action: string, offered: import("./lib/bridge").VoiceResolvedParamDto[]) => Promise<import("./lib/voiceChoice").VoiceChoiceAnswerDto>;
+  /**
    * Every command in the table, annotated for one screen (PRD #802 D7) — what
    * the discovery overlay lists.
    *

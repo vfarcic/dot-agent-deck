@@ -81,7 +81,8 @@ import { Mic, MicOff, SquarePen, Undo2, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
-import type { EndpointSettingsDto, VoiceCommandDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
+import type { EndpointSettingsDto, VoiceCommandDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
+import { answerChoiceLocally, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
 import { desktopFeaturesOf, type DeckRuntimeState } from "../types";
 
 /**
@@ -190,6 +191,28 @@ export const DIALOG_MOVED_ON = "The New agent dialog changed while that was bein
 export function sameNewAgentDeclaration(a: VoiceNewAgentDto | undefined, b: VoiceNewAgentDto | undefined): boolean {
   return (a === undefined) === (b === undefined) && (a?.form === undefined) === (b?.form === undefined);
 }
+
+/**
+ * PRD #1261 — how long a numbered choice stays on offer, in milliseconds.
+ *
+ * Twenty seconds, twice {@link VOICE_UNDO_WINDOW_MS}, because a list has to be
+ * read before it can be answered. A starting value (the PRD's Open Question
+ * 2). The countdown is on screen for all of it, and expiry runs nothing.
+ */
+export const VOICE_CHOICE_WINDOW_MS = 20_000;
+
+/**
+ * PRD #1261 — what the report says when a pending choice ends without an
+ * entry being chosen. Surface sentences for {@link VOICE_NOTHING_TO_CLOSE}'s
+ * reason: nothing Rust-side remembers that a choice was on offer.
+ *
+ * `CLOSED` is the one a non-answer gets, which is then resolved as the
+ * ordinary utterance it is, so the report shows both.
+ */
+export const VOICE_CHOICE_CLOSED = "Choice closed.";
+export const VOICE_CHOICE_CANCELLED = "Choice cancelled — nothing ran.";
+export const VOICE_CHOICE_EXPIRED = "The choice expired, so nothing ran.";
+export const VOICE_CHOICE_REFUSED = "That is not one of the entries on offer, or it is no longer there, so nothing ran. Say the command again.";
 
 /**
  * What a press gets when there is no transcription backend to listen with.
@@ -369,7 +392,7 @@ export function dictationRefused(label: string, reason: string): string {
 }
 
 /** The voice half of the runtime, which a runtime may not have at all. */
-type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "voiceCommands" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel" | "sendTerminalInput" | "desktopFeatures">;
+type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "answerVoiceChoice" | "voiceCommands" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel" | "sendTerminalInput" | "desktopFeatures">;
 
 /** The command table's row for the deck, whose screen issue #1198 hides by default. */
 const OPEN_DECK_COMMAND = "open_deck";
@@ -406,14 +429,33 @@ export type VoicePane = { deckId: string; agentId: string; label: string; inputB
  * into one agent's prompt: the utterance is declared to Rust with the target,
  * which answers it locally and never calls the Commands backend. `deck` is the
  * selected deck at entry, because a deck change is one of the context changes
- * that ends the mode. #1261's `AwaitingChoice` is the next variant.
+ * that ends the mode. `awaitingChoice` (PRD #1261) holds a numbered choice
+ * on offer: the next utterance is answered against it locally, and one that
+ * is not an answer CLOSES it first and is then resolved as an ordinary
+ * utterance — which is how "type on" reaches `dictating` from it.
  *
  * Only one state at a time, and ending one returns to `idle`, never to a state
  * that was pre-empted.
  */
 type VoicePanelState =
   | { kind: "idle" }
-  | { kind: "dictating"; target: Pending; deck: string | undefined };
+  | { kind: "dictating"; target: Pending; deck: string | undefined }
+  | { kind: "awaitingChoice"; offer: VoiceChoiceOffer };
+
+/**
+ * PRD #1261 — a numbered choice on offer: the tie Rust reported, the backend
+ * that answered it, and the declaration the utterance was judged against —
+ * which is what an answer is checked against before the chosen entry runs,
+ * exactly as `resolveOne` checks a resolved dispatch across its round trip.
+ */
+type VoiceChoiceOffer = {
+  outcome: Extract<VoiceOutcomeDto, { kind: "param_ambiguous" }> & { invoke: string; candidates: VoiceResolvedParamDto[] };
+  backend: string;
+  screen: VoiceScreen;
+  directories: VoiceDirectoriesDto | undefined;
+  newAgent: VoiceNewAgentDto | undefined;
+  instance: string | undefined;
+};
 
 const IDLE: VoicePanelState = { kind: "idle" };
 
@@ -639,7 +681,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   newAgentInstanceRef.current = newAgentInstance;
   const endpointsRef = useRef(endpoints);
   endpointsRef.current = endpoints;
-  const { declareVoiceScreen, resolveVoice, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
+  const { declareVoiceScreen, resolveVoice, answerVoiceChoice, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
   /* Issue #1198 — the list of what can be said leaves out the deck while the
      deck is hidden, even from its "elsewhere" half: it is not somewhere else,
      it is not there. The crate withholds the row from the model as well
@@ -728,6 +770,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   selectedDeckRef.current = selectedDeckId;
   const confirmationRef = useRef(confirmationOpen);
   confirmationRef.current = confirmationOpen;
+  /** PRD #1261 — seconds left on a pending choice. */
+  const [choiceIn, setChoiceIn] = useState<number>();
   /** Seconds left before the typed text is sent, or `undefined` for no pending send. */
   const [sendIn, setSendIn] = useState<number>();
   const sendTimer = useRef<number | undefined>(undefined);
@@ -1015,6 +1059,119 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   }, []);
 
   /**
+   * PRD #1261 — end a pending choice, saying why when there is something to
+   * say. Runs nothing. Answers whether a choice was pending.
+   */
+  const closeChoice = useCallback((why?: string) => {
+    if (panelStateRef.current.kind !== "awaitingChoice") return false;
+    setPanelState(IDLE);
+    if (why !== undefined) setProblem(why);
+    return true;
+  }, [setPanelState]);
+
+  /**
+   * PRD #1261 — offer a tie as a numbered choice, if it can be one.
+   *
+   * Only from `idle`: while dictating nothing reaches the Commands backend, so
+   * no tie arises, and a D5 confirmation outranks a choice — with one open,
+   * the tie stays the sentence it always was. A tie with no candidates (one
+   * past {@link VOICE_CHOICE_MAX}, which Rust leaves empty) or more than the
+   * cap is likewise only its sentence.
+   */
+  const offerChoice = useCallback((answer: VoiceResultDto, declared: Omit<VoiceChoiceOffer, "outcome" | "backend">) => {
+    const outcome = answer.outcome;
+    if (outcome.kind !== "param_ambiguous" || outcome.invoke === undefined || outcome.candidates === undefined) return;
+    if (outcome.candidates.length === 0 || outcome.candidates.length > VOICE_CHOICE_MAX) return;
+    if (panelStateRef.current.kind !== "idle" || confirmationRef.current) return;
+    setPanelState({ kind: "awaitingChoice", offer: { ...declared, outcome: { ...outcome, invoke: outcome.invoke, candidates: outcome.candidates }, backend: answer.backend } });
+  }, [setPanelState]);
+
+  /**
+   * PRD #1261 — run the ORIGINAL command with the chosen entry, once.
+   *
+   * No second resolve: the row and every other param are the ones Rust
+   * resolved with the first utterance, and the entry is one of the offered
+   * candidates exactly as offered. What stands between the offer and the run
+   * is the layers a resolved dispatch already meets — the screen and the New
+   * agent dialog as they were declared with the first utterance, then the
+   * target's own re-checks, which get the ORIGINAL directories and form — so
+   * an entry offered against a listing, a dialog or a deck address that has
+   * since moved is refused in that layer's words and nothing runs.
+   *
+   * Through the `refusedRef` path, so a refused entry renders only its
+   * refusal and offers no Undo.
+   */
+  const dispatchChoice = useCallback((offer: VoiceChoiceOffer, candidate: VoiceResolvedParamDto) => {
+    const mode = panelStateRef.current;
+    if (mode.kind !== "awaitingChoice" || mode.offer !== offer) return;
+    setPanelState(IDLE);
+    forget();
+    if (screenRef.current !== offer.screen) {
+      setProblem(SCREEN_MOVED_ON);
+      return;
+    }
+    if (!sameNewAgentDeclaration(offer.newAgent, newAgentRef.current?.()) || offer.instance !== newAgentInstanceRef.current?.()) {
+      setProblem(DIALOG_MOVED_ON);
+      return;
+    }
+    const at = offer.outcome.candidates.findIndex((entry) => entry.value === candidate.value);
+    const chosen = offer.outcome.candidates[at];
+    if (chosen === undefined) {
+      setProblem(VOICE_CHOICE_REFUSED);
+      return;
+    }
+    const outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }> = {
+      kind: "dispatch",
+      transcript: offer.outcome.transcript,
+      action: offer.outcome.action,
+      invoke: offer.outcome.invoke,
+      params: [...(offer.outcome.params ?? []), chosen],
+      /* Rust's own report for this entry; a runtime whose tie carried none
+         (a test fake) gets a plain statement of the choice. */
+      sentence: offer.outcome.reports?.[at] ?? `Chose ${chosen.label}.`,
+    };
+    /* No backend was asked anything for the answer, so no timing is shown. */
+    setResult({ outcome, resolveMs: null, backend: offer.backend });
+    refusedRef.current = false;
+    const dispatched = onDispatch(outcome, offer.directories, offer.newAgent);
+    if (refusedRef.current) setResult(undefined);
+    else if (!dispatched) setProblem(NOTHING_DISPATCHED);
+    else if (dispatched.undo) setUndo({ run: dispatched.undo });
+  }, [forget, onDispatch, setPanelState]);
+
+  /*
+    PRD #1261 — the choice's countdown, and its expiry, which runs nothing.
+    Keyed on the offer, so a new offer restarts it and a closed one stops it.
+  */
+  const offered = panelState.kind === "awaitingChoice" ? panelState.offer : undefined;
+  useEffect(() => {
+    if (!offered) {
+      setChoiceIn(undefined);
+      return;
+    }
+    let left = Math.max(1, Math.round(VOICE_CHOICE_WINDOW_MS / VOICE_DICTATION_TICK_MS));
+    setChoiceIn(left);
+    const timer = window.setInterval(() => {
+      left -= 1;
+      if (left > 0) {
+        setChoiceIn(left);
+        return;
+      }
+      window.clearInterval(timer);
+      closeChoice(VOICE_CHOICE_EXPIRED);
+    }, VOICE_DICTATION_TICK_MS);
+    return () => window.clearInterval(timer);
+  }, [closeChoice, offered]);
+
+  /* PRD #1261 — a D5 confirmation outranks a pending choice: opening one
+     closes the choice, and it does not come back when the confirmation is
+     answered. A stop CHOSEN from a list has already closed it by the time its
+     confirmation opens. */
+  useEffect(() => {
+    if (confirmationOpen) closeChoice(VOICE_CHOICE_CLOSED);
+  }, [closeChoice, confirmationOpen, panelState]);
+
+  /**
    * Open the microphone for the next utterance.
    *
    * The same call whether voice was just switched on or an utterance has just
@@ -1048,6 +1205,42 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    */
   const resolveOne = useCallback(async (utterance: string, ours: () => boolean) => {
     if (!resolveVoice) return;
+    /* PRD #1261 — a pending choice is answered first, locally, with no
+       Commands backend call. Declared first, as a resolve is, so the answer
+       is checked against what is on screen now. A non-answer closes the
+       choice, says so, and falls through to be resolved like any other
+       utterance. */
+    const waiting = panelStateRef.current;
+    if (waiting.kind === "awaitingChoice") {
+      const { offer } = waiting;
+      setPhase("resolving");
+      let verdict: VoiceChoiceAnswerDto;
+      try {
+        declareVoiceScreen?.(screenRef.current, directoriesRef.current?.(), newAgentRef.current?.(), endpointsRef.current?.());
+        verdict = answerVoiceChoice
+          ? await answerVoiceChoice(utterance, offer.outcome.action, offer.outcome.candidates)
+          : answerChoiceLocally(utterance, offer.outcome.candidates);
+      } catch (cause) {
+        if (ours() && closeChoice()) setProblem(sentenceOf(cause));
+        return;
+      }
+      if (!ours()) return;
+      /* Clicked, cancelled or expired while the answer was worked out. */
+      if (panelStateRef.current !== waiting) return;
+      if (verdict.kind === "selected") {
+        dispatchChoice(offer, verdict.candidate);
+        return;
+      }
+      if (verdict.kind === "cancelled") {
+        closeChoice(VOICE_CHOICE_CANCELLED);
+        return;
+      }
+      if (verdict.kind === "refused") {
+        closeChoice(VOICE_CHOICE_REFUSED);
+        return;
+      }
+      closeChoice(VOICE_CHOICE_CLOSED);
+    }
     /* The screen this utterance was JUDGED against, held for the round trip.
        `unavailable` means "not on that screen", so an outcome is only an
        answer about the screen that was declared with it. */
@@ -1088,7 +1281,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         return;
       }
       setResult(answer);
-      if (answer.outcome.kind === "dispatch") {
+      if (answer.outcome.kind === "param_ambiguous") {
+        offerChoice(answer, { screen: declared, directories: declaredDirectories, newAgent: declaredNewAgent, instance: declaredInstance });
+      } else if (answer.outcome.kind === "dispatch") {
         refusedRef.current = false;
         const dispatched = onDispatch(answer.outcome, declaredDirectories, declaredNewAgent);
         /* What the dispatch reached refused it, in its own sentence, so the
@@ -1104,7 +1299,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     } catch (cause) {
       if (ours()) setProblem(sentenceOf(cause));
     }
-  }, [declareVoiceScreen, onDispatch, resolveVoice, setPhase]);
+  }, [answerVoiceChoice, closeChoice, declareVoiceScreen, dispatchChoice, offerChoice, onDispatch, resolveVoice, setPhase]);
 
   /**
    * One whole utterance: close the device, transcribe, resolve, listen again.
@@ -1612,8 +1807,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   /* PRD #1260 — whose prompt the dictation mode is typing into, if it is on. */
   const dictating = panelState.kind === "dictating" ? panelState.target : undefined;
   const dictatingLabel = dictating ? displayText(dictating.label, DISPLAY_LIMITS.name) : undefined;
-  const emptyState = indicator === "on" && dictating === undefined && pending === undefined && problem === undefined && capture === undefined && result === undefined;
-  const reporting = note !== undefined || dictating !== undefined || pending !== undefined || problem !== undefined || capture !== undefined || result !== undefined;
+  /* PRD #1261 — the numbered choice on offer, if there is one. */
+  const choice = panelState.kind === "awaitingChoice" ? panelState.offer : undefined;
+  const emptyState = indicator === "on" && dictating === undefined && choice === undefined && pending === undefined && problem === undefined && capture === undefined && result === undefined;
+  const reporting = note !== undefined || dictating !== undefined || choice !== undefined || pending !== undefined || problem !== undefined || capture !== undefined || result !== undefined;
 
   return (
     /*
@@ -1833,6 +2030,46 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
                   {undo && <button className="button secondary compact" onClick={() => { undo.run(); setUndo(undefined); }}><Undo2 size={13} /> Undo</button>}
                 </div>
               </>
+            )}
+            {/*
+              PRD #1261 — the numbered choice, under the sentence that names
+              the tie. Real buttons inside the row, so they carry the row's
+              `VOICE_PEER_PROPS` exemption and stay reachable behind the agent
+              pane's modal fence. `Escape` cancels while focus is inside the
+              list — and only there: the pane and the New agent dialog own that
+              key at window level, and a second window listener would close
+              both at once. The list does not take focus when it opens (the
+              PRD's Open Question 1): a choice arises from speech, and the user
+              may be typing into a terminal. Its countdown is its own `timer`,
+              for the dictation countdown's reason.
+            */}
+            {choice && (
+              <div
+                className="voice-choice"
+                data-testid="voice-choice"
+                role="group"
+                aria-label="Choose one"
+                onKeyDown={(event) => {
+                  if (event.key !== "Escape") return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  closeChoice(VOICE_CHOICE_CANCELLED);
+                }}
+              >
+                <ol className="voice-choice-list">
+                  {choice.outcome.candidates.map((candidate, at) => (
+                    <li key={candidate.value}>
+                      <button type="button" className="button secondary compact" onClick={() => dispatchChoice(choice, candidate)}>
+                        {`${at + 1}. ${displayText(candidate.label, DISPLAY_LIMITS.name)}`}
+                      </button>
+                    </li>
+                  ))}
+                </ol>
+                <button type="button" className="button secondary compact" aria-label="Cancel" onClick={() => { closeChoice(VOICE_CHOICE_CANCELLED); }}>
+                  <X size={13} /> Cancel
+                </button>
+                {choiceIn !== undefined && <span className="voice-choice-timer" role="timer">{`${choiceIn} s`}</span>}
+              </div>
             )}
           </div>
         )}

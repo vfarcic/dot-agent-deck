@@ -3217,6 +3217,122 @@ async fn resolve_declared_utterance(
     Ok(result)
 }
 
+/// The most bytes one offered candidate's text may carry across the boundary
+/// ([`validate_voice_choice`]): a label or a value is a name, an id or a path.
+const MAX_VOICE_CHOICE_TEXT_BYTES: usize = 4 * 1024;
+
+/// Refuse an offered list no real choice could have produced: more entries
+/// than [`voice::choice::MAX_CHOICES`], or text longer than any name.
+fn validate_voice_choice(offered: &[voice::ResolvedParam]) -> Result<(), String> {
+    let too_long = |param: &voice::ResolvedParam| {
+        [&param.name, &param.spoken, &param.value, &param.label]
+            .iter()
+            .any(|text| text.len() > MAX_VOICE_CHOICE_TEXT_BYTES)
+    };
+    if offered.is_empty()
+        || offered.len() > voice::choice::MAX_CHOICES
+        || offered.iter().any(too_long)
+    {
+        return Err("the choice sent with that answer is not one this app offers".to_string());
+    }
+    Ok(())
+}
+
+/// PRD #1261: answer a pending numbered choice, locally.
+///
+/// **No Commands backend call.** The utterance is answered by
+/// [`voice::choice::answer`] against the list the panel offered and against
+/// what the app observes NOW — the selected deck's agents, read here as
+/// [`desktop_voice_resolve`] reads them, and the dialog's declarations, sent
+/// with the answer for that command's reasons. No model is asked anything, so
+/// no observed name can steer which entry is chosen.
+///
+/// `action` is the row the choice completes; it only decides how decks are
+/// keyed, because a switch's candidates carry the Deck selector's token
+/// ([`voice::address_deck_switch`]). The webview dispatches the chosen entry
+/// itself, through the same staleness checks a resolved dispatch meets.
+#[tauri::command]
+// Nine: each declaration piece is a parameter, for `desktop_voice_resolve`'s reason.
+#[allow(clippy::too_many_arguments)]
+async fn desktop_voice_choice(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    utterance: String,
+    action: String,
+    offered: Vec<voice::ResolvedParam>,
+    directories: Option<voice::VoiceDirectories>,
+    new_agent: Option<voice::VoiceNewAgent>,
+    deck_step: Option<Vec<voice::VoiceDeckChoice>>,
+    endpoints: Option<crate::settings::EndpointSettings>,
+) -> Result<voice::ChoiceAnswer, String> {
+    ensure_main_webview(&webview)?;
+    if utterance.len() > MAX_UTTERANCE_BYTES {
+        return Err(format!(
+            "that answer is too long to send — {MAX_UTTERANCE_BYTES} bytes at most"
+        ));
+    }
+    validate_voice_choice(&offered)?;
+    if let Some(directories) = &directories {
+        validate_voice_directories(directories)?;
+    }
+    if let Some(new_agent) = &new_agent {
+        validate_voice_new_agent(new_agent)?;
+    }
+    if let Some(deck_step) = &deck_step {
+        validate_voice_deck_step(deck_step)?;
+    }
+    let snapshot = get_snapshot(&state.daemon).await;
+    Ok(answer_declared_choice(
+        &utterance,
+        &action,
+        &offered,
+        &snapshot.agents,
+        &snapshot.observed,
+        VoiceDeclaration {
+            directories: directories.as_ref(),
+            new_agent: new_agent.as_ref(),
+            deck_step: deck_step.as_deref(),
+            endpoints: endpoints.as_ref(),
+            dictation: None,
+        },
+    ))
+}
+
+/// [`desktop_voice_choice`] once the live state is read. The decks are the
+/// ones a resolve would have offered; for [`voice::SWITCH_DECK_ROW`] they are
+/// keyed by the Deck selector's token, as that row's candidates are, and a
+/// deck the selector does not list is not live for it.
+fn answer_declared_choice(
+    utterance: &str,
+    action: &str,
+    offered: &[voice::ResolvedParam],
+    agents: &[voice::DesktopAgent],
+    observed: &[crate::dto::ObservedDeckDto],
+    declared: VoiceDeclaration<'_>,
+) -> voice::ChoiceAnswer {
+    let mut decks = voice_decks(observed, declared.deck_step);
+    let selections = selector_voice_decks(declared.endpoints, &mut decks, declared.deck_step);
+    if action == voice::SWITCH_DECK_ROW {
+        decks = decks
+            .into_iter()
+            .filter_map(|mut deck| {
+                deck.id = selections.get(&deck.id)?.token.clone();
+                Some(deck)
+            })
+            .collect();
+    }
+    voice::choice::answer(
+        utterance,
+        offered,
+        &voice::choice::ChoiceLive {
+            agents,
+            decks: &decks,
+            directories: declared.directories,
+            new_agent: declared.new_agent,
+        },
+    )
+}
+
 /// PRD #1195 M3 — the Deck selector's decks, for `switch_deck`: every deck it
 /// lists that [`voice_decks`] did not already take from the observed fleet is
 /// appended to `decks`, and the answer maps EVERY deck in `decks` that the
@@ -5005,6 +5121,7 @@ pub fn run() {
             desktop_voice_status,
             desktop_voice_cancel,
             desktop_voice_resolve,
+            desktop_voice_choice,
             desktop_voice_commands,
         ])
         .build(tauri::generate_context!())
@@ -5245,6 +5362,67 @@ mod tests {
             true,
         )
         .await
+    }
+
+    /// Scenario: the Deck selector lists a build box and a staging box, and
+    /// the user says "switch deck to build box or staging box". The tie is
+    /// offered with each deck's selector token; "two" answers it with the
+    /// staging row, and once that row is gone from Settings the same answer
+    /// is refused rather than switching to whatever the second deck is now.
+    #[tokio::test]
+    async fn a_switch_choice_is_answered_against_the_selector_tokens() {
+        let section = |hosts: &[(&str, &str)]| -> crate::settings::EndpointSettings {
+            serde_json::from_value(serde_json::json!({
+                "remote": hosts
+                    .iter()
+                    .map(|(id, host)| serde_json::json!({ "id": id, "host": host, "port": 22 }))
+                    .collect::<Vec<_>>(),
+                "selection": "local",
+            }))
+            .expect("parses")
+        };
+        let both = section(&[("rowbuild", "build-box"), ("rowstage", "staging-box")]);
+        let said = "switch deck to build box or staging box";
+        let result = resolve_with_section(
+            &both,
+            said,
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+        )
+        .await
+        .expect("resolves");
+        let voice::VoiceOutcome::ParamAmbiguous { candidates, .. } = &result.outcome else {
+            panic!("a choice: {:?}", result.outcome);
+        };
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["rowbuild", "rowstage"]
+        );
+        let declared = |endpoints| VoiceDeclaration {
+            directories: None,
+            new_agent: None,
+            deck_step: None,
+            endpoints: Some(endpoints),
+            dictation: None,
+        };
+        assert_eq!(
+            answer_declared_choice("two", "switch_deck", candidates, &[], &[], declared(&both)),
+            voice::ChoiceAnswer::Selected(candidates[1].clone())
+        );
+        let without_staging = section(&[("rowbuild", "build-box")]);
+        assert_eq!(
+            answer_declared_choice(
+                "two",
+                "switch_deck",
+                candidates,
+                &[],
+                &[],
+                declared(&without_staging)
+            ),
+            voice::ChoiceAnswer::Refused
+        );
     }
 
     /// Scenario: the user keeps more remote decks in Settings than voice takes

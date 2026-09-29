@@ -312,6 +312,236 @@ describe("voice off, as a command", () => {
   });
 });
 
+describe("PRD #1261 numbered choice over the original voice command", () => {
+  beforeEach(() => { window.localStorage.clear(); vi.useFakeTimers(); });
+  afterEach(() => vi.useRealTimers());
+
+  const first = { name: "agent", kind: "agent_ref", spoken: "agent", value: "planner", label: "Plan / architecture" } as const;
+  const second = { name: "agent", kind: "agent_ref", spoken: "agent", value: "builder", label: "Desktop implementation" } as const;
+  const candidates = [first, second];
+  const choice = (action = "open_agent", invoke = "openAgent"): VoiceResultDto => ({
+    resolveMs: 21, backend: "stub",
+    outcome: {
+      kind: "param_ambiguous", transcript: "open the agent", action, invoke,
+      param: "agent", spoken: "agent", matches: candidates.map((candidate) => candidate.label),
+      candidates, params: [], sentence: "Heard: “open the agent” — “agent” matches more than one agent: Plan / architecture, Desktop implementation.",
+    },
+  } as unknown as VoiceResultDto);
+  const selected = (utterance: string, target = second) =>
+    dispatch("open_agent", "openAgent", `Opening ${target.label}.`, utterance, [{ ...target, spoken: "agent" }]);
+  const noMatch = (utterance: string): VoiceResultDto => ({
+    resolveMs: 21, backend: "stub",
+    outcome: { kind: "no_match", transcript: utterance, sentence: `Heard: “${utterance}” — no matching action.` },
+  });
+  const entry = (number: number, label: string) => screen.getByRole("button", { name: `${number}. ${label}` });
+
+  function setup(voice: ReturnType<typeof microphone>, answer: (utterance: string) => VoiceResultDto = selected,
+    configure?: (snapshot: ReturnType<typeof createFixtureSnapshot>) => void) {
+    const snapshot = createFixtureSnapshot("connected");
+    configure?.(snapshot);
+    for (const id of [first.value, second.value]) {
+      if (!snapshot.agents.find((agent) => agent.id === id)) throw new Error(`fixture agent ${id} missing`);
+    }
+    const resolveVoice: ResolveVoice = vi.fn(async (utterance) => utterance === "open the agent" ? choice() : answer(utterance));
+    render(<DeckShell runtime={runtime(resolveVoice, voice, { snapshot, fleet: [snapshot] })} initialView={{ kind: "overview" }} />);
+    return { resolveVoice, snapshot };
+  }
+
+  /** Scenario: the voice row lists the two real agents in order; clicking the second
+   * entry opens exactly that agent through the original openAgent row. */
+  it("renders numbered entries and dispatches the clicked agent value once", async () => {
+    const voice = microphone(["open the agent"]);
+    const { resolveVoice } = setup(voice);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(1, first.label)).toBeVisible();
+    expect(entry(2, second.label)).toBeVisible();
+    await act(async () => { fireEvent.click(entry(2, second.label)); await Promise.resolve(); });
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId(`terminal-${second.value}`)).toBeVisible();
+    expect(resolveVoice).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
+  });
+
+  /** Scenario: saying a whole ordinal or an offered name completes the original
+   * openAgent command with the selected ID and closes the list. */
+  it.each(["two", "Desktop implementation"])("dispatches the offered value when the answer is %s", async (answer) => {
+    const voice = microphone(["open the agent"]);
+    setup(voice);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(2, second.label)).toBeVisible();
+    voice.deliver(answer);
+    await completeUtterance();
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId(`terminal-${second.value}`)).toBeVisible();
+    expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
+  });
+
+  /** Scenario: a different utterance closes the offer and is resolved in its own
+   * right, with both the closure and the new command's refusal reported. */
+  it("closes the choice and resolves a non-answer as an ordinary utterance", async () => {
+    const voice = microphone(["open the agent"]);
+    setup(voice, noMatch);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(2, second.label)).toBeVisible();
+    voice.deliver("what time is it");
+    await completeUtterance();
+    expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/choice closed/i);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("no matching action");
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+  });
+
+  /** Scenario: a different utterance can enter #1260 dictation after an offer
+   * closes. It targets the pane now on screen and never opens a listed agent. */
+  it("closes a choice before type on enters dictation", async () => {
+    const voice = microphone(["open the agent"]);
+    setup(voice, (utterance) => dispatch("dictation_on", "startDictation", "Typing to the agent.", utterance), (snapshot) => {
+      const target = snapshot.agents.find((agent) => agent.id === first.value);
+      if (!target) throw new Error(`fixture agent ${first.value} missing`);
+      target.status = "running";
+      target.writeLease = "write";
+    });
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(2, second.label)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: `Open ${first.label} agent` }));
+    voice.deliver("type on");
+    await completeUtterance();
+    expect(screen.getByTestId("voice-dictating")).toHaveTextContent(first.label);
+    expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId(`terminal-${first.value}`)).toBeVisible();
+  });
+
+  /** Scenario: the user can cancel the list by voice, by its Cancel button, or
+   * with Escape while focus is inside it; none opens an agent. */
+  it.each(["voice", "button", "escape"])("cancels the choice by %s", async (route) => {
+    const voice = microphone(["open the agent"]);
+    const { resolveVoice } = setup(voice, noMatch);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(2, second.label)).toBeVisible();
+    if (route === "voice") { voice.deliver("never mind"); await completeUtterance(); }
+    if (route === "button") fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    if (route === "escape") { entry(1, first.label).focus(); fireEvent.keyDown(entry(1, first.label), { key: "Escape" }); }
+    expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    if (route === "voice") expect(resolveVoice).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: after twenty seconds the offered entries expire; clicking an old
+   * answer cannot dispatch anything. */
+  it("expires the numbered choice without dispatch", async () => {
+    const voice = microphone(["open the agent"]);
+    setup(voice);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(2, second.label)).toBeVisible();
+    expect(within(screen.getByTestId("voice-report")).getByRole("timer")).toHaveTextContent(/20\s*s/i);
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_100); });
+    expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/expir/i);
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+  });
+
+  /** Scenario: a nine-agent tie remains answerable by a single digit, while a
+   * ten-agent tie keeps the old sentence and offers no numbered controls. */
+  it("offers at most nine candidates", async () => {
+    async function offer(count: number) {
+      const snapshot = createFixtureSnapshot("connected");
+      const seed = snapshot.agents.find((agent) => agent.id === "planner");
+      if (!seed) throw new Error("fixture agent planner missing");
+      const offered = Array.from({ length: count }, (_, index) => {
+        const id = `choice-agent-${index + 1}`;
+        const label = `Atlas ${index + 1}`;
+        snapshot.agents.push({ ...seed, id, displayName: label });
+        return { name: "agent", kind: "agent_ref", spoken: "Atlas", value: id, label };
+      });
+      const resolveVoice: ResolveVoice = vi.fn(async () => ({ resolveMs: 21, backend: "stub", outcome: {
+        kind: "param_ambiguous", transcript: "open Atlas", action: "open_agent", invoke: "openAgent",
+        param: "agent", spoken: "Atlas", matches: offered.map((candidate) => candidate.label), candidates: offered,
+        params: [], sentence: `Heard: “open Atlas” — Atlas matches more than one agent: Atlas 1, Atlas 2, Atlas 3, and ${count - 3} more.`,
+      } } as unknown as VoiceResultDto));
+      const view = render(<DeckShell runtime={runtime(resolveVoice, microphone(["open Atlas"]), { snapshot, fleet: [snapshot] })} initialView={{ kind: "overview" }} />);
+      await turnVoiceOn();
+      await completeUtterance();
+      return view;
+    }
+    const nine = await offer(9);
+    expect(entry(9, "Atlas 9")).toBeVisible();
+    nine.unmount();
+    window.localStorage.clear();
+    await offer(10);
+    expect(screen.queryByRole("button", { name: "9. Atlas 9" })).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("and 7 more");
+  });
+
+  /** Scenario: an answer offered on the overview is refused after the user
+   * navigates away; a stale entry never opens either agent. */
+  it("refuses an answer after the screen moves", async () => {
+    const voice = microphone(["open the agent"]);
+    setup(voice);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(2, second.label)).toBeVisible();
+    fireEvent.click(screen.getByTestId("open-deck"));
+    await act(async () => { fireEvent.click(entry(2, second.label)); await Promise.resolve(); });
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/moved on|another screen/i);
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent("Opening Desktop implementation.");
+  });
+
+  /** Scenario: choosing an agent for a spoken stop opens the existing D5
+   * confirmation and closes the choice; nothing is stopped before confirmation. */
+  it("hands a chosen stop to the existing D5 confirmation", async () => {
+    const voice = microphone(["stop the agent"]);
+    const snapshot = createFixtureSnapshot("connected");
+    const target = snapshot.agents.find((agent) => agent.id === second.value);
+    if (!target) throw new Error(`fixture agent ${second.value} missing`);
+    const stopChoice = {
+      ...choice("stop_agent", "confirmStopAgent"),
+      outcome: {
+        kind: "param_ambiguous", transcript: "stop the agent", action: "stop_agent", invoke: "confirmStopAgent",
+        param: "agent", spoken: "agent", matches: candidates.map((candidate) => candidate.label), candidates, params: [],
+        sentence: "Heard: “stop the agent” — “agent” matches more than one agent: Plan / architecture, Desktop implementation.",
+      },
+    } as VoiceResultDto;
+    const resolveVoice: ResolveVoice = vi.fn(async () => stopChoice);
+    const runAction = vi.fn(async () => ({ ok: true }) as DeckActionResult);
+    render(<DeckShell runtime={runtime(resolveVoice, voice, { snapshot, fleet: [snapshot], runAction })} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(2, second.label)).toBeVisible();
+    fireEvent.click(entry(2, second.label));
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent(second.label);
+    expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
+    expect(runAction).not.toHaveBeenCalled();
+    expect(resolveVoice).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Close agent" }));
+      await Promise.resolve();
+    });
+    expect(runAction).toHaveBeenCalledExactlyOnceWith({
+      type: "stop_agent", deckId: snapshot.connection.deckId, agentId: target.id,
+    });
+  });
+
+  /** Scenario: opening a stop confirmation by hand outranks an offered choice
+   * and dismisses that list without letting it dispatch. */
+  it("closes a pending choice when a D5 confirmation opens by click", async () => {
+    const voice = microphone(["open the agent"]);
+    setup(voice);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(2, second.label)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: `Close ${first.label} agent` }));
+    expect(screen.getByRole("alertdialog")).toBeVisible();
+    expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+  });
+});
+
 describe("Settings from the overview by voice", () => {
   beforeEach(() => {
     window.localStorage.clear();
@@ -1509,6 +1739,10 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
      filesystem root has no parent. */
   const LEVELS: Record<string, { parent?: string; children: string[] }> = {
     "/home/dev": { parent: "/home", children: ["billing", "docs"] },
+    "/home/dev/choice": { parent: "/home/dev", children: ["docs-site", "docs-api", "billing"] },
+    "/home/dev/choice/docs-site": { parent: "/home/dev/choice", children: [] },
+    "/home/dev/choice/docs-api": { parent: "/home/dev/choice", children: [] },
+    "/home/dev/choice/billing": { parent: "/home/dev/choice", children: [] },
     "/home/dev/billing": { parent: "/home/dev", children: [] },
     "/home": { parent: "/", children: ["dev"] },
     "/": { children: ["home"] },
@@ -1532,13 +1766,23 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
    * needs a declared `..`. `forced` answers a dispatch regardless, for the
    * cases where the browser moves AFTER Rust judged the utterance.
    */
-  function browserVoice(declared: () => VoiceDirectoriesDto | undefined, options: { forced?: boolean; during?: () => Promise<void> } = {}): ResolveVoice {
+  function browserVoice(declared: () => VoiceDirectoriesDto | undefined, options: { forced?: boolean; during?: () => Promise<void>; ambiguous?: boolean } = {}): ResolveVoice {
     return vi.fn(async (utterance: string) => {
       const directories = declared();
       await options.during?.();
       const unavailable = (action: string, hint: string): VoiceResultDto => ({ resolveMs: 21, backend: "stub", outcome: { kind: "unavailable", transcript: utterance, action, hint, sentence: `Not here — ${hint}.` } });
       if (utterance.startsWith("open dir ")) {
         const name = utterance.slice("open dir ".length);
+        if (options.ambiguous && name === "docs" && directories) {
+          const candidates = directories.entries.filter((entry) => entry.name.startsWith("docs-")).map((entry) => ({
+            name: "dir", kind: "dir_ref", spoken: "docs", value: entry.path, label: entry.name,
+          }));
+          return { resolveMs: 21, backend: "stub", outcome: {
+            kind: "param_ambiguous", transcript: utterance, action: "open_dir", invoke: "openDirectory",
+            param: "dir", spoken: "docs", matches: candidates.map((candidate) => candidate.label), candidates,
+            params: [], sentence: "Heard: “open dir docs” — “docs” matches more than one directory: docs-site, docs-api.",
+          } } as unknown as VoiceResultDto;
+        }
         if (!directories && !options.forced) return unavailable("open_dir", "opening a directory needs the New agent dialog's directory listing; say “new agent” and choose a daemon first");
         const entry = directories?.entries.find((candidate) => candidate.name === name) ?? { name, path: `/home/dev/${name}` };
         return dispatch("open_dir", "openDirectory", `Opening ${entry.name}.`, utterance, [{ name: "dir", kind: "dir_ref", spoken: name, value: entry.path, label: entry.name }]);
@@ -1556,7 +1800,7 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
   }
 
   /** A runtime over the one-deck fixture that can run the New agent flow and records every declaration. */
-  function browsingDeck(voice: VoiceControls, options: { forced?: boolean; during?: () => Promise<void>; startAt?: string; holdStart?: boolean } = {}) {
+  function browsingDeck(voice: VoiceControls, options: { forced?: boolean; during?: () => Promise<void>; startAt?: string; holdStart?: boolean; ambiguous?: boolean } = {}) {
     const declarations: (VoiceDirectoriesDto | undefined)[] = [];
     const declareVoiceScreen = vi.fn((_screen: string, directories?: VoiceDirectoriesDto) => { declarations.push(directories); });
     const listDirectories = vi.fn(async (_deckId: string, path?: string) => listing(path ?? options.startAt ?? "/home/dev"));
@@ -1608,6 +1852,31 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
     expect(listDirectories).toHaveBeenLastCalledWith(deckId, "/home/dev/billing");
     expect(currentPath()).toBe("/home/dev/billing");
     expect(screen.getByTestId("voice-report")).toHaveTextContent("Opening billing.");
+  });
+
+  /** Scenario: a numbered directory was offered from one browser listing, then
+   * a click moved the browser. Answering with the old second entry is refused
+   * by the dialog's listing check and opens no stale directory. */
+  it("refuses a chosen directory after the browser listing moves", async () => {
+    const voice = microphone([]);
+    const { deck, listDirectories } = browsingDeck(voice, { startAt: "/home/dev/choice", ambiguous: true });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openBrowser();
+    voice.deliver("open dir docs");
+    await completeUtterance();
+    expect(screen.getByRole("button", { name: "2. docs-api" })).toBeVisible();
+
+    fireEvent.click(screen.getByTestId("new-agent-directory-list").querySelector("[data-path='/home/dev/choice/billing']")!);
+    await flush();
+    expect(currentPath()).toBe("/home/dev/choice/billing");
+    fireEvent.click(screen.getByRole("button", { name: "2. docs-api" }));
+    await flush();
+
+    expect(currentPath()).toBe("/home/dev/choice/billing");
+    expect(listDirectories).not.toHaveBeenCalledWith(expect.any(String), "/home/dev/choice/docs-api");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(DIRECTORY_MOVED_ON);
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent("Opening docs-api.");
   });
 
   /**
@@ -2787,14 +3056,14 @@ describe("the New agent deck field and Discard, by voice (issues 1263 and 1247)"
    * opens with none chosen — whose resolver answers as Rust would, and can be
    * HELD open for a test that changes the dialog during the round trip.
    */
-  function deckFieldRuntime(voice: VoiceControls) {
+  function deckFieldRuntime(voice: VoiceControls, resolve = answer) {
     const fleet = createFixtureFleet("fleet");
     let gate: Promise<void> | undefined;
     let release: () => void = () => undefined;
     const hold = () => { gate = new Promise<void>((resolve) => { release = resolve; }); };
     const resolveVoice: ResolveVoice = vi.fn(async (utterance: string) => {
       if (gate) await gate;
-      return answer(utterance);
+      return resolve(utterance);
     });
     const deck = runtime(resolveVoice, voice, {
       snapshot: fleet[0],
@@ -2808,6 +3077,39 @@ describe("the New agent deck field and Discard, by voice (issues 1263 and 1247)"
 
   const chosenDeck = () => screen.getByTestId("new-agent-deck-list").querySelector("[data-chosen='true']")?.getAttribute("data-deck-id");
   const pressedMode = () => screen.getByTestId("new-agent-modes").querySelector("[aria-pressed='true']")?.getAttribute("data-mode");
+
+  /** Scenario: the New agent dialog is closed and remounted after its Deck
+   * choices were offered. The old answer cannot select a deck in the new mount. */
+  it("refuses a deck choice after the dialog is remounted", async () => {
+    const voice = microphone([]);
+    const offered = [DECKS["deck local"], DECKS["deck build box"]].map((deck) => ({
+      name: "deck", kind: "deck_ref", spoken: "daemon", value: deck.value, label: deck.label,
+    }));
+    const resolve = (utterance: string): VoiceResultDto => utterance === "deck daemon"
+      ? { resolveMs: 21, backend: "stub", outcome: {
+        kind: "param_ambiguous", transcript: utterance, action: "choose_deck", invoke: "chooseNewAgentDeck",
+        param: "deck", spoken: "daemon", matches: offered.map((deck) => deck.label), candidates: offered,
+        params: [], sentence: "Heard: “deck daemon” — daemon matches more than one deck.",
+      } } as unknown as VoiceResultDto
+      : answer(utterance);
+    const { deck } = deckFieldRuntime(voice, resolve);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openDialog();
+    voice.deliver("deck daemon");
+    await completeUtterance();
+    expect(screen.getByRole("button", { name: `2. ${offered[1].label}` })).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close new agent" }));
+    await flush();
+    await openDialog();
+    fireEvent.click(screen.getByRole("button", { name: `2. ${offered[1].label}` }));
+    await flush();
+
+    expect(chosenDeck()).toBeUndefined();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(DIALOG_MOVED_ON);
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(`Daemon: ${offered[1].label}.`);
+  });
 
   async function openDialog() {
     fireEvent.click(screen.getByTestId("overview-new-agent"));
@@ -3043,6 +3345,45 @@ describe("switch deck by voice, against settings edited mid-flight", () => {
     expect(resolveVoice).toHaveBeenCalledWith(SAID);
     return { store, answer: async () => { await act(async () => { answer(switched()); }); await flush(); } };
   }
+
+  /** Scenario: the user is offered local and build, then edits build's address
+   * in Settings. Choosing the old build entry is refused and reports only the
+   * address change, leaving the selected deck local. */
+  it("refuses a chosen deck whose identity changed after the offer", async () => {
+    const utterance = "switch deck to local or build";
+    const candidates = [
+      { name: "deck", kind: "deck_ref", spoken: "local or build", value: "local", label: "Local daemon" },
+      { name: "deck", kind: "deck_ref", spoken: "local or build", value: ROW_ID, label: "deploy@build-box",
+        deckIdentity: { host: "build-box", user: "deploy", port: 22, socket: "/run/deck.sock" } },
+    ];
+    const resolveVoice: ResolveVoice = vi.fn(async () => ({ resolveMs: 21, backend: "stub", outcome: {
+      kind: "param_ambiguous", transcript: utterance, action: "switch_deck", invoke: "switchDeck",
+      param: "deck", spoken: "local or build", matches: candidates.map((candidate) => candidate.label), candidates,
+      params: [], sentence: "Heard: “switch deck to local or build” — you named more than one daemon: Local daemon, deploy@build-box.",
+    } } as unknown as VoiceResultDto));
+    const store = storeWithBuildBox();
+    const voice = microphone([utterance]);
+    render(<DeckShell runtime={runtime(resolveVoice, voice, { getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(screen.getByRole("button", { name: "2. deploy@build-box" })).toBeVisible();
+
+    fireEvent.click(screen.getByTestId("open-settings"));
+    fireEvent.click(screen.getByTestId("settings-section-decks"));
+    fireEvent.click(screen.getByTestId(`deck-choice-${ROW_ID}`).querySelector("input")!);
+    await flush();
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "other-box" } });
+    await flush();
+    fireEvent.click(screen.getByTestId("deck-choice-local").querySelector("input")!);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "2. deploy@build-box" }));
+    await flush();
+
+    expect(store.current.endpoints?.selection).toBe("local");
+    expect(store.current.endpoints?.remote[0].host).toBe("other-box");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("That daemon changed in Settings since you asked for it — try again.");
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent("Showing deploy@build-box.");
+  });
 
   /**
    * Scenario: say "switch deck to the build box"; while it resolves, open

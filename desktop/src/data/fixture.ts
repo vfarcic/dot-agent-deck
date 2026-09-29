@@ -1226,6 +1226,28 @@ function fixtureHeard(transcript: string, situation: string): string {
 }
 
 /**
+ * PRD #1261 — one canned TIE, so the browser tier can drive the numbered
+ * chooser: "open the agent" on the Daemons screen or the dashboard, answered as
+ * `open_agent` with the two agents of the `connected` deck it names in turn.
+ *
+ * **Fixture data, not the `agent_ref` resolver {@link FIXTURE_VOICE_COMMANDS}
+ * refuses to invent**, for the same line that note draws: this is one canned
+ * answer for one canned phrase, whose interest is what happens AFTER the tie —
+ * the list, its answers, its expiry — which the real resolver's own tests in
+ * `voice/outcome.rs` cannot reach. The sentence and the two reports are the
+ * ones Rust renders for this tie. The agents are the `connected` state's own
+ * `planner` and `builder`, so a chosen entry opens a pane that exists.
+ */
+const FIXTURE_VOICE_TIE = {
+  phrases: ["open the agent"] as readonly string[],
+  screens: ["deck", "overview"] as readonly VoiceScreen[],
+  candidates: [
+    { name: "agent", kind: "agent_ref", spoken: "agent", value: "planner", label: "Plan / architecture" },
+    { name: "agent", kind: "agent_ref", spoken: "agent", value: "builder", label: "Desktop implementation" },
+  ] as readonly VoiceResolvedParamDto[],
+} as const;
+
+/**
  * Resolve one utterance the way the Rust pipeline would, against the screen the
  * webview has stated.
  *
@@ -1256,6 +1278,30 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
           params: [{ name: "prefix", kind: "spoken_prefix", spoken: "", value: text, label: text }],
           sentence: `Typed: “${text}”.`,
         },
+    };
+  }
+  if (FIXTURE_VOICE_TIE.phrases.includes(spoken)) {
+    const hint = "opening an agent works from the Daemons screen or the agent dashboard";
+    if (!FIXTURE_VOICE_TIE.screens.includes(screen)) {
+      return { ...stub, outcome: { kind: "unavailable", transcript: utterance, action: "open_agent", hint, sentence: `Not here — ${hint}.` } };
+    }
+    const candidates = [...FIXTURE_VOICE_TIE.candidates];
+    const matches = candidates.map((candidate) => candidate.label);
+    return {
+      ...stub,
+      outcome: {
+        kind: "param_ambiguous",
+        transcript: utterance,
+        action: "open_agent",
+        invoke: "openAgent",
+        param: "agent",
+        spoken: "agent",
+        matches,
+        candidates,
+        params: [],
+        reports: matches.map((label) => `Opening ${label}.`),
+        sentence: fixtureHeard(utterance, `“agent” matches more than one agent: ${matches.join(", ")}`),
+      },
     };
   }
   const command = FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.phrases.includes(spoken))

@@ -41,6 +41,7 @@
 //! are what the panel will call.
 
 pub mod capture;
+pub mod choice;
 pub mod dictation;
 pub mod hold;
 pub mod http;
@@ -53,6 +54,14 @@ pub mod schema;
 pub mod table;
 pub mod transcribe;
 pub mod wake;
+
+#[cfg(test)]
+#[path = "choice_tests.rs"]
+// The tests build a one-entry offer with `&[candidate.clone()]`, which reads
+// as the list the panel holds; `std::slice::from_ref` would say the same less
+// plainly.
+#[allow(clippy::cloned_ref_to_slice_refs)]
+mod choice_tests;
 
 use std::fmt;
 
@@ -277,6 +286,7 @@ pub use capture::{
     SILENCE_HOLD, SILENCE_RMS, SPEECH_MARGIN, SPEECH_WINDOW, SpeechMeasure, StubSource,
     TARGET_SAMPLE_RATE, Vad,
 };
+pub use choice::{ChoiceAnswer, ChoiceLive, MAX_CHOICES};
 pub use hold::VoiceHold;
 pub use outcome::{
     ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, SWITCH_DECK_ROW, VoiceDeckIdentity,
