@@ -171,8 +171,17 @@ impl IpcListener {
     /// `UnixListener::bind` on purpose — [`bind`]'s process-global umask flip
     /// races sibling tests under single-process `cargo test` — yet still need to
     /// hand the listener to `run_hook_loop`, which takes an `IpcListener`.
-    #[cfg(test)]
-    pub(crate) fn from_tokio_listener(listener: UnixListener) -> Self {
+    ///
+    /// `pub` rather than `#[cfg(test)]` because the desktop crate's lib tests
+    /// need it for the same reason and cannot see this crate's `cfg(test)`
+    /// items (issue #1078): they run the production attach server in-process,
+    /// and `serve_attach` takes an `IpcListener`. Hidden from the docs because
+    /// nothing outside a test has any business skipping the owner-only mode
+    /// [`bind`] guarantees.
+    ///
+    /// [`bind`]: Self::bind
+    #[doc(hidden)]
+    pub fn from_tokio_listener(listener: UnixListener) -> Self {
         Self(listener)
     }
 }

@@ -11,6 +11,9 @@ mod endpoint_test;
 mod endpoint_field_parity;
 mod endpoint_tunnels;
 mod generation;
+// The local deck's address, read in one place so the tests have one seam to move
+// it with instead of the process-wide environment variable (issue #1078).
+mod local_deck;
 // PRD #802 — the two validating newtypes the `[voice]` stages store their
 // service coordinates in. A module of its own rather than one under `voice`
 // for `secrets`' reason: `ALLOWED_FIELD_TYPES` refuses a `String` in any
@@ -29,6 +32,10 @@ mod secrets;
 mod selection_capture;
 mod settings;
 mod terminal;
+// Tests only: binding the production attach server's listener without the
+// process-umask flip (issue #1078).
+#[cfg(all(test, unix))]
+mod test_listener;
 // PRD #802 — the voice command table, its Rust-side consumers, the microphone
 // and the transcription seam.
 //
@@ -3244,7 +3251,7 @@ fn selector_voice_decks(
             .and_then(|step| step.iter().find(|choice| choice.deck_id == deck_id))
             .and_then(|choice| choice.reason.clone())
     };
-    let local = crate::dto::deck_wire_id(&Endpoint::local());
+    let local = crate::dto::deck_wire_id(&crate::local_deck::local_endpoint());
     // The local deck carries no identity: it has no remote address that
     // Settings can change under its token.
     let mut listed: Vec<(voice::VoiceDeck, voice::VoiceDeckSelection)> = vec![(
@@ -5386,7 +5393,7 @@ mod tests {
         let build_key = crate::dto::deck_wire_id(&Endpoint::Remote(
             endpoints.remote[0].endpoint().expect("connectable"),
         ));
-        let local_key = crate::dto::deck_wire_id(&Endpoint::local());
+        let local_key = crate::dto::deck_wire_id(&crate::local_deck::local_endpoint());
         let observed = [crate::dto::ObservedDeckDto {
             deck_id: local_key.clone(),
             label: "/run/deck.sock".to_string(),
@@ -6100,12 +6107,10 @@ mod tests {
     /// keys then keep their tunnels is `endpoint_tunnels`' own pair of tests.
     #[test]
     fn the_fleets_live_set_names_every_observed_deck() {
-        use dot_agent_deck::daemon_client::Endpoint;
-
         let fleet = fleet_of(&["build-box.example.com", "laptop.example.com"]);
         let keys = observed_keys(&fleet);
         assert_eq!(keys.len(), 3, "the local deck plus both configured rows");
-        assert!(keys.contains(&Endpoint::local().identity()));
+        assert!(keys.contains(&crate::local_deck::local_endpoint().identity()));
         for endpoint in fleet.connectable_endpoints() {
             assert!(keys.contains(&endpoint.identity()), "{endpoint:?}");
         }
@@ -6234,7 +6239,7 @@ mod tests {
         let one = fleet_of(&["build-box.example.com"]);
         retarget_selection(&state, &one).await;
         let before = *state.selection.borrow();
-        let local = dot_agent_deck::daemon_client::Endpoint::local();
+        let local = crate::local_deck::local_endpoint();
         let lease = state
             .tunnels
             .acquire(&local)
@@ -6435,10 +6440,8 @@ mod tests {
 
     #[test]
     fn each_observed_deck_claims_exactly_one_watcher() {
-        use dot_agent_deck::daemon_client::Endpoint;
-
         let state = DesktopState::default();
-        let local = Endpoint::local().identity();
+        let local = crate::local_deck::local_endpoint().identity();
 
         assert!(
             state.start_watcher_once_for(&local).is_some(),
@@ -6488,10 +6491,8 @@ mod tests {
     /// registry is correct if it ever happens, not that it does.
     #[tokio::test]
     async fn a_watcher_handle_arriving_for_someone_elses_claim_is_aborted() {
-        use dot_agent_deck::daemon_client::Endpoint;
-
         let state = DesktopState::default();
-        let deck = Endpoint::local().identity();
+        let deck = crate::local_deck::local_endpoint().identity();
 
         let a = state
             .start_watcher_once_for(&deck)
@@ -8794,8 +8795,10 @@ command = "configured-planner"
 
     #[test]
     fn explicit_daemon_start_requires_a_connected_snapshot() {
-        let disconnected =
-            crate::dto::disconnected_snapshot(&Endpoint::local(), "daemon start timed out");
+        let disconnected = crate::dto::disconnected_snapshot(
+            &crate::local_deck::local_endpoint(),
+            "daemon start timed out",
+        );
         assert!(ensure_explicit_start_connected(false, &disconnected).is_ok());
         assert_eq!(
             ensure_explicit_start_connected(true, &disconnected).unwrap_err(),
