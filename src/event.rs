@@ -1766,7 +1766,8 @@ pub struct ProjectRole {
 /// the response field it rides on differs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedOrchestration {
-    /// Where the orchestrator context was published, daemon-side.
+    /// Where the orchestrator context was published, daemon-side. Since issue
+    /// #1233 a file of this preparation's own, never rewritten by a later one.
     pub context_path: String,
     /// PRD #819 M6: the daemon-**canonical** project directory this preparation
     /// resolved to — the same string [`ResolvedProject::path`] carries, restated
@@ -1808,11 +1809,16 @@ pub struct PreparedOrchestration {
     /// [`crate::orchestrator_context::prepare_orchestrator_context`].
     ///
     /// It is here because the client that spawns the roles has to deliver it and
-    /// **may not compose it itself**: the line names
-    /// `.dot-agent-deck/orchestrator-context.md`, which is project-state
-    /// knowledge this PRD moves daemon-side, and it varies with whether the
-    /// preparation carried a task. A client that built its own copy would be
-    /// holding a second, driftable spelling of a file only the daemon wrote.
+    /// **may not compose it itself**: the line names the context file this
+    /// preparation published, which is project-state knowledge this PRD moves
+    /// daemon-side, and it varies with whether the preparation carried a task.
+    /// Since issue #1233 that file is unique to the preparation
+    /// (`.dot-agent-deck/orchestrator-context-<32 hex>.md`, the file
+    /// [`Self::context_path`] names); an older daemon names the fixed
+    /// `.dot-agent-deck/orchestrator-context.md`. A client that built its own
+    /// copy would be holding a second, driftable spelling of a file only the
+    /// daemon wrote — and, against a current daemon, would point the coordinator
+    /// at the shared compatibility mirror rather than at its own brief.
     ///
     /// Additive on a response type, exactly like
     /// [`ResolvedProject::config_revision`]: `#[serde(default)]`, so an older

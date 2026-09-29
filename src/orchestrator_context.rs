@@ -422,16 +422,29 @@ pub fn compose_orchestrator_context(
 /// With a task, the closing instruction must NOT be "wait for instructions" —
 /// the instruction is already in the file, and telling the orchestrator to wait
 /// is what would leave a dispatched unit idle forever.
-fn orchestrator_prompt_line(has_task: bool) -> String {
+///
+/// `context_path` is the file this preparation published (issue #1233), named
+/// relative to the project directory as `.dot-agent-deck/<file>`. The line keeps
+/// the prefix `Read .dot-agent-deck/orchestrator-context` it has always had, and
+/// the path is the line's second whitespace-separated word, so it never needs
+/// quoting: the file name is [`CONTEXT_FILE_PREFIX`] plus hex digits.
+fn orchestrator_prompt_line(has_task: bool, context_path: &std::path::Path) -> String {
+    let file = context_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| CONTEXT_FILE_NAME.to_string());
+    let rel = format!("{CONTEXT_DIR_NAME}/{file}");
     if has_task {
-        "Read .dot-agent-deck/orchestrator-context.md for your role, the available agents, the \
-         delegation protocol, and your task under `## Your task`. Then carry out that task, \
-         delegating to the agents listed there."
-            .to_string()
+        format!(
+            "Read {rel} for your role, the available agents, the delegation protocol, and your \
+             task under `## Your task`. Then carry out that task, delegating to the agents listed \
+             there."
+        )
     } else {
-        "Read .dot-agent-deck/orchestrator-context.md for your role, available agents, and \
-         delegation protocol. Acknowledge your role and wait for instructions."
-            .to_string()
+        format!(
+            "Read {rel} for your role, available agents, and delegation protocol. Acknowledge \
+             your role and wait for instructions."
+        )
     }
 }
 
@@ -448,12 +461,35 @@ pub struct PreparedContext {
     /// and digesting whatever is there by then. PRD #819's audit fix — see
     /// [`crate::prep_token::PrepBinding::context_digest`].
     pub content: String,
-    /// The published file's inode identity, captured from the open temp-file
-    /// handle **before** the publishing `rename(2)`, which is the same inode the
-    /// destination then names. A later publish installs a different one, so this
-    /// value is what makes "still the artifact this preparation published"
-    /// checkable ([`crate::prep_token::PrepBinding::context_identity`]).
+    /// The published file's inode identity, captured from the handle that
+    /// created and wrote it — the value that makes "still the artifact this
+    /// preparation published" checkable
+    /// ([`crate::prep_token::PrepBinding::context_identity`]). While this value
+    /// is alive, [`PreparedContext::held`] keeps the inode allocated, so no
+    /// other file can be handed its number; after it is dropped the number is
+    /// reusable, which is why the spawn-time check pairs it with the digest
+    /// ([`crate::prep_token::InodeIdentity`]).
     pub context_identity: Option<crate::prep_token::InodeIdentity>,
+    /// The directory the file was published into, held open
+    /// ([`PublishedContext::dir`]).
+    pub dir: ContextDir,
+    /// The published file itself, held open ([`PublishedContext::held`]).
+    pub held: HeldContextFile,
+    /// [`PublishedContext::publish_seq`].
+    pub publish_seq: u64,
+}
+
+impl PreparedContext {
+    /// The published half, for [`withdraw_published_context`].
+    pub fn published(&self) -> PublishedContext {
+        PublishedContext {
+            path: self.context_path.clone(),
+            identity: self.context_identity,
+            dir: self.dir.clone(),
+            held: self.held.clone(),
+            publish_seq: self.publish_seq,
+        }
+    }
 }
 
 /// Compose the orchestrator context and publish it, reporting **why** on
@@ -469,9 +505,33 @@ pub struct PreparedContext {
 /// `None` reproduces the pre-#222 output byte-for-byte, which is what keeps the
 /// interactive `Ctrl+n` path unchanged.
 ///
+/// Issue #1233: the context goes to a file of its own
+/// ([`publish_orchestrator_context`]) and the returned prompt names that file;
+/// the fixed [`CONTEXT_FILE_NAME`] is then refreshed as a best-effort
+/// compatibility mirror ([`mirror_orchestrator_context`]), whose failure is
+/// logged and does not fail the preparation.
+///
 /// **Blocking.** Every async caller goes through
 /// [`crate::project_resolve::run_bounded`].
 pub fn prepare_orchestrator_context(
+    config: &OrchestrationConfig,
+    cwd: &std::path::Path,
+    task: Option<&str>,
+    attendance: Attendance,
+) -> Result<PreparedContext, ContextPublishError> {
+    let prepared = prepare_unmirrored_orchestrator_context(config, cwd, task, attendance)?;
+    mirror_into(&prepared.dir, prepared.publish_seq, &prepared.content);
+    Ok(prepared)
+}
+
+/// [`prepare_orchestrator_context`] without the compatibility mirror.
+///
+/// For a caller that still has a reason to withdraw the preparation after the
+/// publish — the daemon verb, whose deadline can expire between the publish and
+/// the reply (issue #1233 item 4). It calls [`mirror_orchestrator_context`]
+/// itself only for a preparation that committed to an answer, so a
+/// preparation refused as expired does not write the mirror.
+pub fn prepare_unmirrored_orchestrator_context(
     config: &OrchestrationConfig,
     cwd: &std::path::Path,
     task: Option<&str>,
@@ -487,11 +547,27 @@ pub fn prepare_orchestrator_context(
     let content = compose_orchestrator_context(config, task, attendance, main_worktree.as_deref());
     let published = publish_orchestrator_context(cwd, &content)?;
     Ok(PreparedContext {
+        prompt: orchestrator_prompt_line(task.is_some(), &published.path),
         context_path: published.path,
-        prompt: orchestrator_prompt_line(task.is_some()),
         context_identity: published.identity,
+        dir: published.dir,
+        held: published.held,
+        publish_seq: published.publish_seq,
         content,
     })
+}
+
+/// What the interactive publish ([`prepare_orchestrator_prompt`],
+/// [`reassert_orchestrator_prompt`]) hands back: the line to inject and the
+/// file it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedPrompt {
+    /// The one-liner to inject into the coordinator's PTY.
+    pub prompt: String,
+    /// The per-publish context file `prompt` names (issue #1233). A TUI tab
+    /// keeps it so its compaction or `/clear` re-arm reads the task back from
+    /// its own file rather than from the shared mirror.
+    pub context_path: std::path::PathBuf,
 }
 
 /// Write the orchestrator context to a file and return a one-liner to inject.
@@ -517,9 +593,12 @@ pub fn prepare_orchestrator_prompt(
     cwd: &str,
     task: Option<&str>,
     attendance: Attendance,
-) -> Option<String> {
+) -> Option<PublishedPrompt> {
     match prepare_orchestrator_context(config, std::path::Path::new(cwd), task, attendance) {
-        Ok(prepared) => Some(prepared.prompt),
+        Ok(prepared) => Some(PublishedPrompt {
+            prompt: prepared.prompt,
+            context_path: prepared.context_path,
+        }),
         Err(e) => {
             tracing::warn!(reason = %e, "could not publish the orchestrator context");
             None
@@ -557,10 +636,11 @@ const TASK_SECTION_MARKER: &str = "\n## Your task\n\n";
 /// one: a context file pruned before the re-arm, and a `prompt_template`
 /// containing the literal `## Your task` marker (which already misdirects the
 /// task read today).
-fn read_back_context(cwd: &str) -> (Option<String>, Attendance) {
-    let file_path = std::path::Path::new(cwd)
-        .join(CONTEXT_DIR_NAME)
-        .join(CONTEXT_FILE_NAME);
+///
+/// `file_path` is the context the re-arming tab was published with, or the
+/// compatibility mirror when the tab does not know its own (issue #1233; see
+/// [`reassert_orchestrator_prompt`]).
+fn read_back_context(file_path: &std::path::Path) -> (Option<String>, Attendance) {
     let Ok(content) = std::fs::read_to_string(file_path) else {
         return (None, Attendance::Attended);
     };
@@ -598,8 +678,31 @@ fn read_back_context(cwd: &str) -> (Option<String>, Attendance) {
 /// because the file already has it. Issue #703's [`Attendance`] rides back the
 /// same way, so a compaction does not quietly re-arm a dispatched coordinator
 /// with the attended text.
-pub fn reassert_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Option<String> {
-    let (task, attendance) = read_back_context(cwd);
+///
+/// **Issue #1233: the task is read back from the tab's OWN file.** `known` is
+/// the context this tab was last published with. Reading the shared fixed path
+/// instead would re-arm this orchestration with whatever task another
+/// preparation in the same project last left there. The re-arm then publishes a
+/// **new** file — published files are never rewritten — and returns its path,
+/// which the tab keeps in place of `known`. `None` covers a tab whose path is
+/// unknown (one re-hydrated after a reattach, or opened by a daemon-side
+/// launch); it falls back to the compatibility mirror, which is exactly the
+/// pre-#1233 behaviour and races as it did. Giving those tabs their path is
+/// follow-up #1395.
+pub fn reassert_orchestrator_prompt(
+    config: &OrchestrationConfig,
+    cwd: &str,
+    known: Option<&std::path::Path>,
+) -> Option<PublishedPrompt> {
+    let mirror;
+    let source = match known {
+        Some(path) => path,
+        None => {
+            mirror = context_dir_of(std::path::Path::new(cwd)).join(CONTEXT_FILE_NAME);
+            mirror.as_path()
+        }
+    };
+    let (task, attendance) = read_back_context(source);
     prepare_orchestrator_prompt(config, cwd, task.as_deref(), attendance)
 }
 
@@ -623,9 +726,29 @@ pub fn reassert_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> 
 /// The per-project directory the orchestrator context is published in.
 pub const CONTEXT_DIR_NAME: &str = ".dot-agent-deck";
 
-/// The file inside it. Matched by `read_back_context` and by every agent-facing
-/// instruction `build_orchestrator_context` emits.
+/// The fixed file inside it — since issue #1233 the **compatibility mirror**,
+/// not the live context.
+///
+/// Every publish writes its own `orchestrator-context-<32 hex>.md`
+/// ([`CONTEXT_FILE_PREFIX`], [`publish_orchestrator_context`]) and the
+/// coordinator prompt names that file. This name is then refreshed with the same
+/// bytes, best effort ([`mirror_orchestrator_context`]), for readers that
+/// predate #1233: an older TUI's compaction re-arm reads the task back from here,
+/// and so do role commands and templates that hard-code the path. So does this
+/// build's re-arm of a tab whose own path it does not know
+/// ([`reassert_orchestrator_prompt`] with `known: None`). Within one process
+/// it holds the latest publish mirrored into it — a mirror write never lands
+/// over a later publish's from the same process ([`mirror_into`]) — but the
+/// daemon, a TUI's `Ctrl+n` and `dispatch --orchestration` each mirror from
+/// their own process, and writes from two of them close together can leave it
+/// with either one's bytes. So those readers keep the old semantics, including
+/// the old race. No preparation binding covers it. Retiring it is
+/// follow-up #1395.
 pub const CONTEXT_FILE_NAME: &str = "orchestrator-context.md";
+
+/// The prefix of every per-publish context file (issue #1233):
+/// `orchestrator-context-<32 hex>.md`.
+pub const CONTEXT_FILE_PREFIX: &str = "orchestrator-context-";
 
 /// Upper bound on a composed orchestrator context this process will write.
 ///
@@ -668,7 +791,62 @@ pub struct PublishedContext {
     /// The published file's inode identity, or `None` where the platform has
     /// none. See [`crate::prep_token::InodeIdentity`].
     pub identity: Option<crate::prep_token::InodeIdentity>,
+    /// The directory it was published into, held open, so a withdrawal or a
+    /// mirror write reaches that directory rather than whatever the path names
+    /// later (issue #1233 audit).
+    pub dir: ContextDir,
+    /// The file the publish created, held open so its inode stays allocated for
+    /// as long as this value (or a clone) lives. That is what makes
+    /// [`withdraw_published_context`]'s identity check exact: an inode number is
+    /// reusable once its inode is freed — ext4 hands the number just freed to
+    /// the next file created, measured on this very test
+    /// (`a_withdrawn_context_is_removed_unless_the_name_was_taken_over`, which
+    /// removed a replacement file at the same name until this was held) — and a
+    /// held inode is never freed.
+    pub held: HeldContextFile,
+    /// This publish's place in this process's publish order
+    /// ([`next_publish_seq`]), which the compatibility mirror's ordering guard
+    /// compares ([`mirror_into`]).
+    pub publish_seq: u64,
 }
+
+/// An open handle on a published context file, kept only to pin its inode
+/// ([`PublishedContext::held`]). Nothing reads or writes through it.
+///
+/// Held on Unix only. Off Unix there is no identity to pin
+/// ([`crate::prep_token::inode_identity`] answers `None` there), and an open
+/// handle would only delay the removal of the name.
+///
+/// Compares equal to every other `HeldContextFile`, like [`ContextDir`]: it
+/// exists so the value types carrying it can stay comparable, not as an
+/// identity check.
+#[derive(Clone, Default)]
+pub struct HeldContextFile(Option<std::sync::Arc<std::fs::File>>);
+
+impl HeldContextFile {
+    fn new(file: std::fs::File) -> Self {
+        if cfg!(unix) {
+            Self(Some(std::sync::Arc::new(file)))
+        } else {
+            Self(None)
+        }
+    }
+}
+
+impl std::fmt::Debug for HeldContextFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldContextFile")
+            .field("held", &self.0.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for HeldContextFile {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for HeldContextFile {}
 
 /// Why an orchestrator context was not published.
 ///
@@ -717,11 +895,14 @@ pub enum ContextPublishError {
     /// [`publish_orchestrator_context`] for what this detects and what it does
     /// not prevent.
     ContextDirReplaced,
-    /// The owner-only temp file could not be created.
+    /// The owner-only context file could not be created (for the mirror, its
+    /// temp file).
     TempCreate(std::io::Error),
-    /// The bytes could not be written to the temp file.
+    /// The bytes could not be written to it.
     TempWrite(std::io::Error),
-    /// The rename that publishes the temp file over the destination failed.
+    /// The rename that installs the mirror's temp file over
+    /// [`CONTEXT_FILE_NAME`] failed. The per-publish file is not renamed, so
+    /// only [`mirror_orchestrator_context`] reaches this.
     Publish(std::io::Error),
 }
 
@@ -756,8 +937,8 @@ impl ContextPublishError {
             Self::ContextDirReplaced => format!(
                 "{CONTEXT_DIR_NAME} was replaced while the orchestrator context was being written"
             ),
-            Self::TempCreate(e) => format!("could not create the temporary context file: {e}"),
-            Self::TempWrite(e) => format!("could not write the temporary context file: {e}"),
+            Self::TempCreate(e) => format!("could not create the context file: {e}"),
+            Self::TempWrite(e) => format!("could not write the context file: {e}"),
             Self::Publish(e) => format!("could not publish the orchestrator context: {e}"),
         }
     }
@@ -1006,13 +1187,13 @@ fn open_context_dir(dir: &std::path::Path) -> Result<ContextDirGuard, ContextPub
 ///
 /// Compares device + inode from the **open handle's** `fstat` against a
 /// `symlink_metadata` of the path. This **detects** a `.dot-agent-deck`
-/// swapped between [`open_context_dir`] and the temp-file create; it does not
-/// **prevent** one. Preventing it needs `openat(2)` from the held descriptor,
-/// which `std` does not expose and which is not worth hand-rolling here: the
-/// swap requires write permission on the project directory, and anyone holding
-/// that can rewrite `.dot-agent-deck.toml` — whose `command` strings the daemon
-/// executes — which is strictly more authority than redirecting one markdown
-/// file. The check is cheap, so it is here; the claim is exactly that.
+/// swapped between [`open_context_dir`] and the write. Since the issue #1233
+/// audit the context and mirror writes themselves no longer depend on it —
+/// each of their creates, renames and removals goes through the held
+/// descriptor ([`ContextDir`]), so a swap cannot redirect one — and what this
+/// check still guards is the *announced*
+/// path: a publish whose directory no longer sits at the path the prompt names
+/// is refused rather than announced.
 #[cfg(unix)]
 fn context_dir_unchanged(guard: &ContextDirGuard, dir: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
@@ -1026,6 +1207,187 @@ fn context_dir_unchanged(guard: &ContextDirGuard, dir: &std::path::Path) -> bool
 fn context_dir_unchanged(_guard: &ContextDirGuard, _dir: &std::path::Path) -> bool {
     // No handle to compare against; see `open_context_dir`'s narrower guarantee.
     true
+}
+
+/// The `.dot-agent-deck` directory a publish checked, **held open**, and the
+/// handle the later creates, renames and removals of context and mirror files
+/// in it go through (issue #1233 audit). The retention sweep is the exception,
+/// below.
+///
+/// On Unix every operation is `*at(2)` relative to the descriptor
+/// [`open_context_dir`] opened with `O_NOFOLLOW | O_DIRECTORY` — `openat` with
+/// `O_CREAT | O_EXCL | O_NOFOLLOW`, `renameat`, `unlinkat`, `fstatat` with
+/// `AT_SYMLINK_NOFOLLOW` — and each takes a **single name**, never a path. So
+/// once the checks have passed, no mutating operation through this handle
+/// re-traverses the project pathname: a project renamed and replaced under a shared parent
+/// afterwards cannot redirect a create, the mirror's rename, a failure's
+/// cleanup or a withdrawal into another directory. Before the
+/// audit each of those joined a name onto the path again, after the identity
+/// check, which is exactly the window it named.
+///
+/// **What it does not anchor.** The descriptor itself is opened by pathname,
+/// so which `.dot-agent-deck` it is still depends on the project path at that
+/// moment; [`context_dir_unchanged`] then *detects* (does not prevent) the path
+/// moving before the write, and refuses rather than announcing a path that
+/// names another directory. The publish's housekeeping still works by path:
+/// the retention sweep ([`sweep_coordination_files`]) and the clone-local git
+/// exclude ([`ensure_git_excludes_context_dir`]). Off Unix the handle is the
+/// path and every operation is a path operation — the narrower guarantee
+/// [`open_context_dir`] states, and the reason the daemon verb is refused
+/// there.
+#[derive(Clone)]
+pub struct ContextDir {
+    path: std::path::PathBuf,
+    guard: std::sync::Arc<ContextDirGuard>,
+}
+
+impl std::fmt::Debug for ContextDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextDir")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Equal when they name the same directory path. The descriptors are not
+/// compared: this exists so the value types carrying a handle can stay
+/// comparable, not as an identity check.
+impl PartialEq for ContextDir {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+impl Eq for ContextDir {}
+
+/// `name` as one path component, or `InvalidInput`: every `*at` call below is
+/// meant to act on an entry of the held directory and nothing else.
+#[cfg(unix)]
+fn single_component(name: &str) -> std::io::Result<std::ffi::CString> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    std::ffi::CString::new(name).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+}
+
+impl ContextDir {
+    /// The directory's pathname — what a published file's path is built from
+    /// and what the prompt names. Not what any operation below resolves.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Whether the pathname still names the held directory
+    /// ([`context_dir_unchanged`]).
+    fn unchanged(&self) -> bool {
+        context_dir_unchanged(&self.guard, &self.path)
+    }
+
+    /// Create `name` in the held directory owner-only, refusing an existing
+    /// entry and never following a symlink. The mode is an argument to
+    /// `openat(2)`, so the file is `0o600` from the instant it exists.
+    #[cfg(unix)]
+    fn create_new(&self, name: &str) -> std::io::Result<std::fs::File> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let name = single_component(name)?;
+        // SAFETY: `guard` is an open directory descriptor for the duration of
+        // the call and `name` is a NUL-terminated single component. The mode is
+        // passed as the promoted `c_uint` the variadic `openat` reads.
+        let fd = unsafe {
+            libc::openat(
+                self.guard.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `openat` just returned this descriptor and nothing else owns it.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    #[cfg(not(unix))]
+    fn create_new(&self, name: &str) -> std::io::Result<std::fs::File> {
+        create_owner_only_file(&self.path.join(name))
+    }
+
+    /// Rename `from` over `to`, both entries of the held directory.
+    #[cfg(unix)]
+    fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let (from, to) = (single_component(from)?, single_component(to)?);
+        let fd = self.guard.as_raw_fd();
+        // SAFETY: one open directory descriptor, two NUL-terminated components.
+        if unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        std::fs::rename(self.path.join(from), self.path.join(to))
+    }
+
+    /// Remove the entry `name` of the held directory. Not a directory: without
+    /// `AT_REMOVEDIR`, `unlinkat` refuses one. A symlink is removed, never
+    /// followed.
+    #[cfg(unix)]
+    fn unlink(&self, name: &str) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let name = single_component(name)?;
+        // SAFETY: an open directory descriptor and a NUL-terminated component.
+        if unsafe { libc::unlinkat(self.guard.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn unlink(&self, name: &str) -> std::io::Result<()> {
+        std::fs::remove_file(self.path.join(name))
+    }
+
+    /// The inode identity of the entry `name` itself (a symlink is not
+    /// followed), or `None` when there is none.
+    #[cfg(unix)]
+    fn identity_of(&self, name: &str) -> Option<crate::prep_token::InodeIdentity> {
+        use std::os::fd::AsRawFd as _;
+        let name = single_component(name).ok()?;
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `st` is written by a successful `fstatat` and read only then.
+        let rc = unsafe {
+            libc::fstatat(
+                self.guard.as_raw_fd(),
+                name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        // SAFETY: `fstatat` returned 0, so it filled `st`.
+        let st = unsafe { st.assume_init() };
+        // The same widening `MetadataExt::{dev, ino}` apply, so this compares
+        // equal to `prep_token::inode_identity` of the same file.
+        #[allow(clippy::unnecessary_cast)]
+        Some(crate::prep_token::InodeIdentity {
+            dev: st.st_dev as u64,
+            ino: st.st_ino as u64,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn identity_of(&self, name: &str) -> Option<crate::prep_token::InodeIdentity> {
+        std::fs::symlink_metadata(self.path.join(name))
+            .ok()
+            .as_ref()
+            .and_then(crate::prep_token::inode_identity)
+    }
 }
 
 /// Do not publish into a `.dot-agent-deck` that grants **write** to group or
@@ -1215,14 +1577,14 @@ pub(crate) fn repair_context_dir_mode(
     Ok(())
 }
 
-/// A temp-file name unique within one directory, for one publish.
+/// A temp-file name unique within one directory, for one mirror write.
 ///
-/// Process id plus a monotonically increasing counter: two publishes in one
+/// Process id plus a monotonically increasing counter: two writes in one
 /// process cannot collide, and two processes cannot either. It is only ever
 /// half of the guarantee — the create is `create_new`, so a collision fails
 /// loudly rather than clobbering — and it is hidden and suffixed so it can never
-/// be mistaken for an orchestrator context by [`read_back_context`], which reads
-/// exactly [`CONTEXT_FILE_NAME`].
+/// be mistaken for an orchestrator context by [`read_back_context`] or by
+/// [`is_sweepable_coordination_name`]'s per-publish rule.
 fn temp_context_file_name() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1233,11 +1595,97 @@ fn temp_context_file_name() -> String {
     )
 }
 
-/// Publish `content` at `<project_dir>/.dot-agent-deck/orchestrator-context.md`,
-/// atomically and owner-only, and answer with the path written.
+/// A fresh per-publish context file name: [`CONTEXT_FILE_PREFIX`], 128 random
+/// bits as hex, `.md` (issue #1233).
+fn unique_context_file_name() -> String {
+    format!(
+        "{CONTEXT_FILE_PREFIX}{}.md",
+        crate::prep_token::random_hex128()
+    )
+}
+
+/// Create `path`, refusing an existing entry — the non-Unix arm of
+/// [`ContextDir::create_new`], which on Unix creates the file `0o600` with
+/// `O_NOFOLLOW` relative to the held directory instead. No mode or DACL is
+/// applied here; see [`open_context_dir`]'s narrower guarantee.
+#[cfg(not(unix))]
+fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Every check a write into `.dot-agent-deck` makes before it creates anything:
+/// the size bound, the owner-only directory creation, the symlink-refusing open
+/// and the group/other-write repair. Answers the directory, held open, that
+/// every later operation goes through ([`ContextDir`]).
+fn open_publish_dir(
+    project_dir: &std::path::Path,
+    content: &str,
+) -> Result<ContextDir, ContextPublishError> {
+    if content.len() > MAX_CONTEXT_BYTES {
+        return Err(ContextPublishError::ContextTooLarge(content.len()));
+    }
+    let dir = project_dir.join(CONTEXT_DIR_NAME);
+    create_context_dir(&dir)?;
+    let guard = open_context_dir(&dir)?;
+    // Before anything is created inside it: an existing directory that group or
+    // other can write has those bits cleared on the descriptor we hold, and is
+    // refused only if that fails — because a 0600 file's directory entry is only
+    // as protected as the directory holding it.
+    ensure_context_dir_owner_writable_only(&guard)?;
+    Ok(ContextDir {
+        path: dir,
+        guard: std::sync::Arc::new(guard),
+    })
+}
+
+/// Write `content` into the freshly created `file`, after confirming the
+/// directory's pathname still names the held directory, and answer the file's
+/// identity taken from the open handle.
 ///
-/// Five properties, each of which the `create_dir_all` + `std::fs::write` pair
-/// it replaced lacked:
+/// The file itself was created relative to the held descriptor, so the check is
+/// not what keeps the bytes in the right directory — it is what keeps this from
+/// announcing a path (the prompt names `.dot-agent-deck/<name>` under the
+/// project) that by now names a different one.
+fn write_context_file(
+    file: &mut std::fs::File,
+    dir: &ContextDir,
+    content: &str,
+) -> Result<Option<crate::prep_token::InodeIdentity>, ContextPublishError> {
+    if !dir.unchanged() {
+        return Err(ContextPublishError::ContextDirReplaced);
+    }
+    use std::io::Write as _;
+    file.write_all(content.as_bytes())
+        .map_err(ContextPublishError::TempWrite)?;
+    file.flush().map_err(ContextPublishError::TempWrite)?;
+    // The identity is taken from the OPEN HANDLE, not from a later `stat` of the
+    // name: a `stat` afterwards would report whichever inode happens to be at
+    // that name by then, which is exactly what this value exists to detect.
+    Ok(file
+        .metadata()
+        .ok()
+        .as_ref()
+        .and_then(crate::prep_token::inode_identity))
+}
+
+/// Publish `content` at a fresh
+/// `<project_dir>/.dot-agent-deck/orchestrator-context-<32 hex>.md`, owner-only,
+/// and answer with the path written.
+///
+/// **One file per publish, never rewritten (issue #1233).** Until #1233 every
+/// publish renamed over one fixed `orchestrator-context.md`, so a second
+/// preparation in the same project replaced the context a first coordinator had
+/// been pointed at but had not read yet. The per-preparation binding caught that
+/// up to the last role's start and not after it. Now each publish has its own
+/// name, the prompt names it ([`orchestrator_prompt_line`]), and no later publish
+/// touches it. [`mirror_orchestrator_context`] keeps the fixed name for older
+/// readers; this function does not write it.
+///
+/// Properties, each of which the `create_dir_all` + `std::fs::write` pair the
+/// PRD #819 publish replaced lacked:
 ///
 /// * **Bounded.** The composed context is checked against
 ///   [`MAX_CONTEXT_BYTES`] before a filesystem is touched, and refused rather
@@ -1258,111 +1706,336 @@ fn temp_context_file_name() -> String {
 ///   arm; the non-Unix arm applies no mode or DACL at all, which is why the
 ///   daemon verb is refused there rather than claiming otherwise (see
 ///   [`open_context_dir`]).
+/// * **Nothing existing is written through or over.** The open is
+///   `create_new` (`O_CREAT | O_EXCL`) with `O_NOFOLLOW`, so an entry already at
+///   the name — a file, a symlink planted there — fails the publish rather than
+///   being followed or truncated.
+/// * **No reader sees a partial file.** No rename is needed for that: the name
+///   is fresh and is announced only once this returns, so nothing is pointed at
+///   the file before its last byte is written. This is not **durability**: no
+///   `fsync` is issued. Publishing an orchestrator context is worth-redoing work,
+///   not a ledger.
 /// * **Tidied.** After a successful publish, `.dot-agent-deck/` is added to the
 ///   clone-local `.git/info/exclude` and coordination files past the retention
 ///   window are removed (issue #329 §§2-3) — the two halves of treating this
 ///   directory as the app's own working state rather than as project content.
 ///   Both are best-effort housekeeping that cannot fail the publish; see
 ///   [`ensure_git_excludes_context_dir`] and [`sweep_coordination_files`].
-/// * **Atomic with respect to a reader.** The bytes go to a `create_new`
-///   temp file in the SAME directory and reach the destination by `rename(2)`,
-///   so a concurrent reader sees either the previous context or the new one and
-///   never a prefix of the new one. This is atomicity, **not durability**: no
-///   `fsync` is issued, so a machine that loses power immediately afterwards may
-///   come back to either version. Publishing an orchestrator context is
-///   worth-redoing work, not a ledger.
-/// * **A destination symlink is replaced, not followed.** `rename(2)` operates
-///   on the directory entry, so a `orchestrator-context.md` that is a symlink to
-///   `/etc/passwd` is *unlinked* and replaced by the new regular file; nothing is
-///   written through it. This is the one property that comes free from choosing
-///   rename over write, and it is the reason the choice is not merely about
-///   atomicity.
 ///
-/// A failure leaves the previous context — if any — exactly as it was, and
-/// removes the temp file. That, not the absence of a partially written
-/// destination alone, is what "a partial write must never be observable as a
-/// orchestrator context" means.
+/// A failure removes the file it created, if it created one, and leaves every
+/// other file in the directory exactly as it was.
 ///
 /// **Blocking.** Async callers go through [`crate::project_resolve::run_bounded`].
 pub fn publish_orchestrator_context(
     project_dir: &std::path::Path,
     content: &str,
 ) -> Result<PublishedContext, ContextPublishError> {
-    if content.len() > MAX_CONTEXT_BYTES {
-        return Err(ContextPublishError::ContextTooLarge(content.len()));
-    }
+    let dir = open_publish_dir(project_dir, content)?;
+    let name = unique_context_file_name();
+    let final_path = dir.path().join(&name);
+    let publish_seq = next_publish_seq();
 
-    let dir = project_dir.join(CONTEXT_DIR_NAME);
-    create_context_dir(&dir)?;
-    let guard = open_context_dir(&dir)?;
-    // Before anything is created inside it: an existing directory that group or
-    // other can write has those bits cleared on the descriptor we hold, and is
-    // refused only if that fails — because a 0600 file's directory entry is only
-    // as protected as the directory holding it.
-    ensure_context_dir_owner_writable_only(&guard)?;
-
-    let final_path = dir.join(CONTEXT_FILE_NAME);
-    let temp_path = dir.join(temp_context_file_name());
-
+    let mut created = false;
     let outcome = (|| {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            // The mode is an argument to `open(2)`, so the file is 0600 from the
-            // instant it exists. `O_NOFOLLOW` costs nothing next to
-            // `create_new` and states the intent at the same seam the directory
-            // open states it.
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = options
-            .open(&temp_path)
+        let mut file = dir
+            .create_new(&name)
             .map_err(ContextPublishError::TempCreate)?;
-
-        if !context_dir_unchanged(&guard, &dir) {
-            return Err(ContextPublishError::ContextDirReplaced);
-        }
-
-        use std::io::Write as _;
-        file.write_all(content.as_bytes())
-            .map_err(ContextPublishError::TempWrite)?;
-        file.flush().map_err(ContextPublishError::TempWrite)?;
-        // The identity is taken from the OPEN HANDLE, before the rename. That is
-        // not a convenience: `rename(2)` moves this inode onto the destination
-        // name, so the handle's `(dev, ino)` IS the published file's, whereas a
-        // `stat` of the destination afterwards would report whichever inode
-        // happens to be there — including a *later* publish's, which is exactly
-        // the interleaving this value exists to detect.
-        let identity = file
-            .metadata()
-            .ok()
-            .as_ref()
-            .and_then(crate::prep_token::inode_identity);
-        drop(file);
-
-        std::fs::rename(&temp_path, &final_path).map_err(ContextPublishError::Publish)?;
-        Ok(identity)
+        created = true;
+        let identity = write_context_file(&mut file, &dir, content)?;
+        Ok((identity, file))
     })();
 
     match outcome {
-        Ok(identity) => {
-            tidy_context_dir(project_dir, &dir);
+        Ok((identity, file)) => {
+            tidy_context_dir(project_dir, dir.path());
             Ok(PublishedContext {
                 path: final_path,
                 identity,
+                dir,
+                held: HeldContextFile::new(file),
+                publish_seq,
             })
         }
         Err(e) => {
             // Best effort, and deliberately not reported: the publish already
-            // failed for a reason the caller is about to be told, and a leftover
-            // temp file is not that reason. `TempCreate` is the one case where
-            // there is nothing to remove, and removing a path that is not there
-            // is a no-op.
-            let _ = std::fs::remove_file(&temp_path);
+            // failed for a reason the caller is about to be told. Only a file
+            // this call created is removed — the name is fresh, so that is the
+            // only thing it can name — and it is removed from the held
+            // directory, not from whatever the path names by now.
+            if created {
+                let _ = dir.unlink(&name);
+            }
             Err(e)
         }
     }
+}
+
+/// Withdraw a context [`publish_orchestrator_context`] published but whose
+/// preparation will not be answered (issue #1233 item 4's expired deadline).
+///
+/// Removes the published file from the directory it was published into —
+/// through the held [`ContextDir`], not by re-resolving `published.path` — and
+/// skips it when that entry no longer holds the inode the publish created: a
+/// file some other party put there since is left alone. The comparison is by
+/// `(dev, ino)`, and it can tell a replacement apart only because
+/// [`PublishedContext::held`] keeps the published inode allocated: a
+/// replacement created after ours was unlinked would otherwise be free to
+/// receive our freed number. (The check and the removal are still two
+/// operations on one held directory, so this narrows rather than closes that
+/// case; the name is fresh and unannounced, so nothing but a guess can have
+/// put anything there.)
+/// Best effort: a failure is logged, and the file is then an ordinary leftover
+/// that [`sweep_coordination_files`] removes once it ages out of the window.
+pub fn withdraw_published_context(published: &PublishedContext) {
+    let Some(name) = published.path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let still_ours = published
+        .dir
+        .identity_of(name)
+        .is_some_and(|now| Some(now) == published.identity);
+    if !still_ours && published.identity.is_some() {
+        return;
+    }
+    if let Err(e) = published.dir.unlink(name)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %published.path.display(),
+            error = %e,
+            "could not withdraw an orchestrator context whose preparation expired"
+        );
+    }
+}
+
+/// Refresh the fixed [`CONTEXT_FILE_NAME`] with `content`, **best effort**
+/// (issue #1233's compatibility mirror).
+///
+/// Called after a successful [`publish_orchestrator_context`], with the same
+/// bytes. A failure logs a `warn!` and is not returned: the launch's own
+/// coordinator is pointed at its own file, not at the mirror, so it is no
+/// reason to fail a launch whose own file is already published — though a
+/// reader of the mirror, this build's re-arm of a tab whose path it does not
+/// know included, then gets an older publish's task. See [`CONTEXT_FILE_NAME`] for who still reads it.
+///
+/// **Blocking.** Async callers go through [`crate::project_resolve::run_bounded`].
+pub fn mirror_orchestrator_context(project_dir: &std::path::Path, content: &str) {
+    let publish_seq = next_publish_seq();
+    match open_publish_dir(project_dir, content) {
+        Ok(dir) => mirror_into(&dir, publish_seq, content),
+        Err(e) => tracing::warn!(
+            project = %project_dir.display(),
+            reason = %e,
+            "could not refresh the {CONTEXT_FILE_NAME} compatibility mirror"
+        ),
+    }
+}
+
+/// [`mirror_orchestrator_context`] into a directory a publish already holds
+/// open — the one its own per-publish file went into — rather than resolving
+/// the project path again (issue #1233 audit).
+///
+/// `publish_seq` is the publish this mirror write belongs to
+/// ([`PublishedContext::publish_seq`]). **Within one process, a mirror write
+/// never lands over a later publish's** (PR #1407 review): the daemon answers a
+/// preparation first and writes its mirror afterwards, on a blocking thread of
+/// its own, so two preparations in one project can finish their mirror writes
+/// in the opposite order to their publishes. [`write_mirror`] therefore checks
+/// `publish_seq` against the last one mirrored into the same directory, under
+/// that directory's lock, immediately before the rename, and discards a write
+/// that has been overtaken.
+///
+/// **Writers in other processes are not ordered by this** — the TUI's
+/// `Ctrl+n` and `dispatch --orchestration` each publish and mirror in their own
+/// process, and a daemon and a TUI in the same project can still leave the
+/// mirror holding whichever of their writes renamed last. What is ordered is
+/// the daemon's own preparations, which are the writes that can run after
+/// their reply.
+pub fn mirror_into(dir: &ContextDir, publish_seq: u64, content: &str) {
+    match write_mirror(dir, publish_seq, content) {
+        Ok(MirrorWrite::Written) => {}
+        Ok(MirrorWrite::Overtaken) => tracing::debug!(
+            dir = %dir.path().display(),
+            "skipped a {CONTEXT_FILE_NAME} compatibility-mirror write a later publish \
+             had already overtaken"
+        ),
+        Err(e) => tracing::warn!(
+            dir = %dir.path().display(),
+            reason = %e,
+            "could not refresh the {CONTEXT_FILE_NAME} compatibility mirror"
+        ),
+    }
+}
+
+/// What [`write_mirror`] did with a write that raised no error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MirrorWrite {
+    /// The mirror now holds this write's bytes.
+    Written,
+    /// A later publish's mirror write had already landed in this directory, so
+    /// this one was discarded and the mirror left as it was.
+    Overtaken,
+}
+
+/// The next value of this process's publish order, starting at 1.
+///
+/// One counter for every project: the order only has to be monotonic within a
+/// directory, and a single counter is monotonic everywhere. Assigned when the
+/// per-publish file is created, so it orders publishes rather than mirror
+/// writes, which is the order the mirror must follow.
+fn next_publish_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Which directory a mirror write lands in, for the ordering guard: the held
+/// directory's inode identity where the platform has one, its path otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum MirrorDirKey {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Identity(crate::prep_token::InodeIdentity),
+    Path(std::path::PathBuf),
+}
+
+impl ContextDir {
+    fn mirror_key(&self) -> MirrorDirKey {
+        #[cfg(unix)]
+        if let Some(identity) = self
+            .guard
+            .metadata()
+            .ok()
+            .as_ref()
+            .and_then(crate::prep_token::inode_identity)
+        {
+            return MirrorDirKey::Identity(identity);
+        }
+        MirrorDirKey::Path(self.path.clone())
+    }
+}
+
+/// The last publish mirrored into each directory this process has mirrored
+/// into, one lock per directory so a stalled rename in one project does not
+/// hold up another's.
+///
+/// Grows by one small entry per directory for the life of the process, and is
+/// never pruned: an entry is what keeps an overtaken write from landing, so
+/// dropping one would reopen the race for that directory. A daemon mirrors
+/// into as many directories as it prepares orchestrations in.
+///
+/// An inode number reused by a `.dot-agent-deck` deleted and recreated
+/// inherits the old directory's entry. That is harmless: the counter is
+/// process-wide, so every publish after the recreation has a higher number
+/// than anything recorded before it.
+fn mirror_order_slot(key: MirrorDirKey) -> std::sync::Arc<std::sync::Mutex<u64>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static SLOTS: OnceLock<Mutex<HashMap<MirrorDirKey, Arc<Mutex<u64>>>>> = OnceLock::new();
+    let mut slots = SLOTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    Arc::clone(slots.entry(key).or_default())
+}
+
+/// A preparation's compatibility-mirror write, held back until the
+/// preparation is certain to be answered (issue #1233 audit).
+///
+/// The daemon verb answers its client first and runs this afterwards on the
+/// same blocking thread, so a slow or stalled mirror write can neither delay
+/// the reply past the deadline nor happen for a preparation that was answered
+/// as expired — one that is withdrawn never produces a `PendingMirror`.
+///
+/// **The cost of that order, accepted rather than fixed** (Qodo finding on PR
+/// #1407): a reader of the fixed `orchestrator-context.md` that acts the
+/// moment the reply arrives can still read the **previous** mirror until this
+/// write lands, and keeps it if the write fails. The coordinator prompt the
+/// reply carries does not read it: it names the per-preparation file this
+/// preparation published before answering. The mirror serves only
+/// compatibility readers — a pre-#1233 TUI's compaction re-arm, a TUI tab
+/// hydrated from the daemon's records without a path (#1395), and role
+/// commands or templates that hard-code the fixed path.
+#[derive(Debug)]
+pub struct PendingMirror {
+    dir: ContextDir,
+    publish_seq: u64,
+    content: String,
+}
+
+impl PendingMirror {
+    /// Hold `content`, published as `publish_seq`, back for `dir`.
+    pub fn new(dir: ContextDir, publish_seq: u64, content: String) -> Self {
+        Self {
+            dir,
+            publish_seq,
+            content,
+        }
+    }
+
+    /// Write it, best effort and never over a later publish's mirror
+    /// ([`mirror_into`]).
+    pub fn write(self) {
+        mirror_into(&self.dir, self.publish_seq, &self.content);
+    }
+}
+
+/// The mirror write itself: the fixed-name publish every deck performed before
+/// issue #1233, unchanged.
+///
+/// * **Atomic with respect to a reader.** The bytes go to a `create_new` temp
+///   file in the SAME directory and reach the destination by `rename(2)`, so a
+///   concurrent reader sees either the previous mirror or the new one and never
+///   a prefix of the new one.
+/// * **A destination symlink is replaced, not followed.** `rename(2)` operates
+///   on the directory entry, so a `orchestrator-context.md` that is a symlink to
+///   `/etc/passwd` is *unlinked* and replaced by the new regular file; nothing is
+///   written through it.
+/// * The same size, symlink-directory, owner-only and group-write checks as
+///   [`publish_orchestrator_context`], through [`open_publish_dir`].
+///
+/// * **Never over a later publish's mirror in this process.** The bytes are
+///   written to the temp file outside any lock; only the comparison of
+///   `publish_seq` against the directory's last mirrored publish and the
+///   rename run under the directory's lock ([`mirror_into`] has the scope).
+///
+/// A failure, or a write that was overtaken, leaves the previous mirror — if
+/// any — exactly as it was, and removes the temp file.
+fn write_mirror(
+    dir: &ContextDir,
+    publish_seq: u64,
+    content: &str,
+) -> Result<MirrorWrite, ContextPublishError> {
+    // Re-applied rather than inherited from the publish that opened `dir`: the
+    // mirror may run after the reply, and the directory's mode can have been
+    // widened since.
+    if content.len() > MAX_CONTEXT_BYTES {
+        return Err(ContextPublishError::ContextTooLarge(content.len()));
+    }
+    ensure_context_dir_owner_writable_only(&dir.guard)?;
+    let temp_name = temp_context_file_name();
+
+    let outcome = (|| {
+        let mut file = dir
+            .create_new(&temp_name)
+            .map_err(ContextPublishError::TempCreate)?;
+        write_context_file(&mut file, dir, content)?;
+        drop(file);
+        let slot = mirror_order_slot(dir.mirror_key());
+        let mut last = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if publish_seq < *last {
+            return Ok(MirrorWrite::Overtaken);
+        }
+        dir.rename(&temp_name, CONTEXT_FILE_NAME)
+            .map_err(ContextPublishError::Publish)?;
+        *last = publish_seq;
+        Ok(MirrorWrite::Written)
+    })();
+    if !matches!(outcome, Ok(MirrorWrite::Written)) {
+        // `TempCreate` is the one case where there is nothing to remove, and
+        // removing a name that is not there is a no-op.
+        let _ = dir.unlink(&temp_name);
+    }
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -1640,13 +2313,22 @@ pub struct SweepReport {
 ///   `work-done-<role>.md`. These are what #329 §3 observed accumulating
 ///   indefinitely: the role-keyed ones are overwritten in place, but the
 ///   slug-keyed ones the protocol tells a coordinator to invent are not.
-/// * this publish's own leftover temp files, `.orchestrator-context.md.<pid>.<seq>.tmp`,
-///   which are removed on a failed publish but survive a process killed between
-///   the create and the rename.
+///   It also covers the per-publish orchestrator contexts,
+///   `orchestrator-context-<32 hex>.md` (issue #1233). Each is written once and
+///   never refreshed, so one whose mtime is past the window belongs to a
+///   preparation that was abandoned, rolled back or finished long ago. The
+///   residual, stated: a coordinator that re-reads its own file on its own
+///   initiative more than the window after its last publish, with no re-arm in
+///   between (a re-arm publishes a fresh file), finds it gone. It then reads
+///   nothing rather than something wrong. Deleting them when the orchestration
+///   ends is follow-up #1395.
+/// * the mirror's own leftover temp files, `.orchestrator-context.md.<pid>.<seq>.tmp`,
+///   which are removed on a failed mirror write but survive a process killed
+///   between the create and the rename.
 ///
-/// [`CONTEXT_FILE_NAME`] is excluded by name: it is the live orchestrator context,
-/// republished rather than accumulated, and an orchestration reads it long after
-/// its mtime stops moving.
+/// [`CONTEXT_FILE_NAME`] is excluded by name: it is the compatibility mirror,
+/// refreshed in place rather than accumulated, and a reader that predates
+/// #1233 reads it long after its mtime stops moving.
 ///
 /// Every other dotfile is excluded, which is what keeps the sweep out of
 /// anything a user or another tool parks there under a leading dot, and nothing
@@ -2113,7 +2795,8 @@ mod tests {
             Some("Verify PR #232 and report."),
             Attendance::Unattended,
         )
-        .expect("context file written");
+        .expect("context file written")
+        .prompt;
         assert!(
             !line.contains('\n'),
             "the injected prompt must be ONE line: {line:?}"
@@ -2143,7 +2826,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path().to_string_lossy().to_string();
         let line = prepare_orchestrator_prompt(&config(), &cwd, None, Attendance::Attended)
-            .expect("written");
+            .expect("written")
+            .prompt;
         assert!(line.contains("Acknowledge your role and wait for instructions."));
         let written =
             std::fs::read_to_string(tmp.path().join(".dot-agent-deck/orchestrator-context.md"))
@@ -2164,7 +2848,8 @@ mod tests {
         let cwd = tmp.path().to_string_lossy().to_string();
         for blank in [Some(""), Some("   \n  ")] {
             let line = prepare_orchestrator_prompt(&config(), &cwd, blank, Attendance::Unattended)
-                .expect("written");
+                .expect("written")
+                .prompt;
             assert!(line.contains("wait for instructions"), "got {line:?}");
             let written =
                 std::fs::read_to_string(tmp.path().join(".dot-agent-deck/orchestrator-context.md"))
@@ -2195,7 +2880,9 @@ mod tests {
         )
         .expect("spawn-time write");
 
-        let line = reassert_orchestrator_prompt(&config(), &cwd).expect("re-assertion written");
+        let line = reassert_orchestrator_prompt(&config(), &cwd, None)
+            .expect("re-assertion written")
+            .prompt;
         assert!(
             line.contains("carry out that task"),
             "a re-assertion that found an existing task must still direct action, got {line:?}"
@@ -2225,7 +2912,9 @@ mod tests {
         prepare_orchestrator_prompt(&config(), &cwd, None, Attendance::Attended)
             .expect("spawn-time write");
 
-        let line = reassert_orchestrator_prompt(&config(), &cwd).expect("re-assertion written");
+        let line = reassert_orchestrator_prompt(&config(), &cwd, None)
+            .expect("re-assertion written")
+            .prompt;
         assert!(line.contains("wait for instructions"), "got {line:?}");
 
         let written =
@@ -2245,8 +2934,221 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path().to_string_lossy().to_string();
 
-        let line = reassert_orchestrator_prompt(&config(), &cwd).expect("written from scratch");
+        let line = reassert_orchestrator_prompt(&config(), &cwd, None)
+            .expect("written from scratch")
+            .prompt;
         assert!(line.contains("wait for instructions"), "got {line:?}");
+    }
+
+    /// Issue #1233: the prompt line names the file this publish wrote, by its
+    /// path relative to the project, as its second word — the word a
+    /// coordinator (and `tests/prep_binding.rs`) resolves against the project.
+    #[test]
+    fn the_prompt_line_names_the_published_relative_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        for task in [None, Some("Verify PR #232 and report.")] {
+            let published =
+                prepare_orchestrator_prompt(&config(), &cwd, task, Attendance::Attended)
+                    .expect("written");
+            let rel = published
+                .prompt
+                .split_whitespace()
+                .nth(1)
+                .expect("the line names a file");
+            assert_eq!(tmp.path().join(rel), published.context_path);
+            assert!(
+                published
+                    .prompt
+                    .starts_with("Read .dot-agent-deck/orchestrator-context-"),
+                "got {:?}",
+                published.prompt
+            );
+            let name = published
+                .context_path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let id = name
+                .strip_prefix(CONTEXT_FILE_PREFIX)
+                .and_then(|n| n.strip_suffix(".md"))
+                .expect("a per-publish name");
+            assert_eq!(id.len(), 32);
+            assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+    }
+
+    /// Issue #1233: a re-arm that knows its tab's own file reads the task back
+    /// from THAT file, not from the shared mirror another preparation in the
+    /// same project last refreshed. It publishes a new file, and leaves the one
+    /// it read untouched (the caller removes it).
+    #[test]
+    fn reassert_with_a_known_path_reads_its_own_task_and_not_the_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let a = prepare_orchestrator_prompt(
+            &config(),
+            &cwd,
+            Some("TASK-ALPHA"),
+            Attendance::Unattended,
+        )
+        .expect("A published");
+        // A second preparation in the same project leaves its task in the mirror.
+        prepare_orchestrator_prompt(&config(), &cwd, Some("TASK-BRAVO"), Attendance::Attended)
+            .expect("B published");
+        assert!(
+            published(&cwd).contains("TASK-BRAVO"),
+            "the premise: the mirror is B's"
+        );
+
+        let rearmed =
+            reassert_orchestrator_prompt(&config(), &cwd, Some(&a.context_path)).expect("re-armed");
+        assert_ne!(
+            rearmed.context_path, a.context_path,
+            "a re-arm publishes a new file"
+        );
+        let c = std::fs::read_to_string(&rearmed.context_path).expect("read the re-armed context");
+        assert!(
+            c.contains("TASK-ALPHA"),
+            "A's task must survive A's re-arm:\n{c}"
+        );
+        assert!(
+            !c.contains("TASK-BRAVO"),
+            "B's task must not leak into A's re-arm:\n{c}"
+        );
+        assert!(
+            c.contains(UNATTENDED_SECTION_HEADING),
+            "A's attendance rides back from A's file too"
+        );
+        assert!(rearmed.prompt.contains("carry out that task"));
+        assert!(
+            a.context_path.is_file(),
+            "the re-arm does not delete the file it read, and neither does the tab (PR #1407 review)"
+        );
+    }
+
+    /// Issue #1233 item 4's withdrawal removes the file it published, and
+    /// leaves one some other party put at that name alone.
+    ///
+    /// The replacement is created right after ours is unlinked, which on ext4
+    /// hands it our freed inode number — so this fails on a disk-backed
+    /// `TMPDIR` (the CI runners') unless the publish keeps its inode pinned
+    /// ([`PublishedContext::held`]). A tmpfs never reuses the number, which is
+    /// how it passed on a tmpfs `/tmp` and failed only in CI.
+    #[cfg(unix)]
+    #[test]
+    fn a_withdrawn_context_is_removed_unless_the_name_was_taken_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let published = publish_orchestrator_context(tmp.path(), "expired").expect("published");
+        withdraw_published_context(&published);
+        assert!(!published.path.exists(), "the withdrawn file is gone");
+
+        let published = publish_orchestrator_context(tmp.path(), "expired").expect("published");
+        std::fs::remove_file(&published.path).unwrap();
+        std::fs::write(&published.path, "someone else's").unwrap();
+        withdraw_published_context(&published);
+        assert_eq!(
+            std::fs::read_to_string(&published.path).unwrap(),
+            "someone else's",
+            "a different inode at the name is not ours to remove"
+        );
+    }
+
+    /// Issue #1233 audit: every operation after the publish's checks goes
+    /// through the held `.dot-agent-deck` descriptor, so a project renamed and
+    /// replaced afterwards cannot redirect it. The withdrawal removes the file
+    /// from the directory it was published into — now under the moved name —
+    /// and leaves a same-named file in the replacement alone; and the mirror is
+    /// not written into the replacement.
+    #[cfg(unix)]
+    #[test]
+    fn publish_follow_ups_act_on_the_held_directory_not_the_replaced_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("p");
+        std::fs::create_dir(&project).unwrap();
+        let published = publish_orchestrator_context(&project, "mine").expect("published");
+        let name = published.path.file_name().unwrap().to_owned();
+
+        // Rename the project away and put a replacement at its path holding a
+        // file of the same name.
+        let moved = tmp.path().join("p.moved");
+        std::fs::rename(&project, &moved).unwrap();
+        let replacement_dir = context_dir_of(&project);
+        std::fs::create_dir_all(&replacement_dir).unwrap();
+        std::fs::write(replacement_dir.join(&name), "the replacement's").unwrap();
+
+        withdraw_published_context(&published);
+        assert!(
+            !context_dir_of(&moved).join(&name).exists(),
+            "the withdrawal reached the directory the file was published into"
+        );
+        assert_eq!(
+            std::fs::read_to_string(replacement_dir.join(&name)).unwrap(),
+            "the replacement's",
+            "and did not touch the directory now at the old path"
+        );
+
+        mirror_into(&published.dir, published.publish_seq, "mine");
+        assert!(
+            !replacement_dir.join(CONTEXT_FILE_NAME).exists(),
+            "the mirror is not written into the replacement"
+        );
+    }
+
+    /// PR #1407 review: two preparations in one project whose mirror writes
+    /// finish in the opposite order to their publishes — the daemon writes each
+    /// after its reply, on a thread of its own — leave the mirror holding the
+    /// LATER publish, and the overtaken write leaves no temp file behind.
+    #[test]
+    fn an_overtaken_mirror_write_does_not_land_over_a_later_publishs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mirror = || std::fs::read_to_string(context_dir_of(tmp.path()).join(CONTEXT_FILE_NAME));
+        let first = publish_orchestrator_context(tmp.path(), "FIRST").expect("published");
+        let second = publish_orchestrator_context(tmp.path(), "SECOND").expect("published");
+        assert!(first.publish_seq < second.publish_seq);
+
+        PendingMirror::new(second.dir.clone(), second.publish_seq, "SECOND".into()).write();
+        PendingMirror::new(first.dir.clone(), first.publish_seq, "FIRST".into()).write();
+        assert_eq!(
+            mirror().unwrap(),
+            "SECOND",
+            "the earlier publish's mirror landed last"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(context_dir_of(tmp.path()))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "overtaken temp files left: {leftovers:?}"
+        );
+
+        // In order, every write lands.
+        let third = publish_orchestrator_context(tmp.path(), "THIRD").expect("published");
+        mirror_into(&third.dir, third.publish_seq, "THIRD");
+        assert_eq!(mirror().unwrap(), "THIRD");
+    }
+
+    /// The ordering guard is per directory: a later publish in one project
+    /// does not stop an earlier one's mirror from landing in another.
+    #[test]
+    fn the_mirror_ordering_guard_is_per_directory() {
+        let (p, q) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let in_q = publish_orchestrator_context(q.path(), "Q").expect("published");
+        let in_p = publish_orchestrator_context(p.path(), "P").expect("published");
+        assert!(in_q.publish_seq < in_p.publish_seq);
+
+        mirror_into(&in_p.dir, in_p.publish_seq, "P");
+        mirror_into(&in_q.dir, in_q.publish_seq, "Q");
+        for (dir, want) in [(p.path(), "P"), (q.path(), "Q")] {
+            assert_eq!(
+                std::fs::read_to_string(context_dir_of(dir).join(CONTEXT_FILE_NAME)).unwrap(),
+                want
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2413,7 +3315,7 @@ mod tests {
             Attendance::Unattended,
         )
         .expect("spawn-time write");
-        reassert_orchestrator_prompt(&config(), &cwd).expect("re-assertion written");
+        reassert_orchestrator_prompt(&config(), &cwd, None).expect("re-assertion written");
 
         let c = published(&cwd);
         assert!(
@@ -2551,7 +3453,7 @@ mod tests {
 
         prepare_orchestrator_prompt(&hostile, &cwd, Some("Fix the bug."), Attendance::Attended)
             .expect("spawn-time write");
-        reassert_orchestrator_prompt(&hostile, &cwd).expect("re-assertion written");
+        reassert_orchestrator_prompt(&hostile, &cwd, None).expect("re-assertion written");
 
         let c = published(&cwd);
         let (before_task, _) = c.split_once(TASK_SECTION_MARKER).expect("task section");
@@ -2609,7 +3511,9 @@ mod tests {
         )
         .unwrap();
 
-        let line = reassert_orchestrator_prompt(&config(), &cwd).expect("re-assertion written");
+        let line = reassert_orchestrator_prompt(&config(), &cwd, None)
+            .expect("re-assertion written")
+            .prompt;
         assert!(line.contains("carry out that task"), "got {line:?}");
 
         let c = published(&cwd);
@@ -2638,7 +3542,7 @@ mod tests {
         );
         prepare_orchestrator_prompt(&config(), &cwd, Some(&hostile), Attendance::Attended)
             .expect("spawn-time write");
-        reassert_orchestrator_prompt(&config(), &cwd).expect("re-assertion written");
+        reassert_orchestrator_prompt(&config(), &cwd, None).expect("re-assertion written");
 
         let c = published(&cwd);
         let (before_task, _) = c.split_once(TASK_SECTION_MARKER).expect("task section");
@@ -3113,6 +4017,9 @@ mod hygiene_tests {
             "worker-task-coder.md",
             "work-done-reviewer.md",
             ".orchestrator-context.md.1234.0.tmp",
+            // Issue #1233: a per-publish context, written once and never
+            // refreshed, ages out like any other handoff file.
+            "orchestrator-context-0123456789abcdef0123456789abcdef.md",
         ] {
             assert!(
                 is_sweepable_coordination_name(name),
@@ -3120,6 +4027,7 @@ mod hygiene_tests {
             );
         }
         for name in [
+            // The compatibility mirror is refreshed in place, never accumulated.
             CONTEXT_FILE_NAME,
             "notes.txt",
             "state.json",
