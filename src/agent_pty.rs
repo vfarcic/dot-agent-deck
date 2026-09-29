@@ -3579,6 +3579,33 @@ impl PaneInputStream {
     }
 }
 
+/// Issue #544: a pane's input stream for `crate::draft_deferral`'s tests,
+/// which drive the draft parser through the real paste framing and submit
+/// scan rather than a copy of them.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct DraftTestStream(PaneInputStream);
+
+#[cfg(test)]
+impl DraftTestStream {
+    /// Feed one byte; `true` if it submits. See [`PaneInputStream::feed_byte`].
+    pub(crate) fn feed_byte(
+        &mut self,
+        byte: u8,
+        origin: crate::draft_deferral::ByteOrigin,
+    ) -> bool {
+        self.0.feed_byte(byte, origin)
+    }
+
+    pub(crate) fn in_paste(&self) -> bool {
+        self.0.in_paste
+    }
+
+    pub(crate) fn draft(&self) -> &crate::draft_deferral::DraftTracker {
+        &self.0.draft
+    }
+}
+
 /// Hash the exact bytes a guarded send hands the PTY. In-process comparison
 /// only — never persisted, never sent on the wire — so `DefaultHasher`'s
 /// across-releases instability does not matter.

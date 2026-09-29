@@ -173,10 +173,17 @@ enum Escape {
     /// `ESC O` — an SS3 key (F1–F4, application-mode arrows).
     Ss3,
     /// `ESC ]` — an OSC reply, ended by `BEL` or `ESC \`.
-    Osc { len: u16, esc: bool },
-    /// `ESC P` — a DCS reply, ended by `ESC \`.
-    Dcs { len: u16, esc: bool },
-    /// The three raw bytes after a legacy X10 mouse report's `ESC [ M`.
+    ///
+    /// `esc` is `Some` once an `ESC` has arrived inside the string: the next
+    /// byte decides whether it begins the `ESC \` terminator or a new
+    /// sequence. It holds whether the USER sent any of the string before that
+    /// `ESC` — the credit the string is owed if it turns out never to have
+    /// been a reply.
+    Osc { len: u16, esc: Option<bool> },
+    /// `ESC P` — a DCS reply, ended by `ESC \`. `esc` as for [`Self::Osc`].
+    Dcs { len: u16, esc: Option<bool> },
+    /// The three raw bytes after a legacy X10 mouse report's `ESC [ M`. Each
+    /// is 32 plus a value, so a control byte ends it as never having been one.
     X10 { remaining: u8 },
 }
 
@@ -234,15 +241,24 @@ const MAX_STRING_LEN: u16 = 4096;
 ///
 /// A sequence is input on behalf of whoever sent its bytes after the `ESC`:
 /// a lone `ESC` followed by a deck byte is the user's Escape key and the
-/// deck's text, so it sets nothing, while a user's `Alt+]` and the text they
-/// kept typing still count when a deck byte is what ends the would-be reply.
+/// deck's text, so it sets nothing whatever that text starts with, while a
+/// user's `Alt+]` and the text they kept typing still count when a deck byte
+/// is what ends the would-be reply. A sequence that was never one — an
+/// unterminated string, an overlong CSI, an X10 or SS3 prefix cut short by a
+/// control byte — is input for whoever sent it, and the byte that ended it is
+/// read afresh for its own sender (PR #1398 finding #17).
 #[derive(Debug, Default)]
 pub(crate) struct DraftTracker {
     pending: bool,
     escape: Escape,
-    /// Whether a USER byte is part of the sequence being parsed — the `ESC`
-    /// that opened it included. Meaningless in [`Escape::Ground`].
+    /// Whether a USER byte is part of the sequence being parsed, counting the
+    /// bytes AFTER the `ESC` that opened it — and that `ESC` too inside a
+    /// paste, where it is content. Meaningless in [`Escape::Ground`].
     seq_user: bool,
+    /// Whether the user sent the `ESC` that opened the sequence being parsed.
+    /// Outside a paste it counts by itself only as the lone Escape key of
+    /// `ESC ESC`, and only when the user sent the second one too.
+    esc_user: bool,
     /// Whether the byte being fed is the user's. Set for each byte by
     /// [`Self::feed_byte`].
     by_user: bool,
@@ -340,17 +356,17 @@ impl DraftTracker {
                     code: Some(0),
                     paste: false,
                 },
-                b']' => Escape::Osc { len: 0, esc: false },
-                b'P' => Escape::Dcs { len: 0, esc: false },
+                b']' => Escape::Osc { len: 0, esc: None },
+                b'P' => Escape::Dcs { len: 0, esc: None },
                 b'O' => Escape::Ss3,
                 // The first ESC was a key of its own; this one starts afresh,
                 // attributed to its own sender by `ground`. The first is
-                // counted only when the user sent it (`seq_user`, not this
+                // counted only when the user sent it (`esc_user`, not this
                 // byte's origin) AND is the one who went on typing: a deck
                 // ESC is never theirs, and a lone Escape keypress followed by
                 // a deck write edits nothing of theirs.
                 ESC => {
-                    self.pending |= self.seq_user && self.by_user;
+                    self.pending |= self.esc_user && self.by_user;
                     self.ground(byte, in_paste)
                 }
                 // `Alt+<key>`, `Alt+Enter`, `Alt+Backspace`: an edit, and the
@@ -444,30 +460,50 @@ impl DraftTracker {
                     self.ground(byte, in_paste)
                 }
             },
-            Escape::Ss3 => {
-                self.input_through();
-                Escape::Ground
-            }
+            Escape::Ss3 => match byte {
+                // A control byte, `ESC` included, is not an SS3 final: `ESC O`
+                // was `Alt+O`, and this byte is read afresh — so a `Ctrl+U`
+                // still clears and an `ESC` still opens its own sequence.
+                0x00..=0x1f => {
+                    self.input_sequence();
+                    self.ground(byte, in_paste)
+                }
+                _ => {
+                    self.input_through();
+                    Escape::Ground
+                }
+            },
             Escape::Osc { len, esc } | Escape::Dcs { len, esc } => {
                 let is_osc = matches!(self.escape, Escape::Osc { .. });
-                let next = |len: u16, esc: bool| {
+                let next = |len: u16, esc: Option<bool>| {
                     if is_osc {
                         Escape::Osc { len, esc }
                     } else {
                         Escape::Dcs { len, esc }
                     }
                 };
-                if esc {
-                    return if byte == b'\\' {
-                        Escape::Ground
-                    } else {
-                        // An unterminated string followed by a new sequence.
-                        self.escape = Escape::Esc { paste: false };
-                        self.step(byte, in_paste)
-                    };
+                if let Some(string_user) = esc {
+                    if byte == b'\\' {
+                        return Escape::Ground;
+                    }
+                    // PR #1398 finding #17: the string was never a reply, so
+                    // it is input for whoever sent it — exactly as the CSI
+                    // fallthrough counts its sequence — and its trailing ESC,
+                    // already attributed as an opener, starts the sequence
+                    // this byte continues.
+                    self.pending |= string_user;
+                    self.escape = Escape::Esc { paste: false };
+                    return self.step(byte, in_paste);
                 }
                 match byte {
-                    ESC => next(len, true),
+                    // Either the start of the `ESC \` terminator or of a new
+                    // sequence: park the string's credit, and read the ESC as
+                    // an opener like any other until the next byte decides.
+                    ESC => {
+                        let string_user = self.seq_user;
+                        self.open_sequence(false);
+                        next(len, Some(string_user))
+                    }
                     BEL if is_osc => Escape::Ground,
                     // A control byte inside a reply means it was never one.
                     0x00..=0x1f => {
@@ -478,19 +514,32 @@ impl DraftTracker {
                         self.input_through();
                         Escape::Ground
                     }
-                    _ => next(len + 1, false),
+                    _ => next(len + 1, None),
                 }
             }
-            Escape::X10 { remaining } => {
-                if remaining > 1 {
-                    Escape::X10 {
-                        remaining: remaining - 1,
-                    }
-                } else {
-                    Escape::Ground
+            Escape::X10 { remaining } => match byte {
+                // Never a report after all: count what was sent as input and
+                // read this byte afresh, as a control byte inside an OSC does.
+                0x00..=0x1f => {
+                    self.input_sequence();
+                    self.ground(byte, in_paste)
                 }
-            }
+                _ if remaining > 1 => Escape::X10 {
+                    remaining: remaining - 1,
+                },
+                _ => Escape::Ground,
+            },
         }
+    }
+
+    /// The byte being fed is an `ESC` that opens a sequence of its own, sent by
+    /// whoever sent it. Outside a paste it is not input by itself — a lone
+    /// Escape edits nothing, and the sequence counts for whoever sends what
+    /// follows — while inside a paste it is content.
+    fn open_sequence(&mut self, in_paste: bool) {
+        self.esc_user = self.by_user;
+        self.seq_user = self.by_user && in_paste;
+        self.fresh = true;
     }
 
     fn ground(&mut self, byte: u8, in_paste: bool) -> Escape {
@@ -499,8 +548,7 @@ impl DraftTracker {
             // marker, which `Escape::Esc { paste: true }` decides. Either way
             // it opens a sequence of its own, sent by whoever sent it.
             0x1b => {
-                self.seq_user = self.by_user;
-                self.fresh = true;
+                self.open_sequence(in_paste);
                 Escape::Esc { paste: in_paste }
             }
             0x15 | 0x03 if !in_paste => {
@@ -939,5 +987,528 @@ mod tests {
         feed_as(&mut tracker, b"PAYLOAD\r", ByteOrigin::Deck);
         feed(&mut tracker, b"]abc");
         assert!(tracker.pending(), "typing after a daemon submit is a draft");
+    }
+
+    /// PR #1398 finding #17: an unterminated OSC or DCS string whose last
+    /// byte is `ESC`, followed by anything but the `\` of an `ESC \`
+    /// terminator, was never a reply. The string is input for whoever sent
+    /// it — so the user's `Alt+]` and what they typed after it count even
+    /// when a deck byte is what ends it — and the trailing `ESC` opens a new
+    /// sequence of its own.
+    #[test]
+    fn an_unterminated_string_ended_by_a_deck_byte_credits_the_users_string() {
+        for opener in [&b"\x1b]"[..], b"\x1bP"] {
+            let mut typed = opener.to_vec();
+            typed.extend_from_slice(b"abc\x1b");
+            for deck in [&b"NOTICE\n"[..], b"\x1b[200~NOTICE\x1b[201~"] {
+                let mut tracker = DraftTracker::default();
+                feed(&mut tracker, &typed);
+                assert!(!tracker.pending(), "still a would-be reply");
+                feed_as(&mut tracker, deck, ByteOrigin::Deck);
+                assert!(
+                    tracker.pending(),
+                    "the user's {typed:?} was dropped when the deck wrote {deck:?}"
+                );
+            }
+        }
+        // The same string, terminated, is a reply and sets nothing.
+        let mut tracker = DraftTracker::default();
+        feed(&mut tracker, b"\x1b]abc\x1b");
+        feed_as(&mut tracker, b"\\", ByteOrigin::Deck);
+        assert!(!tracker.pending());
+    }
+
+    /// Arm-by-arm sweep after finding #17: a sequence counts for whoever sent
+    /// its bytes AFTER the `ESC`. A lone Escape and then deck text is not a
+    /// draft whatever the text's first byte happens to be — before this, text
+    /// starting with `[`, `]`, `P` or `O` was parsed as a sequence the user's
+    /// `ESC` opened and credited to them, while any other text was not.
+    #[test]
+    fn a_lone_escape_before_deck_text_is_not_a_draft_whatever_the_text_starts_with() {
+        for deck in [
+            &b"NOTICE\n"[..],
+            b"[1] done\n",
+            b"]done\n",
+            b"Pane 2 finished\n",
+            b"OK\n",
+        ] {
+            let mut tracker = DraftTracker::default();
+            feed(&mut tracker, b"\x1b");
+            feed_as(&mut tracker, deck, ByteOrigin::Deck);
+            assert!(!tracker.pending(), "a lone Escape before {deck:?}");
+        }
+        // The user's own bytes after an ESC still count, whoever sent the ESC.
+        for (esc, rest) in [(ByteOrigin::User, &b"[A"[..]), (ByteOrigin::Deck, b"[A")] {
+            let mut tracker = DraftTracker::default();
+            feed_as(&mut tracker, b"\x1b", esc);
+            feed(&mut tracker, rest);
+            assert!(tracker.pending(), "{esc:?} ESC, then the user's {rest:?}");
+        }
+    }
+
+    /// Arm-by-arm sweep after finding #17: a control byte (`ESC` included) is
+    /// not the final byte of an SS3 key. `ESC O` was `Alt+O`, and the control
+    /// byte is read afresh — so the user's `Ctrl+U` after it still clears,
+    /// and an `ESC` after it still opens the sequence it starts.
+    #[test]
+    fn an_ss3_prefix_does_not_swallow_the_control_byte_after_it() {
+        let mut tracker = DraftTracker::default();
+        feed(&mut tracker, b"draft\x1bO\x15");
+        assert!(!tracker.pending(), "Ctrl+U after Alt+O did not clear");
+
+        // A lone Escape, deck text starting `O`, then the user's empty paste:
+        // nothing the user sent is content.
+        let mut tracker = DraftTracker::default();
+        feed(&mut tracker, b"\x1b");
+        feed_as(&mut tracker, b"O", ByteOrigin::Deck);
+        feed(&mut tracker, b"\x1b[200~\x1b[201~");
+        assert!(!tracker.pending(), "the user's paste framing set the bit");
+    }
+
+    /// Arm-by-arm sweep after finding #17: every raw byte of a real X10 mouse
+    /// report is 32 plus a value, so a control byte after `ESC [ M` means it
+    /// was never one — the sequence is input, as an aborted OSC is, and the
+    /// control byte is read afresh.
+    #[test]
+    fn an_x10_prefix_does_not_swallow_a_control_byte() {
+        for prefix in [&b"\x1b[M"[..], b"\x1b[M ", b"\x1b[M  "] {
+            let mut bytes = b"draft".to_vec();
+            bytes.extend_from_slice(prefix);
+            bytes.push(0x15);
+            assert!(!pending_after(&bytes), "Ctrl+U after {prefix:?}");
+        }
+        // A complete report still sets nothing, as before.
+        assert!(!pending_after(b"\x1b[M !!"));
+    }
+
+    /// Who wrote the prefix (`A`) and who wrote the interrupting bytes (`B`).
+    const ORIGINS: [(ByteOrigin, ByteOrigin); 4] = [
+        (ByteOrigin::User, ByteOrigin::User),
+        (ByteOrigin::User, ByteOrigin::Deck),
+        (ByteOrigin::Deck, ByteOrigin::User),
+        (ByteOrigin::Deck, ByteOrigin::Deck),
+    ];
+
+    #[derive(Clone, Copy, Debug)]
+    enum Clears {
+        No,
+        /// The interrupting byte submits, whoever sent it.
+        Submit,
+        /// The interrupting byte is a clear key, which clears only from the user.
+        UserKey,
+    }
+
+    /// What an interruption does to the bit, stated as the invariants:
+    /// `prefix` — the prefix is input (text, or a sequence that ended up input:
+    /// completed as a key, abandoned, overlong, aborted), counting for `A`
+    /// when `A` is the user; `byte` — the interrupting bytes are input for
+    /// `B`; `esc_esc` — `ESC ESC`, where the first is a lone Escape that
+    /// counts only when the user sent it AND the user sent the next. A prefix
+    /// that is a lone `ESC` is never input by itself, and framing or a report
+    /// is never input at all.
+    #[derive(Clone, Copy, Debug)]
+    struct Rule {
+        prefix: bool,
+        byte: bool,
+        esc_esc: bool,
+        clears: Clears,
+    }
+
+    const fn rule(prefix: bool, byte: bool) -> Rule {
+        Rule {
+            prefix,
+            byte,
+            esc_esc: false,
+            clears: Clears::No,
+        }
+    }
+    const NOTHING: Rule = rule(false, false);
+    const PREFIX: Rule = rule(true, false);
+    const BYTE: Rule = rule(false, true);
+    const BOTH: Rule = rule(true, true);
+    const ESC_ESC: Rule = Rule {
+        esc_esc: true,
+        ..NOTHING
+    };
+    const SUBMIT: Rule = Rule {
+        clears: Clears::Submit,
+        ..NOTHING
+    };
+    const CLEAR: Rule = Rule {
+        clears: Clears::UserKey,
+        ..NOTHING
+    };
+    const CLEAR_AFTER_PREFIX: Rule = Rule {
+        clears: Clears::UserKey,
+        ..PREFIX
+    };
+
+    impl Rule {
+        fn expect(self, a: ByteOrigin, b: ByteOrigin, drafted: bool) -> bool {
+            let (a, b) = (a == ByteOrigin::User, b == ByteOrigin::User);
+            match self.clears {
+                Clears::Submit => return false,
+                Clears::UserKey if b => return false,
+                _ => {}
+            }
+            drafted || (self.prefix && a) || (self.byte && b) || (self.esc_esc && a && b)
+        }
+    }
+
+    /// A parser state, the prefix that enters it, and each interruption of it
+    /// with the [`Rule`] it must follow.
+    type StateRow = (&'static str, Vec<u8>, Vec<(&'static [u8], Rule)>);
+
+    /// Feed `chunks` through the real stream (paste framing, submit scan,
+    /// draft parser) and report the bit and whether a paste is open.
+    fn run_stream(chunks: &[(&[u8], ByteOrigin)]) -> (bool, bool) {
+        let mut stream = crate::agent_pty::DraftTestStream::default();
+        for (bytes, origin) in chunks {
+            for &byte in *bytes {
+                stream.feed_byte(byte, *origin);
+            }
+        }
+        (stream.draft().pending(), stream.in_paste())
+    }
+
+    /// Arm-by-arm sweep after finding #17: every parser state that a byte can
+    /// interrupt, entered by a prefix `A` wrote and interrupted or ended by
+    /// bytes `B` wrote, for all four combinations of `A` and `B`, starting
+    /// from an empty box and from one holding the user's draft — checked
+    /// against the invariants in [`Rule`]. Inside a paste the opening marker
+    /// is the deck's (framing, which sets nothing whoever sends it) and every
+    /// state is content.
+    #[test]
+    fn every_interruptible_state_honours_the_invariants_for_every_sender_pair() {
+        const X: &[u8] = b"x";
+        const FRAME: &[u8] = b"\x1b[200~\x1b[201~";
+        const CLOSE: &[u8] = b"\x1b[201~";
+        const LF: &[u8] = b"\n";
+        const CU: &[u8] = b"\x15";
+        const CC: &[u8] = b"\x03";
+        const CR: &[u8] = b"\r";
+        let mut csi_param_bound = b"\x1b[".to_vec();
+        csi_param_bound.extend(std::iter::repeat_n(b'1', usize::from(MAX_CSI_LEN)));
+        let mut csi_inter_bound = b"\x1b[".to_vec();
+        csi_inter_bound.extend(std::iter::repeat_n(b' ', usize::from(MAX_CSI_LEN)));
+        let mut osc_bound = b"\x1b]".to_vec();
+        osc_bound.extend(std::iter::repeat_n(b'a', usize::from(MAX_STRING_LEN)));
+
+        // `x_rule`: a printable byte continues the string, or, at the bound,
+        // makes it overlong input.
+        let string_arms = |x_rule: Rule, terminator: &'static [u8], at_terminator: Rule| {
+            vec![
+                (X, x_rule),
+                (terminator, at_terminator),
+                (b"\x1b\\".as_slice(), NOTHING),
+                (FRAME, PREFIX),
+                (LF, BOTH),
+                (CU, CLEAR_AFTER_PREFIX),
+                (CC, CLEAR_AFTER_PREFIX),
+                (CR, SUBMIT),
+            ]
+        };
+        // An unterminated string's trailing ESC, then anything but `\`: the
+        // string is input for `A`, and `ESC <byte>` is a new sequence of `B`'s
+        // (or, for `ESC ESC`, a lone Escape of `B`'s).
+        let string_esc_arms = vec![
+            (X, BOTH),
+            (b"\\".as_slice(), NOTHING),
+            (FRAME, PREFIX),
+            (b"[A".as_slice(), BOTH),
+            (LF, BOTH),
+            // `ESC Ctrl+U` and `ESC CR` are `Alt+` keys: input, and neither
+            // clears nor submits.
+            (CU, BOTH),
+            (CR, BOTH),
+        ];
+        let aborted_arms = |key: &'static [u8], at_key: Rule| {
+            vec![
+                (X, if at_key.byte { BOTH } else { NOTHING }),
+                (key, at_key),
+                (FRAME, PREFIX),
+                (LF, BOTH),
+                (CU, CLEAR_AFTER_PREFIX),
+                (CC, CLEAR_AFTER_PREFIX),
+                (CR, SUBMIT),
+            ]
+        };
+
+        let outside: Vec<StateRow> = vec![
+            (
+                "ground",
+                Vec::new(),
+                vec![
+                    (X, BYTE),
+                    (FRAME, NOTHING),
+                    (LF, BYTE),
+                    (CU, CLEAR),
+                    (CC, CLEAR),
+                    (CR, SUBMIT),
+                ],
+            ),
+            (
+                "ESC",
+                b"\x1b".to_vec(),
+                vec![
+                    (X, BYTE),
+                    (FRAME, ESC_ESC),
+                    (LF, BYTE),
+                    // The accepted ambiguity: `ESC Ctrl+U` is `Alt+Ctrl+U`.
+                    (CU, BYTE),
+                    (CR, BYTE),
+                    (b"[A", BYTE),
+                    (b"[1] done\n", BYTE),
+                    (b"]done\n", BYTE),
+                    (b"Pdone\n", BYTE),
+                    (b"OK", BYTE),
+                ],
+            ),
+            (
+                "CSI params",
+                b"\x1b[1".to_vec(),
+                vec![
+                    (X, BOTH),
+                    (b"~", BOTH),
+                    (b"n", NOTHING),
+                    (FRAME, PREFIX),
+                    (LF, BOTH),
+                    (CU, CLEAR_AFTER_PREFIX),
+                    (CC, CLEAR_AFTER_PREFIX),
+                    (CR, SUBMIT),
+                ],
+            ),
+            (
+                "CSI intermediates",
+                b"\x1b[1 ".to_vec(),
+                aborted_arms(b"q", BOTH),
+            ),
+            (
+                "CSI private",
+                b"\x1b[?1".to_vec(),
+                aborted_arms(b"c", NOTHING),
+            ),
+            (
+                "CSI params at bound",
+                csi_param_bound,
+                aborted_arms(b"1", BOTH),
+            ),
+            (
+                "CSI intermediates at bound",
+                csi_inter_bound,
+                aborted_arms(b" ", BOTH),
+            ),
+            (
+                "OSC",
+                b"\x1b]ab".to_vec(),
+                string_arms(NOTHING, b"\x07", NOTHING),
+            ),
+            ("OSC at bound", osc_bound, string_arms(BOTH, b"a", BOTH)),
+            (
+                "OSC + ESC",
+                b"\x1b]ab\x1b".to_vec(),
+                string_esc_arms.clone(),
+            ),
+            // BEL ends an OSC, not a DCS: in a DCS it is a control byte.
+            (
+                "DCS",
+                b"\x1bPab".to_vec(),
+                string_arms(NOTHING, b"\x07", BOTH),
+            ),
+            ("DCS + ESC", b"\x1bPab\x1b".to_vec(), string_esc_arms),
+            ("X10", b"\x1b[M ".to_vec(), aborted_arms(b"!", NOTHING)),
+            ("SS3", b"\x1bO".to_vec(), aborted_arms(b"P", BOTH)),
+        ];
+
+        // Inside a paste every state is content and nothing clears.
+        let pasted = |prefix_is_content: bool| {
+            let p = |rule: Rule| Rule {
+                prefix: prefix_is_content,
+                ..rule
+            };
+            vec![
+                (X, p(BYTE)),
+                (CLOSE, p(NOTHING)),
+                (LF, p(BYTE)),
+                (CU, p(BYTE)),
+                (CC, p(BYTE)),
+                (CR, p(BYTE)),
+                (b"\x1b[200~".as_slice(), p(BYTE)),
+            ]
+        };
+        let inside: Vec<StateRow> = vec![
+            ("paste: ground", Vec::new(), pasted(false)),
+            ("paste: ESC", b"\x1b".to_vec(), pasted(true)),
+            ("paste: CSI params", b"\x1b[1".to_vec(), pasted(true)),
+            (
+                "paste: CSI intermediates",
+                b"\x1b[1 ".to_vec(),
+                pasted(true),
+            ),
+            ("paste: CSI private", b"\x1b[?1".to_vec(), pasted(true)),
+            ("paste: OSC", b"\x1b]ab".to_vec(), pasted(true)),
+            ("paste: OSC + ESC", b"\x1b]ab\x1b".to_vec(), pasted(true)),
+            ("paste: DCS", b"\x1bPab".to_vec(), pasted(true)),
+            ("paste: DCS + ESC", b"\x1bPab\x1b".to_vec(), pasted(true)),
+            ("paste: X10", b"\x1b[M ".to_vec(), pasted(true)),
+            ("paste: SS3", b"\x1bO".to_vec(), pasted(true)),
+        ];
+
+        let mut failures = Vec::new();
+        for (in_paste, rows) in [(false, &outside), (true, &inside)] {
+            for (state, prefix, arms) in rows {
+                for (interrupt, rule) in arms {
+                    for (a, b) in ORIGINS {
+                        for drafted in [false, true] {
+                            let mut chunks: Vec<(&[u8], ByteOrigin)> = Vec::new();
+                            if drafted {
+                                chunks.push((b"d", ByteOrigin::User));
+                            }
+                            if in_paste {
+                                chunks.push((b"\x1b[200~", ByteOrigin::Deck));
+                            }
+                            chunks.push((prefix, a));
+                            chunks.push((interrupt, b));
+                            let (pending, paste_open) = run_stream(&chunks);
+                            let expected = rule.expect(a, b, drafted);
+                            // Framing agrees too: the paste is open afterwards
+                            // exactly when the row opened one and did not close it.
+                            let expected_open = in_paste && *interrupt != CLOSE;
+                            if pending != expected || paste_open != expected_open {
+                                failures.push(format!(
+                                    "{state} + {interrupt:?}: A={a:?} B={b:?} drafted={drafted}: \
+                                     pending {pending} (want {expected}), paste open \
+                                     {paste_open} (want {expected_open})"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A small deterministic generator, so the randomized sweep below needs
+    /// no new dependency and reproduces exactly from its seed.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Arm-by-arm sweep after finding #17: random mixed-origin streams built
+    /// from the bytes every arm branches on, checked byte by byte against the
+    /// invariants that need no oracle:
+    ///
+    /// 1. The bit goes from clear to set only on a byte of a sequence holding
+    ///    a USER byte — counted from where the parser last left ground, and
+    ///    not counting that sequence's opening `ESC` outside a paste (a lone
+    ///    Escape is not an edit by itself). Deck bytes alone never set it.
+    /// 3. The bit goes from set to clear only on a byte that submits, or on
+    ///    the user's `Ctrl+U` / `Ctrl+C` outside a paste.
+    #[test]
+    fn random_mixed_origin_streams_honour_the_invariants() {
+        const TOKENS: [&[u8]; 34] = [
+            b"\x1b",
+            b"[",
+            b"]",
+            b"P",
+            b"O",
+            b"M",
+            b"\\",
+            b"\x07",
+            b"\r",
+            b"\n",
+            b"\x15",
+            b"\x03",
+            b"2",
+            b"0",
+            b"1",
+            b"~",
+            b";",
+            b"?",
+            b" ",
+            b"$",
+            b"x",
+            b"A",
+            b"n",
+            b"y",
+            b"\x7f",
+            b"\t",
+            b"\x1b[200~",
+            b"\x1b[201~",
+            b"\x1b[I",
+            b"\x1b[<0;1;2M",
+            b"\x1b]10;x\x07",
+            b"\x1b\\",
+            b"\x1b\r",
+            b"\x1bOP",
+        ];
+        for seed in 1..=4000u64 {
+            let mut rng = XorShift(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let mut stream = crate::agent_pty::DraftTestStream::default();
+            let mut fed: Vec<(u8, ByteOrigin, bool)> = Vec::new();
+            let mut window_start = 0;
+            for _ in 0..48 {
+                let token = TOKENS[rng.below(TOKENS.len())];
+                let origin = if rng.below(2) == 0 {
+                    ByteOrigin::User
+                } else {
+                    ByteOrigin::Deck
+                };
+                for &byte in token {
+                    let before = stream.draft().pending();
+                    let was_ground = stream.draft().escape == Escape::Ground;
+                    let in_paste = stream.in_paste();
+                    if was_ground {
+                        window_start = fed.len();
+                    }
+                    fed.push((byte, origin, in_paste));
+                    let submits = stream.feed_byte(byte, origin);
+                    let after = stream.draft().pending();
+                    let history = || {
+                        fed.iter()
+                            .map(|(b, o, _)| {
+                                format!(
+                                    "{b:#04x}{}",
+                                    if *o == ByteOrigin::User { "u" } else { "d" }
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    };
+                    if !before && after {
+                        let window = &fed[window_start..];
+                        let credited = window.iter().enumerate().any(|(i, &(b, o, p))| {
+                            o == ByteOrigin::User && !(i == 0 && b == 0x1b && !p)
+                        });
+                        assert!(
+                            credited,
+                            "seed {seed}: the bit was set with no user byte in the sequence: {}",
+                            history()
+                        );
+                    }
+                    if before && !after {
+                        let user_clear =
+                            origin == ByteOrigin::User && matches!(byte, 0x15 | 0x03) && !in_paste;
+                        assert!(
+                            submits || user_clear,
+                            "seed {seed}: the bit was cleared by neither a submit nor a user clear: {}",
+                            history()
+                        );
+                    }
+                }
+            }
+        }
     }
 }
