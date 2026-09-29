@@ -1,5 +1,6 @@
 import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { actionErrorFrom, LaunchCleanupError } from "./actionError";
+import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
 import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
@@ -3984,7 +3985,28 @@ export class TauriDeckBridge implements DeckBridge {
 
   async saveSettings(settings: DesktopSettingsDto, base?: DesktopSettingsDto): Promise<DesktopSettingsDto> {
     const invoke = await this.getInvoke();
-    const written = normalizeDesktopSettings(await invoke<DesktopSettingsDto>("desktop_set_settings", { settings, base }));
+    let raw: DesktopSettingsDto;
+    try {
+      raw = await invoke<DesktopSettingsDto>("desktop_set_settings", { settings, base });
+    } catch (cause) {
+      const partial = partialSettingsSave(cause);
+      if (!partial) throw cause;
+      // Issue #1350's review: the deck edits reached the shared deck list and
+      // `desktop.toml` did not. The save failed, but the deck section on disk
+      // DID move, so it is recorded and the fleet re-established exactly as for
+      // a successful write before the failure is reported.
+      const written = await this.afterSettingsWrite(normalizeDesktopSettings(partial.written));
+      throw new PartialSettingsSaveError(partial.message, written);
+    }
+    return this.afterSettingsWrite(normalizeDesktopSettings(raw));
+  }
+
+  /**
+   * What follows a write that reached disk — every successful save, and a
+   * partial one: record the endpoints fingerprint, and re-establish the fleet
+   * when it moved.
+   */
+  private async afterSettingsWrite(written: DesktopSettingsDto): Promise<DesktopSettingsDto> {
     const fingerprint = endpointsFingerprint(written);
     // An unspecified section is not a change and must not become the baseline
     // either: recording the sentinel would make the NEXT real edit compare

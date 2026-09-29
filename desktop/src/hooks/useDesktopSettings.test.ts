@@ -1,6 +1,7 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_DESKTOP_SETTINGS, type AppearanceMode, type DesktopSettingsDto } from "../lib/bridge";
+import { PartialSettingsSaveError } from "../lib/settingsError";
 import type { DeckRuntimeState } from "../types";
 import { useDesktopSettings } from "./useDesktopSettings";
 
@@ -309,5 +310,34 @@ describe("useDesktopSettings unreadable document", () => {
 
     rerender({ value: runtime(saveSettings, UNREADABLE) });
     await waitFor(() => expect(result.current.problem).toBe(UNREADABLE));
+  });
+});
+
+/**
+ * A save that half-happened (issue #1350's review).
+ *
+ * The deck edits went to the shared deck list and the rest of the document did
+ * not, so neither the edit nor the old document is what is on disk. The Rust
+ * side sends the re-read settings with the error; the window must show those,
+ * say which half was saved, and take them as the base of the next save.
+ */
+describe("useDesktopSettings partial save", () => {
+  it("shows the settings as they are on disk and diffs the next save against them", async () => {
+    const { bases, pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings);
+
+    await act(async () => { result.current.save({ ...withMode("dark"), zoom: { level: 1.5 } }); });
+    // On disk: the deck half (standing in here as the zoom another writer's
+    // field would show) landed, the theme did not.
+    const onDisk = { ...withMode("light"), zoom: { level: 1.5 } };
+    const message = "The deck list changes were saved, but the other settings were not, so they are shown as they are on disk: disk full";
+    await act(async () => { pending[0].reject(new PartialSettingsSaveError(message, onDisk)); });
+
+    expect(result.current.settings).toEqual(onDisk);
+    expect(result.current.saveError).toBe(message);
+
+    // Not carried: the screen is the disk now, so it is the next base.
+    await act(async () => { result.current.save({ ...result.current.settings, appearance: { mode: "dark" } }); });
+    expect(bases[1]).toEqual(onDisk);
   });
 });

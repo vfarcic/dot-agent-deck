@@ -330,6 +330,77 @@ fn read_task_file(path: &str) -> Result<String, String> {
     read_capped(file, MAX_TASK_BYTES, &source)
 }
 
+/// Read a configuration file the user (or an environment variable) points at:
+/// `Ok(None)` when nothing is there, otherwise its contents — refused unless it
+/// is a **regular file** and at most `max_bytes` long.
+///
+/// The same two properties as [`read_task_file`], with `io::Error`s instead of
+/// `--task-file` wording so a loader can report them as its own read failure:
+/// the file is opened once and judged from the open handle, and on Unix it is
+/// opened `O_NONBLOCK`, so a FIFO with no writer cannot hang the open. Symlinks
+/// are followed, and the check applies to the target — a config file reached
+/// through a dotfile manager's symlink is ordinary.
+///
+/// Issue #1350: `remotes.toml` is read by the desktop at startup and on every
+/// settings snapshot, from a path `DOT_AGENT_DECK_REMOTES` can move, so an
+/// unbounded `read_to_string` there turned a misconfigured path into a hung or
+/// memory-exhausted app.
+pub fn read_config_file(path: &std::path::Path, max_bytes: u64) -> std::io::Result<Option<String>> {
+    use std::io::{Error, ErrorKind};
+
+    let not_regular = |kind: &str| {
+        let message = if kind == "not a regular file" {
+            format!("it is {kind}")
+        } else {
+            format!("it is {kind}, not a regular file")
+        };
+        Error::new(ErrorKind::InvalidInput, message)
+    };
+    let too_large = || {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("it is larger than the {max_bytes}-byte limit"),
+        )
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        // Windows refuses to open a directory at all; name it rather than
+        // surface a bare `Access is denied` (see `read_task_file`).
+        Err(error) => {
+            return Err(if std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
+                not_regular("a directory")
+            } else {
+                error
+            });
+        }
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(not_regular(describe_file_type(&metadata.file_type())));
+    }
+    if metadata.len() > max_bytes {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(too_large());
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| Error::new(ErrorKind::InvalidData, error.utf8_error()))
+}
+
 /// The not-a-regular-file refusal, shared so the type check and the Windows
 /// open-failure recovery word it identically.
 fn not_a_regular_file(source: &str, kind: &str) -> String {

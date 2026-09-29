@@ -1,6 +1,7 @@
 mod agent_view;
 mod appearance;
 mod daemon_bridge;
+mod decks;
 mod dto;
 mod endpoint_test;
 // Tests only: the shared endpoint-validation table, read from here and from
@@ -2392,6 +2393,19 @@ async fn desktop_get_settings(
 /// does not carry is an unknown section the merge preserved: `DesktopSettings`
 /// has nowhere to put one.
 ///
+/// # A save that half-happened says so (issue #1350's review)
+///
+/// The deck edits go to the shared `remotes.toml` and the rest to
+/// `desktop.toml`, and two files cannot be replaced atomically together. A save
+/// that fails after the deck edits landed rejects with
+/// [`crate::dto::DesktopSettingsSaveError::Partial`]: a message naming which
+/// half was saved, plus the settings re-read from disk, whose deck list is also
+/// put into force here. A save whose deck edits were aimed at a deck that
+/// changed outside the app (a CLI remove and re-add under the same name) wrote
+/// nothing, and rejects the same way — the window's list is stale, so it is
+/// replaced with the one on disk. Every other failure rejects with a plain
+/// string, as before.
+///
 /// # The accepted strings are length-bounded
 ///
 /// A compromised webview could otherwise send an arbitrarily long appearance
@@ -2414,7 +2428,7 @@ async fn desktop_set_settings(
     state: State<'_, DesktopState>,
     settings: DesktopSettings,
     base: Option<DesktopSettings>,
-) -> Result<DesktopSettings, String> {
+) -> Result<DesktopSettings, crate::dto::DesktopSettingsSaveError> {
     ensure_main_webview(&webview)?;
     // On a blocking worker: the save is synchronous filesystem work — a read,
     // an `fsync`, a rename — and since #828 it can also wait up to
@@ -2428,14 +2442,38 @@ async fn desktop_set_settings(
         eprintln!("desktop settings: the save task did not complete: {error}");
         "Saving the desktop settings did not complete. Try again.".to_string()
     })?;
-    let written = saved.map_err(|error| {
-        // The detail names the path and belongs in the app's own log; the
-        // webview gets the sanitized half, the way connection errors already do.
-        eprintln!("{}", error.detail());
-        safe_message(error.public())
-    })?;
-    apply_selection(&app, &state, &written).await;
-    Ok(written)
+    let failure = match saved {
+        Ok(written) => {
+            apply_selection(&app, &state, &written).await;
+            return Ok(written);
+        }
+        Err(failure) => failure,
+    };
+    // The detail names the path and belongs in the app's own log; the webview
+    // gets the sanitized half, the way connection errors already do.
+    eprintln!("{}", failure.detail());
+    let message = safe_message(failure.public());
+    if !failure.decks_saved() && !failure.deck_list_conflict() {
+        return Err(message.into());
+    }
+    // Issue #1350's review: the deck edits reached `remotes.toml` and
+    // `desktop.toml` did not — or the deck list changed outside the app so the
+    // edits could not be applied — so neither the edit nor the window's copy
+    // is what is on disk. Re-read both, put that deck list into force — so a
+    // removed deck's tunnel closes and an added one is watched — and hand it to
+    // the window with the error, so it shows what is actually there.
+    let Ok(disk) =
+        tauri::async_runtime::spawn_blocking(|| crate::settings::load_snapshot().settings).await
+    else {
+        return Err(message.into());
+    };
+    apply_selection(&app, &state, &disk).await;
+    Err(crate::dto::DesktopSettingsSaveError::Partial(
+        crate::dto::DesktopPartialSettingsSave {
+            message,
+            written: disk,
+        },
+    ))
 }
 
 /// The three credential commands (PRD #802 M4), and the one that is missing.
@@ -2653,15 +2691,18 @@ pub struct VoiceStatus {
 /// everywhere else. At a few tens of microseconds each that is not worth
 /// caching away the freshness above.
 ///
-/// One consequence is worth naming rather than discovering: `load_snapshot`
+/// It reads `desktop.toml` alone, through `load_settings_without_decks`, so the
+/// poll never touches the shared `remotes.toml` a full `load_snapshot` also
+/// parses (issue #1350's review).
+///
+/// One consequence is worth naming rather than discovering: the load
 /// logs a malformed document through `log_document_problem`, which is a bare
 /// `eprintln!` with no rate limit. A `desktop.toml` this build cannot parse
 /// therefore writes four stderr lines a second while voice is on, where it
 /// wrote one. It is a misconfiguration either way, and the fix — if it ever
 /// matters — is a log-once latch in `settings.rs` rather than a cache here.
 fn voice_speech_settings() -> crate::settings::TranscriptionSettings {
-    crate::settings::load_snapshot()
-        .settings
+    crate::settings::load_settings_without_decks()
         .voice
         .unwrap_or_default()
         .transcription
@@ -3041,8 +3082,7 @@ async fn desktop_voice_resolve(
     // Read per call rather than cached, for `voice_speech_settings`'s reason: a
     // user who changes the backend, the endpoint or the model uses it on the
     // next utterance instead of after a restart.
-    let settings = crate::settings::load_snapshot()
-        .settings
+    let settings = crate::settings::load_settings_without_decks()
         .voice
         .unwrap_or_default();
     let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
@@ -3356,8 +3396,7 @@ async fn desktop_voice_commands(
         new_agent.as_ref(),
         // Read per call, for `desktop_voice_resolve`'s reason: the overlay says
         // what the NEXT utterance can do, so it follows the label choice too.
-        crate::settings::load_snapshot()
-            .settings
+        crate::settings::load_settings_without_decks()
             .voice
             .unwrap_or_default()
             .labels,
@@ -4762,6 +4801,11 @@ fn window_ends_capture(event: &tauri::WindowEvent) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Issue #1350: the decks a pre-#1350 build kept in `desktop.toml` move to
+    // the shared `remotes.toml` here, once per launch and before anything below
+    // reads a snapshot — `appearance::init()` is the first — so the first
+    // snapshot already shows them and `load_snapshot` stays read-only.
+    settings::migrate_legacy_decks();
     let app = tauri::Builder::default()
         .manage(DesktopState::default())
         // PRD #802 M7: the capture session. Opens no device until a `start`.
@@ -5748,6 +5792,10 @@ mod tests {
     /// user could do about it from inside this app.
     #[test]
     fn a_refused_inhibit_does_not_take_voice_with_it() {
+        // `voice_status` reads the speech settings from `desktop.toml`, so
+        // point it at files this test owns rather than the developer's real
+        // ones (issue #1350).
+        let _settings = crate::settings::IsolatedSettingsEnv::new();
         let source =
             voice::StubSource::tone(voice::AudioFormat::new(voice::TARGET_SAMPLE_RATE, 1), 1.0);
         let voice_state = VoiceState {
