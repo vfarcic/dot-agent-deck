@@ -577,10 +577,10 @@ print(count)
 }
 
 /// Scenario: Open a PTY-attached orchestration with a real interactive OpenCode worker, then delegate while its replacement is still booting by removing the readiness buffer. The worker must report a uniquely named fixture file through `work-done` in the same process; after its first Thinking or ToolStart proof, the deck must never probe or retype, and the OpenCode transcript must contain exactly one user task prompt.
-#[spec("orchestration/delegate/045")]
+#[spec("orchestration/delegate/046")]
 #[test]
 #[cfg(unix)]
-fn delegate_045_real_opencode_recovers_early_pointer_in_place() {
+fn delegate_046_real_opencode_recovers_early_pointer_in_place() {
     skip_unless!(common::check_opencode_available());
 
     let worker_command = format!("opencode --model {} --auto", common::opencode_test_model());
@@ -701,7 +701,7 @@ fn delegate_045_real_opencode_recovers_early_pointer_in_place() {
             && line.contains(&replacement_pane)
             && (line.contains("event_type=Thinking") || line.contains("event_type=ToolStart"))
     });
-    eprintln!("delegate_045 delivery evidence: {delivery_evidence:?}");
+    eprintln!("delegate_046 delivery evidence: {delivery_evidence:?}");
     assert!(
         completed,
         "the REAL OpenCode worker did not report the listed sentinel through work-done; \
@@ -745,7 +745,7 @@ fn delegate_045_real_opencode_recovers_early_pointer_in_place() {
         "OpenCode transcript contains {transcript_prompts} user turns for this task pointer"
     );
     eprintln!(
-        "delegate_045: {submit_probes} submit-only probe(s) and {} in-place pointer \
+        "delegate_046: {submit_probes} submit-only probe(s) and {} in-place pointer \
          re-delivery attempt(s) occurred before work-done; first proof={:?}; \
          a retype {} the likely landing copy",
         retry_lines.len(),

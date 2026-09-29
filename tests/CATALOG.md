@@ -3457,50 +3457,50 @@ without depending on the config struct API.
 - **Asserts:** the focused worker shows a draft while the pointer remains absent for three seconds; Enter leaves the draft and pointer as separate submitted lines in the worker PTY.
 - **Does not assert:** native agent editor behavior, retry policy, or any real-agent action on the task file.
 - **Platform coverage:** mac+linux.
-##### orchestration/delegate/041 — A task pointer swallowed by a silent worker's boot is retried into the same process (issue #1383).
+##### orchestration/delegate/042 — A task pointer swallowed by a silent worker's boot is retried into the same process (issue #1383).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`; real deck TUI, daemon, delegate CLI, and managed worker PTY; no model or credential).
 - **Agent:** a Python stand-in declared as `opencode`, which takes raw PTY input and consumes it for 3.5 seconds before accepting lines; it sends no hook event, so delegation uses the declared no-signal readiness path.
 - **Asserts:** the first pointer actually appears in the stand-in's discarded-byte log during boot; after its ready point a retry delivers the pointer, and a unique proof renders in the attached worker pane. The accepting PID equals the replacement worker's PID, the launch log contains only the initial spawn and the one `clear = true` replacement, and that replacement remains alive.
 - **Does not assert:** a real OpenCode boot distribution, model execution of the task file, or acknowledgement protocol details.
 - **Platform coverage:** mac+linux (Unix PTY and Python 3).
 
-##### orchestration/delegate/042 — Exhausted retries report silence without respawning the worker (issue #1383).
+##### orchestration/delegate/043 — Exhausted retries report silence without respawning the worker (issue #1383).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`; real deck TUI, daemon, delegate CLI, and managed worker PTY).
 - **Agent:** a Python stand-in declared as `opencode` that stays alive without reading PTY input or emitting hooks.
 - **Asserts:** after the three configured re-deliveries, the attached orchestrator pane visibly receives the daemon's not-delivered silence notice with the count of three re-sends; the replacement worker PID remains live and the launch log contains no third process.
 - **Does not assert:** any real model's behaviour when it receives an unanswered pointer.
 - **Platform coverage:** mac+linux (Unix PTY and Python 3).
 
-##### orchestration/delegate/043 — A visible composer gets submit-only retries (issues #1383 and #1243).
+##### orchestration/delegate/044 — A visible composer gets submit-only retries (issues #1383 and #1243).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`).
 - **Agent:** a Python stand-in declared as `opencode` that renders typed bytes but temporarily ignores Enter, with no hook events.
 - **Asserts:** the worker eventually renders proof of accepting the task in its attached pane; its raw PTY log contains the task pointer exactly once after the complete retry schedule; the accepting PID is the same replacement worker and no further process launches.
 - **Does not assert:** a real agent's composer layout or model execution.
 - **Platform coverage:** mac+linux (Unix PTY and Python 3).
 
-##### orchestration/delegate/044 — A hookless worker's acknowledgement retires retries and its silence watch (issue #1383).
+##### orchestration/delegate/045 — A hookless worker's acknowledgement retires retries and its silence watch (issue #1383).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`; real CLI and hook socket).
 - **Agent:** a Python stand-in declared as `opencode` that reads its real task file and invokes `dot-agent-deck ack` twice, emitting no agent hook events.
 - **Asserts:** the task file names the pointer's delivery id in its ack header; both ack invocations exit zero; the raw PTY log contains one pointer after the full retry schedule; and the attached orchestrator pane receives no silent-worker notice.
 - **Does not assert:** an LLM following the task-file instruction or a real agent's hook delivery.
 - **Platform coverage:** mac+linux (Unix PTY and Python 3).
 
-##### orchestration/delegate/045 — A real interactive OpenCode worker completes a delegation whose first pointer is sent during boot (issue #1383).
+##### orchestration/delegate/046 — A real interactive OpenCode worker completes a delegation whose first pointer is sent during boot (issue #1383).
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_delegate_respawn_readiness.rs`; real TUI, daemon, OpenCode, and `work-done` CLI; developer credentials required).
 - **Agent:** real interactive OpenCode on the configured cheap test model, with `--auto`; the worker has a uniquely named fixture sentinel in its orchestration worktree.
 - **Asserts:** with a zero readiness buffer and a bounded retry schedule that reaches past observed slow OpenCode startups, the replacement worker lists the fixture worktree by its explicit path, reports the exact sentinel filename through `work-done`, and keeps the same daemon agent identity until completion. The daemon log shows no Enter-only probe or pointer retype after that pane's first `Thinking` or `ToolStart` proof; OpenCode's transcript database contains exactly one user text part for the task pointer. It counts submit-only probes and in-place pointer re-deliveries separately and reports whether a retype was likely the copy that landed; the log cannot identify the consumed copy with certainty. A failure preserves the log beside the harness cast.
-- **Does not assert:** a universal OpenCode boot distribution or that every run loses its first pointer; the zero buffer makes that race likely, while `/041` pins the loss deterministically.
+- **Does not assert:** a universal OpenCode boot distribution or that every run loses its first pointer; the zero buffer makes that race likely, while `/042` pins the loss deterministically.
 - **Platform coverage:** mac+linux (Unix PTY; local lane 2 only).
 - **Cost note:** one short real OpenCode worker turn plus the model preflight.
 
-##### orchestration/delegate/046 — A ready Claude composer recovers an unsubmitted pointer (issue #1243).
+##### orchestration/delegate/047 — A ready Claude composer recovers an unsubmitted pointer (issue #1243).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`).
 - **Agent:** Python stand-in declared as `claude`, emitting `SessionStart` before rendering the `❯` composer and `UserPromptSubmit` through the real hook CLI when a later Enter accepts the pointer.
 - **Asserts:** the pointer reaches the ready worker, the first Enter is dropped, a later Enter submits it in the same process and emits turn evidence, the attached pane shows completion, the pointer was typed exactly once, exactly two Enter bytes reached the worker, and no input byte arrived after acceptance. The stand-in records each raw input byte with a timestamp relative to acceptance.
 - **Does not assert:** a real Claude model turn or the provider's actual composer implementation.
 - **Platform coverage:** mac+linux (Unix PTY and Python 3).
 
-##### orchestration/delegate/047 — A Codex composer recovers an unsubmitted pointer (issue #1243).
+##### orchestration/delegate/048 — A Codex composer recovers an unsubmitted pointer (issue #1243).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`).
 - **Agent:** Python stand-in declared as `codex`, emitting a real `SessionStart` hook and rendering the `›` composer before dropping its first Enter.
 - **Asserts:** the pointer reaches the worker, a later Enter submits it in the same process, the attached pane shows completion, the pointer was typed exactly once, exactly two Enter bytes reached the worker, and no input byte arrived after acceptance. The stand-in records each raw input byte with a timestamp relative to acceptance.

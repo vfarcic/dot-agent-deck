@@ -7813,6 +7813,18 @@ impl AgentPtyRegistry {
         self.launcher_handoff_agents.lock().unwrap().len()
     }
 
+    /// Issue #1383 × #544 test seam: feed `bytes` into `pane_id`'s input model
+    /// as though the deck had written them, without writing them to the PTY —
+    /// how a test opens or closes a bracketed paste, and with it a pending
+    /// draft ([`Self::draft_pending`]), with no user keystroke on record.
+    #[cfg(test)]
+    pub(crate) fn note_deck_bytes_for_test(&self, pane_id: &str, bytes: &[u8]) {
+        self.pane_input
+            .lock()
+            .unwrap()
+            .note_deck_bytes(pane_id, bytes);
+    }
+
     /// Issue #1383 test seam: take and hold `pane_id`'s live writer, so a test
     /// can park a guarded write on it and change state underneath. The writer
     /// is released when the returned guard drops.

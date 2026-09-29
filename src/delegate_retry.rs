@@ -43,14 +43,14 @@
 //! read its task file.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{broadcast, oneshot};
 use tracing::{info, warn};
 
-use crate::agent_pty::{AgentPtyRegistry, GuardedSend, GuardedSendDetail};
+use crate::agent_pty::{AgentPtyRegistry, GuardedSend, GuardedSendDetail, SubmitGate};
 use crate::config_validation::escape_id_for_log;
 use crate::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
 use crate::state::OrchestrationIdentity;
@@ -342,7 +342,7 @@ pub enum Composer {
     /// scrolled it away. Later re-deliveries still press their probe Enter,
     /// because a worker that is not reading its terminal yet has the pointer
     /// and each Enter echoed into this shape by the line discipline alone
-    /// (`orchestration/delegate/042`).
+    /// (`orchestration/delegate/043`).
     PointerInHistory,
     /// The screen says nothing about the composer: it shows nothing at all and
     /// the PTY was resized since the pointer was typed (a resize drops the
@@ -1252,7 +1252,7 @@ pub(crate) async fn run(retry: DeliveryRetry) -> RetryEnd {
                 // A screen the deck cannot read gets the Enter and nothing
                 // more, as before this audit: a resize-blanked one belongs to a
                 // worker that has not repainted since and may well hold the
-                // pointer already (`orchestration/delegate/043` attaches the
+                // pointer already (`orchestration/delegate/044` attaches the
                 // worker pane, which resizes it, after the task was accepted).
                 Composer::Unreadable => continue,
                 // PR #1414 review: the pointer was already submitted. The
@@ -1454,8 +1454,14 @@ async fn redeliver(
     // The dispatch lock, then the generation check: a newer delegation that took
     // the lock first has already superseded this record, so an old pointer can
     // never land after a new delegation starts.
-    let dispatch_mutex = registry.pane_dispatch_lock(pane_id);
-    let _dispatch_guard = dispatch_mutex.lock().await;
+    //
+    // Issue #544 (PR #1398): held as a `PaneDispatchHold`, #1398's own shape for
+    // the delegate pointer, because a retype waits behind the worker's draft
+    // the way the first write does and sets the lock down for as long as it
+    // sleeps there. A superseding delegate or a `pane restart` is therefore
+    // never parked behind that wait (up to the draft cap); the write re-checks
+    // the delivery under the pane's writer once the wait is over (below).
+    let mut dispatch_hold = registry.hold_pane_dispatch(pane_id).await;
     if !registry.pending_deliveries().is_current(pane_id, seq) {
         return Attempt::Stop(RetryEnd::Superseded);
     }
@@ -1472,6 +1478,19 @@ async fn redeliver(
             "delegate retry: someone has typed into the worker pane since the deck last wrote to \
              it; skipping this re-delivery"
         );
+        return Attempt::Skipped;
+    }
+    // Issue #544 (PR #1398): a bare Enter submits whatever the composer holds,
+    // and #1398 does not defer an empty payload, so the probe is skipped
+    // outright while the worker pane has an unsent draft. That can hold with
+    // nobody having typed since the deck's last write: a bracketed paste left
+    // open takes the first write's own CR as paste content, so the draft
+    // survives it. The attempt still counts toward the bound. This is the early
+    // out, before the screen is read; the check that holds is the one under the
+    // pane's writer (below), which also covers the second Enter and a draft that
+    // appears meanwhile. A retype waits for the draft instead.
+    if phase == Phase::Probe && registry.draft_pending(pane_id) {
+        log_draft_skip(ctx, attempt, phase);
         return Attempt::Skipped;
     }
     // Off the async worker: the snapshot takes the registry's synchronous mutex
@@ -1611,19 +1630,25 @@ async fn redeliver(
     let revalidate_registry = Arc::clone(registry);
     let revalidate_pane = pane_id.to_string();
     let expected_orchestration = orchestration.cloned();
-    // Issue #544 / PR #1398: this retype goes through the IMMEDIATE guarded
-    // entry, whose only draft check is "has someone typed since the deck's last
-    // automatic write" (the pre-check above and the writer's own). #1398's
-    // deferring first-write entry also defers on a draft that was already
-    // pending, or that the agent itself put in its composer. Switching this call
-    // to it is NOT a one-line swap: it returns `FirstWriteSend { detail,
-    // deferred }` rather than a `GuardedSendDetail`, so the match below changes;
-    // its wait runs while this function holds `pane_dispatch_lock`, so a
-    // superseding delegation queues behind it; and an ack, a `work-done` or a
-    // supersede can land during that wait, so the pending-delivery generation
-    // has to be revalidated after it (the closure below already re-checks it
-    // under the writer). The probe stays on this entry either way: #1398 exempts
-    // empty payloads, and #424's probe guard refuses one after typing.
+    // Issue #544 / PR #1398: every write here goes through the DEFERRING
+    // first-write entry. A retype is the same pointer the dispatch's first write
+    // waited to type, so it waits for the worker's unsent draft the same way,
+    // with the dispatch lock set down meanwhile. An empty payload is never
+    // deferred (#1398 exempts it); the checks above and under the writer keep
+    // an Enter off a draft instead.
+    //
+    // A deferred retype can sleep until the draft cap, and an ack, a
+    // `work-done`, a supersede or a pane close can land in that time. The
+    // closure below is what re-checks all of them: it runs once, under the
+    // pane's writer, on the pass that writes — so after any wait — and nothing
+    // is written when the delivery is no longer current. It also refuses while
+    // a draft is still pending, which is the cap letting the write go on top of
+    // it: #1398 degrades a FIRST write to that rather than lose a prompt, but a
+    // re-send has a first write behind it and skips instead. And a retype is
+    // refused once someone has typed since the deck last wrote, which is how
+    // most drafts end: the payload guard under the writer only refuses a
+    // repeat of bytes still in the box, and the first write's were released on
+    // `Applied`.
     //
     // Issue #1243: unlike the first write, a retype does NOT hold its CR until
     // the pointer renders. It is only ever typed over a screen that showed no
@@ -1636,42 +1661,69 @@ async fn redeliver(
     //
     // The geometry epoch is read BEFORE the write, as the dispatch reads the
     // first write's: a resize during this write's `SUBMIT_DELAY` then counts.
-    let epoch_before_write = registry.geometry_changes_of(worker_agent_id);
+    //
+    // With a draft wait in front of it, "before the write" means after the
+    // wait: the closure samples the epoch under the writer.
+    let epoch_before_write = Arc::new(Mutex::new(None::<u64>));
+    let refused_for_draft = Arc::new(AtomicBool::new(false));
+    let epoch_sample = Arc::clone(&epoch_before_write);
+    let draft_flag = Arc::clone(&refused_for_draft);
+    let epoch_agent = worker_agent_id.to_string();
+    let retyping = !text.is_empty();
     let outcome = registry
-        .write_and_submit_guarded_detailed(pane_id, text, worker_agent_id, || async move {
-            if revalidate_registry.is_pane_closing(&revalidate_pane) {
-                return false;
-            }
-            // Issue #1383 audit (M4): an ack, a `work-done` or a newer
-            // delegation that removed this delivery while the write waited for
-            // the pane's writer must stop it here, under that writer, rather
-            // than type bytes after it. The ack path does not take the dispatch
-            // lock, so the check above cannot cover that wait.
-            //
-            // Issue #1383 audit (M3), accepted residual: this runs ONCE, before
-            // the payload. An ack that lands after it — during the
-            // `SUBMIT_DELAY` between the payload and the CR — does not stop the
-            // CR: a probe or second Enter still writes its one `\r`, and a
-            // retype, whose pointer bytes are already in the PTY by then, still
-            // writes the `\r` that submits them. An ack means the agent is
-            // already working, so what that costs is one CR, or one queued copy
-            // of the pointer, in the composer of a worker that has its task.
-            // Serialising the ack against this write was judged not worth
-            // holding the ack path on the pane writer for.
-            if !revalidate_registry
-                .pending_deliveries()
-                .is_current(&revalidate_pane, seq)
-            {
-                return false;
-            }
-            crate::state::orchestration_still_matches(
-                expected_orchestration.as_ref(),
-                revalidate_registry
-                    .pane_orchestration(&revalidate_pane)
-                    .as_ref(),
-            )
-        })
-        .await;
+        .write_and_submit_guarded_first_write_parking(
+            pane_id,
+            text,
+            worker_agent_id,
+            || async move {
+                if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                    return false;
+                }
+                // Issue #1383 audit (M4): an ack, a `work-done` or a newer
+                // delegation that removed this delivery while the write waited for
+                // the pane's writer, or for the worker's draft (#544), must stop it
+                // here, under that writer, rather than type bytes after it. The ack
+                // path does not take the dispatch lock, so the check above cannot
+                // cover that wait.
+                //
+                // Issue #1383 audit (M3), accepted residual: this runs ONCE, before
+                // the payload. An ack that lands after it — during the
+                // `SUBMIT_DELAY` between the payload and the CR — does not stop the
+                // CR: a probe or second Enter still writes its one `\r`, and a
+                // retype, whose pointer bytes are already in the PTY by then, still
+                // writes the `\r` that submits them. An ack means the agent is
+                // already working, so what that costs is one CR, or one queued copy
+                // of the pointer, in the composer of a worker that has its task.
+                // Serialising the ack against this write was judged not worth
+                // holding the ack path on the pane writer for.
+                if !revalidate_registry
+                    .pending_deliveries()
+                    .is_current(&revalidate_pane, seq)
+                {
+                    return false;
+                }
+                if revalidate_registry.draft_pending(&revalidate_pane)
+                    || (retyping
+                        && revalidate_registry.user_typed_since_automatic_write(&revalidate_pane))
+                {
+                    draft_flag.store(true, Ordering::SeqCst);
+                    return false;
+                }
+                *epoch_sample.lock().unwrap() =
+                    revalidate_registry.geometry_changes_of(&epoch_agent);
+                crate::state::orchestration_still_matches(
+                    expected_orchestration.as_ref(),
+                    revalidate_registry
+                        .pane_orchestration(&revalidate_pane)
+                        .as_ref(),
+                )
+            },
+            std::time::Instant::now(),
+            &mut dispatch_hold,
+            SubmitGate::Delay,
+        )
+        .await
+        .map(|sent| sent.detail);
     match outcome {
         Ok(GuardedSendDetail::Outcome(GuardedSend::Applied)) => {
             if text.is_empty() {
@@ -1686,7 +1738,7 @@ async fn redeliver(
                 );
                 // The pointer's bytes went in at this epoch, or before a resize
                 // a later reading will see.
-                *pointer_epoch = epoch_before_write;
+                *pointer_epoch = *epoch_before_write.lock().unwrap();
             }
             info!(
                 pane_id = %escape_id_for_log(pane_id),
@@ -1737,6 +1789,11 @@ async fn redeliver(
             );
             Attempt::Stop(RetryEnd::Cancelled)
         }
+        // Issue #544: refused under the writer for a draft; nothing written.
+        Ok(_) if refused_for_draft.load(Ordering::SeqCst) => {
+            log_draft_skip(ctx, attempt, phase);
+            Attempt::Skipped
+        }
         // A partial write: a prefix may be in the box, and a further attempt
         // could submit it. Stop, and leave the payload record standing (#715).
         Ok(GuardedSendDetail::Outcome(GuardedSend::Ambiguous)) => {
@@ -1775,6 +1832,22 @@ async fn redeliver(
             Attempt::Stop(RetryEnd::WriteStopped)
         }
     }
+}
+
+/// Issue #544 (PR #1398): the one log line for a re-delivery skipped over an
+/// unsent draft in the worker pane, whichever check caught it.
+fn log_draft_skip(ctx: &RedeliverCtx<'_>, attempt: usize, phase: Phase) {
+    info!(
+        pane_id = %escape_id_for_log(ctx.pane_id),
+        role = %escape_id_for_log(ctx.role),
+        delivery_id = %ctx.delivery_id,
+        attempt,
+        total_attempts = ctx.total_attempts,
+        phase = ?phase,
+        "delegate retry: the worker pane holds an unsent draft, or someone typed into it while \
+         this re-delivery waited for one; an Enter or a retyped pointer would submit it, so \
+         nothing written and skipping this re-delivery"
+    );
 }
 
 #[cfg(test)]
@@ -2086,7 +2159,7 @@ mod tests {
 
     /// The id fills its row exactly and only the pointer's closing `]` wraps
     /// onto the cursor's row — measured at 77 columns, which is where
-    /// `orchestration/delegate/043`'s worker pane lands. Bare, and inside
+    /// `orchestration/delegate/044`'s worker pane lands. Bare, and inside
     /// OpenCode-style border glyphs.
     #[test]
     fn classify_composer_an_id_whose_closing_bracket_wrapped_is_in_the_composer() {
@@ -3284,6 +3357,179 @@ while chunk := os.read(0, 4096):
             fx.sink_text().await,
             format!("{POINTER}\n"),
             "nothing may reach the worker after its ack"
+        );
+        fx.stop();
+    }
+
+    /// Issue #544 × #1383: a bare Enter submits whatever the worker's
+    /// composer holds, so no re-delivery presses one while the pane has an
+    /// unsent draft — here a bracketed paste left open, whose draft survives
+    /// the first write because that write's CR lands inside the paste. Nobody
+    /// has typed since the deck's last write, so the older "someone typed"
+    /// check does not catch it. The skipped attempts still count toward the
+    /// bound, so the loop ends on schedule.
+    #[tokio::test]
+    async fn retry_loop_presses_no_enter_while_a_draft_is_pending() {
+        let fx = Fixture::start_with("retry-draft-probe", "stty raw -echo").await;
+        let (handle, redeliveries) = fx
+            .deliver_then_retry("150,150", RetypePolicy::Allowed, |fx| {
+                fx.registry.note_deck_bytes_for_test(&fx.pane, b"\x1b[200~");
+            })
+            .await;
+        assert!(fx.registry.draft_pending(&fx.pane), "precondition: a draft");
+        assert!(
+            !fx.registry.user_typed_since_automatic_write(&fx.pane),
+            "precondition: nobody typed since the first write"
+        );
+        assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
+        assert_eq!(redeliveries.tally(), RedeliveryTally::default());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            fx.sink_text().await,
+            format!("{POINTER}\r"),
+            "no Enter may reach a pane holding a draft"
+        );
+        fx.stop();
+    }
+
+    /// The same, for a draft that appears after the attempt's first check while
+    /// its Enter waits for the pane's writer: the check under the writer is the
+    /// one that holds.
+    #[tokio::test]
+    async fn retry_loop_presses_no_enter_over_a_draft_that_appears_while_it_waits_on_the_writer() {
+        let fx = Fixture::start_with("retry-draft-writer", "stty raw -echo").await;
+        let (handle, redeliveries) = fx.deliver_and_retry("150").await;
+        let first = format!("{POINTER}\r");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fx.sink_text().await != first {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "precondition: the first write never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let writer = fx.registry.hold_pane_writer_for_test(&fx.pane).await;
+        // Past the 150 ms wait: the probe has passed its first check and is
+        // queued behind the held writer.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        fx.registry.note_deck_bytes_for_test(&fx.pane, b"\x1b[200~");
+        drop(writer);
+        assert_eq!(end_of(handle).await, RetryEnd::Exhausted);
+        assert_eq!(redeliveries.tally(), RedeliveryTally::default());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            fx.sink_text().await,
+            first,
+            "no Enter may reach a pane holding a draft"
+        );
+        fx.stop();
+    }
+
+    /// Deliver the pointer, let the probe's Enter go unanswered, and park the
+    /// retype that follows on a draft that appears after its attempt began:
+    /// the writer is held through the probe's grace, so the retype passes its
+    /// checks and queues on it with no draft pending, and the draft is opened
+    /// before the writer is let go. Returns the loop and what the worker has
+    /// received so far, once the retype has set the dispatch lock down.
+    async fn park_a_retype_behind_a_draft(
+        fx: &Fixture,
+    ) -> (
+        tokio::task::JoinHandle<RetryEnd>,
+        Arc<RedeliveryCounts>,
+        String,
+    ) {
+        assert!(
+            fx.registry.draft_defer_cap() >= Duration::from_secs(10),
+            "precondition: the draft deferral is on"
+        );
+        let (handle, redeliveries) = fx.deliver_and_retry("2000").await;
+        // The probe's Enter goes in at 2 s; the retype follows a 1 s grace.
+        let probed = format!("{POINTER}\r\r");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fx.sink_text().await != probed {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "precondition: the probe never landed: {:?}",
+                fx.sink_text().await
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let writer = fx.registry.hold_pane_writer_for_test(&fx.pane).await;
+        tokio::time::sleep(probe_grace(Duration::from_millis(2000)) + Duration::from_millis(500))
+            .await;
+        fx.registry.note_deck_bytes_for_test(&fx.pane, b"\x1b[200~");
+        drop(writer);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fx.registry.pane_dispatch_lock(&fx.pane).try_lock().is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a retype waiting for the draft must set the dispatch lock down"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (handle, redeliveries, probed)
+    }
+
+    /// Issue #544 × #1383: a retype goes through #1398's deferring entry, so a
+    /// draft that appears after its attempt began holds it, with the dispatch
+    /// lock set down as #1398 does for the first write, and the pointer is
+    /// typed once the draft ends — not skipped, and not typed onto it.
+    #[tokio::test]
+    async fn retry_loop_retype_waits_for_a_draft_and_then_writes() {
+        let fx = Fixture::start_with("retry-draft-retype-wait", "stty raw -echo").await;
+        let (handle, redeliveries, probed) = park_a_retype_behind_a_draft(&fx).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            fx.sink_text().await,
+            probed,
+            "nothing may be typed while the draft is pending"
+        );
+        fx.registry.note_deck_bytes_for_test(&fx.pane, b"\x1b[201~");
+        let retyped = format!("{probed}{POINTER}\r");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fx.sink_text().await != retyped {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the retype must follow the draft's end: {:?}",
+                fx.sink_text().await
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        fx.tx
+            .send(fx.event(EventType::Thinking, &fx.agent))
+            .unwrap();
+        assert_eq!(end_of(handle).await, RetryEnd::Received);
+        assert_eq!(redeliveries.tally().retypes, 1);
+        fx.stop();
+    }
+
+    /// An ack that lands while a retype waits for a draft leaves nothing
+    /// written once the draft ends: the delivery is re-checked under the
+    /// writer after the wait. The draft ends with no keystroke on record, so
+    /// that re-check is the only thing that can stop the write.
+    #[tokio::test]
+    async fn retry_loop_deferred_retype_writes_nothing_after_an_ack_during_the_wait() {
+        let fx = Fixture::start_with("retry-draft-retype-ack", "stty raw -echo").await;
+        let (handle, redeliveries, probed) = park_a_retype_behind_a_draft(&fx).await;
+        assert!(
+            matches!(
+                fx.registry
+                    .pending_deliveries()
+                    .acknowledge(&fx.pane, ID, Some(&fx.agent)),
+                AckOutcome::Stopped { .. }
+            ),
+            "the ack must match the pending delivery"
+        );
+        fx.registry.note_deck_bytes_for_test(&fx.pane, b"\x1b[201~");
+        assert!(!fx.registry.draft_pending(&fx.pane));
+        assert!(!fx.registry.user_typed_since_automatic_write(&fx.pane));
+        assert_eq!(end_of(handle).await, RetryEnd::Cancelled);
+        assert_eq!(redeliveries.tally().retypes, 0);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            fx.sink_text().await,
+            probed,
+            "nothing may be typed after the ack"
         );
         fx.stop();
     }

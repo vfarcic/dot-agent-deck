@@ -8634,6 +8634,9 @@ async fn dispatch_one_owned(
     // silence watch's reason above: a fast agent's first `Thinking` must not land
     // before the loop can see it. Registering first means an `ack` can never
     // arrive for a delivery the daemon does not know about yet.
+    // (The receiver subscribed here is only the fallback: the loop reads one
+    // re-subscribed when the pointer actually goes in, after any wait for the
+    // worker's draft — see [`PointerWriteSample`].)
     //
     // Armed independently of the silent-worker report, for #1031's reason below:
     // the e2e harness pins that report off, and a delivery fix must not inherit a
@@ -8745,18 +8748,14 @@ async fn dispatch_one_owned(
     // worker's draft — non-zero means the dispatch lock was set down, so a
     // `pane restart` may have replaced the worker meanwhile.
     let mut pointer_deferred = std::time::Duration::ZERO;
-    //
-    // Issue #1383 (Qodo, PR #1414): the geometry epoch the retry loop compares
-    // against is read before the payload goes in, not when the loop starts.
-    // This write can hold its CR for the echo bound plus `SUBMIT_DELAY`, and a
-    // resize inside that time blanks the screen; read afterwards, the epoch
-    // would hide it and the loop would retype a pointer that went in. And it
-    // is read AFTER any wait for the worker's draft (issue #544): a resize
-    // during that wait is not one the pointer's bytes were typed across, and
-    // counting it would withhold every retype for a pointer that did not
-    // render. So `revalidate` samples it — that closure runs once, under the
-    // worker's writer, on the pass that writes, immediately before the payload.
-    let epoch_at_write = Arc::new(std::sync::Mutex::new(None::<u64>));
+    // Issue #1383 × #544: what the retry loop and the silent-worker watch need
+    // from the moment the pointer goes in, sampled by `revalidate` — which runs
+    // once, under the worker's writer, on the pass that writes: after any wait
+    // for the worker's draft, immediately before the payload. See
+    // [`PointerWriteSample`].
+    let write_sample = Arc::new(std::sync::Mutex::new(PointerWriteSample::default()));
+    let sample_retry = pending_retry.is_some();
+    let sample_silence = silence.is_some();
     let outcome = if let Some(worker_agent_id) = expected_worker_agent_id.as_deref() {
         // Issue #544: the idle-worker watch armed in `handle_delegate` must
         // not count the time this write waits for the worker's draft.
@@ -8767,14 +8766,18 @@ async fn dispatch_one_owned(
                 &one_liner,
                 worker_agent_id,
                 {
-                    let epoch_at_write = Arc::clone(&epoch_at_write);
-                    let epoch_agent = worker_agent_id.to_string();
+                    let write_sample = Arc::clone(&write_sample);
+                    let sample_agent = worker_agent_id.to_string();
+                    let sample_tx = event_tx.clone();
                     || async move {
                         if revalidate_registry.is_pane_closing(&revalidate_pane) {
                             return false;
                         }
-                        *epoch_at_write.lock().unwrap() =
-                            revalidate_registry.geometry_changes_of(&epoch_agent);
+                        *write_sample.lock().unwrap() = PointerWriteSample {
+                            epoch: revalidate_registry.geometry_changes_of(&sample_agent),
+                            retry_rx: sample_retry.then(|| sample_tx.subscribe()),
+                            silence_rx: sample_silence.then(|| sample_tx.subscribe()),
+                        };
                         orchestration_still_matches(
                             expected_orchestration.as_ref(),
                             revalidate_registry
@@ -9039,6 +9042,8 @@ async fn dispatch_one_owned(
     // Only over an `Applied` first write, the same line #1031 draws: an
     // `Ambiguous` write may have left a PREFIX of the pointer in the composer, and
     // a retype would submit that prefix and the pointer as one turn.
+    // Empty unless `revalidate` ran, which every `Applied` write did.
+    let mut at_write = std::mem::take(&mut *write_sample.lock().unwrap());
     let redeliveries = Arc::new(crate::delegate_retry::RedeliveryCounts::default());
     let mut retry_done = None;
     if let Some((armed_retry, retry_rx)) = pending_retry {
@@ -9060,7 +9065,7 @@ async fn dispatch_one_owned(
                 );
                 crate::delegate_retry::spawn(crate::delegate_retry::DeliveryRetry {
                     registry: Arc::clone(&registry),
-                    event_rx: retry_rx,
+                    event_rx: at_write.retry_rx.take().unwrap_or(retry_rx),
                     armed: armed_retry,
                     schedule: retry_schedule.clone(),
                     pane_id: pane_id.clone(),
@@ -9068,7 +9073,7 @@ async fn dispatch_one_owned(
                     role: target_role.clone(),
                     delivery_id: delivery_id.clone(),
                     pointer: one_liner.clone(),
-                    pointer_epoch: *epoch_at_write.lock().unwrap(),
+                    pointer_epoch: at_write.epoch,
                     orchestration: orchestration.clone(),
                     redeliveries: Arc::clone(&redeliveries),
                     silence_report_armed: delivered && silence.is_some(),
@@ -9120,13 +9125,45 @@ async fn dispatch_one_owned(
     // consumed them". Watch for the symptom of the difference.
     arm_delegate_silence_watch(
         registry,
-        rx,
+        at_write.silence_rx.take().unwrap_or(rx),
         watch,
         armed,
         pane_id,
         worker_agent_id,
         target_role,
     );
+}
+
+/// Issue #1383 × #544: what a delegate pointer's write samples at the moment it
+/// goes in — under the worker's writer, on the pass that writes, so after any
+/// wait for the worker's unsent draft and immediately before the payload.
+///
+/// Before #544 "just before the write" and "when the dispatch reached its
+/// write" were microseconds apart, and both the retry loop and the silent-worker
+/// watch subscribed at the latter. A draft wait now sits between them, up to the
+/// draft cap, which breaks both in the same direction:
+///
+/// * an event the worker emitted DURING the wait — a turn begun by the draft
+///   the user just submitted, most often — was read as proof that a pointer
+///   not yet written had arrived, and the retry stopped before it began;
+/// * a receiver held through a wait on a busy deck could fall more than the bus
+///   holds behind, and a lagged receiver ends both the loop and the report.
+///
+/// So the loop and the watch take receivers subscribed here instead, and the
+/// retry loop takes its geometry epoch here too: a resize during the wait is
+/// not one the pointer's bytes were typed across, and counting it would read
+/// every later screen as unreadable and withhold every retype. The receivers
+/// the dispatch subscribed earlier are kept only as the fallback for a write
+/// whose `revalidate` never ran, which no `Applied` write is.
+#[derive(Default)]
+struct PointerWriteSample {
+    /// The worker's PTY geometry epoch
+    /// ([`AgentPtyRegistry::geometry_changes_of`]).
+    epoch: Option<u64>,
+    /// For the in-place retry, when one is armed.
+    retry_rx: Option<broadcast::Receiver<BroadcastMsg>>,
+    /// For the silent-worker watch, when one is armed.
+    silence_rx: Option<broadcast::Receiver<BroadcastMsg>>,
 }
 
 /// PRD #20 blocker-4: build an inert [`AgentEvent`] that carries only a
@@ -18290,6 +18327,100 @@ mod tests {
             "the early ack must have cancelled the silent-worker watch"
         );
         drop(event_tx);
+        registry.shutdown_all();
+    }
+
+    /// Issue #1383 × #544: a pointer deferred behind the worker's unsent draft
+    /// has not gone in yet, so nothing the worker emits during that wait is
+    /// proof that it arrived. The retry loop reads a receiver subscribed when
+    /// the pointer is actually written ([`PointerWriteSample`]); one subscribed
+    /// when the dispatch reached its write held the worker's `Thinking` from
+    /// the wait — a turn begun by the draft the user just submitted, in
+    /// practice — and stopped the retry before the pointer was typed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_retry_ignores_an_event_from_the_draft_wait_before_its_pointer() {
+        const ORCH_PANE: &str = "draft-wait-orch";
+        const WORKER_PANE: &str = "draft-wait-worker";
+
+        // The default schedule: its first re-send is 20 s out, so a loop still
+        // pending after the write is one that no event has stopped.
+        let _schedule = RETRY_SCHEDULE_ENV_LOCK.lock().await;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        assert!(
+            registry.draft_defer_cap() >= std::time::Duration::from_secs(10),
+            "precondition: the draft deferral is on"
+        );
+        let spawn = |pane: &str, agent_type: crate::event::AgentType| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )]),
+                    agent_type: Some(agent_type),
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn stand-in")
+        };
+        let worker = spawn(WORKER_PANE, crate::event::AgentType::OpenCode);
+        let _orch = spawn(ORCH_PANE, crate::event::AgentType::ClaudeCode);
+        let (event_tx, _event_rx) = broadcast::channel(64);
+
+        // A bracketed paste left open in the worker pane: a pending draft with
+        // no keystroke on record.
+        registry.note_deck_bytes_for_test(WORKER_PANE, b"\x1b[200~");
+        let dispatch = tokio::spawn(dispatch_one_owned(
+            registry.clone(),
+            event_tx.clone(),
+            None,
+            ORCH_PANE.to_string(),
+            "coder".to_string(),
+            WORKER_PANE.to_string(),
+            "do the task".to_string(),
+            None,
+            None,
+            PointerQueueClock::new(registry.clone(), WORKER_PANE.to_string(), None),
+            None,
+            None,
+            None,
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !registry.pending_deliveries().is_pending(WORKER_PANE)
+            || registry.pane_dispatch_lock(WORKER_PANE).try_lock().is_err()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pointer never parked on the worker's draft"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!dispatch.is_finished(), "precondition: the pointer waits");
+        event_tx
+            .send(BroadcastMsg::Event(
+                serde_json::from_value(serde_json::json!({
+                    "session_id": "s",
+                    "agent_type": "open_code",
+                    "event_type": "thinking",
+                    "timestamp": "2026-09-29T00:00:00Z",
+                    "pane_id": WORKER_PANE,
+                    "agent_id": worker,
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        registry.note_deck_bytes_for_test(WORKER_PANE, b"\x1b[201~");
+        tokio::time::timeout(std::time::Duration::from_secs(30), dispatch)
+            .await
+            .expect("the dispatch finishes once the draft ends")
+            .expect("the dispatch does not panic");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            registry.pending_deliveries().is_pending(WORKER_PANE),
+            "an event from before the pointer went in stopped its retry"
+        );
+        assert!(registry.pending_deliveries().supersede(WORKER_PANE));
         registry.shutdown_all();
     }
 

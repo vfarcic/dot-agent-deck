@@ -18,6 +18,19 @@ use spec::spec;
 
 const DRAFT: &str = "draft-544-sentinel";
 const POINTER: &str = "Read .dot-agent-deck/worker-task-worker.md for your task.";
+
+/// Issue #1383: the pointer ends in its delivery id, so the line the worker
+/// echoes back is `POINTER [delivery d-xxxxxxxx]`. Whether `text` holds that
+/// line submitted — followed by the CR the worker's terminal echoes as CRLF.
+fn pointer_line_submitted(text: &str) -> bool {
+    text.split("\r\n").any(|line| {
+        line.strip_prefix(POINTER)
+            .and_then(|rest| rest.strip_prefix(" [delivery d-"))
+            .and_then(|rest| rest.strip_suffix(']'))
+            .is_some_and(|id| id.len() == 8 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            && text.contains(&format!("{line}\r\n"))
+    })
+}
 const FEEDBACK: &str = "work-done-draft-544-feedback";
 const FIRST_REPORT: &str = "work-done-order-544-first";
 const SECOND_REPORT: &str = "work-done-order-544-second";
@@ -151,7 +164,7 @@ fn orchestration_delegate_041_pointer_waits_for_attached_worker_draft() {
     assert!(
         common::wait_until(Duration::from_secs(10), || {
             let text = pane_text(&deck, &worker.id);
-            text.contains(&format!("{DRAFT}\r\n")) && text.contains(&format!("{POINTER}\r\n"))
+            text.contains(&format!("{DRAFT}\r\n")) && pointer_line_submitted(&text)
         }),
         "delegate pointer never arrived after Enter: {:?}",
         pane_text(&deck, &worker.id)
@@ -159,7 +172,7 @@ fn orchestration_delegate_041_pointer_waits_for_attached_worker_draft() {
     let text = pane_text(&deck, &worker.id);
     assert!(
         text.contains(&format!("{DRAFT}\r\n"))
-            && text.contains(&format!("{POINTER}\r\n"))
+            && pointer_line_submitted(&text)
             && !text.contains(&format!("{DRAFT}{POINTER}")),
         "draft and pointer were not separate submitted lines: {text:?}"
     );

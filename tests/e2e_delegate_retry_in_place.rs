@@ -63,9 +63,9 @@ fn launch_pids(path: &std::path::Path) -> Vec<u32> {
 /// stand-in whose replacement process consumes and discards its first PTY input.
 /// The task pointer must later reach that same process and print its proof in
 /// the attached worker pane, without another respawn.
-#[spec("orchestration/delegate/041")]
+#[spec("orchestration/delegate/042")]
 #[test]
-fn delegate_041_retries_lost_pointer_in_the_same_worker_process() {
+fn delegate_042_retries_lost_pointer_in_the_same_worker_process() {
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
         .with_pty_size(120, 40)
@@ -448,9 +448,9 @@ fn wait_past_retry_schedule() {
 /// stays alive but never reads its PTY or emits hooks. After three retries, the
 /// orchestrator must visibly receive the not-delivered silence report and the
 /// same replacement worker process must still be running.
-#[spec("orchestration/delegate/042")]
+#[spec("orchestration/delegate/043")]
 #[test]
-fn delegate_042_exhaustion_reports_three_retries_without_respawn() {
+fn delegate_043_exhaustion_reports_three_retries_without_respawn() {
     let (deck, work, delivered_pid) = launch_retry_fixture(
         NEVER_READS_WORKER,
         "python3 -u worker.py",
@@ -481,9 +481,9 @@ fn delegate_042_exhaustion_reports_three_retries_without_respawn() {
 /// its composer but ignores Enter for one second. Retries must submit that
 /// visible pointer without typing a second copy, and the same process must
 /// eventually accept the task.
-#[spec("orchestration/delegate/043")]
+#[spec("orchestration/delegate/044")]
 #[test]
-fn delegate_043_visible_composer_retries_submit_only() {
+fn delegate_044_visible_composer_retries_submit_only() {
     let (deck, work, delivered_pid) = launch_retry_fixture(
         COMPOSER_WORKER,
         "python3 -u worker.py",
@@ -619,9 +619,9 @@ fn ready_composer_lost_submit(agent: &str) {
 /// pointer in its ❯ composer, and ignores the first Enter. A later Enter makes
 /// it emit UserPromptSubmit and show completion without a second pointer copy
 /// or any input after acceptance.
-#[spec("orchestration/delegate/046")]
+#[spec("orchestration/delegate/047")]
 #[test]
-fn delegate_046_ready_claude_composer_recovers_lost_submit() {
+fn delegate_047_ready_claude_composer_recovers_lost_submit() {
     ready_composer_lost_submit("claude");
 }
 
@@ -629,9 +629,9 @@ fn delegate_046_ready_claude_composer_recovers_lost_submit() {
 /// pointer in its › composer while dropping the first Enter. A submit-only
 /// retry must complete the task in that process without typing again or
 /// sending any input after acceptance.
-#[spec("orchestration/delegate/047")]
+#[spec("orchestration/delegate/048")]
 #[test]
-fn delegate_047_ready_codex_composer_recovers_lost_submit() {
+fn delegate_048_ready_codex_composer_recovers_lost_submit() {
     ready_composer_lost_submit("codex");
 }
 
@@ -639,9 +639,9 @@ fn delegate_047_ready_codex_composer_recovers_lost_submit() {
 /// instruction from its real task file, then calls the real ack CLI twice.
 /// Both calls must succeed, the pointer must be delivered once, and no silent
 /// worker notice may reach the orchestrator after the retry window.
-#[spec("orchestration/delegate/044")]
+#[spec("orchestration/delegate/045")]
 #[test]
-fn delegate_044_ack_stops_retries_and_silence_notice() {
+fn delegate_045_ack_stops_retries_and_silence_notice() {
     let worker_command = format!(
         "python3 -u worker.py {}",
         env!("CARGO_BIN_EXE_dot-agent-deck")

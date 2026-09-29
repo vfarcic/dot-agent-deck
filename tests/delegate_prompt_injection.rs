@@ -4474,18 +4474,29 @@ fn dispatch_023_delegate_waits_for_unsent_worker_draft() {
             );
 
             harness.send_worker_user_bytes(b"\r").await;
+            // Issue #1383: the pointer ends in its delivery id,
+            // `[delivery d-xxxxxxxx]`, and only that line carries a `]`.
             let delivered = wait_for_snapshot_needle(
                 &harness.registry,
                 &harness.worker_agent_id,
-                b"Read .dot-agent-deck/worker-task-coder.md for your task.\r\n",
+                b"]\r\n",
                 Duration::from_secs(5),
             )
             .await;
             let text = String::from_utf8_lossy(&delivered);
+            let pointer_line = text
+                .split("\r\n")
+                .find(|line| {
+                    line.starts_with("Read .dot-agent-deck/worker-task-coder.md for your task.")
+                })
+                .unwrap_or_default();
             assert!(
                 text.contains("draft-544-sentinel-still-typing\r\n")
-                    && text
-                        .contains("Read .dot-agent-deck/worker-task-coder.md for your task.\r\n")
+                    && pointer_line.starts_with(
+                        "Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-"
+                    )
+                    && pointer_line.ends_with(']')
+                    && text.contains(&format!("{pointer_line}\r\n"))
                     && !text.contains("draft-544-sentinelRead"),
                 "user draft and automatic pointer were not separate submitted lines: {text:?}"
             );
