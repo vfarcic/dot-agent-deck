@@ -6,21 +6,33 @@
 //! what a manifest says. That is why this file depends on nothing but `std` and
 //! `toml`: it is compiled into more than one crate by `#[path]` (the way
 //! `build_version_resolve.rs` is shared between `build.rs` and a test), and each
-//! includer only has to provide `toml`.
+//! includer only has to provide `toml`. (The unit tests at the bottom also use
+//! `tempfile`; they compile only under `cfg(test)`, which `build.rs` never is.)
 //!
 //! Parsing is strict. An unknown key, a missing or empty field, a multi-line
 //! value, a duplicate slug or a slug outside the grammar below is an error,
 //! because a manifest that parses leniently publishes whatever the lenient
 //! reading happened to accept.
+//!
+//! The same two consumers also resolve every file they publish through here
+//! ([`page_source`], [`image_source`], [`image_dir`]), because a valid slug is
+//! not enough: `docs/alias.md` can be a symlink to `develop/secret.md`. The
+//! publication boundary is therefore checked on the CANONICAL path, once, for
+//! both the site and the binary.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Where the manifest lives, relative to the repository root.
 pub const MANIFEST_PATH: &str = "docs/published.toml";
 
 /// The top-level directory under `docs/` that is never published.
 pub const UNPUBLISHED_DIR: &str = "develop";
+
+/// The image directory under `docs/`, and the ONE place a published file may
+/// resolve outside `docs/`: in this repository `docs/img` is a symlink to
+/// `../site/static/img`, the images Docusaurus used to serve.
+pub const IMAGE_DIR: &str = "img";
 
 /// One published page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,4 +184,262 @@ fn check_slug(slug: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Why a file was refused at the publication boundary. The message names the
+/// page it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundaryError(pub String);
+
+impl fmt::Display for BoundaryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BoundaryError {}
+
+/// The canonical locations the boundary is checked against.
+struct Boundary {
+    docs: PathBuf,
+    /// `docs/develop` as a directory entry of the canonical `docs/`, and, when
+    /// it exists, its own canonical path (they differ if it is a symlink).
+    develop: Vec<PathBuf>,
+}
+
+impl Boundary {
+    fn new(docs_dir: &Path) -> Result<Self, BoundaryError> {
+        let docs = docs_dir
+            .canonicalize()
+            .map_err(|e| BoundaryError(format!("cannot resolve {}: {e}", docs_dir.display())))?;
+        let lexical = docs.join(UNPUBLISHED_DIR);
+        let mut develop = vec![lexical.clone()];
+        if let Ok(real) = lexical.canonicalize()
+            && real != lexical
+        {
+            develop.push(real);
+        }
+        Ok(Self { docs, develop })
+    }
+
+    fn is_unpublished(&self, real: &Path) -> bool {
+        self.develop.iter().any(|d| real.starts_with(d))
+    }
+
+    /// The canonical image directory, refused if it resolves under
+    /// `docs/develop/` or to `docs/` itself or one of its ancestors (either of
+    /// which would put `docs/develop/` inside the image tree).
+    fn image_dir(&self) -> Result<PathBuf, BoundaryError> {
+        let lexical = self.docs.join(IMAGE_DIR);
+        let real = lexical
+            .canonicalize()
+            .map_err(|e| BoundaryError(format!("cannot resolve {}: {e}", lexical.display())))?;
+        if self.is_unpublished(&real) || self.docs.starts_with(&real) {
+            return Err(BoundaryError(format!(
+                "docs/{IMAGE_DIR} resolves to {}, which is or contains docs/{UNPUBLISHED_DIR}/",
+                real.display()
+            )));
+        }
+        Ok(real)
+    }
+
+    /// Resolve `docs/<relative>` and refuse it unless its canonical path is
+    /// inside `docs/` and outside `docs/develop/` — or, when `allow_images`,
+    /// inside the image directory.
+    fn resolve(
+        &self,
+        docs_dir: &Path,
+        relative: &str,
+        slug: &str,
+        what: &str,
+        allow_images: bool,
+    ) -> Result<PathBuf, BoundaryError> {
+        let lexical = docs_dir.join(relative);
+        let real = lexical.canonicalize().map_err(|e| {
+            BoundaryError(if allow_images {
+                format!(
+                    "page `{slug}`: {what} {} cannot be read: {e}",
+                    lexical.display()
+                )
+            } else {
+                format!(
+                    "page `{slug}` is in the manifest but {} cannot be read: {e}",
+                    lexical.display()
+                )
+            })
+        })?;
+        let via_symlink = if real == self.docs.join(relative) {
+            ""
+        } else {
+            " through a symlink"
+        };
+        if self.is_unpublished(&real) {
+            return Err(BoundaryError(format!(
+                "page `{slug}`: {what} docs/{relative} resolves{via_symlink} to {}, under \
+                 docs/{UNPUBLISHED_DIR}/, which is never published",
+                real.display()
+            )));
+        }
+        if real.starts_with(&self.docs) {
+            return Ok(real);
+        }
+        if allow_images && real.starts_with(self.image_dir()?) {
+            return Ok(real);
+        }
+        Err(BoundaryError(format!(
+            "page `{slug}`: {what} docs/{relative} resolves{via_symlink} to {}, outside docs/{}",
+            real.display(),
+            if allow_images {
+                format!(" and outside docs/{IMAGE_DIR}/")
+            } else {
+                String::new()
+            }
+        )))
+    }
+}
+
+/// The file to read `page` from: `<docs_dir>/<slug>.md`, canonicalized, and
+/// refused unless it resolves inside `docs/` and outside `docs/develop/`. A
+/// symlink that stays in the published part of `docs/` is allowed; one into
+/// `docs/develop/` or out of `docs/` is not. Both the site generator and
+/// `build.rs` call this, so the binary cannot embed what the site refuses.
+pub fn page_source(docs_dir: &Path, page: &Page) -> Result<PathBuf, BoundaryError> {
+    Boundary::new(docs_dir)?.resolve(docs_dir, &page.file_name(), &page.slug, "page", false)
+}
+
+/// The file to read an image from that `page` references, given as a path
+/// relative to `docs/` (already lexically normalized by the caller).
+/// Canonicalized and refused unless it resolves inside `docs/` outside
+/// `docs/develop/`, or inside [`image_dir`] — the one directory allowed to
+/// live outside `docs/`.
+pub fn image_source(
+    docs_dir: &Path,
+    page: &Page,
+    relative: &str,
+) -> Result<PathBuf, BoundaryError> {
+    Boundary::new(docs_dir)?.resolve(docs_dir, relative, &page.slug, "image", true)
+}
+
+/// The canonical image directory (`docs/img`), refused if it resolves under
+/// `docs/develop/` or to `docs/` or an ancestor of it.
+pub fn image_dir(docs_dir: &Path) -> Result<PathBuf, BoundaryError> {
+    Boundary::new(docs_dir)?.image_dir()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    fn page(slug: &str) -> Page {
+        Page {
+            slug: slug.to_string(),
+            title: "T".to_string(),
+            description: "D".to_string(),
+        }
+    }
+
+    /// A repository-shaped tree: `docs/` with a maintainer page under
+    /// `docs/develop/`, and `docs/img -> ../site/static/img` as in this repo.
+    fn tree() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let docs = root.path().join("docs");
+        fs::create_dir_all(docs.join("develop")).unwrap();
+        fs::write(docs.join("develop/secret.md"), "# Secret\n").unwrap();
+        fs::write(docs.join("start.md"), "# Start\n").unwrap();
+        fs::create_dir_all(root.path().join("site/static/img")).unwrap();
+        fs::write(root.path().join("site/static/img/shot.png"), b"png").unwrap();
+        symlink("../site/static/img", docs.join("img")).unwrap();
+        (root, docs)
+    }
+
+    /// Scenario: `build.rs` resolves each manifest page through
+    /// `page_source` before embedding it. A page symlinked to a maintainer
+    /// page is refused with an error naming the slug and docs/develop/, so
+    /// the binary cannot embed it.
+    #[test]
+    fn page_source_refuses_symlink_into_develop() {
+        let (_root, docs) = tree();
+        symlink("develop/secret.md", docs.join("alias.md")).unwrap();
+        let err = page_source(&docs, &page("alias")).unwrap_err().to_string();
+        assert!(err.contains("`alias`"), "{err}");
+        assert!(err.contains("docs/develop/"), "{err}");
+        assert!(err.contains("through a symlink"), "{err}");
+    }
+
+    #[test]
+    fn page_source_refuses_symlink_outside_docs() {
+        let (root, docs) = tree();
+        fs::write(root.path().join("README.md"), "# Readme\n").unwrap();
+        symlink("../README.md", docs.join("readme.md")).unwrap();
+        let err = page_source(&docs, &page("readme")).unwrap_err().to_string();
+        assert!(err.contains("outside docs/"), "{err}");
+        // A page may not live in the image directory, which is outside docs/.
+        fs::write(root.path().join("site/static/img/page.md"), "# P\n").unwrap();
+        assert!(page_source(&docs, &page("img/page")).is_err());
+    }
+
+    #[test]
+    fn page_source_refuses_symlinked_develop_directory_target() {
+        let (root, docs) = tree();
+        // docs/develop itself relocated behind a symlink: its real location is
+        // still unpublished.
+        fs::rename(docs.join("develop"), root.path().join("maint")).unwrap();
+        symlink("../maint", docs.join("develop")).unwrap();
+        symlink("develop/secret.md", docs.join("alias.md")).unwrap();
+        let err = page_source(&docs, &page("alias")).unwrap_err().to_string();
+        assert!(err.contains("docs/develop/"), "{err}");
+    }
+
+    #[test]
+    fn page_source_allows_plain_pages_and_symlinks_within_published_docs() {
+        let (_root, docs) = tree();
+        assert_eq!(
+            page_source(&docs, &page("start")).unwrap(),
+            docs.canonicalize().unwrap().join("start.md")
+        );
+        symlink("start.md", docs.join("begin.md")).unwrap();
+        assert_eq!(
+            page_source(&docs, &page("begin")).unwrap(),
+            docs.canonicalize().unwrap().join("start.md")
+        );
+    }
+
+    #[test]
+    fn image_source_allows_the_symlinked_image_dir_but_not_develop() {
+        let (root, docs) = tree();
+        let start = page("start");
+        assert_eq!(
+            image_source(&docs, &start, "img/shot.png").unwrap(),
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .join("site/static/img/shot.png")
+        );
+        fs::write(docs.join("develop/diagram.png"), b"png").unwrap();
+        symlink("develop/diagram.png", docs.join("diagram.png")).unwrap();
+        let err = image_source(&docs, &start, "diagram.png")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("docs/develop/"), "{err}");
+        fs::write(root.path().join("other.png"), b"png").unwrap();
+        symlink("../other.png", docs.join("other.png")).unwrap();
+        assert!(image_source(&docs, &start, "other.png").is_err());
+    }
+
+    #[test]
+    fn image_dir_refuses_develop_and_ancestors_of_docs() {
+        let (root, docs) = tree();
+        assert_eq!(
+            image_dir(&docs).unwrap(),
+            root.path().canonicalize().unwrap().join("site/static/img")
+        );
+        fs::remove_file(docs.join("img")).unwrap();
+        symlink("develop", docs.join("img")).unwrap();
+        assert!(image_dir(&docs).is_err());
+        fs::remove_file(docs.join("img")).unwrap();
+        symlink("..", docs.join("img")).unwrap();
+        assert!(image_dir(&docs).is_err());
+    }
 }

@@ -151,14 +151,21 @@ fn embed_published_docs() {
     for page in &pages {
         let path = docs_dir.join(page.file_name());
         emit_rerun_if_changed_path(&path);
-        if let Err(e) = std::fs::read_to_string(&path) {
+        // The publication boundary, on the canonical path: a page that is a
+        // symlink into docs/develop/ (or out of docs/) fails the build here,
+        // by the same check the site generator applies.
+        let source = published_docs::page_source(&docs_dir, page).unwrap_or_else(|e| panic!("{e}"));
+        if let Err(e) = std::fs::read_to_string(&source) {
             panic!(
                 "{}: page `{}` is listed but {} cannot be read as UTF-8 text: {e}",
                 published_docs::MANIFEST_PATH,
                 page.slug,
-                path.display()
+                source.display()
             );
         }
+        // `include_str!` takes the lexical path, which reaches the file just
+        // checked: a canonical path on Windows is a `\\?\` verbatim path,
+        // which cargo would then have to read back out of rustc's dep-info.
         let path = path
             .to_str()
             .unwrap_or_else(|| panic!("{} is not valid UTF-8", path.display()));

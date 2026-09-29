@@ -35,7 +35,11 @@
 //!
 //! Nothing under `docs/develop/` can reach the output: the parser rejects a
 //! `develop/` slug, image references are confined to the docs tree outside
-//! `develop/`, and [`build`] refuses an output path under `docs/develop/`.
+//! `develop/`, every page and image is read from the canonical path the shared
+//! boundary check returns ([`published_docs::page_source`],
+//! [`published_docs::image_source`], [`published_docs::image_dir`]), so a
+//! symlink into `docs/develop/` is refused rather than followed, and [`build`]
+//! refuses an output path under `docs/develop/`.
 
 #[path = "../../../src/published_docs.rs"]
 pub mod published_docs;
@@ -151,7 +155,8 @@ pub fn build(config: &SiteConfig) -> Result<Site, String> {
     let mut bodies = Vec::with_capacity(pages.len());
 
     for page in &pages {
-        let source = config.docs_dir.join(page.file_name());
+        let source =
+            published_docs::page_source(&config.docs_dir, page).map_err(|e| e.to_string())?;
         let body = std::fs::read_to_string(&source).map_err(|e| {
             format!(
                 "page `{}` is in the manifest but {} cannot be read: {e}",
@@ -175,7 +180,9 @@ pub fn build(config: &SiteConfig) -> Result<Site, String> {
             }
         }
         for image in relative_images(config, page, &body)? {
-            let bytes = std::fs::read(config.docs_dir.join(&image))
+            let source = published_docs::image_source(&config.docs_dir, page, &image)
+                .map_err(|e| e.to_string())?;
+            let bytes = std::fs::read(&source)
                 .map_err(|e| format!("page `{}`: cannot read image `{image}`: {e}", page.slug))?;
             site.insert(format!("docs/{image}"), bytes)?;
         }
@@ -186,7 +193,8 @@ pub fn build(config: &SiteConfig) -> Result<Site, String> {
         bodies.push(body);
     }
 
-    copy_tree(&config.docs_dir.join("img"), "img", &mut site)?;
+    let images = published_docs::image_dir(&config.docs_dir).map_err(|e| e.to_string())?;
+    copy_tree(&images, "img", &mut site)?;
     site.insert(
         "llms.txt".to_string(),
         llms_txt(config, &pages).into_bytes(),
@@ -906,7 +914,8 @@ fn normalize(base: &Path, rel: &str) -> Option<String> {
 
 /// Copy every regular file under `dir` into `site` below `prefix`. A symlink
 /// inside the tree is refused rather than followed, so nothing outside it can
-/// be published through one. (`dir` itself may be a symlink: `docs/img` is.)
+/// be published through one. (`dir` is the canonical image directory from
+/// [`published_docs::image_dir`], which resolves the `docs/img` symlink.)
 fn copy_tree(dir: &Path, prefix: &str, site: &mut Site) -> Result<(), String> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
