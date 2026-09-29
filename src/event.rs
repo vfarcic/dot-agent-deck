@@ -829,8 +829,10 @@ pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE: &str = "1";
 /// map, an older daemon ignores it (and keeps today's behaviour), and an older
 /// hook CLI never sets it, so no
 /// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump is needed. Nor is it a
-/// privilege: an event carrying it can only be kept from moving a card's
-/// status, never granted anything a plain event is not.
+/// privilege: an event carrying it is kept from moving a card's status, with
+/// one exception that grants nothing a plain event lacks — a `SubagentStop`
+/// ends a `WaitingForInput` that only subagents of the same id raised (issue
+/// #1364, [`crate::state::SubagentWait`]), which a plain `Idle` would end too.
 pub const SUBAGENT_ID_METADATA_KEY: &str = "subagent_id";
 
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.

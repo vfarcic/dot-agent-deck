@@ -1007,6 +1007,22 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the descendant scan that produces `ShellBusy` (`status/shell-activity/*`).
 - **Platform coverage:** mac+linux.
 
+##### status/subagent/006 — A subagent that asked for permission and then ended takes its prompt with it: the card leaves Needs Input, to Idle after the turn ended and to Thinking inside it (issue #1364).
+- **Layer:** L1 (each payload goes through the real `hook --agent <agent>` CLI, then `AppState::apply_event`).
+- **Agent:** none (Claude Code- and Codex-shaped hook payloads, as `status/subagent/001`).
+- **Asserts:** for `claude-code` ended by `SubagentStop`, `claude-code` ended by `StopFailure` (which the CLI turns into `SubagentStop`) and `codex` ended by `SubagentStop`: a background subagent's `PermissionRequest` after `Stop` returns the card to Idle when that subagent ends; a foreground one inside the main thread's `Agent` call returns it to Thinking, never Working; two waiting subagents both ending returns it to Idle. The controls keep Needs Input: a DIFFERENT subagent ending, only one of two waiting subagents ending, and a wait the MAIN thread raised that a subagent then joined and left. No case leaves a quota reason on the card.
+- **Verified load-bearing:** red with the `SubagentStop` arm in `apply_event` disabled (the first case reads WaitingForInput).
+- **Does not assert:** that a real Claude Code or Codex emits these sequences; the waiting-for-input notice (`scheduler/idle-worker/025`); the rendered badge.
+- **Platform coverage:** mac+linux.
+
+##### status/subagent/007 — A TUI that attaches while a subagent's permission request is pending still ends the wait when that subagent stops (issue #1364, Greptile on #1393).
+- **Layer:** L1 (the daemon side through the real `hook --agent claude-code` CLI and `apply_event`; the TUI side through `SessionSnapshot`'s JSON wire form and `AppState::seed_hydrated_session`).
+- **Agent:** none (Claude Code-shaped hook payloads, as `status/subagent/001`).
+- **Asserts:** after `Stop` and a subagent `PermissionRequest`, the daemon's live snapshot, serialized and decoded, hydrates a fresh TUI card that reads Needs Input; the subagent's `SubagentStop` then takes that card to Idle. The control strips `subagent_wait` from the JSON, as an older daemon sends it, and the card keeps Needs Input — the pre-#1364 behaviour, not a failure.
+- **Verified load-bearing:** red with the snapshot overlay of `subagent_wait` disabled.
+- **Does not assert:** the attach protocol carrying the snapshot (`ListAgents` / `AgentRecord.live`, covered by the rehydration tests); the rendered badge.
+- **Platform coverage:** mac+linux.
+
 ### Agent protocol
 
 #### agent/readiness
@@ -2197,10 +2213,10 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the rendered card label (the `AgentRecord`→placeholder→render mapping is covered by `rehydration` + L1 dashboard tests); the live-stream upgrade path while a TUI is already attached.
 - **Platform coverage:** mac+linux.
 
-##### hooks/delivery/008 — A background subagent's unfinished tool call after the turn went Idle does not flip the rendered card back to Working (issue #1354).
+##### hooks/delivery/008 — A background subagent's unfinished tool call after the turn went Idle does not flip the rendered card back to Working, and a background subagent that asked for permission and then failed does not leave it on Needs Input (issues #1354, #1364).
 - **Layer:** L2.
 - **Agent:** none (Claude Code-shaped payloads piped through the real `dot-agent-deck hook --agent claude-code` CLI at the per-test hook socket).
-- **Asserts:** the card's badge reads Working on the main turn's `Bash` (proving the needle can appear), then Idle after `Stop`; after a subagent `PreToolUse` carrying `agent_id` with no `PostToolUse`, and `SubagentStop`, the background call is visible in the card's tool history and the badge still reads Idle — held for 2 seconds with no `Working` anywhere on screen.
+- **Asserts:** the card's badge reads Working on the main turn's `Bash` (proving the needle can appear), then Idle after `Stop`; after a subagent `PreToolUse` carrying `agent_id` with no `PostToolUse`, and `SubagentStop`, the background call is visible in the card's tool history and the badge still reads Idle — held for 2 seconds with no `Working` anywhere on screen. Then a second subagent's `PermissionRequest` turns the badge to Needs Input (proving that needle can appear), and its `StopFailure` — delivered as `SubagentStop` — returns it to Idle, held for 2 seconds with no `Needs Input`, `Working`, `Blocked` or `Error` on screen (issue #1364).
 - **Does not assert:** a real Claude Code producing the sequence; the Codex half (`status/subagent/001`); anything but the one card.
 - **Platform coverage:** mac+linux.
 
@@ -6275,6 +6291,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** synthetic Codex stand-in that announces its rollout through installed hooks and appends a structured task failure; no provider credential.
 - **Asserts:** one fixed blocked-worker report reaches the orchestrator pane with the worker pane id, no agent-controlled detail, and a second delegate remains busy because work-done is still owed. The report is SUBMITTED, as #708 made its worker-exited sibling: the single byte after its stable final clause (`daemon log names the role.`) is CR, not LF — exact because the orchestrator stand-in runs `cat` under `stty -echo -icanon -icrnl -opost` before its readiness marker. Verified red with the delivery on `write_notice_guarded` (`Some(10)`). The release of its payload record on `Applied`, so a byte-identical report for a later delegation is still submitted after user input, is pinned by the `agent_pty` unit test `worker_blocked_report_is_submitted_and_resubmits_after_user_input`, verified red with that settle call removed.
 - **Does not assert:** eventual worker completion or provider quota reset.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/025 — A waiting-for-input episode ends with the subagent that raised it, reopens for a new delegation to a worker still at its prompt, and survives more `/clear`s than the eight it once did (issues #1364, #1365).
+- **Layer:** fast integration (the daemon's real hook-ingestion step `daemon::ingest_event`, real `handle_delegate` and `handle_work_done` against daemon-owned PTYs; the debounce shortened through `DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS`).
+- **Agent:** none (`cat` stand-ins; the hook events are built in the shape `hook --agent claude-code` posts, the subagent's carrying `SUBAGENT_ID_METADATA_KEY`).
+- **Asserts:** four delegated workers. `redelegated-worker` waits, is reported once, sends `work-done` while still at its prompt and is delegated to again: the orchestrator receives a SECOND notice, after the per-worker spacing (#1365 item 3). `many-times-cleared-worker`'s conversation is cleared twelve times, it waits in the newest session, and a delayed `thinking` and a delayed `session_start` from its FIRST session arrive: its wait is still reported once (#1365 item 4). `subagent-worker`'s wait is a subagent's `permission_request`, and that subagent's `subagent_stop` follows inside the debounce: it is never reported (#1364). `other-subagent-worker` is the control — its waiting subagent keeps waiting while a DIFFERENT subagent stops, and it is reported once. `resumed-worker`'s agent is replaced through the real registry; the successor starts a session of its own, resumes its predecessor's session id, is delegated to and waits, and is reported once — the predecessor's session is not one the successor moved past (Qodo on #1393). Exactly five notices in all.
+- **Verified load-bearing:** red on the pre-fix code, and red again with each of the three changes reverted alone — the delegate-time path no longer reopening a settled episode (one notice for `redelegated-worker`), the superseded-session memory capped at eight again (none for `many-times-cleared-worker`), and the `SubagentStop` arm disabled (one for `subagent-worker`); `resumed-worker` was red (no notice) before the record learned whose sessions it holds.
+- **Does not assert:** the card's status after the subagent ends (`status/subagent/006`); a real agent's subagent; the rendering in an attached TUI.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live

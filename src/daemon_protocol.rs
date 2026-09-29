@@ -7997,6 +7997,7 @@ mod tests {
             SessionStatus::Error,
         ] {
             let snap = SessionSnapshot {
+                subagent_wait: None,
                 status: status.clone(),
                 agent_type: Some(AgentType::ClaudeCode),
                 active_tool: Some(ActiveTool {
@@ -8036,6 +8037,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: Some(SessionSnapshot {
+                subagent_wait: None,
                 status: SessionStatus::Working,
                 agent_type: Some(AgentType::ClaudeCode),
                 active_tool: None,
@@ -8119,6 +8121,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            subagent_wait: None,
             prompt_reports_unavailable: false,
         };
         let snap = session.live_snapshot();

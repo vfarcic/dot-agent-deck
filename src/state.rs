@@ -797,6 +797,15 @@ pub struct SessionSnapshot {
     /// absence, so no `PROTOCOL_VERSION` bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<BlockedReason>,
+    /// Issue #1364 (Greptile on #1393): which subagents alone raised a
+    /// `WaitingForInput` — [`SessionState::subagent_wait`] — so a TUI that
+    /// attaches while one is pending can still end it on that subagent's
+    /// `SubagentStop`. `Some` only while the status is `WaitingForInput`.
+    /// Additive optional, the `blocked` precedent: an older reader ignores the
+    /// key (and keeps its pre-#1364 card), a newer one tolerates its absence,
+    /// so no `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_wait: Option<SubagentWait>,
 }
 
 #[derive(Debug, Clone)]
@@ -853,6 +862,10 @@ pub struct SessionState {
     /// there is no un-orphaning edge to watch for and clearing on the next
     /// unmarked event would just make the badge flicker.
     pub orchestration_orphaned: bool,
+    /// Issue #1364: set while the status is a [`SessionStatus::WaitingForInput`]
+    /// that only subagents raised — see [`SubagentWait`]. `None` for a wait the
+    /// main thread raised and whenever the status is anything else.
+    pub subagent_wait: Option<SubagentWait>,
     /// Issue #559: this session's producer DECLARED that it will never report a
     /// submitted prompt — an event arrived carrying
     /// [`crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`], which
@@ -873,6 +886,25 @@ pub struct SessionState {
     /// read it belong to the TUI that spawned the pane, not to one that
     /// reattached later. See [`Self::confirmation_producer`].
     pub prompt_reports_unavailable: bool,
+}
+
+/// Issue #1364: who raised a [`SessionStatus::WaitingForInput`] that came from
+/// subagents alone (events carrying [`crate::event::SUBAGENT_ID_METADATA_KEY`]),
+/// and what the card read before it.
+///
+/// A subagent's terminal event — `SubagentStop`, which a subagent's
+/// `StopFailure` also arrives as — is informational and asserts nothing about
+/// the main thread (#1354). But a subagent that asked for permission and then
+/// ended has taken its prompt with it, and nothing else would ever lift the
+/// card off Needs Input. So a `SubagentStop` naming the LAST subagent recorded
+/// here ends the wait. It resumes to Idle when the card was Idle before (a
+/// background agent after the turn ended) and to Thinking otherwise, as the
+/// subagent's answered `ToolEnd` does — never to Working, Error or Blocked,
+/// which a subagent event must not assert on the parent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SubagentWait {
+    pub subagent_ids: Vec<String>,
+    pub resume_idle: bool,
 }
 
 impl SessionState {
@@ -906,6 +938,7 @@ impl SessionState {
             // the wire means there was no live session to snapshot at all.
             last_activity_ms: Some(self.last_activity.timestamp_millis()),
             blocked: self.blocked.clone(),
+            subagent_wait: self.subagent_wait.clone(),
         }
     }
 
@@ -1344,11 +1377,17 @@ pub struct AppState {
     /// See #401 for the underlying reason a status report cannot be trusted on
     /// identity alone: the hook socket is unauthenticated.
     pub untagged_status_panes: HashSet<String>,
-    /// Issue #447 (Qodo, #1347): per pane, the most recent hook sessions the
-    /// pane has genuinely moved past, newest last and at most
-    /// [`WAITING_SUPERSEDED_SESSIONS_KEPT`] of them. Written and read only by
-    /// [`Self::apply_event_watching_waiting`], so it is empty in the TUI, and
-    /// dropped with the pane by [`Self::unregister_pane`].
+    /// Issue #447 (Qodo, #1347): per pane, the hook sessions the pane has
+    /// genuinely moved past while its current registry agent owned it — the
+    /// newest [`WAITING_SUPERSEDED_SESSIONS_KEPT`] of them. Written and read
+    /// only by [`Self::apply_event_watching_waiting`], so it is empty in the
+    /// TUI, and dropped with the pane by [`Self::unregister_pane`].
+    ///
+    /// Scoped to one agent generation (#1365 item 4): only a report naming the
+    /// pane's live agent can open or close an episode, so the sessions of an
+    /// agent that no longer owns the pane are never consulted, and the record
+    /// is reset when the agent changes — it fills with one agent's `/clear`s,
+    /// not the pane's.
     ///
     /// It exists because `pane_hook_session`'s timestamp cannot answer "is this
     /// report from a conversation that is over?" on its own: a `SessionStart`
@@ -1356,7 +1395,7 @@ pub struct AppState {
     /// (issue #424 D2), so an old session's delayed start and a new session's
     /// early-stamped one look alike by time. By NAME they do not — the old one
     /// is a session this pane has already left.
-    waiting_superseded_sessions: HashMap<String, VecDeque<String>>,
+    waiting_superseded_sessions: HashMap<String, SupersededSessions>,
     /// Maps pane_id → orchestration role name (set when orchestration tab opens).
     pub pane_role_map: HashMap<String, String>,
     /// Maps pane_id → working directory for orchestration panes.
@@ -3285,12 +3324,59 @@ pub(crate) fn compose_worker_waiting_notice(
 }
 
 /// Issue #447: how many superseded hook sessions per pane
-/// [`AppState::apply_event_watching_waiting`] remembers. A report from a session
-/// further back than this reads as current; the cost of that is at most one
-/// wait closed early or one notice about a wait that has ended, and the pane
-/// would have to have been cleared this many times while such a report was in
-/// flight.
-const WAITING_SUPERSEDED_SESSIONS_KEPT: usize = 8;
+/// [`AppState::waiting_superseded_sessions`] remembers for its live agent,
+/// oldest forgotten first. It bounds the daemon's memory against an agent (or
+/// a same-uid process posting admitted events) that rolls sessions without
+/// end (Qodo, #1393), at roughly 4096 session ids per pane. It used to be
+/// eight, which a ninth `/clear` while one report was in flight was enough to
+/// defeat (#1365 item 4); a report would now have to stay in flight across
+/// thousands of `/clear`s of the same agent to read as current again.
+const WAITING_SUPERSEDED_SESSIONS_KEPT: usize = 4096;
+
+/// Issue #447: the hook sessions one pane has moved past, and the registry
+/// agent that owned the pane while it did — see
+/// [`AppState::waiting_superseded_sessions`].
+///
+/// Sessions are kept as keyed 64-bit digests, not as the ids themselves: a
+/// session id is producer-supplied and a hook line may be up to
+/// [`crate::bounded_read::MAX_HOOK_LINE_BYTES`] long, so storing thousands of
+/// them would bound the count and not the memory (Qodo, #1393). A collision
+/// under the per-record random key would at worst make a new session read as
+/// superseded, which is to say miss one notice.
+#[derive(Debug, Default, Clone)]
+struct SupersededSessions {
+    agent_id: Option<String>,
+    key: std::hash::RandomState,
+    sessions: HashSet<u64>,
+    /// The same digests as `sessions`, oldest first, for eviction at
+    /// [`WAITING_SUPERSEDED_SESSIONS_KEPT`].
+    order: VecDeque<u64>,
+}
+
+impl SupersededSessions {
+    fn digest(&self, session_id: &str) -> u64 {
+        use std::hash::BuildHasher as _;
+        self.key.hash_one(session_id)
+    }
+
+    fn contains(&self, session_id: &str) -> bool {
+        self.sessions.contains(&self.digest(session_id))
+    }
+
+    /// Remember `session_id`, forgetting the oldest beyond
+    /// [`WAITING_SUPERSEDED_SESSIONS_KEPT`].
+    fn insert(&mut self, session_id: &str) {
+        let digest = self.digest(session_id);
+        if self.sessions.insert(digest) {
+            self.order.push_back(digest);
+            if self.order.len() > WAITING_SUPERSEDED_SESSIONS_KEPT
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.sessions.remove(&oldest);
+            }
+        }
+    }
+}
 
 /// What [`AppState::apply_event`] did with one event — the answer issue #447's
 /// waiting-for-input watch needs and every other caller ignores (Qodo, #1347).
@@ -3299,8 +3385,8 @@ enum AppliedEvent {
     /// Admission control refused it: nothing on any card moved.
     Rejected,
     /// Admitted, but the status on the card is not one it wrote — an
-    /// informational event (`SubagentStart`, `SubagentStop`, `Unknown`, a
-    /// subagent's `ToolStart`), or one whose status arm declined to overwrite
+    /// informational event (`SubagentStart`, a `SubagentStop` that ends no
+    /// subagent's wait, `Unknown`, a subagent's `ToolStart`), or one whose status arm declined to overwrite
     /// what was there (`ToolStart` on `WaitingForInput`, `ShellBusy` on a real
     /// status).
     StatusKept,
@@ -3387,10 +3473,13 @@ impl AppState {
         // made is stale in the same sense. Anything else is current, including
         // a new session's start whatever its clock says, and a report on a pane
         // with no generation yet.
+        let live_agent_id = registry.pane_current_agent_id(&pane_id);
         let superseded = self
             .waiting_superseded_sessions
             .get(&pane_id)
-            .is_some_and(|sessions| sessions.contains(&event_session_id));
+            .is_some_and(|superseded| {
+                superseded.agent_id == live_agent_id && superseded.contains(&event_session_id)
+            });
         let from_current_generation = !superseded
             && match &generation_before {
                 Some((current, current_ts)) if *current == event_session_id => {
@@ -3401,34 +3490,55 @@ impl AppState {
         if !from_current_generation {
             return;
         }
+        // Every current report re-keys the record to the pane's live agent, so
+        // `agent_id` always names whose sessions it holds — including the
+        // session the pane was on before this report. When that owner has been
+        // replaced, the record starts over for the successor WITHOUT the
+        // predecessor's session: it is not one the successor moved past, and a
+        // successor that resumes that conversation must still be heard (Qodo,
+        // #1393). The predecessor's own late reports are refused by admission
+        // control before they get here.
+        let superseded = self
+            .waiting_superseded_sessions
+            .entry(pane_id.clone())
+            .or_default();
+        //
+        // A record with no owner yet is ADOPTED by the first published one, not
+        // replaced: a worker's tagged events are admitted while its spawn is
+        // still pending, before the registry names it as the pane's owner, so
+        // "no owner, then this agent" is that same worker arriving (Qodo,
+        // #1393). A predecessor is always a published owner, so a real
+        // replacement is still `Some(old)` giving way to `Some(new)`.
+        let previous_was_live_agents =
+            superseded.agent_id.is_none() || superseded.agent_id == live_agent_id;
+        if previous_was_live_agents {
+            superseded.agent_id.clone_from(&live_agent_id);
+        } else {
+            *superseded = SupersededSessions {
+                agent_id: live_agent_id.clone(),
+                ..SupersededSessions::default()
+            };
+        }
         // Remember the session a current report moved the pane off. A stale
         // one that moved it — the old session's delayed start regressing the
         // pane under #424 D2 — records nothing, so the genuine session it
         // displaced is not mistaken for an old one.
-        if let Some((previous, _)) = &generation_before
+        if previous_was_live_agents
+            && let Some((previous, _)) = &generation_before
             && self
                 .pane_hook_session
                 .get(&pane_id)
                 .is_none_or(|(now, _)| now != previous)
         {
-            let sessions = self
-                .waiting_superseded_sessions
-                .entry(pane_id.clone())
-                .or_default();
-            if !sessions.contains(previous) {
-                sessions.push_back(previous.clone());
-                if sessions.len() > WAITING_SUPERSEDED_SESSIONS_KEPT {
-                    sessions.pop_front();
-                }
-            }
+            superseded.insert(previous);
         }
-        let live_agent_id = registry.pane_current_agent_id(&pane_id);
         if self.pane_status(&pane_id) == Some(SessionStatus::WaitingForInput) {
             self.open_waiting_episode(
                 &pane_id,
                 event_agent_id.as_deref(),
                 live_agent_id.as_deref(),
                 registry,
+                false,
             );
             return;
         }
@@ -3481,6 +3591,7 @@ impl AppState {
         reporting_agent_id: Option<&str>,
         live_agent_id: Option<&str>,
         registry: &Arc<AgentPtyRegistry>,
+        reopen_settled: bool,
     ) {
         let (Some(reporting_agent_id), Some(live_agent_id)) = (reporting_agent_id, live_agent_id)
         else {
@@ -3505,6 +3616,7 @@ impl AppState {
             pane_id,
             live_agent_id,
             debounce * WAITING_NOTICE_COOLDOWN_FACTOR,
+            reopen_settled,
         ) else {
             return;
         };
@@ -3530,6 +3642,10 @@ impl AppState {
     /// Issue #447: [`Self::open_waiting_episode`] for a worker that has just
     /// been delegated to while its status already reads `WaitingForInput`. The
     /// reporting agent is the one recorded on the session that set the status.
+    ///
+    /// A settled episode for the same agent is reopened (#1365 item 3): its one
+    /// notice was about an earlier delegation, and the worker that finished it
+    /// without leaving its prompt owes this one with nobody told.
     fn open_waiting_episode_if_already_waiting(
         &self,
         pane_id: &str,
@@ -3550,6 +3666,7 @@ impl AppState {
             session.agent_id.as_deref(),
             live_agent_id.as_deref(),
             registry,
+            true,
         );
     }
 }
@@ -8309,6 +8426,12 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
     } else {
         None
     };
+    // Issue #1364: likewise the subagents a wait belongs to.
+    session.subagent_wait = if snap.status == SessionStatus::WaitingForInput {
+        snap.subagent_wait.clone()
+    } else {
+        None
+    };
     session.active_tool = snap.active_tool.clone();
     session.tool_count = snap.tool_count;
     session.first_prompts = snap.first_prompts.clone();
@@ -9023,6 +9146,7 @@ impl AppState {
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                subagent_wait: None,
                 prompt_reports_unavailable: false,
             },
         );
@@ -12515,6 +12639,7 @@ impl AppState {
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                subagent_wait: None,
                 prompt_reports_unavailable: false,
             });
 
@@ -12750,6 +12875,28 @@ impl AppState {
                 asserted
             }
             EventType::WaitingForInput | EventType::PermissionRequest => {
+                // Issue #1364: remember which subagents a wait belongs to, so
+                // the one that raised it can end it. A main-thread wait, or a
+                // subagent joining one, is not a subagent's alone.
+                let subagent_id = event
+                    .metadata
+                    .get(crate::event::SUBAGENT_ID_METADATA_KEY)
+                    .cloned();
+                session.subagent_wait = match subagent_id {
+                    None => None,
+                    Some(id) if session.status != SessionStatus::WaitingForInput => {
+                        Some(SubagentWait {
+                            subagent_ids: vec![id],
+                            resume_idle: session.status == SessionStatus::Idle,
+                        })
+                    }
+                    Some(id) => session.subagent_wait.take().map(|mut wait| {
+                        if !wait.subagent_ids.contains(&id) {
+                            wait.subagent_ids.push(id);
+                        }
+                        wait
+                    }),
+                };
                 session.status = SessionStatus::WaitingForInput;
                 true
             }
@@ -12762,6 +12909,28 @@ impl AppState {
                 session.status = SessionStatus::Compacting;
                 session.active_tool = None;
                 true
+            }
+            // Issue #1364: a subagent that ends takes its own prompt with it.
+            // When the card's wait is that subagent's alone — every subagent
+            // that raised it has now stopped — the wait is over; see
+            // [`SubagentWait`] for what the card resumes to.
+            EventType::SubagentStop
+                if session.status == SessionStatus::WaitingForInput
+                    && let Some(ended) =
+                        event.metadata.get(crate::event::SUBAGENT_ID_METADATA_KEY)
+                    && let Some(wait) = session.subagent_wait.as_mut()
+                    && wait.subagent_ids.contains(ended) =>
+            {
+                wait.subagent_ids.retain(|id| id != ended);
+                let asserted = wait.subagent_ids.is_empty();
+                if asserted {
+                    session.status = if wait.resume_idle {
+                        SessionStatus::Idle
+                    } else {
+                        SessionStatus::Thinking
+                    };
+                }
+                asserted
             }
             EventType::SubagentStart | EventType::SubagentStop => {
                 // Informational — recorded in recent_events but no status change
@@ -12807,6 +12976,10 @@ impl AppState {
         // Issue #714: the reason exists only beside the status it explains.
         if session.status != SessionStatus::Blocked {
             session.blocked = None;
+        }
+        // Issue #1364: and so does a wait's subagent attribution.
+        if session.status != SessionStatus::WaitingForInput {
+            session.subagent_wait = None;
         }
 
         // PRD #370 M2: any REAL event other than `ShellBusy` clears the
@@ -14002,6 +14175,138 @@ mod tests {
         }
     }
 
+    /// Issue #447 (#1365 item 4, Qodo on #1393): the record of sessions a pane
+    /// moved past keeps far more than the eight it once did, is bounded at
+    /// [`WAITING_SUPERSEDED_SESSIONS_KEPT`] with the oldest forgotten first,
+    /// and starts over when a different registry agent owns the pane.
+    #[test]
+    fn waiting_superseded_sessions_are_bounded_and_scoped_to_the_live_agent() {
+        fn start(session: &str) -> AgentEvent {
+            AgentEvent {
+                session_id: session.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some("pane".into()),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let mut state = AppState::default();
+        state.managed_pane_ids.insert("pane".into());
+        for generation in 0..=WAITING_SUPERSEDED_SESSIONS_KEPT + 1 {
+            state.apply_event_watching_waiting(start(&format!("s{generation}")), &registry);
+        }
+        let record = &state.waiting_superseded_sessions["pane"];
+        assert_eq!(record.sessions.len(), WAITING_SUPERSEDED_SESSIONS_KEPT);
+        assert_eq!(record.order.len(), WAITING_SUPERSEDED_SESSIONS_KEPT);
+        assert!(
+            !record.contains("s0") && record.contains("s1"),
+            "the oldest session must be the one forgotten"
+        );
+        assert!(record.contains("s9"), "more than eight are kept");
+
+        // A different live agent: the record was keyed to one this registry no
+        // longer names as the pane's owner (it knows none here), as after a
+        // replacement. The previous agent's sessions — including the one the
+        // pane is moving off, which the successor never moved past — are not
+        // the successor's (Qodo, #1393). The takeover through a real registry
+        // is `scheduler/idle-worker/025`'s `resumed-worker`.
+        state
+            .waiting_superseded_sessions
+            .get_mut("pane")
+            .unwrap()
+            .agent_id = Some("a-replaced-agent".into());
+        state.apply_event_watching_waiting(start("after-replacement"), &registry);
+        let record = &state.waiting_superseded_sessions["pane"];
+        assert_eq!(record.agent_id, None);
+        assert!(
+            record.sessions.is_empty() && record.order.is_empty(),
+            "a change of agent must start the record over, without the predecessor's session"
+        );
+        // From there the successor's own moves are recorded as before.
+        state.apply_event_watching_waiting(start("successor-next"), &registry);
+        assert!(state.waiting_superseded_sessions["pane"].contains("after-replacement"));
+    }
+
+    /// Qodo on #1393: a worker's hook events can be admitted while its spawn is
+    /// still pending, before the registry publishes it as the pane's owner. The
+    /// record must read that owner arriving as the SAME worker, not as a
+    /// replacement: the session the worker left after publication is one it
+    /// moved past, and a delayed report from it must not read as current.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_session_reported_before_the_owner_was_published_is_still_superseded() {
+        fn start(session: &str, agent: &str) -> AgentEvent {
+            AgentEvent {
+                session_id: session.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some("pane".into()),
+                agent_id: Some(agent.to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+        // The pending window: the owner read finds no published agent.
+        let pending = Arc::new(AgentPtyRegistry::new());
+        // After publication: the same agent owns the pane.
+        let published = Arc::new(AgentPtyRegistry::new());
+        let agent = published
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane".to_string(),
+                )]),
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        assert_eq!(
+            published.pane_current_agent_id("pane").as_deref(),
+            Some(agent.as_str())
+        );
+
+        let mut state = AppState::default();
+        state.managed_pane_ids.insert("pane".into());
+        state.apply_event_watching_waiting(start("while-pending", &agent), &pending);
+        state.apply_event_watching_waiting(start("after-publication", &agent), &published);
+        let record = &state.waiting_superseded_sessions["pane"];
+        assert_eq!(record.agent_id.as_deref(), Some(agent.as_str()));
+        assert!(
+            record.contains("while-pending"),
+            "the worker's own pre-publication session was dropped as if a predecessor's"
+        );
+
+        // A genuine replacement still starts the record over without the
+        // predecessor's session.
+        let successor = published
+            .respawn_agent_for_pane("pane", "/bin/cat")
+            .await
+            .expect("replace the agent");
+        assert_ne!(successor, agent);
+        state.apply_event_watching_waiting(start("successor", &successor), &published);
+        let record = &state.waiting_superseded_sessions["pane"];
+        assert_eq!(record.agent_id.as_deref(), Some(successor.as_str()));
+        assert!(record.sessions.is_empty());
+        published.shutdown_all();
+    }
+
     /// Issue #447 (Qodo, #1347): the waiting watch's record of the hook sessions
     /// a pane has moved past is dropped when the pane is unregistered, so a
     /// closed pane leaves nothing behind and a later pane reusing its id starts
@@ -14035,7 +14340,8 @@ mod tests {
             state
                 .waiting_superseded_sessions
                 .get("pane")
-                .is_some_and(|sessions| sessions.iter().eq(["before-clear"])),
+                .is_some_and(|superseded| superseded.contains("before-clear")
+                    && superseded.sessions.len() == 1),
             "precondition: the session the pane moved off is recorded"
         );
         state.unregister_pane("pane");
@@ -18061,6 +18367,7 @@ mod tests {
                 display_name: None,
                 shell_synthetic_working: false,
                 orchestration_orphaned: false,
+                subagent_wait: None,
                 prompt_reports_unavailable: false,
             },
         );
@@ -19158,6 +19465,7 @@ mod tests {
     #[test]
     fn status_blocked_007_older_reader_decodes_blocked_as_unknown() {
         let snap = SessionSnapshot {
+            subagent_wait: None,
             status: SessionStatus::Blocked,
             agent_type: Some(AgentType::Codex),
             active_tool: None,
@@ -19220,6 +19528,7 @@ mod tests {
     fn a_hydrated_blocked_snapshot_keeps_only_a_plausible_reset() {
         let now_ms = Utc::now().timestamp_millis();
         let snap = |resets_at_ms| SessionSnapshot {
+            subagent_wait: None,
             status: SessionStatus::Blocked,
             agent_type: Some(AgentType::ClaudeCode),
             active_tool: None,

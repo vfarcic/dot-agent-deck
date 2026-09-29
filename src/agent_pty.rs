@@ -5839,6 +5839,13 @@ impl AgentPtyRegistry {
     /// postponing its notice for ever, and a wait already reported is not
     /// reported again. An open episode for a DIFFERENT agent is replaced.
     ///
+    /// `reopen_settled` is the one exception, for the delegate-time caller: a
+    /// NEW commission to a worker still at the prompt its settled episode was
+    /// about is a new thing to report — the notice already sent was about the
+    /// delegation a `work-done` has since retired — so a settled record for the
+    /// same agent is replaced (#1365 item 3). An unsettled one is still kept:
+    /// its pending notice fires for the new commission too.
+    ///
     /// `cooldown` bounds the rate per worker pane: the returned `not_before` is
     /// the previous submitted notice plus `cooldown`. It delays a notice; it
     /// never drops one.
@@ -5847,6 +5854,7 @@ impl AgentPtyRegistry {
         worker_pane_id: &str,
         worker_agent_id: &str,
         cooldown: Duration,
+        reopen_settled: bool,
     ) -> Option<ArmedWaitingNotice> {
         let mut tracker = self.delegations.lock().unwrap();
         if tracker.closing_panes.contains(worker_pane_id) {
@@ -5855,7 +5863,9 @@ impl AgentPtyRegistry {
         if tracker
             .waiting_notices
             .get(worker_pane_id)
-            .is_some_and(|open| open.worker_agent_id == worker_agent_id)
+            .is_some_and(|open| {
+                open.worker_agent_id == worker_agent_id && !(reopen_settled && open.settled)
+            })
         {
             return None;
         }
@@ -16085,6 +16095,7 @@ mod spawn_tests {
             rows: 0,
             cols: 0,
             live: live_type.map(|agent_type| crate::state::SessionSnapshot {
+                subagent_wait: None,
                 status: crate::state::SessionStatus::Working,
                 agent_type,
                 active_tool: None,
@@ -19161,21 +19172,21 @@ mod spawn_tests {
         let reg = Arc::new(AgentPtyRegistry::new());
         let cooldown = Duration::from_secs(60);
         let mut first = reg
-            .arm_waiting_notice("worker", "agent-1", cooldown)
+            .arm_waiting_notice("worker", "agent-1", cooldown, false)
             .expect("a fresh episode arms");
         assert_eq!(
             first.not_before, None,
             "a pane never reported has no cooldown"
         );
         assert!(
-            reg.arm_waiting_notice("worker", "agent-1", cooldown)
+            reg.arm_waiting_notice("worker", "agent-1", cooldown, false)
                 .is_none(),
             "a repeated report for the same agent must not restart the debounce"
         );
         assert!(reg.waiting_notice_is_current("worker", first.seq));
 
         let second = reg
-            .arm_waiting_notice("worker", "agent-2", cooldown)
+            .arm_waiting_notice("worker", "agent-2", cooldown, false)
             .expect("a different agent replaces the episode");
         assert!(
             matches!(
@@ -19220,14 +19231,16 @@ mod spawn_tests {
         let reg = Arc::new(AgentPtyRegistry::new());
         let cooldown = Duration::from_secs(120);
 
-        let unsent = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        let unsent = reg
+            .arm_waiting_notice("worker", "agent", cooldown, false)
+            .unwrap();
         reg.settle_waiting_notice("worker", unsent.seq, false);
         assert!(
             !reg.waiting_notice_is_current("worker", unsent.seq),
             "a settled episode is no longer pending"
         );
         assert!(
-            reg.arm_waiting_notice("worker", "agent", cooldown)
+            reg.arm_waiting_notice("worker", "agent", cooldown, false)
                 .is_none(),
             "the same agent re-reporting the same wait must not open a second episode"
         );
@@ -19235,7 +19248,9 @@ mod spawn_tests {
             reg.cancel_waiting_notice("worker", "agent"),
             "leaving the state ends it"
         );
-        let after_unsent = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        let after_unsent = reg
+            .arm_waiting_notice("worker", "agent", cooldown, false)
+            .unwrap();
         assert_eq!(
             after_unsent.not_before, None,
             "an episode that sent nothing must not delay the next one"
@@ -19244,7 +19259,9 @@ mod spawn_tests {
         let before = Instant::now();
         reg.settle_waiting_notice("worker", after_unsent.seq, true);
         assert!(reg.cancel_waiting_notice("worker", "agent"));
-        let next = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        let next = reg
+            .arm_waiting_notice("worker", "agent", cooldown, false)
+            .unwrap();
         let floor = next
             .not_before
             .expect("a submitted notice starts the cooldown");
@@ -19259,12 +19276,14 @@ mod spawn_tests {
             "close sweeps the episode"
         );
         assert!(
-            reg.arm_waiting_notice("worker", "agent", cooldown)
+            reg.arm_waiting_notice("worker", "agent", cooldown, false)
                 .is_none(),
             "a closing pane must not open an episode"
         );
         drop(reg.finish_pane_close("worker", true));
-        let reopened = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        let reopened = reg
+            .arm_waiting_notice("worker", "agent", cooldown, false)
+            .unwrap();
         assert_eq!(
             reopened.not_before, None,
             "a closed pane's cooldown must not outlive it onto a pane id reused later"
@@ -19279,12 +19298,14 @@ mod spawn_tests {
     fn waiting_notice_settled_after_a_close_records_no_cooldown() {
         let reg = Arc::new(AgentPtyRegistry::new());
         let cooldown = Duration::from_secs(120);
-        let armed = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        let armed = reg
+            .arm_waiting_notice("worker", "agent", cooldown, false)
+            .unwrap();
         drop(reg.begin_pane_close("worker"));
         drop(reg.finish_pane_close("worker", true));
         reg.settle_waiting_notice("worker", armed.seq, true);
         let successor = reg
-            .arm_waiting_notice("worker", "successor", cooldown)
+            .arm_waiting_notice("worker", "successor", cooldown, false)
             .expect("the reused pane id opens a fresh episode");
         assert_eq!(
             successor.not_before, None,
