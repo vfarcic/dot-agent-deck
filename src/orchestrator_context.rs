@@ -769,13 +769,22 @@ fn read_context_file(project_dir: &std::path::Path, name: &str) -> std::io::Resu
 /// link or FIFO planted under the right name can supply the task. The mirror is
 /// read through the same function.
 ///
-/// The compatibility mirror is the fallback in three cases: `known` is `None`
-/// (an older daemon, or a TUI-launched tab whose publish failed), `known` names
-/// anything other than this tab's own per-publish file, or reading it fails for
-/// any reason — missing (pruned by the 14-day sweep or by hand) included. That
-/// is exactly the pre-#1233 behaviour, and it races as it did: the mirror may
-/// hold another preparation's task. With no readable mirror either, the re-arm
-/// carries no task and degrades to `Attended` ([`read_back_context`]).
+/// **The compatibility mirror is read in exactly two cases**: `known` is `None`
+/// (an older daemon, or a TUI-launched tab whose publish failed), or `known`
+/// names anything other than a per-publish file directly under this tab's
+/// `cwd` — a path that was never this tab's own. That is the pre-#1233
+/// behaviour, and it races as it did: the mirror may hold another
+/// preparation's task. With no readable mirror either, the re-arm carries no
+/// task and degrades to `Attended` ([`read_back_context`]).
+///
+/// **A valid own path whose read fails never falls back to the mirror** —
+/// whether the file is missing (pruned by the 14-day sweep or by hand) or
+/// refused (a link, a FIFO, a directory, over the cap). The tab knows which
+/// preparation it belongs to, and the mirror holds the latest publish in the
+/// project, which may be another orchestration's brief: re-arming from it would
+/// hand this coordinator someone else's task (#1233's race). The re-arm then
+/// carries no task and degrades to `Attended`, as a missing own file did before
+/// the mirror fallback existed, and logs a `warn!` naming the reason.
 pub fn reassert_orchestrator_prompt(
     config: &OrchestrationConfig,
     cwd: &str,
@@ -783,27 +792,30 @@ pub fn reassert_orchestrator_prompt(
 ) -> Option<PublishedPrompt> {
     let project_dir = std::path::Path::new(cwd);
     let own = known.and_then(|path| {
-        let Some(name) = own_context_file_name(project_dir, path) else {
+        let name = own_context_file_name(project_dir, path);
+        if name.is_none() {
             tracing::warn!(
                 path = %path.display(),
                 cwd,
                 "re-arm: the tab's context path is not a context file of its own project; \
                  reading the compatibility mirror instead"
             );
-            return None;
-        };
-        read_context_file(project_dir, name)
+        }
+        name.map(|name| (path, name))
+    });
+    let content = match own {
+        Some((path, name)) => read_context_file(project_dir, name)
             .inspect_err(|e| {
                 tracing::warn!(
                     path = %path.display(),
                     reason = %e,
-                    "re-arm: could not read the tab's own context file; \
-                     reading the compatibility mirror instead"
+                    "re-arm: could not read the tab's own context file; carrying no task \
+                     (the compatibility mirror may hold another orchestration's brief)"
                 );
             })
-            .ok()
-    });
-    let content = own.or_else(|| read_context_file(project_dir, CONTEXT_FILE_NAME).ok());
+            .ok(),
+        None => read_context_file(project_dir, CONTEXT_FILE_NAME).ok(),
+    };
     let (task, attendance) = read_back_context(content.as_deref());
     prepare_orchestrator_prompt(config, cwd, task.as_deref(), attendance)
 }
@@ -837,9 +849,10 @@ pub const CONTEXT_DIR_NAME: &str = ".dot-agent-deck";
 /// bytes, best effort ([`mirror_orchestrator_context`]), for readers that
 /// predate #1233: an older TUI's compaction re-arm reads the task back from here,
 /// and so do role commands and templates that hard-code the path. So does this
-/// build's re-arm of a tab whose own file it does not know or cannot use
-/// ([`reassert_orchestrator_prompt`]: `known` is `None`, names a file outside
-/// the tab's project, or cannot be read). Within one process
+/// build's re-arm of a tab whose own file it does not know
+/// ([`reassert_orchestrator_prompt`]: `known` is `None` or names a file outside
+/// the tab's project — a known own file that cannot be read is NOT replaced by
+/// this one). Within one process
 /// it holds the latest publish mirrored into it — a mirror write never lands
 /// over a later publish's from the same process ([`mirror_into`]) — but the
 /// daemon, a TUI's `Ctrl+n` and `dispatch --orchestration` each mirror from
@@ -2194,7 +2207,7 @@ pub fn remove_ended_orchestration_context(
 /// coordinator is pointed at its own file, not at the mirror, so it is no
 /// reason to fail a launch whose own file is already published — though a
 /// reader of the mirror, this build's re-arm of a tab whose own file it does
-/// not know or cannot use included, then gets an older publish's task. See [`CONTEXT_FILE_NAME`] for who still reads it.
+/// not know included, then gets an older publish's task. See [`CONTEXT_FILE_NAME`] for who still reads it.
 ///
 /// **Blocking.** Async callers go through [`crate::project_resolve::run_bounded`].
 pub fn mirror_orchestrator_context(project_dir: &std::path::Path, content: &str) {
@@ -3920,13 +3933,34 @@ mod tests {
         }
     }
 
+    /// Assert a re-arm carried no task and the attended text: neither the
+    /// mirror's task nor its `Unattended` notice reached it.
+    fn assert_rearmed_without_the_mirror(case: &str, rearmed: &PublishedPrompt) {
+        let c = std::fs::read_to_string(&rearmed.context_path).unwrap();
+        assert!(
+            !c.contains("TASK-MIRROR"),
+            "{case}: the mirror's task must not re-arm a tab that knows its own file:\n{c}"
+        );
+        assert!(
+            !c.contains(UNATTENDED_SECTION_HEADING),
+            "{case}: the mirror's attendance must not ride back either:\n{c}"
+        );
+        assert!(
+            rearmed.prompt.contains("wait for instructions"),
+            "{case}: no task, attended: {:?}",
+            rearmed.prompt
+        );
+    }
+
     /// Issue #1395 audit round 2: the tab's own file is read with
     /// `O_NOFOLLOW | O_NONBLOCK`, regular files only, bounded — so a symlink, a
     /// FIFO, a directory or an over-cap file planted under the tab's own name
-    /// is refused (without blocking) and the re-arm falls back to the mirror.
+    /// is refused (without blocking). The path is a valid own path, so the
+    /// re-arm does NOT read the mirror, which may be another orchestration's
+    /// brief: it carries no task and degrades to `Attended`.
     #[cfg(unix)]
     #[test]
-    fn reassert_refuses_an_unsafe_own_context_file_and_falls_back_to_the_mirror() {
+    fn reassert_refuses_an_unsafe_own_context_file_without_reading_the_mirror() {
         let outside = tempfile::tempdir().unwrap();
         let target = outside.path().join("elsewhere.md");
         std::fs::write(&target, context_with_task("TASK-EVIL")).unwrap();
@@ -3934,8 +3968,17 @@ mod tests {
         for case in ["symlink", "fifo", "directory", "over-cap"] {
             let tmp = tempfile::tempdir().unwrap();
             let cwd = tmp.path().to_string_lossy().to_string();
-            prepare_orchestrator_prompt(&config(), &cwd, Some("TASK-MIRROR"), Attendance::Attended)
-                .expect("mirror published");
+            prepare_orchestrator_prompt(
+                &config(),
+                &cwd,
+                Some("TASK-MIRROR"),
+                Attendance::Unattended,
+            )
+            .expect("mirror published");
+            assert!(
+                published(&cwd).contains("TASK-MIRROR"),
+                "{case}: the premise: the mirror holds a task"
+            );
             let own = tmp.path().join(CONTEXT_DIR_NAME).join(PLANTED_NAME);
             match case {
                 "symlink" => std::os::unix::fs::symlink(&target, &own).unwrap(),
@@ -3962,12 +4005,33 @@ mod tests {
             );
             let rearmed = reassert_within_deadline(&cwd, &own);
             let c = std::fs::read_to_string(&rearmed.context_path).unwrap();
-            assert!(
-                c.contains("TASK-MIRROR"),
-                "{case}: falls back to the mirror:\n{c}"
-            );
             assert!(!c.contains("TASK-EVIL"), "{case}: the planted task leaked");
+            assert_rearmed_without_the_mirror(case, &rearmed);
         }
+    }
+
+    /// Issue #1395: a tab whose own file is gone (the 14-day sweep, or by hand)
+    /// while the mirror holds ANOTHER orchestration's brief must not be re-armed
+    /// with that brief — #1233's race. It carries no task instead.
+    #[test]
+    fn reassert_with_a_missing_own_file_does_not_deliver_the_mirrors_brief() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let a =
+            prepare_orchestrator_prompt(&config(), &cwd, Some("TASK-ALPHA"), Attendance::Attended)
+                .expect("A published");
+        prepare_orchestrator_prompt(&config(), &cwd, Some("TASK-MIRROR"), Attendance::Unattended)
+            .expect("B published");
+        assert!(
+            published(&cwd).contains("TASK-MIRROR"),
+            "the premise: the mirror is B's"
+        );
+        std::fs::remove_file(&a.context_path).unwrap();
+
+        let rearmed = reassert_within_deadline(&cwd, &a.context_path);
+        let c = std::fs::read_to_string(&rearmed.context_path).unwrap();
+        assert!(!c.contains("TASK-ALPHA"), "A's file is gone:\n{c}");
+        assert_rearmed_without_the_mirror("missing", &rearmed);
     }
 
     /// The cap is inclusive: a file exactly [`MAX_CONTEXT_BYTES`] long is read.
