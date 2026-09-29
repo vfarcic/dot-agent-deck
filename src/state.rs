@@ -8596,6 +8596,20 @@ async fn dispatch_one_owned(
             None
         }
     };
+    // Issue #1383 (Qodo, PR #1414): bind this delivery to its worker and to the
+    // watch just armed for it, BEFORE the write and whether or not a retry is
+    // armed below. With the retry off no record carries the watch's seq, so
+    // without this a correct ack of the delivery cancelled nothing and the
+    // worker was reported quiet anyway. Seq-conditional downstream, and a no-op
+    // if a newer delegation already replaced this delivery.
+    if let Some(worker_agent_id) = expected_worker_agent_id.as_deref() {
+        registry.pending_deliveries().bind_current(
+            &pane_id,
+            &delivery_id,
+            worker_agent_id,
+            silence.as_ref().map(|(_, armed, _)| armed.seq),
+        );
+    }
     // Issue #1031: subscribed BEFORE the write, for the same reason the silence
     // watch above is — a `broadcast::Receiver` attaches to future sends only, so
     // subscribing after the write would miss a start that arrived while the
@@ -18177,6 +18191,9 @@ mod tests {
         const WORKER_PANE: &str = "early-ack-worker";
         const NOTICE: &str = "delegated worker went quiet";
 
+        // This test needs the default schedule, so a threaded run must not
+        // overlap the one that switches the retry off.
+        let _schedule = RETRY_SCHEDULE_ENV_LOCK.lock().await;
         let registry = Arc::new(AgentPtyRegistry::new());
         let spawn = |pane: &str, agent_type: crate::event::AgentType| {
             registry
@@ -18271,6 +18288,161 @@ mod tests {
                 crate::agent_pty::SilenceWatchRetirement::Nothing
             ),
             "the early ack must have cancelled the silent-worker watch"
+        );
+        drop(event_tx);
+        registry.shutdown_all();
+    }
+
+    /// Serialises the in-process tests that read
+    /// [`crate::delegate_retry::DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS`]
+    /// through `dispatch_one_owned` against the one that sets it. nextest runs
+    /// each test in its own process; `cargo test` does not.
+    static RETRY_SCHEDULE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Restores the retry schedule variable on drop, panic included.
+    struct RetryScheduleEnv(Option<std::ffi::OsString>);
+
+    impl RetryScheduleEnv {
+        fn set(value: &str) -> Self {
+            let name = crate::delegate_retry::DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS;
+            let previous = std::env::var_os(name);
+            // SAFETY: every in-process reader of this variable that could run
+            // concurrently holds `RETRY_SCHEDULE_ENV_LOCK`.
+            unsafe { std::env::set_var(name, value) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for RetryScheduleEnv {
+        fn drop(&mut self) {
+            let name = crate::delegate_retry::DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS;
+            // SAFETY: as in `set`.
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// Issue #1383 (Qodo, PR #1414): with the retry schedule set to `0` no
+    /// retry record is armed, so the silent-worker watch's seq has to ride on
+    /// the current delivery. A hookless worker that acknowledges its delivery
+    /// after the pointer went in must cancel the watch, and the orchestrator
+    /// must never be told that worker went quiet. A second, unrelated ack from
+    /// another agent before it must cancel nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_ack_with_the_retry_off_cancels_the_silence_watch() {
+        const ORCH_PANE: &str = "retry-off-ack-orch";
+        const WORKER_PANE: &str = "retry-off-ack-worker";
+        const NOTICE: &str = "delegated worker went quiet";
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(2000);
+
+        let _schedule = RETRY_SCHEDULE_ENV_LOCK.lock().await;
+        let _env = RetryScheduleEnv::set("0");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn = |pane: &str, agent_type: crate::event::AgentType| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )]),
+                    agent_type: Some(agent_type),
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn stand-in")
+        };
+        let worker = spawn(WORKER_PANE, crate::event::AgentType::Codex);
+        let orch = spawn(ORCH_PANE, crate::event::AgentType::ClaudeCode);
+        // A clone stays here for the whole test: a bus whose last sender is
+        // gone reads as closed, which suppresses the report by itself.
+        let (event_tx, _event_rx) = broadcast::channel(64);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            dispatch_one_owned(
+                registry.clone(),
+                event_tx.clone(),
+                None,
+                ORCH_PANE.to_string(),
+                "coder".to_string(),
+                WORKER_PANE.to_string(),
+                "do the task".to_string(),
+                None,
+                Some(SilenceWatch {
+                    window: WINDOW,
+                    target: SilenceReportTarget {
+                        pane_id: ORCH_PANE.to_string(),
+                        agent_id: Some(orch.clone()),
+                        orchestration: None,
+                    },
+                    redeliveries: None,
+                    retry_done: None,
+                }),
+                PointerQueueClock::new(registry.clone(), WORKER_PANE.to_string(), None),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the dispatch finishes");
+        assert!(
+            !registry.pending_deliveries().is_pending(WORKER_PANE),
+            "precondition: with the schedule at 0 no retry record is armed"
+        );
+        let (delivery_id, silence_seq) = registry
+            .pending_deliveries()
+            .current_for_test(WORKER_PANE)
+            .expect("the dispatch noted its delivery");
+        assert!(
+            silence_seq.is_some(),
+            "the silent-worker watch must be bound to the current delivery"
+        );
+        let ack = |agent_id: &str| {
+            crate::daemon::handle_delivery_ack(
+                &registry,
+                &crate::event::AckSignal {
+                    pane_id: WORKER_PANE.to_string(),
+                    delivery_id: delivery_id.clone(),
+                    agent_id: Some(agent_id.to_string()),
+                    token: None,
+                },
+                Some(agent_id),
+            )
+        };
+        assert_eq!(
+            ack("some-older-generation"),
+            crate::event::AckDelivery::NotPending
+        );
+        assert_eq!(
+            registry
+                .pending_deliveries()
+                .current_for_test(WORKER_PANE)
+                .and_then(|(_, seq)| seq),
+            silence_seq,
+            "another agent's ack must not use up the worker's watch"
+        );
+        assert_eq!(ack(&worker), crate::event::AckDelivery::NotPending);
+
+        // Well past the window.
+        tokio::time::sleep(WINDOW + std::time::Duration::from_millis(1500)).await;
+        let orch_screen =
+            String::from_utf8_lossy(&registry.snapshot(&orch).expect("orchestrator")).into_owned();
+        assert!(
+            !orch_screen.contains(NOTICE),
+            "an acknowledged worker was reported silent with the retry off: {orch_screen:?}"
+        );
+        assert!(
+            matches!(
+                registry.retire_silence_watch(WORKER_PANE),
+                crate::agent_pty::SilenceWatchRetirement::Nothing
+            ),
+            "the ack must have cancelled the silent-worker watch"
         );
         drop(event_tx);
         registry.shutdown_all();

@@ -1558,7 +1558,7 @@ impl From<crate::delegate_retry::AckOutcome> for AckDelivery {
         match outcome {
             AckOutcome::Stopped { .. } => AckDelivery::Stopped,
             AckOutcome::AlreadyAcknowledged => AckDelivery::AlreadyAcknowledged,
-            AckOutcome::NotPending => AckDelivery::NotPending,
+            AckOutcome::NotPending { .. } => AckDelivery::NotPending,
             AckOutcome::Unknown => AckDelivery::Unknown,
         }
     }

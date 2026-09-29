@@ -568,9 +568,14 @@ pub enum AckOutcome {
     /// The pane's current delivery, with no retry pending to stop: its loop
     /// already ended (most often because a turn began, which a real agent
     /// reports before the `ack` it runs as a tool) or was never armed (the retry
-    /// is off, the agent type is not retried, or a Pi seed delivery). A no-op,
-    /// but a genuine acknowledgement of the task the pane was last given.
-    NotPending,
+    /// is off, the agent type is not retried, or a Pi seed delivery). A genuine
+    /// acknowledgement of the task the pane was last given, so it carries the
+    /// silent-worker watch bound to that delivery for the caller to cancel, as
+    /// [`Self::Stopped`] does (Qodo, PR #1414): with the retry off no record
+    /// holds that seq, and the watch would otherwise report an acknowledged
+    /// worker as never having got its task. `None` once taken, and for an ack
+    /// whose sender is not the delivery's worker.
+    NotPending { silence_seq: Option<u64> },
     /// The id is not the pane's current delivery: mistyped, an earlier
     /// delegation's, or one presented by another agent on the pane while its
     /// retry is pending. A no-op, so a pending retry keeps running.
@@ -584,7 +589,7 @@ impl AckOutcome {
         match self {
             AckOutcome::Stopped { .. }
             | AckOutcome::AlreadyAcknowledged
-            | AckOutcome::NotPending => true,
+            | AckOutcome::NotPending { .. } => true,
             AckOutcome::Unknown => false,
         }
     }
@@ -599,6 +604,18 @@ struct PendingDelivery {
     _cancel: oneshot::Sender<()>,
 }
 
+/// A pane's most recent delegation, whether or not a retry was armed for it.
+struct CurrentDelivery {
+    delivery_id: String,
+    /// The worker the pointer was written for, once the dispatch has resolved
+    /// it. `None` from [`PendingDeliveries::note_delivery`] until then, which is
+    /// what tells [`PendingDeliveries::forget_pane`] that a dispatch may still
+    /// be bringing up the agent this delivery belongs to.
+    worker_agent_id: Option<String>,
+    /// The silent-worker watch armed for this delivery, until an ack takes it.
+    silence_seq: Option<u64>,
+}
+
 #[derive(Default)]
 struct PendingInner {
     next_seq: u64,
@@ -606,11 +623,11 @@ struct PendingInner {
     /// The last delivery id acknowledged per pane, so a repeat ack is told
     /// apart from one that never matched anything.
     last_acked: HashMap<String, String>,
-    /// The delivery id of each pane's most recent delegation, whether or not a
-    /// retry was armed for it and after its loop ends, so an ack that arrives
-    /// once the loop has already stopped is told apart from a mistyped or stale
-    /// id.
-    current: HashMap<String, String>,
+    /// Each pane's most recent delegation, whether or not a retry was armed for
+    /// it and after its loop ends, so an ack that arrives once the loop has
+    /// already stopped is told apart from a mistyped or stale id — and can
+    /// still cancel the delivery's silent-worker watch.
+    current: HashMap<String, CurrentDelivery>,
 }
 
 /// The deliveries a retry loop is watching, one per worker pane.
@@ -642,9 +659,14 @@ impl PendingDeliveries {
         let mut inner = self.inner.lock().unwrap();
         inner.next_seq += 1;
         let seq = inner.next_seq;
-        inner
-            .current
-            .insert(pane_id.to_string(), delivery_id.to_string());
+        inner.current.insert(
+            pane_id.to_string(),
+            CurrentDelivery {
+                delivery_id: delivery_id.to_string(),
+                worker_agent_id: Some(worker_agent_id.to_string()),
+                silence_seq,
+            },
+        );
         inner.records.insert(
             pane_id.to_string(),
             PendingDelivery {
@@ -675,11 +697,100 @@ impl PendingDeliveries {
     /// [`AckOutcome::Unknown`] when no retry is pending. Called by every
     /// delegation, after [`Self::supersede`].
     pub fn note_delivery(&self, pane_id: &str, delivery_id: &str) {
+        self.inner.lock().unwrap().current.insert(
+            pane_id.to_string(),
+            CurrentDelivery {
+                delivery_id: delivery_id.to_string(),
+                worker_agent_id: None,
+                silence_seq: None,
+            },
+        );
+    }
+
+    /// Bind the pane's current delivery to the worker the pointer is written
+    /// for and to the silent-worker watch armed for it, once the dispatch knows
+    /// both — whether or not a retry is armed (Qodo, PR #1414). Without it a
+    /// correct ack of a delivery with the retry off returned
+    /// [`AckOutcome::NotPending`] and left the watch to report the worker quiet.
+    ///
+    /// A no-op unless `delivery_id` is still the pane's current delivery, so a
+    /// dispatch that lost the pane to a newer delegation cannot attach its
+    /// watch to that delegation's delivery.
+    pub fn bind_current(
+        &self,
+        pane_id: &str,
+        delivery_id: &str,
+        worker_agent_id: &str,
+        silence_seq: Option<u64>,
+    ) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.current.get_mut(pane_id) {
+            Some(current) if current.delivery_id == delivery_id => {
+                current.worker_agent_id = Some(worker_agent_id.to_string());
+                current.silence_seq = silence_seq;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The pane closed for good (Qodo, PR #1414): drop what is kept for it, so
+    /// a daemon that outlives many panes does not keep every one's last
+    /// delivery. `closed_agent_id` is the agent whose record just left the
+    /// registry, and the caller has established that no other agent holds the
+    /// pane.
+    ///
+    /// `dispatch_idle` is whether the pane's dispatch lock was free. It must be
+    /// read under the same registry lock hold that established the pane is
+    /// unclaimed: a delegation notes its delivery under that lock before it
+    /// knows its worker, and a `clear = true` delegate that re-creates a pane a
+    /// concurrent close emptied (issue #606) keeps the pane id and brings up
+    /// a new agent for a delivery noted before the close. So while a dispatch
+    /// is in flight only what is bound to `closed_agent_id` goes; an unbound
+    /// delivery, or one bound to any other agent, is the in-flight dispatch's
+    /// and is kept. With the lock free every entry belongs to an agent no
+    /// longer in the registry, and all of it goes.
+    pub fn forget_pane(&self, pane_id: &str, closed_agent_id: &str, dispatch_idle: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        if dispatch_idle
+            || inner
+                .records
+                .get(pane_id)
+                .is_some_and(|record| record.worker_agent_id == closed_agent_id)
+        {
+            inner.records.remove(pane_id);
+        }
+        let current_is_stale = match inner.current.get(pane_id) {
+            None => true,
+            Some(current) => {
+                dispatch_idle || current.worker_agent_id.as_deref() == Some(closed_agent_id)
+            }
+        };
+        if current_is_stale {
+            inner.current.remove(pane_id);
+            inner.last_acked.remove(pane_id);
+        }
+    }
+
+    /// The pane's current delivery id and the watch bound to it, for tests that
+    /// must ack a delivery no retry record holds.
+    #[cfg(test)]
+    pub(crate) fn current_for_test(&self, pane_id: &str) -> Option<(String, Option<u64>)> {
         self.inner
             .lock()
             .unwrap()
             .current
-            .insert(pane_id.to_string(), delivery_id.to_string());
+            .get(pane_id)
+            .map(|current| (current.delivery_id.clone(), current.silence_seq))
+    }
+
+    /// Whether anything at all is kept for `pane_id`.
+    #[cfg(test)]
+    pub(crate) fn tracks_pane(&self, pane_id: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.records.contains_key(pane_id)
+            || inner.current.contains_key(pane_id)
+            || inner.last_acked.contains_key(pane_id)
     }
 
     /// Acknowledge `delivery_id` on `pane_id`.
@@ -709,6 +820,10 @@ impl PendingDeliveries {
             inner
                 .last_acked
                 .insert(pane_id.to_string(), delivery_id.to_string());
+            // The watch is taken here, so a later ack cannot cancel it twice.
+            if let Some(current) = inner.current.get_mut(pane_id) {
+                current.silence_seq = None;
+            }
             return AckOutcome::Stopped {
                 silence_seq: record.silence_seq,
             };
@@ -726,15 +841,25 @@ impl PendingDeliveries {
         {
             return AckOutcome::AlreadyAcknowledged;
         }
-        if inner
-            .current
-            .get(pane_id)
-            .is_some_and(|current| current == delivery_id)
+        if let Some(current) = inner.current.get_mut(pane_id)
+            && current.delivery_id == delivery_id
         {
+            let from_worker = current
+                .worker_agent_id
+                .as_deref()
+                .is_some_and(|worker| agent_id == Some(worker));
+            // A watch is cancelled only by the delivery's own worker, the rule a
+            // pending record applies. Any other sender is answered as before,
+            // but is not recorded as the acknowledgement while the watch is
+            // still armed, so the worker's own ack still reaches it.
+            if current.silence_seq.is_some() && !from_worker {
+                return AckOutcome::NotPending { silence_seq: None };
+            }
+            let silence_seq = current.silence_seq.take();
             inner
                 .last_acked
                 .insert(pane_id.to_string(), delivery_id.to_string());
-            return AckOutcome::NotPending;
+            return AckOutcome::NotPending { silence_seq };
         }
         AckOutcome::Unknown
     }
@@ -2183,9 +2308,9 @@ mod tests {
         assert!(store.finish("p1", armed.seq));
         assert_eq!(
             store.acknowledge("p1", "d-11111111", Some("a1")),
-            AckOutcome::NotPending
+            AckOutcome::NotPending { silence_seq: None }
         );
-        assert!(AckOutcome::NotPending.matched());
+        assert!(AckOutcome::NotPending { silence_seq: None }.matched());
         assert_eq!(
             store.acknowledge("p1", "d-11111111", Some("a1")),
             AckOutcome::AlreadyAcknowledged
@@ -2207,7 +2332,7 @@ mod tests {
         );
         assert_eq!(
             store.acknowledge("p1", "d-33333333", None),
-            AckOutcome::NotPending
+            AckOutcome::NotPending { silence_seq: None }
         );
         assert_eq!(
             store.acknowledge("p2", "d-33333333", None),
@@ -2293,6 +2418,110 @@ mod tests {
                 silence_seq: Some(4)
             }
         );
+    }
+
+    /// Qodo, PR #1414: with the retry off no record is armed, so the watch seq
+    /// rides on the current delivery. Its worker's ack hands it back once; an
+    /// ack from anyone else hands back nothing and does not use it up.
+    #[test]
+    fn pending_deliveries_ack_with_nothing_armed_returns_the_bound_silence_seq() {
+        let store = PendingDeliveries::default();
+        store.note_delivery("p1", "d-11111111");
+        assert!(store.bind_current("p1", "d-11111111", "a1", Some(9)));
+        assert_eq!(
+            store.acknowledge("p1", "d-11111111", Some("a0")),
+            AckOutcome::NotPending { silence_seq: None },
+            "an older generation's ack must not cancel this delivery's watch"
+        );
+        assert_eq!(
+            store.acknowledge("p1", "d-11111111", None),
+            AckOutcome::NotPending { silence_seq: None },
+            "an unidentified sender must not cancel the watch"
+        );
+        assert_eq!(
+            store.acknowledge("p1", "d-11111111", Some("a1")),
+            AckOutcome::NotPending {
+                silence_seq: Some(9)
+            }
+        );
+        assert_eq!(
+            store.acknowledge("p1", "d-11111111", Some("a1")),
+            AckOutcome::AlreadyAcknowledged
+        );
+        // A dispatch that lost the pane to a newer delegation binds nothing.
+        store.supersede("p1");
+        store.note_delivery("p1", "d-22222222");
+        assert!(!store.bind_current("p1", "d-11111111", "a1", Some(10)));
+        assert_eq!(
+            store.acknowledge("p1", "d-22222222", Some("a1")),
+            AckOutcome::NotPending { silence_seq: None }
+        );
+    }
+
+    /// A retry that already ended leaves the watch on the current delivery,
+    /// and a stop hands it back only once.
+    #[test]
+    fn pending_deliveries_watch_is_handed_back_once_whether_stopped_or_not() {
+        let store = PendingDeliveries::default();
+        let armed = store.arm("p1", "d-11111111", "a1", Some(5), RetypePolicy::Allowed);
+        assert!(store.finish("p1", armed.seq));
+        assert_eq!(
+            store.acknowledge("p1", "d-11111111", Some("a1")),
+            AckOutcome::NotPending {
+                silence_seq: Some(5)
+            }
+        );
+
+        let _armed = store.arm("p1", "d-22222222", "a1", Some(6), RetypePolicy::Allowed);
+        assert_eq!(
+            store.acknowledge("p1", "d-22222222", Some("a1")),
+            AckOutcome::Stopped {
+                silence_seq: Some(6)
+            }
+        );
+        assert_eq!(
+            store.acknowledge("p1", "d-22222222", Some("a1")),
+            AckOutcome::AlreadyAcknowledged
+        );
+    }
+
+    /// Qodo, PR #1414: a pane that closes for good leaves nothing behind, but a
+    /// delivery an in-flight dispatch noted for the pane's next agent survives
+    /// the close of its previous one.
+    #[test]
+    fn pending_deliveries_forget_pane_keeps_an_in_flight_dispatchs_delivery() {
+        let store = PendingDeliveries::default();
+        let _armed = store.arm("p1", "d-11111111", "a1", Some(1), RetypePolicy::Allowed);
+        assert_eq!(
+            store.acknowledge("p1", "d-11111111", Some("a1")),
+            AckOutcome::Stopped {
+                silence_seq: Some(1)
+            }
+        );
+        store.forget_pane("p1", "a1", true);
+        assert!(!store.tracks_pane("p1"));
+
+        // A clear=true delegate noted its delivery, then a concurrent close of
+        // the old agent landed while it was still bringing the new one up.
+        store.note_delivery("p1", "d-22222222");
+        store.forget_pane("p1", "a1", false);
+        assert!(store.bind_current("p1", "d-22222222", "a2", Some(2)));
+        assert_eq!(
+            store.acknowledge("p1", "d-22222222", Some("a2")),
+            AckOutcome::NotPending {
+                silence_seq: Some(2)
+            }
+        );
+
+        // Mid-dispatch, what is bound to the closing agent still goes.
+        let _armed = store.arm("p1", "d-33333333", "a2", None, RetypePolicy::Allowed);
+        store.forget_pane("p1", "a2", false);
+        assert!(!store.tracks_pane("p1"));
+
+        // And another pane is untouched.
+        store.note_delivery("p2", "d-44444444");
+        store.forget_pane("p1", "a2", true);
+        assert!(store.tracks_pane("p2"));
     }
 
     #[test]

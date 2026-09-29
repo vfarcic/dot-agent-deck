@@ -3095,7 +3095,8 @@ fn hook_line_for_log(line: &str) -> String {
 /// Issue #1383: act on a worker's `ack` for a delegated task's delivery id.
 ///
 /// Stops the pane's in-place retry when the id is the pane's pending delivery,
-/// and cancels the silent-worker watch armed for that same delivery — an ack is
+/// and cancels the silent-worker watch armed for the pane's current delivery,
+/// retry or no retry — an ack is
 /// not an [`crate::event::AgentEvent`], so that watch cannot see it, and a
 /// hookless worker that acknowledged must not later be reported as never having
 /// got its task. The cancel is seq-conditional, not
@@ -3134,8 +3135,14 @@ pub(crate) fn handle_delivery_ack(
         &signal.delivery_id,
         attested_agent_id.or(signal.agent_id.as_deref()),
     );
+    // A matching ack with no retry pending cancels too (Qodo, PR #1414): with
+    // the retry off no record is ever armed, and the watch would otherwise
+    // report a worker that acknowledged as never having got its task.
     let silence_cancelled = match outcome {
         crate::delegate_retry::AckOutcome::Stopped {
+            silence_seq: Some(seq),
+        }
+        | crate::delegate_retry::AckOutcome::NotPending {
             silence_seq: Some(seq),
         } => registry.cancel_silence_watch_if(&signal.pane_id, seq),
         _ => false,

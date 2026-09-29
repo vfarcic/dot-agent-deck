@@ -9985,6 +9985,20 @@ impl AgentPtyRegistry {
                     .any(|a| a.pane_id_env.as_deref() == Some(pane));
                 if !still_claimed {
                     self.pane_input.lock().unwrap().forget_closed_pane(pane);
+                    // Issue #1383 (Qodo, PR #1414): the pane's delivery
+                    // bookkeeping goes with it. Whether a dispatch is in flight
+                    // is read under this same hold, because a `clear = true`
+                    // delegate can re-create this pane id for a delivery it
+                    // noted before this close; see `forget_pane`. Peeked rather
+                    // than `pane_dispatch_lock`, which would add a map entry for
+                    // a pane that never dispatched.
+                    let dispatch_idle = self
+                        .dispatch_mutexes
+                        .lock()
+                        .unwrap()
+                        .get(pane)
+                        .is_none_or(|mutex| mutex.try_lock().is_ok());
+                    self.pending_deliveries.forget_pane(pane, id, dispatch_idle);
                 }
             }
             agent
@@ -18931,6 +18945,86 @@ mod spawn_tests {
     /// Issue #542: closing an agent drops its launcher standing and, with no
     /// other record left on the pane, all three pane-keyed clocks — and a
     /// declaration arriving after the close cannot put the standing back.
+    #[tokio::test]
+    async fn close_agent_forgets_the_panes_deliveries_but_not_an_in_flight_dispatchs() {
+        // Issue #1383 (Qodo, PR #1414): a pane that closes for good takes its
+        // delivery bookkeeping with it.
+        const PANE: &str = "issue-1383-closed-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn = |pane: &str| {
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/sh"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn sh")
+        };
+        let first = spawn(PANE);
+        let deliveries = registry.pending_deliveries();
+        let _armed = deliveries.arm(
+            PANE,
+            "d-11111111",
+            &first,
+            Some(1),
+            crate::delegate_retry::RetypePolicy::Allowed,
+        );
+        assert!(
+            deliveries.acknowledge(PANE, "d-11111111", Some(&first))
+                != crate::delegate_retry::AckOutcome::Unknown
+        );
+        let _second_armed = deliveries.arm(
+            PANE,
+            "d-22222222",
+            &first,
+            None,
+            crate::delegate_retry::RetypePolicy::Allowed,
+        );
+        registry.close_agent(&first).expect("close");
+        assert!(
+            !deliveries.tracks_pane(PANE),
+            "a pane nothing names any more must keep no delivery state"
+        );
+
+        // A `clear = true` delegate noted its delivery under the dispatch lock,
+        // and the pane's previous agent was then closed under it (issue #606's
+        // recreate). The delivery belongs to the agent that dispatch is
+        // bringing up, and must survive.
+        let old = spawn(PANE);
+        let dispatch_lock = registry.pane_dispatch_lock(PANE);
+        let dispatch = dispatch_lock.lock().await;
+        deliveries.supersede(PANE);
+        deliveries.note_delivery(PANE, "d-33333333");
+        registry.close_agent(&old).expect("close");
+        let fresh = spawn(PANE);
+        assert!(
+            deliveries.bind_current(PANE, "d-33333333", &fresh, Some(3)),
+            "the in-flight dispatch's delivery must survive the close"
+        );
+        drop(dispatch);
+        assert_eq!(
+            deliveries.acknowledge(PANE, "d-33333333", Some(&fresh)),
+            crate::delegate_retry::AckOutcome::NotPending {
+                silence_seq: Some(3)
+            }
+        );
+
+        // A `clear = true` respawn keeps the pane id and closes nothing, so
+        // the delivery it noted stays put.
+        deliveries.supersede(PANE);
+        deliveries.note_delivery(PANE, "d-44444444");
+        let respawned = registry
+            .respawn_agent_for_pane(PANE, "cat")
+            .await
+            .expect("respawn");
+        assert!(deliveries.bind_current(PANE, "d-44444444", &respawned, None));
+
+        // Closing the pane's last agent with no dispatch in flight forgets it.
+        registry.close_agent(&respawned).expect("close");
+        assert!(!deliveries.tracks_pane(PANE));
+        registry.shutdown_all();
+    }
+
     #[tokio::test]
     async fn close_agent_empties_launcher_standing_and_pane_clocks() {
         const PANE: &str = "issue-542-closed-pane";
