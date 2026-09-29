@@ -3070,6 +3070,11 @@ pub struct OrchestrationHydrationBucket {
     /// [`Self::identity`].
     pub orchestration_id: Option<String>,
     pub role_slots: Vec<OrchestrationRoleSlot>,
+    /// Issue #1395 item 1: the per-publish context file the daemon recorded for
+    /// this orchestration, read off its start-role pane's record. Set on the
+    /// rebuilt tab so its re-arm reads the tab's own file; `None` (an older
+    /// daemon, a live surface, a TUI-launched tab) keeps the mirror fallback.
+    pub context_path: Option<std::path::PathBuf>,
 }
 
 impl OrchestrationHydrationBucket {
@@ -3710,6 +3715,7 @@ pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition
                                 // `OrchestrationHydrationBucket::identity`.
                                 orchestration_id: orchestration_id.clone(),
                                 role_slots: Vec::new(),
+                                context_path: None,
                             });
                         i
                     }
@@ -3719,6 +3725,11 @@ pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition
                 // that omitted it: keep the first non-`None` value we see.
                 if out.orchestration_buckets[idx].display_title.is_none() {
                     out.orchestration_buckets[idx].display_title = display_title.clone();
+                }
+                // Issue #1395: only the start role's record carries it.
+                if out.orchestration_buckets[idx].context_path.is_none() {
+                    out.orchestration_buckets[idx].context_path =
+                        h.orchestrator_context_path.clone();
                 }
                 out.orchestration_buckets[idx]
                     .role_slots
@@ -5850,6 +5861,9 @@ fn surface_one_orchestration(
                 is_start_role: r.is_start_role,
             })
             .collect(),
+        // Issue #1395: the surface carries no context path; this tab keeps the
+        // mirror fallback until it is next hydrated from `ListAgents`.
+        context_path: None,
     };
     let project_config = load_project_config(Path::new(&surface.cwd)).map_err(|e| e.to_string());
     let local = project_config
@@ -13061,6 +13075,10 @@ pub fn run_tui(
                     if first_orchestration_tab_index.is_none() {
                         first_orchestration_tab_index = Some(tab_index);
                     }
+                    // Issue #1395 item 1: re-arm this tab from the file its
+                    // coordinator was started with, as a Ctrl+n tab does.
+                    tab_manager
+                        .set_orchestration_context_path(tab_index, bucket.context_path.clone());
                     if let Some(warning) = drift_warning {
                         surface_orchestration_config_drift(
                             &mut ui,
@@ -25745,6 +25763,7 @@ mod tests {
             tab_membership: membership,
             agent_type: None,
             live: None,
+            orchestrator_context_path: None,
         }
     }
 
@@ -27220,6 +27239,7 @@ mod tests {
                     is_start_role: false,
                 },
             ],
+            context_path: None,
         };
         let chosen = resolve_orch_config_for_hydration(Some(local.clone()), &bucket);
         assert_eq!(
@@ -41966,6 +41986,7 @@ mod config_drift_tests {
                     is_start_role: *i == 0,
                 })
                 .collect(),
+            context_path: None,
         }
     }
 

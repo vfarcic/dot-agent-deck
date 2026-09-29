@@ -728,9 +728,11 @@ pub async fn spawn(
             // issue #600 already established for this branch — `Err` from `spawn`
             // means "nothing is running" — instead of inventing a second,
             // half-started outcome beside it.
-            let prompt = match req.compose_orchestrator_context {
+            // Issue #1395: the published file is kept beside the prompt so the
+            // orchestrator's role registration below can record it.
+            let (prompt, context_path) = match req.compose_orchestrator_context {
                 Some(attendance) => {
-                    crate::orchestrator_context::prepare_orchestrator_context(
+                    let prepared = crate::orchestrator_context::prepare_orchestrator_context(
                         &orch_config,
                         Path::new(&req.working_dir),
                         Some(req.prompt.as_str()),
@@ -762,13 +764,13 @@ pub async fn spawn(
                             ),
                         });
                         SpawnError::OrchestratorContext(e)
-                    })?
-                    .prompt
+                    })?;
+                    (prepared.prompt, Some(prepared.context_path))
                 }
                 // #120 / #127: unchanged — the prompt is delivered verbatim, and
                 // nothing is composed, so there is nothing to refuse. See
                 // `compose_orchestrator_context` for why this is not flipped here.
-                None => req.prompt.clone(),
+                None => (req.prompt.clone(), None),
             };
             let mut agents = Vec::with_capacity(roles.len());
             // PRD #127 readiness gate: SUBSCRIBE before any pane is spawned so
@@ -954,6 +956,13 @@ pub async fn spawn(
                         identity.clone(),
                         Some(req.working_dir.as_str()),
                     );
+                    // Issue #1395: the orchestrator's own context file, for its
+                    // `ListAgents` record and for removal when this ends.
+                    if idx == orch_idx
+                        && let Some(path) = context_path.clone()
+                    {
+                        state.record_orchestration_context(&identity, path);
+                    }
                 }
                 agents.push(SpawnedAgent {
                     id,
@@ -7628,6 +7637,7 @@ mod tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         }
     }
 

@@ -3327,6 +3327,22 @@ pub struct AgentRecord {
     /// optional field on this struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crashed: Option<bool>,
+    /// Issue #1395 item 1: the per-publish orchestrator context file
+    /// (`.dot-agent-deck/orchestrator-context-<id>.md`) this pane's
+    /// orchestration was started with — set only on the orchestration's START
+    /// role, by the `ListAgents` handler from what the daemon recorded at the
+    /// start ([`crate::state::AppState::attach_orchestrator_context_paths`]).
+    /// A TUI hydrating the tab re-arms compaction and `/clear` from this file
+    /// instead of the fixed-path mirror, which a later preparation in the same
+    /// project may have overwritten.
+    ///
+    /// `None` for every other pane, for a start role the daemon has no record
+    /// for (a TUI-launched `Ctrl+n` tab, which publishes its own context), and
+    /// from a daemon predating this field — in which case the TUI falls back to
+    /// the mirror exactly as before. Additive optional, so no
+    /// `PROTOCOL_VERSION` bump — same basis as `live` and `crashed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_context_path: Option<String>,
 }
 
 impl AgentRecord {
@@ -12050,6 +12066,7 @@ impl AgentPtyRegistry {
             // reaches no client at all.
             cli_name: None,
             crashed: agent.crashed,
+            orchestrator_context_path: None,
         })
     }
 
@@ -12402,6 +12419,10 @@ impl AgentPtyRegistry {
                 // `AgentRecord::cli_name`.
                 cli_name: None,
                 crashed: agent.crashed,
+                // Issue #1395: the registry does not know it; the `ListAgents`
+                // handler stamps it from `AppState`. See
+                // `AgentRecord::orchestrator_context_path`.
+                orchestrator_context_path: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -17447,6 +17468,7 @@ mod spawn_tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         }
     }
 
@@ -17531,6 +17553,7 @@ mod spawn_tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -17557,6 +17580,33 @@ mod spawn_tests {
             .expect("older daemon shape must decode via #[serde(default)] on rows/cols");
         assert_eq!(back.rows, 0);
         assert_eq!(back.cols, 0);
+    }
+
+    /// Issue #1395 item 1: `orchestrator_context_path` is additive optional —
+    /// an older daemon's record (no key) decodes as `None`, and `None` puts no
+    /// key on the wire, so an older client sees the shape it always has.
+    #[test]
+    fn agent_record_orchestrator_context_path_is_additive_optional() {
+        let legacy_json = r#"{"id": "1"}"#;
+        let back: AgentRecord =
+            serde_json::from_str(legacy_json).expect("a record without the field must decode");
+        assert_eq!(back.orchestrator_context_path, None);
+        let wire = serde_json::to_value(&back).unwrap();
+        assert!(
+            wire.get("orchestrator_context_path").is_none(),
+            "None must be omitted from the wire: {wire}"
+        );
+
+        let with_path = AgentRecord {
+            orchestrator_context_path: Some("/p/.dot-agent-deck/x.md".into()),
+            ..back
+        };
+        let json = serde_json::to_string(&with_path).unwrap();
+        let round: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            round.orchestrator_context_path.as_deref(),
+            Some("/p/.dot-agent-deck/x.md")
+        );
     }
 
     #[test]
@@ -18486,6 +18536,7 @@ mod spawn_tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

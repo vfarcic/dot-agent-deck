@@ -684,11 +684,12 @@ fn read_back_context(file_path: &std::path::Path) -> (Option<String>, Attendance
 /// instead would re-arm this orchestration with whatever task another
 /// preparation in the same project last left there. The re-arm then publishes a
 /// **new** file — published files are never rewritten — and returns its path,
-/// which the tab keeps in place of `known`. `None` covers a tab whose path is
-/// unknown (one re-hydrated after a reattach, or opened by a daemon-side
-/// launch); it falls back to the compatibility mirror, which is exactly the
-/// pre-#1233 behaviour and races as it did. Giving those tabs their path is
-/// follow-up #1395.
+/// which the tab keeps in place of `known`. A tab re-hydrated after a reattach
+/// gets its path from the daemon's record of its start role (issue #1395).
+/// `None` covers a tab whose path is still unknown — hydrated from an older
+/// daemon, or built from a live orchestration surface, which carries none; it
+/// falls back to the compatibility mirror, which is exactly the pre-#1233
+/// behaviour and races as it did.
 pub fn reassert_orchestrator_prompt(
     config: &OrchestrationConfig,
     cwd: &str,
@@ -1954,6 +1955,124 @@ pub fn withdraw_published_context(published: &PublishedContext) {
     }
 }
 
+/// Whether `name` has the exact shape [`unique_context_file_name`] mints:
+/// [`CONTEXT_FILE_PREFIX`], 32 lowercase hex digits, `.md`.
+///
+/// Narrower than [`is_sweepable_coordination_name`] on purpose: this gates
+/// [`remove_ended_orchestration_context`], which acts on a recorded path rather
+/// than on an age, so it accepts nothing but a per-publish context — never the
+/// [`CONTEXT_FILE_NAME`] mirror, a task file, or anything else under the dot
+/// directory.
+pub(crate) fn is_unique_context_file_name(name: &str) -> bool {
+    name.strip_prefix(CONTEXT_FILE_PREFIX)
+        .and_then(|rest| rest.strip_suffix(".md"))
+        .is_some_and(|hex| {
+            hex.len() == 32
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+/// Why [`remove_ended_orchestration_context`] removed nothing.
+#[derive(Debug)]
+pub enum ContextRemovalError {
+    /// The path is not `<project>/.dot-agent-deck/orchestrator-context-<32 hex>.md`.
+    NotAContextFile,
+    /// Opening the project or its `.dot-agent-deck` failed.
+    Dir(ContextPublishError),
+    /// The entry is there but is not a regular file.
+    NotARegularFile,
+    /// The unlink itself failed (a missing entry is not an error).
+    Unlink(std::io::Error),
+}
+
+impl std::fmt::Display for ContextRemovalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAContextFile => f.write_str("not a per-publish orchestrator context path"),
+            Self::Dir(e) => write!(f, "{e}"),
+            Self::NotARegularFile => f.write_str("the entry is not a regular file"),
+            Self::Unlink(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Delete the per-publish context an orchestration was started with, once
+/// that orchestration has ended (issue #1395 item 2).
+///
+/// `context_path` is the path the daemon recorded from its own preparation
+/// binding ([`crate::state::AppState::record_orchestration_context`]), never a
+/// value a client supplied — and it is validated anyway, because this deletes a
+/// file: the file name must be [`is_unique_context_file_name`] and its parent
+/// must be named [`CONTEXT_DIR_NAME`]. The [`CONTEXT_FILE_NAME`] mirror
+/// therefore can never be removed here.
+///
+/// The removal goes through the same held-descriptor discipline as the publish:
+/// the project directory is opened once, `.dot-agent-deck` is opened relative
+/// to it with `O_NOFOLLOW | O_DIRECTORY`, the entry is `fstatat`ed without
+/// following and must be a regular file, and the unlink is an `unlinkat` of that
+/// single name. Nothing is created and no mode is repaired.
+///
+/// A missing file is success: the 14-day sweep, or the user, got there first.
+/// Whether another live orchestration still references the file is the
+/// caller's question to answer, under the state lock, before calling this —
+/// see [`crate::state::AppState::take_ended_orchestration_context`].
+///
+/// **Blocking.** Called off the state lock, from a blocking task.
+pub fn remove_ended_orchestration_context(
+    context_path: &std::path::Path,
+) -> Result<(), ContextRemovalError> {
+    let name = context_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| is_unique_context_file_name(n))
+        .ok_or(ContextRemovalError::NotAContextFile)?;
+    let context_dir = context_path
+        .parent()
+        .filter(|dir| dir.file_name() == Some(std::ffi::OsStr::new(CONTEXT_DIR_NAME)))
+        .ok_or(ContextRemovalError::NotAContextFile)?;
+    let project_dir = context_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or(ContextRemovalError::NotAContextFile)?;
+    let project = open_project_dir(project_dir)
+        .map_err(|e| ContextRemovalError::Dir(ContextPublishError::ContextDirUnusable(e)))?;
+    let guard = match open_context_dir(&project) {
+        Ok(guard) => guard,
+        // No `.dot-agent-deck` at all: nothing left to remove.
+        Err(ContextPublishError::ContextDirUnusable(e))
+            if e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(ContextRemovalError::Dir(e)),
+    };
+    let dir = ContextDir {
+        path: context_dir.to_path_buf(),
+        guard: std::sync::Arc::new(guard),
+    };
+    #[cfg(unix)]
+    match dir.stat_of(name) {
+        Ok(st) if file_type_bits(&st) == libc::S_IFREG => {}
+        Ok(_) => return Err(ContextRemovalError::NotARegularFile),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(ContextRemovalError::Unlink(e)),
+    }
+    #[cfg(not(unix))]
+    match std::fs::symlink_metadata(context_dir.join(name)) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => return Err(ContextRemovalError::NotARegularFile),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(ContextRemovalError::Unlink(e)),
+    }
+    match dir.unlink(name) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ContextRemovalError::Unlink(e)),
+    }
+}
+
 /// Refresh the fixed [`CONTEXT_FILE_NAME`] with `content`, **best effort**
 /// (issue #1233's compatibility mirror).
 ///
@@ -2099,7 +2218,8 @@ fn mirror_order_slot(key: MirrorDirKey) -> std::sync::Arc<std::sync::Mutex<u64>>
 /// reply carries does not read it: it names the per-preparation file this
 /// preparation published before answering. The mirror serves only
 /// compatibility readers — a pre-#1233 TUI's compaction re-arm, a TUI tab
-/// hydrated from the daemon's records without a path (#1395), and role
+/// whose path is unknown (hydrated from an older daemon's records, or built
+/// from a live orchestration surface), and role
 /// commands or templates that hard-code the fixed path.
 #[derive(Debug)]
 pub struct PendingMirror {
@@ -2466,8 +2586,10 @@ pub struct SweepReport {
 ///   residual, stated: a coordinator that re-reads its own file on its own
 ///   initiative more than the window after its last publish, with no re-arm in
 ///   between (a re-arm publishes a fresh file), finds it gone. It then reads
-///   nothing rather than something wrong. Deleting them when the orchestration
-///   ends is follow-up #1395.
+///   nothing rather than something wrong. A daemon-started orchestration's file
+///   is also deleted when the orchestration ends
+///   ([`remove_ended_orchestration_context`], issue #1395); this sweep is the
+///   backstop for every file that path does not reach.
 /// * the mirror's own leftover temp files, `.orchestrator-context.md.<pid>.<seq>.tmp`,
 ///   which are removed on a failed mirror write but survive a process killed
 ///   between the create and the rename.
@@ -4198,6 +4320,86 @@ mod tests {
 // ---------------------------------------------------------------------------
 // Issues #1047 / #329: the permission policy, the sweep, and the git exclude
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod ended_context_removal_tests {
+    use super::*;
+
+    const UNIQUE: &str = "orchestrator-context-0123456789abcdef0123456789abcdef.md";
+
+    #[test]
+    fn only_the_minted_per_publish_shape_is_a_unique_context_name() {
+        assert!(is_unique_context_file_name(UNIQUE));
+        assert!(is_unique_context_file_name(&unique_context_file_name()));
+        for refused in [
+            CONTEXT_FILE_NAME,
+            "orchestrator-context-.md",
+            "orchestrator-context-0123456789ABCDEF0123456789abcdef.md",
+            "orchestrator-context-0123456789abcdef0123456789abcde.md",
+            "orchestrator-context-0123456789abcdef0123456789abcdef.md.bak",
+            "orchestrator-context-0123456789abcdef0123456789abcdeg.md",
+            "worker-task-coder.md",
+            "../orchestrator-context-0123456789abcdef0123456789abcdef.md",
+        ] {
+            assert!(!is_unique_context_file_name(refused), "{refused}");
+        }
+    }
+
+    /// Issue #1395 item 2: the helper removes a recorded per-publish context
+    /// and refuses every other shape — the mirror, a task file, a unique name
+    /// outside `.dot-agent-deck` — leaving each of them on disk.
+    #[test]
+    fn removal_refuses_a_non_matching_name_and_never_touches_the_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(CONTEXT_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+        let unique = dir.join(UNIQUE);
+        let mirror = dir.join(CONTEXT_FILE_NAME);
+        let task = dir.join("worker-task-coder.md");
+        let outside = tmp.path().join(UNIQUE);
+        for f in [&unique, &mirror, &task, &outside] {
+            std::fs::write(f, "x").unwrap();
+        }
+
+        for refused in [&mirror, &task, &outside] {
+            assert!(
+                matches!(
+                    remove_ended_orchestration_context(refused),
+                    Err(ContextRemovalError::NotAContextFile)
+                ),
+                "{} must be refused",
+                refused.display()
+            );
+            assert!(refused.is_file(), "{} must survive", refused.display());
+        }
+
+        remove_ended_orchestration_context(&unique).expect("the recorded file is removed");
+        assert!(!unique.exists());
+        assert!(mirror.is_file() && task.is_file());
+        // Already gone is not an error.
+        remove_ended_orchestration_context(&unique).expect("a missing file is success");
+    }
+
+    /// A directory or symlink under a valid name is refused, never removed or
+    /// followed.
+    #[cfg(unix)]
+    #[test]
+    fn removal_refuses_an_entry_that_is_not_a_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(CONTEXT_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+        let target = tmp.path().join("precious.txt");
+        std::fs::write(&target, "keep").unwrap();
+        let link = dir.join(UNIQUE);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(matches!(
+            remove_ended_orchestration_context(&link),
+            Err(ContextRemovalError::NotARegularFile)
+        ));
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+    }
+}
 
 #[cfg(test)]
 mod hygiene_tests {
