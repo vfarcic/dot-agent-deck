@@ -4,10 +4,25 @@ use std::path::Path;
 use dot_agent_deck::embedded_docs::PAGES;
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+
+    let last = needle.len() - 1;
+    let mut shifts = [needle.len(); 256];
+    for (index, &byte) in needle[..last].iter().enumerate() {
+        shifts[usize::from(byte)] = last - index;
+    }
+
+    let mut offset = 0;
+    while offset <= haystack.len() - needle.len() {
+        let window = &haystack[offset..offset + needle.len()];
+        if window[last] == needle[last] && window == needle {
+            return true;
+        }
+        offset += shifts[usize::from(window[last])];
+    }
+    false
 }
 
 /// Scenario: Inspect every topic embedded in the compiled binary and every
