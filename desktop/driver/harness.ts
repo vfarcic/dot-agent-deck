@@ -147,6 +147,7 @@ type TerminalScreen = {
   rect: { left: number; top: number; width: number; height: number } | null;
   selection: string;
   charSize?: unknown;
+  selectionStart?: unknown;
 };
 
 export type DeckOptions = {
@@ -396,6 +397,8 @@ export class Deck {
     // Installed once per page; each call only empties the record.
     await this.session.execute(
       `window.__dadPointerLog = [];
+       window.__dadSelectionTrace = [];
+       window.__dadDriver.traceSelection();
        if (!window.__dadPointerProbe) {
          window.__dadPointerProbe = true;
          const selection = () => window.__dadDriver.terminalScreens().map((s) => s.selection).join("|");
@@ -403,13 +406,14 @@ export class Deck {
          for (const type of ["mousedown", "mousemove", "mouseup"]) {
            document.addEventListener(type, (e) => {
              const mods = (e.shiftKey ? "S" : "") + (e.ctrlKey ? "C" : "") + (e.altKey ? "A" : "") + (e.metaKey ? "M" : "");
-             note([type, Math.round(e.clientX), Math.round(e.clientY), e.buttons, e.detail, mods]);
+             note([type, Math.round(performance.now()), Math.round(e.clientX), Math.round(e.clientY), e.buttons, e.detail, mods]);
            }, { capture: true });
          }
          // After xterm's own handlers. xterm's press handler always calls
          // preventDefault, so false here means it never saw the press.
          window.addEventListener("mousedown", (e) => {
-           note(["handled@down", e.defaultPrevented, JSON.stringify(window.__dadDriver.terminalScreens().map((s) => s.charSize))]);
+           note(["handled@down", Math.round(performance.now()), e.defaultPrevented,
+             JSON.stringify(window.__dadDriver.terminalScreens().map((s) => [s.charSize, s.selectionStart]))]);
          });
          // What xterm holds at release, and shortly after.
          window.addEventListener("mouseup", () => {
@@ -427,7 +431,7 @@ export class Deck {
           `const el = document.elementFromPoint(arguments[0], arguments[1]);
            return { under: el ? el.nodeName + "." + String(el.className).slice(0, 60) : null,
                     focused: document.activeElement ? document.activeElement.nodeName + "." + String(document.activeElement.className).slice(0, 60) : null,
-                    events: window.__dadPointerLog };`,
+                    events: window.__dadPointerLog, trace: window.__dadSelectionTrace };`,
           [Math.round(span.from.x), Math.round(span.from.y)],
         )
         .catch((probe: unknown) => String(probe));

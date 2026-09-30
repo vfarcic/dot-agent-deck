@@ -190,6 +190,16 @@ export function stripAnsi(raw: string): string {
 // built the ordinary way cannot quietly start carrying it. It exposes the same
 // text the Reader overlay already shows a user, where that text is painted, and
 // it writes nothing.
+/** xterm's private services, for the driver seam's diagnostics only. */
+function xtermInternals(terminal: Terminal):
+  | {
+      _charSizeService?: { width: number; height: number };
+      _selectionService?: { _model?: { selectionStart?: unknown } } & Record<string, unknown>;
+    }
+  | undefined {
+  return (terminal as unknown as { _core?: ReturnType<typeof xtermInternals> })._core;
+}
+
 if (import.meta.env.VITE_DAD_DRIVER_SEAM === "1") {
   (window as Window & { __dadDriver?: unknown }).__dadDriver = {
     terminalTexts: () =>
@@ -209,11 +219,33 @@ if (import.meta.env.VITE_DAD_DRIVER_SEAM === "1") {
         }
         const box = terminal.element?.querySelector(".xterm-screen")?.getBoundingClientRect();
         const rect = box ? { left: box.left, top: box.top, width: box.width, height: box.height } : null;
-        // xterm's measured cell, read from its internals: a drag selects nothing
-        // while that measurement is invalid (issue #1403's CI failures).
-        const core = (terminal as unknown as { _core?: { _charSizeService?: { width: number; height: number } } })._core;
+        // xterm's measured cell and where its selection model says a drag
+        // started, read from its internals (issue #1403's CI failures).
+        const core = xtermInternals(terminal);
         const charSize = core?._charSizeService ? { width: core._charSizeService.width, height: core._charSizeService.height } : null;
-        return { key, cols: terminal.cols, rows: terminal.rows, lines, rect, selection: terminal.getSelection(), charSize };
+        const selectionStart = core?._selectionService?._model?.selectionStart ?? null;
+        return { key, cols: terminal.cols, rows: terminal.rows, lines, rect, selection: terminal.getSelection(), charSize, selectionStart };
       }),
+    // Issue #1403 — record, into `window.__dadSelectionTrace`, every time xterm
+    // clears a terminal's selection (with the caller's stack) and every resize,
+    // so a drag whose selection vanishes says what removed it. Idempotent.
+    traceSelection: () => {
+      const trace = ((window as Window & { __dadSelectionTrace?: unknown[] }).__dadSelectionTrace ??= []);
+      for (const terminal of terminals.values()) {
+        const service = xtermInternals(terminal)?._selectionService as
+          | (Record<string, unknown> & { clearSelection: () => void; __dadTraced?: boolean })
+          | undefined;
+        if (!service || service.__dadTraced) continue;
+        service.__dadTraced = true;
+        const clear = service.clearSelection.bind(service);
+        service.clearSelection = () => {
+          const stack = (new Error().stack ?? "").split("\n").slice(1, 9).map((frame) => frame.trim().slice(0, 90));
+          trace.push(["clear", Math.round(performance.now()), terminal.cols, terminal.rows, stack.join(" < ")]);
+          clear();
+        };
+        terminal.onResize(({ cols, rows }) => trace.push(["resize", Math.round(performance.now()), cols, rows]));
+      }
+      return trace.length;
+    },
   };
 }
