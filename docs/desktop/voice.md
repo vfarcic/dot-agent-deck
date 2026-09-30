@@ -16,6 +16,8 @@ Say "what can I say?" to see every command, split into **On this screen** and **
 
 What the app did with each thing you said appears beside the button and stays until the next one. When a command can be reversed, an **Undo** button is shown beside it for ten seconds.
 
+A command that names an agent, such as "stop the planner" or "close the review orchestration", runs nothing, and the app says why, if you switch daemons or that agent is replaced by a new one under the same name while the app is still working out what you said (which the app can tell only when the daemon reports when each agent started). Say it again to act on the agent that is there now.
+
 To type into an agent, open its [pane](dashboard.md#the-agent-pane) and start with "type", for example "type run the tests". The words after "type" are typed into the agent's prompt, taken from what the Speech service heard rather than from the Commands model's answer, and sent after a short countdown. Nothing is typed, and the app says why, if a confirmation is open, or if the pane on screen is no longer the one you were looking at when you spoke — for example because you opened another agent while the app was still working out what you said. Once the words are typed, the send is called off, and the app says so, if before it happens you close the pane, open another screen or agent, switch daemons, or a confirmation opens: the words stay in the agent's prompt, unsent. It is also called off if the agent in the pane is replaced by a new one. Telling a replacement apart needs a daemon that reports when each agent started; with one that does not, the app cannot tell a replacement from the original agent.
 
 ## When a command matches several things

@@ -521,8 +521,9 @@ type VoiceContext = {
 /**
  * What one side effect acts on, which is what has to still hold for it:
  * `answer` for acting on a resolved utterance at all, `pane` for typing into
- * or pressing Enter in that agent's pane, `agent` for running a chosen entry
- * that names that agent on the selected deck.
+ * or pressing Enter in that agent's pane, `agent` for dispatching an outcome —
+ * resolved directly or chosen from a list — whose params name that agent on
+ * the selected deck (see {@link dispatchLost}).
  */
 type Touches = { answer?: true; pane?: AgentAddress; agent?: string };
 
@@ -530,12 +531,23 @@ type Touches = { answer?: true; pane?: AgentAddress; agent?: string };
 type Lost = { code: "screen" | "dialog" | "mode" | "confirmation" | "pane" | "replaced" | "blocked" | "deck" | "agent"; why: string };
 
 /**
- * PRD #1260/#1261 review, round 4 — THE gate. Every side effect an utterance
- * has passes it immediately before it happens — typing, arming the one-shot
- * countdown, pressing Enter, offering a choice, dispatching a chosen entry —
- * and every context change re-runs it for whatever is still pending. It
- * answers `undefined` while the context `was` declared in still holds for what
- * the effect `touches`, or why not.
+ * PRD #1260/#1261 review, rounds 4-5 — THE gate. Every side effect an
+ * utterance has passes it immediately before it happens, with these touches:
+ * acting on a resolved answer or offering a choice (`answer`, in
+ * `resolveOne`); dispatching a resolved or chosen outcome (`answer`, plus
+ * `agent` for every agent its params name — {@link dispatchLost}, in
+ * `resolveOne` and `dispatchChoice`); typing, "send it" and entering the mode
+ * (`pane`, in the pane seams, against the dispatch's declaration); arming the
+ * one-shot countdown and pressing its Enter (`pane`, against the declaration
+ * kept on `sending`). Every context change re-runs the `pane` check for the
+ * mode and any pending send. It answers `undefined` while the context `was`
+ * declared in still holds for what the effect `touches`, or why not. The
+ * confirmation it reads is whichever screen is mounted — the overview's or
+ * the deck's.
+ *
+ * Outside it by design: Undo, which is the user's own click on a report, and
+ * a dictation-mode write already handed to the terminal before the mode ended
+ * (see the dev doc's "speech still being processed" residual).
  *
  * Two of its rules are ABSOLUTE rather than about change, because a change
  * check can only be as good as the moment it was compared from: nothing is
@@ -545,8 +557,9 @@ type Lost = { code: "screen" | "dialog" | "mode" | "confirmation" | "pane" | "re
  * refuses, it never skips the check.
  *
  * One residual is change-only on purpose: `inputBlocked`. A one-shot typed
- * into a pane that already read as blocked is written, and the terminal's own
- * refusal is what reports it; the typing mode refuses such a pane at entry
+ * into a pane that already read as blocked is written, and in production the
+ * daemon's refusal of the write is what reports it (the fixture runtime echoes
+ * every write, so the preview shows it typed); the typing mode refuses such a pane at entry
  * (`startDictation`), where the failure would otherwise repeat every utterance.
  */
 export function contextLost(was: VoiceContext, now: VoiceContext, touches: Touches): Lost | undefined {
@@ -564,6 +577,32 @@ export function contextLost(was: VoiceContext, now: VoiceContext, touches: Touch
   }
   if ((aim || touches.agent !== undefined) && now.deck !== was.deck) return { code: "deck", why: "the deck changed" };
   if (touches.agent !== undefined && incarnationsDiffer(was.incarnations[touches.agent], now.incarnations[touches.agent])) return { code: "agent", why: "the agent was replaced" };
+  return undefined;
+}
+
+/**
+ * PRD #1260/#1261 review, round 5 — the param kinds whose `value` is an agent
+ * id on the selected deck (see {@link VoiceResolvedParamDto}): `agent_ref`
+ * names the agent itself, `orchestration_ref` one member of the card. Keyed by
+ * KIND rather than by row, so a new row that takes either param is gated
+ * without being listed anywhere.
+ */
+const AGENT_TARGETING_KINDS: ReadonlySet<string> = new Set(["agent_ref", "orchestration_ref"]);
+
+/**
+ * The gate for dispatching a resolved outcome: {@link contextLost}'s `answer`
+ * touch, then its `agent` touch for every agent the outcome's params name —
+ * so a stop resolved before a same-id replacement, or before the selected deck
+ * changed, cannot open its confirmation for the agent that is there now.
+ */
+function dispatchLost(was: VoiceContext, now: VoiceContext, params: readonly VoiceResolvedParamDto[]): Lost | undefined {
+  const lost = contextLost(was, now, { answer: true });
+  if (lost) return lost;
+  for (const param of params) {
+    if (!AGENT_TARGETING_KINDS.has(param.kind)) continue;
+    const moved = contextLost(was, now, { agent: param.value });
+    if (moved) return moved;
+  }
   return undefined;
 }
 
@@ -1030,11 +1069,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    */
   const dispatching = useRef<VoiceContext | undefined>(undefined);
   const dispatchDeclared = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declared: VoiceContext) => {
+    /* Restored rather than cleared (review round 5), so a dispatch nested in
+       another cannot drop the outer one's declaration on its way out. */
+    const outer = dispatching.current;
     dispatching.current = declared;
     try {
       return onDispatch(outcome, declared.directories, declared.newAgent);
     } finally {
-      dispatching.current = undefined;
+      dispatching.current = outer;
     }
   }, [onDispatch]);
   /** The pane seams' gate: the dispatch's declaration against now, for writes to `aim`. */
@@ -1401,10 +1443,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const chosen = offer.outcome.candidates[at];
     /* The one place both a click and a spoken answer pass, so neither can run
        an entry — or open a stop confirmation for an agent — that the gate
-       says has moved on since the first utterance was declared. An agent
-       entry names its agent by id on the selected deck, which alone cannot
-       tell a same-id replacement apart. */
-    const lost = contextLost(offer.declared, current(), { answer: true, ...(chosen?.kind === "agent_ref" ? { agent: chosen.value } : {}) });
+       says has moved on since the first utterance was declared. An agent or
+       orchestration entry names its agent by id on the selected deck, which
+       alone cannot tell a same-id replacement apart. */
+    const lost = dispatchLost(offer.declared, current(), [...(offer.outcome.params ?? []), ...(chosen ? [chosen] : [])]);
     if (lost) {
       setProblem(choiceRefusal(lost));
       return;
@@ -1556,8 +1598,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
          declarations look alike — Qodo on PR #1235) and the typing mode it
          was judged in. An answer judged inside a mode that has since ended is
          dropped silently, because the mode's exit already said why. What the
-         answer then does to a pane is gated where it does it. */
-      const lost = contextLost(declared, current(), { answer: true });
+         answer then does to a pane is gated where it does it.
+
+         PRD #1260/#1261 review, round 5 — a dispatch that names an agent is
+         also held to that agent's incarnation and the selected deck as
+         declared, exactly as a chosen entry is: a stop resolved before a
+         same-id replacement or a deck change must not open the confirmation
+         for whatever agent carries that id now. */
+      const lost = dispatchLost(declared, current(), answer.outcome.kind === "dispatch" ? answer.outcome.params : []);
       if (lost) {
         if (lost.code !== "mode" || declaredDictation === undefined) setProblem(answerRefusal(lost));
         return;
@@ -1992,6 +2040,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       },
       (cause) => {
         if (sendEpoch.current !== epoch) return;
+        /* Nothing was typed, so there is no send left for a later context
+           change to call off — and no "what was typed stays" report to put
+           over this failure (review round 5). */
+        sending.current = undefined;
         setPending(undefined);
         setProblem(sentenceOf(cause));
       },

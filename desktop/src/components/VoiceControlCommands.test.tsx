@@ -1249,6 +1249,32 @@ describe("typing into the open agent", () => {
     expect(screen.getByTestId("voice-report")).toHaveTextContent(/confirmation|not sent|called off/i);
   });
 
+  /** Scenario: a one-shot is resolving for Planner in the deck screen when the
+   * deck's Close confirmation opens. Its late answer must not type or send. */
+  it("refuses a one-shot while the deck's stop confirmation is open", async () => {
+    const voice = microphone(["open the planner"]);
+    const said = "type run the login tests";
+    let settle: (answer: VoiceResultDto) => void = () => {};
+    const resolveVoice: ResolveVoice = vi.fn((utterance: string) => utterance === "open the planner"
+      ? Promise.resolve(dispatch("open_agent", "openAgent", "Opening Planner.", utterance, PLANNER))
+      : new Promise<VoiceResultDto>((resolve) => { settle = resolve; }));
+    const deck = runtime(resolveVoice, voice);
+    render(<DeckShell runtime={deck} />);
+    await openPlanner(voice);
+    voice.deliver(said);
+    await completeUtterance();
+    expect(resolveVoice).toHaveBeenLastCalledWith(said);
+
+    fireEvent.click(screen.getByTestId("stop-run"));
+    expect(screen.getByRole("alertdialog")).toBeVisible();
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("This sends a stop request to");
+    await act(async () => { settle(dictated(said, "type")); await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
+    expect(deck.sendTerminalInput).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("voice-dictation")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Nothing ran — a confirmation is open. Say it again.");
+  });
+
   /** Scenario: the pane first reports no spawn time, then supplies one for the
    * same agent while its words are being written. The completed write still
    * shows its countdown and sends that prompt once. */
@@ -1430,6 +1456,29 @@ describe("typing into the open agent", () => {
       [{ deckId: DECK_ID, agentId: "planner" }, VOICE_DICTATION_SUBMIT],
     ]);
     expect(screen.getByTestId("voice-report")).toHaveTextContent("current Enter refused");
+  });
+
+  /** Scenario: Planner's one-shot text write fails, then the user closes its
+   * pane. The write error remains visible; no report claims text was retained. */
+  it("keeps a failed one-shot write report after the pane closes", async () => {
+    const voice = microphone(["open the planner"]);
+    const said = "type run the login tests";
+    let rejectWrite: (reason: Error) => void = () => {};
+    const sendTerminalInput = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectWrite = reject; }));
+    const deck = runtime(speaking({ [said]: dictated(said, "type") }), voice, { sendTerminalInput });
+    render(<DeckShell runtime={deck} />);
+    await openPlanner(voice);
+    voice.deliver(said);
+    await completeUtterance();
+    expect(sendTerminalInput).toHaveBeenCalledExactlyOnceWith({ deckId: DECK_ID, agentId: "planner" }, "run the login tests ");
+
+    await act(async () => { rejectWrite(new Error("Planner terminal write failed")); await Promise.resolve(); });
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Planner terminal write failed");
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Back to dashboard" }));
+    await flush();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Planner terminal write failed");
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent("what was typed stays in its prompt");
+    expect(sendTerminalInput).toHaveBeenCalledTimes(1);
   });
 
   /** Scenario: a one-shot command is being resolved when the pane's agent is
@@ -3502,6 +3551,54 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     await flush();
     expect(runAction).toHaveBeenCalledTimes(1);
     expect(runAction).toHaveBeenCalledWith({ type: "stop_agent", deckId: snapshot.connection.deckId, agentId: target.id });
+  });
+
+  /** Scenario: a direct spoken stop is still resolving when its named agent is
+   * replaced under the same id or the selected deck changes to another agent
+   * with that id. Neither stop confirmation may open for the new target. */
+  it.each([
+    ["stop_agent", "agent replacement"],
+    ["stop_agent", "deck change"],
+    ["close_orchestration", "agent replacement"],
+    ["close_orchestration", "deck change"],
+  ] as const)("refuses a direct %s after %s during resolution", async (action, change) => {
+    const voice = microphone([]);
+    const { deck, runAction, snapshot } = d5Deck(voice);
+    const target = snapshot.agents.find((agent) => agent.id === "planner");
+    if (!target) throw new Error("Planner fixture missing");
+    target.spawnedAtMs = 1_000;
+    const utterance = `${action === "stop_agent" ? "stop" : "close"} Planner`;
+    const answer = action === "stop_agent"
+      ? dispatch(action, "confirmStopAgent", `Confirm stopping ${target.id} — nothing has been stopped yet.`, utterance,
+        [{ name: "agent", kind: "agent_ref", spoken: "Planner", value: target.id, label: target.displayName }])
+      : dispatch(action, "confirmCloseOrchestration", "Confirm closing review — nothing has been stopped yet.", utterance,
+        [{ name: "orchestration", kind: "orchestration_ref", spoken: "Planner", value: target.id, label: "review" }]);
+    let settle: (result: VoiceResultDto) => void = () => {};
+    const resolveVoice: ResolveVoice = vi.fn(() => new Promise<VoiceResultDto>((resolve) => { settle = resolve; }));
+    const pendingDeck = { ...deck, resolveVoice };
+    const { rerender } = render(<DeckShell runtime={pendingDeck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    voice.deliver(utterance);
+    await completeUtterance();
+    expect(resolveVoice).toHaveBeenCalledWith(utterance);
+    expect(confirmation()).toBeNull();
+
+    const changed = change === "agent replacement"
+      ? { ...snapshot, agents: snapshot.agents.map((agent) => agent.id === target.id ? { ...agent, spawnedAtMs: 2_000 } : agent) }
+      : {
+          ...snapshot,
+          connection: { ...snapshot.connection, deckId: "deck-second" },
+          agents: snapshot.agents.map((agent) => ({ ...agent, daemonId: "deck-second" })),
+        };
+    rerender(<DeckShell runtime={{ ...pendingDeck, snapshot: changed, fleet: change === "deck change" ? [snapshot, changed] : [changed] }} initialView={{ kind: "overview" }} />);
+    await act(async () => { settle(answer); await Promise.resolve(); });
+
+    expect(confirmation()).toBeNull();
+    expect(runAction).not.toHaveBeenCalled();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(change === "agent replacement"
+      ? "Nothing ran — the agent was replaced. Say it again."
+      : "Nothing ran — the deck changed. Say it again.");
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(answer.outcome.kind === "dispatch" ? answer.outcome.sentence : "Confirm");
   });
 
   /**
