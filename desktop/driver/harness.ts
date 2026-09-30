@@ -392,16 +392,24 @@ export class Deck {
    * pointer actions stop selecting says how.
    */
   async selectRow(span: { from: { x: number; y: number }; to: { x: number; y: number } }, text: string): Promise<void> {
+    // Installed once per page; each call only empties the record.
     await this.session.execute(
       `window.__dadPointerLog = [];
-       for (const type of ["pointerdown", "mousedown", "mousemove", "pointerup", "mouseup", "click"]) {
-         document.addEventListener(type, (e) => {
-           if (window.__dadPointerLog.length < 60) {
-             const t = e.target;
-             window.__dadPointerLog.push([type, Math.round(e.clientX), Math.round(e.clientY), e.buttons, e.detail,
-               t && t.className ? String(t.className).slice(0, 40) : t && t.nodeName, e.defaultPrevented]);
-           }
-         }, { capture: true, once: false });
+       if (!window.__dadPointerProbe) {
+         window.__dadPointerProbe = true;
+         const selection = () => window.__dadDriver.terminalScreens().map((s) => s.selection).join("|");
+         const note = (entry) => { if (window.__dadPointerLog.length < 80) window.__dadPointerLog.push(entry); };
+         for (const type of ["mousedown", "mousemove", "mouseup"]) {
+           document.addEventListener(type, (e) => {
+             const mods = (e.shiftKey ? "S" : "") + (e.ctrlKey ? "C" : "") + (e.altKey ? "A" : "") + (e.metaKey ? "M" : "");
+             note([type, Math.round(e.clientX), Math.round(e.clientY), e.buttons, e.detail, mods]);
+           }, { capture: true });
+         }
+         // After xterm's own handlers: what it holds at release, and shortly after.
+         window.addEventListener("mouseup", () => {
+           note(["selection@up", selection()]);
+           for (const ms of [0, 100, 500, 2000]) setTimeout(() => note(["selection@" + ms, selection()]), ms);
+         });
        }`,
     );
     await this.session.drag(span.from, span.to);
