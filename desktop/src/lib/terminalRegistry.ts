@@ -235,6 +235,8 @@ if (import.meta.env.VITE_DAD_DRIVER_SEAM === "1") {
             .split("\n")
             .slice(2, 30)
             .map((frame) => frame.trim().replace(/@tauri:\/\/localhost\/assets\//, "@"))
+            // xterm's own event plumbing says nothing about who asked.
+            .filter((frame) => !/^(_deliver|_deliverQueue|fire|resize)@/.test(frame))
             .join(" < ");
         const clear = service.clearSelection.bind(service);
         service.clearSelection = () => {

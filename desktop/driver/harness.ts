@@ -412,11 +412,11 @@ export class Deck {
     await this.session.clickAt(before.from);
     await this.gridSettled();
     const span = await waitFor(`${text} on its own row after the click`, () => this.rowSpan(text));
-    // Installed once per page; each call only empties the record.
+    // Installed once per page; each call only empties the pointer record. The
+    // selection trace runs from `traceTerminals` and is never emptied.
+    await this.traceTerminals();
     await this.session.execute(
       `window.__dadPointerLog = [];
-       window.__dadSelectionTrace = [];
-       window.__dadDriver.traceSelection();
        if (!window.__dadPointerProbe) {
          window.__dadPointerProbe = true;
          for (const type of ["mousedown", "mousemove", "mouseup"]) {
@@ -438,6 +438,27 @@ export class Deck {
         .catch((probe: unknown) => String(probe));
       throw new Error(`${(error as Error).message}; the page saw ${JSON.stringify(seen)}`);
     }
+  }
+
+  /**
+   * Issue #1403 — start recording every selection clear and resize of the
+   * mounted terminals, and the window's focus changes, into the record a failed
+   * `selectRow` reports. Idempotent; call it as soon as a terminal is mounted
+   * so the record covers the whole scenario.
+   */
+  async traceTerminals(): Promise<void> {
+    await this.session.execute(
+      `window.__dadSelectionTrace = window.__dadSelectionTrace || [];
+       window.__dadDriver.traceSelection();
+       if (!window.__dadFocusProbe) {
+         window.__dadFocusProbe = true;
+         for (const type of ["focus", "blur"]) {
+           window.addEventListener(type, (e) => {
+             if (e.target === window) window.__dadSelectionTrace.push(["window-" + type, Math.round(performance.now())]);
+           });
+         }
+       }`,
+    );
   }
 
   /** Until every mounted terminal's grid and box have held still for `SETTLE_MS`. */

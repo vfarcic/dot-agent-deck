@@ -137,6 +137,7 @@ test("terminal_002 selected terminal text copies to the clipboard without reachi
   await withDeck("terminal_002", { daemonFirst: true, defaultCommand: command }, async (deck) => {
     await deck.element(connected, "the deck group to report connected");
     const input = await openShellPane(deck);
+    await deck.traceTerminals();
 
     // Computed by the shell, so the line on screen, and on the clipboard, can
     // only have come from the PTY rather than from what was typed.
