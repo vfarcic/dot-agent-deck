@@ -213,7 +213,7 @@ The desktop app is published alongside the CLI in releases, as an **alpha**: its
 | macOS Apple silicon | `dot-agent-deck-desktop-alpha-macos-arm64.dmg` | Signed and notarized from v0.42.0, unless that release's notes say otherwise |
 | Linux amd64 | `dot-agent-deck-desktop-alpha-linux-amd64.deb` | Unsigned |
 
-Download from the [latest release](https://github.com/vfarcic/dot-agent-deck/releases/latest) and read that release's notes: they say whether its macOS build is signed. A release whose signing failed ships an unsigned `.dmg` rather than none. A release can also ship without one or both desktop packages while its CLI binaries are published as usual, so check the assets on the release you open.
+Download from the [latest release](https://github.com/vfarcic/dot-agent-deck/releases/latest) and read that release's notes: when the release has a `.dmg`, they say whether it is signed. A release the project built without signing ships an unsigned `.dmg`, and its notes say so. If the macOS package fails to build or to sign, the release ships no `.dmg` at all rather than an unsigned one. A release can also ship without one or both desktop packages while its CLI binaries are published as usual, so check the assets on the release you open.
 
 ### Verify the download
 
