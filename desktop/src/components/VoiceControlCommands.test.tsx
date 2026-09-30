@@ -1856,6 +1856,29 @@ describe("sticky dictation in the open agent pane", () => {
     expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "unsent words ");
   });
 
+  /** Scenario: with Coder's pane open on the deck screen, opening its stop
+   * confirmation ends spoken typing. Cancelling the confirmation keeps typing
+   * off and sends no text to the terminal. */
+  it("ends dictation when the deck's stop confirmation opens", async () => {
+    const { voice, deck } = start();
+    await enter(voice);
+    expect(screen.getByTestId("voice-dictating")).toHaveTextContent(/typing to coder/i);
+
+    fireEvent.click(screen.getByTestId("stop-run"));
+    expect(screen.getByRole("alertdialog")).toBeVisible();
+    expect(screen.queryByTestId("voice-dictation")).toBeNull();
+    expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
+    expect(screen.queryByTestId("voice-dictating")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Typing mode off — a confirmation is open. Nothing was sent to coder.");
+
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Cancel" }));
+    await flush();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
+    expect(screen.queryByTestId("voice-dictating")).toBeNull();
+    expect(deck.sendTerminalInput).not.toHaveBeenCalled();
+  });
+
   /** Scenario: Stop typing while a spoken send is still resolving. Its late
    * answer must not press Enter or leave a send countdown behind. */
   it("drops an in-flight send after Stop typing", async () => {
