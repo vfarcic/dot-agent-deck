@@ -112,6 +112,11 @@
       #     workspace member .../desktop/src-tauri`, before the crate had ever
       #     been compiled — a workspace member is a resolution-time dependency
       #     whether or not it is a build-time one.
+      #   * `docs/` (PRD #1419), because `build.rs` embeds the published user
+      #     docs for the `docs` subcommand: it parses `docs/published.toml` and
+      #     `include_str!`s every page it lists, and fails the build when one is
+      #     missing. Only the manifest and the Markdown outside `docs/develop/` are
+      #     taken: the images are not embedded and maintainer docs never are.
       #
       # `tests/` is left out on purpose: `doCheck = false`, so nothing compiles
       # it.
@@ -129,6 +134,11 @@
           ./examples
           ./xtask
           ./desktop/src-tauri
+          (lib.fileset.difference
+            (lib.fileset.fileFilter
+              (file: file.hasExt "md" || file.name == "published.toml")
+              ./docs)
+            ./docs/develop)
         ];
       };
 

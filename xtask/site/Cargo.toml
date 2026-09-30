@@ -1,0 +1,24 @@
+[package]
+name = "xtask-site"
+version = "0.0.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+
+# PRD #1419: builds the website's output from `docs/published.toml` — the
+# published Markdown, `llms.txt`, `llms-full.txt` and images. Invoked as
+# `cargo xtask site <out-dir>` through the `xtask-linkage-check` multiplexer;
+# the library is what that dispatch and the tests call.
+
+[lib]
+name = "xtask_site"
+path = "src/lib.rs"
+
+[dependencies]
+# The manifest parser is `src/published_docs.rs`, shared with the root package
+# by `#[path]`, and `toml` is all it needs. Same major version as the root
+# package's own `toml` dependency, so this adds no crate to Cargo.lock.
+toml = "1.0"
+
+[dev-dependencies]
+tempfile = "3"

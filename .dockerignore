@@ -1,15 +1,6 @@
-target/
-site/node_modules/
-site/build/
-site/.docusaurus/
-site/helm/
-.git/
-.github/
-.claude/
-prds/
-scripts/
-tests/
-examples/
-dist/
-Cargo.toml
-Cargo.lock
+# The one image built from this repository is site/Dockerfile's, and it copies
+# a site `cargo xtask site` has already built (see that file). The build context
+# is therefore an allowlist: the nginx config and the built output, nothing else.
+*
+!site/nginx-default.conf
+!site/build/

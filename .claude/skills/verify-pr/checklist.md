@@ -47,7 +47,7 @@ Applies when the diff touches the daemon, the TUI↔daemon protocol, orchestrati
 ## F. Docs and changelog
 
 - [ ] Rule 10: prose paragraphs are single lines. A PR that hard-wraps at 72/80 columns changes nothing in the rendered output and makes every future diff noisier.
-- [ ] Rule 11: contributor-facing docs are under `docs/develop/` and are **not** added to `site/sidebars.js`; user-facing docs are under `docs/` and are listed there. Dev docs omit Docusaurus-only frontmatter (`sidebar_position`).
+- [ ] Rule 11: contributor-facing docs are under `docs/develop/` and are linked from `CONTRIBUTING.md`, never from a published page. A new user-facing page under `docs/` has a `[[page]]` entry in `docs/published.toml` whose `title` equals the page's first `#` heading, and its relative `.md` links resolve (`cargo xtask site <out-dir>` runs the link check). Published pages carry no front matter or MDX components: they are served and printed by `dot-agent-deck docs` as plain Markdown.
 - [ ] A `changelog.d/<issue>.<type>.md` fragment exists for anything user-visible, with the right type (`breaking` / `feature` / `bugfix`).
 - [ ] User-facing behaviour changes are reflected in the published docs, not only in the PRD.
 
