@@ -643,7 +643,8 @@ mod tests {
                 ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
                 ("discard_new_agent".to_string(), false),
-                // The D5 stops: on the overview, and each only opens a confirmation.
+                // The D5 stops: on the overview with the New agent dialog
+                // closed (#1260), and each only opens a confirmation.
                 ("stop_agent".to_string(), true),
                 ("close_orchestration".to_string(), true),
             ]

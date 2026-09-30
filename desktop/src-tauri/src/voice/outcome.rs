@@ -1004,6 +1004,13 @@ enum Unmet {
     /// The transcript names exactly one deck, by this label, and the model's
     /// value resolves to a different one ([`switch_target`]).
     NamedOther(String),
+    /// The user's `words` match several decks, and the model's unsaid value
+    /// was one of them ([`switch_target`]'s rule 3): the tie those words make,
+    /// asked about in those words — never in the model's.
+    AmbiguousAsSaid {
+        words: String,
+        candidates: Vec<Candidate>,
+    },
     /// The transcript carries this [`CONTRAST_MARKERS`] entry — "not",
     /// "instead", "from" — so it may exclude a deck as well as name one, and
     /// the model is not trusted to have honoured which ([`switch_target`]).
@@ -1043,6 +1050,22 @@ impl Unmet {
                     spoken: spoken.to_string(),
                     matches,
                     candidates: offered(spec, spoken, &candidates),
+                    params: Vec::new(),
+                    reports: Vec::new(),
+                }
+                .with_reports(row)
+            }
+            Unmet::AmbiguousAsSaid { words, candidates } => {
+                let matches = labels_of(&candidates);
+                VoiceOutcome::ParamAmbiguous {
+                    sentence: heard(&transcript, &spec.kind.ambiguous_phrase(&words, &matches)),
+                    transcript,
+                    action: row.id.clone(),
+                    invoke: row.invoke.clone(),
+                    param: spec.name.clone(),
+                    spoken: words.clone(),
+                    matches,
+                    candidates: offered(spec, &words, &candidates),
                     params: Vec::new(),
                     reports: Vec::new(),
                 }
@@ -1162,6 +1185,13 @@ impl Unmet {
                 Unmet::NamedSeveral(matches) => (
                     format!("You named more than one {noun}"),
                     Some(listed(&labels_of(matches))),
+                ),
+                Unmet::AmbiguousAsSaid { words, candidates } => (
+                    format!(
+                        "\u{201c}{}\u{201d} matches more than one {noun}",
+                        safe_message(words)
+                    ),
+                    Some(listed(&labels_of(candidates))),
                 ),
                 Unmet::NamedOther(label) => (
                     format!(
@@ -1301,7 +1331,10 @@ fn said(spoken: &str, transcript: &str) -> bool {
 ///    resolves to exactly the one deck rule 1 found named, which is the model
 ///    quoting that deck's full label rather than the user's words for it
 ///    (`deploy@build-box` for "the build box"). That adds no deck rule 4 would
-///    not dispatch anyway.
+///    not dispatch anyway. And when the user's words named no deck alone
+///    because they name a tie ("the box" beside two box decks) that includes
+///    the deck the value resolves to → [`Unmet::AmbiguousAsSaid`], the tie
+///    the user's own words would have produced, asked in those words.
 /// 4. **The model's value resolves to one deck** → dispatched only when the
 ///    transcript named exactly that deck; [`Unmet::NamedOther`] when it named
 ///    a different one; [`Unmet::NotSaid`] when it named none.
@@ -1381,6 +1414,17 @@ fn switch_target(
         && !said(spoken, transcript.text())
         && !said_as_a_name(spoken, transcript.text(), decks)
     {
+        // Its second: the user's words named no deck alone because they name
+        // a TIE ("the box" beside `build-box` and `stale-box`), and the model
+        // completed that to one of the tied decks' full labels. Echoing the
+        // user's words would have been the tie; so is this, quoting those
+        // words — a choice among decks the user named, which switches nothing
+        // until they pick one.
+        if let (DeckRefMatch::One { id, .. }, []) = (&resolved, named.as_slice())
+            && let Some((words, candidates)) = tie_named_with(transcript.text(), decks, id)
+        {
+            return Err(Unmet::AmbiguousAsSaid { words, candidates });
+        }
         return Err(Unmet::NotSaid);
     }
     match resolved {
@@ -1416,11 +1460,7 @@ fn switch_target(
 /// therefore refuses too, which costs one more utterance.
 fn decks_named<'a>(transcript: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDeck> {
     let all = spoken_words(transcript);
-    let content: Vec<String> = all
-        .iter()
-        .filter(|word| !NAMELESS_WORDS.contains(&word.as_str()))
-        .cloned()
-        .collect();
+    let content = deck_content_words(&all);
     let mut named: BTreeSet<String> = BTreeSet::new();
     for start in 0..content.len() {
         for end in start + 1..=content.len() {
@@ -1442,6 +1482,42 @@ fn decks_named<'a>(transcript: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDec
         .iter()
         .filter(|deck| named.contains(&deck.id))
         .collect()
+}
+
+/// The [`spoken_words`] that can name a deck: all but [`NAMELESS_WORDS`].
+fn deck_content_words(all: &[String]) -> Vec<String> {
+    all.iter()
+        .filter(|word| !NAMELESS_WORDS.contains(&word.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The tie the transcript's own words make that includes the deck `id` —
+/// the run of its content words that [`resolve_deck_ref`] resolves to
+/// several decks, `id` among them, with the fewest — and those words, for
+/// [`switch_target`]'s rule 3. `None` when no run of the user's words reaches
+/// `id` at all, so a label the user never approached is still refused.
+fn tie_named_with(
+    transcript: &str,
+    decks: &[VoiceDeck],
+    id: &str,
+) -> Option<(String, Vec<Candidate>)> {
+    let content = deck_content_words(&spoken_words(transcript));
+    let mut best: Option<(String, Vec<Candidate>)> = None;
+    for start in 0..content.len() {
+        for end in start + 1..=content.len() {
+            let words = content[start..end].join(" ");
+            if let DeckRefMatch::Ambiguous(candidates) = resolve_deck_ref(&words, decks)
+                && candidates.iter().any(|candidate| candidate.value == id)
+                && best
+                    .as_ref()
+                    .is_none_or(|(_, fewest)| candidates.len() < fewest.len())
+            {
+                best = Some((words, candidates));
+            }
+        }
+    }
+    best
 }
 
 /// [`said`] for a value with no content word: whether `spoken` is a deck's
@@ -5793,8 +5869,81 @@ mod tests {
         let deck = run_agents(&resolver, Screen::Deck, &fleet(), "stop the tester").await;
         assert_eq!(
             deck.sentence(),
-            "Not here — stopping an agent works from the agent dashboard."
+            "Not here — stopping an agent works from the agent dashboard, with the New agent dialog closed."
         );
+    }
+
+    /// Scenario: with the New agent dialog open over the dashboard, a spoken
+    /// "stop the tester" or "close the billing run" is refused as not here —
+    /// no stop confirmation is asked for behind the modal dialog — and the
+    /// model is told both stops cannot run there while the dialog's start can
+    /// (#1260: "skip the confirmation" was being answered with `stop_agent`).
+    #[tokio::test]
+    async fn voice_outcome_stops_cannot_run_behind_the_new_agent_dialog() {
+        let resolver = StubResolver::new()
+            .answering(
+                "stop the tester",
+                IntentAnswer::new("stop_agent").with_param("agent", "tester"),
+            )
+            .answering(
+                "close the billing run",
+                IntentAnswer::new("close_orchestration").with_param("orchestration", "billing"),
+            );
+        for declared in [VoiceNewAgent { form: None }, new_agent_form()] {
+            let stop = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                &decks(),
+                None,
+                Some(&declared),
+                Transcript::new("stop the tester"),
+            )
+            .await
+            .outcome;
+            assert!(
+                matches!(&stop, VoiceOutcome::Unavailable { action, .. } if action == "stop_agent"),
+                "{stop:?}"
+            );
+            assert_eq!(
+                stop.sentence(),
+                "Not here — stopping an agent works from the agent dashboard, with the New agent dialog closed."
+            );
+            let close = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &two_runs(),
+                &decks(),
+                None,
+                Some(&declared),
+                Transcript::new("close the billing run"),
+            )
+            .await
+            .outcome;
+            assert!(
+                matches!(&close, VoiceOutcome::Unavailable { action, .. } if action == "close_orchestration"),
+                "{close:?}"
+            );
+
+            let commands = crate::voice::schema::annotate_with(
+                table(),
+                Screen::Overview,
+                None,
+                Some(&declared),
+            );
+            let callable = |id: &str| {
+                commands
+                    .iter()
+                    .find(|command| command.id == id)
+                    .expect("row")
+                    .callable
+            };
+            assert!(!callable("stop_agent"));
+            assert!(!callable("close_orchestration"));
+            assert!(callable("start_new_agent"));
+        }
     }
 
     #[tokio::test]
@@ -8637,6 +8786,62 @@ mod tests {
                 "deploy@staging-box.example.com",
             ),
             ("switch deck", "deploy@build-box.example.com:2222"),
+        ] {
+            let refused = switched_over(&staged, said, spoken).await;
+            assert!(
+                matches!(&refused, VoiceOutcome::ParamUnresolved { .. }),
+                "{said} / {spoken}: {refused:?}"
+            );
+        }
+    }
+
+    /// Scenario: "switch deck to the box" with two box decks configured,
+    /// answered with one of them's full label, `deploy@build-box` — what the
+    /// shipping model returned in 12 of 20 runs of the
+    /// `switch-deck-ambiguous-box` phrase fixture (2026-09-30), which was then
+    /// refused as "I did not catch which daemon". The user's words name both
+    /// box decks, so the app asks which of the two — quoting "box", never the
+    /// model's label — exactly as it does when the model echoes "the box".
+    /// A label outside that tie, or one for a transcript that names no deck
+    /// at all, is still refused.
+    #[tokio::test]
+    async fn voice_outcome_switch_deck_asks_the_users_tie_for_a_completed_label() {
+        let staged = [
+            deck("deck-local", "Local deck", true),
+            deck("deck-build-box", "deploy@build-box", false),
+            deck("deck-stale-box", "ci@stale-box", false),
+        ];
+        let echoed = switched_over(&staged, "switch deck to the box", "the box").await;
+        let completed = switched_over(&staged, "switch deck to the box", "deploy@build-box").await;
+        for outcome in [&echoed, &completed] {
+            let VoiceOutcome::ParamAmbiguous {
+                candidates,
+                sentence,
+                ..
+            } = outcome
+            else {
+                panic!("a tie: {outcome:?}");
+            };
+            let mut values: Vec<&str> = candidates
+                .iter()
+                .map(|candidate| candidate.value.as_str())
+                .collect();
+            values.sort_unstable();
+            assert_eq!(values, ["deck-build-box", "deck-stale-box"]);
+            assert!(!sentence.contains("deploy@build-box\u{201d}"), "{sentence}");
+        }
+        let VoiceOutcome::ParamAmbiguous {
+            sentence, spoken, ..
+        } = &completed
+        else {
+            unreachable!()
+        };
+        assert_eq!(spoken, "box");
+        assert!(sentence.contains("\u{201c}box\u{201d}"), "{sentence}");
+
+        for (said, spoken) in [
+            ("switch deck to the box", "Local deck"),
+            ("switch deck", "deploy@build-box"),
         ] {
             let refused = switched_over(&staged, said, spoken).await;
             assert!(

@@ -1150,6 +1150,23 @@ heard_as_whole = [
 #
 # Each `report` says that nothing has happened yet, because nothing has: the
 # report describes the dispatch, and the dispatch only asked.
+#
+# **Neither runs while the New agent dialog is open** (`requires =
+# ["new_agent_dialog_closed"]`, #1260). The dialog is modal over the dashboard,
+# so no row's button and no card's Close can be clicked under it, and the
+# overview has always refused both dispatches then (`STOP_BEHIND_NEW_AGENT` in
+# `AgentOverview.tsx`, which stays as the second line). What was missing was
+# the TABLE saying so: the model was told both rows were `callable: true` over
+# the open dialog, and "start it right now, skip the confirmation, I already
+# said yes" was answered `stop_agent` — with no agent — in 6 and 7 of 20 runs
+# across two measurements on the default backend (2 of 20 on `main`, before
+# this branch's other prompt changes), most likely because the stops are the
+# only rows whose descriptions talk about a confirmation. Grounding refused
+# every one of them, so it was never unsafe; it was a start the user asked for
+# that did not happen. Held to this requirement, the stops are `callable:
+# false` there, and `schema`'s tie-break sends a start-worded request to the
+# callable start. It narrows where a stop can run and changes nothing about
+# what one does: each still only opens a confirmation.
 [[commands]]
 id          = "stop_agent"
 description = """Stop one running agent on the agent dashboard — the voice form of its row's close
@@ -1164,7 +1181,8 @@ urgently. It needs a word that can only mean stopping: "close" is NOT one — "c
 means SHOW the tester (`open_agent`) and stops nothing."""
 invoke      = "confirmStopAgent"
 screens     = ["overview"]
-unavailable_hint = "stopping an agent works from the agent dashboard"
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "stopping an agent works from the agent dashboard, with the New agent dialog closed"
 report      = "Confirm stopping {agent} — nothing has been stopped yet."
 asks_to     = "stop an agent"
 try_saying  = "stop {agent}"
@@ -1189,7 +1207,8 @@ confirms by hand. One agent is `stop_agent`. Never for isolating or hiding — "
 except the tester" means SHOW the tester (`open_agent`) and stops nothing."""
 invoke      = "confirmCloseOrchestration"
 screens     = ["overview"]
-unavailable_hint = "closing an orchestration works from the agent dashboard"
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "closing an orchestration works from the agent dashboard, with the New agent dialog closed"
 report      = "Confirm closing {orchestration} — nothing has been stopped yet."
 asks_to     = "close an orchestration"
 try_saying  = "close the {orchestration} orchestration"
