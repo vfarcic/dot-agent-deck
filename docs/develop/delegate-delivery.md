@@ -45,7 +45,7 @@ Every delegation mints a delivery id, `d-` followed by 8 hex characters (`mint_d
 - at the end of the pointer typed into the pane: `Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-7f3a9c21]` (`pointer_suffix`);
 - in a header the daemon prepends to every worker task file, whatever the role's `prompt_template` says, so no project opts in (`task_file_ack_header`). It asks the worker to run `<absolute path of the deck binary> ack d-7f3a9c21` first, tells it to skip that and carry on if the command fails, is not recognised, or is refused or needs an approval it does not get, and says that a pointer seen more than once is the same task.
 
-The header uses the deck's absolute path for the same reason every generated protocol command does (see [Context handoff](../orchestration.md#context-handoff)), which is why a user's allowlist rule has to name `ack` in that path form next to `work-done`.
+The header uses the deck's absolute path for the same reason every generated protocol command does (see [Context handoff and permissions](../orchestration.md#context-handoff-and-permissions)), which is why a user's allowlist rule has to name `ack` in that path form next to `work-done`.
 
 ## What counts as proof of delivery
 
