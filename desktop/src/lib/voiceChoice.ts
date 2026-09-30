@@ -10,8 +10,9 @@
  *
  * {@link answerChoiceLocally} is the same rule for a runtime with no Rust
  * behind it: the browser preview, and the vitest runtimes. It is the order and
- * the closed lists of the Rust function — cancel phrase, whole-utterance
- * ordinal, then a name among the OFFERED entries only — with the name matched
+ * the closed lists of the Rust function — a bare control that is also an
+ * offered label (refused), cancel phrase, whole-utterance ordinal, then a name
+ * among the OFFERED entries only — with the name matched
  * against labels rather than through each kind's resolver, and no liveness
  * check: the dispatch-time checks every target already makes are what stand
  * behind it there. The Rust function is the one production answers with.
@@ -76,12 +77,29 @@ function subset(inner: string[], outer: string[]): boolean {
 }
 
 /**
+ * The 1-based number of the offered entry whose label is, word for word, a
+ * bare ordinal or cancel phrase that `utterance` also is — an agent named
+ * "two", or "cancel" — or `undefined` when there is no such collision. Such an
+ * utterance is refused rather than read either way, here and in
+ * `voice::choice::answer`; the panel uses the number to say "number N".
+ */
+export function collidingChoiceEntry(utterance: string, offered: readonly VoiceResolvedParamDto[]): number | undefined {
+  const words = wholeUtterance(utterance);
+  if (words.length === 0) return undefined;
+  if (!CANCEL_PHRASES.includes(words.join(" ")) && ordinal(words) === undefined) return undefined;
+  const said = words.join(" ");
+  const at = offered.findIndex((candidate) => spokenWords(candidate.label).join(" ") === said);
+  return at >= 0 ? at + 1 : undefined;
+}
+
+/**
  * Answer `utterance` against `offered` with no Rust behind the runtime. See
  * the module note for what this does and does not do.
  */
 export function answerChoiceLocally(utterance: string, offered: readonly VoiceResolvedParamDto[]): VoiceChoiceAnswerDto {
   const words = wholeUtterance(utterance);
   if (words.length === 0) return { kind: "not_answer" };
+  if (collidingChoiceEntry(utterance, offered) !== undefined) return { kind: "refused" };
   if (CANCEL_PHRASES.includes(words.join(" "))) return { kind: "cancelled" };
   const number = ordinal(words);
   if (number !== undefined) {

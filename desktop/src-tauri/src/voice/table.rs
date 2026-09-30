@@ -856,23 +856,31 @@ impl CommandTable {
                 continue;
             };
             // Dispatched with no params, or — when it requires one — with the
-            // pick's own, so it must take none or exactly the same.
+            // pick's own, so it must take none, or exactly the same (names,
+            // kinds AND optionality: an optional param handed to a target that
+            // requires it may be absent), or only optional ones when the pick
+            // requires none either. A target with optional params is
+            // dispatched only when the pick carries no value, which a pick
+            // with a required param always does — and one declaring the pick's
+            // required param as optional is a mismatch the author should see.
             let same_params = |candidate: &CommandRow| {
                 let shape = |row: &CommandRow| {
-                    let mut shape: Vec<(String, ParamKind)> = row
+                    let mut shape: Vec<(String, ParamKind, bool)> = row
                         .params
                         .iter()
-                        .map(|param| (param.name.clone(), param.kind))
+                        .map(|param| (param.name.clone(), param.kind, param.optional))
                         .collect();
                     shape.sort_by(|a, b| a.0.cmp(&b.0));
                     shape
                 };
                 shape(candidate) == shape(row)
             };
+            let none_required = |row: &CommandRow| row.params.iter().all(|param| param.optional);
             let valid = target != row.id
                 && commands.iter().any(|candidate| {
                     candidate.id == target
-                        && (candidate.params.iter().all(|param| param.optional)
+                        && (candidate.params.is_empty()
+                            || (none_required(candidate) && none_required(row))
                             || same_params(candidate))
                 });
             if !valid {
@@ -1037,9 +1045,10 @@ pub enum TableError {
     /// A `heard_as_also` on a row that is not token-grounded by `heard_as`,
     /// or that also declares `heard_as_whole_while`.
     MisplacedGroundingAlso { id: String },
-    /// An `unavailable_redirects` naming no row, the row itself, or a row with a
-    /// required param whose params differ from the redirecting row's — none of
-    /// which a redirect can dispatch with no params or with the pick's own.
+    /// An `unavailable_redirects` naming no row, the row itself, or a row
+    /// with params that differ from the redirecting row's (name, kind or
+    /// optionality) when either of the two requires one — none of which a
+    /// redirect can dispatch with no params or with the pick's own.
     UnknownUnavailableRedirect { id: String, target: String },
 }
 
@@ -1149,7 +1158,7 @@ impl fmt::Display for TableError {
             ),
             TableError::UnknownUnavailableRedirect { id, target } => write!(
                 f,
-                "command `{id}`'s `unavailable_redirects` names `{target}`, which is not another row that takes no required param or exactly its own params"
+                "command `{id}`'s `unavailable_redirects` names `{target}`, which is not another row taking no params, exactly its own (the same names, kinds and optionality), or — when neither requires one — only optional ones"
             ),
         }
     }
@@ -2675,6 +2684,8 @@ mod tests {
         }
     }
 
+    /// Scenario: a redirect can only use the same required parameters or a
+    /// target with none; optionality changes the dispatch contract too.
     #[test]
     fn voice_table_rejects_an_unavailable_redirects_it_cannot_dispatch() {
         // A second row with no params, which a redirect can dispatch.
@@ -2718,6 +2729,42 @@ mod tests {
         // so it must declare exactly those: the same name and kind parses...
         let same_param = one_row().replace("id = \"open_agent\"", "id = \"second\"");
         assert!(CommandTable::parse(&first_opens("second", &same_param)).is_ok());
+        let optional_target = same_param
+            .replace(
+                "kind = \"agent_ref\"",
+                "kind = \"agent_ref\"\noptional = true",
+            )
+            .replace(
+                "report = \"Opening {agent}.\"",
+                "report = \"Opening an agent.\"",
+            )
+            .replace(
+                "try_saying = \"open {agent}\"",
+                "try_saying = \"open an agent\"",
+            );
+        let required_to_optional = first_opens("second", &optional_target);
+        let optional_to_required = first_opens("second", &same_param)
+            .replacen(
+                "kind = \"agent_ref\"",
+                "kind = \"agent_ref\"\noptional = true",
+                1,
+            )
+            .replacen(
+                "report = \"Opening {agent}.\"",
+                "report = \"Opening an agent.\"",
+                1,
+            )
+            .replacen(
+                "try_saying = \"open {agent}\"",
+                "try_saying = \"open an agent\"",
+                1,
+            );
+        let results: Vec<_> = [required_to_optional, optional_to_required]
+            .iter()
+            .map(|source| CommandTable::parse(source))
+            .collect();
+        let rejected: Vec<bool> = results.iter().map(Result::is_err).collect();
+        assert_eq!(rejected, [true, true], "redirect errors: {results:?}");
         // ...and a required param the pick does not carry, or carries as
         // another kind, cannot be dispatched.
         for other in [

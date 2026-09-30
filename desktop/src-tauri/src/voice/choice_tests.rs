@@ -101,6 +101,47 @@ fn choice_names_are_checked_against_the_offered_list_only() {
     assert_eq!(answer("docs", &offered, &live), ChoiceAnswer::Refused);
 }
 
+/// Scenario: an offered agent is literally named like a bare ordinal or a
+/// cancel phrase. Those readings are ambiguous and refuse rather than picking
+/// another agent or cancelling; an explicit numbered choice still selects.
+#[test]
+fn choice_refuses_labels_that_collide_with_bare_controls() {
+    let agents = [
+        role_agent("agent-two", "two"),
+        role_agent("agent-other", "Other"),
+    ];
+    let live = ChoiceLive {
+        agents: &agents,
+        decks: &[],
+        directories: None,
+        new_agent: None,
+    };
+    let offered = [
+        candidate(ParamKind::AgentRef, "agent-two", "two"),
+        candidate(ParamKind::AgentRef, "agent-other", "Other"),
+    ];
+    assert_eq!(
+        answer("number one", &offered, &live),
+        ChoiceAnswer::Selected(offered[0].clone())
+    );
+
+    let cancel_agent = role_agent("agent-cancel", "cancel");
+    let cancel_live = ChoiceLive {
+        agents: std::slice::from_ref(&cancel_agent),
+        decks: &[],
+        directories: None,
+        new_agent: None,
+    };
+    let cancel_offer = [candidate(ParamKind::AgentRef, "agent-cancel", "cancel")];
+    assert_eq!(
+        [
+            answer("two", &offered, &live),
+            answer("cancel", &cancel_offer, &cancel_live),
+        ],
+        [ChoiceAnswer::Refused, ChoiceAnswer::Refused]
+    );
+}
+
 /// Scenario: whole cancel phrases dismiss an offer, while ordinary commands
 /// remain ordinary utterances for the panel to resolve after closing it.
 #[test]

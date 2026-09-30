@@ -74,7 +74,8 @@ pub enum ChoiceAnswer {
     Selected(ResolvedParam),
     /// An answer, but not one that can be acted on: an ordinal outside the
     /// list, a name matching several of the offered entries or only something
-    /// that was not offered, or an entry that is no longer live.
+    /// that was not offered, an entry that is no longer live, or a bare
+    /// ordinal or cancel phrase that is also an offered entry's label.
     Refused,
     /// Not an answer at all. The panel closes the choice and resolves the
     /// utterance as an ordinary one.
@@ -88,6 +89,13 @@ pub enum ChoiceAnswer {
 /// candidates alone, with the resolver their kind already uses. Anything else
 /// is [`ChoiceAnswer::NotAnswer`].
 ///
+/// A bare control that is ALSO, word for word, an offered entry's label — an
+/// agent named "two", or "cancel" — is [`ChoiceAnswer::Refused`] before either
+/// reading is taken: acting on the number would pick another entry, and
+/// cancelling would drop the one the user named. An explicit ordinal with a
+/// lead, "number two", is not the label and stays a number. The webview names
+/// the collision in its refusal (`collidingChoiceEntry` in `voiceChoice.ts`).
+///
 /// A selected candidate is re-checked against `live` before it is returned, so
 /// an entry whose agent, deck, orchestration, directory or chip has gone since
 /// the offer is refused rather than acted on.
@@ -96,10 +104,19 @@ pub fn answer(utterance: &str, offered: &[ResolvedParam], live: &ChoiceLive) -> 
     if words.is_empty() {
         return ChoiceAnswer::NotAnswer;
     }
-    if CANCEL_PHRASES.contains(&words.join(" ").as_str()) {
+    let cancels = CANCEL_PHRASES.contains(&words.join(" ").as_str());
+    let ordinal = ordinal(&words);
+    if (cancels || ordinal.is_some())
+        && offered
+            .iter()
+            .any(|candidate| spoken_words(&candidate.label) == words)
+    {
+        return ChoiceAnswer::Refused;
+    }
+    if cancels {
         return ChoiceAnswer::Cancelled;
     }
-    if let Some(ordinal) = ordinal(&words) {
+    if let Some(ordinal) = ordinal {
         let at = match ordinal {
             Ordinal::Last => offered.len().checked_sub(1),
             Ordinal::Nth(number) => number.checked_sub(1),

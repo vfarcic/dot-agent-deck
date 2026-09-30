@@ -85,7 +85,7 @@ import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
 import type { EndpointSettingsDto, VoiceCommandDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
-import { answerChoiceLocally, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
+import { answerChoiceLocally, collidingChoiceEntry, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
 import { desktopFeaturesOf, type DeckRuntimeState } from "../types";
 
 /**
@@ -216,6 +216,14 @@ export const VOICE_CHOICE_CLOSED = "Choice closed.";
 export const VOICE_CHOICE_CANCELLED = "Choice cancelled — nothing ran.";
 export const VOICE_CHOICE_EXPIRED = "The choice expired, so nothing ran.";
 export const VOICE_CHOICE_REFUSED = "That is not one of the entries on offer, or it is no longer there, so nothing ran. Say the command again.";
+/**
+ * PRD #1261 — the refusal for a bare number or cancel word that is also an
+ * offered entry's name (`collidingChoiceEntry`): either reading could be
+ * wrong, so the sentence says how to pick that entry unambiguously.
+ */
+export function voiceChoiceCollision(entry: number): string {
+  return `That is both an entry's name and a number or cancel word, so nothing ran. Say the command again, then click the entry or say “number ${entry}”.`;
+}
 
 /**
  * PRD #1261 — {@link SCREEN_MOVED_ON} and {@link DIALOG_MOVED_ON} for an
@@ -225,6 +233,29 @@ export const VOICE_CHOICE_REFUSED = "That is not one of the entries on offer, or
  * can be a click, and "while that was being worked out" describes a round trip
  * a click never made. What moved is the time since the list was offered.
  */
+/**
+ * PRD #1260 review — {@link SCREEN_MOVED_ON}'s case for the dictation mode: the
+ * mode was entered or left while an utterance judged OUTSIDE it was being
+ * worked out. An utterance judged INSIDE a mode that has since ended is dropped
+ * without a sentence of its own, because the mode's exit already said that
+ * nothing was sent and why.
+ */
+export const VOICE_MODE_MOVED_ON = "Typing mode changed while that was being worked out, so nothing ran. Say it again.";
+/**
+ * PRD #1260 review — the agent in the pane on screen was replaced by a new one
+ * under the same deck and agent id while an utterance was being worked out.
+ */
+export const VOICE_PANE_REPLACED = "The agent in this pane was replaced while that was being worked out, so nothing ran. Say it again.";
+/**
+ * PRD #1260 review — a pending one-shot send called off because the agent it
+ * would have pressed Enter for was replaced under the same id.
+ */
+export function voiceSendReplaced(label: string): string {
+  return `The agent in ${label}'s pane was replaced, so nothing was sent. What was typed went to the agent it replaced.`;
+}
+/** Why the dictation mode ends when its agent is replaced (`dictationStopped`). */
+const DICTATION_AGENT_REPLACED = "the agent in the pane was replaced";
+
 export const VOICE_CHOICE_SCREEN_MOVED_ON = "You moved to another screen after the choice was offered, so nothing ran. Say the command again here.";
 export const VOICE_CHOICE_DIALOG_MOVED_ON = "The New agent dialog changed after the choice was offered, so nothing ran. Say the command again.";
 
@@ -425,14 +456,28 @@ const OPEN_DECK_COMMAND = "open_deck";
  * and typing a user's words into the wrong machine's namesake is the worst
  * version of that collision this app has.
  */
-type Pending = { deckId: string; agentId: string; label: string };
+type Pending = { deckId: string; agentId: string; label: string; spawnedAtMs?: number };
+
+/**
+ * PRD #1260 review — whether the pane on screen shows `aim`'s deck and agent id
+ * but a DIFFERENT agent: the daemon replaced it under the same identity, which
+ * `spawnedAtMs` tells apart and the ids cannot. A pane showing another agent,
+ * or none, is not a replacement; the mode's own checks handle those.
+ */
+function paneReplaced(aim: Pending, pane: VoicePane | undefined): boolean {
+  return pane !== undefined && pane.deckId === aim.deckId && pane.agentId === aim.agentId && pane.spawnedAtMs !== aim.spawnedAtMs;
+}
 
 /**
  * PRD #1260 — the pane on screen, as the host sees it: whose it is, what the
  * deck calls that agent, and why its terminal cannot take input right now, if
  * it cannot. The dictation mode targets this and ends when it changes.
+ *
+ * `spawnedAtMs` is the agent's incarnation (`AgentRecord.spawned_at_ms`): a
+ * daemon can replace an agent under the same deck and agent id, and the mode
+ * ends then too, even when no snapshot ever showed the pane without an agent.
  */
-export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string };
+export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string; spawnedAtMs?: number };
 
 /**
  * PRD #1260 — the voice panel's state, the one model #1260, #1261 and #1184
@@ -771,8 +816,18 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const panelStateRef = useRef<VoicePanelState>(IDLE);
   const dictationChanged = useRef(onDictationChange);
   dictationChanged.current = onDictationChange;
+  /**
+   * PRD #1260 review — the dictation mode's generation: bumped on every entry
+   * to and exit from `dictating`. A cycle notes it when it declares, and after
+   * its round trip acts only if it is unchanged — so an utterance judged inside
+   * a mode that has since ended types nothing and presses nothing, even when
+   * the user re-entered the mode on the same pane in between, which the
+   * target's identity alone cannot tell apart.
+   */
+  const modeGeneration = useRef(0);
   const setPanelState = useCallback((next: VoicePanelState) => {
     const was = panelStateRef.current;
+    if (was.kind === "dictating" || next.kind === "dictating") modeGeneration.current += 1;
     panelStateRef.current = next;
     setPanelStateState(next);
     if (was.kind === "dictating" || next.kind === "dictating") dictationChanged.current?.(next.kind === "dictating" ? next.target : undefined);
@@ -1017,6 +1072,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       }
       cancelPendingSend();
       setPending(undefined);
+      if (paneReplaced(aim, paneRef.current)) {
+        setProblem(voiceSendReplaced(aim.label));
+        return;
+      }
       void submitDictation(aim);
     }, VOICE_DICTATION_TICK_MS);
   }, [cancelPendingSend, setPending, submitDictation]);
@@ -1049,14 +1108,28 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const paneDeckId = pane?.deckId;
   const paneAgentId = pane?.agentId;
   const paneBlocked = pane?.inputBlocked;
+  const paneSpawnedAtMs = pane?.spawnedAtMs;
   useEffect(() => {
     const mode = panelStateRef.current;
     if (mode.kind !== "dictating") return;
     if (confirmationOpen) endDictation("a confirmation opened");
     else if (paneDeckId !== mode.target.deckId || paneAgentId !== mode.target.agentId) endDictation("the pane closed");
+    else if (paneSpawnedAtMs !== mode.target.spawnedAtMs) endDictation(DICTATION_AGENT_REPLACED);
     else if (paneBlocked !== undefined) endDictation(`the pane stopped taking input: ${paneBlocked}`);
     else if (selectedDeckId !== mode.deck) endDictation("the deck changed");
-  }, [confirmationOpen, endDictation, paneAgentId, paneBlocked, paneDeckId, panelState, selectedDeckId]);
+  }, [confirmationOpen, endDictation, paneAgentId, paneBlocked, paneDeckId, paneSpawnedAtMs, panelState, selectedDeckId]);
+
+  /* PRD #1260 review — a pending one-shot send is called off, not sent, when
+     the agent it would press Enter for is replaced under the same id: the
+     words were typed into the agent that is gone, and Enter would submit
+     whatever the new one has in its prompt. */
+  useEffect(() => {
+    const aim = pendingRef.current;
+    if (!aim || !paneReplaced(aim, paneRef.current)) return;
+    cancelPendingSend();
+    setPending(undefined);
+    setProblem(voiceSendReplaced(aim.label));
+  }, [cancelPendingSend, paneAgentId, paneDeckId, paneSpawnedAtMs, pending, setPending]);
 
   /* The host marks the pane it is typing into; a panel going away takes the
      mode with it, so it must not leave the mark behind. */
@@ -1250,7 +1323,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         return;
       }
       if (verdict.kind === "refused") {
-        closeChoice(VOICE_CHOICE_REFUSED);
+        const colliding = collidingChoiceEntry(utterance, offer.outcome.candidates);
+        closeChoice(colliding === undefined ? VOICE_CHOICE_REFUSED : voiceChoiceCollision(colliding));
         return;
       }
       closeChoice(VOICE_CHOICE_CLOSED);
@@ -1269,6 +1343,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        call at all. */
     const mode = panelStateRef.current;
     const declaredDictation = mode.kind === "dictating" ? { deckId: mode.target.deckId, agentId: mode.target.agentId } : undefined;
+    /* PRD #1260 review — which mode instance, and which agent in the pane, the
+       utterance was judged for; see `modeGeneration` and `paneReplaced`. */
+    const declaredGeneration = modeGeneration.current;
+    const declaredPane = paneRef.current;
     setPhase("resolving");
     try {
       declareVoiceScreen?.(declared, declaredDirectories, declaredNewAgent, declaredEndpoints, declaredDictation);
@@ -1278,6 +1356,18 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (!ours()) return;
       if (screenRef.current !== declared) {
         setProblem(SCREEN_MOVED_ON);
+        return;
+      }
+      /* The mode the answer was judged in has ended, or one began: an answer
+         about typing into a mode that is no longer on types nothing and
+         presses nothing, and one judged without the mode is not an answer
+         inside it. */
+      if (modeGeneration.current !== declaredGeneration) {
+        if (declaredDictation === undefined) setProblem(VOICE_MODE_MOVED_ON);
+        return;
+      }
+      if (declaredPane && paneReplaced(declaredPane, paneRef.current)) {
+        setProblem(VOICE_PANE_REPLACED);
         return;
       }
       /* The same question for the declaration the grounding was computed
@@ -1687,7 +1777,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       );
       return;
     }
-    const aim: Pending = { deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId };
+    /* The pane's incarnation when it is the target, so a same-id replacement
+       before the countdown ends calls the send off (`paneReplaced`). */
+    const shown = paneRef.current;
+    const incarnation = shown && shown.deckId === target.deckId && shown.agentId === target.agentId ? { spawnedAtMs: shown.spawnedAtMs } : {};
+    const aim: Pending = { deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId, ...incarnation };
     const typed = dictationText(target.text ?? "");
     /* Nothing to type. Rust refuses an empty remainder before it ever becomes a
        dispatch, so this is the residual — text that was nothing but control
@@ -1696,7 +1790,15 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (typed === "") return;
     cancelPendingSend();
     void sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed).then(
-      () => { setPending(aim); armSend(aim); },
+      () => {
+        if (paneReplaced(aim, paneRef.current)) {
+          setPending(undefined);
+          setProblem(voiceSendReplaced(aim.label));
+          return;
+        }
+        setPending(aim);
+        armSend(aim);
+      },
       (cause) => { setPending(undefined); setProblem(sentenceOf(cause)); },
     );
   }, [armSend, cancelPendingSend, endDictation, sendTerminalInput, setPanelState, setPending]);
@@ -1751,7 +1853,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     }
     cancelPendingSend();
     setPending(undefined);
-    setPanelState({ kind: "dictating", target: { deckId: target.deckId, agentId: target.agentId, label }, deck: selectedDeckRef.current });
+    setPanelState({ kind: "dictating", target: { deckId: target.deckId, agentId: target.agentId, label, spawnedAtMs: shown.spawnedAtMs }, deck: selectedDeckRef.current });
   }, [cancelPendingSend, reportRefused, setPanelState, setPending]);
   /**
    * PRD #1260 — leave the dictation mode by voice. Answered in this surface's

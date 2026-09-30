@@ -577,6 +577,8 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * condition each screen draws it on — so a pane that went away for any
    * reason ends the mode, and the mode never follows the user to another.
    *
+   * `spawnedAtMs` tells a same-id replacement apart, which the ids cannot.
+   *
    * Writability is what this app already holds about the pane's agent
    * (`terminalInputState`: its lease, its status, the last delivery verdict),
    * plus the deck having a live link at all; nothing is sent to find out.
@@ -588,6 +590,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       deckId: agentView.deckId,
       agentId: agentView.agentId,
       label: paneShownAgent.displayName,
+      /* The agent's incarnation: a daemon can replace an agent under the same
+         deck and agent id, and the mode must not survive that (#1260 review). */
+      spawnedAtMs: paneShownAgent.spawnedAtMs,
       inputBlocked: paneInput.readOnly
         ? (paneInput.notice ?? "its terminal cannot take input.")
         : (!paneDeckAttachable || heldPaneAgent ? "its deck is not answering." : undefined),

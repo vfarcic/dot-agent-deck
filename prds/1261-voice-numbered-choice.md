@@ -202,3 +202,7 @@ Written from issue #1261 by a dispatched unit, alongside PRDs #1260 and #1184, a
 - **Docs.** `docs/desktop/voice.md` has "When a command matches several things" with a generated screenshot (`voice-choice` scenario, `cargo docs-screenshots --scenario voice-choice`), and the "decided on this machine" list names the choice's answers. `voice-first-design.md` section 8 has the numbered choice (the offered-list check as distinct from grounding, the refusals that never become a choice, the genuine-ties note, the non-answer rule, staleness, the two copies) and checklist item 11; `desktop-gui.md` has the surface note and manual walk step 12c for the Rust path.
 - **Changelog.** `changelog.d/1261.feature.md`, and `1261.bugfix.md` for the two fixture fixes, which a user can observe.
 
+### 2026-09-30 — Review findings
+
+- **A label that is also a bare control is refused.** When an offered entry's label is, word for word, a bare ordinal or cancel phrase that the utterance also is (an agent called "two" or "cancel"), `voice::choice::answer` and `answerChoiceLocally` now return `Refused` instead of reading it either way; the panel's refusal (`voiceChoiceCollision`) says to click the entry or say "number N". "number one" is still a number. Both copies share the rule through the offered labels, and `collidingChoiceEntry` gives the panel the entry's number for any runtime.
+- **The user docs list every cancel phrase** ("cancel that" was missing; "nevermind" is the same words) and describe the collision rule.

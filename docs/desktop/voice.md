@@ -16,7 +16,7 @@ Say "what can I say?" to see every command, split into **On this screen** and **
 
 What the app did with each thing you said appears beside the button and stays until the next one. When a command can be reversed, an **Undo** button is shown beside it for ten seconds.
 
-To type into an agent, open its [pane](dashboard.md#the-agent-pane) and start with "type", for example "type run the tests". The words after "type" are typed into the agent's prompt, taken from what the Speech service heard rather than from the Commands model's answer, and sent after a short countdown.
+To type into an agent, open its [pane](dashboard.md#the-agent-pane) and start with "type", for example "type run the tests". The words after "type" are typed into the agent's prompt, taken from what the Speech service heard rather than from the Commands model's answer, and sent after a short countdown. If the agent in the pane is replaced by a new one before the countdown ends, nothing is sent and the app says so.
 
 ## When a command matches several things
 
@@ -28,9 +28,11 @@ If what you said names more than one thing on screen, for example "open the agen
 - **Say the name** of one of the listed entries, such as "Desktop implementation".
 - **Click** an entry, or reach it with Tab and press Enter.
 
+If an entry's name is itself a number or a way of cancelling, for example an agent called "two" or "cancel", saying just that name chooses nothing: the list closes and the app says why. Say the command again, then say "number" and the entry's position, such as "number one", or click the entry.
+
 The command you first gave then runs with the entry you chose; what you said is not sent to the Commands service again. Choosing does not skip a confirmation: if the command stops an agent or closes an orchestration, the confirmation still opens, and you answer it by hand.
 
-To choose nothing, say "cancel", "never mind", "none", "none of them", "neither" or "no", press **Cancel**, or press Escape while an entry has focus. The list also closes on its own after 20 seconds, and when you turn voice off; nothing runs.
+To choose nothing, say "cancel", "cancel that", "never mind", "none", "none of them", "neither" or "no" on its own, press **Cancel**, or press Escape while an entry has focus. The list also closes on its own after 20 seconds, and when you turn voice off; nothing runs.
 
 If you say something else while the list is open, the list closes and what you said is treated as a new command. A number that is not on the list, a name that matches more than one entry, or on its own the name of something on screen that is not on the list, closes the list without running anything; say the command again, more specifically.
 
@@ -58,7 +60,7 @@ Typing mode ends, and **nothing is sent** when it does, if you:
 - close the pane (for example with Escape), open another screen, open another agent, or switch daemons;
 - or a confirmation opens, for example to stop an agent.
 
-It also ends if the agent stops accepting input, for example because it exited. Whatever you dictated stays in the agent's prompt, where you can edit it or send it yourself. The app says why typing mode ended. Typing mode never moves to another agent on its own: to dictate to a different agent, open its pane and say "type on" again. If the agent on screen cannot take input, "type on" is refused with the reason.
+It also ends if the agent stops accepting input, for example because it exited, or if it is replaced by a new agent in the same pane. Something you said just before typing mode ended is not typed or sent. Whatever you dictated stays in the agent's prompt, where you can edit it or send it yourself. The app says why typing mode ended. Typing mode never moves to another agent on its own: to dictate to a different agent, open its pane and say "type on" again. If the agent on screen cannot take input, "type on" is refused with the reason.
 
 If the app mishears "type off", the words are typed into the prompt instead of stopping typing mode. They are not sent: press **Stop typing** and delete them.
 

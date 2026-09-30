@@ -1132,9 +1132,9 @@ describe("sticky dictation in the open agent pane", () => {
     { name: "prefix", kind: "spoken_prefix", spoken: "", value: said, label: said },
   ]);
 
-  function start(answers: Record<string, VoiceResultDto> = {}) {
+  function start(answers: Record<string, VoiceResultDto> = {}, override?: ResolveVoice) {
     const voice = microphone([]);
-    const resolveVoice: ResolveVoice = vi.fn(async (said: string) =>
+    const resolveVoice: ResolveVoice = override ?? vi.fn(async (said: string) =>
       ({ "type on": modeOn, ...answers }[said] ?? inModeText(said)));
     const snapshot = createFixtureSnapshot("crowded");
     const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot] });
@@ -1271,6 +1271,69 @@ describe("sticky dictation in the open agent pane", () => {
     expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "unsent words ");
   });
 
+  /** Scenario: Stop typing while a spoken send is still resolving. Its late
+   * answer must not press Enter or leave a send countdown behind. */
+  it("drops an in-flight send after Stop typing", async () => {
+    let settle: (answer: VoiceResultDto) => void = () => {};
+    const resolveVoice: ResolveVoice = vi.fn((said: string) => said === "type on"
+      ? Promise.resolve(modeOn)
+      : new Promise<VoiceResultDto>((resolve) => { settle = resolve; }));
+    const { voice, deck } = start({}, resolveVoice);
+    await enter(voice);
+    voice.deliver("send it");
+    await completeUtterance();
+    expect(resolveVoice).toHaveBeenLastCalledWith("send it");
+    fireEvent.click(screen.getByRole("button", { name: /stop typing/i }));
+    await act(async () => { settle(dispatch("submit_prompt", "submitAgentPrompt", "Sent.", "send it")); await Promise.resolve(); });
+    expect(vi.mocked(deck.sendTerminalInput).mock.calls).toEqual([]);
+    expect(screen.queryByText(/sending in \d+ s/i)).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
+    expect(vi.mocked(deck.sendTerminalInput).mock.calls).toEqual([]);
+  });
+
+  /** Scenario: Stop typing while an ordinary sentence is resolving. The stale
+   * answer must neither type it as a one-shot prompt nor arm a countdown. */
+  it("drops in-flight words after Stop typing", async () => {
+    let settle: (answer: VoiceResultDto) => void = () => {};
+    const resolveVoice: ResolveVoice = vi.fn((said: string) => said === "type on"
+      ? Promise.resolve(modeOn)
+      : new Promise<VoiceResultDto>((resolve) => { settle = resolve; }));
+    const { voice, deck } = start({}, resolveVoice);
+    await enter(voice);
+    voice.deliver("review the diff");
+    await completeUtterance();
+    expect(resolveVoice).toHaveBeenLastCalledWith("review the diff");
+    fireEvent.click(screen.getByRole("button", { name: /stop typing/i }));
+    await act(async () => { settle(inModeText("review the diff")); await Promise.resolve(); });
+    expect(vi.mocked(deck.sendTerminalInput).mock.calls).toEqual([]);
+    expect(screen.queryByText(/sending in \d+ s/i)).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
+    expect(vi.mocked(deck.sendTerminalInput).mock.calls).toEqual([]);
+  });
+
+  /** Scenario: Stop typing, cycle Voice, and re-enter dictation on the same
+   * pane while the old result is pending. The first mode's answer stays stale. */
+  it("keeps a prior mode's result out of a newly entered same-pane mode", async () => {
+    let settle: (answer: VoiceResultDto) => void = () => {};
+    const resolveVoice: ResolveVoice = vi.fn((said: string) => said === "type on"
+      ? Promise.resolve(modeOn)
+      : new Promise<VoiceResultDto>((resolve) => { settle = resolve; }));
+    const { voice, deck } = start({}, resolveVoice);
+    await enter(voice);
+    voice.deliver("first mode words");
+    await completeUtterance();
+    expect(resolveVoice).toHaveBeenLastCalledWith("first mode words");
+    fireEvent.click(screen.getByRole("button", { name: /stop typing/i }));
+    await act(async () => { fireEvent.click(voiceButton()); await Promise.resolve(); });
+    await turnVoiceOn();
+    voice.deliver("type on");
+    await completeUtterance();
+    expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
+    await act(async () => { settle(inModeText("first mode words")); await Promise.resolve(); });
+    expect(vi.mocked(deck.sendTerminalInput).mock.calls).toEqual([]);
+    expect(screen.queryByText(/sending in \d+ s/i)).toBeNull();
+  });
+
   /** Scenario: pressing Voice or closing the pane ends an active mode, leaving
    * already typed words unsent and no target for a later utterance. */
   it.each(["Voice button", "pane close"]) ("ends dictation without sending when the %s is used", async (exit) => {
@@ -1304,6 +1367,35 @@ describe("sticky dictation in the open agent pane", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
     expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "unsent words ");
+  });
+
+  /** Scenario: the daemon replaces Coder without an empty fleet snapshot and
+   * reuses its deck and agent ids. Dictation ends before words reach that new terminal. */
+  it("ends dictation when the same-id pane agent has a new spawn time", async () => {
+    if (coder.spawnedAtMs === undefined) throw new Error("Coder fixture needs a spawn time");
+    let declaredDictation = false;
+    const resolveVoice: ResolveVoice = vi.fn(async (said: string) => said === "type on"
+      ? modeOn
+      : declaredDictation ? inModeText(said) : {
+        resolveMs: 21, backend: "stub", outcome: { kind: "no_match", transcript: said, sentence: "No matching command." },
+      } as VoiceResultDto);
+    const { voice, deck, rerender } = start({}, resolveVoice);
+    const declareVoiceScreen = vi.fn((...args: unknown[]) => { declaredDictation = args[4] !== undefined; });
+    rerender(<DeckShell runtime={{ ...deck, declareVoiceScreen }} />);
+    await enter(voice);
+    const replaced = {
+      ...deck.snapshot,
+      agents: deck.snapshot.agents.map((agent) => agent.id === coderId
+        ? { ...agent, spawnedAtMs: coder.spawnedAtMs! + 1_000 }
+        : agent),
+    };
+    rerender(<DeckShell runtime={{ ...deck, declareVoiceScreen, snapshot: replaced, fleet: [replaced] }} />);
+    await flush();
+    expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/replaced|restart|new session|pane.*changed|agent.*changed/i);
+    voice.deliver("review the diff");
+    await completeUtterance();
+    expect(vi.mocked(deck.sendTerminalInput).mock.calls).toEqual([]);
   });
 
   /** Scenario: selected deck identity changes while coder's pane is open.

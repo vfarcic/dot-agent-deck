@@ -29,4 +29,18 @@ describe("answerChoiceLocally", () => {
     for (const said of ["cancel", "never mind", "none of them", "no"]) expect(answerChoiceLocally(said, offered)).toEqual({ kind: "cancelled" });
     expect(answerChoiceLocally("do not cancel the build", offered)).toEqual({ kind: "not_answer" });
   });
+
+  /** Scenario: a visible name that also means a bare ordinal or cancel is
+   * ambiguous and refused; an explicit numbered choice can still select it. */
+  it("refuses offered labels that collide with bare choice controls", () => {
+    const names = [
+      { name: "agent", kind: "agent_ref" as const, spoken: "two", value: "agent-two", label: "two" },
+      { name: "agent", kind: "agent_ref" as const, spoken: "Other", value: "agent-other", label: "Other" },
+    ];
+    expect(answerChoiceLocally("number one", names)).toEqual({ kind: "selected", candidate: names[0] });
+    const cancel = [{ name: "agent", kind: "agent_ref" as const, spoken: "cancel", value: "agent-cancel", label: "cancel" }];
+    expect([answerChoiceLocally("two", names), answerChoiceLocally("cancel", cancel)]).toEqual([
+      { kind: "refused" }, { kind: "refused" },
+    ]);
+  });
 });
