@@ -320,13 +320,13 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
 
   const first = { name: "agent", kind: "agent_ref", spoken: "agent", value: "planner", label: "Plan / architecture" } as const;
   const second = { name: "agent", kind: "agent_ref", spoken: "agent", value: "builder", label: "Desktop implementation" } as const;
-  const candidates = [first, second];
-  const choice = (action = "open_agent", invoke = "openAgent"): VoiceResultDto => ({
+  const candidates: VoiceResolvedParamDto[] = [first, second];
+  const choice = (action = "open_agent", invoke = "openAgent", offered: typeof candidates = candidates): VoiceResultDto => ({
     resolveMs: 21, backend: "stub",
     outcome: {
       kind: "param_ambiguous", transcript: "open the agent", action, invoke,
-      param: "agent", spoken: "agent", matches: candidates.map((candidate) => candidate.label),
-      candidates, params: [], sentence: "Heard: “open the agent” — “agent” matches more than one agent: Plan / architecture, Desktop implementation.",
+      param: "agent", spoken: "agent", matches: offered.map((candidate) => candidate.label),
+      candidates: offered, params: [], sentence: `Heard: “open the agent” — “agent” matches more than one agent: ${offered.map((candidate) => candidate.label).join(", ")}.`,
     },
   } as unknown as VoiceResultDto);
   const selected = (utterance: string, target = second) =>
@@ -339,13 +339,13 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
 
   function setup(voice: ReturnType<typeof microphone>, answer: (utterance: string) => VoiceResultDto = selected,
     configure?: (snapshot: ReturnType<typeof createFixtureSnapshot>) => void,
-    answerVoiceChoice?: NonNullable<DeckRuntimeState["answerVoiceChoice"]>) {
+    answerVoiceChoice?: NonNullable<DeckRuntimeState["answerVoiceChoice"]>, offered = candidates) {
     const snapshot = createFixtureSnapshot("connected");
     configure?.(snapshot);
     for (const id of [first.value, second.value]) {
       if (!snapshot.agents.find((agent) => agent.id === id)) throw new Error(`fixture agent ${id} missing`);
     }
-    const resolveVoice: ResolveVoice = vi.fn(async (utterance) => utterance === "open the agent" ? choice() : answer(utterance));
+    const resolveVoice: ResolveVoice = vi.fn(async (utterance) => utterance === "open the agent" ? choice("open_agent", "openAgent", offered) : answer(utterance));
     render(<DeckShell runtime={runtime(resolveVoice, voice, { snapshot, fleet: [snapshot], answerVoiceChoice })} initialView={{ kind: "overview" }} />);
     return { resolveVoice, snapshot };
   }
@@ -378,6 +378,32 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId(`terminal-${second.value}`)).toBeVisible();
     expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
     expect(resolveVoice).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: the first offered agent is named “two”, so saying “two” could
+   * mean its name or the second entry's number. The list closes without opening
+   * either agent; saying “number two” on a new offer opens the second entry. */
+  it("refuses an offered name that collides with a number but accepts an explicit number", async () => {
+    const voice = microphone(["open the agent"]);
+    const namedTwo = { ...first, label: "two" };
+    const { resolveVoice } = setup(voice, selected, undefined, undefined, [namedTwo, second]);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(1, "two")).toBeVisible();
+
+    voice.deliver("two");
+    await completeUtterance();
+    expect(screen.queryByRole("button", { name: "1. two" })).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("That is both an entry's name and a number or cancel word, so nothing ran. Say the command again, then click the entry or say “number 1”.");
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+
+    voice.deliver("open the agent");
+    await completeUtterance();
+    expect(entry(2, second.label)).toBeVisible();
+    voice.deliver("number two");
+    await completeUtterance();
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId(`terminal-${second.value}`)).toBeVisible();
+    expect(resolveVoice).toHaveBeenCalledTimes(2);
   });
 
   /** Scenario: when the runtime provides a choice answer, the panel uses that
@@ -825,6 +851,25 @@ describe("typing into the open agent", () => {
   /** What the daemon itself calls that agent — read from the fixture, not retyped. */
   const PLANNER_LABEL = createFixtureSnapshot("connected").agents.find((agent) => agent.id === "planner")?.displayName ?? "";
 
+  function plannerWithSpawnTime() {
+    const snapshot = createFixtureSnapshot("connected");
+    const planner = snapshot.agents.find((agent) => agent.id === "planner");
+    if (!planner) throw new Error("Planner fixture missing");
+    planner.spawnedAtMs = 1_000;
+    return snapshot;
+  }
+
+  function replacePlanner(deck: DeckRuntimeState) {
+    const original = deck.snapshot.agents.find((agent) => agent.id === "planner");
+    if (original?.spawnedAtMs === undefined) throw new Error("Planner fixture needs a spawn time");
+    return {
+      ...deck.snapshot,
+      agents: deck.snapshot.agents.map((agent) => agent.id === "planner"
+        ? { ...agent, spawnedAtMs: original.spawnedAtMs! + 1_000 }
+        : agent),
+    };
+  }
+
   /**
    * One dictation outcome, shaped the way Rust shapes it.
    *
@@ -976,6 +1021,81 @@ describe("typing into the open agent", () => {
 
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS); });
     expect(deck.sendTerminalInput).toHaveBeenLastCalledWith({ deckId: DECK_ID, agentId: "planner" }, VOICE_DICTATION_SUBMIT);
+  });
+
+  /** Scenario: a one-shot sentence is typed and its send countdown is visible.
+   * The daemon replaces that pane's agent under the same id; the countdown
+   * disappears with a replacement report and never presses Enter. */
+  it("calls off a one-shot countdown when the same-id agent is replaced", async () => {
+    const voice = microphone(["open the planner"]);
+    const said = "type run the login tests";
+    const snapshot = plannerWithSpawnTime();
+    const deck = runtime(speaking({ [said]: dictated(said, "type") }), voice, { snapshot, fleet: [snapshot] });
+    const { rerender } = render(<DeckShell runtime={deck} />);
+    await openPlanner(voice);
+    voice.deliver(said);
+    await completeUtterance();
+    expect(screen.getByTestId("voice-dictation")).toHaveTextContent("sending in 5 s");
+
+    const replaced = replacePlanner(deck);
+    rerender(<DeckShell runtime={{ ...deck, snapshot: replaced, fleet: [replaced] }} />);
+    await flush();
+    expect(screen.queryByTestId("voice-dictation")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(`The agent in ${PLANNER_LABEL}'s pane was replaced, so nothing was sent. What was typed went to the agent it replaced.`);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: one-shot words are still being typed into the original agent
+   * when a same-id replacement arrives. Completing that write never starts a
+   * countdown or presses Enter in the replacement's prompt. */
+  it("does not arm a one-shot countdown after a pending write meets a replacement", async () => {
+    const voice = microphone(["open the planner"]);
+    const said = "type run the login tests";
+    let settleTyped: () => void = () => {};
+    const sendTerminalInput = vi.fn(() => new Promise<void>((resolve) => { settleTyped = resolve; }));
+    const snapshot = plannerWithSpawnTime();
+    const deck = runtime(speaking({ [said]: dictated(said, "type") }), voice, { sendTerminalInput, snapshot, fleet: [snapshot] });
+    const { rerender } = render(<DeckShell runtime={deck} />);
+    await openPlanner(voice);
+    voice.deliver(said);
+    await completeUtterance();
+    expect(sendTerminalInput).toHaveBeenCalledWith({ deckId: DECK_ID, agentId: "planner" }, "run the login tests ");
+    expect(screen.queryByTestId("voice-dictation")).toBeNull();
+
+    const replaced = replacePlanner(deck);
+    rerender(<DeckShell runtime={{ ...deck, snapshot: replaced, fleet: [replaced] }} />);
+    await act(async () => { settleTyped(); await Promise.resolve(); });
+    expect(screen.queryByTestId("voice-dictation")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(`The agent in ${PLANNER_LABEL}'s pane was replaced, so nothing was sent. What was typed went to the agent it replaced.`);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
+    expect(sendTerminalInput).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: a one-shot command is being resolved when the pane's agent is
+   * replaced under the same id. Its answer is reported as stale and cannot
+   * type into the new agent. */
+  it("drops an in-flight one-shot result after same-id agent replacement", async () => {
+    const voice = microphone(["open the planner"]);
+    const said = "type run the login tests";
+    let settle: (answer: VoiceResultDto) => void = () => {};
+    const resolveVoice: ResolveVoice = vi.fn((utterance: string) => utterance === "open the planner"
+      ? Promise.resolve(dispatch("open_agent", "openAgent", "Opening Planner.", utterance, PLANNER))
+      : new Promise<VoiceResultDto>((resolve) => { settle = resolve; }));
+    const snapshot = plannerWithSpawnTime();
+    const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot] });
+    const { rerender } = render(<DeckShell runtime={deck} />);
+    await openPlanner(voice);
+    voice.deliver(said);
+    await completeUtterance();
+    expect(resolveVoice).toHaveBeenLastCalledWith(said);
+
+    const replaced = replacePlanner(deck);
+    rerender(<DeckShell runtime={{ ...deck, snapshot: replaced, fleet: [replaced] }} />);
+    await act(async () => { settle(dictated(said, "type")); await Promise.resolve(); });
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("The agent in this pane was replaced while that was being worked out, so nothing ran. Say it again.");
+    expect(deck.sendTerminalInput).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("voice-dictation")).toBeNull();
   });
 
   /**
