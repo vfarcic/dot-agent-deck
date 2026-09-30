@@ -438,6 +438,16 @@ pub fn rename(
     .map(drop)
 }
 
+/// Whether a refused [`rename`] means the window's deck list is no longer what
+/// is on disk, so the window must be handed the list re-read from disk along
+/// with the refusal (issue #1426's review): the row is no longer the deck the
+/// window showed ([`RenameDeckError::Changed`]), or it is gone — removed in a
+/// terminal since the window loaded ([`RenameDeckError::NotFound`]), which
+/// would otherwise leave the removed row on screen.
+pub fn refusal_shows_disk(error: &RenameDeckError) -> bool {
+    matches!(error, RenameDeckError::Changed | RenameDeckError::NotFound)
+}
+
 /// The name a deck at `host` (and `user`) is given when it is added without
 /// one — the default the add form pre-fills (issue #1426). The same
 /// [`deck_list::derive_deck_name`] call [`new_entry`] makes, against the
@@ -1569,6 +1579,37 @@ mod tests {
             Some("legacy"),
             "the row as it is now renames"
         );
+    }
+
+    /// Scenario: the window shows `prod`; in a terminal `remote remove prod`
+    /// takes it out of the deck list. Renaming it from the window is refused
+    /// with "no longer in the deck list", writes nothing, and — like a deck
+    /// that changed — is a refusal after which the window is handed the list
+    /// as it is on disk, so the removed row does not stay on screen.
+    #[test]
+    fn a_rename_of_a_deck_removed_elsewhere_shows_the_list_on_disk() {
+        let (_dir, path) = registry(CLI_ROW);
+        let shown = load_rows(&path).unwrap().remove(0);
+        std::fs::write(&path, "").unwrap();
+
+        let error = rename(&path, &shown, "production").unwrap_err();
+
+        assert!(matches!(error, RenameDeckError::NotFound), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "That deck is no longer in the deck list."
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        assert!(
+            refusal_shows_disk(&error),
+            "a removed deck must reload the list"
+        );
+        // The control: a deck that changed already reloads; a refusal about
+        // the name itself leaves the list alone.
+        assert!(refusal_shows_disk(&RenameDeckError::Changed));
+        assert!(!refusal_shows_disk(&RenameDeckError::DuplicateName {
+            name: "staging".into()
+        }));
     }
 
     #[test]

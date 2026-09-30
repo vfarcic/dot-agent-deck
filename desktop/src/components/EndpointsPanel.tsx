@@ -224,6 +224,15 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
   const nameValue = draft ? draftName : renameValue;
   const verdict = selected && nameCheck?.id === selected.id && nameCheck.name === nameValue ? nameCheck.refusal : undefined;
   const nameRefusal = (selected && renameRefusal?.id === selected.id ? renameRefusal.message : undefined) ?? verdict ?? undefined;
+  /**
+   * A rename refused because its deck left the deck list (removed in a
+   * terminal meanwhile): the window now shows the list without that row, so
+   * the sentence cannot sit beside its field and is said above the form
+   * instead, until another deck is chosen or added.
+   */
+  const goneRefusal = renameRefusal && !rows.some((row) => row.id === renameRefusal.id)
+    ? renameRefusal.message
+    : undefined;
 
   /*
     Issue #1426: pre-fill a draft's name with the one the library would derive
@@ -304,6 +313,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
     // host is not one the app can be pointed at yet.
     setDraft(blankEndpoint());
     setDraftName("");
+    setRenameRefusal(undefined);
     draftNameTouched.current = false;
   };
 
@@ -314,7 +324,10 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
    *
    * The name is checked once more at the moment of confirming, because the
    * verdict on screen may still be in flight; a refusal is shown and nothing is
-   * stored. An empty name stores none, and the library derives one.
+   * stored. An empty name stores none, and the library derives one. The Deck
+   * name field is locked (`confirming`) while that check runs, so the name
+   * captured here is the one checked, saved and on screen — an edit made during
+   * the check used to be dropped in favour of this earlier value.
    *
    * The name can still be taken between that check and the save (a `remote
    * add` in a terminal). The save then writes nothing and the window is shown
@@ -393,6 +406,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
    */
   const chooseDeck = (id: string) => {
     if (draft?.id === id) return;
+    setRenameRefusal(undefined);
     setDraft(undefined);
     saveSection({ ...section, selection: id });
   };
@@ -540,6 +554,8 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
         </div>
       </div>
 
+      <Problem text={goneRefusal} />
+
       {fleetSelected && (
         <p className="settings-hint" data-testid="deck-fleet-note">
           All daemons is every daemon at once, so it has no settings and nothing to test. Choose a daemon to
@@ -556,6 +572,9 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
               value={draftName}
               placeholder="derived from the address"
               problem={nameRefusal}
+              // Locked while Add this daemon re-checks it, so the name saved is
+              // the one that was checked and is on screen.
+              disabled={confirming}
               onChange={(name) => {
                 draftNameTouched.current = true;
                 setDraftName(name);
@@ -718,12 +737,13 @@ function DeckChoice({ id, label, address, selected, onSelect, onRemove }: {
 }
 
 /** A two-column text row, in the same shape as every other settings row. */
-function TextRow({ id, label, value, placeholder, problem, onChange }: {
+function TextRow({ id, label, value, placeholder, problem, disabled, onChange }: {
   id: string;
   label: string;
   value: string;
   placeholder: string;
   problem: string | undefined;
+  disabled?: boolean;
   onChange: (value: string) => void;
 }) {
   return (
@@ -738,6 +758,7 @@ function TextRow({ id, label, value, placeholder, problem, onChange }: {
           autoComplete="off"
           value={value}
           placeholder={placeholder}
+          disabled={disabled}
           aria-invalid={problem ? true : undefined}
           onChange={(event) => onChange(event.target.value)}
         />

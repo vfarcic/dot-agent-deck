@@ -2515,7 +2515,8 @@ async fn desktop_set_settings(
 ///
 /// A refusal rejects with the sentence the rename form shows as it is — the
 /// library's own wording, the same one [`desktop_check_deck_name`] gives. When
-/// the row is no longer the deck the window showed, the rejection also carries
+/// the row is no longer the deck the window showed, or is no longer in the
+/// deck list at all ([`crate::decks::refusal_shows_disk`]), the rejection also carries
 /// the settings re-read from disk (a [`crate::dto::DesktopSettingsSaveError::Partial`],
 /// as a save's conflict does), so the window shows the list as it is. A
 /// failure to read or write the deck list rejects with a sentence that names
@@ -2553,8 +2554,8 @@ async fn desktop_rename_deck(
     })?;
     let written = match renamed {
         Ok(written) => written,
-        Err(RenameDeckError::Changed) => {
-            let message = RenameDeckError::Changed.to_string();
+        Err(error) if crate::decks::refusal_shows_disk(&error) => {
+            let message = error.to_string();
             let Ok(disk) =
                 tauri::async_runtime::spawn_blocking(|| crate::settings::load_snapshot().settings)
                     .await

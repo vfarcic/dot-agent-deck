@@ -266,6 +266,32 @@ describe("EndpointsPanel", () => {
     expect(screen.getByTestId("save-new-deck")).toBeDisabled();
   });
 
+  /// Scenario: While Add this daemon re-checks the name, the Deck name field is locked, so the name saved is the one checked and on screen.
+  it("locks the draft name while confirming, so the checked name is the one saved", async () => {
+    const confirmCheck = deferred<string | null>();
+    let checks = 0;
+    const checkDeckName = vi.fn(async (name: string) => {
+      checks += 1;
+      return name === "mine" && checks > 1 ? confirmCheck.promise : null;
+    });
+    const { onSave } = renderPanel({}, { defaultDeckName: vi.fn(async () => ""), checkDeckName });
+    fireEvent.click(screen.getByTestId("add-deck"));
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "mine" } });
+    await waitFor(() => expect(checkDeckName).toHaveBeenCalledWith("mine", undefined));
+    await waitFor(() => expect(screen.getByTestId("save-new-deck")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("save-new-deck"));
+    await waitFor(() => expect(checkDeckName).toHaveBeenCalledTimes(2));
+
+    // The check is in flight: the name it is checking cannot be edited under it.
+    expect(screen.getByLabelText("Deck name")).toBeDisabled();
+    expect(screen.getByTestId("save-new-deck")).toBeDisabled();
+
+    await act(async () => { confirmCheck.resolve(null); });
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect((onSave.mock.calls[0][0] as DesktopSettingsDto).endpoints?.remote[0].name).toBe("mine");
+  });
+
   /// Scenario: A name taken during the save leaves the complete draft on screen, explains the refusal, and shows the save error.
   it("restores a refused add when the name is taken during save", async () => {
     const disk = { ...DEFAULT_DESKTOP_SETTINGS, endpoints: { remote: [], selection: "local" } };
@@ -595,6 +621,27 @@ describe("EndpointsPanel", () => {
     expect(screen.getByLabelText("Host")).toHaveValue("other-host");
     expect(screen.getByLabelText("Deck name")).toHaveValue("other");
     expect(screen.getByTestId(`deck-choice-${row.id}`)).toHaveTextContent("other");
+  });
+
+  /// Scenario: A deck removed in a terminal is renamed from the window; the removed row leaves the list and the panel says the deck no longer exists.
+  it("says a renamed deck no longer exists once the disk list drops it", async () => {
+    const row = deck({ name: "build" });
+    const other = deck({ id: "deck0000000000bb", host: "ci-box", name: "ci" });
+    const disk = { ...DEFAULT_DESKTOP_SETTINGS, endpoints: { remote: [other], selection: "local" } };
+    const renameDeck = vi.fn(async (): Promise<DesktopSettingsDto> => {
+      throw new Error("That deck is no longer in the deck list.");
+    });
+    const { update } = renderPanel({ endpoints: { remote: [row, other], selection: row.id } }, { renameDeck });
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "production" } });
+    fireEvent.click(screen.getByTestId("rename-deck"));
+    await waitFor(() => expect(renameDeck).toHaveBeenCalled());
+    update(disk);
+
+    expect(screen.queryByTestId(`deck-choice-${row.id}`)).toBeNull();
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("That deck is no longer in the deck list."));
+    // Choosing another deck retires the sentence: it was about the row that went.
+    fireEvent.click(screen.getByTestId(`deck-choice-${other.id}`).querySelector("input")!);
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   /**
