@@ -7230,8 +7230,8 @@ fn write_work_done_summary(
     // Issue #509: framed as untrusted worker-authored text, in full.
     //
     // Qodo on PR #1438: the check, the write and the record of what was written
-    // are one step for this path ([`summary_write_lock`]).
-    let serializer = summary_write_lock(&path);
+    // are one step for this file ([`summary_write_lock`]).
+    let serializer = summary_write_lock(std::path::Path::new(cwd), &file_name);
     let _serialized = serializer
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -7275,17 +7275,26 @@ fn write_work_done_summary(
 /// summary path. Without it, two completions for the same path could record
 /// their fingerprints in the opposite order to their writes, leaving a record
 /// that no longer matches the file, and the next completion would then be
-/// diverted. One lock per path, keyed like the record, so a slow filesystem
-/// under one project does not hold up completions in another. A std mutex: the
-/// only non-test caller runs on the blocking pool, and nothing under it awaits.
-fn summary_write_lock(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+/// diverted. One lock per file, so a slow filesystem under one project does not
+/// hold up completions in another. The key is the resolved project directory,
+/// so two spellings of it (a symlink, a `..` segment) share one lock rather
+/// than interleaving their writes into the one file; a directory that cannot
+/// be resolved is keyed as spelled, and its write fails anyway. A std mutex:
+/// the only non-test caller runs on the blocking pool, and nothing under it
+/// awaits.
+fn summary_write_lock(
+    cwd: &std::path::Path,
+    file_name: &str,
+) -> std::sync::Arc<std::sync::Mutex<()>> {
     type Locks = HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>;
     static LOCKS: std::sync::LazyLock<std::sync::Mutex<Locks>> =
         std::sync::LazyLock::new(Default::default);
+    let dir = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let key = crate::orchestrator_context::context_dir_of(&dir).join(file_name);
     LOCKS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(path.to_path_buf())
+        .entry(key)
         .or_default()
         .clone()
 }
@@ -16212,7 +16221,7 @@ mod tests {
         let held = tempfile::tempdir().expect("tempdir");
         let other = tempfile::tempdir().expect("tempdir");
         let other_str = other.path().to_str().expect("utf8 cwd").to_string();
-        let held_lock = summary_write_lock(&held.path().join(".dot-agent-deck/work-done-coder.md"));
+        let held_lock = summary_write_lock(held.path(), "work-done-coder.md");
         let _slow_write_in_progress = held_lock.lock().expect("held path's lock");
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -16229,6 +16238,45 @@ mod tests {
             rx.recv_timeout(std::time::Duration::from_secs(10)),
             Ok(SummaryWrite::Written),
             "a write to a different summary path must not wait for this one"
+        );
+    }
+
+    /// Qodo on PR #1438: two spellings of one project directory — through a
+    /// symlink here — end at one summary file, so they share its lock. A
+    /// completion filing through the alias waits for one in progress under the
+    /// real path, rather than interleaving its bytes with it.
+    #[cfg(unix)]
+    #[test]
+    fn write_work_done_summary_serializes_aliases_of_one_project() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).expect("project dir");
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&project, &alias).expect("alias symlink");
+        let alias_str = alias.to_str().expect("utf8 cwd").to_string();
+
+        let held_lock = summary_write_lock(&project, "work-done-coder.md");
+        let slow_write_in_progress = held_lock.lock().expect("real path's lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(write_work_done_summary(
+                Some(&alias_str),
+                "coder",
+                "coder",
+                "pane-1",
+                "Through the alias.",
+            ));
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_millis(500)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "a write through an alias of the same project must wait for the one in progress"
+        );
+        drop(slow_write_in_progress);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(SummaryWrite::Written),
+            "and must then file its report"
         );
     }
 
