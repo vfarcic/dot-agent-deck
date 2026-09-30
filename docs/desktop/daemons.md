@@ -1,65 +1,71 @@
----
-title: Daemons
----
-
 # Daemons
 
-The desktop app can watch several daemons at once: the one on this machine and any number of remote ones reached over ssh. The TUI attaches to one daemon at a time, and reaches a remote one with `dot-agent-deck connect` (see [Remote Environments](../remote-environments.md)).
+The desktop app can watch several daemons at once: the one on this machine and any number of remote ones reached over ssh. The TUI attaches to one daemon at a time and reaches a remote one with `dot-agent-deck connect` (see [Remote Environments](../remote-environments.md)).
 
-## The daemon selector
+The app shares its list of remote daemons with the CLI: both read and write `remotes.toml` in `~/.config/dot-agent-deck/` (or the file `DOT_AGENT_DECK_REMOTES` names). So a host registered with `dot-agent-deck remote add` is already in the app's list, and a daemon added in the app is listed by `dot-agent-deck remote list`. The app shows only `ssh` entries.
 
-The **Daemon** selector under the Dashboard's title chooses what the Dashboard shows:
+## Choose which daemons the Dashboard shows
 
-- **All daemons** — every daemon at once, one section each. The **DAEMONS** counter then says how many of them answered.
-- **This machine** — the daemon on this computer. The app finds it at the same default address the TUI uses; if you point the TUI at another socket with `DOT_AGENT_DECK_ATTACH_SOCKET`, launch the app with the same variable.
-- One entry per remote daemon added in Settings, named after its user, host and port.
+The **Daemon** selector under the Dashboard's title chooses what the Dashboard shows, and the choice is saved:
 
-The selector's menu only chooses. Daemons are added and removed in **Settings → Daemons**.
+- **All daemons**: every daemon at once, one section each. The **DAEMONS** counter then says how many of them answered.
+- **This machine**: the daemon on this computer, at the same default address the TUI uses. This is the default. If you point the TUI at another socket with `DOT_AGENT_DECK_ATTACH_SOCKET`, launch the app with the same variable.
+- One entry per remote daemon, named after its user, host and port (the port only when it is not 22).
 
-## Settings → Daemons
+The selector only chooses. Daemons are added and removed in **Settings → Daemons**.
 
-Open **Settings** in the rail and choose **Daemons**. The **Daemon** row lists the same choices as the selector; choose one to see or change its settings, or press **Add a daemon** to add a remote one. The trash icon beside a remote daemon removes it from the app; it does nothing on the host.
+## Watch a daemon on another machine
+
+The app reaches a remote daemon through an ssh tunnel, using the `ssh` program on this computer and your ssh config. It does not install anything on the host and does not start a daemon there, so do these first.
+
+1. **Make ssh to the host work without a prompt.** The app runs ssh non-interactively (`BatchMode=yes`, `StrictHostKeyChecking=yes`), so a password prompt or an unknown host key fails the connection. Check from a terminal: `ssh -o BatchMode=yes <user>@<host> true` must exit 0 without asking anything.
+2. **Install the deck on the host and start a daemon there.** See [What a remote daemon must already have](#what-a-remote-daemon-must-already-have).
+3. **Add the daemon in the app.** Open **Settings** in the rail, choose **Daemons**, press **Add a daemon**, and fill in the fields (below). Changes are saved as you make them. If you registered the host with `dot-agent-deck remote add` while the app was open, restart the app to see it; it is then already listed.
+4. **Press Test connection.** It checks the daemon and, when **Daemon socket** is empty, finds the socket path on the host and saves it.
+5. **Choose the daemon** in the Dashboard's **Daemon** selector, or choose **All daemons**.
+
+**Check it worked:** **Test connection** reports `<daemon> answered and is compatible with this app.`, and on the Dashboard the daemon's section lists its agents (or **No agents are running yet**) instead of a title such as **Daemon disconnected**.
 
 ![Settings → Daemons with a remote daemon, build-box, chosen in the Daemon row beside All daemons and This machine, its Host filled in, the other fields showing their placeholders, and Test connection below, not yet pressed](/img/settings-daemons-desktop.png)
 
 A remote daemon has these fields:
 
-| Field | What it is |
-| --- | --- |
-| **Host** | The host name or address to ssh to. |
-| **User** | The ssh user. Leave it empty to take it from your ssh config. |
-| **Port** | The ssh port, `22` by default. |
-| **Key file** | The ssh identity file, for example `~/.ssh/id_ed25519`. Leave it empty for ssh's defaults. |
-| **Jump host** | A bastion to go through, as ssh's `ProxyJump` takes it. |
-| **Daemon socket** | The path of the daemon's socket on the host. Leave it empty: **Test connection** finds it and fills it in. |
+| Field | What it is | Required |
+| --- | --- | --- |
+| **Host** | The host name or address to ssh to. | Yes |
+| **User** | The ssh user. Empty takes it from your ssh config. | No |
+| **Port** | The ssh port, 1 to 65535. | No, `22` by default |
+| **Key file** | The ssh identity file to offer (`ssh -i`), as a path starting with `/` or `~/`, for example `~/.ssh/id_ed25519`. Empty uses ssh's defaults. | No |
+| **Jump host** | The name of a `Host` block in your `~/.ssh/config` to connect through (`ssh -J`). The jump host's own address, user and key stay in that config. | No |
+| **Daemon socket** | The path of the daemon's attach socket on the host. Leave it empty: **Test connection** finds it and fills it in. | No |
 
-The app reaches a remote daemon through an ssh tunnel, using the `ssh` program on this computer and your ssh config. It runs ssh non-interactively, so ssh to the host has to work without a password prompt, and the host's key has to be in your `known_hosts` already.
+A field whose value the app refuses (a character ssh would misread, a key path that is not absolute) shows the problem under it, and **Test connection** stays disabled until it is fixed.
 
 ## Test connection
 
-**Test connection** checks the chosen daemon and says what it found, in one sentence, with a command to run when there is one. The results include:
+**Test connection** checks the chosen daemon and says what it found in one sentence, with a command to run when there is one. It works for **This machine** and for each remote daemon; **All daemons** has nothing to test, so choose one daemon first.
 
 | Result | What to do |
 | --- | --- |
 | `<daemon> answered and is compatible with this app.` | Nothing: the daemon is ready. |
+| `<daemon> answered; a declared compatibility break sits between the two builds.` | Run the same release on the host as the app. The Dashboard offers **Connect anyway** for this case. |
+| `<daemon> speaks a different protocol version.` | Run the same release on the host as the app. Nothing overrides this. |
+| `<daemon> refused the connection.` | Read the reason the test shows; usually a daemon from another release. |
 | `The ssh connection to <daemon> works, but nothing is listening on its daemon socket over there.` | Start a daemon on the host (below), then test again. |
-| `This machine has not verified <daemon>'s host key.` | Run the `ssh` command shown under it once in a terminal, then test again. |
-| `ssh reached <daemon> and the login was refused.` | Check **User** and **Key file**. |
-| `ssh could not reach <daemon>.` | Check **Host**, **Port** and your network. |
-| `<daemon> has no daemon socket path yet, and this test could not discover one.` | Check that `dot-agent-deck` is installed on the host, in `~/.local/bin` or on its `PATH`, or fill in **Daemon socket**. |
-| `<daemon> speaks a different protocol version.` | Run the same release on the host as the app. |
-| `No ssh program was found on this machine…` | Install an OpenSSH client. |
+| `No daemon answered at <daemon>. Start Agent Deck on this machine, then test again.` | For **This machine**: start a daemon here, for example with `dot-agent-deck`. |
+| `This machine has not verified <daemon>'s host key.` | Run the `ssh` command shown under it once in a terminal, accept the key, then test again. |
+| `ssh reached <daemon> and the login was refused.` | Check **User** and **Key file**, and that the key is loaded in your ssh agent if it has a passphrase. |
+| `ssh could not reach <daemon>.` | Check **Host**, **Port**, **Jump host** and your network. |
+| `The ssh tunnel to <daemon> could not be established.` | Read the detail the test shows. `dot-agent-deck remote doctor <name>` diagnoses the ssh setup of a host registered with the CLI. |
+| `<daemon> has no daemon socket path yet, and this test could not discover one.` | Check that `dot-agent-deck` is installed on the host, in `~/.local/bin`, on its `PATH` or in a Homebrew `bin` directory, and that a daemon is running there; or fill in **Daemon socket** yourself. |
+| `No ssh program was found on this machine, so no remote daemon can be reached.` | Install an OpenSSH client. |
 
-A test also lists anything your ssh config adds to the tunnel (for example port forwards) and where host keys are checked, because the tunnel carries those for as long as it is open.
-
-**All daemons** has nothing to test; choose one daemon first.
+A test also lists what your ssh config adds to the tunnel (for example port forwards) and which files host keys are checked against, because the tunnel carries those for as long as it is open.
 
 ## What a remote daemon must already have
 
-The desktop app does not install anything on a remote host and does not start a daemon there. Before adding a host:
-
-1. **Install the deck on the host.** The simplest way is from a machine with the CLI: `dot-agent-deck remote add <name> <user@host>` installs `dot-agent-deck` into `~/.local/bin` on the host and sets up the agent hooks. [Remote Environment Requirements](../remote-requirements.md) and [Remote Recipes](../remote-recipes.md) cover what the host needs.
-2. **Have a daemon running on it.** A daemon exits about 30 seconds after its last client disconnects when it has no agents and no enabled schedules, so a daemon started and left alone does not stay up. Either keep agents running on it (start them with `dot-agent-deck connect <name>` and detach, or from the desktop app while the daemon is up), or run it with the idle shutdown turned off, for example on the host:
+1. **The deck installed on the host.** From a machine with the CLI, `dot-agent-deck remote add <name> <user@host>` installs `dot-agent-deck` into `~/.local/bin` on the host, sets up the agent hooks, and registers the host in `remotes.toml`, so it then appears in the app too. [Remote Environment Requirements](../remote-requirements.md) and [Remote Recipes](../remote-recipes.md) cover what the host needs.
+2. **A daemon running on it.** A daemon exits about 30 seconds after its last client disconnects when it has no agents and no enabled schedules, so a daemon started and left alone does not stay up. Either keep agents running on it (start them with `dot-agent-deck connect <name>` and detach, or from the desktop app while the daemon is up), or run it with the idle shutdown turned off, on the host:
 
    ```bash
    DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 nohup ~/.local/bin/dot-agent-deck daemon serve >/dev/null 2>&1 &
@@ -68,3 +74,14 @@ The desktop app does not install anything on a remote host and does not start a 
    To have it come back after a logout, a crash or a reboot, run it under `systemd --user` or a macOS LaunchAgent as [Remote Environment Requirements](../remote-requirements.md#recommended-for-persistent-and-safe-use) describes.
 
 While the desktop app is connected to a daemon, that connection counts as a client, so the daemon does not idle out under it.
+
+## Remove a remote daemon
+
+In **Settings → Daemons**, press the trash icon beside the daemon. This removes its entry from `remotes.toml`, so `dot-agent-deck connect <name>` and `dot-agent-deck remote list` no longer know it either. It does nothing on the host: the binary, the hooks and any running daemon stay there. `dot-agent-deck remote remove <name>` does the same from the CLI.
+
+If another program changed or removed the same entry since the app loaded the list, the app refuses the save rather than guess which host you meant; the list is shown as it now is, and you make the change again.
+
+## Limits
+
+- Remote daemons need macOS or Linux on the computer running the app; the ssh tunnel is not available on other platforms.
+- Entries in `remotes.toml` of a type other than `ssh`, or whose values the app's ssh validation refuses, are left out of the app's list and left untouched in the file.

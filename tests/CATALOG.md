@@ -4528,6 +4528,43 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** the exact wording of the rejection message (clap's default unknown-argument text or a custom friendly message both satisfy it).
 - **Platform coverage:** mac+linux.
 
+#### cli/docs
+
+##### cli/docs/001 — `dot-agent-deck docs` lists every published topic and its description.
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive).
+- **Agent:** none.
+- **Asserts:** one line per `docs/published.toml` entry, in manifest order, containing its slug and description; a missing or empty manifest fails clearly.
+- **Does not assert:** exact list formatting beyond the one-line topic and description contract.
+- **Platform coverage:** mac+linux.
+
+##### cli/docs/002 — A top-level and a nested topic print a preamble followed by unchanged Markdown.
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive).
+- **Agent:** none.
+- **Asserts:** `docs orchestration` and `docs desktop/voice` exit 0, start with one preamble line mentioning `dot-agent-deck docs`, and then print their source files byte for byte.
+- **Does not assert:** exact preamble wording.
+- **Platform coverage:** mac+linux.
+
+##### cli/docs/003 — An unknown topic fails and lists the valid topics.
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive).
+- **Agent:** none.
+- **Asserts:** an unknown slug exits non-zero and the diagnostic names every manifest slug.
+- **Does not assert:** exact error wording or whether the diagnostic uses stdout or stderr.
+- **Platform coverage:** mac+linux.
+
+##### cli/docs/004 — `docs --all` includes every published page in manifest order.
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive).
+- **Agent:** none.
+- **Asserts:** exit 0 and the complete original Markdown of each page appears in manifest order.
+- **Does not assert:** exact separators between pages.
+- **Platform coverage:** mac+linux.
+
+##### cli/docs/005 — Relative inline and reference Markdown links stay within published pages and resolve to headings.
+- **Layer:** L2 (repository Markdown check in the e2e-gated CLI docs test file).
+- **Agent:** none.
+- **Asserts:** each relative `.md` inline link or reference definition outside code fences in a manifest page, including a definition with its destination on the next line, resolves against its containing directory to another manifest slug, and each linked anchor matches a GitHub-style heading slug in the target page.
+- **Does not assert:** external URLs or image links.
+- **Platform coverage:** mac+linux.
+
 ### Shared remote registry (issue #1350)
 
 #### remote/registry
@@ -6630,8 +6667,8 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 | `dot-agent-deck connect <remote>` end-to-end SSH flow ([docs/remote-environments.md](../docs/remote-environments.md), [docs/remote-recipes.md](../docs/remote-recipes.md)) | Requires a remote-harness shape that does not exist yet. Catalogued at M4+ when remote testing lands. Local quit-dialog coverage (`prompt/quit/001`–`005`) already pins the Detach / Stop / Cancel behavior; remote attach adds only the daemon-side log distinction. |
 | `dot-agent-deck remote add / list / upgrade / remove` ([docs/remote-environments.md](../docs/remote-environments.md)) | Same — remote-harness territory; the lib already covers the pure-data slices (URL parsing, command construction, error classification) in the kept tests. **Security properties deferred to M4+ end-to-end coverage:** shell-metacharacter quoting on remote-CLI argv assembly (unit-covered by `system_ssh_executor_quotes_arguments_safely`), `remotes.toml` written at mode 0o600 (covered by the now-moved `remotes_toml_written_at_0o600` test — restore at M4+), `DOT_AGENT_DECK_VIA_DAEMON=1` propagation on the remote shell (unit-covered by `build_connect_command_has_t_flag_and_via_daemon_env`). `remote doctor` is the exception: `remote/doctor/001`–`011` cover it through the deterministic PATH-stub `ssh` seam, without a real remote harness. Issue #1372's `remote::homebrew_remote_tests` (unit tier, `cargo test-fast`) executes the commands `remote add` / `remote upgrade` send under `/bin/sh` against a sandbox `HOME` with stand-in `brew`, `curl` and deck binaries — install-method detection, `brew upgrade`, no second copy in `~/.local/bin`, and the recorded binary — but no real ssh hop, Homebrew or release download. |
 | Container-based `remote doctor` validation via [`scripts/reverse-tunnel-validation.sh`](../scripts/reverse-tunnel-validation.sh) (PRD #345 M5) | Deliberately remains manual: it needs a container runtime plus privileged sshd configuration mutation, a harness shape with no e2e-tier precedent. The deterministic PATH-stub coverage in `remote/doctor/001`–`011` exercises the command's observation and classification outcomes; the script remains the documented real-sshd manual validation path. |
-| `dot-agent-deck validate` CLI subcommand ([docs/configuration.md#config-validation](../docs/configuration.md#config-validation)) | Non-TUI; the underlying validator is exhaustively covered by the pure-data `config_validation` tests. |
-| `dot-agent-deck watch` CLI subcommand ([docs/configuration.md#dot-agent-deck-watch](../docs/configuration.md#dot-agent-deck-watch)) | Non-TUI subcommand; an L2 test would only exercise its output formatting against a real shell — low value compared to the deck-rendering surface. |
+| `dot-agent-deck validate` CLI subcommand ([docs/configuration.md#check-it](../docs/configuration.md#check-it)) | Non-TUI; the underlying validator is exhaustively covered by the pure-data `config_validation` tests. |
+| `dot-agent-deck watch` CLI subcommand ([docs/configuration.md#run-a-command-repeatedly-dot-agent-deck-watch](../docs/configuration.md#run-a-command-repeatedly-dot-agent-deck-watch)) | Non-TUI subcommand; an L2 test would only exercise its output formatting against a real shell — low value compared to the deck-rendering surface. |
 | `dot-agent-deck config get` / `config set` ([docs/configuration.md](../docs/configuration.md)) | Non-TUI; the underlying config field reflection is covered by pure-data tests (`*_get_set_field`, `*_get_set_fields`). |
 | `dot-agent-deck hooks install` / `uninstall` CLI commands ([docs/troubleshooting.md#hooks](../docs/troubleshooting.md)) | Auto-install path is catalogued as `hooks/install/001`–`003`; the explicit subcommand variants share the same install/uninstall code. A targeted L2 test will be added only if a divergence appears. |
 | Ghostty-specific Shift+Enter terminal config ([docs/troubleshooting.md#shiftenter-submits-instead-of-inserting-a-newline](../docs/troubleshooting.md)) | **No longer a skip** — PRD #227 showed the break was deck-side (`keyevent_to_bytes` collapsed `Enter + SHIFT` to a bare CR), so there IS a deck-side surface: it is now covered by `embed/key-forwarding/001`. Only the outer-terminal *configuration* itself (what a user types into `ghostty/config`) remains untestable here. |

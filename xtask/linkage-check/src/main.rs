@@ -61,6 +61,9 @@
 //!
 //! - `docs` — invokes the `xtask-docs` binary's logic (paired-`.md`
 //!   generator). Forwards remaining args.
+//! - `site` — PRD #1419: builds the website's output (published Markdown,
+//!   `llms.txt`, `llms-full.txt`, images) from `docs/published.toml` into the
+//!   directory given as its argument. The logic is `xtask-site`'s library.
 //! - `clean-e2e-tmp` — issue #322: reaps stale e2e harness temp dirs left
 //!   behind by SIGKILLed test processes. Decides by whether the owning PID
 //!   in the `dad-tests-<pid>-*` name is still alive rather than by age
@@ -195,7 +198,7 @@ mod sample_attribution;
 #[cfg(all(test, unix))]
 mod sidecar_staging;
 /// Issue #1200: every `/img/…` and `./img/…` image reference under `docs/` and
-/// `site/src/` resolves to a file in `site/static/img/`. Like
+/// `site/landing/` resolves to a file in `site/static/img/`. Like
 /// `desktop_project_boundary` this one carries a live rule — rule 16 in
 /// [`RULES`] — as well as its own planted-bad-input tests.
 mod site_image_refs;
@@ -967,10 +970,10 @@ const RULES: &[Rule] = &[
     Rule {
         number: 16,
         name: "site-image-refs",
-        summary: "Every `/img/...` and `./img/...` image reference under `docs/` and `site/src/` \
-                  resolves to a file in `site/static/img/`. Docusaurus does not resolve an image \
-                  path at build time, so `onBrokenLinks: 'throw'` never sees a dead one: the page \
-                  builds clean and the browser 404s (issue #1200). See `site_image_refs`.",
+        summary: "Every `/img/...` and `./img/...` image reference under `docs/` and \
+                  `site/landing/` resolves to a file in `site/static/img/`, including the \
+                  unpublished `docs/develop/` pages that `cargo xtask site`'s link check never \
+                  reads (issue #1200). See `site_image_refs`.",
         check: rule_site_image_refs,
     },
     Rule {
@@ -1247,7 +1250,7 @@ fn rule_no_bare_git_ctor(inputs: &Inputs) -> Vec<String> {
     inputs.scanned.bare_git.clone()
 }
 
-/// Rule 16 (issue #1200). Its own trees — `docs/` and `site/src/` against
+/// Rule 16 (issue #1200). Its own trees — `docs/` and `site/landing/` against
 /// `site/static/img/` — so, like rules 12–14, the inputs going missing is a
 /// finding rather than a vacuous pass.
 fn rule_site_image_refs(inputs: &Inputs) -> Vec<String> {
@@ -1513,6 +1516,9 @@ fn main() -> ExitCode {
     }
     if matches!(args.first().map(String::as_str), Some("clean-e2e-tmp")) {
         return clean_tmp::run(&args[1..]);
+    }
+    if matches!(args.first().map(String::as_str), Some("site")) {
+        return xtask_site::run(&repo_root(), &args[1..]);
     }
     // Accepted anywhere in the remaining args, because the `linkage-check`
     // subcommand name itself is optional: `cargo xtask --list-rules` and
