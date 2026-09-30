@@ -146,6 +146,7 @@ type TerminalScreen = {
   lines: string[];
   rect: { left: number; top: number; width: number; height: number } | null;
   selection: string;
+  charSize?: unknown;
 };
 
 export type DeckOptions = {
@@ -405,7 +406,12 @@ export class Deck {
              note([type, Math.round(e.clientX), Math.round(e.clientY), e.buttons, e.detail, mods]);
            }, { capture: true });
          }
-         // After xterm's own handlers: what it holds at release, and shortly after.
+         // After xterm's own handlers. xterm's press handler always calls
+         // preventDefault, so false here means it never saw the press.
+         window.addEventListener("mousedown", (e) => {
+           note(["handled@down", e.defaultPrevented, JSON.stringify(window.__dadDriver.terminalScreens().map((s) => s.charSize))]);
+         });
+         // What xterm holds at release, and shortly after.
          window.addEventListener("mouseup", () => {
            note(["selection@up", selection()]);
            for (const ms of [0, 100, 500, 2000]) setTimeout(() => note(["selection@" + ms, selection()]), ms);

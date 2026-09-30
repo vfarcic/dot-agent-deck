@@ -209,7 +209,11 @@ if (import.meta.env.VITE_DAD_DRIVER_SEAM === "1") {
         }
         const box = terminal.element?.querySelector(".xterm-screen")?.getBoundingClientRect();
         const rect = box ? { left: box.left, top: box.top, width: box.width, height: box.height } : null;
-        return { key, cols: terminal.cols, rows: terminal.rows, lines, rect, selection: terminal.getSelection() };
+        // xterm's measured cell, read from its internals: a drag selects nothing
+        // while that measurement is invalid (issue #1403's CI failures).
+        const core = (terminal as unknown as { _core?: { _charSizeService?: { width: number; height: number } } })._core;
+        const charSize = core?._charSizeService ? { width: core._charSizeService.width, height: core._charSizeService.height } : null;
+        return { key, cols: terminal.cols, rows: terminal.rows, lines, rect, selection: terminal.getSelection(), charSize };
       }),
   };
 }
