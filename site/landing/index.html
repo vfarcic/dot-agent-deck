@@ -17,6 +17,13 @@
   prefers-color-scheme, and the two small scripts only add the theme toggle
   and the copy button.
 
+  The page's call to action is the agent prompt in the hero (maintainer
+  decision, 2026-09-30): there is no install command and no "get started"
+  link. A person who would rather install it by hand gets one link, to the
+  installation guide rendered on GitHub, because the published docs are raw
+  Markdown written for agents. The list of every docs page stays, for
+  agents, as the quiet last band above the footer.
+
   The copy, the screenshot alt text and the captions came from
   site/src/data/landing-content.js, whose comments record why each claim is
   worded the way it is (see that file in git history before rewording one).
@@ -70,31 +77,15 @@
       <p class="eyebrow"><span class="dot" aria-hidden="true"></span>Open source · MIT</p>
       <h1 class="heroTitle">Stop watching one agent.<br><span class="heroTitleAccent">Run the whole team.</span></h1>
       <p class="heroLede">Runs your AI coding agents under one background daemon, shows what each of them is doing in real time — in a terminal UI or in a desktop app, both watching the same agents — and starts new work for you: a team under one orchestrator, an isolated unit in its own copy of the repo, or a task that fires on a schedule.</p>
-      <div class="ctaRow">
-        <a class="ctaPrimary" href="{{doc:getting-started}}">Get started</a>
-        <a class="ctaGhost" href="https://github.com/vfarcic/dot-agent-deck">Star on GitHub</a>
-      </div>
       <!--
-        The command is one word per inline-block rather than one string, so a
-        wrapped command can only break at a space; landing.css carries the
-        reasoning. The spaces stay real text nodes, so selecting the pill
-        still copies the command exactly.
+        The hand-off to the user's own agent (PRD #1419), and the page's call
+        to action. Everyone who uses the deck already runs a coding agent, so
+        the page gives that agent a concrete starting point: llms.txt, which
+        also tells it about the version-matched docs in the binary.
       -->
-      <div class="installPill"><span class="installSigil" aria-hidden="true">$</span><code><span class="installWord">brew</span> <span class="installWord">tap</span> <span class="installWord">vfarcic/tap</span> <span class="installWord">&amp;&amp;</span> <span class="installWord">brew</span> <span class="installWord">install</span> <span class="installWord">dot-agent-deck</span></code></div>
-    </div>
-  </header>
-
-  <main id="main">
-    <!--
-      The hand-off to the user's own agent (PRD #1419). Everyone who uses the
-      deck already runs a coding agent, so the page gives that agent a
-      concrete starting point: llms.txt on the site, and once the deck is
-      installed, the docs embedded in the binary for its own version.
-    -->
-    <section class="agentPrompt" aria-labelledby="agent-prompt-title">
-      <div class="agentPromptInner">
-        <h2 id="agent-prompt-title" class="agentPromptTitle">Or hand it to your agent</h2>
-        <p class="agentPromptLede">Paste this into the coding agent you already use. It installs the deck, sets it up, and tells you what it can do and how to use it, so you can pick where to go from there.</p>
+      <section class="heroPrompt" id="agent-prompt" aria-labelledby="agent-prompt-title">
+        <h2 id="agent-prompt-title" class="heroPromptTitle">Hand it to your coding agent</h2>
+        <p class="heroPromptLede">Paste this into the coding agent you already use. It installs the deck, sets it up, and tells you what it can do and how to use it, so you can pick where to go from there.</p>
         <!--
           The prompt copies (by hand or with the button) as one line of plain
           text. It names no goal on purpose: a first-time visitor does not yet
@@ -105,10 +96,12 @@
           <pre id="agent-prompt-text">Read https://agent-deck.devopstoolkit.ai/llms.txt, then install dot-agent-deck, set it up for me, and explain what it does and how to use it.</pre>
           <button type="button" class="copyButton" id="copy-prompt" hidden>Copy</button>
         </div>
-        <p class="agentPromptNote">An AI agent should start at <a href="/llms.txt">/llms.txt</a>: it indexes every page of the <a href="#docs">documentation</a>, which is published as plain Markdown, and <a href="/llms-full.txt">/llms-full.txt</a> holds all of it in one file. Once the deck is installed, <code>dot-agent-deck docs</code> prints the same pages as they are for that version, with no network access.</p>
-      </div>
-    </section>
+        <p class="diyLink">Prefer to do it yourself? <a href="https://github.com/vfarcic/dot-agent-deck/blob/main/docs/installation.md">Installation guide →</a></p>
+      </section>
+    </div>
+  </header>
 
+  <main id="main">
     <section class="showcase">
       <!--
         Both clients, side by side (PRD #1321): each column's width is its
@@ -148,7 +141,6 @@
           <img src="/img/dashboard-tui.png" loading="lazy" alt="The terminal UI with four agent cards on the left, each showing its status, directory and last prompt, and the focused agent’s terminal pane on the right">
           <h3>Terminal UI</h3>
           <p>The dot-agent-deck binary, in the terminal you already use: agent cards beside their live panes, keyboard first, with the Schedules manager and remote hosts over ssh. It attaches to one daemon at a time.</p>
-          <p class="clientLink"><a href="{{doc:getting-started}}">Get started with the terminal UI →</a></p>
         </article>
         <article class="clientCard">
           <img src="/img/dashboard-desktop.png" loading="lazy" alt="The desktop app’s dashboard with four agents in one daemon section, each row showing its status, name and uptime">
@@ -295,66 +287,38 @@
       </div>
     </section>
 
-    <section class="install">
+    <section class="install" aria-labelledby="install-title">
       <div class="installInner">
-        <h2 class="sectionTitle">Runs where you work</h2>
-        <div class="installCols">
-          <div class="installCol">
-            <h3 class="installHeading">Platforms</h3>
-            <ul class="platformList">
-              <li><span class="markOk" aria-hidden="true">✓</span><span class="platformName">macOS<span class="platformDetail">Intel &amp; Apple Silicon</span></span><span class="platformStatus">Supported</span></li>
-              <li><span class="markOk" aria-hidden="true">✓</span><span class="platformName">Linux<span class="platformDetail">amd64 &amp; arm64</span></span><span class="platformStatus">Supported</span></li>
-              <li><span class="markOk" aria-hidden="true">✓</span><span class="platformName">Windows via WSL<span class="platformDetail">runs as Linux</span></span><span class="platformStatus">Supported</span></li>
-              <li><span class="markOk" aria-hidden="true">✓</span><span class="platformName">Desktop app<span class="platformDetail">macOS on Apple Silicon and Linux amd64</span></span><span class="platformStatus">Alpha</span></li>
-              <li><span class="markNot" aria-hidden="true">·</span><span class="platformName">Windows native<span class="platformDetail">no .exe in the release artifacts yet</span></span><span class="platformStatus">Not yet — use WSL today</span></li>
-            </ul>
-          </div>
-          <div class="installCol">
-            <h3 class="installHeading">Ways in</h3>
-            <ul class="routeList">
-              <li><span class="routeName">Homebrew</span><span class="routeDetail">macOS and Linux, amd64 and arm64</span><code class="routeCode">brew tap vfarcic/tap &amp;&amp; brew install dot-agent-deck</code></li>
-              <li><span class="routeName">Nix</span><span class="routeDetail">flake, overlay and home-manager module</span><code class="routeCode">nix run github:vfarcic/dot-agent-deck</code></li>
-              <li><span class="routeName">Prebuilt binary</span><span class="routeDetail">darwin/linux, amd64 and arm64, from the releases page</span></li>
-              <li><span class="routeName">Source</span><span class="routeDetail">Rust 1.85 or newer, edition 2024</span><code class="routeCode">cargo build --release</code></li>
-              <li><span class="routeName">Desktop app (alpha)</span><span class="routeDetail">Outside the CLI’s support expectations, from the releases page. A release can ship without one or both desktop packages, so check the assets on the release you open; the CLI ships even when they do not. The app connects to a daemon that is already running and starts none of its own: on Linux the .deb installs the dot-agent-deck CLI alongside the app, and on macOS install the CLI too, or start the daemon from the copy inside the app bundle, as the install steps describe. Each release’s notes say whether its .dmg is signed and notarized; the .deb is unsigned, so check it as below before installing it.</span><span class="routeFiles"><code class="routeCode">dot-agent-deck-desktop-alpha-macos-arm64.dmg</code><code class="routeCode">dot-agent-deck-desktop-alpha-linux-amd64.deb</code></span><span class="routeLink"><a href="{{doc:installation#desktop-app}}">How to install the desktop app →</a></span></li>
-            </ul>
-            <p class="installMore"><a href="{{doc:installation}}">Full installation guide →</a></p>
-          </div>
-        </div>
-        <div class="verify">
-          <h3 class="installHeading">Check what you downloaded</h3>
-          <p class="verifyNote">Every asset the release workflow uploads — the binaries, the desktop packages, and both checksums manifests — carries build provenance: proof that this exact file came out of this repository’s release workflow, and a record of the commit it was built from. Run it on what you downloaded before you open it.</p>
-          <div class="installPill"><span class="installSigil" aria-hidden="true">$</span><code><span class="installWord">gh</span> <span class="installWord">attestation</span> <span class="installWord">verify</span> <span class="installWord">&lt;file&gt;</span> <span class="installWord">--repo</span> <span class="installWord">vfarcic/dot-agent-deck</span> <span class="installWord">--signer-workflow</span> <span class="installWord">vfarcic/dot-agent-deck/.github/workflows/release.yml</span></code></div>
-          <p class="verifyScope">The manifests matter most here: the list of hashes you would check everything else against is exactly the file worth swapping, so it is vouched for by the same proof rather than trusted on its own. The one thing not covered is GitHub’s own “Source code” archives — GitHub synthesizes those from the tag rather than the workflow uploading them.</p>
-        </div>
+        <h2 id="install-title" class="sectionTitle">Runs where you work</h2>
+        <ul class="platformList">
+          <li><span class="markOk" aria-hidden="true">✓</span><span class="platformName">macOS<span class="platformDetail">Intel &amp; Apple Silicon</span></span><span class="platformStatus">Supported</span></li>
+          <li><span class="markOk" aria-hidden="true">✓</span><span class="platformName">Linux<span class="platformDetail">amd64 &amp; arm64</span></span><span class="platformStatus">Supported</span></li>
+          <li><span class="markOk" aria-hidden="true">✓</span><span class="platformName">Windows<span class="platformDetail">through WSL, as Linux; no native Windows build yet</span></span><span class="platformStatus">Via WSL</span></li>
+          <li><span class="markOk" aria-hidden="true">✓</span><span class="platformName">Desktop app<span class="platformDetail">macOS on Apple Silicon and Linux amd64</span></span><span class="platformStatus">Alpha</span></li>
+        </ul>
+        <p class="diyLink">Prefer to do it yourself? <a href="https://github.com/vfarcic/dot-agent-deck/blob/main/docs/installation.md">Installation guide →</a></p>
       </div>
     </section>
 
     <section class="close">
       <div class="closeInner">
-        <h2 class="closeTitle">One command to install. One place for everything you have running.</h2>
-        <div class="installPill"><span class="installSigil" aria-hidden="true">$</span><code><span class="installWord">brew</span> <span class="installWord">tap</span> <span class="installWord">vfarcic/tap</span> <span class="installWord">&amp;&amp;</span> <span class="installWord">brew</span> <span class="installWord">install</span> <span class="installWord">dot-agent-deck</span></code></div>
+        <h2 class="closeTitle">One prompt to set it up. One place for everything you have running.</h2>
         <div class="ctaRow">
-          <a class="ctaPrimary" href="{{doc:getting-started}}">Read the guide</a>
+          <a class="ctaPrimary" href="#agent-prompt">Hand it to your agent</a>
           <a class="ctaGhost" href="https://github.com/vfarcic/dot-agent-deck">Browse the source</a>
         </div>
       </div>
     </section>
 
-    <section class="door" id="docs" aria-labelledby="door-title">
-      <div class="doorInner">
-        <h2 id="door-title" class="doorTitle">Where to start in the docs</h2>
-        <p class="doorLede">The docs are Markdown, written for the coding agent that sets the deck up for you; they read fine in a browser too. An agent should start at <a href="/llms.txt">/llms.txt</a>.</p>
-        <div class="doorGrid">
-          <a class="doorCard" href="{{doc:getting-started}}"><span class="doorCardTitle">Getting started</span><span class="doorCardBody">Install it, start your first agent, and read what the deck shows you about it.</span><span class="doorArrow" aria-hidden="true">→</span></a>
-          <a class="doorCard" href="{{doc:orchestration}}"><span class="doorCardTitle">Orchestration</span><span class="doorCardBody">Roles, delegation, and letting one agent run the others.</span><span class="doorArrow" aria-hidden="true">→</span></a>
-          <a class="doorCard" href="{{doc:dispatcher-mode}}"><span class="doorCardTitle">Dispatcher mode</span><span class="doorCardBody">Start isolated work in its own copy of the repo, just by asking for it.</span><span class="doorArrow" aria-hidden="true">→</span></a>
-          <a class="doorCard" href="{{doc:desktop/index}}"><span class="doorCardTitle">Desktop app</span><span class="doorCardBody">The dashboard over several daemons, New agent, Settings and voice control.</span><span class="doorArrow" aria-hidden="true">→</span></a>
-          <a class="doorCard" href="{{doc:keyboard-shortcuts}}"><span class="doorCardTitle">Keyboard shortcuts</span><span class="doorCardBody">The terminal UI’s full key map, and the TOML that rebinds most of it.</span><span class="doorArrow" aria-hidden="true">→</span></a>
-          <a class="doorCard" href="{{doc:remote-environments}}"><span class="doorCardTitle">Remote environments</span><span class="doorCardBody">Run the deck on another machine over ssh, and leave the agents there.</span><span class="doorArrow" aria-hidden="true">→</span></a>
-          <a class="doorCard" href="{{doc:configuration}}"><span class="doorCardTitle">Configuration</span><span class="doorCardBody">Environment variables, defaults, and the .dot-agent-deck.toml a project carries.</span><span class="doorArrow" aria-hidden="true">→</span></a>
-        </div>
-        <h3 class="docsIndexTitle">Every page</h3>
+    <!--
+      For agents: every published page as a plain <a href>, generated from the
+      manifest, beside where an agent should start. Kept quiet and last,
+      because a person reading this page is sent to the prompt instead.
+    -->
+    <section class="forAgents" id="docs" aria-labelledby="for-agents-title">
+      <div class="forAgentsInner">
+        <h2 id="for-agents-title" class="forAgentsTitle">For agents: every docs page, as Markdown</h2>
+        <p class="forAgentsNote">The docs are Markdown, written for the <strong>coding agent</strong> that sets the deck up for you. An AI agent should start at <a href="/llms.txt">/llms.txt</a>: it indexes every page below, and <a href="/llms-full.txt">/llms-full.txt</a> holds all of them in one file. Once the deck is installed, <code>dot-agent-deck docs</code> prints the same pages as they are for that version, with no network access.</p>
         <ul class="docsIndex">
 {{docs-index}}
         </ul>
@@ -368,9 +332,8 @@
     <div class="footerCol">
       <p class="footerTitle">Documentation</p>
       <ul>
-        <li><a href="{{doc:getting-started}}">Getting Started</a></li>
-        <li><a href="{{doc:installation}}">Installation</a></li>
-        <li><a href="{{doc:keyboard-shortcuts}}">Keyboard Shortcuts</a></li>
+        <li><a href="https://github.com/vfarcic/dot-agent-deck/blob/main/docs/installation.md">Installation guide</a></li>
+        <li><a href="#docs">Every docs page, for agents</a></li>
         <li><a href="/llms.txt">llms.txt</a></li>
       </ul>
     </div>

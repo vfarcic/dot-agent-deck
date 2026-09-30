@@ -599,12 +599,100 @@ fn netlify_headers_serve_markdown_and_llms_files_readable() {
             "{headers}"
         );
     }
-    for path in ["/llms.txt", "/llms-full.txt"] {
+    for path in ["/llms.txt", "/llms-full.txt", "/robots.txt"] {
         assert!(
             headers.contains(&format!("{path}\n  Content-Type: {LLMS_CONTENT_TYPE}\n")),
             "{headers}"
         );
     }
+    assert!(
+        headers.contains(&format!(
+            "/sitemap.xml\n  Content-Type: {SITEMAP_CONTENT_TYPE}\n"
+        )),
+        "{headers}"
+    );
+}
+
+/// The `<loc>` values of a generated sitemap, in order.
+fn sitemap_locs(sitemap: &str) -> Vec<&str> {
+    sitemap
+        .split("<loc>")
+        .skip(1)
+        .map(|rest| &rest[..rest.find("</loc>").expect("unterminated <loc>")])
+        .collect()
+}
+
+#[test]
+fn sitemap_lists_the_landing_page_and_exactly_the_manifest_pages() {
+    let fx = Fixture::new();
+    // Without a landing page, the sitemap holds the pages alone.
+    let site = build(&fx.config).unwrap();
+    let sitemap = site.text("sitemap.xml").unwrap();
+    assert!(
+        sitemap.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset "),
+        "{sitemap}"
+    );
+    assert_eq!(
+        sitemap_locs(sitemap),
+        [
+            "https://example.test/docs/start.md",
+            "https://example.test/docs/desktop/index.md",
+        ]
+    );
+    assert!(!sitemap.contains("develop"), "{sitemap}");
+
+    with_landing(&fx, "<a href=\"{{doc:start}}\">s</a>\n");
+    let site = build(&fx.config).unwrap();
+    assert_eq!(
+        sitemap_locs(site.text("sitemap.xml").unwrap()),
+        [
+            "https://example.test/",
+            "https://example.test/docs/start.md",
+            "https://example.test/docs/desktop/index.md",
+        ]
+    );
+}
+
+#[test]
+fn robots_txt_allows_everything_and_points_at_the_sitemap() {
+    let fx = Fixture::new();
+    let site = build(&fx.config).unwrap();
+    assert_eq!(
+        site.text("robots.txt").unwrap(),
+        "User-agent: *\nAllow: /\n\nSitemap: https://example.test/sitemap.xml\n"
+    );
+}
+
+/// The real sitemap: the landing page plus one URL per manifest page, each a
+/// file the site publishes, and nothing from `docs/develop/`.
+#[test]
+fn the_real_sitemap_lists_the_landing_page_and_every_published_page() {
+    let config = SiteConfig::from_workspace(&workspace_root());
+    let site = build(&config).unwrap();
+    let pages = published_docs::read(&config.docs_dir).unwrap();
+    let mut expected = vec![format!("{DEFAULT_BASE_URL}/")];
+    expected.extend(
+        pages
+            .iter()
+            .map(|p| format!("{DEFAULT_BASE_URL}/docs/{}", p.file_name())),
+    );
+    let sitemap = site.text("sitemap.xml").unwrap();
+    assert_eq!(sitemap_locs(sitemap), expected);
+    for loc in sitemap_locs(sitemap) {
+        let path = loc.strip_prefix(DEFAULT_BASE_URL).unwrap();
+        let file = if path == "/" {
+            "index.html"
+        } else {
+            &path[1..]
+        };
+        assert!(site.files.contains_key(file), "{loc} is not published");
+    }
+    assert!(!sitemap.contains("/docs/develop"), "{sitemap}");
+    assert!(
+        site.text("robots.txt")
+            .unwrap()
+            .contains(&format!("\nSitemap: {DEFAULT_BASE_URL}/sitemap.xml\n"))
+    );
 }
 
 /// The redirect table, checked against the two lists PRD #1419 names: the URLs
@@ -1005,32 +1093,109 @@ fn heading_anchors_follow_the_github_convention() {
     assert_eq!(anchors, expected);
 }
 
+/// The GitHub-rendered installation guide: the one link on the landing page for
+/// a person who would rather install by hand, readable where the published
+/// Markdown is raw.
+const INSTALLATION_GUIDE_URL: &str =
+    "https://github.com/vfarcic/dot-agent-deck/blob/main/docs/installation.md";
+
 #[test]
 fn the_real_landing_page_hands_off_to_the_docs_in_plain_html() {
     let config = SiteConfig::from_workspace(&workspace_root());
     let site = build(&config).unwrap();
     let html = site.text("index.html").unwrap();
-    // The agent prompt, copied as is: one line of plain text, no markup and
-    // no slot to fill in, pointing the agent at /llms.txt.
-    let start = html
+    // The agent prompt is the hero's call to action: it sits inside the hero,
+    // between its opening and the end of the hero's <header>.
+    let hero_start = html
+        .find("<header class=\"hero\">")
+        .expect("landing page lost its hero");
+    let hero_end = hero_start + html[hero_start..].find("</header>").unwrap();
+    let hero = &html[hero_start..hero_end];
+    assert!(
+        hero.contains("id=\"agent-prompt-title\""),
+        "the prompt is not in the hero:\n{hero}"
+    );
+    assert!(
+        !hero.contains("<h2 id=\"agent-prompt-title\" class=\"heroPromptTitle\">Or"),
+        "the prompt's heading starts with \"Or\" again"
+    );
+    // The prompt, copied as is: one line of plain text, no markup and no slot
+    // to fill in, pointing the agent at /llms.txt.
+    let start = hero
         .find("<pre id=\"agent-prompt-text\">")
-        .expect("landing page lost the agent prompt");
+        .expect("the hero lost the agent prompt");
     let body = start + "<pre id=\"agent-prompt-text\">".len();
-    let end = body + html[body..].find("</pre>").unwrap();
+    let end = body + hero[body..].find("</pre>").unwrap();
     assert_eq!(
-        &html[body..end],
+        &hero[body..end],
         "Read https://agent-deck.devopstoolkit.ai/llms.txt, then install dot-agent-deck, \
          set it up for me, and explain what it does and how to use it."
     );
+    assert!(
+        hero.contains("id=\"copy-prompt\""),
+        "the copy button left the hero"
+    );
     assert!(!html.contains("promptSlot"), "the goal slot is back");
-    assert!(html.contains("dot-agent-deck docs"));
-    assert!(html.contains("An AI agent should start at <a href=\"/llms.txt\">/llms.txt</a>"));
-    // Every published page is linked with a plain <a href> in the served HTML.
+    // For agents: where to start, and every published page as a plain
+    // <a href> in the served HTML, in the last band above the footer.
+    let agents_start = html
+        .find("<section class=\"forAgents\" id=\"docs\"")
+        .expect("landing page lost the docs list for agents");
+    let agents_end = agents_start + html[agents_start..].find("</section>").unwrap();
+    let agents = &html[agents_start..agents_end];
+    assert!(
+        html[agents_end + "</section>".len()..]
+            .trim_start()
+            .starts_with("</main>"),
+        "the docs list for agents is no longer the last band"
+    );
+    assert!(agents.contains("For agents: every docs page, as Markdown"));
+    assert!(agents.contains("An AI agent should start at <a href=\"/llms.txt\">/llms.txt</a>"));
+    assert!(agents.contains("<a href=\"/llms-full.txt\">/llms-full.txt</a>"));
+    assert!(agents.contains("dot-agent-deck docs"));
+    assert!(agents.contains(
+        "The docs are Markdown, written for the <strong>coding agent</strong> that sets the deck \
+         up for you."
+    ));
+    assert_eq!(agents.matches("<strong>").count(), 1, "{agents}");
+    // No install command and no "get started" call to action: the only link to
+    // Getting Started is its entry in the list of every page, for agents.
+    // The list is generated from the manifest, whose Installation entry names
+    // Homebrew as one of its routes for an agent; everything else is the page.
+    let outside_list = format!("{}{}", &html[..agents_start], &html[agents_end..]);
+    assert!(
+        !outside_list.to_lowercase().contains("brew"),
+        "brew is back on the landing page"
+    );
+    for cta in [
+        "Get started",
+        "Read the guide",
+        "Where to start in the docs",
+    ] {
+        assert!(!html.contains(cta), "`{cta}` is back on the landing page");
+    }
+    assert_eq!(
+        html.matches("href=\"/docs/getting-started.md").count(),
+        1,
+        "Getting Started is linked outside the docs list"
+    );
+    // One readable installation guide for a person, the same URL wherever it
+    // appears, and no link to the raw installation page outside the docs list.
+    let guide = format!("<a href=\"{INSTALLATION_GUIDE_URL}\">Installation guide →</a>");
+    assert!(
+        hero.contains(&format!("Prefer to do it yourself? {guide}")),
+        "the hero lost the do-it-yourself link"
+    );
+    assert_eq!(
+        html.matches("href=\"/docs/installation.md").count(),
+        1,
+        "the raw installation page is linked outside the docs list"
+    );
     let pages = published_docs::read(&config.docs_dir).unwrap();
     for page in &pages {
         assert!(
-            html.contains(&format!("<a href=\"/docs/{}\">", page.file_name())),
-            "no plain link to {}",
+            agents.contains(&format!("<a href=\"/docs/{}\">", page.file_name())),
+            "no plain link to {} in the docs list",
             page.slug
         );
     }

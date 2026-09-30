@@ -8,8 +8,9 @@
 # The redirects and the content types live in the output, not here: `cargo
 # xtask site` writes `_redirects` (every URL the Docusaurus site served, to its
 # Markdown successor) and `_headers` (`text/markdown; charset=utf-8` for each
-# published `.md` page, `text/plain; charset=utf-8` for llms.txt and
-# llms-full.txt), both generated from docs/published.toml so the page list is
+# published `.md` page, `text/plain; charset=utf-8` for llms.txt,
+# llms-full.txt and robots.txt, `application/xml; charset=utf-8` for
+# sitemap.xml), all generated from docs/published.toml so the page list is
 # never restated by hand. site/nginx-default.conf does the same for the image.
 #
 # No SPA fallback, as with nginx (`try_files $uri $uri/ =404`), so an unknown

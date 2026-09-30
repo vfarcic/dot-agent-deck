@@ -11,8 +11,8 @@
  * 2. Base element styles standing in for the Infima defaults the page used to
  *    inherit from the Docusaurus theme (font stacks, link colour, code chips).
  * 3. The page's own header and footer, which replaced the Docusaurus navbar
- *    and footer, and the bands PRD #1419 added (the agent prompt and the
- *    docs index).
+ *    and footer, and the pieces PRD #1419 added (the agent prompt in the
+ *    hero, and the docs index for agents above the footer).
  * 4. The design itself, `site/src/pages/index.module.css` ported rather than
  *    restyled: the CSS-module class names became plain classes and nothing
  *    else moved.
@@ -330,40 +330,45 @@ code {
 /* ---------- 3. the agent prompt (PRD #1419) ---------- */
 
 /*
- * The hand-off to the user's own agent. It sits straight under the hero's
- * install pill because it is the other way in: the pill installs the deck
- * yourself, the prompt has your agent do it.
+ * The page's call to action, inside the hero under the lede: a heading, one
+ * line on what the prompt does, the prompt with its copy button, and the one
+ * link for a person who would rather install by hand. The hero is centred;
+ * the prompt itself is left-aligned, because it is text to read and copy.
  */
-.agentPrompt {
-  padding: 0 1rem 3rem;
-}
-
-.agentPromptInner {
-  max-width: 820px;
-  margin: 0 auto;
-  padding: 1.5rem 1.6rem;
+.heroPrompt {
+  max-width: 680px;
+  margin: 2.4rem auto 0;
+  padding: 1.4rem 1.5rem 1.2rem;
   border: 1px solid var(--c-line);
   border-radius: 12px;
   background: var(--c-bg-alt);
+  box-shadow: 0 18px 40px -28px var(--c-violet);
+  text-align: left;
 }
 
-.agentPromptTitle {
-  font-size: clamp(1.2rem, 4vw, 1.5rem);
+.heroPromptTitle {
+  font-size: clamp(1.15rem, 3.6vw, 1.4rem);
   font-weight: 750;
   letter-spacing: -0.02em;
-  margin: 0 0 0.5rem;
+  margin: 0 0 0.4rem;
 }
 
-.agentPromptLede,
-.agentPromptNote {
+.heroPromptLede {
   color: var(--c-dim);
   margin: 0;
   font-size: 0.95rem;
 }
 
-.agentPromptNote {
-  margin-top: 1rem;
-  font-size: 0.88rem;
+/* The one link for a person who would rather install it by hand. */
+.diyLink {
+  margin: 1rem 0 0;
+  font-size: 0.92rem;
+  color: var(--c-dim);
+}
+
+.diyLink a {
+  font-weight: 600;
+  white-space: nowrap;
 }
 
 .promptBox {
@@ -407,35 +412,57 @@ code {
   border-color: var(--c-teal);
 }
 
-/* ---------- 3. the docs index (PRD #1419) ---------- */
+/* ---------- 3. the docs index, for agents (PRD #1419) ---------- */
 
-.doorLede {
-  color: var(--c-dim);
-  margin: 0.75rem 0 0;
-  max-width: 62ch;
+/*
+ * The last band above the footer, kept quiet: small text, flat surface,
+ * hairline rules. It is there for an agent reading the served HTML (every
+ * published page as a plain link, beside where an agent should start), not
+ * as something a person is asked to click through.
+ */
+.forAgents {
+  border-top: 1px solid var(--c-line);
+  background: var(--c-bg-alt);
+  padding: 2.5rem 1rem 3rem;
 }
 
-.docsIndexTitle {
+.forAgentsInner {
+  max-width: 1080px;
+  margin: 0 auto;
+}
+
+.forAgentsTitle {
   font-size: 0.72rem;
   letter-spacing: 0.18em;
   text-transform: uppercase;
   color: var(--c-dim);
-  margin: 2.5rem 0 1rem;
+  margin: 0;
+}
+
+.forAgentsNote {
+  color: var(--c-dim);
+  font-size: 0.85rem;
+  margin: 0.75rem 0 1.25rem;
+  max-width: 80ch;
+}
+
+.forAgentsNote strong {
+  color: var(--c-ink);
 }
 
 .docsIndex {
   list-style: none;
   margin: 0;
   padding: 0;
-  columns: 2;
-  column-gap: 2.5rem;
+  columns: 3;
+  column-gap: 2rem;
 }
 
 .docsIndex li {
   break-inside: avoid;
-  padding: 0.45rem 0;
+  padding: 0.35rem 0;
   border-bottom: 1px solid var(--c-line);
-  font-size: 0.9rem;
+  font-size: 0.8rem;
 }
 
 .docsIndex a {
@@ -445,10 +472,16 @@ code {
 .docsIndex span {
   display: block;
   color: var(--c-dim);
-  font-size: 0.82rem;
+  font-size: 0.75rem;
 }
 
 @media (max-width: 996px) {
+  .docsIndex {
+    columns: 2;
+  }
+}
+
+@media (max-width: 560px) {
   .docsIndex {
     columns: 1;
   }
@@ -584,70 +617,6 @@ code {
   color: var(--c-ink);
   text-decoration: none;
   border-color: var(--c-teal);
-}
-
-/*
- * The pill WRAPS at every width instead of scrolling sideways. It used to wrap
- * only at 560px and below and scroll above it, which was fine for the hero's
- * `brew tap ...` (471px in the box at every desktop width) and wrong for the
- * download check's `gh attestation verify ...`, which then sat in a separate
- * desktop-app band: 1105px of content in a 932px box from 1120px up, so it
- * rendered cut at "/.github/wo" and the rest was
- * reachable only by scrolling inside the pill. That is the command this page
- * gives a reader for checking a download before they open it -- for the
- * unsigned `.deb`, the only check anybody makes -- so the whole of it has to
- * be ON the page.
- *
- * Each word is its own inline-block (`index.html` writes the words out
- * split), so a line ends at a space wherever the words fit. Letting the text
- * wrap directly was the simpler change and it breaks after hyphens too --
- * measured: `--signer-` / `workflow` at 768px, `vfarcic/dot-agent-` /
- * `deck/...` at 1120px and up -- which leaves a line ending meaning a space in
- * some places and nothing in others. That is not something a reader retyping a
- * verification command should have to work out. A word WIDER than the pill
- * still breaks inside itself, and `overflow-wrap` stays for exactly that: the
- * 52-character signer-workflow path does it at 300-552px and again at
- * 561-576px, where the alternative is overflow rather than a tidier break.
- * (Those widths were measured in the old desktop-app band, whose own padding
- * set the pill's width; since PRD #1321 moved the check into the install
- * section, the exact break points differ, and the reasoning does not.)
- *
- * `align-items: baseline` sits the `$` on the first line's baseline rather
- * than centring it against a two-line block, and the sigil's `line-height: 1`
- * keeps its taller line box from pushing the command down: 9.8px above the
- * first line and 9.8px below the last, at every width from 300 to 1440.
- */
-.installPill {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 0.6rem;
-  margin: 1.6rem auto 0;
-  padding: 0.55rem 1rem;
-  border: 1px solid var(--c-line);
-  border-radius: 8px;
-  background: var(--c-bg-alt);
-  max-width: 100%;
-}
-
-.installSigil {
-  color: var(--c-teal);
-  font-weight: 700;
-  line-height: 1;
-}
-
-.installPill code {
-  background: transparent;
-  border: none;
-  color: var(--c-ink);
-  font-size: 0.85rem;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  padding: 0;
-}
-
-.installWord {
-  display: inline-block;
-  max-width: 100%;
 }
 
 /* ---------- showcase ---------- */
@@ -1089,7 +1058,7 @@ code {
   font-size: 0.95rem;
 }
 
-/* ---------- platforms and install routes ---------- */
+/* ---------- platforms ---------- */
 
 .install {
   background: var(--c-bg-alt);
@@ -1099,30 +1068,11 @@ code {
 }
 
 .installInner {
-  max-width: 1000px;
+  max-width: 720px;
   margin: 0 auto;
 }
 
-.installCols {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 2.5rem;
-}
-
-.installCol {
-  min-width: 0;
-}
-
-.installHeading {
-  font-size: 0.72rem;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--c-dim);
-  margin: 0 0 1rem;
-}
-
-.platformList,
-.routeList {
+.platformList {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -1136,19 +1086,11 @@ code {
   border-bottom: 1px solid var(--c-line);
 }
 
-.markOk,
-.markNot {
+.markOk {
   flex: 0 0 1rem;
   font-weight: 700;
   font-size: 0.85rem;
-}
-
-.markOk {
   color: var(--c-teal);
-}
-
-.markNot {
-  color: var(--c-dim);
 }
 
 .platformName {
@@ -1171,76 +1113,8 @@ code {
   text-align: right;
 }
 
-.routeList li {
-  padding: 0.7rem 0;
-  border-bottom: 1px solid var(--c-line);
-}
-
-.routeName {
-  font-weight: 600;
-}
-
-.routeDetail {
-  display: block;
-  font-size: 0.82rem;
-  color: var(--c-dim);
-}
-
-.routeCode {
-  display: inline-block;
-  margin-top: 0.45rem;
-  font-size: 0.72rem;
-  background: var(--c-bg);
-  border: 1px solid var(--c-line);
-  border-radius: 5px;
-  padding: 0.2rem 0.5rem;
-  overflow-wrap: anywhere;
-}
-
-.installMore {
-  margin: 1.25rem 0 0;
-  font-weight: 600;
-}
-
-/*
- * The desktop app's route lists its two release assets rather than one
- * command, so each gets its own chip, wrapping as the column narrows, and the
- * route ends in a link to the install steps instead of a command to copy.
- */
-.routeFiles {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-}
-
-.routeLink {
-  display: block;
-  margin-top: 0.5rem;
-  font-size: 0.85rem;
-  font-weight: 600;
-}
-
-/*
- * The download check sits under both columns because it covers every asset
- * a release publishes, the CLI's binaries as well as the desktop app's
- * packages. The scope note sits UNDER the command: it says what the command
- * does not reach, which only means anything once the reader has seen it.
- */
-.verify {
-  margin-top: 2.5rem;
-}
-
-.verifyNote,
-.verifyScope {
-  font-size: 0.88rem;
-  color: var(--c-dim);
-  max-width: 62ch;
-  margin: 0;
-}
-
-.verifyScope {
-  font-size: 0.82rem;
-  margin-top: 0.75rem;
+.install .diyLink {
+  margin-top: 1.25rem;
 }
 
 /* ---------- close ---------- */
@@ -1267,95 +1141,14 @@ code {
   margin: 0 0 1.5rem;
 }
 
-/* ---------- the docs index ---------- */
-
-/*
- * The last band before the footer. It steps the page's own
- * visual layer back down -- flat surface, hairline rules, no gradient -- so the
- * handoff into the footer reads as a step rather than a cut.
- *
- * A visitor at the bottom of a landing page wants to know where to click, not
- * how the site is put together, so the band is a heading, one line saying who
- * the docs are written for and where an agent starts (`.doorLede`, PRD
- * #1419), the curated pages in the order to read them, and then every
- * published page (`.docsIndex`, generated from the manifest).
- */
-.door {
-  border-top: 1px solid var(--c-line);
-  background: var(--c-bg-alt);
-  padding: 3.5rem 1rem 4rem;
-}
-
-.doorInner {
-  max-width: 1080px;
-  margin: 0 auto;
-}
-
-.doorTitle {
-  font-size: clamp(1.4rem, 4.5vw, 2rem);
-  font-weight: 750;
-  letter-spacing: -0.03em;
-  margin: 0;
-}
-
-.doorGrid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 1rem;
-  margin-top: 2.25rem;
-}
-
-.doorCard {
-  position: relative;
-  display: block;
-  padding: 1.1rem 2.6rem 1.1rem 1.2rem;
-  border: 1px solid var(--c-line);
-  border-radius: 10px;
-  background: var(--c-bg);
-  text-decoration: none;
-  color: var(--c-ink);
-  transition: border-color 0.12s ease, transform 0.12s ease;
-}
-
-.doorCard:hover,
-.doorCard:focus-visible {
-  text-decoration: none;
-  color: var(--c-ink);
-  border-color: var(--c-teal);
-  transform: translateY(-1px);
-}
-
-.doorCardTitle {
-  display: block;
-  font-weight: 650;
-  margin-bottom: 0.25rem;
-}
-
-.doorCardBody {
-  display: block;
-  font-size: 0.85rem;
-  color: var(--c-dim);
-}
-
-.doorArrow {
-  position: absolute;
-  top: 1.1rem;
-  right: 1.2rem;
-  color: var(--c-teal);
-}
-
 /* ---------- links inside the dimmed text, pinned to the accent ---------- */
 
-.platformStatus a,
-.installMore a,
-.routeLink a,
+.diyLink a,
 .clientLink a {
   color: var(--c-teal);
 }
 
-.platformStatus a:hover,
-.installMore a:hover,
-.routeLink a:hover,
+.diyLink a:hover,
 .clientLink a:hover {
   color: var(--c-teal);
   text-decoration: underline;
@@ -1364,12 +1157,12 @@ code {
 /* ---------- focus ---------- */
 
 /*
- * One focus ring for every link on the page. `.ctaPrimary`, `.ctaGhost` and
- * `.doorCard` carried their own `:focus-visible` rules while the agent-strip
- * links and the three colour-override links fell back to the browser default,
- * so keyboard focus looked different in four places and was close to invisible
- * in two of them. Those rules stay -- they are the hover affordance repeated --
- * and this adds the indicator they were standing in for.
+ * One focus ring for every link on the page. `.ctaPrimary` and `.ctaGhost`
+ * carry their own `:focus-visible` rules while the agent-strip links and the
+ * colour-override links fell back to the browser default, so keyboard focus
+ * looked different from place to place and was close to invisible in some.
+ * Those rules stay -- they are the hover affordance repeated -- and this adds
+ * the indicator they were standing in for.
  *
  * `--c-teal` is #0a7c73 on the light background (5.07:1) and #4ecdc4 on the
  * dark one (10.01:1), so the ring clears WCAG's 3:1 for non-text in both.
@@ -1420,13 +1213,8 @@ code {
   }
 
   .principleGrid,
-  .clientGrid,
-  .installCols {
+  .clientGrid {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .doorGrid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .story {
@@ -1439,19 +1227,25 @@ code {
     padding-top: 3rem;
   }
 
+  .heroPrompt {
+    padding: 1.1rem 1rem 1rem;
+  }
+
   .ctaPrimary,
   .ctaGhost {
     width: 100%;
     text-align: center;
   }
 
-  .doorGrid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
   /* The status column needs its own line before it starts squeezing the name. */
   .platformList li {
     flex-wrap: wrap;
+  }
+
+  /* A zero basis keeps a long detail beside its mark instead of wrapping it
+     onto a line of its own. */
+  .platformName {
+    flex-basis: 0;
   }
 
   .platformStatus {

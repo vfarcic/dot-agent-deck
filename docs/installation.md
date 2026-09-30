@@ -213,7 +213,7 @@ The desktop app is published alongside the CLI in releases, as an **alpha**: its
 | macOS Apple silicon | `dot-agent-deck-desktop-alpha-macos-arm64.dmg` | Signed and notarized from v0.42.0, unless that release's notes say otherwise |
 | Linux amd64 | `dot-agent-deck-desktop-alpha-linux-amd64.deb` | Unsigned |
 
-Download from the [latest release](https://github.com/vfarcic/dot-agent-deck/releases/latest) and read that release's notes: they say whether its macOS build is signed. A release whose signing failed ships an unsigned `.dmg` rather than none.
+Download from the [latest release](https://github.com/vfarcic/dot-agent-deck/releases/latest) and read that release's notes: they say whether its macOS build is signed. A release whose signing failed ships an unsigned `.dmg` rather than none. A release can also ship without one or both desktop packages while its CLI binaries are published as usual, so check the assets on the release you open.
 
 ### Verify the download
 
@@ -226,6 +226,8 @@ gh attestation verify dot-agent-deck-desktop-alpha-macos-arm64.dmg \
 ```
 
 Use the name of the file you downloaded. A pass reports a verified attestation from this repository's release workflow. If it does not, do not install the file and do not override any warning your OS raises about it.
+
+The same check works on every file a release uploads: the CLI binaries, the desktop packages, and both checksum manifests, `checksums.txt` and `checksums-desktop-alpha.txt`. It does not cover GitHub's own **Source code** archives, which GitHub generates from the tag rather than the release workflow uploading them.
 
 ### macOS
 

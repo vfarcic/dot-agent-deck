@@ -21,10 +21,13 @@
 //! - the landing page, from [`landing_page`]: `index.html` rendered from the
 //!   `site/landing/` template, whose docs links come from the manifest, and
 //!   its stylesheet.
+//! - `sitemap.xml` ([`sitemap_xml`]): the landing page and every published
+//!   page's URL, on the `--base-url`; and `robots.txt` ([`robots_txt`]), which
+//!   allows everything and names the sitemap's absolute URL.
 //! - `_redirects` and `_headers`, which Netlify reads from the published
 //!   directory: every URL the Docusaurus site served redirects to its Markdown
-//!   successor ([`redirects`]), and `.md` / `llms` files get a readable
-//!   `Content-Type`.
+//!   successor ([`redirects`]), and `.md`, `llms`, `robots.txt` and
+//!   `sitemap.xml` get a readable `Content-Type`.
 //! - separately from the published tree, the same redirects as an nginx
 //!   `include` ([`nginx_redirects`]), written only when `--nginx-redirects` asks
 //!   for it, because a file nginx serves from its root would publish its own
@@ -113,8 +116,11 @@ pub const RETIRED_PAGES: &[(&str, &str)] = &[("workspace-modes", "configuration"
 
 /// The `Content-Type` a published `.md` page is served with, on both targets.
 pub const MARKDOWN_CONTENT_TYPE: &str = "text/markdown; charset=utf-8";
-/// The `Content-Type` of `llms.txt` and `llms-full.txt`, on both targets.
+/// The `Content-Type` of `llms.txt`, `llms-full.txt` and `robots.txt`, on
+/// both targets.
 pub const LLMS_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+/// The `Content-Type` of `sitemap.xml`, on both targets.
+pub const SITEMAP_CONTENT_TYPE: &str = "application/xml; charset=utf-8";
 
 /// Inputs to [`build`].
 #[derive(Debug, Clone)]
@@ -257,6 +263,12 @@ pub fn build(config: &SiteConfig) -> Result<Site, String> {
     for (path, bytes) in landing_page(config, &pages, &anchors)? {
         site.insert(path, bytes)?;
     }
+    let landing = site.files.contains_key("index.html");
+    site.insert(
+        "sitemap.xml".to_string(),
+        sitemap_xml(config, &pages, landing).into_bytes(),
+    )?;
+    site.insert("robots.txt".to_string(), robots_txt(config).into_bytes())?;
     check_links(&site, &config.base_url)?;
     Ok(site)
 }
@@ -355,6 +367,35 @@ fn page_path(page: &Page) -> String {
     format!("/docs/{}", page.file_name())
 }
 
+/// `sitemap.xml`: the landing page (when the site has one) and every published
+/// page, as absolute URLs on `base_url`, in manifest order. Nothing else is
+/// listed: `llms.txt` and the images are reached from the pages, and the
+/// redirects' legacy URLs are not pages.
+pub fn sitemap_xml(config: &SiteConfig, pages: &[Page], landing: bool) -> String {
+    let mut out = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
+    );
+    let urls = landing
+        .then(|| format!("{}/", config.base_url))
+        .into_iter()
+        .chain(pages.iter().map(|page| config.page_url(page)));
+    for url in urls {
+        out.push_str(&format!("  <url><loc>{}</loc></url>\n", html_escape(&url)));
+    }
+    out.push_str("</urlset>\n");
+    out
+}
+
+/// `robots.txt`: every crawler may fetch everything, and the sitemap is at
+/// its absolute URL on `base_url`.
+pub fn robots_txt(config: &SiteConfig) -> String {
+    format!(
+        "User-agent: *\nAllow: /\n\nSitemap: {}/sitemap.xml\n",
+        config.base_url
+    )
+}
+
 fn html_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -446,9 +487,12 @@ pub fn netlify_headers(pages: &[Page]) -> String {
             page_path(page)
         ));
     }
-    for path in ["/llms.txt", "/llms-full.txt"] {
+    for path in ["/llms.txt", "/llms-full.txt", "/robots.txt"] {
         out.push_str(&format!("{path}\n  Content-Type: {LLMS_CONTENT_TYPE}\n"));
     }
+    out.push_str(&format!(
+        "/sitemap.xml\n  Content-Type: {SITEMAP_CONTENT_TYPE}\n"
+    ));
     out
 }
 
