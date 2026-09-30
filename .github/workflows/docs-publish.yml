@@ -28,7 +28,48 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The site is generated HERE, in a job with a read-only token and no secret,
+  # and handed to both deploy paths as an artifact. `publish` below holds the
+  # admin RELEASE_TOKEN (its checkout persists it for the push) and
+  # `packages: write`; running `cargo xtask site` there would hand both to
+  # every build script in the crates it compiles. The same reasoning kept
+  # `npm ci` out of that job while the site was Docusaurus. The deploy jobs
+  # run no code from the dependency tree at all.
+  site-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      # The commit everything downstream publishes: `publish` builds its image
+      # from this artifact and checks this commit out, and the Netlify deploy
+      # reads its site/netlify.toml, so `main` moving mid-run cannot mix two.
+      - name: Record the commit
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: 1.97.1
+
+      - name: Build site
+        run: cargo xtask site site/build/public --nginx-redirects site/build/nginx-redirects.conf
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docs-site
+          path: site/build
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
+    needs: site-build
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
@@ -73,10 +114,12 @@ jobs:
             echo "::error::RELEASE_TOKEN is unset or empty. This job pushes the chart bump to the protected \`main\` branch and needs the admin PAT to bypass the ruleset; GITHUB_TOKEN cannot. If this run was triggered by release.yml, check that its \`docs\` job forwards the secret. See CLAUDE.md rule 8."
             exit 1
           fi
+      # The commit `site-build` generated the site from. "Commit chart
+      # changes" switches to `main` before it commits.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-          ref: main
+          ref: ${{ needs.site-build.outputs.sha }}
           token: ${{ secrets.RELEASE_TOKEN }}
 
       - name: Resolve image tag
@@ -93,9 +136,10 @@ jobs:
             TAG="main-${SHORT_SHA}"
             ORIGIN="manual"
           fi
-          # `sha` is the commit the image is built from. "Commit chart changes"
-          # pulls `main` forward, so the Netlify jobs below check this out
-          # rather than `main` to publish exactly what the image holds.
+          # `sha` is the commit the image is built from, the one `site-build`
+          # generated the site from. "Commit chart changes" pulls `main`
+          # forward, so the Netlify job below checks this out rather than
+          # `main` to publish exactly what the image holds.
           {
             echo "tag=${TAG}"
             echo "origin=${ORIGIN}"
@@ -116,6 +160,13 @@ jobs:
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+
+      # The generated site, which site/Dockerfile copies (it has no build
+      # stage). Data only: nothing in it runs here.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: docs-site
+          path: site/build
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -255,50 +306,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # Netlify production deploy, running ALONGSIDE the image + chart path above
-  # while agent-deck.devopstoolkit.ai still points at the cluster. Both jobs
-  # need `publish`, so a Netlify failure cannot stop the cluster rolling forward.
-  #
-  # SEPARATE JOBS, ON PURPOSE. `publish` holds the admin RELEASE_TOKEN (its
-  # checkout persists it for the push) and `packages: write`; the image's
-  # `npm ci` never saw either, because it ran inside the Docker build. Running
-  # `npm ci` and `npm run build` on that job's host would hand both to every
-  # install script and build plugin in site/'s dependency tree. So the build
-  # runs here with a read-only token and no secrets, and the deploy job -- the
-  # only one holding the Netlify token -- runs no npm code at all.
-  netlify-build:
-    needs: publish
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ needs.publish.outputs.sha }}
-          persist-credentials: false
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: '24'
-          cache: 'npm'
-          cache-dependency-path: site/package-lock.json
-
-      # --ignore-scripts: the build needs none (core-js's banner is the only
-      # install script in the tree), and this job has nothing to steal anyway.
-      - name: Build site
-        working-directory: site
-        run: |
-          npm ci --ignore-scripts
-          npm run build
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: docs-site
-          path: site/build
-          if-no-files-found: error
-          retention-days: 1
-
+  # while agent-deck.devopstoolkit.ai still points at the cluster. It needs
+  # `publish`, so a Netlify failure cannot stop the cluster rolling forward,
+  # and it deploys the same `site-build` artifact the image was built from.
+  # It is the only job holding the Netlify token, and it runs no code from the
+  # site's build at all.
   netlify-deploy:
-    needs: [publish, netlify-build]
+    needs: [publish, site-build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -321,9 +335,8 @@ jobs:
 
       # `--cwd site` is load-bearing. `devbox run` always executes from the repo
       # root, and from there netlify-cli never finds site/netlify.toml: the
-      # deploy still succeeds, just without its headers (measured: /assets/*
-      # came back max-age=0 instead of immutable). `--dir` is then relative to
-      # site/. `--no-build` because the CLI otherwise runs a build of its own.
+      # deploy still succeeds, just without what it configures. `--dir` is
+      # then relative to site/. `--no-build` because the CLI otherwise runs a build of its own.
       #
       # No spaces or `#` in any argument: some devbox versions flatten
       # `devbox run`'s args into one string and re-parse it through a shell
@@ -335,7 +348,7 @@ jobs:
           IMAGE_TAG: ${{ needs.publish.outputs.tag }}
         run: |
           set -euo pipefail
-          URL=$(devbox run -- netlify deploy --cwd site --prod --no-build --dir=build \
+          URL=$(devbox run -- netlify deploy --cwd site --prod --no-build --dir=build/public \
             --message "docs-${IMAGE_TAG}" --json | jq -r '.url // .deploy_url')
           echo "Netlify production: ${URL}"
           echo "## Netlify production: ${URL} (\`docs-${IMAGE_TAG}\`)" >> "$GITHUB_STEP_SUMMARY"

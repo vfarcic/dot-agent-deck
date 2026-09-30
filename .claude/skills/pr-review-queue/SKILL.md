@@ -365,7 +365,7 @@ Derive it from `scan.sh`'s buckets, then write prose that names the real files:
 | `PRD` / `CHANGELOG` | Prose-only surfaces. Check the fragment's category (`.feature` / `.bugfix` / `.breaking`) matches what shipped, and rule 12's bump policy. |
 | `OTHER` | Nothing classified it, so nothing suggests a risk. Read the paths yourself and say what they are — never leave the note empty because the bucket was. |
 | Destructive operations (worktree/branch removal, file deletion, reaping) | Scrutinise the safety gates. Be specific about **what could be destroyed if a gate is wrong** — name the path or ref, not "data loss". |
-| `DOCS` / `DOCS_DEVELOP` | Rules 10 and 11: no hard-wrapped prose; developer docs stay under `docs/develop/` and out of `site/sidebars.js`. |
+| `DOCS` / `DOCS_DEVELOP` | Rules 10 and 11: no hard-wrapped prose; developer docs stay under `docs/develop/` and out of `docs/published.toml`; a new user page has a manifest entry whose title matches its first heading. |
 
 A PR usually hits more than one row. Merge them into prose rather than pasting the table.
 

@@ -22,10 +22,9 @@ tmp/
 # logs), created in whichever directory they are invoked from.
 .dad-sandbox/
 
-# Documentation site
-site/node_modules/
+# Documentation site: `cargo xtask site site/build/public --nginx-redirects
+# site/build/nginx-redirects.conf`, the layout CI builds and site/Dockerfile copies.
 site/build/
-site/.docusaurus/
 
 # Demo-reel build artifacts (regenerated each build; reel lives on YouTube)
 /reel.mp4
