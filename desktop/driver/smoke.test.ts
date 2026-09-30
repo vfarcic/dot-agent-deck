@@ -15,11 +15,6 @@ import { type Deck, waitFor, withDeck } from "./harness.ts";
 import { CONTROL, ENTER, type Element, META, SHIFT } from "./webdriver.ts";
 
 const connected = '[data-testid="daemon-group"][data-deck-connected="yes"]';
-/// How long a finished drag may take to show up as xterm's selection. The
-/// selection is made while the drag is handled, so this only absorbs a slow
-/// runner; a drag that selected nothing fails here rather than as a clipboard
-/// that never filled, two minutes later.
-const SELECT_MS = 15_000;
 
 /// Scenario: open the real window with no daemon on its socket and see the
 /// overview say the deck is disconnected, then start a real daemon on that
@@ -152,8 +147,7 @@ test("terminal_002 selected terminal text copies to the clipboard without reachi
     // Half a command, not yet run: an interrupt would throw it away, and any
     // byte the gesture leaked would land in it.
     await deck.session.type(input, "echo still-typing-$((2+3))");
-    await deck.session.drag(firstRow.from, firstRow.to);
-    await waitFor(`the drag to select ${first}`, () => deck.hasSelection(first), SELECT_MS);
+    await deck.selectRow(firstRow, first);
     await deck.session.chord([CONTROL, SHIFT, "c"]);
     await waitFor(`the clipboard to hold ${first}`, async () => (await deck.clipboardText()) === first);
 
@@ -164,16 +158,14 @@ test("terminal_002 selected terminal text copies to the clipboard without reachi
     const secondRow = await waitFor(`${second} on its own row, the half-typed command run unchanged`, () =>
       deck.rowSpan(second),
     );
-    await deck.session.drag(secondRow.from, secondRow.to);
-    await waitFor(`the drag to select ${second}`, () => deck.hasSelection(second), SELECT_MS);
+    await deck.selectRow(secondRow, second);
     await deck.session.chord([META, "c"]);
     await waitFor(`the clipboard to hold ${second}`, async () => (await deck.clipboardText()) === second);
 
     // The control. Plain Ctrl+C belongs to the agent even while text is
     // selected: bash abandons the half-typed line and prints a fresh prompt.
     await deck.session.type(input, "echo must-not-run");
-    await deck.session.drag(firstRow.from, firstRow.to);
-    await waitFor(`the drag to select ${first} again`, () => deck.hasSelection(first), SELECT_MS);
+    await deck.selectRow(firstRow, first);
     await deck.session.chord([CONTROL, "c"]);
     await deck.session.type(input, `echo after-interrupt-$((3+4))${ENTER}`);
     await waitFor("the next command's output", async () => (await deck.rowSpan("after-interrupt-7")) !== undefined);

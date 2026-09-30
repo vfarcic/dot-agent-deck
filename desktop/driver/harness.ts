@@ -32,6 +32,14 @@ export { WAIT_MS };
 /** Polling cadence inside `waitFor`. Not a wait in its own right. */
 const POLL_MS = 100;
 
+/**
+ * Issue #1403 — how long a finished drag may take to show up as xterm's
+ * selection. xterm makes the selection while it handles the drag, so this only
+ * absorbs a slow runner, and a drag that selected nothing fails at once rather
+ * than as a clipboard that never filled, `WAIT_MS` later.
+ */
+const SELECT_MS = 15_000;
+
 const paths = {
   app: process.env.DAD_DRIVER_APP ?? join(REPO_ROOT, "target", "debug", "dot-agent-deck-desktop"),
   daemon: process.env.DAD_DRIVER_DAEMON ?? join(REPO_ROOT, "target", "debug", "dot-agent-deck"),
@@ -374,6 +382,43 @@ export class Deck {
    */
   async hasSelection(text: string): Promise<boolean> {
     return (await this.terminalScreens()).some(({ selection }) => selection === text);
+  }
+
+  /**
+   * Issue #1403 — select the row `span` covers with a real drag, and wait for
+   * xterm to hold `text` as its selection. When it does not, the error carries
+   * what the page saw: the element under the press point, and every mouse
+   * event that reached the document during the drag, so a runner on which
+   * pointer actions stop selecting says how.
+   */
+  async selectRow(span: { from: { x: number; y: number }; to: { x: number; y: number } }, text: string): Promise<void> {
+    await this.session.execute(
+      `window.__dadPointerLog = [];
+       for (const type of ["pointerdown", "mousedown", "mousemove", "pointerup", "mouseup", "click"]) {
+         document.addEventListener(type, (e) => {
+           if (window.__dadPointerLog.length < 60) {
+             const t = e.target;
+             window.__dadPointerLog.push([type, Math.round(e.clientX), Math.round(e.clientY), e.buttons, e.detail,
+               t && t.className ? String(t.className).slice(0, 40) : t && t.nodeName, e.defaultPrevented]);
+           }
+         }, { capture: true, once: false });
+       }`,
+    );
+    await this.session.drag(span.from, span.to);
+    try {
+      await waitFor(`the drag to select ${text}`, () => this.hasSelection(text), SELECT_MS);
+    } catch (error) {
+      const seen = await this.session
+        .execute<unknown>(
+          `const el = document.elementFromPoint(arguments[0], arguments[1]);
+           return { under: el ? el.nodeName + "." + String(el.className).slice(0, 60) : null,
+                    focused: document.activeElement ? document.activeElement.nodeName + "." + String(document.activeElement.className).slice(0, 60) : null,
+                    events: window.__dadPointerLog };`,
+          [Math.round(span.from.x), Math.round(span.from.y)],
+        )
+        .catch((probe: unknown) => String(probe));
+      throw new Error(`${(error as Error).message}; the page saw ${JSON.stringify(seen)}`);
+    }
   }
 
   private async terminalScreens(): Promise<TerminalScreen[]> {
