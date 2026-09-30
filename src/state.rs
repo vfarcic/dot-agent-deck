@@ -7228,6 +7228,17 @@ fn write_work_done_summary(
     // Issue #329 §1: owner-only, directory and file — a worker's report is as
     // sensitive as the task that produced it, and this pair used to land at 0664.
     // Issue #509: framed as untrusted worker-authored text, in full.
+    //
+    // Qodo on PR #1438: the check, the write and the record of what was written
+    // are one step. Without a lock across all three, two completions for the
+    // same path could record their fingerprints in the opposite order to their
+    // writes, leaving a record that no longer matches the file, and the next
+    // completion would then be diverted. A std mutex: the only non-test caller
+    // runs on the blocking pool, and nothing here awaits.
+    static SUMMARY_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serialized = SUMMARY_WRITE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match crate::orchestrator_context::replace_coordination_file_if(
         std::path::Path::new(cwd),
         &file_name,
@@ -16113,6 +16124,67 @@ mod tests {
             write_work_done_summary(Some(restarted_str), "coder", "coder", "pane-1", "After."),
             SummaryWrite::Occupied,
             "with no record, an unframed file is still kept"
+        );
+    }
+
+    /// Qodo on PR #1438: completions racing for the same summary path are still
+    /// all the deck's own reports, so every one of them is filed there rather
+    /// than diverted, and the recorded fingerprint ends up matching the file.
+    /// Without one lock held across the guarded write and the record, one writer
+    /// could record its fingerprint after another had already replaced the file,
+    /// and the next completion then found "a file the deck did not write".
+    #[test]
+    fn write_work_done_summary_files_racing_completions_without_diverting() {
+        const WRITERS: usize = 8;
+        const ROUNDS: usize = 200;
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let cwd_str = cwd.path().to_str().expect("utf8 cwd");
+        let path = cwd.path().join(".dot-agent-deck/work-done-coder.md");
+        let barrier = std::sync::Barrier::new(WRITERS);
+
+        let outcomes: Vec<SummaryWrite> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|writer| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        (0..ROUNDS)
+                            .map(|round| {
+                                write_work_done_summary(
+                                    Some(cwd_str),
+                                    "coder",
+                                    "coder",
+                                    "pane-1",
+                                    &format!("Report {writer}/{round}."),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().expect("writer thread"))
+                .collect()
+        });
+
+        let count = |what: SummaryWrite| outcomes.iter().filter(|o| **o == what).count();
+        assert_eq!(
+            (count(SummaryWrite::Occupied), count(SummaryWrite::Failed)),
+            (0, 0),
+            "every racing completion wrote the deck's own report, so none may find the path \
+             occupied (left) or fail (right), of {}",
+            outcomes.len()
+        );
+        assert_eq!(
+            written_summaries().get(&path).copied(),
+            Some(SummaryFingerprint::of(&std::fs::read(&path).unwrap())),
+            "the recorded fingerprint must be the file's bytes"
+        );
+        assert_eq!(
+            write_work_done_summary(Some(cwd_str), "coder", "coder", "pane-1", "After the race."),
+            SummaryWrite::Written,
+            "the next completion must not be diverted"
         );
     }
 
