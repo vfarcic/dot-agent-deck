@@ -589,10 +589,10 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     });
   });
 
-  /** Scenario: a spoken stop offers two agents, then the daemon replaces the
-   * selected agent under the same id before the user chooses it. The stale
-   * choice cannot open a stop confirmation for the replacement. */
-  it("refuses a chosen stop after same-id replacement of its agent", async () => {
+  /** Scenario: a spoken stop is still resolving when the daemon replaces one
+   * candidate under the same id. Choosing that candidate from the late offer
+   * cannot open a stop confirmation for the replacement. */
+  it("refuses a chosen stop when its agent was replaced during resolution", async () => {
     const voice = microphone(["stop the agent"]);
     const snapshot = createFixtureSnapshot("connected");
     const target = snapshot.agents.find((agent) => agent.id === second.value);
@@ -606,17 +606,22 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
       },
     };
     const runAction = vi.fn(async () => ({ ok: true }) as DeckActionResult);
-    const deck = runtime(vi.fn(async () => stopChoice), voice, { snapshot, fleet: [snapshot], runAction });
+    let settle: (answer: VoiceResultDto) => void = () => {};
+    const resolveVoice: ResolveVoice = vi.fn(() => new Promise<VoiceResultDto>((resolve) => { settle = resolve; }));
+    const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot], runAction });
     const { rerender } = render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
     await turnVoiceOn();
     await completeUtterance();
-    expect(entry(2, second.label)).toBeVisible();
+    expect(resolveVoice).toHaveBeenCalledWith("stop the agent");
+    expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
 
     const replaced = {
       ...snapshot,
       agents: snapshot.agents.map((agent) => agent.id === target.id ? { ...agent, spawnedAtMs: 2_000 } : agent),
     };
     rerender(<DeckShell runtime={{ ...deck, snapshot: replaced, fleet: [replaced] }} initialView={{ kind: "overview" }} />);
+    await act(async () => { settle(stopChoice); await Promise.resolve(); });
+    expect(entry(2, second.label)).toBeVisible();
     await act(async () => { fireEvent.click(entry(2, second.label)); await Promise.resolve(); });
     expect(screen.queryByRole("alertdialog")).toBeNull();
     expect(screen.getByTestId("voice-report")).toHaveTextContent(/replaced|changed|moved on|gone/i);
@@ -1056,6 +1061,10 @@ describe("typing into the open agent", () => {
 
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS); });
     expect(deck.sendTerminalInput).toHaveBeenLastCalledWith({ deckId: DECK_ID, agentId: "planner" }, VOICE_DICTATION_SUBMIT);
+    expect(vi.mocked(deck.sendTerminalInput).mock.calls).toEqual([
+      [{ deckId: DECK_ID, agentId: "planner" }, "run the login tests "],
+      [{ deckId: DECK_ID, agentId: "planner" }, VOICE_DICTATION_SUBMIT],
+    ]);
   });
 
   /** Scenario: a one-shot sentence is typed and its send countdown is visible.
@@ -1180,6 +1189,64 @@ describe("typing into the open agent", () => {
       [{ deckId: snapshot.connection.deckId, agentId: coder.id }, "run the login tests "],
     ]);
     expect(screen.getByTestId("voice-report")).toHaveTextContent(/not sent|called off/i);
+  });
+
+  /** Scenario: a one-shot is still resolving for Coder when the user opens
+   * Coder's stop confirmation. Its late answer must type nothing and must
+   * never send Enter while the confirmation is open. */
+  it("refuses a one-shot that resolves after a D5 confirmation opens", async () => {
+    const voice = microphone([]);
+    const said = "type run the login tests";
+    let settle: (answer: VoiceResultDto) => void = () => {};
+    const resolveVoice: ResolveVoice = vi.fn(() => new Promise<VoiceResultDto>((resolve) => { settle = resolve; }));
+    const snapshot = createFixtureSnapshot("crowded");
+    const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot] });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    fireEvent.click(screen.getByRole("button", { name: /open coder agent/i }));
+    await turnVoiceOn();
+    voice.deliver(said);
+    await completeUtterance();
+    expect(resolveVoice).toHaveBeenCalledWith(said);
+
+    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    expect(screen.getByRole("alertdialog")).toBeVisible();
+    await act(async () => { settle(dictated(said, "type")); await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
+    expect(vi.mocked(deck.sendTerminalInput).mock.calls).toEqual([]);
+    expect(screen.queryByTestId("voice-dictation")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/confirmation/i);
+  });
+
+  /** Scenario: Coder's one-shot terminal write is still outstanding when its
+   * stop confirmation opens. Finishing that write must not arm a countdown or
+   * send Enter, even though the text write was already requested. */
+  it("never arms a one-shot send when a D5 confirmation opens during its write", async () => {
+    const voice = microphone([]);
+    const said = "type run the login tests";
+    let settleTyped: () => void = () => {};
+    const sendTerminalInput = vi.fn(() => new Promise<void>((resolve) => { settleTyped = resolve; }));
+    const snapshot = createFixtureSnapshot("crowded");
+    const coder = snapshot.agents.find((agent) => agent.role === "Coder");
+    if (!coder || !snapshot.connection.deckId) throw new Error("Coder fixture missing its agent or deck id");
+    const deck = runtime(speaking({ [said]: dictated(said, "type") }), voice, { snapshot, fleet: [snapshot], sendTerminalInput });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    fireEvent.click(screen.getByRole("button", { name: /open coder agent/i }));
+    await turnVoiceOn();
+    voice.deliver(said);
+    await completeUtterance();
+    expect(sendTerminalInput.mock.calls).toEqual([
+      [{ deckId: snapshot.connection.deckId, agentId: coder.id }, "run the login tests "],
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    expect(screen.getByRole("alertdialog")).toBeVisible();
+    await act(async () => { settleTyped(); await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
+    expect(sendTerminalInput.mock.calls).toEqual([
+      [{ deckId: snapshot.connection.deckId, agentId: coder.id }, "run the login tests "],
+    ]);
+    expect(screen.queryByTestId("voice-dictation")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/confirmation|not sent|called off/i);
   });
 
   /** Scenario: the pane first reports no spawn time, then supplies one for the
@@ -1389,6 +1456,33 @@ describe("typing into the open agent", () => {
     expect(screen.getByTestId("voice-report")).toHaveTextContent("The agent in this pane was replaced while that was being worked out, so nothing ran. Say it again.");
     expect(deck.sendTerminalInput).not.toHaveBeenCalled();
     expect(screen.queryByTestId("voice-dictation")).toBeNull();
+  });
+
+  /** Scenario: while a one-shot for Planner is resolving, the user opens
+   * Builder's pane directly from the overview. The late answer must type into
+   * neither pane and must never send Enter. */
+  it("refuses an in-flight one-shot after the visible pane changes to another agent", async () => {
+    const voice = microphone([]);
+    const said = "type run the login tests";
+    let settle: (answer: VoiceResultDto) => void = () => {};
+    const resolveVoice: ResolveVoice = vi.fn(() => new Promise<VoiceResultDto>((resolve) => { settle = resolve; }));
+    const snapshot = createFixtureSnapshot("connected");
+    const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot] });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    fireEvent.click(screen.getByRole("button", { name: /open plan \/ architecture agent/i }));
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId("terminal-planner")).toBeVisible();
+    await turnVoiceOn();
+    voice.deliver(said);
+    await completeUtterance();
+    expect(resolveVoice).toHaveBeenCalledWith(said);
+
+    fireEvent.click(screen.getByRole("button", { name: /open desktop implementation agent/i, hidden: true }));
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId("terminal-builder")).toBeVisible();
+    await act(async () => { settle(dictated(said, "type")); await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
+    expect(vi.mocked(deck.sendTerminalInput).mock.calls).toEqual([]);
+    expect(screen.queryByTestId("voice-dictation")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/pane|agent|moved on|changed/i);
   });
 
   /** Scenario: asking for the command list is still resolving when the agent
