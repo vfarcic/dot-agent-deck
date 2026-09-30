@@ -16,7 +16,7 @@ Say "what can I say?" to see every command, split into **On this screen** and **
 
 What the app did with each thing you said appears beside the button and stays until the next one. When a command can be reversed, an **Undo** button is shown beside it for ten seconds.
 
-To type into an agent, open its [pane](dashboard.md#the-agent-pane) and start with "type", for example "type run the tests". The words after "type" are typed into the agent's prompt, taken from what the Speech service heard rather than from the Commands model's answer, and sent after a short countdown. If the agent in the pane is replaced by a new one before the countdown ends, nothing is sent and the app says so.
+To type into an agent, open its [pane](dashboard.md#the-agent-pane) and start with "type", for example "type run the tests". The words after "type" are typed into the agent's prompt, taken from what the Speech service heard rather than from the Commands model's answer, and sent after a short countdown. If the agent in the pane is replaced by a new one before the countdown ends, nothing is sent and the app says so. This needs a daemon that reports when each agent started; with one that does not, the app cannot tell a replacement from the original agent.
 
 ## When a command matches several things
 
@@ -60,7 +60,7 @@ Typing mode ends, and **nothing is sent** when it does, if you:
 - close the pane (for example with Escape), open another screen, open another agent, or switch daemons;
 - or a confirmation opens, for example to stop an agent.
 
-It also ends if the agent stops accepting input, for example because it exited, or if it is replaced by a new agent in the same pane. Something you said just before typing mode ended is not typed or sent. Whatever you dictated stays in the agent's prompt, where you can edit it or send it yourself. The app says why typing mode ended. Typing mode never moves to another agent on its own: to dictate to a different agent, open its pane and say "type on" again. If the agent on screen cannot take input, "type on" is refused with the reason.
+It also ends if the agent stops accepting input, for example because it exited, or if it is replaced by a new agent in the same pane (which the app can tell only when the daemon reports when each agent started). Something you said just before typing mode ended is not typed or sent. If the agent you were typing to is still there, whatever you dictated stays in its prompt, where you can edit it or send it yourself; a replacement agent starts with an empty prompt. The app says why typing mode ended. Typing mode never moves to another agent on its own: to dictate to a different agent, open its pane and say "type on" again. If the agent on screen cannot take input, "type on" is refused with the reason.
 
 If the app mishears "type off", the words are typed into the prompt instead of stopping typing mode. They are not sent: press **Stop typing** and delete them.
 

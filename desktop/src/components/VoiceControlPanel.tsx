@@ -459,13 +459,36 @@ const OPEN_DECK_COMMAND = "open_deck";
 type Pending = { deckId: string; agentId: string; label: string; spawnedAtMs?: number };
 
 /**
+ * PRD #1260 review — whether two spawn times name different incarnations of
+ * one agent. Only when BOTH are known: `spawnedAtMs` is optional on the wire,
+ * so a missing one is "not reported", never "a different agent" — a pane that
+ * gains its spawn time is still the agent it was. The cost is that a same-id
+ * replacement is not detected while the daemon omits the spawn time.
+ */
+function incarnationsDiffer(was: number | undefined, now: number | undefined): boolean {
+  return was !== undefined && now !== undefined && was !== now;
+}
+
+/**
  * PRD #1260 review — whether the pane on screen shows `aim`'s deck and agent id
  * but a DIFFERENT agent: the daemon replaced it under the same identity, which
  * `spawnedAtMs` tells apart and the ids cannot. A pane showing another agent,
  * or none, is not a replacement; the mode's own checks handle those.
  */
 function paneReplaced(aim: Pending, pane: VoicePane | undefined): boolean {
-  return pane !== undefined && pane.deckId === aim.deckId && pane.agentId === aim.agentId && pane.spawnedAtMs !== aim.spawnedAtMs;
+  return pane !== undefined && pane.deckId === aim.deckId && pane.agentId === aim.agentId && incarnationsDiffer(aim.spawnedAtMs, pane.spawnedAtMs);
+}
+
+/**
+ * PRD #1260 review, round 2 — the rows that type into, or press Enter in, the
+ * open pane's terminal. A same-id replacement during resolution refuses only
+ * these: every other command neither reads nor writes that agent's prompt, so
+ * the replacement changes nothing about what it would do.
+ */
+const PANE_INPUT_INVOKES: ReadonlySet<string> = new Set(["dictateToAgent", "submitAgentPrompt", "startDictation"]);
+
+function actsOnPane(outcome: VoiceOutcomeDto): boolean {
+  return (outcome.kind === "dispatch" || outcome.kind === "param_ambiguous") && outcome.invoke !== undefined && PANE_INPUT_INVOKES.has(outcome.invoke);
 }
 
 /**
@@ -844,6 +867,18 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   /** Seconds left before the typed text is sent, or `undefined` for no pending send. */
   const [sendIn, setSendIn] = useState<number>();
   const sendTimer = useRef<number | undefined>(undefined);
+  /**
+   * PRD #1260 review, round 2 — the one-shot send's token. Every cancellation
+   * bumps it ({@link cancelPendingSend} is the only writer), and a one-shot
+   * notes it when its terminal write starts. The write's continuations and the
+   * countdown act only while it is unchanged, so a write that finishes after
+   * Voice went off, a mode began or a newer send replaced it arms nothing,
+   * presses nothing, and does not clear or overwrite the newer one's report.
+   *
+   * Needed because the write is detached from the cycle: the microphone
+   * reopens while it is outstanding, so anything can happen before it settles.
+   */
+  const sendEpoch = useRef(0);
 
   /**
    * The screen is read at submit time rather than closed over, so a navigation
@@ -1029,11 +1064,15 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * about would press Enter in an agent's prompt with nobody watching, which is
    * the one thing this feature must never do.
    */
-  const cancelPendingSend = useCallback(() => {
+  const clearSendTimer = useCallback(() => {
     if (sendTimer.current !== undefined) window.clearInterval(sendTimer.current);
     sendTimer.current = undefined;
     setSendIn(undefined);
   }, []);
+  const cancelPendingSend = useCallback(() => {
+    sendEpoch.current += 1;
+    clearSendTimer();
+  }, [clearSendTimer]);
 
   /**
    * Press Enter in the agent's prompt.
@@ -1060,11 +1099,16 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * both redraws and decides, so the two cannot disagree about how long is
    * left.
    */
-  const armSend = useCallback((aim: Pending) => {
-    cancelPendingSend();
+  const armSend = useCallback((aim: Pending, epoch: number) => {
+    clearSendTimer();
     let left = Math.max(1, Math.round(VOICE_DICTATION_SEND_MS / VOICE_DICTATION_TICK_MS));
     setSendIn(left);
     sendTimer.current = window.setInterval(() => {
+      /* Every cancellation clears this interval, so this is a backstop. */
+      if (sendEpoch.current !== epoch) {
+        clearSendTimer();
+        return;
+      }
       left -= 1;
       if (left > 0) {
         setSendIn(left);
@@ -1078,7 +1122,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       }
       void submitDictation(aim);
     }, VOICE_DICTATION_TICK_MS);
-  }, [cancelPendingSend, setPending, submitDictation]);
+  }, [cancelPendingSend, clearSendTimer, setPending, submitDictation]);
 
   /* A pending send must not survive this panel. The timer is a window timer and
      would otherwise keep running with nothing behind it. */
@@ -1114,7 +1158,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (mode.kind !== "dictating") return;
     if (confirmationOpen) endDictation("a confirmation opened");
     else if (paneDeckId !== mode.target.deckId || paneAgentId !== mode.target.agentId) endDictation("the pane closed");
-    else if (paneSpawnedAtMs !== mode.target.spawnedAtMs) endDictation(DICTATION_AGENT_REPLACED);
+    else if (incarnationsDiffer(mode.target.spawnedAtMs, paneSpawnedAtMs)) endDictation(DICTATION_AGENT_REPLACED);
     else if (paneBlocked !== undefined) endDictation(`the pane stopped taking input: ${paneBlocked}`);
     else if (selectedDeckId !== mode.deck) endDictation("the deck changed");
   }, [confirmationOpen, endDictation, paneAgentId, paneBlocked, paneDeckId, paneSpawnedAtMs, panelState, selectedDeckId]);
@@ -1366,7 +1410,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         if (declaredDictation === undefined) setProblem(VOICE_MODE_MOVED_ON);
         return;
       }
-      if (declaredPane && paneReplaced(declaredPane, paneRef.current)) {
+      /* Only for an answer that would type into or submit in that pane: the
+         command list, a navigation or a deck switch does the same thing
+         whichever agent the pane now shows. */
+      if (declaredPane && paneReplaced(declaredPane, paneRef.current) && actsOnPane(answer.outcome)) {
         setProblem(VOICE_PANE_REPLACED);
         return;
       }
@@ -1765,13 +1812,19 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       }
       const typed = dictationText(target.text ?? "");
       if (typed === "") return;
+      /* The mode instance the words were typed for. Every exit and entry bumps
+         it, and a same-id replacement ends the mode, so it names the pane's
+         incarnation as well. */
+      const generation = modeGeneration.current;
       void sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed).then(
         () => undefined,
         /* A terminal that refuses once will refuse every utterance after it,
-           so the mode ends with the refusal rather than repeating it. */
+           so the mode ends with the refusal rather than repeating it. A
+           failure from a mode that has since ended is dropped: it must not end
+           a mode entered after it, nor overwrite that mode's report. */
         (cause) => {
-          const now = panelStateRef.current;
-          if (now.kind === "dictating" && now.target.deckId === aim.deckId && now.target.agentId === aim.agentId) setPanelState(IDLE);
+          if (modeGeneration.current !== generation) return;
+          setPanelState(IDLE);
           setProblem(sentenceOf(cause));
         },
       );
@@ -1789,17 +1842,24 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        nobody added to. */
     if (typed === "") return;
     cancelPendingSend();
+    const epoch = sendEpoch.current;
     void sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed).then(
       () => {
+        /* Called off while the words were being written — see `sendEpoch`. */
+        if (sendEpoch.current !== epoch) return;
         if (paneReplaced(aim, paneRef.current)) {
           setPending(undefined);
           setProblem(voiceSendReplaced(aim.label));
           return;
         }
         setPending(aim);
-        armSend(aim);
+        armSend(aim, epoch);
       },
-      (cause) => { setPending(undefined); setProblem(sentenceOf(cause)); },
+      (cause) => {
+        if (sendEpoch.current !== epoch) return;
+        setPending(undefined);
+        setProblem(sentenceOf(cause));
+      },
     );
   }, [armSend, cancelPendingSend, endDictation, sendTerminalInput, setPanelState, setPending]);
 

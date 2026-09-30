@@ -206,3 +206,7 @@ Written from issue #1261 by a dispatched unit, alongside PRDs #1260 and #1184, a
 
 - **A label that is also a bare control is refused.** When an offered entry's label is, word for word, a bare ordinal or cancel phrase that the utterance also is (an agent called "two" or "cancel"), `voice::choice::answer` and `answerChoiceLocally` now return `Refused` instead of reading it either way; the panel's refusal (`voiceChoiceCollision`) says to click the entry or say "number N". "number one" is still a number. Both copies share the rule through the offered labels, and `collidingChoiceEntry` gives the panel the entry's number for any runtime.
 - **The user docs list every cancel phrase** ("cancel that" was missing; "nevermind" is the same words) and describe the collision rule.
+
+### 2026-09-30 — Review round 2
+
+- **The changelog named the wrong number.** `changelog.d/1261.feature.md` told a user with a colliding entry to say "number one"; the right number is the colliding entry's own position, so it now says to say its number.
