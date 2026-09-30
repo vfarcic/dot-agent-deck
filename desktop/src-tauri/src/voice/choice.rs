@@ -373,10 +373,50 @@ fn in_an_offered_run(
         .any(|member| offers(&member.id) && run_of(member).as_deref() == Some(run.as_str()))
 }
 
-/// The names an orchestration member's card answers to — its config name and
-/// run title — plus the label its entry was offered under, when it is the
-/// member offered.
-fn orchestration_names(agent: &DesktopAgent, offered: &[ResolvedParam]) -> Vec<String> {
+/// Every name the live entry `value` of `kind` answers to, by the same per-kind
+/// name function [`by_name`] matches an answer with — [`spoken_names`] for an
+/// agent, [`deck_spoken_names`], [`dir_names`], [`run_names`],
+/// [`mode_names`] and [`agent_type_names`] for the rest. This is what an
+/// offered candidate carries as [`ResolvedParam::names`], so the webview's
+/// fallback (`answerChoiceLocally`) reads these names rather than keeping a
+/// second definition of them. Empty when nothing live has that value.
+pub(super) fn names_of(kind: ParamKind, value: &str, live: &ChoiceLive) -> Vec<String> {
+    let names = match kind {
+        ParamKind::AgentRef => live
+            .agents
+            .iter()
+            .find(|agent| agent.id == value)
+            .map(spoken_names),
+        ParamKind::DeckRef => live
+            .decks
+            .iter()
+            .find(|deck| deck.id == value)
+            .map(deck_spoken_names),
+        ParamKind::DirRef => live
+            .directories
+            .and_then(|listing| listing.entries.iter().find(|entry| entry.path == value))
+            .map(|entry| dir_names(&entry.name)),
+        ParamKind::OrchestrationRef => live
+            .agents
+            .iter()
+            .find(|agent| agent.id == value)
+            .map(run_names),
+        ParamKind::ModeRef => form_choices(kind, live)
+            .iter()
+            .find(|choice| choice.id == value)
+            .map(mode_names),
+        ParamKind::AgentTypeRef => form_choices(kind, live)
+            .iter()
+            .find(|choice| choice.id == value)
+            .map(agent_type_names),
+        ParamKind::SpokenPrefix => None,
+    };
+    names.unwrap_or_default()
+}
+
+/// The names an orchestration member's card answers to: its config name and
+/// run title.
+fn run_names(agent: &DesktopAgent) -> Vec<String> {
     let mut names = Vec::new();
     if let DesktopTab::Orchestration {
         name,
@@ -387,6 +427,13 @@ fn orchestration_names(agent: &DesktopAgent, offered: &[ResolvedParam]) -> Vec<S
         names.push(name.clone());
         names.extend(display_title.clone());
     }
+    names
+}
+
+/// [`run_names`], plus the label its entry was offered under, when it is the
+/// member offered.
+fn orchestration_names(agent: &DesktopAgent, offered: &[ResolvedParam]) -> Vec<String> {
+    let mut names = run_names(agent);
     names.extend(
         offered
             .iter()
@@ -483,6 +530,7 @@ mod tests {
             value: id.to_string(),
             label: label.to_string(),
             deck_identity: None,
+            names: Vec::new(),
         }
     }
 

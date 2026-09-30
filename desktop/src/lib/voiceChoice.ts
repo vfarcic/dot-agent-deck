@@ -13,10 +13,13 @@
  * the closed lists of the Rust function — a bare control that is also an
  * offered label (refused), cancel phrase, whole-utterance ordinal, then a name
  * among the OFFERED entries only, said on its own (PR #1451 review: "stop
- * Planner" is a new command, not an answer) — with the name matched
- * against labels rather than through each kind's resolver, and no liveness
- * check: the dispatch-time checks every target already makes are what stand
- * behind it there. The Rust function is the one production answers with.
+ * Planner" is a new command, not an answer) — with the name matched against
+ * each entry's label and the `names` Rust supplied with it (the per-kind list
+ * `voice::choice::answer` itself matches against, `ResolvedParam::names`)
+ * rather than through each kind's resolver, never against `value`, and no
+ * liveness check: the dispatch-time checks every target already makes are
+ * what stand behind it there. The Rust function is the one production
+ * answers with.
  */
 import type { VoiceResolvedParamDto } from "./bridge";
 
@@ -128,10 +131,12 @@ export function answerChoiceLocally(utterance: string, offered: readonly VoiceRe
     const candidate = offered[number === "last" ? offered.length - 1 : number - 1];
     return candidate ? { kind: "selected", candidate } : { kind: "refused" };
   }
-  const labels = offered.map((candidate) => spokenWords(candidate.label));
-  const same = (label: string[]) => label.length === words.length && label.every((word, at) => word === words[at]);
-  const exact = offered.filter((_, at) => same(labels[at]));
-  const loose = exact.length > 0 ? exact : offered.filter((candidate, at) => covers(words, labels[at], candidate.kind));
+  /* Each entry's label and the names Rust supplied with it — never `value`,
+     which is an ID the user may not know and was not shown. */
+  const names = offered.map((candidate) => [candidate.label, ...(candidate.names ?? [])].map(spokenWords));
+  const same = (name: string[]) => name.length === words.length && name.every((word, at) => word === words[at]);
+  const exact = offered.filter((_, at) => names[at].some(same));
+  const loose = exact.length > 0 ? exact : offered.filter((candidate, at) => names[at].some((name) => covers(words, name, candidate.kind)));
   if (loose.length === 1) return { kind: "selected", candidate: loose[0] };
   return loose.length > 1 ? { kind: "refused" } : { kind: "not_answer" };
 }

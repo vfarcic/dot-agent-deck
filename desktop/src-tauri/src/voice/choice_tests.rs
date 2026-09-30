@@ -23,6 +23,7 @@ fn candidate(kind: ParamKind, value: &str, label: &str) -> ResolvedParam {
         value: value.to_string(),
         label: label.to_string(),
         deck_identity: None,
+        names: Vec::new(),
     }
 }
 
@@ -82,8 +83,9 @@ fn choice_answers_whole_ordinals_and_refuses_out_of_range() {
 }
 
 /// Scenario: a spoken name selects one of the offered entries only. A live but
-/// unoffered directory or a shared name is refused, and a command containing
-/// an offered agent's name remains a new command rather than an answer.
+/// unoffered directory or a shared name is refused. An offered planner can be
+/// named by its ID when its label differs, but a command or extra word cannot
+/// answer; two offered planner IDs remain ambiguous.
 #[test]
 fn choice_names_are_checked_against_the_offered_list_only() {
     let listing = listing();
@@ -102,7 +104,7 @@ fn choice_names_are_checked_against_the_offered_list_only() {
     assert_eq!(answer("docs", &offered, &live), ChoiceAnswer::Refused);
 
     let agents = [
-        role_agent("planner", "Planner"),
+        role_agent("planner", "Plan / architecture"),
         role_agent("builder", "Desktop implementation"),
     ];
     let live_agents = ChoiceLive {
@@ -112,19 +114,47 @@ fn choice_names_are_checked_against_the_offered_list_only() {
         new_agent: None,
     };
     let agent_offers = [
-        candidate(ParamKind::AgentRef, "planner", "Planner"),
+        candidate(ParamKind::AgentRef, "planner", "Plan / architecture"),
         candidate(ParamKind::AgentRef, "builder", "Desktop implementation"),
     ];
     assert_eq!(
-        answer("Planner", &agent_offers, &live_agents),
+        answer("Plan / architecture", &agent_offers, &live_agents),
+        ChoiceAnswer::Selected(agent_offers[0].clone())
+    );
+    assert_eq!(
+        answer("planner", &agent_offers, &live_agents),
         ChoiceAnswer::Selected(agent_offers[0].clone())
     );
     assert_eq!(
         [
-            answer("stop Planner", &agent_offers, &live_agents),
+            answer("stop planner", &agent_offers, &live_agents),
+            answer("planner extra", &agent_offers, &live_agents),
             answer("desktop implementation extra", &agent_offers, &live_agents),
         ],
-        [ChoiceAnswer::NotAnswer, ChoiceAnswer::NotAnswer]
+        [
+            ChoiceAnswer::NotAnswer,
+            ChoiceAnswer::NotAnswer,
+            ChoiceAnswer::NotAnswer,
+        ]
+    );
+
+    let two_planners = [
+        role_agent("planner-one", "Plan / architecture"),
+        role_agent("planner-two", "Desktop implementation"),
+    ];
+    let live_planners = ChoiceLive {
+        agents: &two_planners,
+        decks: &[],
+        directories: None,
+        new_agent: None,
+    };
+    let planner_offers = [
+        candidate(ParamKind::AgentRef, "planner-one", "Plan / architecture"),
+        candidate(ParamKind::AgentRef, "planner-two", "Desktop implementation"),
+    ];
+    assert_eq!(
+        answer("planner", &planner_offers, &live_planners),
+        ChoiceAnswer::Refused
     );
 }
 

@@ -1236,14 +1236,16 @@ function fixtureHeard(transcript: string, situation: string): string {
  * the list, its answers, its expiry — which the real resolver's own tests in
  * `voice/outcome.rs` cannot reach. The sentence and the two reports are the
  * ones Rust renders for this tie. The agents are the `connected` state's own
- * `planner` and `builder`, so a chosen entry opens a pane that exists.
+ * `planner` and `builder`, so a chosen entry opens a pane that exists, and
+ * each carries the `names` Rust's `spoken_names` gives that agent — its display
+ * name and its role — so the fallback answers "planner" as Rust would.
  */
 const FIXTURE_VOICE_TIE = {
   phrases: ["open the agent"] as readonly string[],
   screens: ["deck", "overview"] as readonly VoiceScreen[],
   candidates: [
-    { name: "agent", kind: "agent_ref", spoken: "agent", value: "planner", label: "Plan / architecture" },
-    { name: "agent", kind: "agent_ref", spoken: "agent", value: "builder", label: "Desktop implementation" },
+    { name: "agent", kind: "agent_ref", spoken: "agent", value: "planner", label: "Plan / architecture", names: ["Plan / architecture", "planner"] },
+    { name: "agent", kind: "agent_ref", spoken: "agent", value: "builder", label: "Desktop implementation", names: ["Desktop implementation", "builder"] },
   ] as readonly VoiceResolvedParamDto[],
 } as const;
 

@@ -826,6 +826,14 @@ export interface VoiceResolvedParamDto {
    * row before writing. Absent for the local deck, which has no remote address.
    */
   deckIdentity?: VoiceDeckIdentityDto;
+  /**
+   * PRD #1261 — on an offered candidate of a `param_ambiguous` outcome alone,
+   * every name the entry answers to, from the same per-kind list Rust's
+   * `voice::choice::answer` matches a spoken answer against
+   * (`ResolvedParam::names`). `answerChoiceLocally` reads these beside the
+   * label, never `value`. Rust omits it when empty.
+   */
+  names?: string[];
 }
 
 /**

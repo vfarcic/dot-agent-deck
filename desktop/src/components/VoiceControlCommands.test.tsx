@@ -318,8 +318,8 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
   beforeEach(() => { window.localStorage.clear(); vi.useFakeTimers(); });
   afterEach(() => vi.useRealTimers());
 
-  const first = { name: "agent", kind: "agent_ref", spoken: "agent", value: "planner", label: "Plan / architecture" } as const;
-  const second = { name: "agent", kind: "agent_ref", spoken: "agent", value: "builder", label: "Desktop implementation" } as const;
+  const first = { name: "agent", kind: "agent_ref", spoken: "agent", value: "planner", label: "Plan / architecture", names: ["planner"] as string[] } as const;
+  const second = { name: "agent", kind: "agent_ref", spoken: "agent", value: "builder", label: "Desktop implementation", names: ["builder"] as string[] } as const;
   const candidates: VoiceResolvedParamDto[] = [first, second];
   const choice = (action = "open_agent", invoke = "openAgent", offered: typeof candidates = candidates): VoiceResultDto => ({
     resolveMs: 21, backend: "stub",
@@ -366,17 +366,17 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
   });
 
-  /** Scenario: saying a whole ordinal or an offered name completes the original
-   * openAgent command with the selected ID and closes the list. */
-  it.each(["two", "Desktop implementation"])("dispatches the offered value when the answer is %s", async (answer) => {
+  /** Scenario: saying a whole ordinal, offered label, or the planner agent's supplied spoken name
+   * opens that agent through the original command and closes the list. */
+  it.each([["two", second], ["Desktop implementation", second], ["planner", first]] as const)("dispatches the offered value when the answer is %s", async (answer, target) => {
     const voice = microphone(["open the agent"]);
-    const { resolveVoice } = setup(voice);
+    const { resolveVoice } = setup(voice, noMatch);
     await turnVoiceOn();
     await completeUtterance();
     expect(entry(2, second.label)).toBeVisible();
     voice.deliver(answer);
     await completeUtterance();
-    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId(`terminal-${second.value}`)).toBeVisible();
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId(`terminal-${target.value}`)).toBeVisible();
     expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
     expect(resolveVoice).toHaveBeenCalledTimes(1);
   });

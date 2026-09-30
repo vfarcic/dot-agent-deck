@@ -25,14 +25,28 @@ describe("answerChoiceLocally", () => {
   });
 
   const agents = [
-    { name: "agent", kind: "agent_ref" as const, spoken: "agent", value: "planner", label: "Planner" },
-    { name: "agent", kind: "agent_ref" as const, spoken: "agent", value: "builder", label: "Desktop implementation" },
+    { name: "agent", kind: "agent_ref" as const, spoken: "agent", value: "planner", label: "Plan / architecture", names: ["planner"] },
+    { name: "agent", kind: "agent_ref" as const, spoken: "agent", value: "builder", label: "Desktop implementation", names: ["builder"] },
   ];
 
-  /** Scenario: saying an offered agent's whole name selects it, while a stop command containing that name remains a new utterance. */
+  /** Scenario: the offered planner can be named by a spoken name supplied with the choice even though its label reads Plan / architecture.
+   * A stop command or extra word is not a choice answer, and a name matching two offered agents is refused. */
   it("does not answer an open-agent choice with a stop command", () => {
-    expect(answerChoiceLocally("Planner", agents)).toEqual({ kind: "selected", candidate: agents[0] });
-    expect(answerChoiceLocally("stop Planner", agents)).toEqual({ kind: "not_answer" });
+    expect(answerChoiceLocally("Plan / architecture", agents)).toEqual({ kind: "selected", candidate: agents[0] });
+    expect.soft(answerChoiceLocally("planner", agents)).toEqual({ kind: "selected", candidate: agents[0] });
+    expect(answerChoiceLocally("stop planner", agents)).toEqual({ kind: "not_answer" });
+    expect(answerChoiceLocally("planner extra", agents)).toEqual({ kind: "not_answer" });
+    const similarlyNamed = [
+      { ...agents[0], value: "planner-one", names: ["planner-one"] },
+      { ...agents[1], value: "planner-two", names: ["planner-two"] },
+    ];
+    expect.soft(answerChoiceLocally("planner", similarlyNamed)).toEqual({ kind: "refused" });
+  });
+
+  /** Scenario: an agent ID without a supplied spoken name does not answer a choice when its visible label differs. */
+  it("does not treat the candidate value as a spoken name", () => {
+    const withoutNames = { name: "agent", kind: "agent_ref", spoken: "agent", value: "planner", label: "Plan / architecture" };
+    expect(answerChoiceLocally("planner", [withoutNames])).toEqual({ kind: "not_answer" });
   });
 
   /** Scenario: saying a full offered label with an extra word does not select it, matching the Rust choice answer. */

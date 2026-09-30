@@ -42,7 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::choice::MAX_CHOICES;
+use super::choice::{ChoiceLive, MAX_CHOICES};
 use super::dictation::{
     DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS, SUBMIT_PHRASES,
     VOICE_OFF_PHRASES, opening_with, strip_opening,
@@ -123,6 +123,15 @@ pub struct ResolvedParam {
     /// deck, which has no remote address to change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deck_identity: Option<VoiceDeckIdentity>,
+    /// PRD #1261 — on an OFFERED candidate of a
+    /// [`VoiceOutcome::ParamAmbiguous`] alone, every name the entry answers
+    /// to ([`super::choice::names_of`], the per-kind list
+    /// [`super::choice::answer`] matches a spoken answer against), so a
+    /// runtime with no Rust behind it answers the choice by the same names
+    /// (`answerChoiceLocally` in `voiceChoice.ts`) rather than by the label
+    /// alone or by `value`. Empty everywhere else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
 }
 
 /// PRD #1195 — a `[[endpoints.remote]]` row's address as it stood when voice
@@ -324,6 +333,19 @@ impl VoiceOutcome {
             *params = resolved.to_vec();
         }
         self.with_reports(row)
+    }
+
+    /// PRD #1261 — each offered candidate of a
+    /// [`VoiceOutcome::ParamAmbiguous`] with its [`ResolvedParam::names`],
+    /// read from `live` — the state it was resolved against. Every other
+    /// outcome is returned as it was.
+    fn named(mut self, live: &ChoiceLive) -> Self {
+        if let VoiceOutcome::ParamAmbiguous { candidates, .. } = &mut self {
+            for candidate in candidates.iter_mut() {
+                candidate.names = super::choice::names_of(candidate.kind, &candidate.value, live);
+            }
+        }
+        self
     }
 
     /// PRD #1261 — each candidate's report, as a dispatch of it would render
@@ -944,7 +966,14 @@ pub async fn handle_utterance_with_dictation(
                 // LAST param, where everything a chosen candidate is
                 // dispatched beside has already resolved.
                 let last = row.params.last().is_some_and(|last| last.name == spec.name);
-                let refusal = unmet.refusal(transcript, row, spec, spoken);
+                let refusal = unmet
+                    .refusal(transcript, row, spec, spoken)
+                    .named(&ChoiceLive {
+                        agents,
+                        decks,
+                        directories,
+                        new_agent,
+                    });
                 return finish(refusal.offered_beside(row, &resolved, last));
             }
         }
@@ -1262,6 +1291,7 @@ fn implied_param(spec: &super::table::ParamSpec, decks: &[VoiceDeck]) -> Option<
         value: only.id.clone(),
         label: only.label.clone(),
         deck_identity: None,
+        names: Vec::new(),
     })
 }
 
@@ -1369,11 +1399,15 @@ fn said(spoken: &str, transcript: &str) -> bool {
 ///
 /// # The bound
 ///
-/// What this guarantees: a voice switch goes only to a deck that the user's
-/// own words, read with the resolver's matching, named and named alone — and
-/// only when the model's value resolves to that same deck (words the user
-/// said, or that deck's own label). So neither the model nor text injected into what it reads can
-/// choose a deck the user did not name.
+/// What this guarantees: a DIRECT voice switch goes only to a deck that the
+/// user's own words, read with the resolver's matching, named and named alone
+/// — and only when the model's value resolves to that same deck (words the
+/// user said, or that deck's own label). Where the words named several decks
+/// ([`Unmet::NamedSeveral`]) or a tie that includes the model's pick
+/// ([`Unmet::AmbiguousAsSaid`]), nothing switches: a numbered choice is offered
+/// among the decks the user's words named (PRD #1261), and only the user's
+/// explicit answer picks one. So neither the model nor text injected into what
+/// it reads can choose a deck the user did not name.
 ///
 /// What remains, deliberately: the user names one deck while EXCLUDING it in
 /// words outside [`CONTRAST_MARKERS`] ("switch to the build box, it's broken,
@@ -1546,8 +1580,9 @@ fn said_as_a_name(spoken: &str, transcript: &str, decks: &[VoiceDeck]) -> bool {
 /// **Closed on purpose, and not chased further.** Natural-language exclusion
 /// is unbounded, so no list catches every way to say it; what this list buys
 /// is refusing the common phrasings outright. The security property does not
-/// rest on it — it rests on rule 1 and rule 4, which keep a switch to a deck
-/// the user's own words named on their own (see [`switch_target`]'s bound).
+/// rest on it — it rests on rule 1 and rule 4, which keep a direct switch to a
+/// deck the user's own words named on their own, and a choice to the decks
+/// they named (see [`switch_target`]'s bound).
 const CONTRAST_MARKERS: [&str; 27] = [
     "not",
     "no",
@@ -1719,6 +1754,7 @@ fn resolve_param(
         value,
         label,
         deck_identity: None,
+        names: Vec::new(),
     };
     match spec.kind {
         // The fidelity guarantee (PRD #802 D6, rebuilt), and it is checked
@@ -1976,6 +2012,7 @@ fn local_intercept(
             value: typed.to_string(),
             label: typed.to_string(),
             deck_identity: None,
+            names: Vec::new(),
         }],
     ))
 }
@@ -2069,6 +2106,7 @@ fn dictation_intercept(
             value: typed.to_string(),
             label: typed.to_string(),
             deck_identity: None,
+            names: Vec::new(),
         }],
     ))
 }
@@ -2607,6 +2645,7 @@ fn offered(
             value: candidate.value.clone(),
             label: candidate.label.clone(),
             deck_identity: None,
+            names: Vec::new(),
         })
         .collect()
 }
@@ -3797,6 +3836,7 @@ mod tests {
                     value: "deck-local".to_string(),
                     label: "Local deck".to_string(),
                     deck_identity: None,
+                    names: Vec::new(),
                 }],
                 // Named, because the user did not name it: a wrong guess is
                 // heard rather than found later on a deck they did not choose.
@@ -3846,6 +3886,7 @@ mod tests {
                 value: "deck-build".to_string(),
                 label: "deploy@build-box.example.com:2222".to_string(),
                 deck_identity: None,
+                names: Vec::new(),
             }]
         );
     }
@@ -4224,6 +4265,7 @@ mod tests {
                     value: "/home/dev/code/billing-api".to_string(),
                     label: "billing-api".to_string(),
                     deck_identity: None,
+                    names: Vec::new(),
                 }],
                 sentence: "Opening billing-api.".to_string(),
             }
@@ -4562,6 +4604,7 @@ mod tests {
                         value: "a-1".to_string(),
                         label: "dot-agent-deck-orchestrator-1".to_string(),
                         deck_identity: None,
+                        names: Vec::new(),
                     }],
                     sentence: "Confirm closing dot-agent-deck-orchestrator-1 \u{2014} nothing has \
                                been stopped yet."
@@ -5420,6 +5463,7 @@ mod tests {
                     value: "dispatcher".to_string(),
                     label: "dispatcher".to_string(),
                     deck_identity: None,
+                    names: Vec::new(),
                 }],
                 sentence: "Mode: dispatcher.".to_string(),
             }
@@ -6331,6 +6375,36 @@ mod tests {
         );
     }
 
+    /// Scenario: "open Atlas" matches two agents both shown as Atlas. Each
+    /// offered candidate carries every name its agent answers to — the list
+    /// the Rust choice answer matches against — so the webview's fallback can
+    /// answer by the agent's ID or role and never has to read `value`.
+    #[tokio::test]
+    async fn voice_outcome_offered_agent_candidates_carry_their_spoken_names() {
+        let agents = vec![
+            role_agent("planner", "Atlas"),
+            role_agent("builder", "Atlas"),
+        ];
+        let resolver = StubResolver::new().answering(
+            "open Atlas",
+            IntentAnswer::new("open_agent").with_param("agent", "Atlas"),
+        );
+        let outcome = run(&resolver, Screen::Deck, &agents, "open Atlas").await;
+        let VoiceOutcome::ParamAmbiguous { candidates, .. } = &outcome else {
+            panic!("expected an ambiguous param, got {outcome:?}");
+        };
+        assert_eq!(candidates.len(), 2);
+        for (candidate, agent) in candidates.iter().zip(&agents) {
+            assert_eq!(candidate.value, agent.id);
+            assert_eq!(candidate.names, spoken_names(agent));
+            assert!(candidate.names.contains(&agent.id), "{candidate:?}");
+        }
+        assert_eq!(
+            serde_json::to_value(&candidates[0]).expect("serializes")["names"],
+            serde_json::json!(spoken_names(&agents[0]))
+        );
+    }
+
     #[tokio::test]
     async fn voice_outcome_ambiguity_sentence_summarises_a_long_list() {
         let agents: Vec<DesktopAgent> = (1..=5)
@@ -6521,6 +6595,7 @@ mod tests {
             value: name.to_string(),
             label: label.to_string(),
             deck_identity: None,
+            names: Vec::new(),
         };
 
         // The hostile case: the first label names the second param.
@@ -6587,6 +6662,7 @@ mod tests {
             value: "1".to_string(),
             label: "tester".to_string(),
             deck_identity: None,
+            names: Vec::new(),
         };
         assert_eq!(report(&row, &[param]), "Opening tester.");
     }
@@ -6665,6 +6741,7 @@ mod tests {
             value: "1".to_string(),
             label: "tester".to_string(),
             deck_identity: None,
+            names: Vec::new(),
         };
         let variants = vec![
             VoiceOutcome::Dispatch {
@@ -6756,6 +6833,7 @@ mod tests {
                 value: "1".to_string(),
                 label: "tester".to_string(),
                 deck_identity: None,
+                names: Vec::new(),
             }],
             sentence: "Opening tester.".to_string(),
         };
@@ -8475,6 +8553,7 @@ mod tests {
                 value: "deck-build".to_string(),
                 label: "deploy@build-box".to_string(),
                 deck_identity: None,
+                names: Vec::new(),
             }],
         };
         let value = |outcome: &VoiceOutcome| match outcome {
