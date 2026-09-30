@@ -239,6 +239,18 @@ test.describe("the voice row is reserved space", () => {
     await expect(stop).toBeFocused();
   });
 
+  /** Scenario: the browser fixture enters typing mode in a writable agent pane, then hears a punctuated stop command. It ends the mode without typing those command words into the pane. */
+  test("a spoken punctuated stop ends typing mode without typing it", async ({ page }) => {
+    await openWithSpeech(page, "/?fixture=1&state=crowded&voice=type%20on&voice=stop%20typing.");
+    await page.getByRole("button", { name: "Open coder agent" }).click();
+    await voiceButton(page).click();
+
+    await expect(page.getByTestId("voice-report")).toContainText("Typing mode off. Nothing was sent to coder.");
+    await expect(page.getByTestId("voice-dictating")).toHaveCount(0);
+    await expect(page.getByTestId("voice-report")).not.toContainText("Typed:");
+    await expect(voiceButton(page)).toHaveAttribute("aria-pressed", "true");
+  });
+
   /**
    * Scenario: let the speech fixture's utterance navigate to the overview, then
    * look at the row it reported in. The Undo beside the sentence is hit-testable
