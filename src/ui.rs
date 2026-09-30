@@ -5828,6 +5828,47 @@ fn adopt_surfaced_context_path(
     }
 }
 
+/// Issue #1395 (Qodo on PR #1444): a surface whose role panes a tab already
+/// owns is otherwise dropped whole, and with it any context path it carries.
+/// That loses the path when startup hydration built the tab from a record
+/// listed before the daemon recorded the start role's path, and the start
+/// role's surface — the one carrying it — arrives afterwards: the tab would
+/// then re-arm from the shared mirror for its whole life.
+///
+/// So adopt the path here, but only into a tab that (a) owns one of this
+/// surface's role panes, (b) is the same orchestration instance by
+/// [`TabManager::orchestration_tab_is`], and (c) has no path yet. Never
+/// overwrite one: a tab that already knows its file learned it from the
+/// daemon's own record at hydration, from its start, or from a later re-arm
+/// publish, and a surface queued before any of those is no newer.
+fn adopt_context_path_into_owning_tab(
+    tab_manager: &mut TabManager,
+    surface: &OrchestrationSurface,
+) {
+    let Some(path) = surface.context_path.as_deref() else {
+        return;
+    };
+    let owner = surface.roles.iter().find_map(|r| {
+        tab_manager.tab_index_for_pane(&r.pane_id).filter(|&i| {
+            tab_manager.orchestration_tab_is(
+                i,
+                &surface.cwd,
+                &surface.name,
+                surface.orchestration_id.as_deref(),
+            )
+        })
+    });
+    let Some(owner) = owner else {
+        return;
+    };
+    if let Some(Tab::Orchestration {
+        context_path: None, ..
+    }) = tab_manager.tabs().get(owner)
+    {
+        tab_manager.set_orchestration_context_path(owner, Some(PathBuf::from(path)));
+    }
+}
+
 /// Build one live orchestration tab from a daemon [`OrchestrationSurface`].
 /// Idempotent on the role pane ids, so a duplicate broadcast (or a race with a
 /// reconnect that already hydrated the tab) doesn't double-build.
@@ -5849,6 +5890,7 @@ fn surface_one_orchestration(
         .iter()
         .any(|r| tab_manager.tab_index_for_pane(&r.pane_id).is_some());
     if already_built {
+        adopt_context_path_into_owning_tab(tab_manager, &surface);
         tracing::debug!(
             cwd = %surface.cwd,
             orchestration = %surface.name,
@@ -24120,6 +24162,86 @@ mod tests {
             Some(own.as_path()),
             "a surface without a path must not clear the tab's own"
         );
+    }
+
+    /// Issue #1395 (Qodo on PR #1444): a start role's surface that arrives
+    /// after startup hydration already built its tab — from a record listed
+    /// before the daemon recorded the path — takes that path into the tab,
+    /// rather than being dropped whole by the already-built guard. It never
+    /// overwrites a path the tab already holds, and never lands in a tab of a
+    /// different orchestration instance that happens to own the pane id.
+    #[test]
+    fn an_already_built_tab_adopts_a_late_surfaced_context_path_only_when_unset() {
+        let cfg = OrchestrationConfig {
+            default: false,
+            name: "team".to_string(),
+            roles: vec![OrchestrationRoleConfig {
+                agent: None,
+                name: "orchestrator".to_string(),
+                command: "cat".to_string(),
+                start: true,
+                description: None,
+                prompt_template: None,
+                clear: false,
+            }],
+        };
+        let open = |orchestration_id: Option<&str>| {
+            let mut tm = TabManager::new(Arc::new(CapturingPaneController::new()));
+            let (tab_index, _) = tm
+                .open_orchestration_tab_with_existing_role_panes(
+                    &cfg,
+                    "/work",
+                    vec![Some("lead".into())],
+                    None,
+                    orchestration_id,
+                )
+                .expect("open the tab");
+            (tm, tab_index)
+        };
+        let tab_path = |tm: &TabManager, i: usize| match &tm.tabs()[i] {
+            Tab::Orchestration { context_path, .. } => context_path.clone(),
+            _ => panic!("expected an orchestration tab"),
+        };
+        let own = "/work/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        let other =
+            "/work/.dot-agent-deck/orchestrator-context-fedcba9876543210fedcba9876543210.md";
+        let surface =
+            |orchestration_id: Option<&str>, context_path: Option<&str>| OrchestrationSurface {
+                name: "team".into(),
+                cwd: "/work".into(),
+                display_title: None,
+                orchestration_id: orchestration_id.map(str::to_string),
+                roles: vec![crate::event::OrchestrationSurfaceRole {
+                    pane_id: "lead".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                }],
+                context_path: context_path.map(str::to_string),
+            };
+
+        // Hydration built the tab with no path; the start role's surface
+        // carries one: adopted.
+        let (mut tm, i) = open(Some("inst-a"));
+        adopt_context_path_into_owning_tab(&mut tm, &surface(Some("inst-a"), Some(own)));
+        assert_eq!(tab_path(&tm, i), Some(PathBuf::from(own)));
+
+        // The tab already knows its file: a surface never overwrites it.
+        adopt_context_path_into_owning_tab(&mut tm, &surface(Some("inst-a"), Some(other)));
+        assert_eq!(tab_path(&tm, i), Some(PathBuf::from(own)));
+
+        // A surface of another orchestration instance naming the same pane id
+        // (a reused slot) leaves this tab alone.
+        let (mut tm, i) = open(Some("inst-a"));
+        adopt_context_path_into_owning_tab(&mut tm, &surface(Some("inst-b"), Some(own)));
+        assert_eq!(tab_path(&tm, i), None);
+        adopt_context_path_into_owning_tab(&mut tm, &surface(None, Some(own)));
+        assert_eq!(tab_path(&tm, i), None);
+
+        // A surface with no path changes nothing.
+        let (mut tm, i) = open(None);
+        adopt_context_path_into_owning_tab(&mut tm, &surface(None, None));
+        assert_eq!(tab_path(&tm, i), None);
     }
 
     /// Issue #717: the close-confirmation preview asks the daemon about EVERY

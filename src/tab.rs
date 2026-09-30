@@ -1437,24 +1437,26 @@ impl TabManager {
         name: &str,
         orchestration_id: Option<&str>,
     ) -> Option<usize> {
-        self.tabs.iter().position(|t| match t {
-            Tab::Orchestration {
-                cwd: c,
-                config,
-                orchestration_id: tab_id,
-                ..
-            } => {
-                if c != cwd || resolve_orchestration_name(&config.name, Path::new(c)) != name {
-                    return false;
-                }
-                match (orchestration_id, tab_id.as_deref()) {
-                    (Some(a), Some(b)) => a == b,
-                    (None, None) => true,
-                    _ => false,
-                }
-            }
-            _ => false,
-        })
+        self.tabs
+            .iter()
+            .position(|t| tab_is_orchestration(t, cwd, name, orchestration_id))
+    }
+
+    /// Whether the tab at `index` is the orchestration `(cwd, name,
+    /// orchestration_id)` names, by exactly the matching rule of
+    /// [`Self::orchestration_tab_index_for`]. For a caller that already knows
+    /// WHICH tab (by a pane it owns) and must confirm it is the same instance
+    /// rather than find the first one that is.
+    pub fn orchestration_tab_is(
+        &self,
+        index: usize,
+        cwd: &str,
+        name: &str,
+        orchestration_id: Option<&str>,
+    ) -> bool {
+        self.tabs
+            .get(index)
+            .is_some_and(|t| tab_is_orchestration(t, cwd, name, orchestration_id))
     }
 
     /// PRD #92 F4: close an orchestration tab and return a
@@ -1698,6 +1700,29 @@ impl TabManager {
             }
         }
         None
+    }
+}
+
+/// The identity rule behind [`TabManager::orchestration_tab_index_for`] and
+/// [`TabManager::orchestration_tab_is`]; that method's doc has the reasoning.
+fn tab_is_orchestration(tab: &Tab, cwd: &str, name: &str, orchestration_id: Option<&str>) -> bool {
+    match tab {
+        Tab::Orchestration {
+            cwd: c,
+            config,
+            orchestration_id: tab_id,
+            ..
+        } => {
+            if c != cwd || resolve_orchestration_name(&config.name, Path::new(c)) != name {
+                return false;
+            }
+            match (orchestration_id, tab_id.as_deref()) {
+                (Some(a), Some(b)) => a == b,
+                (None, None) => true,
+                _ => false,
+            }
+        }
+        _ => false,
     }
 }
 
