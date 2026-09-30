@@ -1093,11 +1093,18 @@ fn heading_anchors_follow_the_github_convention() {
     assert_eq!(anchors, expected);
 }
 
-/// The GitHub-rendered installation guide: the one link on the landing page for
-/// a person who would rather install by hand, readable where the published
-/// Markdown is raw.
+/// Where a docs page is readable as GitHub renders it. The site serves the docs
+/// as raw Markdown for agents, so a link offered to a person goes here instead.
+const RENDERED_DOCS_PREFIX: &str = "https://github.com/vfarcic/dot-agent-deck/blob/main/docs/";
+
+/// The GitHub-rendered installation guide: the link on the landing page for a
+/// person who would rather install by hand.
 const INSTALLATION_GUIDE_URL: &str =
     "https://github.com/vfarcic/dot-agent-deck/blob/main/docs/installation.md";
+
+/// The GitHub-rendered desktop app page, linked from the clients section.
+const DESKTOP_PAGE_URL: &str =
+    "https://github.com/vfarcic/dot-agent-deck/blob/main/docs/desktop/index.md";
 
 #[test]
 fn the_real_landing_page_hands_off_to_the_docs_in_plain_html() {
@@ -1191,6 +1198,22 @@ fn the_real_landing_page_hands_off_to_the_docs_in_plain_html() {
         1,
         "the raw installation page is linked outside the docs list"
     );
+    // The desktop app is read about on its rendered page, once, from its card;
+    // its raw page is linked only from the docs list.
+    assert_eq!(
+        outside_list
+            .matches(&format!(
+                "<a href=\"{DESKTOP_PAGE_URL}\">Read about the desktop app →</a>"
+            ))
+            .count(),
+        1,
+        "the desktop app card lost its link to the rendered page"
+    );
+    assert_eq!(
+        html.matches("href=\"/docs/desktop/index.md").count(),
+        1,
+        "the raw desktop page is linked outside the docs list"
+    );
     let pages = published_docs::read(&config.docs_dir).unwrap();
     for page in &pages {
         assert!(
@@ -1199,6 +1222,28 @@ fn the_real_landing_page_hands_off_to_the_docs_in_plain_html() {
             page.slug
         );
     }
+    // Outside the docs list, a person is never linked to raw Markdown: every
+    // .md link is a GitHub-rendered page, and names a published one.
+    let mut rendered = 0;
+    for href in outside_list.split("href=\"").skip(1) {
+        let href = &href[..href.find('"').unwrap()];
+        let path = href.split(['#', '?']).next().unwrap();
+        if !path.ends_with(".md") {
+            continue;
+        }
+        let file = path
+            .strip_prefix(RENDERED_DOCS_PREFIX)
+            .unwrap_or_else(|| panic!("`{href}` links a person to raw Markdown"));
+        assert!(
+            pages.iter().any(|page| page.file_name() == file),
+            "`{href}` is not a published page"
+        );
+        rendered += 1;
+    }
+    assert!(
+        rendered > 0,
+        "no rendered docs link found outside the docs list"
+    );
     assert!(!html.contains("{{"));
     assert!(!html.contains("docs/develop"));
     assert!(site.files.contains_key("landing.css"));

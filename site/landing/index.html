@@ -5,11 +5,17 @@
 
   This file is a TEMPLATE. `cargo xtask site` (xtask/site) reads it and
   replaces two kinds of placeholder, each written between double curly
-  braces, so every docs link on the page comes from docs/published.toml and a
-  link to a page that is not published fails the build:
+  braces, so every link to a page on this site comes from docs/published.toml
+  and a link to a page that is not published fails the build:
 
     doc:<slug> or doc:<slug>#<anchor>   the URL of that published page
     docs-index                          one <li> per published page
+
+  The site serves the docs as raw Markdown, for agents. A link offered to a
+  person outside the "For agents" band goes to the page as GitHub renders it
+  (github.com/.../blob/main/docs/...) instead; those URLs are written out
+  here, and the build's link check skips them as external; the landing-page
+  test in xtask/site checks that each one names a published page.
 
   Every docs link is a plain <a href> in the served HTML, not inserted by
   script, because an agent fetching this page reads it as served (PRD #1419
@@ -146,7 +152,7 @@
           <img src="/img/dashboard-desktop.png" loading="lazy" alt="The desktop app’s dashboard with four agents in one daemon section, each row showing its status, name and uptime">
           <h3>Desktop app (alpha)</h3>
           <p>A native window for macOS on Apple Silicon and Linux amd64: one dashboard over several daemons at once — this machine and remote ones — with each agent’s terminal a click away, and voice control. It connects to a running daemon and starts none of its own.</p>
-          <p class="clientLink"><a href="{{doc:desktop/index}}">Read about the desktop app →</a></p>
+          <p class="clientLink"><a href="https://github.com/vfarcic/dot-agent-deck/blob/main/docs/desktop/index.md">Read about the desktop app →</a></p>
         </article>
       </div>
     </section>
