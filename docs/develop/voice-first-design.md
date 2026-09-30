@@ -173,6 +173,8 @@ The words that stay live in the mode are lists in `voice/dictation.rs`, matched 
 | `VOICE_OFF_PHRASES` | `voice_off` | in the mode only — in `Idle` the model answers `voice_off` from its description |
 | `SUBMIT_PHRASES`, plus `submit_prompt`'s `heard_as_whole` entries | `submit_prompt` | in the mode; `SUBMIT_PHRASES` in `Idle` too |
 
+The browser preview's fixture (`resolveFixtureVoice` in `desktop/src/data/fixture.ts`) carries copies of these lists on its `voice_off`, `dictation_on`, `dictation_off` and `submit_prompt` rows, matched by the same whole-utterance rule with the same politeness words. `desktop/src/data/fixture.test.ts` reads the Rust lists out of `dictation.rs`, `outcome.rs` and `commands.toml` and fails on a phrase missing from either side, so a list edit in Rust has to be made in the fixture too.
+
 **Each phrase in the set is a phrase the user cannot dictate alone**, and that is the cost the whole design is priced in. Said inside a longer utterance it is typed; said on its own it acts. Three classes today — stop typing, stop listening, send — and adding a fourth is a decision recorded in the PRD that adds it, not a list edit. Linkage-check rule 14 holds two properties over the lists: every phrase in each list appears in its row's `description` (so a phrase the fast path answers is one the model was told about, and the phrase fixtures pin the model's `Idle` answer for the voice-off phrases the model owns there), and the lists — the four above and `DICTATION_OPENERS` — are pairwise disjoint, so the order they are checked in is never load-bearing.
 
 ### Classification order

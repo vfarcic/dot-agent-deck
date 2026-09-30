@@ -1034,7 +1034,7 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
  * the voice surface as a peer dialog, so the question is askable and the row is
  * here to answer it.
  */
-const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
+export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   readonly phrases: readonly string[];
   readonly action: string;
   readonly invoke: string;
@@ -1110,7 +1110,10 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     // matcher is `screens.includes(screen)`, so an empty array here would mean
     // the opposite of what an empty column means in `commands.toml`; spelling
     // the three out is what keeps the preview and the table agreeing.
-    phrases: ["voice off", "turn off the voice", "stop listening"],
+    //
+    // The phrases are `voice::dictation::VOICE_OFF_PHRASES`, all of them —
+    // `fixture.test.ts` compares this row with the Rust list.
+    phrases: ["voice off", "turn off the voice", "turn voice off", "stop listening", "stop voice control", "stop voice", "mute", "mic off"],
     action: "voice_off",
     invoke: "stopVoice",
     screens: ["deck", "overview", "agent"],
@@ -1157,10 +1160,10 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Typed.",
   },
   {
-    // PRD #1260 — the dictation mode's switches, whole-utterance equality like
-    // the real fast path (`voice::dictation::DICTATION_ON_PHRASES` and
-    // `DICTATION_OFF_PHRASES`), and ahead of the opener row in effect because
-    // the matcher tries equality first.
+    // PRD #1260 — the dictation mode's switches, the real fast path's lists
+    // (`voice::dictation::DICTATION_ON_PHRASES` and `DICTATION_OFF_PHRASES`)
+    // matched by its whole-utterance rule ({@link fixtureSaidWhole}) ahead of
+    // the opener row, as `local_intercept` checks them.
     phrases: ["type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing"],
     action: "dictation_on",
     invoke: "startDictation",
@@ -1177,11 +1180,18 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Stopped typing.",
   },
   {
-    // Whole-utterance equality, which is what the phrase matcher already is —
-    // the real fast path draws the same line, and for the reason its own
-    // constant documents at length: a trailing rule would submit "the meeting
-    // is at the" when somebody said "type the meeting is at the end".
-    phrases: ["end", "send", "send it", "submit", "enter", "press enter"],
+    // Whole-utterance equality ({@link fixtureSaidWhole}) — the real fast path
+    // draws the same line, and for the reason its own constant documents at
+    // length: a trailing rule would submit "the meeting is at the" when
+    // somebody said "type the meeting is at the end".
+    //
+    // `voice::dictation::SUBMIT_PHRASES` together with `submit_prompt`'s
+    // `heard_as_whole` entries in `commands.toml`, which is the set the mode
+    // answers ("go ahead" is one); `fixture.test.ts` compares this row with both.
+    phrases: [
+      "end", "send", "send it", "submit", "enter", "press enter",
+      "submit it", "go ahead", "that is the end", "finished", "the prompt is finished",
+    ],
     action: "submit_prompt",
     invoke: "submitAgentPrompt",
     screens: ["agent"],
@@ -1263,10 +1273,10 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
   const stub = { resolveMs: null, backend: "stub" } as const;
   /* PRD #1260 — while the dictation mode is on the real pipeline asks no model
      and matches only the reserved whole utterances, typing everything else
-     whole. The same rule here, over this module's own rows. */
+     whole. The same rule here, over this module's own rows, in
+     `dictation_intercept`'s order: the biggest stop first. */
   if (dictating) {
-    const reserved = FIXTURE_VOICE_COMMANDS.find((candidate) =>
-      ["voice_off", "dictation_off", "submit_prompt"].includes(candidate.action) && candidate.phrases.includes(spoken));
+    const reserved = fixtureReserved(utterance, ["voice_off", "dictation_off", "submit_prompt"]);
     const text = utterance.trim();
     return {
       ...stub,
@@ -1282,7 +1292,11 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
         },
     };
   }
-  if (FIXTURE_VOICE_TIE.phrases.includes(spoken)) {
+  /* Outside the mode `local_intercept` answers the switches and a submit by
+     the same whole-utterance rule, ahead of the `type` opener — "type on"
+     opens with `type` and would otherwise type the word "on". */
+  const reserved = fixtureReserved(utterance, ["dictation_on", "dictation_off", "submit_prompt"]);
+  if (!reserved && FIXTURE_VOICE_TIE.phrases.includes(spoken)) {
     const hint = "opening an agent works from the Daemons screen or the agent dashboard";
     if (!FIXTURE_VOICE_TIE.screens.includes(screen)) {
       return { ...stub, outcome: { kind: "unavailable", transcript: utterance, action: "open_agent", hint, sentence: `Not here — ${hint}.` } };
@@ -1306,7 +1320,8 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
       },
     };
   }
-  const command = FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.phrases.includes(spoken))
+  const command = reserved
+    ?? FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.phrases.includes(spoken))
     ?? FIXTURE_VOICE_COMMANDS.find((candidate) => (candidate.openers ?? []).some((opener) => fixtureOpening(utterance, opener) !== undefined));
   if (!command) {
     return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
@@ -1336,6 +1351,45 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
       sentence: text === undefined ? command.report : `Typed: “${text}”.`,
     },
   };
+}
+
+/**
+ * `voice::outcome::WHOLE_UTTERANCE_POLITENESS` — words that may open or close a
+ * reserved phrase without making it a different request ("okay, send it
+ * please"). Only these, and only at the edges; `fixture.test.ts` says every
+ * one of them on both edges of every reserved phrase.
+ */
+const FIXTURE_WHOLE_UTTERANCE_POLITENESS: readonly string[] = [
+  "okay", "ok", "alright", "yes", "yeah", "please", "just", "now", "thanks",
+];
+
+/** `voice::table::spoken_words`: lowercased runs of letters and digits, so a transcriber's case and punctuation decide nothing. */
+function fixtureSpokenWords(text: string): string[] {
+  return text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((word) => word !== "");
+}
+
+/**
+ * `voice::outcome::said_whole`: the utterance's words less any edge politeness
+ * word ARE one of `phrases`. Never a prefix or a suffix test, so "please send
+ * it to the tester later" is not a send.
+ */
+function fixtureSaidWhole(utterance: string, phrases: readonly string[]): boolean {
+  const words = fixtureSpokenWords(utterance);
+  const polite = (word: string) => FIXTURE_WHOLE_UTTERANCE_POLITENESS.includes(word);
+  const start = words.findIndex((word) => !polite(word));
+  if (start < 0) return false;
+  const end = words.length - [...words].reverse().findIndex((word) => !polite(word));
+  const said = words.slice(start, end).join(" ");
+  return phrases.some((phrase) => fixtureSpokenWords(phrase).join(" ") === said);
+}
+
+/** The first of `actions`, in order, whose row's phrases the whole utterance is. */
+function fixtureReserved(utterance: string, actions: readonly string[]): (typeof FIXTURE_VOICE_COMMANDS)[number] | undefined {
+  for (const action of actions) {
+    const row = FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.action === action);
+    if (row && fixtureSaidWhole(utterance, row.phrases)) return row;
+  }
+  return undefined;
 }
 
 /**
