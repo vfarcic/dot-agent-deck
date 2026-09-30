@@ -678,9 +678,9 @@ pub(crate) fn own_context_file_name<'a>(
     (context_path.parent() == Some(context_dir_of(project_dir).as_path())).then_some(name)
 }
 
-/// Read `<project_dir>/.dot-agent-deck/<name>` for a re-arm, **bounded, never
-/// following a link at the last two components, and never blocking on a
-/// non-regular file** (issue #1395 audit round 2).
+/// Read `<project_dir>/.dot-agent-deck/<name>` for a re-arm, **bounded on every
+/// platform, and on Unix never following a link at the last two components nor
+/// blocking on a non-regular file** (issue #1395 audit round 2).
 ///
 /// On Unix: the project directory is opened once ([`open_project_dir`], which
 /// follows a symlinked project path as every other publish step does),
