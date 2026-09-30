@@ -114,7 +114,7 @@ Four things step 6 surfaced, all worth knowing before doing it again elsewhere:
 
 ## Renovate and automerge
 
-`renovate.json` automerges five groups on green CI: Rust patch crates, Rust minors on crates already at 1.0, devbox packages, GitHub Actions, and the docs-site npm dependencies. Renovate merges these itself — PR #426 was merged by `renovate[bot]`, not by a human — so the ruleset applies to it like any other actor.
+Four `packageRules` in `renovate.json` set `automerge: true`, so these merge on green CI: Rust patch crates, Rust minors on crates already at 1.0, devbox packages, and GitHub Actions. (A fifth, the docs site's npm dependencies, went with Docusaurus in PRD #1419.) Renovate merges these itself — PR #426 was merged by `renovate[bot]`, not by a human — so the ruleset applies to it like any other actor.
 
 **Renovate is a GitHub App, not a collaborator.** The `RepositoryRole: admin` bypass does not cover it; apps are a separate `actor_type` (`Integration`). That distinction is the whole hazard:
 

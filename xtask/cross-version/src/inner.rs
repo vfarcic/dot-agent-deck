@@ -37,11 +37,14 @@ pub(crate) const DAEMON_TIMEOUT: Duration = Duration::from_secs(45);
 /// between and there is nothing specific to poll for.
 pub(crate) const SETTLE: Duration = Duration::from_millis(400);
 
-/// The button the deck's footer draws only in command mode — see
-/// [`focus_role`]. Either TUI can be the one focusing (forward: the branch;
+/// The button the deck's footer draws only in command mode — [`footer_mode`]'s
+/// second spelling of it. Either TUI can be the one focusing (forward: the branch;
 /// reverse: the previous release), and #1045 renamed the button from "New
 /// Pane" to "New Agent", so both spellings count.
 const COMMAND_MODE_BUTTONS: [&str; 2] = ["[New Agent Ctrl+N]", "[New Pane Ctrl+N]"];
+/// The deck's own experimental-flag label, drawn alone on the screen's last
+/// row below the footer — see [`footer_mode`].
+const EXPERIMENTAL_LABEL: &str = "experimental: on";
 /// How long the daemon gets after its one SIGTERM. Well past its 3 s agent
 /// grace (`AGENT_TERMINATE_GRACE`).
 pub(crate) const DAEMON_GRACE: Duration = Duration::from_secs(20);
@@ -1167,8 +1170,17 @@ fn scenario(
     ));
 
     println!("xver (inner): step 3 — Ctrl+D, Ctrl+C, Detach (never Stop)");
-    setup_tui.send(b"\x04"); // Ctrl+D — leave PaneInput. Without this Ctrl+C goes
-    std::thread::sleep(SETTLE); // to the focused PANE and kills a role.
+    // Leave PaneInput first: there Ctrl+C goes to the focused PANE and kills a
+    // role. Read off the footer rather than assumed, because Ctrl+D toggles —
+    // from command mode it would enter the pane instead (issue #1392).
+    if !ensure_command_mode(&setup_tui) {
+        return Err(Abort::Scenario(format!(
+            "the {} TUI never showed a COMMAND footer, so Ctrl+C was not sent: in PaneInput it \
+             would kill the focused role.\n=== grid ===\n{}",
+            cast.daemon_side,
+            setup_tui.grid()
+        )));
+    }
     setup_tui.send(b"\x03"); // Ctrl+C — the quit dialog
     if !setup_tui.wait_for_grid_string("Quit dot-agent-deck?", UI_TIMEOUT) {
         return Err(Abort::Scenario(format!(
@@ -2817,21 +2829,97 @@ fn open_orchestration(deck: &pty::PtyDeck) -> Result<(), String> {
     Ok(())
 }
 
+/// Which of its two keyboard modes the deck's footer says it is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FooterMode {
+    /// Keystrokes drive the deck: a digit is a card jump.
+    Command,
+    /// `PaneInput`: keystrokes are written to the focused pane's PTY.
+    Typing,
+}
+
+/// Read the deck's current keyboard mode off the grid's bottom row.
+///
+/// Since PRD #341 the footer opens with a mode chip, ` COMMAND ` or ` TYPING `
+/// (`CHIP_COMMAND` / `CHIP_TYPING` in `src/ui.rs`), and it states the mode the
+/// last painted frame was drawn in — which is the whole point: `Ctrl+D` is a
+/// TOGGLE (issue #88 made it re-enter the pane from command mode), so what a
+/// keystroke will do depends on this and nothing else. The command-mode button
+/// bar is accepted as a second spelling of `Command`, for a build whose chip is
+/// missing. `None` when the row carries neither, e.g. the inline Filter/Rename
+/// prompts, which draw no chip.
+///
+/// The deck reserves the screen's last row for its `experimental: on` label
+/// (`render_experimental_footer`), blank when the flag is off, so with
+/// `--experimental` the footer is the row above that label — which is skipped
+/// the same way a blank row is.
+pub(crate) fn footer_mode(grid: &str) -> Option<FooterMode> {
+    let row = grid
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty() && l.trim() != EXPERIMENTAL_LABEL)?;
+    let head = row.trim_start();
+    if head.starts_with("TYPING") {
+        Some(FooterMode::Typing)
+    } else if head.starts_with("COMMAND")
+        || COMMAND_MODE_BUTTONS
+            .iter()
+            .any(|button| row.contains(button))
+    {
+        Some(FooterMode::Command)
+    } else {
+        None
+    }
+}
+
+/// Put the deck in command mode and prove it by the footer, sending `Ctrl+D`
+/// only when the footer says it is needed.
+///
+/// Returns whether command mode was confirmed. Each `Ctrl+D` is followed by a
+/// wait for a `COMMAND` footer, and the mode is re-read before any further
+/// press, so a slow redraw never earns a second toggle that would undo the
+/// first.
+pub(crate) fn ensure_command_mode(deck: &pty::PtyDeck) -> bool {
+    for _ in 0..3 {
+        if footer_mode(&deck.grid()) == Some(FooterMode::Command) {
+            return true;
+        }
+        deck.send(b"\x04"); // Ctrl+D: PaneInput -> command mode
+        if deck.wait_for_grid(STEP_TIMEOUT, |g| {
+            footer_mode(g) == Some(FooterMode::Command)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Give keyboard focus to `role`'s pane and leave the deck in `PaneInput` mode
 /// on it.
 ///
-/// `Ctrl+D` returns to command mode, a digit jumps to that role's card, and
-/// `focus_deck` re-enters `PaneInput` on success — so one digit both selects the
-/// pane and makes it the one keystrokes reach. `PaneLayout::Stacked` draws only
-/// the focused role's pane and fuses its title into the box corner as
-/// `┌<role>`, so that string on the settled grid is what confirms the jump
-/// landed. The digit is the role's position in the fixture, which is the card
-/// order; none of those keys is written to any pane's PTY — they are the deck's
-/// own shortcuts — so focusing a pane is not "typing into" it.
+/// From command mode a digit jumps to that role's card, and `focus_deck`
+/// re-enters `PaneInput` on success — so one digit both selects the pane and
+/// makes it the one keystrokes reach. `PaneLayout::Stacked` draws only the
+/// focused role's pane and fuses its title into the box corner as `┌<role>`, so
+/// that string together with a `TYPING` footer is what confirms the jump landed.
+/// The digit is the role's position in the fixture, which is the card order.
 ///
-/// Cycles tabs first when the deck is not on the orchestration tab: after a
-/// reattach the deck lands wherever the previous session left it, and a digit on
-/// the Dashboard tab means something else.
+/// **Command mode is read off the footer, never assumed (issue #1392).** This
+/// used to press `Ctrl+D` unconditionally and then wait for the command-mode
+/// button bar. But `Ctrl+D` toggles, and a TUI that has just attached lands in
+/// command mode — so that press took the deck INTO the orchestrator's pane, and
+/// the wait was satisfied at once by the bar still on screen from the frame
+/// BEFORE the keystroke. The digit then reached the pane's shell as input, which
+/// ran `1dot-agent-deck delegate …` and failed tells 3 and 4, deterministically
+/// on a quiet box. Measured with a footer trace on `main`: ` COMMAND ` before
+/// the press, ` TYPING ` 45 ms after it. So [`ensure_command_mode`] presses
+/// `Ctrl+D` only when the footer is not already `COMMAND`, and every wait below
+/// is for a state the keystroke CHANGES — the footer flipping — never for one
+/// that might predate it.
+///
+/// Cycles tabs when the deck is not on the orchestration tab: after a reattach
+/// the deck lands wherever the previous session left it, and a digit on the
+/// Dashboard tab means something else.
 pub(crate) fn focus_role(deck: &pty::PtyDeck, plan: &Plan, role: &str) -> Result<(), String> {
     let index = roles(plan)
         .iter()
@@ -2843,41 +2931,34 @@ pub(crate) fn focus_role(deck: &pty::PtyDeck, plan: &Plan, role: &str) -> Result
         .map(|d| b'0' + d)
         .ok_or_else(|| format!("role {role} is card {} — past the digit keys", index + 1))?;
     let expanded = format!("┌{role}");
-    for attempt in 0..6 {
-        deck.send(b"\x04"); // Ctrl+D -> command mode
-        // Wait for command mode to be PAINTED before the digit, rather than only
-        // sleeping. A fixed `SETTLE` alone lost the race on a loaded host (load
-        // average 12-20 on 16 cores, found running this harness for #1243): the
-        // digit reached the focused pane as input, the orchestrator's shell ran
-        // `1dot-agent-deck delegate …`, and tells 3 and 4 failed on `main` and
-        // on a branch alike. The full button bar is drawn only outside
-        // PaneInput mode (which shows just the dashboard button), so its
-        // `[New Agent Ctrl+N]` is a positive confirmation — the one the e2e
-        // tier's own PTY tests use after the same Ctrl+D. Bounded, and the
-        // sleep stays: a transient status message can occupy the bar's row, and
-        // then this falls back to exactly the old behaviour.
-        let _ = deck.wait_for_grid(SETTLE * 5, |g| {
-            COMMAND_MODE_BUTTONS.iter().any(|button| g.contains(button))
-        });
-        std::thread::sleep(SETTLE);
+    for _attempt in 0..6 {
+        if !ensure_command_mode(deck) {
+            // Sending the digit now could type it into a pane. Stop instead:
+            // the error names the footer the deck was actually showing.
+            break;
+        }
         deck.send(&[digit]);
-        if deck.wait_for_grid_string(&expanded, STEP_TIMEOUT) {
+        if deck.wait_for_grid(STEP_TIMEOUT, |g| {
+            footer_mode(g) == Some(FooterMode::Typing) && g.contains(&expanded)
+        }) {
             return Ok(());
         }
         // Not on the orchestration tab (or not yet rebuilt): step right one tab
-        // and try again.
-        deck.send(b"\x04");
-        std::thread::sleep(SETTLE);
+        // and try again. The arrow is a deck shortcut only in command mode, so
+        // that is established first — the digit may have focused some other
+        // pane on the way.
+        if !ensure_command_mode(deck) {
+            break;
+        }
         deck.send(b"\x1b[C");
         std::thread::sleep(SETTLE);
-        if attempt == 5 {
-            return Err(format!(
-                "could not focus the `{role}` role pane (looked for {expanded:?}).\n=== grid ===\n{}",
-                deck.grid()
-            ));
-        }
     }
-    unreachable!("the loop returns or errors on its last iteration")
+    let grid = deck.grid();
+    Err(format!(
+        "could not focus the `{role}` role pane (looked for {expanded:?} with a TYPING \
+         footer; the footer reads {:?}).\n=== grid ===\n{grid}",
+        footer_mode(&grid)
+    ))
 }
 
 /// Type `text` into the focused pane and submit it.
@@ -3000,6 +3081,51 @@ pub fn compare_hellos(old_raw: &str, new_raw: &str) -> Result<Vec<String>, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A grid whose bottom row is `footer`, under a pane whose own text could
+    /// be mistaken for a chip if the whole grid were searched.
+    fn grid_with_footer(footer: &str) -> String {
+        format!(
+            "┌orchestrator─────┐\n│$ echo COMMAND    │\n│TYPING           │\n└─────────────────┘\n{footer}\n\n"
+        )
+    }
+
+    #[test]
+    fn footer_mode_reads_the_chip_on_the_bottom_row_only() {
+        let command =
+            grid_with_footer(" COMMAND  [Back to Pane Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W]");
+        assert_eq!(footer_mode(&command), Some(FooterMode::Command));
+        let typing = grid_with_footer(
+            " TYPING  PaneInput mode — type to interact, Ctrl+d for dashboard   [Command Mode Ctrl+D]",
+        );
+        assert_eq!(footer_mode(&typing), Some(FooterMode::Typing));
+    }
+
+    #[test]
+    fn footer_mode_skips_the_experimental_label_below_the_footer() {
+        // `--experimental` puts the label on the last row, under the chip.
+        let command = grid_with_footer(
+            " COMMAND  [Back to Pane Ctrl+D] [New Agent Ctrl+N]\nexperimental: on",
+        );
+        assert_eq!(footer_mode(&command), Some(FooterMode::Command));
+        let typing =
+            grid_with_footer(" TYPING  PaneInput mode\n                experimental: on   ");
+        assert_eq!(footer_mode(&typing), Some(FooterMode::Typing));
+    }
+
+    #[test]
+    fn footer_mode_takes_the_command_button_bar_without_a_chip() {
+        let older = grid_with_footer("[Dashboard Ctrl+D] [New Pane Ctrl+N] [Close Ctrl+W]");
+        assert_eq!(footer_mode(&older), Some(FooterMode::Command));
+    }
+
+    #[test]
+    fn footer_mode_is_unknown_for_a_chipless_input_row() {
+        // The inline Filter prompt draws no chip and no button bar, so a pane
+        // above it that happens to print either word must not decide the mode.
+        assert_eq!(footer_mode(&grid_with_footer("/filter text")), None);
+        assert_eq!(footer_mode(""), None);
+    }
 
     #[test]
     fn extract_prompt_takes_the_whole_prompt_and_drops_the_carriage_returns() {

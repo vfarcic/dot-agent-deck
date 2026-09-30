@@ -380,8 +380,14 @@ fn teardown_inventory(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
     // recorded one at the recorded endpoints.
     ctx.g
         .preconnect_logged("old TUI: Stop stimulus", &plan.env, ctx.ev)?;
-    ctx.tui.send(b"\x04");
-    std::thread::sleep(inner::SETTLE);
+    // Command mode first, read off the footer: Ctrl+D toggles, and Ctrl+C in
+    // PaneInput would go to the focused pane (issue #1392).
+    if !inner::ensure_command_mode(ctx.tui) {
+        return Err(Abort::Scenario(format!(
+            "the old TUI never showed a COMMAND footer, so Ctrl+C was not sent.\n=== grid ===\n{}",
+            ctx.tui.grid()
+        )));
+    }
     ctx.tui.send(b"\x03");
     if !ctx
         .tui
