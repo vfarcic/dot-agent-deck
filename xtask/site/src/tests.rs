@@ -173,7 +173,13 @@ fn llms_txt_lists_exactly_the_manifest_pages_in_order() {
     let site = build(&fx.config).unwrap();
     let llms = site.text("llms.txt").unwrap();
     assert!(llms.starts_with("# dot-agent-deck\n\n> "), "{llms}");
+    // The landing-page prompt does not name the subcommand, so llms.txt is
+    // where an agent sent there learns of it, older-release caveat included.
     assert!(llms.contains("`dot-agent-deck docs"), "{llms}");
+    assert!(
+        llms.contains("reports an unrecognized subcommand"),
+        "{llms}"
+    );
     assert!(
         llms.contains("https://example.test/llms-full.txt"),
         "{llms}"
@@ -1004,37 +1010,19 @@ fn the_real_landing_page_hands_off_to_the_docs_in_plain_html() {
     let config = SiteConfig::from_workspace(&workspace_root());
     let site = build(&config).unwrap();
     let html = site.text("index.html").unwrap();
-    // The agent prompt, with the user's goal in a marked slot, and the
-    // visible pointer to /llms.txt. The slot is markup only: with the tags
-    // stripped, the prompt is one line of plain text naming the goal.
+    // The agent prompt, copied as is: one line of plain text, no markup and
+    // no slot to fill in, pointing the agent at /llms.txt.
     let start = html
         .find("<pre id=\"agent-prompt-text\">")
         .expect("landing page lost the agent prompt");
-    let end = start + html[start..].find("</pre>").unwrap();
-    let prompt = &html[start..end];
-    assert!(
-        prompt.contains("<mark class=\"promptSlot\">"),
-        "the prompt has no goal slot: {prompt}"
+    let body = start + "<pre id=\"agent-prompt-text\">".len();
+    let end = body + html[body..].find("</pre>").unwrap();
+    assert_eq!(
+        &html[body..end],
+        "Read https://agent-deck.devopstoolkit.ai/llms.txt, then install dot-agent-deck, \
+         set it up for me, and explain what it does and how to use it."
     );
-    let mut plain = String::new();
-    let mut in_tag = false;
-    for c in prompt.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            c if !in_tag => plain.push(c),
-            _ => {}
-        }
-    }
-    assert!(
-        plain.starts_with(
-            "Read https://agent-deck.devopstoolkit.ai/llms.txt, then install dot-agent-deck \
-             and set it up for me so that: "
-        ),
-        "{plain}"
-    );
-    assert!(plain.contains("an orchestrator"), "{plain}");
-    assert!(!plain.contains('\n'), "the prompt is not one line: {plain}");
+    assert!(!html.contains("promptSlot"), "the goal slot is back");
     assert!(html.contains("dot-agent-deck docs"));
     assert!(html.contains("An AI agent should start at <a href=\"/llms.txt\">/llms.txt</a>"));
     // Every published page is linked with a plain <a href> in the served HTML.
