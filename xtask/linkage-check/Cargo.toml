@@ -32,6 +32,8 @@ syn = { version = "3", features = ["full", "parsing", "visit"] }
 # this needs the DOM only, so no feature is turned on.
 toml_edit = "0.25"
 xtask-docs = { path = "../docs" }
+# PRD #1419: `cargo xtask site <out-dir>` dispatches into this library.
+xtask-site = { path = "../site" }
 
 # `clean-e2e-tmp` needs two libc calls that have no std equivalent:
 #
