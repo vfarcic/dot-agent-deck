@@ -8,7 +8,7 @@ Three paths in this repository are committed as symlinks (git mode `120000`), on
 |---|---|---|
 | `AGENTS.md` | `CLAUDE.md` | The file Codex and OpenCode read for the project's conventions |
 | `.agents/skills` | `../.claude/skills` | The same skills tree Claude gets, exposed to Codex/OpenCode |
-| `docs/img` | `../site/static/img` | The docs' image directory, shared with the Docusaurus site |
+| `docs/img` | `../site/static/img` | The docs' image directory, which `cargo xtask site` publishes at `/img/` |
 
 The first two exist so that **one** `CLAUDE.md` and **one** skills directory reach every agent the deck supports, instead of three near-copies drifting apart. That is a deliberately good design, and it is worth keeping — the whole point of this page is what it costs on one platform and how that cost is contained.
 

@@ -1,61 +1,67 @@
----
-sidebar_position: 4
-title: Session Management
----
-
-import Tabs from '@theme/Tabs';
-import TabItem from '@theme/TabItem';
-
 # Session Management
+
+This page says what each agent status means in the TUI and the desktop app, what a TUI card shows, how to leave agents running and come back to them, and how to start from an empty workspace.
 
 ## Session Statuses
 
-The daemon tracks each agent's state from the events its hooks report, and both clients show it: the TUI on each agent's card, the desktop app in the **Status** column of the [Dashboard](desktop/dashboard.md).
+The daemon sets each agent's status from the events its hooks report (see [Installation → Agent hooks](installation.md#agent-hooks)). The TUI shows it on the agent's card; the desktop app shows it in the **Status** column of the [Dashboard](desktop/dashboard.md); `dot-agent-deck daemon status` prints the daemon's name for it.
 
-<Tabs groupId="client">
-<TabItem value="tui" label="TUI">
+**TUI:**
 
 ![The TUI with four agent cards, each with its status in the card's title row: Idle, Working, Working and Needs Input](/img/dashboard-tui.png)
 
-</TabItem>
-<TabItem value="desktop" label="Desktop">
+**Desktop:**
 
 ![The desktop app's dashboard with four agents, each row starting with its status: waiting or running](/img/dashboard-desktop.png)
 
-</TabItem>
-</Tabs>
+| TUI card | `daemon status` | Desktop app | Meaning | What to do |
+|---|---|---|---|---|
+| **Thinking** | `Thinking` | running | The agent is reasoning before it acts. | Nothing. |
+| **Working** | `Working` | running | The agent is running a tool; the card shows which. | Nothing. |
+| **Compacting** | `Compacting` | running | The agent is compressing its context window. | Nothing. |
+| **Needs Input** | `WaitingForInput` | waiting | The agent is waiting for a permission answer or other input. | Answer it in the pane. In the TUI's command mode, `y` / `n` on the selected card sends approve / deny to a pending permission request. |
+| **Idle** | `Idle` | waiting | The agent finished its turn and is waiting for a prompt. | Give it the next prompt. |
+| **Error** | `Error` | failed | The agent reported a failure, including a turn its provider rejected for a reason other than a usage limit (an API error, a model the account cannot use). | Read the pane. |
+| **Blocked** | `Blocked` | blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. | Wait for the limit to reset, switch account or provider, or add credit. See [Blocked](#blocked). |
+| **No agent** | — | — | The pane is not running an agent the deck recognises (for example a plain shell), or the agent has not reported yet. | If it is an agent, see [Troubleshooting → Hooks](troubleshooting.md#hooks). |
 
-The TUI shows seven statuses. The desktop app folds them into four, shown in the last column:
+A newer daemon can report a status this build does not know; the TUI shows it as **Idle** and the desktop app as **waiting**.
 
-| TUI status | Meaning | Desktop |
-|---|---|---|
-| **Thinking** | Agent is reasoning before acting | RUNNING |
-| **Working** | Agent is executing a tool (tool name shown) | RUNNING |
-| **Compacting** | Context window is being compressed | RUNNING |
-| **Needs Input** | Agent needs user approval or input (`WaitingForInput` in `dot-agent-deck daemon status`). When the prompt was raised by a subagent and that subagent then stops or fails without it being answered, the card goes back to Idle if the main agent's turn had already ended, and to Thinking if it is still running; in the desktop app that is WAITING and RUNNING respectively. Covered: **Claude Code** and **Codex**, the two agents whose hooks say which subagent an event came from. **Not covered:** the deck reads no subagent marker from Devin (its hooks carry none), OpenCode or Pi, so on those cards a subagent's prompt is not told apart from the main agent's. | WAITING |
-| **Idle** | Agent is between tasks | WAITING |
-| **Error** | Something went wrong. That includes a turn the provider rejected for a reason other than a usage limit, such as an API error or a model the account cannot use. Covered: **Claude Code** 2.1.78 or newer (its `StopFailure` hook), **Codex** (its session log, read while a turn is running, since Codex runs no hook for a failed turn; the card turns Error a few seconds after the failure) and **OpenCode** (its `session.error` event). A usage-limit refusal shows **Blocked** instead. **Not covered:** Pi and Devin give the deck no signal for a failed provider turn (Pi's `agent-event` has no error state, and the deck installs no failure hook for Devin), so such a failure does not turn their cards Error. | FAILED |
-| **Blocked** | The agent reported that its provider refused it because a usage limit or credit pool is exhausted. In the TUI, a line under `Dir:` says which limit and, when the provider says, when it resets. It clears only when the agent works again (a new prompt, a tool, a permission prompt) or when its pane restarts. Work done by a subagent does not count, since the card describes the main agent, and a subagent that hits a limit does not turn the card Blocked either: the main agent reports its own limit when it meets one. There is no timer, because a spent credit pool does not reset on its own. Covered: **Claude Code** 2.1.78 or newer (its `StopFailure` hook), **Codex** (its session log, read while a turn is running) and **OpenCode** (the structured fields of its `session.error` event). While OpenCode is still retrying a refused request, its card shows `Thinking`; it turns Blocked once OpenCode gives up and reports the error. **Not covered:** Pi and Devin report no structured quota signal, so their cards never show Blocked; neither does an Anthropic "credit balance is too low" error reached through OpenCode, which carries no machine-readable marker. In the desktop app, the reason is shown in the agent's pane. | BLOCKED |
+### Which agents report which status
 
-The Claude Code hook and the OpenCode plugin that report Blocked are installed when the TUI or the deck's background daemon starts, so the desktop app gets them too, but only into configuration that already exists: the Claude Code hook when `~/.claude` exists, and the OpenCode plugin when `~/.config/opencode` (or `$XDG_CONFIG_HOME/opencode`) or `~/.opencode` exists. If that directory did not exist yet when the deck started, for example because the agent had never run on this machine, nothing was installed for that agent: run `dot-agent-deck hooks install` (or `dot-agent-deck hooks install --agent opencode`), which creates it, or restart the daemon once the directory exists. An agent that was already running may need a restart to pick them up. The Claude Code hook is installed only when `claude --version` reports 2.1.78 or newer, because the older Claude Code releases we tested ignore every hook in the settings file when this one is present. A daemon still running from before an upgrade installs them the next time it starts; to install them without waiting, on this machine or on a remote host, run `dot-agent-deck hooks install` there (and `dot-agent-deck hooks install --agent opencode` for OpenCode).
+The first five statuses come from each agent's hooks, plugin or extension, and how finely an agent separates them depends on what it reports: Pi's extension, for example, reports only running (shown as **Thinking**), waiting (**Needs Input**) and finished (**Idle**). Error and Blocked depend on the agent:
 
-When a worker that still owes a `work-done` turns Blocked, the daemon submits a one-time report to its orchestrator, which can then reassign the task to a role on another provider or account, or notify you. The delegation stays outstanding.
+| Status | Claude Code | Codex | OpenCode | Pi | Devin |
+|---|---|---|---|---|---|
+| **Error** for a failed provider turn | Yes, 2.1.78 or newer | Yes, a few seconds after the failure | Yes | No | No |
+| **Blocked** | Yes, 2.1.78 or newer | Yes | Yes, once OpenCode stops retrying (it shows **Thinking** while it retries) | No | No |
+| A subagent's permission prompt told apart from the main agent's | Yes | Yes | No | No | No |
 
-### What a TUI card shows
+- For Claude Code, Error and Blocked need the `StopFailure` hook, which the deck installs only when `claude --version` reports 2.1.78 or newer. After upgrading Claude Code to 2.1.78 or newer, run `dot-agent-deck hooks install` (or restart the daemon) to add it.
+- OpenCode reaching Anthropic through an Anthropic "credit balance is too low" error does not turn the card Blocked; that error carries no marker the deck can read.
+- Where a subagent is told apart: when a subagent's permission prompt is abandoned (the subagent stops or fails without it being answered), the card goes back to Idle if the main agent's turn had ended, or to Thinking if it is still running.
+
+### Blocked
+
+In the TUI, a line under `Dir:` says which limit was hit and, when the provider says, when it resets. In the desktop app, the reason is shown in the agent's pane. The status stays until the agent shows it is working again (a new prompt, a tool call or a permission prompt from the main agent) or its pane restarts. There is no timer: a spent credit pool does not reset by itself. A subagent hitting a limit does not turn the card Blocked.
+
+When a worker in an [orchestration](orchestration.md) that still owes a `work-done` turns Blocked, the daemon sends its orchestrator a one-time report, so the orchestrator can reassign the task or notify you; see [Idle Workers & Notifications](idle-workers-and-notifications.md).
+
+If Blocked never appears for Claude Code or OpenCode, the hook or plugin that reports it may not be installed. The deck installs them at startup only into configuration directories that already exist (`~/.claude`; `~/.config/opencode`, `$XDG_CONFIG_HOME/opencode` or `~/.opencode`). If the agent had never run on this machine when the deck started, run `dot-agent-deck hooks install` or `dot-agent-deck hooks install --agent opencode`, then restart the agent. On a remote host, run the same commands there.
+
+## What a TUI card shows
 
 *This section is about the TUI. The desktop app's rows and columns are described on [Desktop app → Dashboard](desktop/dashboard.md#rows-and-columns).*
 
-Cards also display:
-
-- **Title row** — card number, the pane's display name (or `agent_type · session_id` if it hasn't been renamed), an animated status dot, and the status label
-- **`Dir:`** — the working directory (basename), shortened with `…` when it doesn't fit
-- **`Prmt:`** — the most recent user prompt(s)
-- **Recent tool calls** — the last commands the agent ran
-- **`Last:` and `Tools:`** — elapsed time since the agent's last activity and the total tool-call count, shown in the card's bottom-right border. Narrow cards abbreviate them to `2m · 14 tools`, then `2m · 14`; the very narrowest omit them.
+- **Title row**: the card number, the agent type, the pane's display name (or the session id if it has none), and on the right an animated dot and the status.
+- **`Dir:`**: the basename of the working directory, shortened with `…` when it does not fit.
+- **`Prmt:`**: the most recent prompt or prompts.
+- **Recent tool calls**: the last commands the agent ran.
+- **`Last:` and `Tools:`**: time since the agent's last activity and its total tool-call count, in the bottom-right border. Narrow cards shorten them to `2m · 14 tools`, then `2m · 14`, and the narrowest omit them.
 
 ![Single agent card showing directory, last activity, tool count, recent prompt, and recent tool calls](/img/session-management-card.jpg)
 
-How many prompts and tool calls fit on a card depends on the auto-chosen density, which Agent Deck picks based on how many cards are on the dashboard and how much room is available:
+The deck picks a density from how many cards it has to fit and the space available:
 
 | Density | Prompts shown | Recent tool calls shown |
 |---|---|---|
@@ -63,57 +69,63 @@ How many prompts and tool calls fit on a card depends on the auto-chosen density
 | Normal | 1 | up to 3 |
 | Compact | 1 | 1 |
 
-The more agents you run in parallel, the more cards Agent Deck has to fit on the screen, so each card automatically becomes more compact. This is deliberate — scrolling through cards would defeat the point of having a single dashboard.
-
 ![Five agents running in parallel — cards switch to Compact density to fit them all without scrolling](/img/home-hero-dashboard.jpg)
+
+### Diagnostic markers on a card
+
+| Marker | Where | Meaning | What to do |
+|---|---|---|---|
+| ` orphaned ` in the title, and `Orphaned — delegation unavailable` under `Dir:` | An orchestration role's card | The daemon that registered this pane's orchestration role was stopped or restarted while the agent kept running. The agent still works and reports status, but `dot-agent-deck delegate` from it is refused with `the daemon holds no orchestration role for pane …`. | Close the orchestration and start it again. See [Troubleshooting](troubleshooting.md#an-orchestration-stops-being-able-to-delegate-the-daemon-holds-no-orchestration-role-for-pane-). To avoid it, let `dot-agent-deck daemon stop` refuse rather than passing `--force` while an orchestration runs. |
+| ` history ` in the title | A session the deck shows but does not drive, such as a Codex session run under `dot-agent-deck wrap` in another terminal | The deck shows its status but cannot type into it. | Type into it in the terminal where it runs. |
+| ` view-only ` in the title | A session whose input channel this build does not recognise (for example, reported by a newer daemon) | The deck shows it but cannot deliver input to it. | Type into it where it runs, or upgrade this client. |
 
 ## Resuming Sessions
 
-*This section is about the TUI. The desktop app keeps no workspace of its own: it shows whatever agents the daemon has, and closing it leaves them running.*
+*This section is about the TUI. The desktop app keeps no workspace of its own: it shows the agents the daemon has, and closing it leaves them running.*
 
-Agent Deck restores your workspace automatically. There is no flag to pass and no decision to make: every time you launch the TUI — `dot-agent-deck` locally or `dot-agent-deck connect <name>` for a remote machine — your previous panes, names, directories, commands, and tabs come back. If you would rather start from an empty dashboard, see [Starting Fresh](#starting-fresh) below.
-
-What you get back depends on whether your agents are still running — and that is usually settled on the way out. `Ctrl+C` from command mode opens the quit dialog:
+To leave the TUI, press `Ctrl+c` in command mode (press `Ctrl+d` first if you are typing in a pane). The quit dialog opens:
 
 ![The Quit dialog, headed “Quit dot-agent-deck?”, offering three options: Detach, currently selected, described as “leave agents running on the daemon”; Stop, “shut down agents and daemon”; and Cancel, “return to dashboard”. A clickable row of Detach, Stop and Cancel buttons sits below them, above the hint “Up/Down: navigate, Enter: confirm, Esc: cancel”](/img/detach.webp)
 
-**Detach** is the default, and it is the everyday one: the TUI exits and your agents carry on without it. **Stop** is the deliberate opposite — it shuts the agents down along with the daemon holding them, and asks once more first while any of them are still alive. **Cancel** returns you to the dashboard. See [Dialogs](keyboard-shortcuts.md#dialogs) for the keys.
+- **Detach** (the default): the TUI exits and the agents keep running in the daemon.
+- **Stop**: stops the agents and the daemon. While agents are running it asks once more first.
+- **Cancel**: back to the dashboard.
 
-That leaves two cases when you come back:
+The keys are in [Keyboard Shortcuts → Dialogs](keyboard-shortcuts.md#dialogs).
 
-- **They're still running.** When you close the TUI or disconnect, your agents keep running in the background (see [How it runs](getting-started.md#how-it-runs)), so coming back brings them up exactly as they were, with their live output. Each card is restored with the agent's *real, current* state as well — its status (Working, Thinking, Needs Input, Idle, and so on), its agent label, the tool it is mid-run on, its tool count, and its recent prompts — so the reconnected dashboard matches what you saw before you disconnected. It does **not** reset every card to Idle (or show "No agent") and then wait for each agent to emit its next event to become correct. If you reopen your laptop to an agent that has been quietly waiting for input, its card reads **Needs Input** straight away. This is the everyday case.
-- **They're gone.** On a fresh machine, the first launch after a reboot, or after an unexpected shutdown, Agent Deck rebuilds your workspace — panes, names, directories, commands, and tabs — and starts the agents fresh. It restores the *shape* of your workspace, not an agent's in-progress work; each agent picks its own conversation back up through its own command (for example, `claude --continue`).
+Every `dot-agent-deck` launch (and `dot-agent-deck connect <name>` for a [remote](remote-environments.md)) restores your workspace automatically. What comes back depends on whether the agents are still running:
 
-If there's nothing to bring back, you start on a clean, empty dashboard. If a saved directory no longer exists, that pane is skipped with a warning.
+- **They are still running** (you detached, or the terminal closed): the dashboard shows each agent with its live output and its current status, tool, tool count and recent prompts. An agent that was waiting for you shows **Needs Input** straight away.
+- **They are gone** (a reboot, a fresh machine, or the daemon stopped): the deck recreates the workspace (panes, names, directories, commands and tabs) and starts each command again. It restores the layout, not the agents' conversations; use the agent's own resume option in its command, for example `claude --continue`.
+
+If there is nothing to restore, you get an empty dashboard. A pane whose saved directory no longer exists is skipped with a warning.
+
+**Check:** after relaunching, the cards match what you left; `dot-agent-deck daemon status` lists the same agents.
 
 ### You come back where you were
 
-Agent Deck remembers the tab you were on and the pane you had focused in each tab, so reconnecting to agents that are still running puts you back in front of the same agent rather than at the start of the orchestration. Switching to another tab afterwards also lands on the role you left it on, not on that tab's first role. If you were on the dashboard when you disconnected, you come back to the dashboard — that counts as a choice, and it is restored like any other.
+The deck remembers which tab you were on and which pane was focused in each tab, including whether you were on the dashboard. When the agents are still running, reattaching puts you back on that tab and pane. A pane you closed in the meantime, or a role whose agent has finished, is not restored; that tab falls back to its start role. With nothing remembered (a first run), you land on the first orchestration tab if there is one, otherwise the dashboard.
 
-Your position is checked against what is actually running when you return. A pane you closed in the meantime, or a role whose agent finished while you were away, is simply not restored; that tab falls back to its start role, so you are never dropped into a pane that is no longer there. When Agent Deck has nothing remembered — a first run, or a workspace you have not left a position in — it falls back to the older behaviour: land on the first orchestration tab if you have one, otherwise the dashboard.
+When the agents are gone and the panes are recreated, only the tab is restored, not the focused pane.
 
-There is one case that restores less on purpose. When your agents are gone and Agent Deck is rebuilding your panes from scratch (a fresh machine, or the first launch after a reboot), those panes are new ones, and matching a remembered position against them could quietly put you in front of a *different* agent — which is worse than not restoring the position at all. In that case Agent Deck restores which tab you were on and leaves the rest alone.
-
-The position is stored with the rest of your saved workspace, so it is per-machine and shared by every deck you run under the same account: if you run two at once, the last one you close decides where the next one lands — the same way it already decides which panes come back.
+The position is saved with the rest of the workspace, one per user account on the machine. If you run two TUIs at once, the one you close last decides what the next launch restores.
 
 ### Your setup stays up to date
 
-Agent Deck keeps your saved workspace current as you work — after every new agent, rename, tab, and agent change, and again whenever you disconnect — so what it brings back is your most recent setup, never a stale copy from the last time you happened to quit. That is what makes recovery worthwhile after an unexpected shutdown: you return to where you actually were, not to a workspace from days ago.
+The workspace is saved after every new agent, rename, tab change and agent change, and when you disconnect, so after an unexpected shutdown you come back to your latest setup.
 
 ### Orchestration tabs come back too
 
-Orchestration tabs return in full, with the orchestrator and its prompt, the role panes in their original order, and the start-role cursor where you left it.
-
-In every case only the workspace structure is restored, not an agent's internal conversation. If something in your project's `.dot-agent-deck.toml` has changed since you last ran it — the file is missing, an orchestration was renamed, or a role was removed — Agent Deck shows a clear warning and brings that pane back as a plain dashboard pane instead of a broken tab.
+Orchestration tabs return with the orchestrator and its prompt, the role panes in their original order, and the start-role cursor where you left it. If the project's `.dot-agent-deck.toml` has changed since (the file is missing, the orchestration was renamed or a role was removed), the deck shows a warning and restores that pane as a plain dashboard pane instead.
 
 ### Starting Fresh
 
-To discard the saved workspace and start from an empty dashboard next time, clear the snapshot:
+To start the next launch from an empty dashboard, clear the saved workspace:
 
 ```bash
 dot-agent-deck snapshot clear
 ```
 
-This clears your saved workspace, so the next launch starts empty. Note that `dot-agent-deck remote remove <name>` does **not** do this — it only forgets a remote you had connected to and leaves your saved workspace untouched, so removing an unrelated remote never wipes your setup.
+It prints ``Cleared the local saved-session snapshot. The next `dot-agent-deck` startup will begin from an empty dashboard.`` It does not stop running agents, and the next launch still shows any agents the daemon is running; close them first, or quit with **Stop**, for a truly empty dashboard.
 
-Your saved workspace lives in `~/.config/dot-agent-deck/session.toml`.
+The saved workspace is `~/.config/dot-agent-deck/session.toml` (`DOT_AGENT_DECK_SESSION` overrides the path). `dot-agent-deck remote remove <name>` does not clear it.

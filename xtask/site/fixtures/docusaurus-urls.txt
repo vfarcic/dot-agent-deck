@@ -1,0 +1,65 @@
+# The /docs URLs the last Docusaurus build served (PRD #1419).
+#
+# Captured, not derived: produced by running the Docusaurus build
+# (`cd site && npm ci && npm run build`, @docusaurus/core 3.10.2) at commit
+# 15c514ff on 2026-09-29, before Docusaurus was removed. Every page the build
+# emitted under /docs is a `docs/<path>/index.html` file, which both deploy
+# targets served at `/docs/<path>` and `/docs/<path>/` (nginx
+# `try_files $uri $uri/`, Netlify pretty URLs), so each emitted page
+# contributes both forms below. The desktop category index `desktop/index.md`
+# was emitted at `/docs/desktop/`.
+#
+# `/docs/<path>/index.html` also resolved on both targets; it is not listed
+# because Docusaurus never linked to that form and its sitemap does not use it.
+#
+# The build emitted nothing at `/docs` itself (it was a 404). It is listed
+# anyway, in the last section, because the PRD requires `/docs` to redirect to
+# a docs index.
+#
+# Format: one URL path per line; `#` starts a comment; blank lines ignored.
+
+# Emitted by the build
+/docs/configuration
+/docs/configuration/
+/docs/desktop
+/docs/desktop/
+/docs/desktop/daemons
+/docs/desktop/daemons/
+/docs/desktop/dashboard
+/docs/desktop/dashboard/
+/docs/desktop/new-agent
+/docs/desktop/new-agent/
+/docs/desktop/settings
+/docs/desktop/settings/
+/docs/desktop/voice
+/docs/desktop/voice/
+/docs/dispatcher-mode
+/docs/dispatcher-mode/
+/docs/getting-started
+/docs/getting-started/
+/docs/idle-workers-and-notifications
+/docs/idle-workers-and-notifications/
+/docs/installation
+/docs/installation/
+/docs/keyboard-shortcuts
+/docs/keyboard-shortcuts/
+/docs/license
+/docs/license/
+/docs/orchestration
+/docs/orchestration/
+/docs/remote-environments
+/docs/remote-environments/
+/docs/remote-recipes
+/docs/remote-recipes/
+/docs/remote-requirements
+/docs/remote-requirements/
+/docs/scheduled-tasks
+/docs/scheduled-tasks/
+/docs/session-management
+/docs/session-management/
+/docs/troubleshooting
+/docs/troubleshooting/
+
+# Not emitted by the build; required by the PRD
+/docs
+/docs/
