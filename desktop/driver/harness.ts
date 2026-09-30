@@ -40,6 +40,14 @@ const POLL_MS = 100;
  */
 const SELECT_MS = 15_000;
 
+/**
+ * Issue #1403 — how long a terminal's grid must hold still after a click
+ * before a drag on it is trusted. The resize it waits out (the window's focus
+ * claim, see `selectRow`) landed within 10ms of the press on a GitHub runner,
+ * so this is margin, not a measured bound.
+ */
+const SETTLE_MS = 1_000;
+
 const paths = {
   app: process.env.DAD_DRIVER_APP ?? join(REPO_ROOT, "target", "debug", "dot-agent-deck-desktop"),
   daemon: process.env.DAD_DRIVER_DAEMON ?? join(REPO_ROOT, "target", "debug", "dot-agent-deck"),
@@ -146,8 +154,6 @@ type TerminalScreen = {
   lines: string[];
   rect: { left: number; top: number; width: number; height: number } | null;
   selection: string;
-  charSize?: unknown;
-  selectionStart?: unknown;
 };
 
 export type DeckOptions = {
@@ -387,13 +393,25 @@ export class Deck {
   }
 
   /**
-   * Issue #1403 — select the row `span` covers with a real drag, and wait for
-   * xterm to hold `text` as its selection. When it does not, the error carries
-   * what the page saw: the element under the press point, and every mouse
-   * event that reached the document during the drag, so a runner on which
-   * pointer actions stop selecting says how.
+   * Issue #1403 — select the row whose text is exactly `text` the way a person
+   * does: click into the terminal, then drag across the row, and wait for xterm
+   * to hold `text` as its selection.
+   *
+   * The first click matters. WebDriver types into the page without the window
+   * holding focus, so the scenario's first press is also the window's focus-in,
+   * and on a focus-in the app claims this terminal's size on its daemon
+   * (PRD #1105). When that changes the grid's row count, xterm drops any
+   * selection in progress, so a drag started by that same press selects
+   * nothing. The click lets that settle, and the row is measured again after
+   * it, because a new grid moves the rows. When the selection still does not
+   * appear, the error carries the mouse events the page saw during the drag
+   * and every selection clear and resize, with the stack that caused it.
    */
-  async selectRow(span: { from: { x: number; y: number }; to: { x: number; y: number } }, text: string): Promise<void> {
+  async selectRow(text: string): Promise<void> {
+    const before = await waitFor(`${text} on its own row`, () => this.rowSpan(text));
+    await this.session.clickAt(before.from);
+    await this.gridSettled();
+    const span = await waitFor(`${text} on its own row after the click`, () => this.rowSpan(text));
     // Installed once per page; each call only empties the record.
     await this.session.execute(
       `window.__dadPointerLog = [];
@@ -401,27 +419,14 @@ export class Deck {
        window.__dadDriver.traceSelection();
        if (!window.__dadPointerProbe) {
          window.__dadPointerProbe = true;
-         const selection = () => window.__dadDriver.terminalScreens().map((s) => s.selection).join("|");
-         const note = (entry) => { if (window.__dadPointerLog.length < 80) window.__dadPointerLog.push(entry); };
-         const active = () => document.activeElement ? document.activeElement.nodeName + "." + String(document.activeElement.className).slice(0, 40) : null;
-         document.addEventListener("mousedown", () => note(["focus@down", active()]), { capture: true });
          for (const type of ["mousedown", "mousemove", "mouseup"]) {
            document.addEventListener(type, (e) => {
-             const mods = (e.shiftKey ? "S" : "") + (e.ctrlKey ? "C" : "") + (e.altKey ? "A" : "") + (e.metaKey ? "M" : "");
-             note([type, Math.round(performance.now()), Math.round(e.clientX), Math.round(e.clientY), e.buttons, e.detail, mods]);
+             if (window.__dadPointerLog.length < 60) {
+               const mods = (e.shiftKey ? "S" : "") + (e.ctrlKey ? "C" : "") + (e.altKey ? "A" : "") + (e.metaKey ? "M" : "");
+               window.__dadPointerLog.push([type, Math.round(performance.now()), Math.round(e.clientX), Math.round(e.clientY), e.buttons, e.detail, mods]);
+             }
            }, { capture: true });
          }
-         // After xterm's own handlers. xterm's press handler always calls
-         // preventDefault, so false here means it never saw the press.
-         window.addEventListener("mousedown", (e) => {
-           note(["handled@down", Math.round(performance.now()), e.defaultPrevented,
-             JSON.stringify(window.__dadDriver.terminalScreens().map((s) => [s.charSize, s.selectionStart]))]);
-         });
-         // What xterm holds at release, and shortly after.
-         window.addEventListener("mouseup", () => {
-           note(["selection@up", selection()]);
-           for (const ms of [0, 100, 500, 2000]) setTimeout(() => note(["selection@" + ms, selection()]), ms);
-         });
        }`,
     );
     await this.session.drag(span.from, span.to);
@@ -429,16 +434,24 @@ export class Deck {
       await waitFor(`the drag to select ${text}`, () => this.hasSelection(text), SELECT_MS);
     } catch (error) {
       const seen = await this.session
-        .execute<unknown>(
-          `const el = document.elementFromPoint(arguments[0], arguments[1]);
-           return { under: el ? el.nodeName + "." + String(el.className).slice(0, 60) : null,
-                    focused: document.activeElement ? document.activeElement.nodeName + "." + String(document.activeElement.className).slice(0, 60) : null,
-                    events: window.__dadPointerLog, trace: window.__dadSelectionTrace };`,
-          [Math.round(span.from.x), Math.round(span.from.y)],
-        )
+        .execute<unknown>("return { events: window.__dadPointerLog, trace: window.__dadSelectionTrace };")
         .catch((probe: unknown) => String(probe));
       throw new Error(`${(error as Error).message}; the page saw ${JSON.stringify(seen)}`);
     }
+  }
+
+  /** Until every mounted terminal's grid and box have held still for `SETTLE_MS`. */
+  private async gridSettled(): Promise<void> {
+    let last = "";
+    let since = Date.now();
+    await waitFor("the terminal's grid to settle", async () => {
+      const now = JSON.stringify((await this.terminalScreens()).map(({ cols, rows, rect }) => [cols, rows, rect]));
+      if (now !== last) {
+        last = now;
+        since = Date.now();
+      }
+      return Date.now() - since >= SETTLE_MS;
+    });
   }
 
   private async terminalScreens(): Promise<TerminalScreen[]> {

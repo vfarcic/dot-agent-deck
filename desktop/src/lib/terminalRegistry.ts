@@ -191,12 +191,7 @@ export function stripAnsi(raw: string): string {
 // text the Reader overlay already shows a user, where that text is painted, and
 // it writes nothing.
 /** xterm's private services, for the driver seam's diagnostics only. */
-function xtermInternals(terminal: Terminal):
-  | {
-      _charSizeService?: { width: number; height: number };
-      _selectionService?: { _model?: { selectionStart?: unknown } } & Record<string, unknown>;
-    }
-  | undefined {
+function xtermInternals(terminal: Terminal): { _selectionService?: Record<string, unknown> } | undefined {
   return (terminal as unknown as { _core?: ReturnType<typeof xtermInternals> })._core;
 }
 
@@ -219,16 +214,14 @@ if (import.meta.env.VITE_DAD_DRIVER_SEAM === "1") {
         }
         const box = terminal.element?.querySelector(".xterm-screen")?.getBoundingClientRect();
         const rect = box ? { left: box.left, top: box.top, width: box.width, height: box.height } : null;
-        // xterm's measured cell and where its selection model says a drag
-        // started, read from its internals (issue #1403's CI failures).
-        const core = xtermInternals(terminal);
-        const charSize = core?._charSizeService ? { width: core._charSizeService.width, height: core._charSizeService.height } : null;
-        const selectionStart = core?._selectionService?._model?.selectionStart ?? null;
-        return { key, cols: terminal.cols, rows: terminal.rows, lines, rect, selection: terminal.getSelection(), charSize, selectionStart };
+        return { key, cols: terminal.cols, rows: terminal.rows, lines, rect, selection: terminal.getSelection() };
       }),
     // Issue #1403 — record, into `window.__dadSelectionTrace`, every time xterm
-    // clears a terminal's selection (with the caller's stack) and every resize,
-    // so a drag whose selection vanishes says what removed it. Idempotent.
+    // clears a terminal's selection and every resize, each with the stack that
+    // caused it, so a drag whose selection vanishes says what removed it. This
+    // is how a focus claim's resize was found clearing `terminal_002`'s
+    // selection. It wraps a private xterm method, which is tolerable only in
+    // this build-gated seam. Idempotent.
     traceSelection: () => {
       const trace = ((window as Window & { __dadSelectionTrace?: unknown[] }).__dadSelectionTrace ??= []);
       for (const terminal of terminals.values()) {

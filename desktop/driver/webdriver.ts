@@ -158,6 +158,22 @@ export class Session {
     await this.perform([{ type: "key", id: "keyboard", actions: [...down, ...up] }]);
   }
 
+  /** Issue #1403 — a real left-button click at a viewport point, as W3C pointer actions. */
+  async clickAt(point: { x: number; y: number }): Promise<void> {
+    await this.perform([
+      {
+        type: "pointer",
+        id: "mouse",
+        parameters: { pointerType: "mouse" },
+        actions: [
+          { type: "pointerMove", duration: 0, origin: "viewport", x: Math.round(point.x), y: Math.round(point.y) },
+          { type: "pointerDown", button: 0 },
+          { type: "pointerUp", button: 0 },
+        ],
+      },
+    ]);
+  }
+
   /**
    * Issue #1403 — a real left-button drag between two viewport points, which is
    * how a person selects text in xterm: the selection service listens for the

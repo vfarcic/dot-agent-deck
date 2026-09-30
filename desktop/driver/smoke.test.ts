@@ -125,8 +125,8 @@ test("terminal_001 a shell started from New agent runs a typed command in a real
   });
 });
 
-/// Scenario: in a shell agent's pane, print a line, select it by dragging the
-/// mouse across it and press Ctrl+Shift+C, then find exactly that line on the
+/// Scenario: in a shell agent's pane, print a line, click into the terminal and
+/// select the line by dragging the mouse across it, and press Ctrl+Shift+C, then find exactly that line on the
 /// system clipboard; select a second line and copy it with Cmd (Meta)+C the
 /// same way. The copies are made over a half-typed command, and pressing Enter
 /// afterwards runs it unchanged — so neither copy sent the agent an interrupt or
@@ -142,12 +142,12 @@ test("terminal_002 selected terminal text copies to the clipboard without reachi
     // only have come from the PTY rather than from what was typed.
     await deck.session.type(input, `echo dad-copy-$((6*7))-ok${ENTER}`);
     const first = "dad-copy-42-ok";
-    const firstRow = await waitFor(`${first} on its own row`, () => deck.rowSpan(first));
+    await waitFor(`${first} on its own row`, () => deck.rowSpan(first));
 
     // Half a command, not yet run: an interrupt would throw it away, and any
     // byte the gesture leaked would land in it.
     await deck.session.type(input, "echo still-typing-$((2+3))");
-    await deck.selectRow(firstRow, first);
+    await deck.selectRow(first);
     await deck.session.chord([CONTROL, SHIFT, "c"]);
     await waitFor(`the clipboard to hold ${first}`, async () => (await deck.clipboardText()) === first);
 
@@ -155,17 +155,15 @@ test("terminal_002 selected terminal text copies to the clipboard without reachi
     // WebDriver), but the chord is decided in the page, and this runs that code.
     await deck.session.type(input, ENTER);
     const second = "still-typing-5";
-    const secondRow = await waitFor(`${second} on its own row, the half-typed command run unchanged`, () =>
-      deck.rowSpan(second),
-    );
-    await deck.selectRow(secondRow, second);
+    await waitFor(`${second} on its own row, the half-typed command run unchanged`, () => deck.rowSpan(second));
+    await deck.selectRow(second);
     await deck.session.chord([META, "c"]);
     await waitFor(`the clipboard to hold ${second}`, async () => (await deck.clipboardText()) === second);
 
     // The control. Plain Ctrl+C belongs to the agent even while text is
     // selected: bash abandons the half-typed line and prints a fresh prompt.
     await deck.session.type(input, "echo must-not-run");
-    await deck.selectRow(firstRow, first);
+    await deck.selectRow(first);
     await deck.session.chord([CONTROL, "c"]);
     await deck.session.type(input, `echo after-interrupt-$((3+4))${ENTER}`);
     await waitFor("the next command's output", async () => (await deck.rowSpan("after-interrupt-7")) !== undefined);
