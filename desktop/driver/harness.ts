@@ -403,6 +403,8 @@ export class Deck {
          window.__dadPointerProbe = true;
          const selection = () => window.__dadDriver.terminalScreens().map((s) => s.selection).join("|");
          const note = (entry) => { if (window.__dadPointerLog.length < 80) window.__dadPointerLog.push(entry); };
+         const active = () => document.activeElement ? document.activeElement.nodeName + "." + String(document.activeElement.className).slice(0, 40) : null;
+         document.addEventListener("mousedown", () => note(["focus@down", active()]), { capture: true });
          for (const type of ["mousedown", "mousemove", "mouseup"]) {
            document.addEventListener(type, (e) => {
              const mods = (e.shiftKey ? "S" : "") + (e.ctrlKey ? "C" : "") + (e.altKey ? "A" : "") + (e.metaKey ? "M" : "");

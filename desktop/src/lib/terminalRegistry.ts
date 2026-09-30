@@ -237,13 +237,18 @@ if (import.meta.env.VITE_DAD_DRIVER_SEAM === "1") {
           | undefined;
         if (!service || service.__dadTraced) continue;
         service.__dadTraced = true;
+        const stack = () =>
+          (new Error().stack ?? "")
+            .split("\n")
+            .slice(2, 30)
+            .map((frame) => frame.trim().replace(/@tauri:\/\/localhost\/assets\//, "@"))
+            .join(" < ");
         const clear = service.clearSelection.bind(service);
         service.clearSelection = () => {
-          const stack = (new Error().stack ?? "").split("\n").slice(1, 9).map((frame) => frame.trim().slice(0, 90));
-          trace.push(["clear", Math.round(performance.now()), terminal.cols, terminal.rows, stack.join(" < ")]);
+          trace.push(["clear", Math.round(performance.now()), terminal.cols, terminal.rows, stack()]);
           clear();
         };
-        terminal.onResize(({ cols, rows }) => trace.push(["resize", Math.round(performance.now()), cols, rows]));
+        terminal.onResize(({ cols, rows }) => trace.push(["resize", Math.round(performance.now()), cols, rows, stack()]));
       }
       return trace.length;
     },
