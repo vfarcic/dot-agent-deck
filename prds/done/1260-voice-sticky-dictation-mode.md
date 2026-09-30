@@ -1,11 +1,11 @@
 # PRD #1260: A sticky dictation mode for desktop voice ("type on" / "type off")
 
-**Status**: In progress — M2 and M3 done on branch `agent/dispatch-voice-interaction-modes` (2026-09-29); M1's measurement was not taken and the overlapped capture cycle it would decide was deferred (Work Log). Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1261](1261-voice-numbered-choice.md) and [PRD #1184](1184-voice-command-chains.md), because the three share one voice panel state model (below).
+**Status**: Complete — M2 and M3 done on branch `agent/dispatch-voice-interaction-modes` (2026-09-29). M1's measurement was not taken (no microphone) and **moved to [#1450](https://github.com/vfarcic/dot-agent-deck/issues/1450)**, together with the overlapped capture cycle it would decide (Work Log). Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1261](1261-voice-numbered-choice.md) and [PRD #1184](../1184-voice-command-chains.md), because the three share one voice panel state model (below).
 **Priority**: Medium
 **Created**: 2026-09-29
 **Issue**: [#1260](https://github.com/vfarcic/dot-agent-deck/issues/1260)
 **Order**: #1260 → [#1261](https://github.com/vfarcic/dot-agent-deck/issues/1261) → [#1184](https://github.com/vfarcic/dot-agent-deck/issues/1184). This PRD comes first because it defines the panel states the other two slot into; #1261 adds `AwaitingChoice`; #1184 pauses in the states the first two define.
-**Depends on**: [PRD #802](done/802-desktop-voice-control.md) (desktop voice control and per-utterance dictation, shipped), [PRD #1195](done/1195-voice-command-registration-and-widening.md) (the registration guard and the grounding lessons recorded in its Work Log, shipped).
+**Depends on**: [PRD #802](802-desktop-voice-control.md) (desktop voice control and per-utterance dictation, shipped), [PRD #1195](1195-voice-command-registration-and-widening.md) (the registration guard and the grounding lessons recorded in its Work Log, shipped).
 
 ## Problem Statement
 
@@ -42,7 +42,7 @@ This section is the one state model for #1260, #1261 and #1184. The other two PR
 | D5 confirmation | a stop or orchestration close is waiting to be answered by hand | #802 D5, #1223 | as today: the confirmation is answered by clicking; a second spoken stop is refused (`CONFIRMATION_ALREADY_OPEN`) |
 | the existing pending answers | the New agent dialog's form and directory browser, and a pending dictation send (`Pending` + countdown in `VoiceControlPanel.tsx`) | #802, #1223 | as today |
 
-**A chain in progress ([#1184](1184-voice-command-chains.md)) is not a state of its own.** A chain that has to stop for the user stops by entering `AwaitingChoice` or by ending at the D5 confirmation, with any remaining steps held by that state. That keeps the number of things the panel can be waiting for fixed at the rows above.
+**A chain in progress ([#1184](../1184-voice-command-chains.md)) is not a state of its own.** A chain that has to stop for the user stops by entering `AwaitingChoice` or by ending at the D5 confirmation, with any remaining steps held by that state. That keeps the number of things the panel can be waiting for fixed at the rows above.
 
 **Where each state lives.** `Dictating` and `AwaitingChoice` are held by the voice panel (`VoiceControlPanel.tsx`), in a ref mirrored into state for the reason `Pending` already is (the poll reads it between awaits). The D5 confirmation is held where it is today, by the overview (`AgentOverview.tsx`'s `confirm`); the panel does not own it and learns of it only through what the host declares. The Rust side stays stateless per utterance — `handle_utterance` keeps no memory between utterances (`docs/develop/voice-first-design.md` §2) — so whatever a state needs Rust to know travels in the declaration made with each utterance, the way the New agent dialog's state already does.
 
@@ -68,7 +68,7 @@ This section is the one state model for #1260, #1261 and #1184. The other two PR
 
 ### Out of Scope
 
-- The numbered choice ([#1261](1261-voice-numbered-choice.md)) and chains ([#1184](1184-voice-command-chains.md)), except where this PRD's state model constrains them.
+- The numbered choice ([#1261](1261-voice-numbered-choice.md)) and chains ([#1184](../1184-voice-command-chains.md)), except where this PRD's state model constrains them.
 - Changing one-shot dictation. "type run the tests" in `Idle` keeps working exactly as today, countdown included.
 - A keyboard shortcut of its own for the mode (Technical Approach, "Non-voice exits", says why).
 - Any daemon or TUI↔daemon protocol change. Everything here is inside the desktop binary, between its Rust side and its webview (see "Contract").
@@ -155,12 +155,12 @@ What rule 4 means for the desktop, as #802 and #1195 applied it: the blocking ti
 - While the mode is on, no request reaches the Commands backend (proven by a test with a resolver that fails if called).
 - Every listed exit ends the mode, sends nothing, and says why; the mode never moves to another agent.
 - A missed "type off" lands visibly in the prompt, unsent.
-- M1's measurements of word loss between segments and of silence artefacts are recorded, and the decisions they drive are made.
+- M1's measurements of word loss between segments and of silence artefacts are recorded, and the decisions they drive are made. **Not met — moved to [#1450](https://github.com/vfarcic/dot-agent-deck/issues/1450)**: no microphone was available to the implementing agents.
 - `cargo test-fast`, rule 2's clippy, `pnpm test`, and linkage-check stay green; `PROTOCOL_VERSION` unchanged; the credentialed fixtures run locally and are named in the PR.
 
 ## Milestones
 
-- [ ] **M1 — Measure before building the cycle.** *Not done — no microphone was available to the implementing agents; deferred to the manual walk (`docs/develop/desktop-gui.md` item 12b) and a follow-up. See the Work Log.* With the serial cycle as it is, dictate multi-sentence text with natural pauses and with deliberate long silences, against the local and the hosted Speech backends; record words lost between segments and artefacts typed. Decide, in the Work Log, whether the overlapped cycle and a stricter silence gate are built.
+- [ ] **M1 — Measure before building the cycle.** *Not done — moved to [#1450](https://github.com/vfarcic/dot-agent-deck/issues/1450). No microphone was available to the implementing agents; the measurement is the manual walk's item 12b (`docs/develop/desktop-gui.md`). See the Work Log.* With the serial cycle as it is, dictate multi-sentence text with natural pauses and with deliberate long silences, against the local and the hosted Speech backends; record words lost between segments and artefacts typed. Decide, in the Work Log, whether the overlapped cycle and a stricter silence gate are built.
 - [x] **M2 — The mode.** Rows, fast path, reserved-set classification, the panel state, indicator, **Stop typing**, every context-change exit, the D5 precedence, the capped-segment rule, the writability check on entry; the overlapped capture cycle if M1 decided it (it did not run, so the cycle was not built). Rust, vitest and linkage-check tests per the table.
 - [x] **M3 — Fixtures, docs, changelog.** Phrase fixtures for entering and for the reserved phrases not being stolen; `docs/desktop/voice.md` (what the user says, sees and can do — rule 21), `docs/develop/desktop-gui.md` (the mode section, the manual walk step) and `docs/develop/voice-first-design.md` (the reserved set as a new class of spoken words the model is never asked about); `changelog.d/1260.feature.md` (rule 19: a user can observe this). Run the `docs-screenshots-review` skill for the user-doc change. Credentialed fixtures run locally and named in the PR.
 
@@ -249,3 +249,7 @@ The common thread: an async continuation acting after the thing the user asked f
 - **`dispatchDeclared` restores the outer declaration** in its `finally` rather than clearing it, so a nested dispatch cannot drop an outer one's.
 - **Recorded as intended (reviewer nit 2):** a one-shot declared with no known pane is refused rather than aimed at whatever pane appears by the time it resolves.
 - **Docs.** `docs/develop/voice-first-design.md` and the gate's comment state which touches each path uses and name what is outside the gate (Undo, and a mode write already handed to the terminal); the claim that the terminal refuses a write to a read-only pane is marked production-specific, since the fixture runtime echoes every write. `docs/desktop/voice.md` and the `1260.bugfix.md` fragment say a direct command naming an agent runs nothing after a deck switch or a same-name replacement, and that a confirmation on the deck screen stops typing too.
+
+### 2026-09-30 — Closed; M1 moved to #1450
+
+Everything but M1 is built and shipped in the PR that closes #1260. M1 (word loss between segments, silence artefacts, and the decision on the overlapped capture cycle) needs a live microphone and moved to [#1450](https://github.com/vfarcic/dot-agent-deck/issues/1450), with `docs/develop/desktop-gui.md` step 12b as the procedure. The success criterion "M1's measurements are recorded" is therefore unmet here and is tracked there, not dropped.

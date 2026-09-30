@@ -1,11 +1,11 @@
 # PRD #1261: Offer a numbered choice when a voice command names several things
 
-**Status**: M1, M2 and M3 implemented; D1 (action ambiguity) deferred and **not done** — this PRD delivers value ambiguity only. Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1260](1260-voice-sticky-dictation-mode.md) and [PRD #1184](1184-voice-command-chains.md).
+**Status**: Complete — M1, M2 and M3 implemented; this PRD delivers value ambiguity only. D1 (action ambiguity) is **not done** and **moved to [PRD #1184](../1184-voice-command-chains.md)** as a dependent follow-up. Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1260](1260-voice-sticky-dictation-mode.md) and [PRD #1184](../1184-voice-command-chains.md).
 **Priority**: Medium
 **Created**: 2026-09-29
 **Issue**: [#1261](https://github.com/vfarcic/dot-agent-deck/issues/1261)
 **Order**: [#1260](https://github.com/vfarcic/dot-agent-deck/issues/1260) → #1261 → [#1184](https://github.com/vfarcic/dot-agent-deck/issues/1184). The panel states and their precedence are defined once, in [PRD #1260's "Voice panel states and precedence"](1260-voice-sticky-dictation-mode.md#voice-panel-states-and-precedence); this PRD adds the `AwaitingChoice` state that section names and does not restate the model.
-**Depends on**: [PRD #802](done/802-desktop-voice-control.md), [PRD #1195](done/1195-voice-command-registration-and-widening.md), and PRD #1260's state model (its M2 need not have shipped; this PRD's M1 can land the state model's shared parts if it goes first).
+**Depends on**: [PRD #802](802-desktop-voice-control.md), [PRD #1195](1195-voice-command-registration-and-widening.md), and PRD #1260's state model (its M2 need not have shipped; this PRD's M1 can land the state model's shared parts if it goes first).
 
 ## Problem Statement
 
@@ -37,7 +37,7 @@ When a **required** param is ambiguous, the panel shows the candidates as a **nu
 
 ### Action ambiguity: deferred, and why
 
-The pipeline does not detect it. The Commands backend returns **one** action (`IntentAnswer { action, params }` in `voice/resolver.rs`), so there is no outcome that says two rows fit; "close the agent" is settled before the app sees it, by vocabulary and instructions — `close` claims the phrase, `stop_agent`'s `heard_as` has no "close", and `TOOL_INSTRUCTIONS` says a view-or-stop reading means the view (`voice-first-design.md` §5, "An ambiguous reading resolves to the non-destructive action"). Detecting it would need the backend to return several candidate actions, which is the response-schema change [PRD #1184](1184-voice-command-chains.md) makes for chains. So action ambiguity is deferred to after #1184's schema lands (D1 below), and when it is revisited the rule is already written: the non-destructive reading is **option 1**, and the destructive option still ends at D5.
+The pipeline does not detect it. The Commands backend returns **one** action (`IntentAnswer { action, params }` in `voice/resolver.rs`), so there is no outcome that says two rows fit; "close the agent" is settled before the app sees it, by vocabulary and instructions — `close` claims the phrase, `stop_agent`'s `heard_as` has no "close", and `TOOL_INSTRUCTIONS` says a view-or-stop reading means the view (`voice-first-design.md` §5, "An ambiguous reading resolves to the non-destructive action"). Detecting it would need the backend to return several candidate actions, which is the response-schema change [PRD #1184](../1184-voice-command-chains.md) makes for chains. So action ambiguity is deferred to after #1184's schema lands (D1 below), and when it is revisited the rule is already written: the non-destructive reading is **option 1**, and the destructive option still ends at D5.
 
 ## Technical Approach
 
@@ -153,7 +153,7 @@ Answers are local, so the fixtures cover only the first utterance (reaching `par
 
 D1 below is deferred, not done: "close the agent" and every other reading the Commands backend settles into ONE action still never offers a choice, because the backend's answer cannot carry a second action until PRD #1184's schema lands.
 
-- [ ] **D1 — Action ambiguity.** After PRD #1184's response schema can carry more than one action. Non-destructive reading as option 1; a destructive option still ends at D5.
+- [ ] **D1 — Action ambiguity.** *Moved to PRD #1184 (its "Dependent follow-up: action ambiguity" section).* After PRD #1184's response schema can carry more than one action. Non-destructive reading as option 1; a destructive option still ends at D5.
 
 ## Deviations from the design above, as built
 
@@ -222,3 +222,7 @@ Written from issue #1261 by a dispatched unit, alongside PRDs #1260 and #1184, a
 ### 2026-09-30 — Review round 5 — direct stops held to the same gate
 
 - **A direct stop could still reach a replacement.** Round 4 applied the gate's `agent` touch only to an entry chosen from a list; a direct "stop Planner" or "close review" resolved across a same-id replacement or a selected-deck change opened the D5 confirmation for the new target. `dispatchLost` in `VoiceControlPanel.tsx` now holds every dispatch — resolved directly in `resolveOne` or chosen in `dispatchChoice` — to `answer` plus `agent` for every param of an agent-targeting kind (`agent_ref`, `orchestration_ref`), keyed by kind rather than by row, so a new row taking either param is covered without being listed. A chosen `orchestration_ref` entry, which round 4 did not gate on incarnation, is covered by the same change. Reports: "Nothing ran — the agent was replaced. Say it again." / "Nothing ran — the deck changed. Say it again." for a direct command; the `VOICE_CHOICE_*` sentences for a chosen one, as before.
+
+### 2026-09-30 — Closed; D1 moved to PRD #1184
+
+Everything but D1 is built and ships in the PR that closes #1261. D1 needs the multi-action response schema that PRD #1184 would introduce, and #1184's M1 measured NO-GO (not now), so D1 moved into [PRD #1184](../1184-voice-command-chains.md) as a dependent follow-up rather than staying open here.

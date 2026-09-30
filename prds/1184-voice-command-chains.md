@@ -1,10 +1,10 @@
 # PRD #1184: Chain several voice commands from one utterance
 
-**Status**: M1 measured 2026-09-29 — **NO-GO (not now)**, nothing shipped; see the Work Log. Originally: the one of the three that may be deferred: M1 is a go/no-go measurement, and the milestones are written so each stops cleanly. Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1260](1260-voice-sticky-dictation-mode.md) and [PRD #1261](1261-voice-numbered-choice.md).
+**Status**: M1 measured 2026-09-29 — **NO-GO (not now)**, nothing shipped; see the Work Log. Originally: the one of the three that may be deferred: M1 is a go/no-go measurement, and the milestones are written so each stops cleanly. Written 2026-09-29 on branch `agent/dispatch-voice-interaction-modes`, together with [PRD #1260](done/1260-voice-sticky-dictation-mode.md) and [PRD #1261](done/1261-voice-numbered-choice.md).
 **Priority**: Low
 **Created**: 2026-09-29
 **Issue**: [#1184](https://github.com/vfarcic/dot-agent-deck/issues/1184)
-**Order**: [#1260](https://github.com/vfarcic/dot-agent-deck/issues/1260) → [#1261](https://github.com/vfarcic/dot-agent-deck/issues/1261) → #1184. A chain pauses by entering the states those two define; the model is in [PRD #1260's "Voice panel states and precedence"](1260-voice-sticky-dictation-mode.md#voice-panel-states-and-precedence) and is not restated here.
+**Order**: [#1260](https://github.com/vfarcic/dot-agent-deck/issues/1260) → [#1261](https://github.com/vfarcic/dot-agent-deck/issues/1261) → #1184. A chain pauses by entering the states those two define; the model is in [PRD #1260's "Voice panel states and precedence"](done/1260-voice-sticky-dictation-mode.md#voice-panel-states-and-precedence) and is not restated here.
 **Depends on**: [PRD #802](done/802-desktop-voice-control.md) (which excluded chaining from v1), [PRD #1223](done/1223-desktop-new-agent-dialog.md) (action grounding, whole-utterance rows, declaration staleness), [PRD #1195](done/1195-voice-command-registration-and-widening.md), PRD #1261 (for a chain that pauses on an ambiguous step), PRD #1260 (for "type on" as a last step).
 
 ## Problem Statement
@@ -36,7 +36,7 @@ If any step fails validation, **nothing runs**. Execution then runs the steps in
 - Chains longer than three steps.
 - Any step whose effect the table cannot predict, except as the last step (below).
 - `start_new_agent`, `submit_prompt` and `discard_new_agent` in any chain (below).
-- Action ambiguity ([PRD #1261 D1](1261-voice-numbered-choice.md)), though the schema change here is what makes it possible later.
+- Action ambiguity ([PRD #1261 D1](done/1261-voice-numbered-choice.md)), though the schema change here is what makes it possible later.
 - Any daemon or TUI↔daemon protocol change.
 
 ## Technical Approach
@@ -126,7 +126,7 @@ Desktop-only: the answer schema is between the desktop and the user's Commands e
 
 ## Testing
 
-Tiers as in [PRD #1260's Testing section](1260-voice-sticky-dictation-mode.md#testing).
+Tiers as in [PRD #1260's Testing section](done/1260-voice-sticky-dictation-mode.md#testing).
 
 | behaviour | tier | where | extends / new |
 | --- | --- | --- | --- |
@@ -162,6 +162,12 @@ Each milestone ends at a state that can ship or stop on its own.
 - [ ] **M3 — Navigation-only chains.** Execution, per-step revalidation, stop-and-report, chain Undo — for steps with a `lands_on` screen and a last step that is any navigation-safe row. **Clean stop:** a useful, bounded feature ("open the overview and then the tester") even if M4 never lands.
 - [ ] **M4 — Pauses and last-step specials.** The `AwaitingChoice` pause (needs #1261 shipped), the mutually exclusive case as a choice, D5 last steps, dictation and `dictation_on` last steps (needs #1260 shipped).
 - [ ] **M5 — Fixtures, docs, changelog.** `docs/desktop/voice.md` (rule 21: what to say, what is shown when a step is refused), `docs/develop/voice-first-design.md` (per-step grounding, the position rules and why), `docs/develop/desktop-gui.md`; `changelog.d/1184.feature.md` at the first milestone a user can observe (M3). Run `docs-screenshots-review`.
+
+## Dependent follow-up: action ambiguity (from PRD #1261 D1)
+
+[PRD #1261](done/1261-voice-numbered-choice.md) shipped value ambiguity only. Its **D1** — offering a numbered choice when an utterance fits two *actions* ("close the agent": view or stop) — moved here, because detecting it needs the Commands backend to return several candidate actions, the response-schema change this PRD's `steps` schema makes. It is **not** a milestone of the chain feature and does not un-defer it: with M1's NO-GO, D1 waits until this PRD or an equivalent multi-action schema is revived. When it is, the rule is already written in #1261: the non-destructive reading is option 1, and a destructive option still ends at the D5 confirmation.
+
+- [ ] **D1 — Action ambiguity.** After the response schema can carry more than one action.
 
 ## Risks
 
