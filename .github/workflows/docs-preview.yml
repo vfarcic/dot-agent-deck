@@ -5,8 +5,8 @@ name: Docs Preview
 # WHY THIS IS A SEPARATE `workflow_run` WORKFLOW rather than a step in docs.yml:
 # NETLIFY_AUTH_TOKEN is a personal token over the whole Netlify account, and a
 # `pull_request` job runs the PR's code -- its copy of the workflow, the init
-# hook in its devbox.json (which sources `.env`), every install script and
-# build plugin in site/'s npm tree. Excluding forks does not change that for a
+# hook in its devbox.json (which sources `.env`), every build script in the
+# crates `cargo xtask site` compiles. Excluding forks does not change that for a
 # same-repository branch, and this repo's branches are pushed by dispatched
 # agents and Renovate as well as by people. So docs.yml builds with no secret
 # and uploads only the static output, and this workflow -- which GitHub always
@@ -88,7 +88,7 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           set -euo pipefail
-          URL=$(devbox run -- netlify deploy --cwd site --no-build --dir=build \
+          URL=$(devbox run -- netlify deploy --cwd site --no-build --dir=build/public \
             --alias "pr-${PR_NUMBER}" --message "pr-${PR_NUMBER}" --json | jq -r '.deploy_url')
           echo "Preview: ${URL}"
           echo "url=${URL}" >> "$GITHUB_OUTPUT"

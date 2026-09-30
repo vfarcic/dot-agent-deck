@@ -9,8 +9,8 @@ The Agent Deck mark is one symbol — a stack of three terminal windows fanning 
 | `assets/brand/logo.svg` | **the master symbol**, 512×512, transparent background | `scripts/brand-logo.py` |
 | `assets/brand/lockup-light.svg`, `lockup-dark.svg` | symbol plus the "Agent Deck" wordmark, for light and dark backgrounds; used at the top of `README.md` | `scripts/brand-lockups.py` |
 | `assets/brand/reference/gpt-original.png` | the GPT-generated image the symbol was traced from | kept for reference only; nothing reads it |
-| `site/static/img/logo.svg` | docs navbar logo (`site/docusaurus.config.js`) | copy of the master, `scripts/brand-icons.sh` |
-| `site/static/img/favicon.ico` | docs favicon, frames at 16/24/32/48/64/256px | copy of the Tauri `icon.ico`, `scripts/brand-icons.sh` |
+| `site/static/img/logo.svg` | the logo in the landing page's header (`site/landing/index.html`) | copy of the master, `scripts/brand-icons.sh` |
+| `site/static/img/favicon.ico` | the landing page's favicon, frames at 16/24/32/48/64/256px | copy of the Tauri `icon.ico`, `scripts/brand-icons.sh` |
 | `desktop/src/assets/logo.svg` | the desktop rail badge (`desktop/src/components/NavigationRail.tsx`) | copy of the master, `scripts/brand-icons.sh` |
 | `desktop/src-tauri/icons/*` | the desktop app icon set: `icon.png`, `32x32.png`, `64x64.png`, `128x128.png`, `128x128@2x.png`, `icon.icns` (macOS), `icon.ico` (Windows) | `tauri icon`, via `scripts/brand-icons.sh` |
 
@@ -24,7 +24,7 @@ Three steps. A change to the shape needs all three; a change to one derived file
 
 ```bash
 python3 scripts/brand-logo.py      # rewrites assets/brand/logo.svg (standard library only)
-./scripts/brand-icons.sh           # rewrites the navbar logo, the rail badge, the Tauri icon set and the favicon
+./scripts/brand-icons.sh           # rewrites the site logo, the rail badge, the Tauri icon set and the favicon
 # ...then rebuild the two README lockups, which embed the symbol -- see "Regenerating the lockups" below
 ```
 
@@ -53,13 +53,13 @@ Without Nix — or on an Intel Mac — `pip install fonttools uharfbuzz` plus a 
 The design constraints the mark was chosen against, and what to look at if you change it:
 
 - **Legible at 16px.** The favicon and the smallest icon frames are 16px. Render the master at 16px and zoom it with nearest-neighbour scaling rather than trusting a smooth preview; detail that is two pixels wide is gone.
-- **Works on light and dark.** Check it on the docs site's two backgrounds (`#ffffff` and `#0a0e12`) and on the desktop rail (`--shell`, `#222a27` light / `#1b2220` dark). This is why the front window's body is `#18232c` rather than the ink `#0e1418` of the reference: ink on the near-black dark theme made the window's bottom edge vanish.
-- **No tile.** The app icon is the symbol on a transparent background, like the favicon and the navbar logo, so there is one mark rather than a mark and a tile-mounted variant.
+- **Works on light and dark.** Check it on the landing page's two backgrounds (`--c-bg` in `site/landing/landing.css`: `#ffffff` and `#0a0e12`) and on the desktop rail (`--shell`, `#222a27` light / `#1b2220` dark). This is why the front window's body is `#18232c` rather than the ink `#0e1418` of the reference: ink on the near-black dark theme made the window's bottom edge vanish.
+- **No tile.** The app icon is the symbol on a transparent background, like the favicon and the landing page's header logo, so there is one mark rather than a mark and a tile-mounted variant.
 
 `resvg` renders an SVG to PNG at any size (`resvg -w 16 assets/brand/logo.svg out.png`), and `nix --extra-experimental-features 'nix-command flakes' shell nixpkgs#resvg nixpkgs#imagemagick` provides it along with ImageMagick for compositing onto test backgrounds.
 
 ## Where the change becomes visible
 
 - **Desktop app:** the icon set is compiled in by `tauri-build` (the window icon) and read by the bundler (`.icns`, `.ico`, PNGs) at packaging time, so a rebuild picks it up. The rail badge is a normal Vite asset.
-- **Docs site:** `site/static/img/` ships with the site, which goes live on a release or a `/publish-docs` run, not on merge.
+- **Website:** `site/static/img/` is copied into the site at `/img/` by `cargo xtask site`, and the site goes live on a release or a `/publish-docs` run, not on merge. Only image files are copied (the extensions in `IMAGE_EXTENSIONS`, `src/published_docs.rs`); any other file there fails the build, so a new asset type means adding its extension to that list. That list checks the file name, not the content: an SVG can carry script, any file renamed to an image extension passes, and the copy refuses symlinks but cannot tell a hard link from an ordinary file, so what sits in `site/static/img/` is published as a trusted build input and has to be reviewed like one.
 - **README:** immediately, on GitHub.

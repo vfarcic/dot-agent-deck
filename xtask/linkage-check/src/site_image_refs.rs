@@ -1,14 +1,17 @@
 //! Issue #1200 — the `site-image-refs` rule: every local image reference under
-//! `docs/` and `site/src/` resolves to a file in `site/static/img/`.
+//! `docs/` and `site/landing/` resolves to a file in `site/static/img/`.
 //!
 //! ## What it is for
 //!
-//! A reference to a file under `site/static/` that does not exist **builds
-//! clean**. Docusaurus does not resolve an image path at build time — it is a
-//! string that reaches the browser verbatim — so `onBrokenLinks: 'throw'` never
-//! sees it, the page ships, and the browser 404s. No compiler, no bundler and
-//! no link checker looks at it either, which is the whole reason this is a
-//! `linkage-check` rule rather than something a build step would have caught.
+//! When this rule was written, a reference to a file under `site/static/` that
+//! did not exist **built clean**: Docusaurus did not resolve an image path at
+//! build time — it was a string that reached the browser verbatim — so
+//! `onBrokenLinks: 'throw'` never saw it, the page shipped, and the browser
+//! 404ed. PRD #1419 replaced Docusaurus with `cargo xtask site`, whose link
+//! check does resolve the published pages' and the landing page's images. This
+//! rule stays because it covers what that build does not see: the maintainer
+//! docs under `docs/develop/`, which are never published, and the checkout as
+//! it stands, on every `cargo test-fast`, without building the site.
 //!
 //! Issue #1200 was filed off two instances inside one pull request (#1155).
 //! One worker re-encoded the images to WebP and deleted `busy-deck.png` while
@@ -24,9 +27,10 @@
 //!
 //! `docs/img` is a **symlink** to `../site/static/img`, so the two spellings
 //! this rule matches end at the same bytes on disk by two different routes:
-//! Docusaurus serves `/img/x.png` out of `site/static/`, and MDX resolves a
-//! relative `./img/x.png` as a file reference next to the source page, which
-//! the symlink forwards. Both therefore resolve here against
+//! the site serves `/img/x.png` out of `site/static/img/`, and a relative
+//! `./img/x.png` resolves next to the source page, which the symlink forwards
+//! (on GitHub and on disk; `cargo xtask site` publishes the file beside the
+//! page). Both therefore resolve here against
 //! [`IMAGE_ROOT`] alone, and nothing in this rule reads the symlink — which is
 //! also what keeps it working on a Windows checkout, where git may materialise
 //! a symlink as a text file holding its target.
@@ -38,7 +42,8 @@
 //! every UTF-8 file under the scanned trees. That is deliberate and it is the
 //! only version that covers the instances above, which arrived in three
 //! different syntaxes — a Markdown image (`![alt](/img/x.png)`), a JavaScript
-//! string (`src: '/img/x.png'` in `site/src/data/landing-content.js`) and a raw
+//! string (`src: '/img/x.png'` in the Docusaurus landing page's data module, now
+//! gone) and a raw
 //! HTML/JSX `<img src="./img/x.png">`. A syntax-aware rule would have to be
 //! taught each one, and the raw-`<img>` instance is precisely the form the
 //! Markdown-aware tooling already skips.
@@ -79,10 +84,10 @@ use crate::paths::slash_path;
 /// `docs/` covers the published pages *and* the maintainer docs under
 /// `docs/develop/` — they are the same tree, they resolve against the same
 /// directory, and a developer doc with a dead image in it is still a dead
-/// image. `site/src/` is where the landing page keeps its screenshots, in a
-/// data module rather than in Markdown, which is how #1200's first instance
-/// got in.
-const SCANNED_DIRS: &[&str] = &["docs", "site/src"];
+/// image. `site/landing/` is where the landing page keeps its screenshots, in
+/// HTML rather than in Markdown; #1200's first instance got in through the
+/// landing page when it was a Docusaurus data module under `site/src/`.
+const SCANNED_DIRS: &[&str] = &["docs", "site/landing"];
 
 /// Where every reference resolves. See the module docs for why one target
 /// covers both spellings.
@@ -98,17 +103,15 @@ const IMAGE_ROOT: &str = "site/static/img";
 const MISSING_IMAGE_ALLOW: &str = "linkage-check:allow-missing-image";
 
 /// The rule, quoted at every finding.
-pub const MISSING_IMAGE_RULE: &str = "so the page ships a 404 instead of failing the build: \
-     Docusaurus does not resolve an image path at build time, which is why \
-     `onBrokenLinks: 'throw'` never sees this one (issue #1200). Restore the \
+pub const MISSING_IMAGE_RULE: &str = "so the page shows a broken image (issue #1200). Restore the \
      file, re-point the reference, or declare the exception with \
      `linkage-check:allow-missing-image` on the line";
 
 /// File extensions a reference must end in to be one.
 ///
 /// The extension is what keeps the rule off prose. Both trees discuss their own
-/// image paths in comments and in sentences — the landing-page data module
-/// records why `orchestration-config.png` was deleted, and
+/// image paths in comments and in sentences — the old landing-page data module
+/// recorded why `orchestration-config.png` was deleted, and
 /// `docs/develop/linkage-check-rules.md` quotes the two spellings — and a bare
 /// `/img/` with no file name after it is not a reference to anything.
 ///
@@ -243,7 +246,7 @@ fn collect_images(base: &Path, entries: std::fs::ReadDir, out: &mut BTreeSet<Str
 ///
 /// **The top-level root is probed separately from what it contains**, on
 /// purpose — a Greptile finding on #1238 caught the version that was not.
-/// `docs` and `site/src` are two independent trees this rule promises to
+/// `docs` and `site/landing` are two independent trees this rule promises to
 /// scan; losing one of them silently (missing directory, permissions) used to
 /// pass unnoticed as long as the *other* tree still produced a match, because
 /// `check`'s vacuous-scan guard only fires when NEITHER tree yields anything.
@@ -335,7 +338,7 @@ mod tests {
         vec![("docs/page.md".to_string(), text.to_string())]
     }
 
-    /// The hit, in both spellings: `docs/` writes relative and `site/src/`
+    /// The hit, in both spellings: `docs/` writes relative and `site/landing/`
     /// writes site-absolute, and `docs/img` being a symlink to
     /// `site/static/img` is why one resolution target settles both.
     #[test]
@@ -347,8 +350,8 @@ mod tests {
                     "![alt](./img/launch.jpg)\n".to_string(),
                 ),
                 (
-                    "site/src/data/landing-content.js".to_string(),
-                    "  src: '/img/launch.jpg',\n".to_string(),
+                    "site/landing/index.html".to_string(),
+                    "<img src=\"/img/launch.jpg\" alt=\"\">\n".to_string(),
                 ),
             ],
             &available(&["launch.jpg"]),
@@ -366,8 +369,8 @@ mod tests {
                     "intro\n![alt](./img/gone.jpg)\n".to_string(),
                 ),
                 (
-                    "site/src/data/landing-content.js".to_string(),
-                    "  src: '/img/gone.webp',\n".to_string(),
+                    "site/landing/index.html".to_string(),
+                    "<img src=\"/img/gone.webp\" alt=\"\">\n".to_string(),
                 ),
             ],
             &available(&["kept.jpg"]),
@@ -382,7 +385,7 @@ mod tests {
         );
         assert!(
             findings[1].starts_with(
-                "site/src/data/landing-content.js:1: `/img/gone.webp` resolves to `site/static/img/gone.webp`"
+                "site/landing/index.html:1: `/img/gone.webp` resolves to `site/static/img/gone.webp`"
             ),
             "{}",
             findings[1]
@@ -424,7 +427,7 @@ mod tests {
     }
 
     /// A repo-relative path written as prose is not a reference. Both trees do
-    /// this: the landing-page data module records why an image was deleted, and
+    /// this: the old landing-page data module recorded why an image was deleted, and
     /// this module's own docs quote the spellings.
     #[test]
     fn a_repo_relative_path_in_prose_is_not_a_reference() {
@@ -550,7 +553,7 @@ mod tests {
     /// or unreadable `SCANNED_DIRS` root silently produced no files from THAT
     /// tree while the other one still yielded matches, so `seen_any` stayed
     /// true and `check`'s vacuous-scan guard never fired — the rule could pass
-    /// having lost all coverage of a whole declared input tree. `site/src/` is
+    /// having lost all coverage of a whole declared input tree. `site/landing/` is
     /// never created here; `docs/` alone still resolves cleanly, and that must
     /// not be enough for a clean run.
     #[test]
@@ -561,11 +564,11 @@ mod tests {
         std::fs::write(root.join(IMAGE_ROOT).join("kept.png"), "x").expect("kept");
         std::fs::create_dir_all(root.join("docs")).expect("docs");
         std::fs::write(root.join("docs/page.md"), "![a](/img/kept.png)\n").expect("page");
-        // site/src/ is never created.
+        // site/landing/ is never created.
 
         let findings = run(root);
         assert_eq!(findings.len(), 1, "{findings:?}");
-        assert!(findings[0].starts_with("site/src/"), "{}", findings[0]);
+        assert!(findings[0].starts_with("site/landing/"), "{}", findings[0]);
         assert!(
             findings[0].contains("is missing or unreadable"),
             "{}",
@@ -574,7 +577,7 @@ mod tests {
     }
 
     /// `run` end to end over a synthetic tree, including the walk: the miss is
-    /// found in a nested `site/src/` module and reported with a `/`-separated
+    /// found in a nested `site/landing/` file and reported with a `/`-separated
     /// path.
     #[test]
     fn run_walks_both_trees_and_reports_relative_paths() {
@@ -584,17 +587,17 @@ mod tests {
         std::fs::write(root.join(IMAGE_ROOT).join("kept.png"), "x").expect("kept");
         std::fs::create_dir_all(root.join("docs")).expect("docs");
         std::fs::write(root.join("docs/page.md"), "![a](./img/kept.png)\n").expect("page");
-        std::fs::create_dir_all(root.join("site/src/data")).expect("data");
+        std::fs::create_dir_all(root.join("site/landing/nested")).expect("landing dir");
         std::fs::write(
-            root.join("site/src/data/landing-content.js"),
-            "  src: '/img/gone.png',\n",
+            root.join("site/landing/nested/part.html"),
+            "<img src=\"/img/gone.png\" alt=\"\">\n",
         )
         .expect("landing");
 
         let findings = run(root);
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(
-            findings[0].starts_with("site/src/data/landing-content.js:1:"),
+            findings[0].starts_with("site/landing/nested/part.html:1:"),
             "{}",
             findings[0]
         );
@@ -617,7 +620,7 @@ mod tests {
         std::fs::create_dir_all(root.join("docs")).expect("docs");
         std::fs::write(root.join("docs/page.md"), "![a](/img/note.svg)\n").expect("page");
         std::os::unix::fs::symlink("../site/static/img", root.join("docs/img")).expect("symlink");
-        std::fs::create_dir_all(root.join("site/src")).expect("site/src");
+        std::fs::create_dir_all(root.join("site/landing")).expect("site/landing");
 
         let findings = run(root);
         assert!(findings.is_empty(), "{findings:?}");
@@ -625,7 +628,7 @@ mod tests {
 
     /// The tree itself. This is what makes the planted-input tests above mean
     /// something — they prove the scan CAN fail, and this proves the checked-in
-    /// pages and landing data do not.
+    /// pages and the landing page do not.
     #[test]
     fn the_checked_in_docs_and_site_references_all_resolve() {
         let findings = run(&repo_root());

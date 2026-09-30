@@ -35,9 +35,11 @@ inputs.dot-agent-deck.url = "github:vfarcic/dot-agent-deck";
 
 ## Documentation
 
-For installation guides, configuration, keyboard shortcuts, and more, visit the documentation site:
+For installation guides, configuration, keyboard shortcuts, and more, visit the website:
 
 **[Agent Deck](https://agent-deck.devopstoolkit.ai)**
+
+The docs are written so your AI agent can set the deck up for you. Point it at [llms.txt](https://agent-deck.devopstoolkit.ai/llms.txt), the index of every page, or, once the deck is installed, have it run `dot-agent-deck docs`, which prints the docs for the version you have.
 
 ## License
 
