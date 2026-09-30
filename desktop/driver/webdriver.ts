@@ -162,6 +162,11 @@ export class Session {
    * Issue #1403 — a real left-button drag between two viewport points, which is
    * how a person selects text in xterm: the selection service listens for the
    * press on the terminal's screen and follows the pointer until release.
+   *
+   * The pointer passes through the midpoint and rests at the end before the
+   * button comes up, as a hand does. On a slow runner a single move straight
+   * into the release could reach the page after the button was already up,
+   * and xterm then records a click, not a selection.
    */
   async drag(from: { x: number; y: number }, to: { x: number; y: number }): Promise<void> {
     const at = (point: { x: number; y: number }, duration: number) => ({
@@ -176,7 +181,14 @@ export class Session {
         type: "pointer",
         id: "mouse",
         parameters: { pointerType: "mouse" },
-        actions: [at(from, 0), { type: "pointerDown", button: 0 }, at(to, 150), { type: "pointerUp", button: 0 }],
+        actions: [
+          at(from, 0),
+          { type: "pointerDown", button: 0 },
+          at({ x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 }, 100),
+          at(to, 100),
+          { type: "pause", duration: 150 },
+          { type: "pointerUp", button: 0 },
+        ],
       },
     ]);
   }

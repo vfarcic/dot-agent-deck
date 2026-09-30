@@ -130,6 +130,16 @@ async function stopChild(child: ChildProcess | undefined): Promise<void> {
 }
 
 /** What a scenario's deck is configured with. */
+/** One mounted terminal, as the build-gated seam's `terminalScreens()` reports it. */
+type TerminalScreen = {
+  key: string;
+  cols: number;
+  rows: number;
+  lines: string[];
+  rect: { left: number; top: number; width: number; height: number } | null;
+  selection: string;
+};
+
 export type DeckOptions = {
   /** Start the daemon before the window opens. `false` leaves it to `startDaemon()`. */
   daemonFirst: boolean;
@@ -344,19 +354,7 @@ export class Deck {
    * text in the DOM to measure instead.
    */
   async rowSpan(text: string): Promise<{ from: { x: number; y: number }; to: { x: number; y: number } } | undefined> {
-    type Screen = {
-      cols: number;
-      rows: number;
-      lines: string[];
-      rect: { left: number; top: number; width: number; height: number } | null;
-    };
-    const screens = await this.session.execute<Screen[] | null>(
-      "return window.__dadDriver ? window.__dadDriver.terminalScreens() : null",
-    );
-    if (screens === null) {
-      throw new Error("the bundle carries no driver seam: build it with VITE_DAD_DRIVER_SEAM=1 (docs/develop/desktop-gui.md)");
-    }
-    for (const { cols, rows, lines, rect } of screens) {
+    for (const { cols, rows, lines, rect } of await this.terminalScreens()) {
       const row = lines.findIndex((line) => line === text);
       if (row < 0 || !rect || cols < 1 || rows < 1) continue;
       const cell = { width: rect.width / cols, height: rect.height / rows };
@@ -367,6 +365,25 @@ export class Deck {
       };
     }
     return undefined;
+  }
+
+  /**
+   * Issue #1403 — whether any mounted terminal's xterm holds exactly `text` as
+   * its selection. Checked between a drag and the copy chord, so a failure
+   * says which of the two did not happen.
+   */
+  async hasSelection(text: string): Promise<boolean> {
+    return (await this.terminalScreens()).some(({ selection }) => selection === text);
+  }
+
+  private async terminalScreens(): Promise<TerminalScreen[]> {
+    const screens = await this.session.execute<TerminalScreen[] | null>(
+      "return window.__dadDriver ? window.__dadDriver.terminalScreens() : null",
+    );
+    if (screens === null) {
+      throw new Error("the bundle carries no driver seam: build it with VITE_DAD_DRIVER_SEAM=1 (docs/develop/desktop-gui.md)");
+    }
+    return screens;
   }
 
   /**
@@ -417,6 +434,7 @@ export class Deck {
       writeFileSync(join(dir, "screenshot.png"), Buffer.from(await this.session.screenshot(), "base64"));
       writeFileSync(join(dir, "page.txt"), await this.session.execute<string>("return document.body.innerText"));
       writeFileSync(join(dir, "terminals.json"), JSON.stringify(await this.terminalTexts(), null, 2));
+      writeFileSync(join(dir, "terminal-screens.json"), JSON.stringify(await this.terminalScreens(), null, 2));
     } catch (error) {
       writeFileSync(join(dir, "capture-error.txt"), String(error));
     }

@@ -197,7 +197,9 @@ if (import.meta.env.VITE_DAD_DRIVER_SEAM === "1") {
     // Issue #1403 — where each terminal's visible rows are painted, so a
     // scenario can drag across a row the way a person selects text. One entry
     // per viewport row (not re-joined like the snapshot above, so row `i` is
-    // screen row `i`), plus the grid and the screen's box in viewport pixels.
+    // screen row `i`), plus the grid and the screen's box in viewport pixels,
+    // and what xterm currently holds as its selection, so a scenario can tell
+    // a drag that selected nothing from a copy that did not land.
     terminalScreens: () =>
       [...terminals.entries()].map(([key, terminal]) => {
         const buffer = terminal.buffer.active;
@@ -207,7 +209,7 @@ if (import.meta.env.VITE_DAD_DRIVER_SEAM === "1") {
         }
         const box = terminal.element?.querySelector(".xterm-screen")?.getBoundingClientRect();
         const rect = box ? { left: box.left, top: box.top, width: box.width, height: box.height } : null;
-        return { key, cols: terminal.cols, rows: terminal.rows, lines, rect };
+        return { key, cols: terminal.cols, rows: terminal.rows, lines, rect, selection: terminal.getSelection() };
       }),
   };
 }
