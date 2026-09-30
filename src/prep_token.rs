@@ -289,6 +289,22 @@ impl PrepTokens {
         self.live.len() != before
     }
 
+    /// Forget every token whose binding names `context_path` as its
+    /// coordinator context, so none can start anything against that file any
+    /// more (issue #1395, Qodo on PR #1444). `true` when this store held one.
+    ///
+    /// For the file's deletion once its orchestration has ended: a token is not
+    /// consumed by a start, so without this a reused one could re-verify
+    /// against the file and record it for a new orchestration just before the
+    /// file is removed. Every preparation publishes a fresh, uniquely named file
+    /// ([`random_hex128`]), so the tokens this removes are exactly the ones that
+    /// could still hand that file to a start.
+    pub fn revoke_context_path(&mut self, context_path: &std::path::Path) -> bool {
+        let before = self.live.len();
+        self.live.retain(|r| r.binding.context_path != context_path);
+        self.live.len() != before
+    }
+
     /// How many unexpired tokens the store holds. Test-facing.
     pub fn len(&self) -> usize {
         self.live.len()
@@ -331,6 +347,13 @@ pub fn issue(binding: PrepBinding) -> String {
 pub fn binding(token: &str) -> Option<PrepBinding> {
     let mut guard = store().lock().unwrap_or_else(|p| p.into_inner());
     guard.binding(token, Instant::now())
+}
+
+/// Revoke every token naming `context_path` in the daemon-wide store
+/// ([`PrepTokens::revoke_context_path`]).
+pub fn revoke_context_path(context_path: &std::path::Path) -> bool {
+    let mut guard = store().lock().unwrap_or_else(|p| p.into_inner());
+    guard.revoke_context_path(context_path)
 }
 
 /// Revoke `token` in the daemon-wide store ([`PrepTokens::revoke`]).
@@ -405,6 +428,24 @@ mod tests {
                 "Read .dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md"
                     .to_string(),
         }
+    }
+
+    /// Issue #1395 (Qodo on PR #1444): revoking by context path takes every
+    /// token that names the file, and only those.
+    #[test]
+    fn revoking_a_context_path_takes_exactly_the_tokens_that_bind_it() {
+        let mut tokens = PrepTokens::new();
+        let now = Instant::now();
+        let bound = binding_for("/p");
+        let path = bound.context_path.clone();
+        let first = tokens.issue(now, bound.clone());
+        let second = tokens.issue(now, bound);
+        let other = tokens.issue(now, binding_for("/q"));
+        assert!(tokens.revoke_context_path(&path));
+        assert!(tokens.binding(&first, now).is_none());
+        assert!(tokens.binding(&second, now).is_none());
+        assert!(tokens.binding(&other, now).is_some());
+        assert!(!tokens.revoke_context_path(&path), "nothing left to revoke");
     }
 
     /// A token is valid the moment it is issued and for the whole TTL.

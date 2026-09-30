@@ -10566,8 +10566,33 @@ impl AppState {
     /// is dropped and `None` is answered. Never the fixed-path mirror (the
     /// deletion helper refuses any other name shape too).
     ///
-    /// Pure bookkeeping under the state lock; the caller does the unlink after
+    /// Bookkeeping under the state lock; the caller does the unlink after
     /// releasing it ([`Self::unregister_pane`]).
+    ///
+    /// **A path answered for deletion has its preparation tokens revoked first**
+    /// (Qodo on PR #1444). A token is not consumed by a start — one launch
+    /// presents it once per role — so for [`crate::prep_token::PREP_TOKEN_TTL`]
+    /// after the preparation a start presenting it re-verifies against, and
+    /// then records, this same file. Left live, such a start arriving between
+    /// this answer and the deferred unlink would record the file for a new
+    /// orchestration and the unlink would delete a live coordinator's context.
+    /// Revoked here, under the same lock that decided "no live orchestration
+    /// references it", any start that fetches its binding afterwards is
+    /// refused as stale. Taking the token store's mutex while holding the state
+    /// lock is safe: that mutex is a leaf, held only inside `prep_token`'s own
+    /// functions, none of which touches the state.
+    ///
+    /// What revocation does not reach, precisely: a start that fetched its
+    /// binding BEFORE this revoke, passed its re-verification (which reads the
+    /// file back by inode and digest) BEFORE the unlink, and records after it.
+    /// Its coordinator is spawned against a file the unlink then removes. That
+    /// needs a second start from the same token to be mid-flight, between its
+    /// re-verification and its `record_orchestration_context`, at the instant
+    /// the last pane of another orchestration started from that token closes.
+    /// A start that re-verifies after the unlink is refused, so no start
+    /// begins on a file that is already gone. The daemon's own `spawn` path records
+    /// only a file it has just published under a fresh random name, so no
+    /// start by that path can name this file at all.
     pub fn take_ended_orchestration_context(
         &mut self,
         identity: &OrchestrationIdentity,
@@ -10590,7 +10615,11 @@ impl AppState {
             .orchestration_context_paths
             .values()
             .any(|other| *other == path);
-        (!still_referenced).then_some(path)
+        if still_referenced {
+            return None;
+        }
+        crate::prep_token::revoke_context_path(&path);
+        Some(path)
     }
 
     fn prune_orchestration_title(&mut self, identity: &OrchestrationIdentity) {
@@ -14239,6 +14268,56 @@ mod tests {
         assert_eq!(
             state.orchestration_context_paths.get(&instance("b")),
             Some(&shared)
+        );
+    }
+
+    /// Issue #1395 (Qodo on PR #1444): a preparation token is reusable within
+    /// its TTL, so it could hand an ended orchestration's context file to a new
+    /// start just before that file's deferred unlink. Answering the file for
+    /// deletion therefore revokes the token first; while another orchestration
+    /// still records the file, nothing is answered and the token stays usable.
+    #[test]
+    fn releasing_an_ended_context_revokes_the_tokens_that_could_reuse_it() {
+        let path = std::path::PathBuf::from(format!(
+            "/p/.dot-agent-deck/orchestrator-context-{}.md",
+            crate::prep_token::random_hex128()
+        ));
+        let token = crate::prep_token::issue(crate::prep_token::PrepBinding {
+            project_dir: std::path::PathBuf::from("/p"),
+            project_identity: None,
+            config_revision: "fnv1a128-00".to_string(),
+            orchestration: "loop".to_string(),
+            context_path: path.clone(),
+            context_identity: None,
+            context_digest: "ctx-fnv1a128-00".to_string(),
+            coordinator_prompt: String::new(),
+        });
+
+        let mut state = AppState::default();
+        register_role_pane(&mut state, "a0", "orchestrator", true, instance("a"));
+        register_role_pane(&mut state, "b0", "orchestrator", true, instance("b"));
+        state.record_orchestration_context(&instance("a"), path.clone());
+        // A second start from the same token already recorded the same file.
+        state.record_orchestration_context(&instance("b"), path.clone());
+
+        // `a` ends while `b` still records the file: kept, token still live.
+        state.pane_orchestration_map.remove("a0");
+        assert_eq!(state.take_ended_orchestration_context(&instance("a")), None);
+        assert!(
+            crate::prep_token::binding(&token).is_some(),
+            "a file still in use keeps the token that minted it"
+        );
+
+        // `b` ends and nothing records it: answered for deletion, and the token
+        // can no longer start a successor on the file about to be removed.
+        state.pane_orchestration_map.remove("b0");
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("b")),
+            Some(path)
+        );
+        assert!(
+            crate::prep_token::binding(&token).is_none(),
+            "a reused token must not re-verify against a file answered for deletion"
         );
     }
 
