@@ -6892,6 +6892,7 @@ dependencies = [
  "tempfile",
  "toml_edit 0.25.15+spec-1.1.0",
  "xtask-docs",
+ "xtask-site",
  "yaml-rust2",
 ]
 
@@ -6902,6 +6903,14 @@ dependencies = [
  "serde_json",
  "tempfile",
  "vt100",
+]
+
+[[package]]
+name = "xtask-site"
+version = "0.0.0"
+dependencies = [
+ "tempfile",
+ "toml 1.1.6+spec-1.1.0",
 ]
 
 [[package]]

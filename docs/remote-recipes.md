@@ -1,118 +1,102 @@
----
-sidebar_position: 7.6
-title: Remote Recipes
----
-
 # Remote Recipes
 
-Getting a host into a state where `dot-agent-deck remote add` will succeed. The deck ships no provisioner and has no opinion about where the machine comes from — these are starting points you adapt to your environment.
+Commands for getting a host ready for `dot-agent-deck remote add`, registering it, and lending it your laptop's network through an ssh tunnel. [Remote Environment Requirements](remote-requirements.md) is the full list of what a host must provide; [Remote Environments](remote-environments.md) covers connecting, detaching and upgrading.
 
-For prerequisites the host must satisfy see [Remote Environment Requirements](remote-requirements.md). For lifecycle and connection semantics see [Remote Environments](remote-environments.md). The Kubernetes-as-host recipe lives in [issue #81](https://github.com/vfarcic/dot-agent-deck/issues/81) and is not yet shipped.
-
-> **Status.** Validated end to end on Linux (Ubuntu 24.04 LTS) and on macOS (Apple Silicon). The distribution is not a requirement — see [Which Linux distribution](remote-requirements.md#which-linux-distribution) for the two things that genuinely vary. **Where the machine comes from does not matter to the deck** — `remote add` connects over ssh, checks what the host is, installs a binary and sets up hooks; nothing in it is specific to any cloud, hypervisor or distribution. So the only thing that varies below is how you obtain a machine, which is your provider's business rather than the deck's.
-
-## What the deck needs
-
-Whatever you do below converges on the same end state:
-
-1. **A machine reachable over ssh** — a Linux box or a Mac. Whose hardware it is, and where it runs, is irrelevant to the deck.
-2. **A user account** with `~/.local/bin` on `PATH` and the agent CLI installed. Nothing stops that being `root` — the daemon runs fine as root — but agents run as children of the daemon and inherit its account, so on anything beyond a throwaway sandbox make it a [non-root user](remote-requirements.md#non-root-user-account).
-3. **Outbound HTTPS** to the LLM provider, package registries, and your git remote.
-4. From your laptop:
-
-   ```bash
-   dot-agent-deck remote add <name> <user>@<host>
-   ```
-
-[Remote Environment Requirements](remote-requirements.md) is the authority on what the host must provide. This page is just the bootstrap.
+Adapt these to your environment: the deck has no provisioner, and nothing in `remote add` depends on the cloud, hypervisor or distribution the host runs on.
 
 ## Getting a machine
 
-- **One you already have.** A homelab server, a Raspberry Pi 5, a spare Mac, an old laptop left plugged in. Nothing to provision — go straight to the bootstrap below. (Elsewhere "your laptop" means the machine you connect *from*; here it is the host.)
-- **A local VM**, for isolation without a cloud account:
+- **One you already have**: a home server, a Raspberry Pi 5, a spare Mac, an old laptop left plugged in. Go straight to bootstrapping.
+- **A local VM**, for example with Multipass:
 
   ```bash
   multipass launch 24.04 --name dad-dev --cpus 2 --memory 2G --disk 20G
   multipass shell dad-dev
   ```
 
-- **A cloud VM**, from any provider. Create the smallest instance that meets [the hardware requirements](remote-requirements.md#hardware), running any modern Linux, with your ssh key installed, and note its address. How you do that is your provider's documentation, not ours — the deck never learns which one you picked.
-
-Cloud images commonly log you in as `root`. If yours does, the first bootstrap step is the one that matters.
+- **A cloud VM** from any provider: the smallest instance that meets [the hardware requirements](remote-requirements.md#hardware), running a glibc-based Linux ([Which Linux distribution](remote-requirements.md#which-linux-distribution)), with your ssh public key installed. Note its address.
 
 ## Bootstrapping a Linux host
 
-Once the machine exists and you can ssh to it, the rest is the same everywhere.
+These commands use Debian/Ubuntu package names; substitute your distribution's package manager.
 
-**If you land as `root` — most cloud images do — create a non-root user and stop using root.** This is not enforced: the deck will run as root perfectly well. The reason to bother is that agents inherit the daemon's account, so under root every command an agent runs has full system privileges over the host.
+**1. As `root` on the host**, install the packages the deck and your agent need. This example installs Claude Code; for another agent, see the install table in [Software on the host](remote-requirements.md#software-on-the-host):
+
+```bash
+apt-get update
+apt-get install -y curl git nodejs npm
+npm install -g @anthropic-ai/claude-code
+```
+
+If you log in as a non-root user with `sudo`, prefix each command with `sudo` and skip to step 3.
+
+**2. Create a non-root user** and turn off root and password logins. Agents run with the daemon's account, so under root they have full control of the host. Still as root:
 
 ```bash
 adduser --disabled-password --gecos "" deck
-usermod -aG sudo deck
 mkdir -p /home/deck/.ssh
 cp ~/.ssh/authorized_keys /home/deck/.ssh/
 chown -R deck:deck /home/deck/.ssh
 chmod 700 /home/deck/.ssh
 chmod 600 /home/deck/.ssh/authorized_keys
+```
 
-# sshd hardening: no root login, no password auth.
+From your laptop, check that `ssh deck@<address> true` works. Only then, as root on the host:
+
+```bash
 sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
 systemctl restart ssh
-exit
 ```
 
-**Then, as that user, install the agent toolchain.** The commands below are Debian/Ubuntu spelling; substitute your distribution's package manager — nothing here is specific to `apt`.
+The ssh service is `ssh` on Debian and Ubuntu and `sshd` on most other distributions. The `deck` user has no password, so it cannot use `sudo`; do later system-wide installs as root before you turn off root login, or give the user a password.
+
+**3. As the user the deck will run as**, put `~/.local/bin` on `PATH` and log your agent in:
 
 ```bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 mkdir -p ~/.local/bin
-sudo apt-get update
-sudo apt-get install -y nodejs npm git
-
-# Install whichever agent you use. Example: Claude Code.
-npm install -g @anthropic-ai/claude-code
-echo 'export ANTHROPIC_API_KEY=sk-ant-...' >> ~/.bashrc
-
-# systemd lingering, so the daemon survives your shell exiting.
-sudo loginctl enable-linger $USER
-exit
 ```
 
-**Then, from your laptop:**
+If your agent needs a newer Node.js than the distribution ships, install Node.js from [NodeSource](https://github.com/nodesource/distributions) or with `nvm` instead. Log the agent in on the host (for Claude Code, run `claude` once and follow its login), or give the daemon's user its API key; see [Credentials and one host per project](remote-requirements.md#credentials-and-one-host-per-project).
+
+**4. From your laptop**, accept the host key, then register and connect:
 
 ```bash
+ssh deck@<address> true
 dot-agent-deck remote add dad-dev deck@<address>
 dot-agent-deck connect dad-dev
 ```
 
-If your ssh identity isn't in one of ssh's default search paths, pass it explicitly:
+If your key is not one ssh finds by default, add `--key ~/.ssh/<key>` to `remote add`; `connect` reuses it.
 
-```bash
-dot-agent-deck remote add dad-dev deck@<address> --key ~/.ssh/dot-agent-deck
-```
+Check it worked: `remote add` ends with `Added remote 'dad-dev' …`, `dot-agent-deck remote list` shows the entry, and `connect` opens an empty dashboard where `Ctrl+N` starts an agent.
 
-On a home LAN, mDNS (`hostname.local`) works as the address. For access from outside the LAN, set up a tunnel (Tailscale, ZeroTier, or a port-forwarded ssh) before running `remote add`.
+**5. Optional:** run the daemon as a systemd user service so it restarts with the host; see [Keep the daemon running](remote-requirements.md#keep-the-daemon-running).
+
+On a home network, the host's mDNS name (`hostname.local`) works as the address. To reach the host from outside that network, set up a VPN such as Tailscale or ZeroTier, or a forwarded ssh port, before running `remote add`.
 
 ## Bootstrapping a macOS host
 
-A Mac needs no provisioning — it is a machine you already have, and `remote add` installs onto it exactly as it does onto Linux. Enable Remote Login in System Settings so it accepts ssh, install your agent CLI, and run `remote add` from your laptop.
-
-Two things differ from a Linux host, and both are covered in [macOS as a remote host](remote-requirements.md#macos-as-a-remote-host): Claude Code needs a one-time `/login` inside the pane, and the Mac has to be told not to sleep.
+1. On the Mac, turn on **Remote Login** (System Settings → General → Sharing).
+2. Install your agent CLI on the Mac. macOS includes `curl`, which `remote add` uses to download the deck.
+3. Stop the Mac from sleeping (`pmset`, see [macOS as a remote host](remote-requirements.md#macos-as-a-remote-host)).
+4. From your laptop: `ssh <user>@<mac>.local true`, then `dot-agent-deck remote add my-mac <user>@<mac>.local` and `dot-agent-deck connect my-mac`.
+5. In the first Claude Code pane, run `/login` once.
 
 ## Reaching networks only your laptop can see
 
-Sometimes the remote is *less* connected than your laptop: the laptop holds a corporate VPN that grants access to internal git and private registries, and the VM — on your home LAN, or in a restricted-egress segment — cannot reach them. Agents spawn fine and then the first `git clone` fails.
+Sometimes the host reaches less than your laptop does: your laptop is on a corporate VPN that reaches an internal git server or package registry, and the host is not. Agents start fine, then the first `git clone` fails.
 
-`connect` runs plain `ssh` and does not pass `-F` or otherwise override your ssh configuration, so a `Host` block in `~/.ssh/config` applies to the deck exactly as it does to any other ssh invocation. You can lend the VM your laptop's network access with a reverse tunnel, with no deck-side configuration at all.
+`connect` runs your system `ssh` and applies your `~/.ssh/config`, so a `Host` block there can lend the host your laptop's network through a reverse tunnel, with nothing to configure in the deck. This works while you are connected; see [Limits](#limits).
 
-> **Status.** The tunnel mechanism below is verified end to end (a service reachable only from the laptop's loopback, fetched from a remote through the tunnel). It has **not** been validated against a real corporate VPN — whether your internal git host is reachable this way depends on your network and your IT policy. See [issue #97](https://github.com/vfarcic/dot-agent-deck/issues/97).
+This has been tested with a service reachable only from the laptop, fetched from the host through the tunnel. It has not been tested against a real corporate VPN; whether your internal hosts are reachable this way depends on your network and its policy.
 
-**Prerequisite on the remote.** Its sshd must permit TCP forwarding — `AllowTcpForwarding yes`, which is the OpenSSH default but is disabled in some distributions' packages (Alpine's, for one) and by most hardening baselines. Check with `sshd -T | grep allowtcpforwarding`, or from the laptop with [`dot-agent-deck remote doctor <name>`](#troubleshooting-with-remote-doctor), which reads the same value over ssh and reports it as the `AllowTcpForwarding` check. If it is off, every forward fails with `remote port forwarding failed for listen port N`, which looks identical to a port collision — telling those two apart is the reason `remote doctor` exists. Note that `sshd_config` takes the *first* value it finds for a keyword, so appending `AllowTcpForwarding yes` to the end of the file does nothing if the key is already set above — rewrite the existing line.
+**On the host**, sshd must allow TCP forwarding (`AllowTcpForwarding yes`). That is OpenSSH's default, but some distribution packages (Alpine's among them) and most hardening baselines turn it off. Check with `sudo sshd -T | grep allowtcpforwarding` on the host, or with `dot-agent-deck remote doctor <name>` from your laptop. sshd uses the **first** value it finds for a keyword, so edit an existing `AllowTcpForwarding` line rather than appending a new one, then reload sshd.
 
 ### Reverse SOCKS proxy (recommended)
 
-Covers HTTPS git, private package registries, and internal APIs in one rule, and preserves hostnames end to end. On the **laptop**, in `~/.ssh/config`:
+One rule covers HTTPS git, private package registries and internal APIs, and keeps host names intact. On your **laptop**, in `~/.ssh/config`, using the same host name you registered:
 
 ```
 Host deck-vm.example
@@ -120,17 +104,19 @@ Host deck-vm.example
     ExitOnForwardFailure yes
 ```
 
-`RemoteForward` with a port and **no destination** is reverse dynamic forwarding: ssh opens a SOCKS proxy on the VM's loopback at port 1080 and forwards whatever it requests out through your laptop. Requires OpenSSH 7.6 or newer on the laptop. Then on the **VM**:
+`RemoteForward` with a port and **no destination** opens a SOCKS proxy on the host's loopback at port 1080 that sends traffic out through your laptop. It needs OpenSSH 7.6 or newer on your laptop. `ExitOnForwardFailure yes` makes a session whose tunnel cannot be set up fail instead of connecting without it. Then, **on the host**:
 
 ```bash
 git config --global http.proxy socks5h://127.0.0.1:1080
 ```
 
-Use `socks5h`, not `socks5` — the `h` sends hostname resolution through the proxy, so the name is resolved at your laptop (the VM has no DNS for it) and TLS still sees the real hostname, so certificate validation and SNI work normally.
+Use `socks5h`, not `socks5`: with `h`, host names are resolved at your laptop, which is the side that can resolve them, and TLS still sees the real host name.
+
+Check it: connect with `dot-agent-deck connect <name>`, then in a pane on the host run `git ls-remote https://<internal-git-host>/<repo>.git`; from your laptop, `dot-agent-deck remote doctor <name>` should show `ForwardBound` as `PASS` while that session is open.
 
 ### Single host over ssh
 
-Simpler when you only need one git host and it speaks the ssh protocol. On the **laptop**:
+When you need one git server that speaks ssh. On your **laptop**:
 
 ```
 Host deck-vm.example
@@ -138,7 +124,7 @@ Host deck-vm.example
     ExitOnForwardFailure yes
 ```
 
-On the **VM**, give the tunnel a name so host-key checking stays meaningful:
+**On the host**, in `~/.ssh/config`, give the tunnel a name:
 
 ```
 Host company-git
@@ -148,50 +134,37 @@ Host company-git
     HostKeyAlias git.company.com
 ```
 
-Then `git clone company-git:team/repo.git`. `HostKeyAlias` records the real host's key under its real name in `known_hosts`, instead of filing it under `[127.0.0.1]:2222` where it would collide with any other host you tunnel to that port.
+Then `git clone company-git:team/repo.git`. `HostKeyAlias` stores the real server's key under its real name in `known_hosts`, so it does not collide with another server you tunnel through the same local port.
 
-> **`DynamicForward` is the wrong direction.** `DynamicForward` (and `ssh -D`) opens a SOCKS listener on *your laptop* that egresses via the remote — useful for reaching the remote's network from the laptop, which is the opposite of the problem here. Use `RemoteForward <port>` with no destination. This mistake is silent, so [`remote doctor`](#troubleshooting-with-remote-doctor) calls it out by name as the `DynamicForward` check.
+`DynamicForward` (and `ssh -D`) is the wrong direction for this: it opens a SOCKS listener on your laptop that exits through the host. Use `RemoteForward <port>` with no destination. `remote doctor`'s `DynamicForward` check reports this mistake.
 
-### Authentication
+### Authentication through the tunnel
 
-The tunnel carries packets, not credentials. A reachable git endpoint still needs to authenticate, and the options are not equally good:
+The tunnel carries traffic, not credentials; the internal server still needs to authenticate the host.
 
-- **A deck-specific deploy key on the VM, registered with your git host — recommended.** Scoped to the repositories it needs, revocable on its own, and it leaves an audit trail distinct from your personal account. Usually needs a request to whoever administers the git host.
-- **A PAT in the VM's environment.** Works for HTTPS-only flows, but the token is now durable on a machine that may be less protected than your laptop.
-- **`ForwardAgent yes` — avoid.** It is the least effort and the worst trade: every agent on the VM can use your laptop's ssh-agent for as long as you are connected, with no per-agent scoping and no way to revoke one agent's access short of disconnecting.
+- **A deploy key on the host, registered with your git server (recommended).** It can be limited to the repositories it needs and revoked on its own.
+- **A personal access token in the host's environment.** Works for HTTPS, but leaves a long-lived token on the host.
+- **`ForwardAgent yes` (avoid).** Every agent on the host can use your laptop's ssh-agent for as long as you are connected, with no way to limit or revoke one agent's access. `remote doctor` warns about it.
 
-### Limits worth knowing before you rely on this
+### Limits
 
-**The tunnel lives and dies with the ssh session; your agents do not.** Agents survive detach by design — their access to laptop-tunneled resources does not. An agent that pushes while you are disconnected fails; one that clones, pulls, or fetches from a private registry blocks on bytes that will never arrive. Reads in particular are not deferrable. If a task needs the tunnel mid-flight, stay connected. On reconnect the forward comes back up with the new session.
-
-**The `Host` block applies to every ssh the deck makes to that host** — the version probe, `remote add`, `remote upgrade`, and each automatic reconnect attempt, not just `connect`. Mostly harmless, but it interacts badly with `ExitOnForwardFailure yes`: if a previous session's listener is still held on the remote, the next connection fails to bind and exits. The deck used to report that as an unreachable host; since issue #344 it says `SSH forwarding failed` instead and points you at [`remote doctor`](#troubleshooting-with-remote-doctor), whose `ClientAliveInterval` check reads the reaping policy this paragraph asks you to set. Two mitigations, and you want both: set `ClientAliveInterval 15` / `ClientAliveCountMax 3` in the remote's `sshd_config` so it reaps dead sessions on roughly the same ~45s budget the deck's client-side keepalive uses (sshd's default is to never probe, so a listener orphaned by a laptop sleeping can linger for a long time), and do not run two `connect` sessions to the same remote with the same forward port.
-
-**Forward ports are per-remote, not per-laptop.** Two laptops connecting to the same VM with the same `RemoteForward 1080` will collide — the second one's forward fails to bind. Give each laptop its own port. [`remote doctor`](#troubleshooting-with-remote-doctor)'s `ForwardBound` check is the one that catches this, and it is the check that separates a collision from a policy refusal.
-
-**Three options the deck sets explicitly override your config.** `connect` passes `ConnectTimeout`, `ServerAliveInterval`, and `ServerAliveCountMax` on the command line, and ssh gives command-line `-o` precedence over the config file, so setting those in your `Host` block has no effect. Forwarding options are untouched.
+- **The tunnel exists only while a `connect` session is open; your agents keep running without it.** While you are disconnected, a push through the tunnel fails and a clone, fetch or package download through it hangs. Stay connected while a task needs the tunnel. Each new session brings the tunnel back.
+- **The `Host` block applies to every ssh the deck makes to that host**: `remote add`, `remote upgrade`, the checks before each `connect`, and each reconnect. With `ExitOnForwardFailure yes`, if a previous session's listener is still held on the host, the next session cannot bind it and `connect` fails with `SSH forwarding failed for remote …`. Set `ClientAliveInterval 15` and `ClientAliveCountMax 3` in the host's `sshd_config`, so sshd drops a dead session in about 45 seconds (sshd's default never checks), and do not run two `connect` sessions to one host with the same forward port.
+- **Forward ports are per host.** Two laptops using `RemoteForward 1080` on the same host collide: the second one's forward fails. Give each laptop its own port.
+- **`connect` sets `ConnectTimeout`, `ServerAliveInterval` and `ServerAliveCountMax` on the ssh command line**, which overrides those settings in your `Host` block. Forwarding options are not touched.
 
 ### Troubleshooting with `remote doctor`
 
-Every caveat above is something you can check from the laptop in one command:
-
 ```bash
-dot-agent-deck remote doctor desk-vm
+dot-agent-deck remote doctor deck-vm
 ```
 
-It resolves the name from your remote registry, runs a fixed ordered list of checks, and prints each as PASS / WARN / FAIL / UNKNOWN with the directive and the file to change. It is **read-only**: it issues no command that edits your ssh config, the remote's `sshd_config`, the registry, or anything else on the remote. Every remote command it runs is a query — `sshd -T` to read the resolved sshd policy, and a `/dev/tcp` connect to see whether the forward is actually listening. There is one thing it writes on purpose (the SOCKS greeting, below) and one thing ssh may do underneath it whatever the doctor asks (a first-use `known_hosts` entry, also below); both are stated here rather than hidden behind the word.
+`remote doctor` looks the name up in your registry, runs ten checks in a fixed order, and prints each as `PASS`, `WARN`, `FAIL` or `UNKNOWN`, with the fix under any that is not `PASS`. It changes nothing: it edits no ssh config, `sshd_config`, registry entry or file on the host, and its own ssh sessions set up none of your forwards and do not forward your ssh-agent. It does open ssh connections under your own host-key settings, so with `StrictHostKeyChecking accept-new` (or `no`) a first connection to a new host adds its key to `known_hosts`, as any ssh would. For a reverse-dynamic forward (`RemoteForward <port>` with no destination), the `ForwardBound` check sends the three-byte SOCKS5 greeting to that port on the host to confirm the listener is a SOCKS proxy.
 
-**One thing the doctor sends rather than reads**, and it is worth knowing about: when your `Host` block configures a reverse-*dynamic* forward — `RemoteForward <port>` with no destination, which is the recipe above — the liveness probe speaks SOCKS to it. It writes the three-byte SOCKS5 no-auth greeting `05 01 00` and looks for `05 00` back. That is the only way to tell *your* tunnel from an unrelated service that happens to hold the port: a plain connect answers "something is listening" and a squatter passes it. The greeting goes **only** to a port you declared to be SOCKS by omitting the destination. A `RemoteForward` with a concrete destination carries whatever you tunnelled — a database, an internal API — so the doctor connects to it and says nothing, and reports UNKNOWN rather than guessing (see [A concrete `RemoteForward` reports UNKNOWN, not PASS](#a-concrete-remoteforward-reports-unknown-not-pass)). Nothing the greeting does outlives the probe: no file, no configuration, no listener state — read-only here means your persistent state, not the bytes on a socket the doctor itself opened.
-
-Read-only extends to the ssh sessions themselves. Every session the doctor opens passes `-o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o PermitLocalCommand=no -o UpdateHostKeys=no`, so it creates none of the forwards your `Host` block asks for, leaves no persistent master connection behind, runs no `LocalCommand`, and does not rewrite `known_hosts` on a key rotation. Two consequences worth knowing: the doctor's own probes are immune to the forwarding problems it is diagnosing (so reachability is reported cleanly instead of cascading into UNKNOWN), and `ForwardBound` reports on **pre-existing** state rather than on a listener the doctor created for itself. The one command that does *not* get those options is `ssh -G`, which never connects and whose whole purpose is to show the forwards the others suppress.
-
-**Those sessions also refuse to delegate your credentials**, and this is the part worth reading even if you skip the rest. `ClearAllForwardings` clears local, remote, dynamic and tunnel forwards — and nothing else, so it does not touch agent or X11 forwarding. Left alone, a `Host` block carrying `ForwardAgent yes` would hand your laptop's ssh-agent to the endpoint on *every* probe the doctor makes, before you have read the report's own advisory about it. An endpoint that has been compromised cannot pull private key material out of an agent socket, but it can *use* your key to authenticate or sign as you for as long as the probe runs — and `remote doctor` is exactly the command you run against a host you already suspect. So each session additionally passes `-o ForwardAgent=no -o ForwardX11=no -o ForwardX11Trusted=no -o GSSAPIDelegateCredentials=no -o AddKeysToAgent=no`. Nothing the doctor runs on the remote needs your credentials, your display, or a Kerberos ticket. This does not change what the report tells you: the `ForwardAgent` check reads your *configured* value out of `ssh -G`, which never gets these options, so a `Host` block with `ForwardAgent yes` still shows up as a WARN — you are told what your config does while the diagnostic itself declines to do it.
-
-**What "read-only" does not promise: host-key verification is left exactly as you configured it.** The doctor never weakens `StrictHostKeyChecking`, and never strengthens it either. `UpdateHostKeys=no` stops the rotation-driven rewrite of `known_hosts`, but it does not stop **first use**: if your config sets `StrictHostKeyChecking accept-new` (or `no`), connecting to a host you have never connected to before appends its key to your `known_hosts`, and the doctor's session is a connection like any other. Forcing `yes` would be worse than the gap — a diagnostic is precisely what you reach for on a remote you have not connected to yet, and failing with "host key not known" would make the command useless exactly when you want it. So read the guarantee as: the doctor issues no mutation of its own and suppresses every delegation and persistence option it can without weakening verification, and ssh still does what *your* configuration tells it to do on any connection.
-
-A healthy remote reads top to bottom, cause before symptom:
+A healthy host with the reverse SOCKS recipe, checked while connected:
 
 ```
-Diagnosing remote 'desk-vm' at deck@desk-vm.example:22 (read-only)
+Diagnosing remote 'deck-vm' at deck@deck-vm.example:22 (read-only)
 
 PASS    HostReachable        ssh connected and authenticated
 PASS    RemoteBinary         the deck answered on the remote
@@ -207,133 +180,69 @@ PASS    ForwardAgent         agent forwarding is off for this destination
 Overall: PASS
 ```
 
-There are **three exit codes**, so a script can tell the outcomes apart:
+Exit status:
 
-| Code | Meaning |
+| Status | Meaning |
 |---|---|
-| `0` | Clear. Every check PASSed, or at most raised an advisory WARN. |
-| `1` | A check FAILed — or the command could not run at all (unknown name, unreadable registry). |
-| `2` | Incomplete. No FAIL, but at least one check is UNKNOWN. |
+| `0` | Every check is `PASS` or `WARN`. |
+| `1` | At least one check is `FAIL`, or the command could not run (unknown name, unreadable registry). |
+| `2` | No `FAIL`, but at least one check is `UNKNOWN`. |
 
-Both non-zero codes keep the promise that an UNKNOWN never reads as PASS: a diagnostic that reports "fine" when it could not actually look is worse than one that admits it does not know. Separating them is what makes the most common real-world outcome — a perfectly healthy tunnel on a host where `sshd -T` needs a root you do not have — a stable, scriptable `2` instead of something indistinguishable from a broken tunnel.
+On a host **without** a reverse tunnel, `RemoteForward` is `FAIL`, `ExitOnForwardFailure` is `WARN` and `ForwardBound` is `UNKNOWN`, so the command exits `1`. For such a host only the first three checks matter.
 
-#### Which check covers which caveat
-
-| Caveat | Check | What it reads |
+| Check | What it reads | `FAIL` / `WARN` / `UNKNOWN` and what to do |
 |---|---|---|
-| `AllowTcpForwarding` disabled on the remote | `AllowTcpForwarding` | `sshd -T` over ssh |
-| A forward that fails silently | `ExitOnForwardFailure` | `ssh -G` |
-| `DynamicForward` pointing the wrong way | `DynamicForward` | `ssh -G` |
-| Nothing forwarded at all | `RemoteForward` | `ssh -G` |
-| Two laptops on the same listen port | `ForwardBound` + `AllowTcpForwarding` | a loopback SOCKS5 handshake on the remote, read against the sshd policy |
-| A listener orphaned by a sleeping laptop | `ClientAliveInterval` | `sshd -T` over ssh |
-| `ForwardAgent yes` (advisory, never a failure) | `ForwardAgent` | `ssh -G` |
-| The ordinary broken-ssh case | `HostReachable` | the deck's existing version probe |
+| `HostReachable` | an ssh session to the host | `FAIL`: ssh could not log in. Make `ssh <target> true` work without a prompt. `UNKNOWN`: `ssh` could not be started on your laptop. |
+| `RemoteBinary` | `<binary> --version` on the host | `FAIL`: `dot-agent-deck remote upgrade <name>`. `UNKNOWN`: an earlier failure stopped it; fix that first. |
+| `ProtocolCompatible` | `<binary> daemon hello` on the host | `FAIL`: `dot-agent-deck remote upgrade <name>`; `connect` refuses the host until this passes. |
+| `RemoteForward` | `ssh -G` on your laptop | `FAIL`: no `RemoteForward` for this host. Add `RemoteForward 1080` to its `Host` block, or ignore this line if you do not use a tunnel. |
+| `DynamicForward` | `ssh -G` | `FAIL` (or `WARN` next to a `RemoteForward`): a `DynamicForward` points the wrong way. Replace it with `RemoteForward <port>`. |
+| `ExitOnForwardFailure` | `ssh -G` | `FAIL` with a tunnel, `WARN` without: add `ExitOnForwardFailure yes`. |
+| `AllowTcpForwarding` | `sshd -T` on the host | `FAIL`: the host's sshd refuses reverse tunnels; set `AllowTcpForwarding yes` (edit the existing line) and reload sshd. `UNKNOWN`: `sshd -T` needs root; run `sudo sshd -T \| grep allowtcpforwarding` on the host. |
+| `ClientAliveInterval` | `sshd -T` on the host | `WARN`: `ClientAliveInterval 0`; set `ClientAliveInterval 15` and `ClientAliveCountMax 3`. `UNKNOWN`: as above. |
+| `ForwardBound` | a loopback connection to the forward's port on the host | See [Reading `ForwardBound`](#reading-forwardbound). |
+| `ForwardAgent` | `ssh -G` | `WARN`: `ForwardAgent yes`. Prefer a deploy key; see [Authentication through the tunnel](#authentication-through-the-tunnel). |
 
-#### `AllowTcpForwarding no` versus a port collision
+#### `AllowTcpForwarding no` versus a port already in use
 
-These two produce **byte-identical** client errors — `Error: remote port forwarding failed for listen port 1080` and nothing else — so no amount of client-side error text can separate them. The remote's own sshd is the only witness, which is the whole reason this command exists.
+Both produce the same ssh error on your laptop, `remote port forwarding failed for listen port 1080`. The doctor tells them apart from the host's side.
 
-When the remote refuses forwarding outright, the sshd policy is named and the unbound port is attributed to it:
+When the host's sshd refuses forwarding:
 
 ```
-PASS    HostReachable        ssh connected and authenticated
-...
 FAIL    AllowTcpForwarding   the remote's sshd refuses reverse (`-R`) tunnels (`AllowTcpForwarding no`)
-        -> Set `AllowTcpForwarding yes` in the remote's sshd_config and reload sshd. sshd honours the FIRST value it finds for a keyword, so rewrite the existing line — appending a new one at the end does nothing. Alpine's openssh package and most hardening baselines ship this disabled.
-PASS    ClientAliveInterval  the remote's sshd probes idle sessions every 30s
+        -> Set `AllowTcpForwarding yes` in the remote's sshd_config and reload sshd. ...
 FAIL    ForwardBound         port 1080 is not bound on the remote, which the sshd policy above explains
-        -> This is the remote's policy refusing the tunnel, not a busy port. Fix `AllowTcpForwarding` on the remote first, then re-run this command.
 ```
 
-When the policy permits the tunnel and nothing answers on the port, the same client error produces a different report:
+When sshd allows forwarding but nothing is listening on the port:
 
 ```
-PASS    HostReachable        ssh connected and authenticated
-...
 PASS    AllowTcpForwarding   the remote's sshd permits reverse (`-R`) tunnels (`AllowTcpForwarding yes`)
-PASS    ClientAliveInterval  the remote's sshd probes idle sessions every 30s
 FAIL    ForwardBound         port 1080 is not bound on the remote, though its sshd permits the tunnel
-        -> Nothing is listening there right now. If a session to this remote is up as you read this, its tunnel did not bind — that port is taken by something else, so give this laptop its own listen port or drop whatever still holds it (forward ports are per-remote, so two laptops on the same one collide). If you are not connected, expect this: the tunnel exists only while a session does, so re-run this while connected to learn anything more.
 ```
 
-If instead something *does* answer on the port but is not your tunnel, the report is different again — see [A foreign service holding the port](#a-foreign-service-holding-the-port) below.
+If you are connected, your tunnel did not bind, usually because something else holds the port: pick another port for this laptop or stop whatever holds it. If you are not connected, this line is expected, because the tunnel exists only during a session; run the doctor again while connected.
 
-Note that `HostReachable` is PASS in both. ssh reached the host and authenticated fine; only the forward failed. Before issue #344 the deck classified this as an unreachable host and burned its reconnect budget against a network path that was never broken — which is the fourth failure mode, and the reason the doctor's own first check had to be fixed before the rest was worth building.
+#### Reading `ForwardBound`
 
-#### When `sshd -T` needs root
+`ForwardBound` looks at what is already listening on the host; the doctor never creates the forward itself. It probes only the first `RemoteForward` that `ssh -G` resolves.
 
-`sshd -T` typically requires root, and run as an ordinary user it either exits non-zero or prints a partial dump next to a permission complaint. Both become UNKNOWN, never PASS, and the rest of the report still renders:
+| Result | Meaning | What to do |
+|---|---|---|
+| `PASS` … answered the SOCKS5 no-auth handshake | A SOCKS proxy is listening, as the recipe expects. It could be another SOCKS proxy on the same port. | Nothing. |
+| `FAIL` … is not bound on the remote | Nothing listens there. | See the section above. |
+| `FAIL` … is held by something else | Another service answered with bytes a SOCKS proxy does not send. | Use another port for this laptop, or stop that service. |
+| `FAIL` … accepted the connection and then never answered | Another service holds the port and stayed silent. | Same as above. |
+| `UNKNOWN` … a tunnel to a concrete destination carries no greeting | Your `RemoteForward` names a destination (`RemoteForward 1080 db.internal:5432`), so the doctor will not send anything to it and cannot tell whose listener it is. | Check on the host with `ss -ltnp`, or use the destination-less form. |
+| `UNKNOWN` … the live bind state on the remote was not observed | No tunnel is configured, or the host lacks `bash`, `timeout`, `head` or `od`. | Install them, or ignore this line if you use no tunnel. |
+| `UNKNOWN` … not a shape this probe will target | The listen address is not an IPv4 literal, a non-link-local IPv6 literal, or a host name of letters, digits, `.` and `-`. | Rewrite the `RemoteForward` listen address in `~/.ssh/config`. |
 
-```
-UNKNOWN AllowTcpForwarding   could not read the remote's sshd policy
-        -> `sshd -T` needs root on most hosts and is unavailable otherwise. Re-run it on the remote with elevated permission (`sudo sshd -T | grep allowtcpforwarding`), or ask whoever administers the host.
-UNKNOWN ClientAliveInterval  could not read the remote's sshd keepalive policy
-        -> `sshd -T` needs root on most hosts and is unavailable otherwise. Re-run it on the remote with elevated permission, or ask whoever administers the host.
+## Common first-time failures
 
-Overall: UNKNOWN
-```
+`remote add` stops at the first failing step and prints why; [Remote Environments → Failure modes](remote-environments.md#failure-modes) lists the messages and fixes. The ones most often seen on a fresh host:
 
-The `ForwardBound` check degrades the same way when the remote is missing the tooling the probe needs — `bash` for the `/dev/tcp` connect, or `timeout`, `head` and `od` for the bounded reply it reads back: UNKNOWN, not a claim that the port is free and not a claim that a squatter holds it. It also refuses to probe a listen address that is not a plain IPv4 literal, IPv6 literal, or a hostname of letters, digits, `.` and `-` — a bind address ends up inside a command the remote's shell parses, so anything else is reported as UNKNOWN naming the value rather than guessed at.
-
-#### A foreign service holding the port
-
-The nastiest version of a collision is the one where *everything else is right*. Your `Host` block is correct, the remote permits forwarding, and some unrelated service got to port 1080 first. A probe that only checked whether the connect succeeded would call that healthy and exit 0 — which is exactly the scenario this command exists for. The SOCKS handshake is what catches it:
-
-```
-PASS    AllowTcpForwarding   the remote's sshd permits reverse (`-R`) tunnels (`AllowTcpForwarding yes`)
-PASS    ClientAliveInterval  the remote's sshd probes idle sessions every 30s
-FAIL    ForwardBound         port 1080 is held by something else — it answered the SOCKS5 handshake with bytes no SOCKS proxy sends
-        -> A service that is not a SOCKS proxy already owns that port on the remote, so your tunnel cannot bind it. Give this laptop its own listen port, or stop whatever holds this one — forward ports are per-remote, so two laptops on the same one collide.
-```
-
-A squatter that accepts the connection and then says nothing at all — which many services do, since they speak only when spoken to in their own protocol — is the same collision seen through a quieter service, and reads the same way:
-
-```
-FAIL    ForwardBound         port 1080 is held by something that accepted the connection and then never answered the SOCKS5 handshake
-        -> A live SOCKS proxy replies in microseconds over loopback, so silence means the port belongs to another service. Give this laptop its own listen port, or stop whatever holds this one — forward ports are per-remote, so two laptops on the same one collide.
-```
-
-That second case is why the probe carries its own short read deadline instead of relying on ssh's: `bash`'s `/dev/tcp` never times a read out, so a listener that stays silent would otherwise hold the probe open for the whole `DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS` window.
-
-#### A concrete `RemoteForward` reports UNKNOWN, not PASS
-
-If your reverse forward names a destination — `RemoteForward 1080 db.internal.test:5432` rather than the destination-less reverse-dynamic form — an accepting listener is reported as UNKNOWN and the command exits 2:
-
-```
-PASS    RemoteForward        ssh resolved 1080 to db.internal.test:5432
-...
-UNKNOWN ForwardBound         port 1080 has a listener, but a tunnel to a concrete destination carries no greeting this probe may use to attribute it
-        -> Your configuration is right and something is listening; the deck just cannot prove that something is yours. Only the reverse-dynamic form (`RemoteForward <port>` with no destination) puts a SOCKS proxy there, whose no-auth handshake the deck can safely speak. Confirm ownership on the remote yourself (`ss -ltnp`), or switch to the reverse-dynamic form this recipe uses.
-```
-
-This is not a failure being reported as a mystery, and it is not a change in behaviour — it is how the check has always worked. The reasoning is worth stating, because UNKNOWN looks like a cop-out and here it is the only honest answer. PASS and WARN both exit 0, so either would be a confident all-clear about a listener nobody verified. FAIL would be worse: for a concrete forward an accepting listener usually *is* your tunnel working, and a tool that calls a healthy setup broken is a tool people learn to ignore. The deck could only do better by writing a probe into your database's port, which it will not do. UNKNOWN says the true thing — your configuration is right, and ownership of the listener could not be established from here.
-
-#### What `ForwardBound` does and does not tell you
-
-Because the doctor's sessions create no forwards, this check answers a question about **pre-existing** state: what is already listening on that port on the remote? Three limits follow, and none is fixable without the doctor binding the port itself, which is the mutation it refuses:
-
-- A verified PASS means the listener answered a SOCKS5 handshake, so it is a SOCKS proxy — which is what the recipe puts there. It does not distinguish *your* SOCKS proxy from another one on the same port, and if you deliberately run one for something else, expect a PASS.
-- Nothing listening is the normal state when no session is up. Run the doctor **while connected** if you want this line to say something about your tunnel.
-- Only the **first** reverse forward `ssh -G` resolved is probed. A `Host` block with several is listed in full by `RemoteForward`, but liveness is checked for one listener — enough for the single-tunnel recipe above, which is the case this was built for.
-
-The two causes this command exists to separate do not depend on any of that: `AllowTcpForwarding` is read from the remote's own sshd and is independent of the liveness probe.
-
-#### Reproducing the failure modes yourself
-
-[`scripts/reverse-tunnel-validation.sh`](https://github.com/vfarcic/dot-agent-deck/blob/main/scripts/reverse-tunnel-validation.sh) is the manual, container-based validation path. It runs sshd in a container with a service reachable only from the laptop's loopback and reproduces every failure mode above deterministically, which is how the indistinguishable-error case was discovered in the first place. Two false-pass traps it guards against, both of which cost real debugging time: an auth failure exits 255 exactly like a forward collision, and a wholesale forwarding refusal produces the same error text as a port collision — so a collision assertion has to verify that the *first* session actually bound before drawing any conclusion.
-
-## What to watch for
-
-If `remote add` fails, the deck distinguishes three failure classes; see [Remote Environments → Failure modes](remote-environments.md#failure-modes) for what each one means and how to recover.
-
-The most common first-time failures are:
-
-- **Wrong user.** If the image's default user isn't `root`, the install steps above need to run under the right account. Check the image's own documentation.
-- **`~/.local/bin` not on `PATH`.** The remote-side install lands the binary there, but a fresh non-interactive ssh session may not source `~/.bashrc`. The deck handles this — `remote add` invokes the binary by absolute path during install — but later commands assume a login shell with `PATH` set.
-- **Node.js too old.** Distribution-packaged Node.js often lags; if your agent's CLI requires a newer version, install via [NodeSource](https://github.com/nodesource/distributions) or `nvm` instead of your package manager.
-
-## See also
-
-- [Remote Environment Requirements](remote-requirements.md) — what a host must provide.
-- [Remote Environments](remote-environments.md) — lifecycle, failure modes, hooks behavior.
+- **`ssh failed: host key not yet trusted for …`**: run `ssh <target> true` once and accept the key.
+- **`ssh authentication to … failed`**: wrong user, or a key that needs a passphrase. Check the image's default user in its documentation, pass `--key`, or `ssh-add` the key.
+- **`Failed to download dot-agent-deck …`**: the host has no `curl` or no outbound HTTPS to GitHub.
+- **An agent command not found in a pane**: the agent is not on the `PATH` your login shell sets on the host. Check with `ssh <target> '$SHELL -ilc "command -v claude"'`.

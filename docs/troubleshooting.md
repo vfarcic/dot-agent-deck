@@ -1,366 +1,59 @@
----
-sidebar_position: 8
-title: Troubleshooting
----
-
 # Troubleshooting
 
-Most of this page applies to both clients, the TUI and the [desktop app](desktop/index.md), because the problems live in the daemon or the agents they share. A section that applies to only one client says so under its heading. For a desktop app that shows **Daemon disconnected**, see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon).
+Each entry below starts from what you see, says what causes it, and gives the commands that fix it and a way to check that the fix worked. Most entries apply to both clients, the TUI and the [desktop app](desktop/index.md), because the problem lives in the daemon or in the agents they share; an entry that applies to one client says so under its heading.
 
-## Shift+Enter Submits Instead of Inserting a Newline
-
-*Applies to the TUI.*
-
-Inside an embedded agent pane, **Shift+Enter** inserts a newline into the agent's draft and plain **Enter** submits it — the same behavior you get running the agent directly. This works with **no terminal configuration** on any terminal that implements the enhanced ("kitty") keyboard protocol, which the deck negotiates for you at startup.
-
-If you already have `keybind = shift+enter=csi:13;2u` in `~/Library/Application Support/com.mitchellh.ghostty/config`, you can leave it — it still works and does no harm, and it is not needed.
-
-### If It Still Submits
-
-- **You are running the deck inside tmux.** tmux reports no keyboard-enhancement support, so the deck skips the negotiation there and Shift+Enter falls back to its previous behavior. Either run the deck outside tmux, or have tmux pass extended keys through with `set -s extended-keys always` and `set -s extended-keys-format csi-u`.
-- **Your terminal does not implement the enhanced keyboard protocol.** Bind the keystroke to the CSI u encoding yourself if your terminal supports custom keybinds — in Ghostty that is the `keybind = shift+enter=csi:13;2u` line above. The deck forwards the modifier faithfully either way.
-- **Your deck is out of date.** Upgrade; no configuration change is needed after that.
-
-## Hooks
-
-Hooks are **auto-installed on every startup** — most users never need to think about them. The deck detects which agents are present and installs hooks accordingly, both when the dashboard starts and when its background daemon starts:
-
-- **Claude Code** (`~/.claude/` detected) — writes entries into `~/.claude/settings.json` for hook types: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, PreCompact, SubagentStart, SubagentStop. Only the deck's own hook commands are touched; your `model`, `env`, `permissions` and every other setting survive byte-for-byte, and if you put one of your own hooks in the same rule object as the deck's, `hooks uninstall` removes only the deck's command and leaves yours (with its matcher) in place. The read-modify-write is serialized by an in-process mutex and published atomically (temp file + `rename`), so a crash mid-write never leaves a truncated file, and the file keeps its existing permissions (a settings file the deck creates itself is owner-only). A `settings.json` the deck cannot parse — one trailing comma is enough — is backed up to `settings.json.bak` and the install *or uninstall* errors out rather than clobbering it. A `settings.json` that is a **symlink** (a dotfiles arrangement) is refused for the same reason: the deck will neither replace your link with a regular file nor write through it to a path outside `~/.claude/`. Point it at a real file, or edit the linked file's hooks yourself.
-- **OpenCode** (`~/.opencode/` detected) — creates a JS plugin at `~/.opencode/plugin/dot-agent-deck/index.js` that forwards session, tool, and permission events.
-- **Codex** (`codex` found on `PATH`) — writes a `hooks.json` into your Codex home (`$CODEX_HOME`, or `~/.codex`) whose hooks forward prompt, tool, and turn events to the dashboard, and records trust for **exactly those hooks** in that home's `config.toml` (Codex only runs hooks it trusts). Both happen at startup and again whenever the deck launches a Codex pane, so they work however you launch Codex. Your own hooks are preserved (the deck merges, it never overwrites), and `config.toml` is edited surgically — comments, your model choice, and any trust records you made yourself are left byte-for-byte intact. The deck never trusts a hook it didn't author: a third-party hook sitting in the same file stays untrusted.
-- **Devin** (`devin` found on `PATH`) — merges a `"hooks"` object into Devin's user config, whose commands shell `dot-agent-deck hook --agent devin`. The config is located the way Devin locates it: `$XDG_CONFIG_HOME/devin/config.json` when that variable is set, and `~/.config/devin/config.json` otherwise. Devin ships a Claude-Code-compatible hooks engine, so its native command hooks post the same stdin JSON shape Claude's do and ride the existing hook socket — no wrapper, no trust ceremony. Only the `"hooks"` key is touched; your `agent` (model), `permissions`, `mcpServers`, `theme_mode`, and every other setting survive byte-for-byte. The read-modify-write is serialized by an in-process mutex and published atomically (temp file + `rename`), so a crash mid-write never leaves a truncated config, and the file keeps its existing permissions (a config the deck creates itself is owner-only). Devin documents its config as JSON *with comment support*, which the deck's parser cannot edit in place: a config it cannot parse is backed up to `config.json.bak` and the install errors rather than clobbering it.
-
-Auto-install is idempotent and best-effort — if an agent directory is missing the step is silently skipped, and errors are logged without blocking startup.
-
-The daemon half is what covers the desktop app: the app never starts a dashboard, and the daemon it connects to installs the hooks whichever way that daemon was started (see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)), so a machine with the desktop app and no CLI installed gets the same hooks as one running the dashboard. When that daemon is the copy bundled in the app and there is no CLI install to point at, those hooks name the daemon bundled in the app, so moving or deleting the app leaves them pointing at nothing until the deck next starts and repairs them (below). The install runs when the daemon **starts**, so after upgrading the desktop app from a version that did not install these hooks, a daemon still running from before the upgrade keeps serving the app without them; they appear the next time the daemon starts.
-
-### A hook fails with `not found` and names a path you never typed
-
-If an agent reports something like `Stop hook error: /bin/sh: 1: /home/you/code/dot-agent-deck-pr-356/target/release/dot-agent-deck: not found`, the hook command in your agent's config names a deck binary that is no longer there. A **build directory** is the usual culprit: `cargo clean` removes one, and it disappears entirely when a git worktree is deleted. The install runs silently on every dashboard launch, so the failure tends to surface days after the launch that wrote the entry.
-
-What gets written is an **installed** deck in preference to whatever is running — `~/.local/bin/dot-agent-deck`, or a `dot-agent-deck` in a directory on your `PATH`. So a deck launched from a build directory, or from a copy parked somewhere scratch such as a branch build under `/var/tmp`, resolves your install and writes that rather than pinning itself. With no install anywhere to find, a build directory is refused outright — `hooks install` fails with a message telling you what to install, and writes nothing rather than leaving a command that will break — while any other path is pinned as a last resort, with a warning in the log saying it was pinned without being vouched for. That last case is what keeps hooks working on a machine whose only deck is the one running, such as a desktop app starting its bundled daemon.
-
-Hooks also repair themselves: on the next launch, a deck-owned hook whose binary is confirmed missing is rewritten to the resolved path — for Claude Code's `settings.json`, Codex's `hooks.json`, Devin's `config.json` and the OpenCode plugin alike.
-
-A hook whose path still **works** is left alone even when it differs from what the deck would write. Your own wrapper, or a second checkout you are deliberately using, is not something a startup should quietly repoint. Note what "left alone" means, because it is not "adopted": the still-valid rule stays where it is and the launching deck's rule is added **beside** it, so that agent fires two deck hooks per event — one per install — until you remove whichever you no longer want. Two genuine installs do this deliberately; a copy parked somewhere scratch is not one, and adds nothing. A hook of your own that merely mentions `dot-agent-deck` is never touched, on any of the four, and a handler of your own sharing a rule object with a deck command stays put — install and uninstall remove the deck's command alone and leave yours, with its matcher, in place.
-
-To fix it now:
-
-1. **Start the dashboard once.** That is usually the whole fix — a deck-owned entry whose binary is missing is repaired on startup.
-2. **Or repair explicitly**, per agent: `dot-agent-deck hooks install`, adding `--agent codex`, `--agent opencode` or `--agent devin` for the others.
-3. **If the install refuses**, it is telling you there is no durable deck on the machine to point at. Install one — `cargo install --path .` from a checkout, or put the release binary on your `PATH` — and run the install again.
-
-You can confirm the result by looking for the path in the config: `grep -o '[^"]*dot-agent-deck' ~/.claude/settings.json | sort -u`. It should name your installed binary, never a `target/debug` or `target/release` directory.
-
-If the listing shows a second path pointing at a copy of the deck you parked somewhere, nothing will remove it while that copy is still on disk — a hook command that still *works* is left alone by design (above). Delete the copy and start the dashboard once: the self-heal then finds a deck-owned rule whose binary is missing and rewrites it. Editing the entry out by hand does just as well.
-
-### Codex events not showing
-
-Codex only runs hooks it *trusts*, and the deck handles that for you: it records trust for its own hook entries — and only those — in your Codex home's `config.toml`. This is independent of how you start Codex, so a launcher (`devbox run codex-big`, a `run_codex_agent.sh`, an alias, a path whose name isn't `codex`) needs **nothing** added to it. Launch Codex however you already do.
-
-If a Codex card still shows only coarse status with no tool or prompt detail, check these in order:
-
-1. **Is `codex` on the deck's `PATH`?** The setup step self-skips when it isn't. Run `codex --version` from the same shell you start the deck from, then restart the deck.
-2. **Does your launcher re-export `CODEX_HOME`?** The deck pins the home it prepared onto the process it starts, but a script can override that before running `codex` — and the deck's hooks and trust records live in the *original* home. Drop the re-export, or point it at the same home the deck uses (`$CODEX_HOME`, else `~/.codex`).
-3. **Re-run the install manually** to see any error the silent startup step swallowed: `dot-agent-deck hooks install --agent codex`.
-4. **Approve them by hand as a fallback:** run Codex once and approve the deck's hooks in its interactive `/hooks` review. Codex remembers that trust for subsequent runs.
-
-While those hooks are not trusted — or if you switch the deck's `UserPromptSubmit` hook off in Codex's `/hooks` list — Codex also cannot tell the deck that it received an automatic prompt — a mode's seed, an orchestration role's first task, a dispatched unit's task. The deck then types such a prompt in **once** and does not type it again, rather than risk giving Codex the same task twice; for an orchestration role's task it may still press Enter on a task left unsent in Codex's input box. If a Codex pane's automatic prompt sometimes goes missing, fixing the trust step above is also the fix for that.
-
-Trust is pinned to each hook's exact content, so it deliberately fails *closed*: if a definition changes underneath a trust record, Codex refuses to run it and the card falls back to coarse status rather than running something unreviewed. Re-running the install re-records trust for the new content.
-
-### Codex as a role or worker: allow sandbox network access
-
-Codex is usable as an orchestrator **role** or a delegated **worker**. In those flows the Codex agent has to reach the dashboard daemon — it runs `dot-agent-deck delegate …` to hand work to another pane and `dot-agent-deck work-done …` to report completion, both of which connect to the daemon over its local socket. Codex's `workspace-write` sandbox blocks that connection by default, so those commands silently fail and the orchestration pipeline never moves.
-
-Launch Codex with `workspace-write`, non-interactive approvals, **and** sandbox network access so the deck's CLI can reach the daemon:
+If you are not sure where to start, turn on logging ([Enabling Debug Logs](#enabling-debug-logs)) and list what the daemon is managing:
 
 ```bash
-codex --sandbox workspace-write --ask-for-approval never \
-  -c "sandbox_workspace_write.network_access=true"
+dot-agent-deck daemon status
 ```
 
-The `-c "sandbox_workspace_write.network_access=true"` override is the important part — without it, `delegate` / `work-done` can't reach the daemon even though the pane itself looks healthy. Point a role at Codex by setting that full command as the role's `command` in `.dot-agent-deck.toml`.
+`daemon status` prints each managed agent's pane id, label, working directory, orchestration role, status and active tool. It only reads: it never starts a daemon, and it reports a missing or unreachable daemon instead of starting one. Add `--json` for machine-readable output.
 
-### Manual Management
+## Logs and diagnostics
 
-The `hooks install` and `hooks uninstall` commands are available when you need to debug or temporarily remove hooks:
+### Enabling Debug Logs
+
+Set `DOT_AGENT_DECK_LOG` to write the deck's log to a file:
 
 ```bash
-# Install manually
-dot-agent-deck hooks install                    # Claude Code
-dot-agent-deck hooks install --agent opencode   # OpenCode
-dot-agent-deck hooks install --agent codex      # Codex
-dot-agent-deck hooks install --agent devin      # Devin
-
-# Remove hooks
-dot-agent-deck hooks uninstall                    # Claude Code
-dot-agent-deck hooks uninstall --agent opencode   # OpenCode
-dot-agent-deck hooks uninstall --agent codex      # Codex
-dot-agent-deck hooks uninstall --agent devin      # Devin
-```
-
-> **Note:** If you uninstall hooks manually, the next dashboard launch will re-install them automatically.
-
-## A bare command like `claude`, `opencode`, `pi`, `codex`, or `devin` fails to spawn
-
-If a pane comes up with an error such as *"Unable to spawn `claude` because it doesn't exist on the filesystem and was not found in PATH"*, the daemon couldn't resolve that bare command against its `PATH`.
-
-### Why This Happens
-
-The daemon resolves a bare command against its own process `PATH`. At startup it captures your **login-shell PATH** — the PATH you get in an interactive login shell, the same as when you SSH in — so commands installed under, for example, `~/.local/bin` or a directory added by `~/.bashrc` (such as `~/.opencode/bin`) normally resolve. You can still hit this if the command isn't on your login shell's PATH at all, or if it was added — or the agent was installed — **after** the daemon last started, because the PATH is captured only once per daemon start.
-
-### Fix
-
-1. Confirm the command resolves in a fresh login shell of your own:
-   ```bash
-   $SHELL -ilc 'command -v claude'
-   ```
-   If that prints nothing, fix your shell startup files (for example, add the install directory to `PATH` in `~/.profile` or `~/.bashrc`) until it does.
-
-2. Restart the daemon so it re-captures the login-shell PATH:
-   ```bash
-   dot-agent-deck daemon restart
-   ```
-
-If `command -v` finds the command in your login shell but a pane still can't spawn it after a daemon restart, capture debug logs with `DOT_AGENT_DECK_LOG=1` and file an issue — the daemon logs the PATH it captured at startup.
-
-## Delegate prompts silently no-op after staying on an older daemon
-
-After upgrading the `dot-agent-deck` binary, the new TUI can keep talking to a daemon that was spawned by the *previous* version. The wire format stays compatible, but newer features (delegate role maps, orchestration tab fields, and similar internal refactors) silently no-op because the older daemon doesn't know about the newer shape.
-
-This only happens when you are **deliberately** still on the older daemon. The common cause: you upgraded while agents were running, the launch prompt warned that restarting would stop them, and you **declined the restart to keep your agents** — which leaves the new TUI attached to the older daemon on purpose. (It can also happen with a very old, pre-handshake binary that attached without any version check.) With no agents running, the handshake restarts the daemon silently, so a fresh daemon at the new version is the normal outcome.
-
-When the upgrade changed the wire format itself — the attach protocol — declining does not leave you attached at all: the TUI refuses with `error: daemon speaks attach protocol vN, but this binary speaks vM` and exits, leaving the daemon and its agents running. See [Upgrading](installation.md#upgrading) for the two ways on from there.
-
-### Symptom
-
-You upgrade `dot-agent-deck`, keep your running agents on the existing daemon, and delegate prompts arrive in the TUI as if they were queued — but the orchestration pipeline never moves. Other recently-added features may also fail to take effect without an obvious error.
-
-### Fix
-
-When you are ready to move to the new version, let the daemon restart. The simplest path is to finish or detach your running agents and relaunch — with no agents left, the handshake restarts the daemon silently:
-
-```bash
-dot-agent-deck
-```
-
-If agents are still running and you want to upgrade now, relaunch and press **S** at the prompt (it names the live agents first) to restart the daemon onto the new version — this stops those agents. The TUI then lazy-spawns a fresh daemon at the new binary's version on its way into the dashboard.
-
-If the relaunch is happening from a script, CI job, or piped context (no TTY) while agents are running, the TUI cannot prompt. Run `daemon stop` explicitly first:
-
-```bash
-dot-agent-deck daemon stop
-dot-agent-deck
-```
-
-If managed agents are still running and you cannot detach them first, pass `--force` to terminate them along with the daemon:
-
-```bash
-dot-agent-deck daemon stop --force
-```
-
-See [Installation › Recycling the local daemon](installation.md#recycling-the-local-daemon) for the full command reference, including the data-loss guard and exit codes.
-
-### Why this happens
-
-On every launch, the TUI performs a build-version handshake with the daemon. When the binary versions differ, the resolution depends only on whether managed agents are running. With **no agents running**, the older daemon is restarted **silently** — there is nothing to lose. With **agents running** and an interactive terminal, the TUI prompts you: the prompt **names the live agents** and warns that restarting stops them, then offers a single-keystroke choice — press **S** to restart onto the new version, or any other key to **keep the current daemon** and stay attached to it with your agents intact. Keeping the current daemon is what leaves you on the older shape. When the TUI is not attached to a terminal (CI, pipes) and agents are running, it prints the recovery hint to stderr and exits non-zero instead of prompting.
-
-## `work-done`, `dispatch` or `delegate` fails with "refused: … hook capability token"
-
-An agent reports back and the command fails instead of returning quietly:
-
-```text
-Error: the daemon did not accept this work-done report: refused: this pane was
-issued a hook capability token and the message presented none. The usual cause
-is that the `dot-agent-deck` binary invoked in this pane is older than the
-daemon that spawned it; set DOT_AGENT_DECK_HOOK_PROVENANCE=warn on the daemon
-to accept it anyway. [missing_token]
-```
-
-### Why this happens
-
-The daemon gives each agent it spawns a per-spawn capability token in that pane's environment. Six commands carry it — `work-done`, `dispatch` (including `--list-targets`), `delegate`, `pane restart`, `pane spawn` and `get-seed` — and the daemon refuses one that names a pane it *has* minted a token for without presenting that pane's own token. That is what stops another process on the same machine signalling as your pane after reading its id off `daemon status`.
-
-Two mixed-version situations produce a refusal from a sender that is entirely legitimate:
-
-- **`missing_token`** — the `dot-agent-deck` binary the pane invokes is *older* than the daemon that spawned the pane, so it does not know to forward the token. The usual cause is a daemon started from a different build than the one on `PATH`.
-- **"not one this daemon issued"** — the agent outlived the daemon that started it (a `daemon stop`, a version restart, a crash) and still holds the old daemon's token. Such a pane has lost its orchestration role as well; see the next section.
-
-### Fix
-
-Put the matching binary on the pane's `PATH` — usually by recycling the daemon so both halves come from the same build:
-
-```bash
-dot-agent-deck daemon stop
-dot-agent-deck
-```
-
-If you need to keep a mixed install working for now, tell the **daemon** to accept a message that presents no token at all:
-
-```bash
-DOT_AGENT_DECK_HOOK_PROVENANCE=warn dot-agent-deck daemon serve
-```
-
-That relaxes only the missing-token case, and logs a warning naming the pane each time. It does not accept a token minted for a different pane, or one this daemon never issued.
-
-### Why you are seeing this at all
-
-`work-done` and `dispatch` used to read no reply from the daemon, so a refused report exited 0 and vanished: the only trace was a line in the daemon log. They now read an acknowledgement, which is why a refusal that was already happening has become visible. The acknowledgement says whether the daemon accepted the message, not whether the work behind it succeeded.
-
-## An orchestration stops being able to delegate: "the daemon holds no orchestration role for pane …"
-
-An orchestrator that has been delegating happily suddenly cannot. Its `dot-agent-deck delegate` fails with:
-
-```text
-delegate from pane sched-issue-work-17-r0 failed: the daemon holds no
-orchestration role for pane sched-issue-work-17-r0, so this delegate was
-routed nowhere. Only a pane spawned as part of an orchestration can delegate.
-```
-
-Nothing else looks wrong. The pane is still running, the agent is still working, and the card is still updating — which is what makes this expensive: the failure surfaces only at the moment someone delegates, which for an orchestrator can be hours into a run.
-
-### Why this happens
-
-The daemon holds each orchestration's role registrations **in memory only**. There is no file, no snapshot, and nothing that survives the process. If the daemon restarts — `daemon stop`, a build-version restart, a crash — those registrations are gone. An agent that has detached from the PTY it was born under keeps running regardless, so it outlives the daemon that knew about it, reconnects its hooks to the new one (which accepts them), and is simply never able to delegate again.
-
-Restoring the maps from disk is deliberately *not* the fix: a restart kills the PTYs the daemon owned, so most panes in such a file would be genuinely dead, and a restored entry pointing at a dead pane turns an honest refusal into a delegate that silently routes into a void.
-
-### What you will see now
-
-An affected card is marked **`orphaned`** in its title and carries a `Orphaned — delegation unavailable` row, so the state is visible on the dashboard instead of waiting for the next delegate to expose it.
-
-And `daemon stop` refuses while any orchestration role still has a live agent under it, listing the panes and roles at stake:
-
-```text
-daemon holds 2 live orchestration role(s):
-  sched-issue-work-17-r0 orchestrator (orchestrator) [issue-work]
-  sched-issue-work-17-r1 coder [issue-work]
-stopping the daemon deletes these registrations for good — they are held in memory only, so any agent that survives the restart keeps running but can never delegate again
-pass --force to stop anyway
-```
-
-### Fix
-
-There is no in-place recovery for a pane that is already orphaned — re-dispatch the orchestration. To avoid it, let an orchestration finish before recycling the daemon, and treat `daemon stop --force` while roles are live as a decision to abandon that run.
-
-## A pane says "disconnected" and ignores what you type
-
-*Applies to the TUI.*
-
-A pane whose title ends in `— disconnected` is no longer connected to an agent. Its last output stays on screen so you can read what happened, but the pane cannot accept input again — typing into it reports that it is disconnected rather than sending anything. Close the pane and start a new one; there is nothing to recover in place.
-
-The deck reaches this state only after it has already tried to reconnect and failed. When an agent goes away — a crash, an external `kill`, or a restart that never comes back — the deck looks the agent up again and re-attaches, which is what makes a normal respawn invisible to you. It gives up in two cases, and the status message tells you which:
-
-- **"Agent exited on every restart"** — the agent was found and re-attached to repeatedly, but produced no output each time. Usually the agent itself fails immediately on startup: check its command and working directory, and try running that command directly in a shell.
-- **"Agent is no longer running"** — no agent claimed the pane within the retry window, so the daemon no longer has one. Expected if you stopped it deliberately or the daemon restarted underneath the pane.
-
-If a pane disconnects and neither cause fits — the agent looks healthy, or it keeps happening — that is worth reporting. Re-run with logging on and attach the excerpt:
-
-```bash
-DOT_AGENT_DECK_LOG=1 dot-agent-deck
-```
-
-Search the log for `giving up on this pane`. The `reason` field on that line (`empty-sessions` or `no-live-agent`) identifies which path was taken, and the surrounding lines show the reconnect attempts that preceded it — that is the detail needed to tell a genuine bug from an agent that simply died.
-
-## An agent on a remote says an image or file "does not exist"
-
-You are connected to a [remote environment](remote-environments.md), you drag a screenshot onto your terminal window (or paste one with `Ctrl+V` / `Cmd+V`), and the agent replies that the file is not there.
-
-Nothing is broken. The agent runs on the **remote**, but your terminal — and the file — are on your **laptop**. Dragging inserts a laptop path, which is meaningless from the remote's point of view; pasting reads the remote's clipboard, which has no screenshot on it. Plain `ssh remote` followed by `claude` fails the same way, and the same drag into a deck running locally works fine.
-
-Copy the file to the remote first, then reference its remote path:
-
-```bash
-scp ~/Desktop/screenshot.png my-vm:/tmp/
-```
-
-See [Remote Environments › Getting files to the remote](remote-environments.md#getting-files-to-the-remote) for the full explanation and the ssh-config note.
-
-## A remote will not connect, or an ssh tunnel to it is not working
-
-Ask the deck instead of guessing:
-
-```bash
-dot-agent-deck remote doctor my-vm
-```
-
-It runs a fixed ordered list of read-only checks — ssh reachability and auth, whether the deck is installed on the remote, the forwards `ssh -G` actually resolved, the remote's own `AllowTcpForwarding` and `ClientAliveInterval` from `sshd -T`, and whether a configured forward is really bound — and prints each as PASS / WARN / FAIL / UNKNOWN with the directive and file to change. Three exit codes: `0` clear, `1` a check failed, `2` a check could not be determined — so an incomplete diagnosis never reads as all-clear, and is still distinguishable from a broken one. It writes nothing: not your ssh config, not the remote's `sshd_config`, not the registry, not the remote — and the ssh sessions it opens clear all forwardings, so it does not even create the tunnel it is inspecting.
-
-It earns its keep on one case in particular. `AllowTcpForwarding no` on the remote and a port collision produce **byte-identical** errors from ssh, so no client-side message can separate them; the doctor reads the remote's own sshd policy and tells you which one you have. See [Reverse tunnels › Troubleshooting with `remote doctor`](remote-recipes.md#troubleshooting-with-remote-doctor) for annotated output of every case.
-
-## A pane does not fill its box, or is cut off, while another app is open on the same agent
-
-This is expected, and it is what makes two clients able to watch one agent at all.
-
-A terminal program is drawn onto a pseudo-terminal, and **a pseudo-terminal has exactly one size**. The agent asks the operating system how big its screen is, lays its interface out for that answer, and then draws by moving the cursor to absolute positions on that grid. There is no way to hand two clients different sizes of the same live screen — the bytes the agent emits only mean anything at the size it drew them for.
-
-So the daemon picks one size per agent, and **the app you used last picks it.** Switching to the desktop app's window, or clicking, scrolling or typing in a `dot-agent-deck` TUI, tells the daemon that app has focus, and every agent it is showing takes the size of its pane there. If you are working in the desktop app's full-window pane at 150 columns while a TUI shows the same agent in a 60-column tile, the agent runs at 150 columns: the desktop pane fills its box, and the TUI's tile shows only the left-hand 60 columns of the agent's screen. Click or type in the TUI and it switches back — the agent redraws at 60 columns, the TUI fits, and the desktop pane leaves the rest of its box blank. Switching to anything else, such as a browser, changes nothing: the last of the two you used keeps deciding.
-
-A terminal can only report that it gained focus if it supports focus reporting — tmux does only with `set -g focus-events on` — so in one that does not, the TUI takes over on your first key press or click rather than the moment you switch to it.
-
-**Until an app claims focus, or when the app that did is not showing this agent, the smallest pane wins** — the smallest rows and the smallest columns among every client attached to the agent, so every client can draw the whole screen and the larger ones leave the remainder blank. That resolves itself when the smaller view goes away: close the other client, or close the agent's pane in the desktop app (or, on its experimental Daemons screen, scroll the tile out of view) — the desktop attaches only to the terminals actually on screen — and the agent grows back to fit whoever is left, within a frame. Nothing needs restarting, and you do not need to resize anything by hand.
-
-**A TUI from an older release cannot take focus back.** It never tells the daemon it has focus, so while a current desktop app holds focus on an agent they both show, the older TUI shows that agent at the desktop's size and cuts it off wherever its own pane is smaller. Upgrading the TUI restores switching.
-
-If a pane stays short of its box with *no* other client open, that is not this: check whether a `dot-agent-deck` TUI is still running in another terminal or tmux window, since it counts as an attached client for as long as it is open.
-
-## Scrolling back in a pane shows nothing after another client resized the agent
-
-Also expected, and narrower than it looks.
-
-When an agent's size changes, the daemon drops the copy of that agent's output it keeps for **replay**. It has to: those bytes were drawn for the old grid, and replaying them into a differently-sized screen is what produces overlapping text and stray vertical strips down the right-hand edge. Keeping them would trade a missing history for a scrambled one.
-
-What this costs is precise, and **only a client that attaches or re-attaches after the size changed is affected**: it gets a correct live screen with no history behind it. A client that was already attached keeps its own scrollback and can still scroll it — the loss is not retroactive, so nothing disappears from a pane you are looking at. In practice you meet it by opening an agent's pane in the desktop app after the agent's size changed (or bringing a tile back on screen on its experimental Daemons screen), since showing a terminal is what attaches it; a pane that respawns and a client that reconnects after a dropped link are in the same position, because both attach afresh.
-
-Switching between the desktop app and a TUI that show the same agent changes its size too, when their panes differ, so switching drops the replay copy again. Switches that land within about a quarter of a second of each other are applied as a single size change rather than one each, so flipping back and forth quickly costs no more than a single switch does.
-
-The agent's own output fills the history back in as it keeps working.
-
-## The deck is missing cards — a role or agent I know is running has no card
-
-*Applies to the TUI.*
-
-Check the deck's title row first. If it reads something like `dot-agent-deck — 7 agent(s)  (↓2)`, nothing is wrong with the agents: the count is right, and the `(↓2)` says two cards are below the bottom of the window. `(↑2)` means two are above it, and both appear together when you are scrolled into the middle. Move the selection with `j` / `k` (or the arrow keys) to bring them into view, or give the terminal a few more rows and they all fit again.
-
-The deck fits as many cards as it can before it resorts to this. It picks the number of card columns and the card size together, widening the grid to a second or third column when that is what it takes to show every card, so the marker only appears on a window genuinely too small for the cards at any layout — a very short terminal, or a very large number of agents.
-
-If there is **no** marker and a card you expect is still absent, the count in the title is the thing to read next: it is the number of agents the deck actually knows about, and `dot-agent-deck daemon status` lists what the daemon has. A role present in your `.dot-agent-deck.toml` but missing from both is one that never started — check its `command` (see [a bare command fails to spawn](#a-bare-command-like-claude-opencode-pi-codex-or-devin-fails-to-spawn)).
-
-## Enabling Debug Logs
-
-When something goes wrong and the dashboard's status messages aren't enough to diagnose it, set the `DOT_AGENT_DECK_LOG` environment variable to capture tracing output to a file:
-
-```bash
-# Default — writes to /tmp/dot-agent-deck.log on macOS and Linux
+# Default location
 DOT_AGENT_DECK_LOG=1 dot-agent-deck
 
-# Custom path
+# A path of your choosing
 DOT_AGENT_DECK_LOG=/tmp/my-debug.log dot-agent-deck
 ```
 
-On Windows the default is `dot-agent-deck.log` in the system temp directory — the one `%TEMP%` points at, usually `C:\Users\<you>\AppData\Local\Temp`. `/tmp` is not a Windows location, so there would be nothing there to write to.
+| Value of `DOT_AGENT_DECK_LOG` | Where the log goes |
+| --- | --- |
+| unset | no log file |
+| `1` or empty | `/tmp/dot-agent-deck.log` on macOS and Linux; `dot-agent-deck.log` in the system temp directory (the one `%TMP%`/`%TEMP%` names) on Windows |
+| anything else | that path, used as given |
 
-The log file captures session events, hook activity, session restoration, and any errors logged by the daemon. Attach the relevant excerpt when filing an issue. See [Configuration › Environment Variables](configuration.md#environment-variables) for the full list of variables.
+The file is appended to, never truncated. If it cannot be opened, the command prints `Warning: failed to open log file <path>: <error>` on stderr and runs without logging; the deck creates the file but not its parent directory, so point the variable into a directory that exists.
 
-**The daemon reads the variable only when it starts.** When you launch the TUI and no daemon is running, the daemon it starts gets `DOT_AGENT_DECK_LOG` from your command, and the TUI and the daemon both write to the same file. When a daemon is already running, only the TUI's own lines appear, because that daemon was started without the variable. Restart the daemon so the next launch starts a new one with logging on:
+**The variable applies to the process it is set on, and the daemon is a separate process.** When `dot-agent-deck` has to start the daemon, the daemon inherits the variable and logs to the same file. When a daemon is already running, it keeps the logging it was started with, so `DOT_AGENT_DECK_LOG=1 dot-agent-deck` then logs only the TUI. To capture the daemon's side (hook events, spawning agents, delegation, orchestration roles), restart the daemon with the variable set:
 
 ```bash
-dot-agent-deck daemon restart
+dot-agent-deck daemon stop
 DOT_AGENT_DECK_LOG=1 dot-agent-deck
 ```
 
-`daemon restart` refuses while agents are running; see [Recycling the local daemon](installation.md#recycling-the-local-daemon).
+`daemon stop` refuses while managed agents or orchestration roles are live; see [Recycling the daemon](#recycling-the-daemon) before you add `--force`.
 
-You may also find a `daemon.log` in `~/.local/state/dot-agent-deck/` (on Windows, `%LOCALAPPDATA%\dot-agent-deck`). It is not the debug log: it holds what a daemon running in the background prints rather than logs, such as a crash message or the notices [schedules](scheduled-tasks.md) print as they run (an issue dispatched or skipped, a run that failed, a configuration error). Without schedules it is often empty. Attach it as well if it has anything in it.
+Check that it worked: after the deck starts, `grep 'login-shell PATH' /tmp/dot-agent-deck.log` finds the line the daemon writes at startup (`applied login-shell PATH to the daemon environment`, or `no login-shell PATH captured`). If that line is missing, the daemon was started without the variable.
 
-### With the desktop app
+A daemon the deck starts in the background also writes its standard output and error to `daemon.log` in the deck's state directory: `$XDG_STATE_HOME/dot-agent-deck/daemon.log` when `XDG_STATE_HOME` is set, otherwise `~/.local/state/dot-agent-deck/daemon.log`, and `%LOCALAPPDATA%\dot-agent-deck\daemon.log` on Windows (`DOT_AGENT_DECK_STATE_DIR` replaces the directory). It is not the debug log: it holds what the daemon prints rather than logs, such as a crash message or the `[scheduler]` notices [schedules](scheduled-tasks.md) print as they run (an issue dispatched or skipped, a run that failed, a configuration error). The log described above is the more useful of the two; without schedules, `daemon.log` is often empty. Attach the relevant excerpts of both when you file an issue. [Configuration](configuration.md) lists the other environment variables.
 
-The desktop app writes no log file of its own. The log to collect is the **daemon's**, and the daemon has to be started with `DOT_AGENT_DECK_LOG` set. Restarting only the app does not turn the log on, because the app does not restart the daemon. The desktop app is built for macOS (Apple Silicon) and Linux (amd64). There is no Windows build.
+#### With the desktop app
+
+*Applies to the desktop app.*
+
+The desktop app writes no log file of its own. The log to collect is the **daemon's**, and the daemon has to be started with `DOT_AGENT_DECK_LOG` set. Restarting only the app does not turn the log on, because the app does not restart the daemon. The desktop app is built for macOS (Apple Silicon) and Linux (amd64); there is no Windows build.
 
 The app connects to a daemon you started (see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)), so start that daemon with logging on:
 
-1. If a daemon is already running, stop it. `dot-agent-deck daemon stop` refuses while agents are running, so finish or close them first.
+1. If a daemon is already running, stop it with `dot-agent-deck daemon stop`. It refuses while agents are running, so finish or close them first; see [Recycling the daemon](#recycling-the-daemon).
 2. Start a daemon with the variable set, in a terminal:
 
    ```bash
@@ -374,22 +67,422 @@ The app connects to a daemon you started (see [How the desktop app gets a daemon
    ```
 
    Starting the TUI instead works too: `DOT_AGENT_DECK_LOG=1 dot-agent-deck`.
-3. Press **Reconnect** in the app.
+3. Press **Reconnect** in the app. A `daemon serve` that nothing connects to exits after about 30 seconds, so reconnect promptly.
 
-The log lands at `/tmp/dot-agent-deck.log` on both macOS and Linux, or at the path you gave the variable. For a [remote daemon](desktop/daemons.md), start it on its host the same way, and the log is on that host. `RUST_LOG` (below) goes on the same command. For example, `RUST_LOG=dot_agent_deck=debug DOT_AGENT_DECK_LOG=1 dot-agent-deck daemon serve`.
+The log lands at `/tmp/dot-agent-deck.log` on both macOS and Linux, or at the path you gave the variable, and the `login-shell PATH` line described above confirms that the daemon logs. `RUST_LOG` ([below](#turning-the-verbosity-up)) goes on the same command, for example `RUST_LOG=dot_agent_deck=debug DOT_AGENT_DECK_LOG=1 dot-agent-deck daemon serve`. For a [remote daemon](desktop/daemons.md), start it on its host the same way; the log is then on that host.
 
-With the `experimental` flag on, the app can start a daemon itself, using **Start daemon** or **Replace daemon**. That daemon gets the variables only when the app itself was launched with them. On Linux, that means starting the app from a terminal, for example `DOT_AGENT_DECK_LOG=1 dot-agent-deck-desktop`. An app opened from the macOS Dock or Finder, or from a Linux application menu, does not get variables exported in your shell profile, so a daemon it starts has no log. In that case, start the daemon yourself as above.
+With the `experimental` flag on, the app can start a daemon itself, with **Start daemon** or **Replace daemon**. That daemon gets the variables only when the app itself was launched with them. On Linux, that means starting the app from a terminal, for example `DOT_AGENT_DECK_LOG=1 dot-agent-deck-desktop`. An app opened from the macOS Dock or Finder, or from a Linux application menu, does not get variables exported in your shell profile, so a daemon it starts has no log. In that case, start the daemon yourself as above.
 
-### Turning the verbosity up
+#### Turning the verbosity up
 
-The log is written at `info` for the deck itself and `error` for its dependencies. `RUST_LOG` overrides that, using the standard [`tracing` filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html):
+The log records the deck itself at `info` and its dependencies at `error`. `RUST_LOG` changes that, using the [`tracing` filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html):
 
 ```bash
 # Everything the deck logs, at debug
 RUST_LOG=dot_agent_deck=debug DOT_AGENT_DECK_LOG=1 dot-agent-deck
 
-# Just one subsystem, to keep the file readable
+# One subsystem, to keep the file readable
 RUST_LOG=dot_agent_deck::daemon=debug DOT_AGENT_DECK_LOG=1 dot-agent-deck
 ```
 
-`RUST_LOG` on its own does nothing — it selects *what* is logged, while `DOT_AGENT_DECK_LOG` decides *whether* there is a log file at all, so the two go together. A directive naming the `dot_agent_deck` target replaces the built-in default; anything else (a bare level such as `RUST_LOG=debug`, or a different crate) is layered alongside it, so the deck stays at `info` unless you name it.
+`RUST_LOG` does nothing on its own: it selects what is logged, and `DOT_AGENT_DECK_LOG` decides whether there is a log file, so set both. Your `RUST_LOG` directives are applied after the defaults, so `dot_agent_deck=debug` replaces the `info` default; a directive for anything else is added beside the defaults, which means a bare `RUST_LOG=debug` raises the dependencies but leaves the deck at `info` unless you name `dot_agent_deck`. As with `DOT_AGENT_DECK_LOG`, the daemon has to be started with `RUST_LOG` set for its side to change.
+
+### "daemon failed to start within …ms"
+
+`dot-agent-deck` exits with:
+
+```text
+daemon failed to start within 15000ms: endpoint <path> never became available. For daemon stderr see <state dir>/daemon.log — but note it stays empty unless the daemon was started with DOT_AGENT_DECK_LOG set, so an empty log is not evidence the daemon never ran.
+```
+
+The deck started a daemon in the background and waited for it to open its socket. The most common cause is slow shell startup files: before it opens its socket, the daemon runs your login shell (`$SHELL -ilc`) once to learn your `PATH`, and waits up to 10 seconds for it. The daemon may finish starting after the deck has given up.
+
+1. Run `dot-agent-deck` again. If a daemon came up late, the second run attaches to it.
+2. Time your shell: `time $SHELL -ilc true`. If it takes several seconds, trim what your startup files run in non-interactive contexts.
+3. If it still fails, run the daemon in the foreground to see its errors directly: `DOT_AGENT_DECK_LOG=1 dot-agent-deck daemon serve`. Stop it with `Ctrl+C` when you are done.
+
+### "refusing to connect to daemon attach socket"
+
+The deck found a file at its socket path that it does not trust (wrong owner, type or permissions), and refuses to connect to it or remove it. The message names the path. Move the deck to a socket path only you can write by setting `DOT_AGENT_DECK_ATTACH_SOCKET`, for example under `$XDG_RUNTIME_DIR` or your home directory, then run `dot-agent-deck` again. Set the same value for every process that should reach that daemon.
+
+### "refusing the daemon connection at …: the process listening there runs as uid …"
+
+The deck connected to its socket and found that the process listening there belongs to another user, so it closed the connection without talking to it. Another user on the machine may have bound that path first. Set `DOT_AGENT_DECK_SOCKET` and `DOT_AGENT_DECK_ATTACH_SOCKET` to paths inside a directory only you can write (for example `mkdir -m 700 ~/.dad-sock` and put both sockets there), export them in every shell that starts the TUI, the desktop app or the daemon, and run `dot-agent-deck` again. Check with `dot-agent-deck daemon status`, which should report your daemon.
+
+## Hooks
+
+Hooks are how an agent tells the deck what it is doing: prompts, tool use, waiting for you, finishing. Without them a card still appears, but its status is coarse and it shows no tool or prompt detail. The deck installs them for you: when the TUI starts and when the daemon starts, it installs hooks for every supported agent it detects. The daemon half is what covers the desktop app, which never runs the TUI.
+
+| Agent | Detected when | What the deck writes |
+| --- | --- | --- |
+| Claude Code | `~/.claude/` exists | hook entries in `~/.claude/settings.json` for `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`, `Stop`, `PreCompact`, `SubagentStart` and `SubagentStop`, plus `StopFailure` when the installed Claude Code is 2.1.78 or newer |
+| OpenCode | `$XDG_CONFIG_HOME/opencode/` (default `~/.config/opencode/`) or `~/.opencode/` exists | a plugin file, `plugin/dot-agent-deck.js`, in each of those directories that exists |
+| Codex | `codex` is on the `PATH` | `hooks.json` in the Codex home (`$CODEX_HOME`, else `~/.codex`), and trust records for exactly those hooks in that home's `config.toml` |
+| Devin | `devin` is on the `PATH` | a `"hooks"` object in `$XDG_CONFIG_HOME/devin/config.json` (when `XDG_CONFIG_HOME` is an absolute path), else `~/.config/devin/config.json` |
+| Pi | `pi` is on the `PATH` | no hooks; the daemon writes the deck's Pi extension to `$PI_CODING_AGENT_DIR/extensions/dot-agent-deck` (default `~/.pi/agent/extensions/dot-agent-deck`) when it starts. `dot-agent-deck orchestrator setup` does the same on demand |
+
+Each hook command runs `<path to dot-agent-deck> hook --agent <agent>`. Only the deck's own entries are added, changed or removed; your other settings and your own hooks are kept, including a hook of yours that shares a rule with a deck entry. The startup install is silent: a problem is written to the log (see [Enabling Debug Logs](#enabling-debug-logs)) and does not stop the deck. Run the install by hand ([Manual Management](#manual-management)) to see errors on your terminal.
+
+On Windows, `$HOME` is usually unset, so Codex hooks are installed only when `CODEX_HOME` is set.
+
+The install runs when the daemon **starts**. After you install an agent, or upgrade the desktop app from a version that did not install hooks, a daemon already running has not installed them; restart it ([Recycling the daemon](#recycling-the-daemon)) or run [the manual install](#manual-management).
+
+### Checking that hooks are installed
+
+Each command prints the hook commands the deck wrote. Every line should name an installed `dot-agent-deck` binary (for example `~/.local/bin/dot-agent-deck` or the one `command -v dot-agent-deck` prints), not a `target/debug` or `target/release` directory and not a file that no longer exists:
+
+```bash
+# Claude Code
+grep -o '[^"]*hook --agent claude-code' ~/.claude/settings.json | sort -u
+
+# Codex
+grep -o '[^"]*hook --agent codex' "${CODEX_HOME:-$HOME/.codex}/hooks.json" | sort -u
+
+# Devin
+grep -o '[^"]*hook --agent devin' "${XDG_CONFIG_HOME:-$HOME/.config}/devin/config.json" | sort -u
+
+# OpenCode (prints the pinned binary from each plugin file that exists)
+grep -h 'const BINARY_PATH' "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugin/dot-agent-deck.js" ~/.opencode/plugin/dot-agent-deck.js 2>/dev/null
+```
+
+No output means no deck hooks are installed for that agent. Then start an agent in the deck and check that its card moves past a coarse status and shows its prompt and tools.
+
+### A newly installed agent never changes status
+
+The agent works, but its card stays on a coarse status with no prompt or tool detail. The automatic install at startup writes hooks only for an agent it detects (see the table above): Claude Code and OpenCode by their config directory, Codex and Devin by their command on the daemon's `PATH`. An agent installed after the daemon started, or whose config directory does not exist yet, has no hooks.
+
+1. Install them explicitly: `dot-agent-deck hooks install --agent <claude-code|opencode|codex|devin>`.
+2. Restart the agent (close its pane and start it again), because an agent reads its hook configuration when it starts.
+3. Check with [Checking that hooks are installed](#checking-that-hooks-are-installed).
+
+### A hook fails with `not found` and names a path you never typed
+
+An agent reports something like:
+
+```text
+Stop hook error: /bin/sh: 1: /home/you/code/dot-agent-deck-pr-356/target/release/dot-agent-deck: not found
+```
+
+The hook command in that agent's config names a deck binary that is no longer there. A build directory is the usual cause: `cargo clean` removes it, and deleting a git worktree removes it with the worktree.
+
+The deck writes an **installed** binary into hooks when it can find one: `~/.local/bin/dot-agent-deck`, or a `dot-agent-deck` in a directory on your `PATH`. With no installed binary, it refuses to write a build-directory path at all (`hooks install` fails and says what to install), and pins any other path as a last resort, with a warning in the log.
+
+To fix it:
+
+1. **Start the deck once** (`dot-agent-deck`, or restart the daemon). On startup the deck rewrites a deck hook whose binary is missing so that it names the binary it resolves.
+2. **Or reinstall explicitly**: `dot-agent-deck hooks install`, adding `--agent codex`, `--agent opencode` or `--agent devin` for the others.
+3. **If the install refuses**, there is no installed deck to point at. Install one (see [Installation](installation.md)) and run the install again.
+
+Check with the commands in [Checking that hooks are installed](#checking-that-hooks-are-installed).
+
+A hook command whose binary still **exists** is left alone, even when it names a different binary from the one the deck would write. The deck then adds its own entry beside it, so that agent runs two deck hooks per event. If the listing shows a second path that points at a copy of the deck you no longer want, delete that copy and start the deck once (its entry is then repaired, because its binary is missing), or remove the entry from the config by hand.
+
+### An agent's config file cannot be edited
+
+`dot-agent-deck hooks install` or `hooks uninstall` fails with one of:
+
+- `<path> is not valid JSON (left unchanged, original preserved at <path>.bak): …` — the config (for example `~/.claude/settings.json`) does not parse; one trailing comma is enough. The deck leaves the file as it is and copies it to `<name>.bak` beside it. Fix the syntax and run the install again. Devin documents its config as JSON with comments; the deck cannot edit a Devin config that contains comments, so remove them or add the hooks by hand.
+- `<path> is a symlink (left unchanged): …` — the config is a symbolic link, as in a dotfiles setup. The deck neither replaces the link nor writes through it. Point it at a regular file, or add the deck's hooks to the linked file yourself.
+
+At startup the same problems are logged instead of printed, and the hooks are not installed.
+
+### Codex events not showing
+
+Codex only runs hooks it trusts. The deck records trust for its own hook entries, and only those, in the Codex home's `config.toml`, at startup and whenever it starts a Codex pane. This does not depend on how you launch Codex, so a launcher (`devbox run codex-big`, a script, an alias) needs nothing added.
+
+If a Codex card shows only coarse status with no tool or prompt detail, check in this order:
+
+1. **Is `codex` on the daemon's `PATH`?** The install is skipped when it is not. `$SHELL -ilc 'command -v codex'` should print a path; if you installed Codex after the daemon started, restart the daemon ([Recycling the daemon](#recycling-the-daemon)).
+2. **Does your launcher change `CODEX_HOME`?** The deck sets `CODEX_HOME` on the Codex process it starts, to the home it installed into. A script that re-exports `CODEX_HOME` before running `codex` points Codex at a home without the deck's hooks. Remove the re-export, or make it the same home (`$CODEX_HOME`, else `~/.codex`).
+3. **Run the install by hand** to see errors the startup install only logs: `dot-agent-deck hooks install --agent codex`. Then check with [the Codex listing command](#checking-that-hooks-are-installed).
+4. **Approve the hooks in Codex** as a fallback: run Codex once and approve the deck's hooks in its `/hooks` review. Codex remembers that trust.
+
+Trust is tied to each hook's exact content. If a hook definition changes after trust was recorded, Codex refuses to run it and the card falls back to coarse status; running the install again records trust for the new content.
+
+While Codex's hooks are not trusted, or if you turn off the deck's `UserPromptSubmit` hook in Codex's `/hooks` list, Codex cannot confirm to the deck that it received an automatic prompt (a mode's seed, an orchestration role's first task, a dispatched unit's task). The deck then types such a prompt once and does not retype it, so the prompt can go missing. Fixing trust fixes that as well.
+
+### Codex as a role or worker: allow sandbox network access
+
+A Codex agent used as an orchestration role or a worker runs `dot-agent-deck delegate …` and `dot-agent-deck work-done …`, which connect to the daemon's local socket. Codex's `workspace-write` sandbox blocks that connection unless network access is allowed, and the pipeline then stops moving while the pane looks healthy.
+
+Give the role a `command` in `.dot-agent-deck.toml` that allows it:
+
+```bash
+codex --sandbox workspace-write --ask-for-approval never -c "sandbox_workspace_write.network_access=true"
+```
+
+The `-c "sandbox_workspace_write.network_access=true"` override is the part that matters. See [Orchestration](orchestration.md) for role definitions.
+
+### Manual Management
+
+`hooks install` and `hooks uninstall` take `--agent` with one of `claude-code` (the default), `opencode`, `codex` or `devin`:
+
+```bash
+# Install
+dot-agent-deck hooks install                    # Claude Code
+dot-agent-deck hooks install --agent opencode   # OpenCode
+dot-agent-deck hooks install --agent codex      # Codex (also records trust)
+dot-agent-deck hooks install --agent devin      # Devin
+
+# Remove
+dot-agent-deck hooks uninstall                    # Claude Code
+dot-agent-deck hooks uninstall --agent opencode   # OpenCode
+dot-agent-deck hooks uninstall --agent codex      # Codex
+dot-agent-deck hooks uninstall --agent devin      # Devin
+```
+
+For OpenCode, an explicit install always writes the binary it resolves now, replacing the path in an existing plugin file, and it writes the plugin into each OpenCode directory that exists, or creates `$XDG_CONFIG_HOME/opencode/plugin/dot-agent-deck.js` (default `~/.config/opencode/…`) when neither exists.
+
+Hooks you uninstall come back the next time the TUI or the daemon starts, while the agent is still detected.
+
+## Spawning agents
+
+### A bare command like `claude`, `opencode`, `pi`, `codex`, or `devin` fails to spawn
+
+A pane comes up with an error such as:
+
+```text
+Unable to spawn claude because it doesn't exist on the filesystem and was not found in PATH
+```
+
+The daemon looks up a bare command on its own `PATH`. When it starts, it runs your login shell (`$SHELL -ilc`) once and adopts the `PATH` that shell reports, so commands installed under `~/.local/bin` or added by `~/.bashrc` normally resolve. The lookup fails when the command is not on your login shell's `PATH`, when you installed the agent or changed your `PATH` after the daemon started, or when the shell took longer than 10 seconds and the daemon kept the `PATH` it inherited.
+
+1. Check that the command resolves in a fresh login shell:
+
+   ```bash
+   $SHELL -ilc 'command -v claude'
+   ```
+
+   If that prints nothing, add the install directory to `PATH` in your shell startup files (for example `~/.profile` or `~/.bashrc`) until it does.
+2. Restart the daemon so it reads the `PATH` again ([Recycling the daemon](#recycling-the-daemon)), then start the agent again.
+
+Alternatively, give the full path to the agent as the command. If `command -v` finds it, the daemon was restarted, and the pane still cannot spawn it, look for the `login-shell PATH` line in the daemon's log ([Enabling Debug Logs](#enabling-debug-logs)): it records the `PATH` the daemon adopted, or that it captured none.
+
+## Upgrades and version mismatches
+
+### Recycling the daemon
+
+Several fixes on this page end with a daemon restart. The daemon keeps running when you quit the TUI, so a new binary or a changed `PATH` takes effect only when a new daemon starts.
+
+```bash
+dot-agent-deck daemon stop     # or: dot-agent-deck daemon restart
+dot-agent-deck                 # starts a fresh daemon on the way in
+```
+
+`daemon restart` is the same as `daemon stop`; the next `dot-agent-deck` starts the new daemon. Both refuse while the daemon manages running agents (`daemon has N managed agent(s) running; pass --force to terminate them`) or holds live orchestration roles (see [below](#an-orchestration-stops-being-able-to-delegate-the-daemon-holds-no-orchestration-role-for-pane-)). `--force` stops the daemon anyway: it terminates those agents, and escalates to `SIGKILL` if the daemon does not exit in time. Finish or stop the agents you care about first. In the desktop app, reconnect after the new daemon is up.
+
+### Delegate prompts silently no-op after staying on an older daemon
+
+*Applies to the TUI.*
+
+After you upgrade `dot-agent-deck`, a new TUI can stay attached to a daemon started by the previous version. Features the older daemon does not know about may then not take effect, without an error: for example, delegated prompts appear to be sent but the orchestration does not move.
+
+This happens when you chose it. When the TUI starts and finds a daemon from a different build:
+
+- With **no agents running**, it restarts the daemon onto the new version without asking.
+- With **agents running** and an interactive terminal, it shows `⚠  Daemon version mismatch  (N agent(s) running)`, names the agents a restart would stop, and offers `[S] restart daemon and continue   [any other key] keep current daemon`. Any key other than `S` keeps the older daemon and your agents.
+- With **agents running** and no terminal (a script, a CI job, a pipe), it prints `error: local daemon is build <old> but this TUI is build <new>` and `recover with: dot-agent-deck daemon stop`, and exits non-zero.
+
+To move to the new version, let the daemon restart: finish or stop your agents and run `dot-agent-deck` (it restarts the daemon without asking), or run `dot-agent-deck` and press `S` at the prompt, which stops the running agents. From a script, use `dot-agent-deck daemon stop` (with `--force` if agents must be terminated) and then `dot-agent-deck`. Check with `dot-agent-deck --version`, and relaunch: with no mismatch, no prompt appears.
+
+### "daemon speaks attach protocol vN, but this binary speaks vM"
+
+*Applies to the TUI.*
+
+When the upgrade changed the attach protocol, the new TUI cannot attach to the older daemon at all. The mismatch prompt says `This binary cannot attach to it`, and its second option becomes `exit, leaving the daemon running`; declining (or running without a terminal) prints `error: daemon speaks attach protocol vN, but this binary speaks vM` and exits, leaving the daemon and its agents running. Either attach with the build that started that daemon to keep the agents, or stop it (`dot-agent-deck daemon stop`, which stops the agents too) and relaunch. See [Installation](installation.md) for upgrading. The same prompt appears on `dot-agent-deck connect <remote>` after `remote upgrade` changed the protocol: press `S` to restart the remote's daemon (which stops its agents), or return to the version those agents run with `dot-agent-deck remote upgrade <remote> --version <old version>`.
+
+## Orchestration and delegation
+
+### "DOT_AGENT_DECK_PANE_ID environment variable not set"
+
+`delegate`, `work-done`, `dispatch`, `pane spawn` or `pane restart` exits 1 with:
+
+```text
+Error: DOT_AGENT_DECK_PANE_ID environment variable not set.
+This command should be run from within a dot-agent-deck managed pane.
+```
+
+These commands act for the pane they run in, and the deck sets that variable only in panes it starts. Run the command from the orchestrator, worker or dispatcher pane it belongs to, not from a separate terminal. If an agent's own shell reports it, its launcher (a script, `env -i`, a container) dropped the deck's environment: pass the `DOT_AGENT_DECK_*` variables through. See [Orchestration](orchestration.md) for the commands.
+
+### `work-done`, `dispatch` or `delegate` fails with "refused: … hook capability token"
+
+A command an agent runs to talk to the daemon fails instead of returning quietly, for example:
+
+```text
+Error: the daemon did not accept this work-done report: refused: this pane was issued a hook capability token and the message presented none. The usual cause is that the `dot-agent-deck` binary invoked in this pane is older than the daemon that spawned it; set DOT_AGENT_DECK_HOOK_PROVENANCE=warn on the daemon to accept it anyway. [missing_token]
+```
+
+The daemon gives each agent it starts a token in that pane's environment, and the commands an agent uses to act for its pane present it: `delegate`, `work-done`, `dispatch` (including `--list-targets`), `pane spawn`, `pane restart`, `get-seed` and `ack` (`ack` always exits 0, so it never shows this error). The daemon refuses one that names a token-bearing pane without that pane's token. The bracketed code says which case you have:
+
+| Code | Message | Cause | Fix |
+| --- | --- | --- | --- |
+| `missing_token` | `…the message presented none…` | The `dot-agent-deck` the pane runs is older than the daemon, usually because the daemon was started from a different build than the one on the pane's `PATH`. | Make the two the same build: [recycle the daemon](#recycling-the-daemon) from the binary on your `PATH`. |
+| `unknown_token` or `malformed_token` | `…is not one this daemon issued…` | The agent outlived the daemon that started it (a `daemon stop`, a version restart, a crash). | Restart that agent. It has also lost its orchestration role; see the [next entry](#an-orchestration-stops-being-able-to-delegate-the-daemon-holds-no-orchestration-role-for-pane-). |
+| `token_names_another_pane` | `…was issued for a different pane…` | The message named a different pane from the one whose token it carried, for example because `DOT_AGENT_DECK_PANE_ID` was changed in that shell. | Run the command in the agent's own pane, with the environment the deck gave it. |
+
+To keep a mixed install working for now, start the **daemon** with `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`. That accepts a message with no token (and logs a warning naming the pane each time); it does not accept a token issued for another pane or by another daemon. Any other value, including a typo, leaves the check on.
+
+```bash
+dot-agent-deck daemon stop
+DOT_AGENT_DECK_HOOK_PROVENANCE=warn dot-agent-deck
+```
+
+An accepted `work-done` or `dispatch` means the daemon admitted the message, not that the work behind it succeeded.
+
+### An orchestration stops being able to delegate: "the daemon holds no orchestration role for pane …"
+
+An orchestrator that has been delegating cannot any more. Its `dot-agent-deck delegate` fails with:
+
+```text
+Error: delegate from pane sched-issue-work-17-r0 failed: the daemon holds no orchestration role for pane sched-issue-work-17-r0, so this action was routed nowhere. Only a pane spawned as part of an orchestration can delegate.
+```
+
+The pane is still running and its card keeps updating. The daemon holds orchestration roles in memory only, so a daemon restart (`daemon stop --force`, a version restart, a crash) loses them. An agent that survives the restart keeps working and reporting status to the new daemon, but can no longer delegate or be delegated to.
+
+In the TUI, an affected card shows `orphaned` in its title and an `Orphaned — delegation unavailable` row, once the new daemon hears from that agent. The desktop app does not show this marker; use `dot-agent-deck daemon status`, where the pane has no orchestration role.
+
+There is no in-place recovery: close the orphaned panes and start the orchestration again (see [Orchestration](orchestration.md)). To avoid it, let an orchestration finish before restarting the daemon. `daemon stop` refuses while roles are live and lists them:
+
+```text
+daemon holds 2 live orchestration role(s):
+  sched-issue-work-17-r0 orchestrator (orchestrator) [issue-work]
+  sched-issue-work-17-r1 coder [issue-work]
+stopping the daemon deletes these registrations for good — they are held in memory only, so any agent that survives the restart keeps running but can never delegate again
+pass --force to stop anyway
+```
+
+Treat `--force` at that point as abandoning those runs.
+
+## Panes and the dashboard
+
+### Shift+Enter Submits Instead of Inserting a Newline
+
+*Applies to the TUI.*
+
+In an agent pane, **Shift+Enter** inserts a newline in the agent's draft and **Enter** submits it. The deck asks the terminal for the enhanced ("kitty") keyboard protocol at startup, which is what lets it tell the two apart; a terminal that supports that protocol needs no configuration. If you already have `keybind = shift+enter=csi:13;2u` in your Ghostty config, it does no harm.
+
+If Shift+Enter still submits:
+
+- **You are running the deck inside tmux.** The deck does not enable the enhanced protocol when the terminal does not report support for it, which is the usual case inside tmux, and Shift+Enter then arrives as plain Enter. Run the deck outside tmux, or try having tmux pass extended keys through (`set -s extended-keys always` and `set -s extended-keys-format csi-u` in `~/.tmux.conf`).
+- **Your terminal does not support the enhanced protocol.** If it supports custom key bindings, bind Shift+Enter to the CSI u sequence yourself (in Ghostty, the `keybind` line above). The deck forwards the modifier either way.
+- **Your deck is older than this behaviour.** Upgrade.
+
+### A pane says "disconnected" and ignores what you type
+
+*Applies to the TUI.*
+
+A pane whose title ends in `— disconnected` is no longer connected to an agent. Its last output stays on screen, and typing into it shows the reason instead of sending anything. Close the pane and start a new one; there is nothing to recover in place.
+
+The TUI gets here only after trying to reconnect. The status message says which case you have:
+
+- **`Agent exited on every restart — pane is disconnected. Close it to start over.`** The agent kept exiting without output (three times in a row). It usually fails at startup: check the command and working directory, and run that command yourself in a shell.
+- **`Agent is no longer running — pane is disconnected. Close it to start over.`** No running agent claimed the pane within the retry window (about 10 seconds). Expected if you stopped the agent or the daemon restarted.
+
+If neither fits, capture a log ([Enabling Debug Logs](#enabling-debug-logs); the TUI's side is enough here) and search it for `giving up on this pane`. The line's `reason` field is one of `empty-sessions` (the agent kept exiting), `no-live-agent` (the daemon answered and had no agent for the pane), `daemon-unreachable` (the daemon stopped answering) or `attach-failing` (the daemon had the agent but attaching to it kept failing). Include that line and the reconnect attempts before it when you report the problem.
+
+### The deck is missing cards — a role or agent I know is running has no card
+
+*Applies to the TUI.*
+
+Read the deck's title row first:
+
+- **`dot-agent-deck — 7 agent(s)  (↓2)`**: all agents are there, and two cards are below the bottom of the window. `(↑2)` means two are above; both show when you are scrolled into the middle. Move the selection (`j`/`k` by default) or give the terminal more rows.
+- **`dot-agent-deck — 3/7 agent(s)`**: a filter is hiding four cards. Clear it with `Esc` (the default `clear_filter` key); `/` starts a new one. See [Keyboard Shortcuts](keyboard-shortcuts.md).
+
+If the title shows neither and a card is still missing, the count is the number of agents the TUI knows about; compare it with `dot-agent-deck daemon status`. A role defined in `.dot-agent-deck.toml` that is in neither never started: check its `command` ([a bare command fails to spawn](#a-bare-command-like-claude-opencode-pi-codex-or-devin-fails-to-spawn)).
+
+### Keys set in `keybindings.toml` have no effect
+
+*Applies to the TUI.*
+
+The TUI reads `keybindings.toml` once, at startup, and prints each problem it finds as a `keybindings (<path>): …` warning on stderr before it takes over the screen, so the warnings are easy to miss. A file that is not valid TOML is ignored as a whole, so every action keeps its default. In a valid file, an entry with a problem keeps its default binding (a binding to `Ctrl+C` instead leaves that action unbound).
+
+1. Restart the TUI after editing the file.
+2. To read the warnings, start it with stderr sent to a file, then quit: `dot-agent-deck 2>/tmp/dad-keys.txt`, then `grep keybindings /tmp/dad-keys.txt`.
+3. Fix each entry the warnings name, using the key names and actions in [Keyboard Shortcuts](keyboard-shortcuts.md).
+
+### A pane does not fill its box, or is cut off, while another app is open on the same agent
+
+This is expected when two clients show the same agent: an agent has one screen size at a time, and the daemon chooses it.
+
+- **The client you used last decides.** Focusing the desktop app's window, or clicking, scrolling or typing in a TUI, makes that client decide the size of every agent it shows. The other client shows the agent at that size: where its own pane is smaller, the agent is cut off at the right or bottom; where it is larger, the rest of the box stays blank. Using the other client switches the size back. Switching to an unrelated app, such as a browser, changes nothing.
+- **Until a client has claimed focus, or when the one that did is not showing this agent, the smallest pane wins** on each axis, and larger panes leave the remainder blank. The agent grows back when the smaller view goes away: close the other client, or close the agent's pane in the desktop app.
+- **A terminal without focus reporting** (tmux without `set -g focus-events on`, for example) cannot tell the TUI it gained focus, so the TUI takes over on your first key press or click rather than when you switch to it.
+- **A TUI from an older release never claims focus.** While a current desktop app has focus on an agent they both show, the older TUI shows that agent at the desktop's size. Upgrade the TUI.
+
+If a pane stays smaller than its box with no other client open, check for a `dot-agent-deck` TUI still running in another terminal or tmux window: it counts as a client for as long as it is open.
+
+### Scrolling back in a pane shows nothing after another client resized the agent
+
+When an agent's size changes, the daemon discards the output history it keeps for clients that attach later, because that output was drawn for the old size and would replay garbled. Only a client that attaches or re-attaches after the change is affected: it gets the correct live screen with no history behind it. A client that was already attached keeps its own scrollback. In practice you see this when you open an agent's pane in the desktop app after the agent was resized, or when a pane reconnects. Switching between two clients whose panes differ in size resizes the agent, so each switch discards the history again (switches within about a quarter of a second count as one). The history fills back in as the agent keeps working.
+
+## Configuration and schedules
+
+### A setting or environment variable has no effect
+
+The TUI reads `config.toml` only when it starts, and the daemon keeps the environment it was started with. So a changed `config.toml` needs a TUI restart, and an exported `DOT_AGENT_DECK_*` variable that the daemon reads needs a daemon restart ([Recycling the daemon](#recycling-the-daemon)) from a shell that has the variable. [Configuration › When a setting does not take effect](configuration.md#when-a-setting-does-not-take-effect) lists the other cases, including a desktop app that offers no orchestrations for a directory the TUI handles, and `config set` rewriting the file (it drops comments and unknown keys, and replaces a file that does not parse with defaults plus the key you set, so repair such a file by hand first).
+
+### A schedule does not run, or opens the wrong thing
+
+Nothing opens at the scheduled time, or a run opens the whole team instead of one agent (or the reverse). Schedule problems are not shown in either client; the daemon writes them as `[scheduler]` lines to its output:
+
+```bash
+grep '\[scheduler\]' ~/.local/state/dot-agent-deck/daemon.log | tail -20
+```
+
+Also check the day-of-week field: numeric days count from `1` = Sunday, so `1-5` means Sunday to Thursday; write `MON-FRI` instead. [Schedules › When a schedule does not run](scheduled-tasks.md#when-a-schedule-does-not-run) maps each symptom and log line to its fix.
+
+### Closing a dispatched issue tab lost my changes
+
+Closing the tab of an issue-dispatch run removes the worktree the run created, with `git worktree remove --force`, so uncommitted changes in it are discarded. Commit (and push) the work you want to keep before closing the tab. See [Schedules › Clean up](scheduled-tasks.md#clean-up).
+
+## Remotes
+
+### An agent on a remote says an image or file "does not exist"
+
+You are connected to a [remote environment](remote-environments.md), you drag a screenshot onto your terminal (or paste one with `Ctrl+V` / `Cmd+V`), and the agent says the file is not there. The agent runs on the remote; the file is on your laptop. Dragging inserts a laptop path, which does not exist on the remote, and pasting reads the remote's clipboard. Copy the file to the remote first, then give the agent the remote path:
+
+```bash
+scp ~/Desktop/screenshot.png my-vm:/tmp/
+```
+
+See [Remote Environments › Getting files to the remote](remote-environments.md#getting-files-to-the-remote).
+
+### A remote will not connect, or an ssh tunnel to it is not working
+
+First check plain ssh, the way the deck calls it (non-interactively, so it cannot answer a host-key or passphrase prompt):
+
+```bash
+ssh -o BatchMode=yes <user>@<host> true
+```
+
+If that fails, fix ssh before anything else: run a plain `ssh <user>@<host>` once to accept a new host key (`remote add` fails with `ssh failed: host key not yet trusted for <target>` until you do), and add a passphrase-protected key to your agent with `ssh-add <key>`. [Remote Environments › Failure modes](remote-environments.md#failure-modes) lists each message `connect`, `remote add` and `remote upgrade` print, with its fix.
+
+When plain ssh works, run the diagnosis for that remote:
+
+```bash
+dot-agent-deck remote doctor my-vm
+```
+
+It runs read-only checks — ssh reachability and authentication, whether the deck is installed on the remote, the forwards `ssh -G` resolved, the remote sshd's `AllowTcpForwarding` and `ClientAliveInterval` (from `sshd -T`), and whether a configured forward is bound — and prints each as `PASS`, `WARN`, `FAIL` or `UNKNOWN`, naming the setting and file to change. It changes nothing: not your ssh config, not the remote's sshd config, not the deck's list of remotes, and nothing on the remote.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | every check is clear |
+| `1` | a check failed |
+| `2` | a check could not be determined |
+
+On a remote with no reverse tunnel configured, `remote doctor` exits `1` because its `RemoteForward` check fails with `ssh resolved no reverse tunnel`; that is expected. For such a remote, only `HostReachable`, `RemoteBinary` and `ProtocolCompatible` say whether it works.
+
+It tells apart two causes whose ssh error messages are identical: `AllowTcpForwarding no` on the remote and a local port collision. See [Remote Recipes › Troubleshooting with `remote doctor`](remote-recipes.md#troubleshooting-with-remote-doctor) for example output of each case.
+
+## Desktop app
+
+### "Daemon disconnected" or "Incompatible daemon"
+
+*Applies to the desktop app.*
+
+- **Daemon disconnected** (`No daemon is listening on the configured socket.`): no daemon answered. Start one as described in [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon), then press **Reconnect**. A daemon started on its own with `dot-agent-deck daemon serve` exits after 30 seconds with no clients, agents or pending schedules; to keep it up while you start the app, run `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 dot-agent-deck daemon serve`.
+- **Incompatible daemon** (`A daemon answered but this build cannot speak to it.`): the daemon is from a build the app cannot read, usually after upgrading one of the two. Bring them to the same version (for a local daemon, [recycle it](#recycling-the-daemon) from the matching binary) and reconnect. When the two builds share a wire protocol and differ only by a declared compatibility change, the app also offers **Connect anyway**, which connects to the daemon as it is.
+
+See [Daemons](desktop/daemons.md) for adding and testing daemons in the app.

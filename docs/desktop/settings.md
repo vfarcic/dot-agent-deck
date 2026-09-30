@@ -1,27 +1,23 @@
----
-title: Settings
----
-
 # Settings
 
-**Settings**, in the rail on the left, opens the app's settings. It has four sections: **Appearance**, **Daemons**, **Voice** and **Zoom**. Press `Escape` to close it. Changes are saved as you make them.
+**Settings**, in the rail on the left, opens the app's settings over the current screen. It has four sections: **Appearance**, **Daemons**, **Voice** and **Zoom**. Changes are saved to the [settings file](#the-settings-file) as you make them. Press `Escape` to close it.
 
-**Daemons** is on its own page, [Daemons](daemons.md), and **Voice** on [Voice control](voice.md).
+**Daemons** is described on its own page, [Daemons](daemons.md), and **Voice** on [Voice Control](voice.md).
 
 ## Appearance
 
-**System**, **Light** or **Dark**. **System** follows your operating system's setting. The agent terminals stay dark in every appearance.
+**System**, **Light** or **Dark**; **System** is the default and follows your operating system's setting. The agent terminals stay dark in every appearance.
 
 The TUI has no appearance setting; it uses your terminal's colours.
 
 ## Zoom
 
-Scales the whole window, from 75% to 300%. Choose a level in **Settings → Zoom**, or use the keys:
+Scales the whole window. The levels are 75%, 90%, 100%, 110%, 125%, 150%, 175%, 200%, 250% and 300%; 100% is the default. Choose one in **Settings → Zoom**, or use the keys:
 
 | Keys | Does |
 | --- | --- |
-| `Ctrl` or `⌘` with `=` or `+` | Zoom in one step |
-| `Ctrl` or `⌘` with `-` | Zoom out one step |
+| `Ctrl` or `⌘` with `=` or `+` | Zoom in one level |
+| `Ctrl` or `⌘` with `-` | Zoom out one level |
 | `Ctrl` or `⌘` with `0` | Back to 100% |
 
 Either modifier works on every platform, and the keys work while an agent's terminal has focus too: they are not passed to the agent. The level is saved in the settings file.
@@ -30,11 +26,22 @@ This is not the TUI's `Ctrl+z`, which makes the focused pane fill the TUI's fram
 
 ## The settings file
 
-The footer of **Settings** names the file your settings are stored in. It is `desktop.toml` in the same directory as the TUI's config: `~/.config/dot-agent-deck/desktop.toml` on macOS and Linux. Set `DOT_AGENT_DECK_DESKTOP_CONFIG` in the app's environment to use another file.
+The footer of **Settings** names the file your settings are stored in: `~/.config/dot-agent-deck/desktop.toml`, beside the TUI's `config.toml`. Set `DOT_AGENT_DECK_DESKTOP_CONFIG` to a file path in the app's environment to use another file. The file is written by the app; you can also edit it by hand while the app is closed.
 
-The desktop app and the TUI share no settings file: the TUI's `config.toml` and `keybindings.toml` do not affect the app, and `desktop.toml` does not affect the TUI. What both clients share is the daemon's own configuration, such as [`default_dir`](../configuration.md), because it belongs to the daemon.
+It holds:
 
-If the file cannot be read, **Settings** says so in the footer instead of the path.
+| Table and key | Setting | Values | Default |
+| --- | --- | --- | --- |
+| `[appearance]` `mode` | Appearance | `"system"`, `"light"`, `"dark"` | `"system"` |
+| `[zoom]` `level` | Zoom, as a scale factor | `0.75`, `0.9`, `1.0`, `1.1`, `1.25`, `1.5`, `1.75`, `2.0`, `2.5`, `3.0`; another number is rounded to the nearest of these | `1.0` |
+| `[endpoints]` `selection` | What the Dashboard's **Daemon** selector shows | `"local"` (This machine), `"all"` (All daemons), or a remote daemon's id | `"local"` |
+| `[voice]` | The **Voice** settings | See [Voice Control → Settings → Voice](voice.md#settings--voice) | Written once you change a voice setting |
+
+The remote daemons themselves are not in this file: they are in `remotes.toml`, which the app shares with the CLI (see [Daemons](daemons.md)). API keys for voice are not in it either; they are in your operating system's keychain. [Configuration](../configuration.md#desktoptoml-reference) has the full reference.
+
+The desktop app and the TUI share no settings file: the TUI's `config.toml` and `keybindings.toml` do not affect the app, and `desktop.toml` does not affect the TUI. What both clients share is the daemon's own configuration, such as [`default_dir`](../configuration.md#set-the-directory-new-agents-start-browsing-in) and [`default_command`](../configuration.md#set-the-command-new-agents-start-with), because it belongs to the daemon.
+
+**If the file cannot be read** (it is not valid TOML, a value has the wrong type or is refused, the path is a directory or a symlink, or the file is larger than 256 KiB), the footer says so instead of showing the path, the app runs on default settings for this session, and it does not save over the file. Fix or remove the file, then restart the app. An unknown key is ignored, and an unknown `mode` reads as `"system"`.
 
 ## Keyboard shortcuts
 
@@ -42,8 +49,10 @@ The desktop app has a few keyboard shortcuts of its own. None of the TUI's [keyb
 
 | Keys | Where | Does |
 | --- | --- | --- |
-| `Ctrl+N` / `⌘N` | Dashboard, with no agent pane open | Opens [New agent](new-agent.md) |
+| `Ctrl+N` / `⌘N` | Dashboard, with no agent pane open and no text field focused | Opens [New agent](new-agent.md) |
 | `Escape` | Agent pane | Closes the pane and returns to the Dashboard |
 | `Escape` | Settings | Closes Settings |
+| `Escape` | New agent | Clears the directory filter; otherwise closes the dialog, keeping a draft |
 | `Ctrl` / `⌘` with `=`, `+`, `-`, `0` | Everywhere | Zoom (above) |
-| `j` `k` `l` `h` `Space` `/` `.` `q` | New agent's directory list | Move, open, go up, use, filter, show hidden, close (see [New agent](new-agent.md#directory)) |
+| `j` `k` `l` `h` `Space` `/` `.` `q` | New agent's directory list | Move, open, go up, use, filter, show hidden, close (see [New agent → Directory](new-agent.md#directory)) |
+| `←` `→` | New agent's Mode chips | Previous or next chip |

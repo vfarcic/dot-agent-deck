@@ -1,0 +1,392 @@
+<!doctype html>
+<!--
+  The landing page (issue #1021, ported from the Docusaurus page PR #1155
+  shipped to static HTML by PRD #1419).
+
+  This file is a TEMPLATE. `cargo xtask site` (xtask/site) reads it and
+  replaces two kinds of placeholder, each written between double curly
+  braces, so every link to a page on this site comes from docs/published.toml
+  and a link to a page that is not published fails the build:
+
+    doc:<slug> or doc:<slug>#<anchor>   the URL of that published page
+    docs-index                          one <li> per published page
+
+  The site serves the docs as raw Markdown, for agents. A link offered to a
+  person outside the "For agents" band goes to the page as GitHub renders it
+  (github.com/.../blob/main/docs/...) instead; those URLs are written out
+  here, and the build's link check skips them as external; the landing-page
+  test in xtask/site checks that each one names a published page.
+
+  Every docs link is a plain <a href> in the served HTML, not inserted by
+  script, because an agent fetching this page reads it as served (PRD #1419
+  Decision 2). The page works without script: the colour scheme follows
+  prefers-color-scheme, and the two small scripts only add the theme toggle
+  and the copy button.
+
+  The page's call to action is the agent prompt in the hero (maintainer
+  decision, 2026-09-30): there is no install command and no "get started"
+  link. A person who would rather install it by hand gets one link, to the
+  installation guide rendered on GitHub, because the published docs are raw
+  Markdown written for agents. The list of every docs page stays, for
+  agents, as the quiet last band above the footer.
+
+  The copy, the screenshot alt text and the captions came from
+  site/src/data/landing-content.js, whose comments record why each claim is
+  worded the way it is (see that file in git history before rewording one).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Deck — run your coding agents in parallel</title>
+<meta name="description" content="A dashboard for running, orchestrating and dispatching AI coding agents in parallel — in your terminal, or in a desktop app">
+<link rel="icon" href="/img/favicon.ico">
+<link rel="alternate" type="text/plain" href="/llms.txt" title="Documentation index for AI agents">
+<link rel="stylesheet" href="/landing.css">
+<script>
+  // Apply a saved explicit theme before first paint. Without script, or with
+  // nothing saved, the page follows prefers-color-scheme.
+  try {
+    var saved = localStorage.getItem('theme');
+    if (saved === 'light' || saved === 'dark') {
+      document.documentElement.setAttribute('data-theme', saved);
+    }
+  } catch (e) {}
+</script>
+</head>
+<body>
+<a class="skipLink" href="#main">Skip to content</a>
+<header class="navbar">
+  <div class="navbarInner">
+    <a class="navbarBrand" href="/">
+      <img src="/img/logo.svg" alt="" width="32" height="32">
+      <span>Agent Deck</span>
+    </a>
+    <nav class="navbarLinks" aria-label="Main">
+      <a href="#docs">Docs</a>
+      <a href="/llms.txt">llms.txt</a>
+    </nav>
+    <div class="navbarRight">
+      <a href="https://github.com/vfarcic/dot-agent-deck">GitHub</a>
+      <button type="button" class="themeToggle" id="theme-toggle" hidden aria-label="Switch between dark and light mode">
+        <svg class="iconSun" viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg>
+        <svg class="iconMoon" viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<div class="page">
+  <header class="hero">
+    <div class="spotlight" aria-hidden="true"></div>
+    <div class="heroInner">
+      <p class="eyebrow"><span class="dot" aria-hidden="true"></span>Open source · MIT</p>
+      <h1 class="heroTitle">Stop watching one agent.<br><span class="heroTitleAccent">Run the whole team.</span></h1>
+      <p class="heroLede">Runs your AI coding agents under one background daemon, shows what each of them is doing in real time — in a terminal UI or in a desktop app, both watching the same agents — and starts new work for you: a team under one orchestrator, an isolated unit in its own copy of the repo, or a task that fires on a schedule.</p>
+      <!--
+        The hand-off to the user's own agent (PRD #1419), and the page's call
+        to action. Everyone who uses the deck already runs a coding agent, so
+        the page gives that agent a concrete starting point: llms.txt, which
+        also tells it about the version-matched docs in the binary.
+      -->
+      <section class="heroPrompt" id="agent-prompt" aria-labelledby="agent-prompt-title">
+        <h2 id="agent-prompt-title" class="heroPromptTitle">Hand it to your coding agent</h2>
+        <p class="heroPromptLede">Paste this into the coding agent you already use. It installs the deck, sets it up, and tells you what it can do and how to use it, so you can pick where to go from there.</p>
+        <!--
+          The prompt copies (by hand or with the button) as one line of plain
+          text. It names no goal on purpose: a first-time visitor does not yet
+          know what an orchestration is, so asking the agent to explain the
+          deck sends it through the docs and lets the user choose next.
+        -->
+        <div class="promptBox">
+          <pre id="agent-prompt-text">Read https://agent-deck.devopstoolkit.ai/llms.txt, then install dot-agent-deck, set it up for me, and explain what it does and how to use it.</pre>
+          <button type="button" class="copyButton" id="copy-prompt" hidden>Copy</button>
+        </div>
+        <p class="diyLink">Prefer to do it yourself? <a href="https://github.com/vfarcic/dot-agent-deck/blob/main/docs/installation.md">Installation guide →</a></p>
+      </section>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="showcase">
+      <!--
+        Both clients, side by side (PRD #1321): each column's width is its
+        frame's aspect ratio (2536/1942 and 2482/2044), so the two windows
+        stand the same height. They stack on narrow screens.
+      -->
+      <div class="showcasePair" style="--hero-columns: minmax(0, 1.3059fr) minmax(0, 1.2143fr)">
+        <figure class="device">
+          <div class="deviceBar" aria-hidden="true"><span class="light"></span><span class="light"></span><span class="light"></span><span class="deviceTitle">dot-agent-deck</span><span class="deviceLabel">Terminal UI</span></div>
+          <img class="deviceImage" src="/img/orchestration-tui-home.png" width="2536" height="1942" alt="Agent Deck’s terminal UI on the dot-agent-deck-dispatch-issue-544 orchestration tab — six role cards down the left, orchestrator, coder, reviewer, auditor, tester and release, run by Claude Code, Pi, OpenCode and Codex, with tester Working and the rest Idle, beside the orchestrator’s pane showing its report on the pull request it prepared, over a footer reading 15 active, 4 working, 1 thinking, 10 idle">
+        </figure>
+        <figure class="device">
+          <div class="deviceBar" aria-hidden="true"><span class="light"></span><span class="light"></span><span class="light"></span><span class="deviceTitle">Agent Deck</span><span class="deviceLabel">Desktop app</span></div>
+          <img class="deviceImage" src="/img/orchestration-desktop-home.png" width="2482" height="2044" alt="The desktop app’s Agent dashboard across all daemons — 43 agents over 3 daemons — with a remote daemon’s standalone agents above two six-role orchestrations: the first lists 01 orchestrator, marked ORCHESTRATOR, then coder, reviewer, auditor, tester and release, one running and five waiting, each with its uptime">
+        </figure>
+      </div>
+      <p class="showcaseCaption">The same six-role orchestration in both clients. In the terminal UI its roles are cards beside the orchestrator’s pane, Claude Code, Pi, OpenCode and Codex side by side; in the desktop app they are a group on a dashboard that spans every daemon, with the orchestrator marked.</p>
+    </section>
+
+    <section class="agentStrip">
+      <p class="agentStripLabel">Drives the client you already use</p>
+      <ul class="agentStripList">
+        <li><a href="https://www.anthropic.com/claude-code">Claude Code</a></li>
+        <li><a href="https://opencode.ai">OpenCode</a></li>
+        <li><a href="https://github.com/earendil-works/pi">Pi</a></li>
+        <li><a href="https://github.com/openai/codex">Codex</a></li>
+        <li><a href="https://devin.ai">Devin</a></li>
+      </ul>
+      <p class="agentStripNote">Any other command still runs in a pane — it just gets no live status tracking. Adapters for Gemini CLI and Aider are designed and open, not shipped.</p>
+    </section>
+
+    <section class="clients" aria-labelledby="clients-title">
+      <h2 id="clients-title" class="sectionTitle">Two clients, one daemon</h2>
+      <p class="clientsIntro">The agents run under a small background daemon, not inside a window. The terminal UI and the desktop app are two ways of looking at it, so an agent you start in one shows up in the other, and closing either leaves the agents running.</p>
+      <div class="clientGrid">
+        <article class="clientCard">
+          <img src="/img/dashboard-tui.png" loading="lazy" alt="The terminal UI with four agent cards on the left, each showing its status, directory and last prompt, and the focused agent’s terminal pane on the right">
+          <h3>Terminal UI</h3>
+          <p>The dot-agent-deck binary, in the terminal you already use: agent cards beside their live panes, keyboard first, with the Schedules manager and remote hosts over ssh. It attaches to one daemon at a time.</p>
+        </article>
+        <article class="clientCard">
+          <img src="/img/dashboard-desktop.png" loading="lazy" alt="The desktop app’s dashboard with four agents in one daemon section, each row showing its status, name and uptime">
+          <h3>Desktop app (alpha)</h3>
+          <p>A native window for macOS on Apple Silicon and Linux amd64: one dashboard over several daemons at once — this machine and remote ones — with each agent’s terminal a click away, and voice control. It connects to a running daemon and starts none of its own.</p>
+          <p class="clientLink"><a href="https://github.com/vfarcic/dot-agent-deck/blob/main/docs/desktop/index.md">Read about the desktop app →</a></p>
+        </article>
+      </div>
+    </section>
+
+    <section class="why">
+      <h2 class="sectionTitle">Why Agent Deck</h2>
+      <p class="pullQuote">Running one AI agent at a time, you're still a software engineer who happens to use AI. Running many at the same time, you stop being one. You become a project manager supervising a team, a tech lead unblocking them, an architect designing the approach, a product manager deciding what to build.</p>
+      <div class="whyRest">
+        <p>The agents do the work — writing the code, running the tests, watching the pipelines, answering the review comments. Your job is everything around it — defining the work up front, supervising it in flight, and validating that the right thing got built. None of this is new. It's the same craft people have practiced for decades. The team just looks different.</p>
+        <p>Agent Deck is the tool that lets you do that without losing your mind. One place holds all of it — a lone agent, a team working under an orchestrator, a unit off in its own copy of the repo — and every one of them is something you can open, watch and type into, in the terminal you already use or in a desktop window beside it, with the agent client you already know.</p>
+      </div>
+    </section>
+
+    <section class="story" aria-labelledby="story-title">
+      <!--
+        The four steps are <h3>s, so the section needs an <h2> above them or
+        the document outline jumps a level. The design has no room for a
+        visible one, so it is visually hidden rather than dropped.
+      -->
+      <h2 id="story-title" class="visuallyHidden">How it works</h2>
+
+      <div class="storyRow">
+        <div class="storyText">
+          <span class="storyStep">01</span>
+          <h3>Start an agent</h3>
+          <p>Pick a directory and choose what starts there: Ctrl+n in the terminal UI, New agent in the desktop app. A single agent on the command you give it. A full multi-agent orchestration, every role at once. A dispatcher you can ask for isolated work. Or a scheduled task, written here and fired later by the deck itself.</p>
+        </div>
+        <div class="storyFigures">
+          <figure class="storyFigure">
+            <span class="storyFigureLabel">Terminal UI</span>
+            <img src="/img/orchestration-new-deck.png" loading="lazy" alt="The New Agent form — Dir /tmp/storefront, a Mode row offering No mode, Orch: review-team, schedule and dispatcher, Agent on auto, Name storefront, Command claude, and Submit and Cancel buttons">
+            <figcaption>The form Ctrl+n opens once the directory is picked. The Mode row is where the choice above is made — a plain agent, a scheduled task, a dispatcher, and review-team, which is not a built-in option but the orchestration this directory defines.</figcaption>
+          </figure>
+          <figure class="storyFigure">
+            <span class="storyFigureLabel">Desktop app</span>
+            <img src="/img/new-agent-desktop.png" loading="lazy" alt="The desktop app’s New agent dialog over the Agent dashboard — daemon Local daemon, directory /home/dev/demo-project, a Mode row offering No mode, Orch: demo-loop, schedule and dispatcher, Name demo-project, an empty Command field, and Discard and Create agent buttons">
+            <figcaption>The desktop app’s New agent dialog makes the same choice, after asking which daemon to start the agent on. demo-loop is not built in: it is the orchestration this directory defines.</figcaption>
+          </figure>
+        </div>
+      </div>
+
+      <div class="storyRow">
+        <div class="storyText">
+          <span class="storyStep">02</span>
+          <h3>Watch every one of them</h3>
+          <p>Every agent shows up live, with what it is doing right now, the tool it is running, its directory and its last prompt, and nothing for you to wire up. In the terminal UI each one gets a card, and the cards get tighter the more agents you run, because the deck would rather shrink them than make you go looking for one. In the desktop app each one gets a row with the columns you choose, and one dashboard can hold the agents of several daemons, on this machine and on remote ones.</p>
+        </div>
+        <div class="storyFigures">
+          <figure class="storyFigure">
+            <span class="storyFigureLabel">Terminal UI</span>
+            <img src="/img/busy-deck-real.webp" loading="lazy" alt="A deck with the Dashboard and four orchestration tabs along the top and six agent cards down the sidebar — ClaudeCode, Pi, OpenCode and Codex filling the orchestrator, coder, reviewer, auditor, tester and release roles, two marked Working and the rest Idle — the cards all laid out the same way, with the directory, the last prompt, the command last run, the time since the last activity and a tool count, over a footer reading 23 active, 2 working, 1 thinking, 20 idle">
+            <figcaption>Four different agent clients — Claude Code, Pi, OpenCode and Codex — running side by side under one orchestrator, and the deck reads all of them the same way: the same card, the same live status, whichever client is behind it. The header counts the six sessions in view out of the deck’s 25; the footer counts every agent it is holding: 23 active, 2 working, 1 thinking, 20 idle.</figcaption>
+          </figure>
+          <figure class="storyFigure">
+            <span class="storyFigureLabel">Desktop app</span>
+            <img src="/img/dashboard-fleet-desktop.png" loading="lazy" alt="The desktop app’s Agent dashboard showing All daemons: a Local daemon section with four standalone agents and a dev@build-box section with two, each row showing its status, running or waiting, its name and its uptime, under counters reading 6 agents, 3 running, 3 waiting and daemons 2/2">
+            <figcaption>Two daemons on one dashboard, this machine and a remote build box, each in its own section with its own New agent button.</figcaption>
+          </figure>
+        </div>
+      </div>
+
+      <div class="storyRow">
+        <div class="storyText">
+          <span class="storyStep">03</span>
+          <h3>Let one agent run the others</h3>
+          <p>Define the roles your project needs — orchestrator, coder, reviewer, release — and one agent hands each piece of work to the right one. Every worker starts fresh, with only the context it was given, and you watch the hand-offs land: across the orchestration’s tab in the terminal UI, down its group in the desktop app. If a worker goes quiet, the deck tells the orchestrator, so a stalled run does not sit there unnoticed.</p>
+        </div>
+        <div class="storyFigures">
+          <figure class="storyFigure">
+            <span class="storyFigureLabel">Terminal UI</span>
+            <img src="/img/orchestration-delegation-parallel.png" loading="lazy" alt="Orchestrator delegating to reviewer and auditor in parallel — both cards light up simultaneously">
+            <figcaption>One agent delegating to two others at once. Both cards light up together.</figcaption>
+          </figure>
+          <figure class="storyFigure">
+            <span class="storyFigureLabel">Desktop app</span>
+            <img src="/img/orchestration-desktop.png" loading="lazy" alt="The desktop app’s Agent dashboard with a demo-loop orchestration group below the standalone agents: 01 planner, marked ORCHESTRATOR, and 02 builder, both running, with a Close button on the group’s header">
+            <figcaption>In the desktop app an orchestration is a group: its roles in order, the one you message marked ORCHESTRATOR, and one Close for all of them.</figcaption>
+          </figure>
+        </div>
+      </div>
+
+      <div class="storyRow">
+        <div class="storyText">
+          <span class="storyStep">04</span>
+          <h3>Send work off on its own</h3>
+          <p>Ask a dispatcher for something — “work on the search bug” — and it makes a separate copy of your repository and puts an agent, or a whole orchestration, to work inside it. It works in that copy rather than in your working tree, so start as many as you like and carry on with what you were doing. Each unit arrives on the deck, as a card or a tab in the terminal UI and as a row or a group in the desktop app, and reports back when it is done.</p>
+        </div>
+        <!--
+          A single frame: the dispatcher's work is a conversation in an
+          agent's pane and the desktop fixture has no dispatcher transcript to
+          capture, so the caption says what the desktop app does instead.
+        -->
+        <div class="storyFigures storyFiguresSingle">
+          <figure class="storyFigure">
+            <span class="storyFigureLabel">Terminal UI</span>
+            <img src="/img/dispatch.webp" loading="lazy" alt="A dispatcher pane in the terminal UI. The request asks for three dispatched agents or teams at a time, counting the two already running, and a stop at twenty in total; the dispatcher reads it back as a standing loop that keeps three units running, dispatches a fresh one each time a slot frees, and stops once twenty have been dispatched, with eighteen more to go">
+            <figcaption>A dispatcher pane with two units already up, asked to keep three running at a time and stop at twenty — which it reads back as a standing loop with eighteen still to go. In the desktop app a dispatcher is an agent like any other: you talk to it in its pane, and the units it starts appear on the dashboard.</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section class="audience">
+      <div class="audienceInner">
+        <h2 class="sectionTitle">Who this is for</h2>
+        <ul class="audienceList">
+          <li><span class="check" aria-hidden="true">✓</span>You already run more than one coding agent at a time, and you are losing track of what each one is doing.</li>
+          <li><span class="check" aria-hidden="true">✓</span>You would rather keep your own tools than move into someone else’s IDE to get a dashboard: the terminal you have spent years configuring, or a plain desktop window beside it.</li>
+          <li><span class="check" aria-hidden="true">✓</span>You want one agent to plan the work and hand pieces of it to others, with somewhere to watch that happen.</li>
+        </ul>
+        <p class="audienceNot">If you run one agent, in one window, and that is working fine — this is not for you yet. Come back when the second one starts drifting.</p>
+      </div>
+    </section>
+
+    <section class="principles">
+      <h2 class="sectionTitle">Four decisions that shaped it</h2>
+      <div class="principleGrid">
+        <article class="principleCard">
+          <span class="principleNum">01</span>
+          <h3>Your terminal, or a window</h3>
+          <p>The terminal UI runs in Ghostty, iTerm2, Alacritty, Kitty, WezTerm — whatever you already configured — as a guest, not a replacement, with no multiplexer to set up underneath. The desktop app is a native window over the same agents, so you can use either, or both at once.</p>
+        </article>
+        <article class="principleCard">
+          <span class="principleNum">02</span>
+          <h3>Uses your agent client</h3>
+          <p>Claude Code, OpenCode, Pi, Codex or Devin — keep the shortcuts, skills, and configs you already dialed in. No new agent client to learn.</p>
+        </article>
+        <article class="principleCard">
+          <span class="principleNum">03</span>
+          <h3>Closing the window does not stop the work</h3>
+          <p>Detach the terminal UI or quit the desktop app, and the agents carry on without you; open either again and you rejoin the same agents, mid-run. The same holds over ssh — agents running on another machine stay running when you disconnect.</p>
+        </article>
+        <article class="principleCard">
+          <span class="principleNum">04</span>
+          <h3>Keyboard, pointer or voice</h3>
+          <p>In the terminal UI every action is one or two keystrokes away, because managing a team of agents has to fit in muscle memory, and a button bar along the bottom names each command and the key it answers to. The desktop app is built for the pointer, with a few keys of its own, and it can be driven by voice: open screens, start a new agent, and type into one.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="install" aria-labelledby="install-title">
+      <div class="installInner">
+        <h2 id="install-title" class="sectionTitle">Runs where you work</h2>
+        <ul class="platformList">
+          <li><span class="markOk" aria-hidden="true">✓</span><span class="platformName">macOS<span class="platformDetail">Intel &amp; Apple Silicon</span></span><span class="platformStatus">Supported</span></li>
+          <li><span class="markOk" aria-hidden="true">✓</span><span class="platformName">Linux<span class="platformDetail">amd64 &amp; arm64</span></span><span class="platformStatus">Supported</span></li>
+          <li><span class="markOk" aria-hidden="true">✓</span><span class="platformName">Windows<span class="platformDetail">through WSL, as Linux; no native Windows build yet</span></span><span class="platformStatus">Via WSL</span></li>
+          <li><span class="markOk" aria-hidden="true">✓</span><span class="platformName">Desktop app<span class="platformDetail">macOS on Apple Silicon and Linux amd64</span></span><span class="platformStatus">Alpha</span></li>
+        </ul>
+        <p class="diyLink">Prefer to do it yourself? <a href="https://github.com/vfarcic/dot-agent-deck/blob/main/docs/installation.md">Installation guide →</a></p>
+      </div>
+    </section>
+
+    <section class="close">
+      <div class="closeInner">
+        <h2 class="closeTitle">One prompt to set it up. One place for everything you have running.</h2>
+        <div class="ctaRow">
+          <a class="ctaPrimary" href="#agent-prompt">Hand it to your agent</a>
+          <a class="ctaGhost" href="https://github.com/vfarcic/dot-agent-deck">Browse the source</a>
+        </div>
+      </div>
+    </section>
+
+    <!--
+      For agents: every published page as a plain <a href>, generated from the
+      manifest, beside where an agent should start. Kept quiet and last,
+      because a person reading this page is sent to the prompt instead.
+    -->
+    <section class="forAgents" id="docs" aria-labelledby="for-agents-title">
+      <div class="forAgentsInner">
+        <h2 id="for-agents-title" class="forAgentsTitle">For agents: every docs page, as Markdown</h2>
+        <p class="forAgentsNote">The docs are Markdown, written for the <strong>coding agent</strong> that sets the deck up for you. An AI agent should start at <a href="/llms.txt">/llms.txt</a>: it indexes every page below, and <a href="/llms-full.txt">/llms-full.txt</a> holds all of them in one file. Once the deck is installed, <code>dot-agent-deck docs</code> prints the same pages as they are for that version, with no network access.</p>
+        <ul class="docsIndex">
+{{docs-index}}
+        </ul>
+      </div>
+    </section>
+  </main>
+</div>
+
+<footer class="footer">
+  <div class="footerInner">
+    <div class="footerCol">
+      <p class="footerTitle">Documentation</p>
+      <ul>
+        <li><a href="https://github.com/vfarcic/dot-agent-deck/blob/main/docs/installation.md">Installation guide</a></li>
+        <li><a href="#docs">Every docs page, for agents</a></li>
+        <li><a href="/llms.txt">llms.txt</a></li>
+      </ul>
+    </div>
+    <div class="footerCol">
+      <p class="footerTitle">Community</p>
+      <ul>
+        <li><a href="https://github.com/vfarcic/dot-agent-deck/issues">GitHub Issues</a></li>
+        <li><a href="https://github.com/vfarcic/dot-agent-deck/releases">Releases</a></li>
+      </ul>
+    </div>
+  </div>
+  <p class="footerCopyright">Copyright © DevOps Toolkit. MIT License.</p>
+</footer>
+
+<script>
+  (function () {
+    var root = document.documentElement;
+    var toggle = document.getElementById('theme-toggle');
+    function current() {
+      var explicit = root.getAttribute('data-theme');
+      if (explicit === 'light' || explicit === 'dark') {
+        return explicit;
+      }
+      return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    if (toggle) {
+      toggle.hidden = false;
+      toggle.addEventListener('click', function () {
+        var next = current() === 'dark' ? 'light' : 'dark';
+        root.setAttribute('data-theme', next);
+        try {
+          localStorage.setItem('theme', next);
+        } catch (e) {}
+      });
+    }
+    var copy = document.getElementById('copy-prompt');
+    var text = document.getElementById('agent-prompt-text');
+    if (copy && text && navigator.clipboard) {
+      copy.hidden = false;
+      copy.addEventListener('click', function () {
+        navigator.clipboard.writeText(text.textContent).then(function () {
+          copy.textContent = 'Copied';
+          setTimeout(function () { copy.textContent = 'Copy'; }, 2000);
+        }, function () {});
+      });
+    }
+  })();
+</script>
+</body>
+</html>
