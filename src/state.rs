@@ -7230,13 +7230,9 @@ fn write_work_done_summary(
     // Issue #509: framed as untrusted worker-authored text, in full.
     //
     // Qodo on PR #1438: the check, the write and the record of what was written
-    // are one step. Without a lock across all three, two completions for the
-    // same path could record their fingerprints in the opposite order to their
-    // writes, leaving a record that no longer matches the file, and the next
-    // completion would then be diverted. A std mutex: the only non-test caller
-    // runs on the blocking pool, and nothing here awaits.
-    static SUMMARY_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _serialized = SUMMARY_WRITE
+    // are one step for this path ([`summary_write_lock`]).
+    let serializer = summary_write_lock(&path);
+    let _serialized = serializer
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match crate::orchestrator_context::replace_coordination_file_if(
@@ -7272,6 +7268,26 @@ fn write_work_done_summary(
             SummaryWrite::Failed
         }
     }
+}
+
+/// Qodo on PR #1438: the lock [`write_work_done_summary`] holds across the
+/// guarded check, the write and the [`written_summaries`] record for one
+/// summary path. Without it, two completions for the same path could record
+/// their fingerprints in the opposite order to their writes, leaving a record
+/// that no longer matches the file, and the next completion would then be
+/// diverted. One lock per path, keyed like the record, so a slow filesystem
+/// under one project does not hold up completions in another. A std mutex: the
+/// only non-test caller runs on the blocking pool, and nothing under it awaits.
+fn summary_write_lock(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    type Locks = HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>;
+    static LOCKS: std::sync::LazyLock<std::sync::Mutex<Locks>> =
+        std::sync::LazyLock::new(Default::default);
+    LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(path.to_path_buf())
+        .or_default()
+        .clone()
 }
 
 /// Issue #331 (Greptile P1 on #1438): the length and hash of a summary this
@@ -16185,6 +16201,34 @@ mod tests {
             write_work_done_summary(Some(cwd_str), "coder", "coder", "pane-1", "After the race."),
             SummaryWrite::Written,
             "the next completion must not be diverted"
+        );
+    }
+
+    /// Qodo on PR #1438: the lock serializing a summary write is per path, so a
+    /// completion whose report file is slow to write in one project does not
+    /// hold up a completion filing into another.
+    #[test]
+    fn write_work_done_summary_does_not_wait_on_another_paths_write() {
+        let held = tempfile::tempdir().expect("tempdir");
+        let other = tempfile::tempdir().expect("tempdir");
+        let other_str = other.path().to_str().expect("utf8 cwd").to_string();
+        let held_lock = summary_write_lock(&held.path().join(".dot-agent-deck/work-done-coder.md"));
+        let _slow_write_in_progress = held_lock.lock().expect("held path's lock");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(write_work_done_summary(
+                Some(&other_str),
+                "coder",
+                "coder",
+                "pane-1",
+                "Another project's report.",
+            ));
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(SummaryWrite::Written),
+            "a write to a different summary path must not wait for this one"
         );
     }
 
