@@ -786,6 +786,12 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   /* PRD #1195 — the Deck selector's section as it renders, not as it is on
      disk: `save` applies an edit at once and writes it behind. */
   const readEndpoints = useCallback(() => latestSettings.current.settings.endpoints, []);
+  /* PRD #1261 review, round 3 — an agent's incarnation on the selected deck,
+     read at the moment a numbered choice is offered and again when it is
+     answered, so an entry whose agent was replaced under its id is refused. */
+  const latestAgents = useRef(runtime.snapshot.agents);
+  latestAgents.current = runtime.snapshot.agents;
+  const readAgentIncarnation = useCallback((agentId: string) => latestAgents.current.find((agent) => agent.id === agentId)?.spawnedAtMs, []);
   /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
      and `DeckSurface`'s own promotion condition. */
   const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId } : undefined;
@@ -851,7 +857,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
       <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
       {screenNode}
-      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} selectedDeckId={selectedDeckId} confirmationOpen={base === "overview" && confirmationOpen} onDictationChange={setDictating} />
+      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} selectedDeckId={selectedDeckId} confirmationOpen={base === "overview" && confirmationOpen} onDictationChange={setDictating} agentIncarnation={readAgentIncarnation} />
       <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
     </PaneDictation.Provider>
   );

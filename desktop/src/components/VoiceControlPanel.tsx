@@ -253,9 +253,25 @@ export const VOICE_PANE_REPLACED = "The agent in this pane was replaced while th
 export function voiceSendReplaced(label: string): string {
   return `The agent in ${label}'s pane was replaced, so nothing was sent. What was typed went to the agent it replaced.`;
 }
+/**
+ * PRD #1260 review, round 3 — a pending one-shot send called off because the
+ * context it was typed in moved: the pane closed or shows another agent, the
+ * selected deck changed, or a confirmation opened. The same rule that ends the
+ * typing mode on any context change, applied to the one Enter a one-shot owes.
+ */
+export function voiceSendCalledOff(label: string, why: string): string {
+  return `Sending to ${label} was called off — ${why}. Nothing was sent; what was typed stays in its prompt.`;
+}
 /** Why the dictation mode ends when its agent is replaced (`dictationStopped`). */
 const DICTATION_AGENT_REPLACED = "the agent in the pane was replaced";
 
+/**
+ * PRD #1261 review, round 3 — the chosen agent is no longer the one offered:
+ * the daemon replaced it under the same id, or the selected deck changed, so
+ * the id now names a different agent (or none).
+ */
+export const VOICE_CHOICE_AGENT_REPLACED = "The agent you chose was replaced after the choice was offered, so nothing ran. Say the command again.";
+export const VOICE_CHOICE_DECK_MOVED_ON = "The selected deck changed after the choice was offered, so nothing ran. Say the command again.";
 export const VOICE_CHOICE_SCREEN_MOVED_ON = "You moved to another screen after the choice was offered, so nothing ran. Say the command again here.";
 export const VOICE_CHOICE_DIALOG_MOVED_ON = "The New agent dialog changed after the choice was offered, so nothing ran. Say the command again.";
 
@@ -480,6 +496,37 @@ function paneReplaced(aim: Pending, pane: VoicePane | undefined): boolean {
 }
 
 /**
+ * PRD #1260 review, round 3 — where a one-shot send was typed: the target, the
+ * selected deck, whether the target was the pane on screen and could take
+ * input then, and whether a confirmation was already open. Noted when the
+ * write starts and checked until Enter is pressed (see {@link sendContextLost}).
+ *
+ * The last two are the state at typing so that only a CHANGE calls the send
+ * off: a one-shot typed while a pane already read as blocked is the residual
+ * `startDictation`'s note describes, and it is not re-litigated here.
+ */
+type SendContext = { aim: Pending; deck: string | undefined; viaPane: boolean; writable: boolean; confirmation: boolean };
+
+/**
+ * PRD #1260 review, round 3 — why a pending one-shot send must be called off,
+ * or `undefined` while its context still holds. A one-shot send is called off,
+ * never sent, when the context moves under it — the same context changes that
+ * end the typing mode: the agent replaced under its id, a confirmation opening,
+ * the selected deck changing, and the pane closing, showing another agent or
+ * no longer taking input it could take when the words were typed.
+ */
+function sendContextLost(context: SendContext, pane: VoicePane | undefined, deck: string | undefined, confirmation: boolean): string | undefined {
+  const { aim } = context;
+  if (paneReplaced(aim, pane)) return voiceSendReplaced(aim.label);
+  if (confirmation && !context.confirmation) return voiceSendCalledOff(aim.label, "a confirmation opened");
+  if (deck !== context.deck) return voiceSendCalledOff(aim.label, "the deck changed");
+  if (!context.viaPane) return undefined;
+  if (pane === undefined || pane.deckId !== aim.deckId || pane.agentId !== aim.agentId) return voiceSendCalledOff(aim.label, "the pane closed");
+  if (context.writable && pane.inputBlocked !== undefined) return voiceSendCalledOff(aim.label, `the pane stopped taking input: ${pane.inputBlocked}`);
+  return undefined;
+}
+
+/**
  * PRD #1260 review, round 2 — the rows that type into, or press Enter in, the
  * open pane's terminal. A same-id replacement during resolution refuses only
  * these: every other command neither reads nor writes that agent's prompt, so
@@ -537,6 +584,12 @@ type VoiceChoiceOffer = {
   directories: VoiceDirectoriesDto | undefined;
   newAgent: VoiceNewAgentDto | undefined;
   instance: string | undefined;
+  /** PRD #1261 review, round 3 — the selected deck when the choice was
+      offered, which an `agent_ref` candidate's id is resolved against. */
+  deck: string | undefined;
+  /** And each offered agent's incarnation then, by agent id, so an entry
+      whose agent was replaced under the same id is refused. */
+  incarnations: Record<string, number | undefined>;
 };
 
 const IDLE: VoicePanelState = { kind: "idle" };
@@ -707,6 +760,13 @@ interface VoiceControlPanelProps {
   /** PRD #1260 — told when the dictation mode starts or ends, so the host can
    * mark the pane it is typing into. */
   onDictationChange?: (target: Pending | undefined) => void;
+  /**
+   * PRD #1261 review, round 3 — the incarnation (`spawnedAtMs`) of an agent
+   * on the selected deck as the host sees it now, or `undefined` when it is
+   * not reported or the agent is gone. A numbered choice notes it for each
+   * offered agent and refuses an entry whose agent was replaced since.
+   */
+  agentIncarnation?: (agentId: string) => number | undefined;
 }
 
 /**
@@ -752,7 +812,7 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, selectedDeckId, confirmationOpen = false, onDictationChange }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, selectedDeckId, confirmationOpen = false, onDictationChange, agentIncarnation }: VoiceControlPanelProps) {
   /* Held in a ref so the resolve and the overlay read the host's latest getter
      without either callback being rebuilt when the host re-renders. */
   const directoriesRef = useRef(directories);
@@ -763,6 +823,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   newAgentInstanceRef.current = newAgentInstance;
   const endpointsRef = useRef(endpoints);
   endpointsRef.current = endpoints;
+  const agentIncarnationRef = useRef(agentIncarnation);
+  agentIncarnationRef.current = agentIncarnation;
   const { declareVoiceScreen, resolveVoice, answerVoiceChoice, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
   /* Issue #1198 — the list of what can be said leaves out the deck while the
      deck is hidden, even from its "elsewhere" half: it is not somewhere else,
@@ -879,6 +941,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * reopens while it is outstanding, so anything can happen before it settles.
    */
   const sendEpoch = useRef(0);
+  /**
+   * PRD #1260 review, round 3 — the context the live one-shot send was typed
+   * in ({@link SendContext}), from the moment its write starts until it is
+   * called off or its Enter is pressed. Cleared with every epoch bump.
+   */
+  const sendContext = useRef<SendContext | undefined>(undefined);
 
   /**
    * The screen is read at submit time rather than closed over, so a navigation
@@ -1071,6 +1139,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   }, []);
   const cancelPendingSend = useCallback(() => {
     sendEpoch.current += 1;
+    sendContext.current = undefined;
     clearSendTimer();
   }, [clearSendTimer]);
 
@@ -1083,9 +1152,16 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * the text invisible until it was already gone.
    */
   const submitDictation = useCallback(async (aim: Pending) => {
+    /* PRD #1260 review, round 3 — the action this Enter belongs to. A failure
+       that arrives after a newer send, utterance or mode change is dropped: it
+       must not cover the newer report. Every caller bumps the epoch first, so
+       this names this Enter alone. */
+    const epoch = sendEpoch.current;
+    const generation = modeGeneration.current;
     try {
       await sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, VOICE_DICTATION_SUBMIT);
     } catch (cause) {
+      if (sendEpoch.current !== epoch || modeGeneration.current !== generation) return;
       setProblem(sentenceOf(cause));
     }
   }, [sendTerminalInput]);
@@ -1114,10 +1190,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         setSendIn(left);
         return;
       }
+      /* The final guard: the context is re-checked immediately before Enter,
+         so a change no effect has seen yet still calls the send off. */
+      const context = sendContext.current;
+      const lost = context && sendContextLost(context, paneRef.current, selectedDeckRef.current, confirmationRef.current);
       cancelPendingSend();
       setPending(undefined);
-      if (paneReplaced(aim, paneRef.current)) {
-        setProblem(voiceSendReplaced(aim.label));
+      if (lost !== undefined) {
+        setProblem(lost);
         return;
       }
       void submitDictation(aim);
@@ -1166,14 +1246,19 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   /* PRD #1260 review — a pending one-shot send is called off, not sent, when
      the agent it would press Enter for is replaced under the same id: the
      words were typed into the agent that is gone, and Enter would submit
-     whatever the new one has in its prompt. */
+     whatever the new one has in its prompt. Round 3 widens it to every
+     context change that ends the typing mode — the pane closing or showing
+     another agent, the deck changing, a confirmation opening — and to the
+     whole send, from the write starting to Enter, not only the countdown. */
   useEffect(() => {
-    const aim = pendingRef.current;
-    if (!aim || !paneReplaced(aim, paneRef.current)) return;
+    const context = sendContext.current;
+    if (!context) return;
+    const lost = sendContextLost(context, paneRef.current, selectedDeckId, confirmationOpen);
+    if (lost === undefined) return;
     cancelPendingSend();
     setPending(undefined);
-    setProblem(voiceSendReplaced(aim.label));
-  }, [cancelPendingSend, paneAgentId, paneDeckId, paneSpawnedAtMs, pending, setPending]);
+    setProblem(lost);
+  }, [cancelPendingSend, confirmationOpen, paneAgentId, paneBlocked, paneDeckId, paneSpawnedAtMs, pending, selectedDeckId, setPending]);
 
   /* The host marks the pane it is typing into; a panel going away takes the
      mode with it, so it must not leave the mark behind. */
@@ -1209,12 +1294,18 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * past {@link VOICE_CHOICE_MAX}, which Rust leaves empty) or more than the
    * cap is likewise only its sentence.
    */
-  const offerChoice = useCallback((answer: VoiceResultDto, declared: Omit<VoiceChoiceOffer, "outcome" | "backend">) => {
+  const offerChoice = useCallback((answer: VoiceResultDto, declared: Omit<VoiceChoiceOffer, "outcome" | "backend" | "deck" | "incarnations">) => {
     const outcome = answer.outcome;
     if (outcome.kind !== "param_ambiguous" || outcome.invoke === undefined || outcome.candidates === undefined) return;
     if (outcome.candidates.length === 0 || outcome.candidates.length > VOICE_CHOICE_MAX) return;
     if (panelStateRef.current.kind !== "idle" || confirmationRef.current) return;
-    setPanelState({ kind: "awaitingChoice", offer: { ...declared, outcome: { ...outcome, invoke: outcome.invoke, candidates: outcome.candidates }, backend: answer.backend } });
+    const read = agentIncarnationRef.current;
+    const incarnations: Record<string, number | undefined> = {};
+    for (const candidate of outcome.candidates) if (candidate.kind === "agent_ref") incarnations[candidate.value] = read?.(candidate.value);
+    setPanelState({
+      kind: "awaitingChoice",
+      offer: { ...declared, outcome: { ...outcome, invoke: outcome.invoke, candidates: outcome.candidates }, backend: answer.backend, deck: selectedDeckRef.current, incarnations },
+    });
   }, [setPanelState]);
 
   /**
@@ -1250,6 +1341,20 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (chosen === undefined) {
       setProblem(VOICE_CHOICE_REFUSED);
       return;
+    }
+    /* PRD #1261 review, round 3 — an agent entry names an agent by its id on
+       the selected deck, and the id alone cannot tell a same-id replacement
+       apart. The one place both a click and a spoken answer pass, so neither
+       can open a stop confirmation for an agent that was never offered. */
+    if (chosen.kind === "agent_ref") {
+      if (selectedDeckRef.current !== offer.deck) {
+        setProblem(VOICE_CHOICE_DECK_MOVED_ON);
+        return;
+      }
+      if (incarnationsDiffer(offer.incarnations[chosen.value], agentIncarnationRef.current?.(chosen.value))) {
+        setProblem(VOICE_CHOICE_AGENT_REPLACED);
+        return;
+      }
     }
     const outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }> = {
       kind: "dispatch",
@@ -1833,7 +1938,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     /* The pane's incarnation when it is the target, so a same-id replacement
        before the countdown ends calls the send off (`paneReplaced`). */
     const shown = paneRef.current;
-    const incarnation = shown && shown.deckId === target.deckId && shown.agentId === target.agentId ? { spawnedAtMs: shown.spawnedAtMs } : {};
+    const onPane = shown !== undefined && shown.deckId === target.deckId && shown.agentId === target.agentId;
+    const incarnation = onPane ? { spawnedAtMs: shown.spawnedAtMs } : {};
     const aim: Pending = { deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId, ...incarnation };
     const typed = dictationText(target.text ?? "");
     /* Nothing to type. Rust refuses an empty remainder before it ever becomes a
@@ -1843,13 +1949,17 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (typed === "") return;
     cancelPendingSend();
     const epoch = sendEpoch.current;
+    sendContext.current = { aim, deck: selectedDeckRef.current, viaPane: onPane, writable: onPane && shown.inputBlocked === undefined, confirmation: confirmationRef.current };
     void sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed).then(
       () => {
         /* Called off while the words were being written — see `sendEpoch`. */
         if (sendEpoch.current !== epoch) return;
-        if (paneReplaced(aim, paneRef.current)) {
+        const context = sendContext.current;
+        const lost = context && sendContextLost(context, paneRef.current, selectedDeckRef.current, confirmationRef.current);
+        if (lost !== undefined) {
+          cancelPendingSend();
           setPending(undefined);
-          setProblem(voiceSendReplaced(aim.label));
+          setProblem(lost);
           return;
         }
         setPending(aim);

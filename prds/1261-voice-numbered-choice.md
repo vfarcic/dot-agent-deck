@@ -210,3 +210,7 @@ Written from issue #1261 by a dispatched unit, alongside PRDs #1260 and #1184, a
 ### 2026-09-30 — Review round 2
 
 - **The changelog named the wrong number.** `changelog.d/1261.feature.md` told a user with a colliding entry to say "number one"; the right number is the colliding entry's own position, so it now says to say its number.
+
+### 2026-09-30 — Review round 3
+
+- **A chosen stop could open a confirmation for a same-id replacement.** Choice candidates name an agent by id, which cannot tell a replacement apart, so a `stop_agent` entry answered after the daemon replaced that agent opened D5 for the new one. The offer now snapshots the selected deck and each `agent_ref` candidate's `spawnedAtMs` (the host's `agentIncarnation` getter), and `dispatchChoice` — the one place a click and a spoken answer both pass — refuses the entry with `VOICE_CHOICE_AGENT_REPLACED` when the incarnations differ (only when both are known, `incarnationsDiffer`), or with `VOICE_CHOICE_DECK_MOVED_ON` when the selected deck changed, since the id then names an agent on another deck. `voice::choice::answer`'s liveness check stays by id: its candidates carry no spawn time and the panel check covers both routes.
