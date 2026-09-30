@@ -12,7 +12,8 @@
  * behind it: the browser preview, and the vitest runtimes. It is the order and
  * the closed lists of the Rust function — a bare control that is also an
  * offered label (refused), cancel phrase, whole-utterance ordinal, then a name
- * among the OFFERED entries only — with the name matched
+ * among the OFFERED entries only, said on its own (PR #1451 review: "stop
+ * Planner" is a new command, not an answer) — with the name matched
  * against labels rather than through each kind's resolver, and no liveness
  * check: the dispatch-time checks every target already makes are what stand
  * behind it there. The Rust function is the one production answers with.
@@ -71,9 +72,30 @@ function ordinal(words: string[]): number | "last" | undefined {
   return /^\d+$/.test(digits) ? Number(digits) : undefined;
 }
 
-/** Whether every word of `inner` is a word of `outer`. */
-function subset(inner: string[], outer: string[]): boolean {
-  return inner.length > 0 && inner.every((word) => outer.includes(word));
+/*
+ * `voice::choice::ANSWER_FILLER`: the words an answer may carry around a name
+ * without naming anything else — an article, and the noun for what is being
+ * chosen, by param kind.
+ */
+const ARTICLES = ["the", "a", "an"];
+const KIND_NOUNS: Record<string, string[]> = {
+  agent_ref: ["agent"],
+  deck_ref: ["deck", "daemon"],
+  dir_ref: ["folder", "directory"],
+  orchestration_ref: ["orchestration", "run"],
+  mode_ref: ["mode", "chip"],
+  agent_type_ref: ["agent", "type"],
+};
+
+/**
+ * `voice::choice::covers`: whether the answer `words` say nothing but `label`
+ * — every word is a word of the label or filler, and at least one is the
+ * label's. A command around a name ("stop Planner") or a name with extra words
+ * does not.
+ */
+function covers(words: string[], label: string[], kind: string): boolean {
+  const filler = [...ARTICLES, ...(KIND_NOUNS[kind] ?? [])];
+  return words.some((word) => label.includes(word)) && words.every((word) => label.includes(word) || filler.includes(word));
 }
 
 /**
@@ -109,7 +131,7 @@ export function answerChoiceLocally(utterance: string, offered: readonly VoiceRe
   const labels = offered.map((candidate) => spokenWords(candidate.label));
   const same = (label: string[]) => label.length === words.length && label.every((word, at) => word === words[at]);
   const exact = offered.filter((_, at) => same(labels[at]));
-  const loose = exact.length > 0 ? exact : offered.filter((_, at) => subset(words, labels[at]) || subset(labels[at], words));
+  const loose = exact.length > 0 ? exact : offered.filter((candidate, at) => covers(words, labels[at], candidate.kind));
   if (loose.length === 1) return { kind: "selected", candidate: loose[0] };
   return loose.length > 1 ? { kind: "refused" } : { kind: "not_answer" };
 }

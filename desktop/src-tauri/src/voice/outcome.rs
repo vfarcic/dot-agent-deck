@@ -2939,7 +2939,7 @@ pub fn resolve_dir_ref(spoken: &str, directories: Option<&VoiceDirectories>) -> 
 }
 
 /// Every name a child directory answers to. See [`resolve_dir_ref`].
-fn dir_names(name: &str) -> Vec<String> {
+pub(super) fn dir_names(name: &str) -> Vec<String> {
     let mut names = vec![name.to_string()];
     if name.contains('.') {
         names.push(name.replace('.', " "));
@@ -2974,7 +2974,7 @@ pub fn resolve_mode_ref(spoken: &str, modes: &[VoiceChoice]) -> ChoiceMatch {
 }
 
 /// Every name a Mode chip answers to. See [`resolve_mode_ref`] for the rule.
-fn mode_names(choice: &VoiceChoice) -> Vec<String> {
+pub(super) fn mode_names(choice: &VoiceChoice) -> Vec<String> {
     let mut names = vec![choice.label.clone()];
     if let Some(name) = choice.label.strip_prefix("Orch:").map(str::trim) {
         names.push(name.to_string());
@@ -3046,7 +3046,7 @@ pub fn resolve_agent_type_ref(spoken: &str, agent_types: &[VoiceChoice]) -> Choi
 }
 
 /// Every name an agent entry answers to. See [`resolve_agent_type_ref`].
-fn agent_type_names(choice: &VoiceChoice) -> Vec<String> {
+pub(super) fn agent_type_names(choice: &VoiceChoice) -> Vec<String> {
     let mut names = vec![choice.label.clone()];
     if choice.id != choice.label {
         names.push(choice.id.clone());
@@ -3295,7 +3295,7 @@ fn deck_reference(spoken: &str) -> String {
 }
 
 /// Every name this deck answers to. See [`resolve_deck_ref`] for the rule.
-fn deck_spoken_names(deck: &VoiceDeck) -> Vec<String> {
+pub(super) fn deck_spoken_names(deck: &VoiceDeck) -> Vec<String> {
     let mut names = vec![deck.label.clone()];
     if deck.local {
         names.push("local".to_string());

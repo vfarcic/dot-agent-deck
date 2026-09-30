@@ -223,6 +223,13 @@ Written from issue #1261 by a dispatched unit, alongside PRDs #1260 and #1184, a
 
 - **A direct stop could still reach a replacement.** Round 4 applied the gate's `agent` touch only to an entry chosen from a list; a direct "stop Planner" or "close review" resolved across a same-id replacement or a selected-deck change opened the D5 confirmation for the new target. `dispatchLost` in `VoiceControlPanel.tsx` now holds every dispatch — resolved directly in `resolveOne` or chosen in `dispatchChoice` — to `answer` plus `agent` for every param of an agent-targeting kind (`agent_ref`, `orchestration_ref`), keyed by kind rather than by row, so a new row taking either param is covered without being listed. A chosen `orchestration_ref` entry, which round 4 did not gate on incarnation, is covered by the same change. Reports: "Nothing ran — the agent was replaced. Say it again." / "Nothing ran — the deck changed. Say it again." for a direct command; the `VOICE_CHOICE_*` sentences for a chosen one, as before.
 
+### 2026-09-30 — PR #1451 review
+
+- **A new command containing an offered name answered the choice.** With "open the agent" offering Planner, "stop Planner" selected Planner through the resolvers' loose pass and ran the open. A name answer must now be the whole utterance — every word a word of an offered entry's name, an article or the kind's noun (`choice::covers`) — and anything else is a non-answer that closes the choice and resolves normally. `answerChoiceLocally` mirrors it, which also drops its label-subset-of-answer match ("Desktop implementation extra").
+- **A removed agent's entry was still dispatched on click.** The gate's incarnation check compared spawn times only when both existed; an entry whose agent was declared and is now absent is refused (`gone`, `VOICE_CHOICE_AGENT_GONE`).
+- **Expiry counted timer callbacks.** The offer stores a wall-clock deadline, checked before any answer is dispatched; the countdown is derived from it.
+- **A rejected dictation-mode write left the "Typed …" sentence beside its error.** The failure now clears the result (PRD #1260's surface, fixed here with the rest of the round).
+
 ### 2026-09-30 — Closed; D1 moved to PRD #1184
 
 Everything but D1 is built and ships in the PR that closes #1261. D1 needs the multi-action response schema that PRD #1184 would introduce, and #1184's M1 measured NO-GO (not now), so D1 moved into [PRD #1184](../1184-voice-command-chains.md) as a dependent follow-up rather than staying open here.

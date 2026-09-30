@@ -81,8 +81,9 @@ fn choice_answers_whole_ordinals_and_refuses_out_of_range() {
     );
 }
 
-/// Scenario: a spoken name selects one of the offered directories only. A
-/// live but unoffered directory, and a name shared by two offers, are refused.
+/// Scenario: a spoken name selects one of the offered entries only. A live but
+/// unoffered directory or a shared name is refused, and a command containing
+/// an offered agent's name remains a new command rather than an answer.
 #[test]
 fn choice_names_are_checked_against_the_offered_list_only() {
     let listing = listing();
@@ -99,6 +100,32 @@ fn choice_names_are_checked_against_the_offered_list_only() {
     );
     assert_eq!(answer("src", &offered, &live), ChoiceAnswer::Refused);
     assert_eq!(answer("docs", &offered, &live), ChoiceAnswer::Refused);
+
+    let agents = [
+        role_agent("planner", "Planner"),
+        role_agent("builder", "Desktop implementation"),
+    ];
+    let live_agents = ChoiceLive {
+        agents: &agents,
+        decks: &[],
+        directories: None,
+        new_agent: None,
+    };
+    let agent_offers = [
+        candidate(ParamKind::AgentRef, "planner", "Planner"),
+        candidate(ParamKind::AgentRef, "builder", "Desktop implementation"),
+    ];
+    assert_eq!(
+        answer("Planner", &agent_offers, &live_agents),
+        ChoiceAnswer::Selected(agent_offers[0].clone())
+    );
+    assert_eq!(
+        [
+            answer("stop Planner", &agent_offers, &live_agents),
+            answer("desktop implementation extra", &agent_offers, &live_agents),
+        ],
+        [ChoiceAnswer::NotAnswer, ChoiceAnswer::NotAnswer]
+    );
 }
 
 /// Scenario: an offered agent is literally named like a bare ordinal or a

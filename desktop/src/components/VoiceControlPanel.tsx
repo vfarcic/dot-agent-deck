@@ -273,6 +273,12 @@ export function voiceSendCalledOff(label: string, why: string): string {
  * so the id now names a different agent (or none).
  */
 export const VOICE_CHOICE_AGENT_REPLACED = "The agent you chose was replaced after the choice was offered, so nothing ran. Say the command again.";
+/**
+ * PRD #1261 — PR #1451 review: the agent an entry names was removed from the
+ * selected deck after the choice was offered — distinct from a same-id
+ * replacement, and refused the same way.
+ */
+export const VOICE_CHOICE_AGENT_GONE = "The agent you chose is gone since the choice was offered, so nothing ran. Say the command again.";
 export const VOICE_CHOICE_DECK_MOVED_ON = "The selected deck changed after the choice was offered, so nothing ran. Say the command again.";
 export const VOICE_CHOICE_SCREEN_MOVED_ON = "You moved to another screen after the choice was offered, so nothing ran. Say the command again here.";
 export const VOICE_CHOICE_DIALOG_MOVED_ON = "The New agent dialog changed after the choice was offered, so nothing ran. Say the command again.";
@@ -528,7 +534,7 @@ type VoiceContext = {
 type Touches = { answer?: true; pane?: AgentAddress; agent?: string };
 
 /** Why {@link contextLost} refused: a code the caller picks its sentence by, and the reason in words. */
-type Lost = { code: "screen" | "dialog" | "mode" | "confirmation" | "pane" | "replaced" | "blocked" | "deck" | "agent"; why: string };
+type Lost = { code: "screen" | "dialog" | "mode" | "confirmation" | "pane" | "replaced" | "blocked" | "deck" | "agent" | "gone"; why: string };
 
 /**
  * PRD #1260/#1261 review, rounds 4-5 — THE gate. Every side effect an
@@ -576,6 +582,7 @@ export function contextLost(was: VoiceContext, now: VoiceContext, touches: Touch
     if (now.pane.inputBlocked !== undefined && was.pane.inputBlocked === undefined) return { code: "blocked", why: `the pane stopped taking input: ${now.pane.inputBlocked}` };
   }
   if ((aim || touches.agent !== undefined) && now.deck !== was.deck) return { code: "deck", why: "the deck changed" };
+  if (touches.agent !== undefined && touches.agent in was.incarnations && !(touches.agent in now.incarnations)) return { code: "gone", why: "the agent is gone" };
   if (touches.agent !== undefined && incarnationsDiffer(was.incarnations[touches.agent], now.incarnations[touches.agent])) return { code: "agent", why: "the agent was replaced" };
   return undefined;
 }
@@ -621,6 +628,7 @@ function choiceRefusal(lost: Lost): string {
   if (lost.code === "dialog") return VOICE_CHOICE_DIALOG_MOVED_ON;
   if (lost.code === "deck") return VOICE_CHOICE_DECK_MOVED_ON;
   if (lost.code === "agent") return VOICE_CHOICE_AGENT_REPLACED;
+  if (lost.code === "gone") return VOICE_CHOICE_AGENT_GONE;
   return voiceNothingRan(lost.why);
 }
 
@@ -667,6 +675,13 @@ type VoiceChoiceOffer = {
   outcome: Extract<VoiceOutcomeDto, { kind: "param_ambiguous" }> & { invoke: string; candidates: VoiceResolvedParamDto[] };
   backend: string;
   declared: VoiceContext;
+  /**
+   * PR #1451 review — the wall-clock moment (`Date.now()`) the offer expires,
+   * {@link VOICE_CHOICE_WINDOW_MS} after it was made. Checked before any
+   * answer is dispatched, so a webview that delays the countdown's callbacks
+   * cannot stretch the window.
+   */
+  deadline: number;
 };
 
 const IDLE: VoicePanelState = { kind: "idle" };
@@ -1414,7 +1429,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (panelStateRef.current.kind !== "idle" || confirmationRef.current) return;
     setPanelState({
       kind: "awaitingChoice",
-      offer: { outcome: { ...outcome, invoke: outcome.invoke, candidates: outcome.candidates }, backend: answer.backend, declared },
+      offer: { outcome: { ...outcome, invoke: outcome.invoke, candidates: outcome.candidates }, backend: answer.backend, declared, deadline: Date.now() + VOICE_CHOICE_WINDOW_MS },
     });
   }, [setPanelState]);
 
@@ -1437,6 +1452,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const dispatchChoice = useCallback((offer: VoiceChoiceOffer, candidate: VoiceResolvedParamDto) => {
     const mode = panelStateRef.current;
     if (mode.kind !== "awaitingChoice" || mode.offer !== offer) return;
+    /* The window is wall-clock time, whatever the countdown has managed to
+       show: an answer after the deadline expires the choice and runs nothing. */
+    if (Date.now() >= offer.deadline) {
+      closeChoice(VOICE_CHOICE_EXPIRED);
+      return;
+    }
     setPanelState(IDLE);
     forget();
     const at = offer.outcome.candidates.findIndex((entry) => entry.value === candidate.value);
@@ -1472,7 +1493,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (refusedRef.current) setResult(undefined);
     else if (!dispatched) setProblem(NOTHING_DISPATCHED);
     else if (dispatched.undo) setUndo({ run: dispatched.undo });
-  }, [current, dispatchDeclared, forget, setPanelState]);
+  }, [closeChoice, current, dispatchDeclared, forget, setPanelState]);
 
   /*
     PRD #1261 — the choice's countdown, and its expiry, which runs nothing.
@@ -1484,10 +1505,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       setChoiceIn(undefined);
       return;
     }
-    let left = Math.max(1, Math.round(VOICE_CHOICE_WINDOW_MS / VOICE_DICTATION_TICK_MS));
-    setChoiceIn(left);
+    /* Counted from the offer's deadline rather than from the ticks seen, so a
+       delayed callback shows the time actually left. */
+    const remaining = () => Math.ceil((offered.deadline - Date.now()) / VOICE_DICTATION_TICK_MS);
+    setChoiceIn(Math.max(1, remaining()));
     const timer = window.setInterval(() => {
-      left -= 1;
+      const left = remaining();
       if (left > 0) {
         setChoiceIn(left);
         return;
@@ -2022,6 +2045,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         (cause) => {
           if (modeGeneration.current !== generation) return;
           setPanelState(IDLE);
+          /* The dispatch's "Typed …" sentence is now false: the terminal
+             refused the words it reports (Qodo on PR #1451). */
+          setResult(undefined);
           setProblem(sentenceOf(cause));
         },
       );

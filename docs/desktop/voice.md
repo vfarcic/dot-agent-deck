@@ -27,7 +27,7 @@ If what you said names more than one thing on screen, for example "open the agen
 ![The agent dashboard with voice on and "open the agent" heard: beside the Voice button, the sentence saying "agent" matches more than one agent, then the numbered buttons 1. Plan / architecture and 2. Desktop implementation, a Cancel button and a 20 s countdown](/img/voice-choice-desktop.png)
 
 - **Say the number**: "two", "2", "number two", "option two", "the second one" or "the last one", on its own.
-- **Say the name** of one of the listed entries, such as "Desktop implementation".
+- **Say the name** of one of the listed entries on its own, such as "Desktop implementation". A sentence that only contains a listed name, such as "stop Planner", is not an answer: the list closes and that sentence runs as a new command.
 - **Click** an entry, or reach it with Tab and press Enter.
 
 If an entry's name is itself a number or a way of cancelling, for example an agent called "two" or "cancel", saying just that name chooses nothing: the list closes and the app says why. Say the command again, then say "number" and the entry's position, such as "number one", or click the entry.

@@ -346,8 +346,9 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
       if (!snapshot.agents.find((agent) => agent.id === id)) throw new Error(`fixture agent ${id} missing`);
     }
     const resolveVoice: ResolveVoice = vi.fn(async (utterance) => utterance === "open the agent" ? choice("open_agent", "openAgent", offered) : answer(utterance));
-    render(<DeckShell runtime={runtime(resolveVoice, voice, { snapshot, fleet: [snapshot], answerVoiceChoice })} initialView={{ kind: "overview" }} />);
-    return { resolveVoice, snapshot };
+    const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot], answerVoiceChoice });
+    const view = render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    return { resolveVoice, snapshot, deck, ...view };
   }
 
   /** Scenario: the voice row lists the two real agents in order; clicking the second
@@ -438,6 +439,29 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
   });
 
+  /** Scenario: while an open-agent choice offers Planner, saying "stop Planner"
+   * closes that choice and opens the stop confirmation as a new command. */
+  it("resolves a stop command containing an offered name instead of opening it", async () => {
+    const voice = microphone(["open the agent"]);
+    const planner = { ...first, label: "Planner" };
+    const { resolveVoice } = setup(
+      voice,
+      (utterance) => dispatch("stop_agent", "confirmStopAgent", "Stop Planner?", utterance, [planner]),
+      undefined,
+      undefined,
+      [planner, second],
+    );
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(1, planner.label)).toBeVisible();
+    voice.deliver("stop Planner");
+    await completeUtterance();
+    expect(screen.queryByRole("button", { name: `1. ${planner.label}` })).toBeNull();
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Plan / architecture");
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(resolveVoice).toHaveBeenLastCalledWith("stop Planner");
+  });
+
   /** Scenario: a different utterance can enter #1260 dictation after an offer
    * closes. It targets the pane now on screen and never opens a listed agent. */
   it("closes a choice before type on enters dictation", async () => {
@@ -506,6 +530,26 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
   });
 
+  /** Scenario: twenty seconds pass while timer callbacks are delayed. A late
+   * click or spoken answer expires the choice and never opens the agent. */
+  it.each(["click", "voice"])("refuses a %s answer after the wall-clock deadline", async (route) => {
+    const voice = microphone(["open the agent"]);
+    setup(voice);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(2, second.label)).toBeVisible();
+    vi.setSystemTime(Date.now() + 20_100);
+    if (route === "click") {
+      await act(async () => { fireEvent.click(entry(2, second.label)); await Promise.resolve(); });
+    } else {
+      voice.deliver("two");
+      await completeUtterance();
+    }
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/expir/i);
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
+  });
+
   /** Scenario: a nine-agent tie remains answerable by a single digit, while a
    * ten-agent tie keeps the old sentence and offers no numbered controls. */
   it("offers at most nine candidates", async () => {
@@ -551,6 +595,23 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
     expect(screen.getByTestId("voice-report")).toHaveTextContent(/moved on|another screen/i);
     expect(screen.getByTestId("voice-report")).not.toHaveTextContent("Opening Desktop implementation.");
+  });
+
+  /** Scenario: an agent disappears from the overview after its choice is
+   * offered. Clicking its old entry reports the loss and opens no pane. */
+  it("refuses a clicked agent that was removed after the offer", async () => {
+    const voice = microphone(["open the agent"]);
+    const { snapshot, deck, rerender } = setup(voice);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(entry(2, second.label)).toBeVisible();
+    const removed = { ...snapshot, agents: snapshot.agents.filter((agent) => agent.id !== second.value) };
+    rerender(<DeckShell runtime={{ ...deck, snapshot: removed, fleet: [removed] }} initialView={{ kind: "overview" }} />);
+    expect(entry(2, second.label)).toBeVisible();
+    await act(async () => { fireEvent.click(entry(2, second.label)); await Promise.resolve(); });
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/gone|removed|moved on|nothing ran/i);
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(/Chose Desktop implementation|Opening Desktop implementation/i);
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
   });
 
   /** Scenario: choosing an agent for a spoken stop opens the existing D5
@@ -1781,6 +1842,23 @@ describe("sticky dictation in the open agent pane", () => {
     expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "a long paragraph kept going without a pause ");
     expect(screen.getByTestId("voice-report")).toHaveTextContent(/30 s limit/i);
     expect(screen.queryByText(/nothing was sent/i)).toBeNull();
+  });
+
+  /** Scenario: after sticky dictation reports a phrase as typed, the terminal
+   * rejects that write. The mode ends and the report shows the error without
+   * the earlier success sentence. */
+  it("clears a successful dictation report when its terminal write fails", async () => {
+    const { voice, deck, rerender } = start();
+    const sendTerminalInput = vi.fn(async () => { throw new Error("Coder terminal write refused"); });
+    rerender(<DeckShell runtime={{ ...deck, sendTerminalInput }} />);
+    await enter(voice);
+    voice.deliver("review the diff");
+    await completeUtterance();
+    expect(sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "review the diff ");
+    const report = screen.getByTestId("voice-report");
+    expect(report).toHaveTextContent("Coder terminal write refused");
+    expect(report).not.toHaveTextContent("Typed: “review the diff”.");
+    expect(screen.queryByTestId("voice-dictating")).toBeNull();
   });
 
   /** Scenario: a pane with a read lease cannot accept typed input. Asking for

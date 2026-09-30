@@ -24,6 +24,22 @@ describe("answerChoiceLocally", () => {
     expect(answerChoiceLocally("type on", offered)).toEqual({ kind: "not_answer" });
   });
 
+  const agents = [
+    { name: "agent", kind: "agent_ref" as const, spoken: "agent", value: "planner", label: "Planner" },
+    { name: "agent", kind: "agent_ref" as const, spoken: "agent", value: "builder", label: "Desktop implementation" },
+  ];
+
+  /** Scenario: saying an offered agent's whole name selects it, while a stop command containing that name remains a new utterance. */
+  it("does not answer an open-agent choice with a stop command", () => {
+    expect(answerChoiceLocally("Planner", agents)).toEqual({ kind: "selected", candidate: agents[0] });
+    expect(answerChoiceLocally("stop Planner", agents)).toEqual({ kind: "not_answer" });
+  });
+
+  /** Scenario: saying a full offered label with an extra word does not select it, matching the Rust choice answer. */
+  it("does not select a label followed by extra words", () => {
+    expect(answerChoiceLocally("desktop implementation extra", agents)).toEqual({ kind: "not_answer" });
+  });
+
   /** Scenario: the closed cancel phrases cancel when said on their own, and not inside a command. */
   it("cancels only on a whole cancel phrase", () => {
     for (const said of ["cancel", "never mind", "none of them", "no"]) expect(answerChoiceLocally(said, offered)).toEqual({ kind: "cancelled" });

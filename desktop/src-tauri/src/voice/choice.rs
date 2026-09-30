@@ -22,9 +22,10 @@
 use serde::Serialize;
 
 use super::outcome::{
-    AgentRefMatch, ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, resolve_agent_ref,
-    resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref, resolve_mode_ref,
-    resolve_orchestration_ref, spoken_names, whole_utterance,
+    AgentRefMatch, ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, agent_type_names,
+    deck_spoken_names, dir_names, mode_names, resolve_agent_ref, resolve_agent_type_ref,
+    resolve_deck_ref, resolve_dir_ref, resolve_mode_ref, resolve_orchestration_ref, spoken_names,
+    whole_utterance,
 };
 use super::table::{ParamKind, spoken_words};
 use super::{DesktopAgent, VoiceChoice, VoiceDeck, VoiceDirectories, VoiceNewAgent};
@@ -52,6 +53,39 @@ const CANCEL_PHRASES: [&str; 8] = [
 /// Words that introduce an ordinal without being one: "number two", "option
 /// 2", "choice three".
 const ORDINAL_LEADS: [&str; 5] = ["number", "option", "choice", "entry", "item"];
+
+/// Words a NAME answer may carry around the name without saying anything
+/// else: an article. [`kind_nouns`] adds the noun for what is being chosen.
+const ARTICLES: [&str; 3] = ["the", "a", "an"];
+
+/// The noun for what a choice of `kind` is choosing — "the review
+/// orchestration", "the docs folder" — which an answer may say beside a name.
+fn kind_nouns(kind: ParamKind) -> &'static [&'static str] {
+    match kind {
+        ParamKind::AgentRef => &["agent"],
+        ParamKind::DeckRef => &["deck", "daemon"],
+        ParamKind::DirRef => &["folder", "directory"],
+        ParamKind::OrchestrationRef => &["orchestration", "run"],
+        ParamKind::ModeRef => &["mode", "chip"],
+        ParamKind::AgentTypeRef => &["agent", "type"],
+        ParamKind::SpokenPrefix => &[],
+    }
+}
+
+/// Whether the answer `words` say `name` and nothing else (PR #1451 review):
+/// every word is a word of the name, an article or the kind's noun, and at
+/// least one is the name's. "stop Planner" does not cover "Planner" — it is
+/// a new command that happens to contain an offered name, and answering the
+/// choice with it would run the ORIGINAL action on Planner instead of the
+/// stop the user asked for. Neither does a name followed by extra words.
+fn covers(words: &[String], name: &str, kind: ParamKind) -> bool {
+    let name = spoken_words(name);
+    let filler = |word: &String| {
+        ARTICLES.contains(&word.as_str()) || kind_nouns(kind).contains(&word.as_str())
+    };
+    words.iter().any(|word| name.contains(word))
+        && words.iter().all(|word| name.contains(word) || filler(word))
+}
 
 /// The live state an answer is checked against — what the app observes NOW,
 /// not what it observed when the choice was offered.
@@ -85,9 +119,10 @@ pub enum ChoiceAnswer {
 }
 
 /// Answer `utterance` against `offered`, in this order: a cancel phrase, a
-/// whole-utterance ordinal, then a name that resolves among the offered
-/// candidates alone, with the resolver their kind already uses. Anything else
-/// is [`ChoiceAnswer::NotAnswer`].
+/// whole-utterance ordinal, then a name said on its own ([`covers`]) that
+/// resolves among the offered candidates alone, with the resolver their kind
+/// already uses. Anything else — including a command that contains an offered
+/// name — is [`ChoiceAnswer::NotAnswer`].
 ///
 /// A bare control that is ALSO, word for word, an offered entry's label — an
 /// agent named "two", or "cancel" — is [`ChoiceAnswer::Refused`] before either
@@ -179,11 +214,18 @@ fn ordinal(words: &[String]) -> Option<Ordinal> {
 }
 
 /// The name half of [`answer`]: the utterance resolved among the offered
-/// candidates that are still live, with their kind's own resolver. One →
-/// selected; several → refused. None → refused when the whole utterance IS the
-/// name of something on screen that was not offered, or of an offered entry
-/// that has gone — an answer, just not one that can be acted on — and
-/// otherwise not an answer at all.
+/// candidates that are still live AND that it [`covers`] — the whole utterance
+/// is one of that entry's names, or part of one, with nothing else said — with
+/// their kind's own resolver. One → selected; several → refused. None →
+/// refused when the whole utterance IS the name of something on screen that
+/// was not offered, or of an offered entry that has gone — an answer, just not
+/// one that can be acted on — and otherwise not an answer at all.
+///
+/// The [`covers`] filter is what keeps a command from answering (PR #1451
+/// review): each resolver's loose pass also accepts a reference that merely
+/// CONTAINS a name, which is right for resolving a command's param and wrong
+/// here, where "stop Planner" must close the choice and be resolved as the
+/// stop it is.
 fn by_name(
     utterance: &str,
     words: &[String],
@@ -194,12 +236,24 @@ fn by_name(
         return ChoiceAnswer::NotAnswer;
     };
     let offers = |value: &str| offered.iter().any(|candidate| candidate.value == value);
+    let said = |names: Vec<String>| names.iter().any(|name| covers(words, name, kind));
+    // An offered entry is said by its offered label as well as by its own
+    // names.
+    let said_offered = |value: &str, mut names: Vec<String>| {
+        offered
+            .iter()
+            .find(|candidate| candidate.value == value)
+            .is_some_and(|candidate| {
+                names.push(candidate.label.clone());
+                said(names)
+            })
+    };
     let found = match kind {
         ParamKind::AgentRef => {
             let agents: Vec<DesktopAgent> = live
                 .agents
                 .iter()
-                .filter(|agent| offers(&agent.id))
+                .filter(|agent| said_offered(&agent.id, spoken_names(agent)))
                 .cloned()
                 .collect();
             match resolve_agent_ref(utterance, &agents) {
@@ -212,7 +266,7 @@ fn by_name(
             let decks: Vec<VoiceDeck> = live
                 .decks
                 .iter()
-                .filter(|deck| offers(&deck.id))
+                .filter(|deck| said_offered(&deck.id, deck_spoken_names(deck)))
                 .cloned()
                 .collect();
             match resolve_deck_ref(utterance, &decks) {
@@ -226,7 +280,7 @@ fn by_name(
                 entries: listing
                     .entries
                     .iter()
-                    .filter(|entry| offers(&entry.path))
+                    .filter(|entry| said_offered(&entry.path, dir_names(&entry.name)))
                     .cloned()
                     .collect(),
                 ..listing.clone()
@@ -241,7 +295,10 @@ fn by_name(
             let agents: Vec<DesktopAgent> = live
                 .agents
                 .iter()
-                .filter(|agent| offers(&agent.id) || in_an_offered_run(agent, live, &offers))
+                .filter(|agent| {
+                    (offers(&agent.id) || in_an_offered_run(agent, live, &offers))
+                        && said(orchestration_names(agent, offered))
+                })
                 .cloned()
                 .collect();
             choice_found(resolve_orchestration_ref(utterance, &agents))
@@ -249,7 +306,14 @@ fn by_name(
         ParamKind::ModeRef | ParamKind::AgentTypeRef => {
             let choices: Vec<VoiceChoice> = form_choices(kind, live)
                 .iter()
-                .filter(|choice| offers(&choice.id))
+                .filter(|choice| {
+                    let names = if kind == ParamKind::ModeRef {
+                        mode_names(choice)
+                    } else {
+                        agent_type_names(choice)
+                    };
+                    said_offered(&choice.id, names)
+                })
                 .cloned()
                 .collect();
             choice_found(if kind == ParamKind::ModeRef {
@@ -307,6 +371,29 @@ fn in_an_offered_run(
     live.agents
         .iter()
         .any(|member| offers(&member.id) && run_of(member).as_deref() == Some(run.as_str()))
+}
+
+/// The names an orchestration member's card answers to — its config name and
+/// run title — plus the label its entry was offered under, when it is the
+/// member offered.
+fn orchestration_names(agent: &DesktopAgent, offered: &[ResolvedParam]) -> Vec<String> {
+    let mut names = Vec::new();
+    if let DesktopTab::Orchestration {
+        name,
+        display_title,
+        ..
+    } = &agent.tab
+    {
+        names.push(name.clone());
+        names.extend(display_title.clone());
+    }
+    names.extend(
+        offered
+            .iter()
+            .filter(|candidate| candidate.value == agent.id)
+            .map(|candidate| candidate.label.clone()),
+    );
+    names
 }
 
 /// The New agent form's Mode chips or agent entries, as declared now.
