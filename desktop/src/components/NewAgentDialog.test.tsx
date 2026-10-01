@@ -79,7 +79,15 @@ function renderDialog(runtime: FakeRuntime, props: { initialDeckId?: string; app
 const deckList = () => screen.getByTestId("new-agent-deck-list");
 const directoryList = () => screen.getByTestId("new-agent-directory-list");
 const activeRow = () => directoryList().querySelector("[aria-selected='true']")?.getAttribute("data-path");
-const currentPath = async (path: string) => expect(await screen.findByTestId("new-agent-current-path")).toHaveTextContent(path);
+/**
+ * Waits until the browser SHOWS `path`. Retrying the text, not just the
+ * lookup, is the point: after a keystroke the element is already on screen
+ * showing the directory it left, so `findByTestId` resolved at once and its
+ * one text check raced the listing reply's render — red in CI on PR #1435, and
+ * twice in 32 runs of this file under load. Exact, not `toHaveTextContent`'s
+ * substring match, which would take `/home/dev/beta` as showing `/home/dev`.
+ */
+const currentPath = (path: string) => waitFor(() => expect(screen.getByTestId("new-agent-current-path").textContent).toBe(path));
 
 /**
  * The only eligible deck is chosen on open, so its home is listed without a

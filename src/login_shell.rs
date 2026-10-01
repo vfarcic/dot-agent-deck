@@ -272,7 +272,7 @@ mod tests {
     /// Write `body` to a fresh executable script under `dir` and return its path.
     fn write_shell(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, body).expect("write fake shell");
+        crate::test_isolation::write_script(&path, body).expect("write fake shell");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake shell");
         path

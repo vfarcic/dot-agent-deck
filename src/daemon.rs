@@ -5733,7 +5733,7 @@ mod hook_ingestion_tests {
             .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
             .with_ansi(false)
             .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
 
         let fixture = HookLoopFixture::start();
 

@@ -185,16 +185,16 @@ Remote 'my-vm' runs 0.43.0; you have 0.44.0 (2 running agents). Upgrade and conn
 
 ### Hosts where Homebrew installed the deck
 
-`remote add` and `remote upgrade` first look for a Homebrew install on the host: `brew list --formula dot-agent-deck` succeeding with `brew` found on the host's `PATH` or under `/opt/homebrew`, `/usr/local` or `/home/linuxbrew/.linuxbrew`. When one exists:
+`remote add` and `remote upgrade` first look for an installed Homebrew formula on the host, either `dot-agent-deck` or `dot-agent-deck-beta`. They find Homebrew on the host's `PATH` or under `/opt/homebrew`, `/usr/local` or `/home/linuxbrew/.linuxbrew`. When a formula owns the install:
 
 - Nothing is downloaded to `~/.local/bin`. The registry records the install method as `homebrew` and the binary as `<prefix>/bin/dot-agent-deck`, and `connect`, `remote doctor` and `hooks install` run that binary.
 - `remote add` registers the version the Homebrew install reports. If it differs from `--version`, it says so.
-- `remote upgrade` runs `brew upgrade dot-agent-deck` on the host. Homebrew installs its tap's latest release and cannot install a chosen one, so `--version` is not honoured; the command records the version that landed and says so if it differs.
+- `remote upgrade` upgrades the installed formula (`dot-agent-deck` or `dot-agent-deck-beta`) on the host. Homebrew installs its tap's latest release and cannot install a chosen one, so `--version` is not honoured; the command records the version that landed and says so if it differs.
 - With `--no-install`, the Homebrew install must report exactly `--version`.
 
 If the host has both a Homebrew install and `~/.local/bin/dot-agent-deck`, the command uses the Homebrew one, leaves the other file alone, and prints the `ssh … 'rm ~/.local/bin/dot-agent-deck'` command to remove it. Remove it, because an older `dot-agent-deck` client runs that path on `connect`.
 
-An entry without a recorded install method runs `~/.local/bin/dot-agent-deck` until the next `remote upgrade`, which detects and records the install. An older `dot-agent-deck` client always runs `~/.local/bin/dot-agent-deck`, so it cannot `connect` to a host whose only install is Homebrew's.
+For an entry without a recorded binary path, `connect` first tries `~/.local/bin/dot-agent-deck`. If that copy is gone but Homebrew installed the deck, it finds and records the Homebrew binary, then connects without upgrading it. An older `dot-agent-deck` client always runs `~/.local/bin/dot-agent-deck`, so it cannot `connect` to a host whose only install is Homebrew's.
 
 ## Check a remote's health
 
@@ -337,7 +337,7 @@ The CLI and the desktop app read and write the same registry file. A remote adde
 - The app shows each daemon by its name, the one `connect <name>` takes. When you add a daemon it suggests the host, lowercased, with characters a name cannot hold replaced by `-` (for example `build.example.com`); if that is taken, `<user>-<host>`, then `<host>-2`, `<host>-3` and so on. Keep it or type your own. A daemon can be renamed later in **Settings → Daemons**, and `connect` takes the new name straight away.
 - `remote list` shows `unmanaged` as the version of a daemon added in the app, because the CLI did not install its binary. `dot-agent-deck remote upgrade <name>` installs and manages it from then on.
 - `connect` does not use a **Jump host** set in the app. For a host reachable only through a bastion, add a `ProxyJump` line for it to `~/.ssh/config`; `connect` runs your system `ssh`, which reads it.
-- Changing a daemon's **Host**, **User** or **Port** in the app forgets the recorded install method and binary path, so `connect` runs `~/.local/bin/dot-agent-deck` until the next `remote upgrade`. Changing **Key file** or **Jump host** keeps them. The CLI has no command that edits an entry.
+- Changing a daemon's **Host**, **User** or **Port** in the app forgets the recorded install method and binary path, so `connect` tries `~/.local/bin/dot-agent-deck` first and can rediscover a Homebrew install if that path is missing. Changing **Key file** or **Jump host** keeps them. The CLI has no command that edits an entry.
 
 Keep the CLI and the desktop app on the same release on each machine. A CLI older than the shared list rewrites the whole file when it changes it (`remote add`, `remote remove`, `remote upgrade`, or `connect` when a session ends cleanly) and drops the fields it does not know: the app may fall back to the local daemon, jump hosts need entering again, and **Test connection** needs running again. A desktop app older than the shared list shows no remote daemons once a newer one has moved them into it.
 

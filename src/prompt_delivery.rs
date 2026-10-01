@@ -1833,7 +1833,7 @@ mod tests {
                 .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
                 .with_ansi(false)
                 .finish();
-            let guard = tracing::subscriber::set_default(subscriber);
+            let guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
             log_prompt_confirmed("dispatch", "pane-7", "d-42", 3, confirmation);
             drop(guard);
             String::from_utf8(captured.0.lock().unwrap().clone())

@@ -3950,7 +3950,9 @@ mod tests {
 
         let one = selecting_a_remote_deck();
         let all = observing_all(&["build-box.example.com", "laptop.example.com"]);
-        // The two legal answers, each read while nothing else is writing.
+        // The two reference shapes, each read while nothing else is writing.
+        // The local endpoint's wire id may change during the loop if an old
+        // daemon's fallback socket appears or disappears on this host.
         apply_settings_selection(&one);
         let fleet_of_one = observed_fleet();
         apply_settings_selection(&all);
@@ -3976,9 +3978,12 @@ mod tests {
                     while WRITING.load(Ordering::SeqCst) {
                         let fleet = observed_fleet();
                         assert!(
-                            fleet == fleet_of_one || fleet == fleet_of_all,
+                            fleet == fleet_of_one
+                                || (fleet.len() == fleet_of_all.len()
+                                    && fleet[1..] == fleet_of_all[1..]),
                             "a fleet must describe ONE applied document: {fleet:?} is neither \
-                             {fleet_of_one:?} nor {fleet_of_all:?}"
+                             {fleet_of_one:?} nor the three-deck fleet with remote tail {:?}",
+                            &fleet_of_all[1..]
                         );
                     }
                 });

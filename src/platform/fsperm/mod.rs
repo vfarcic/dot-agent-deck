@@ -25,7 +25,8 @@ mod windows;
 #[cfg(unix)]
 pub use unix::{
     create_owner_only_dir, ensure_owner_only_dir, set_create_mode_owner_only,
-    set_endpoint_mode_owner_only, set_file_owner_only, verify_endpoint_trusted, with_socket_umask,
+    set_create_mode_owner_only_readable, set_endpoint_mode_owner_only, set_file_owner_only,
+    verify_endpoint_trusted, with_socket_umask,
 };
 // The Windows list carries three extras with no Unix counterpart to export —
 // `pipe_security_descriptor` / `OwnedSecurityDescriptor` /
@@ -35,9 +36,9 @@ pub use unix::{
 #[cfg(windows)]
 pub use windows::{
     OwnedSecurityDescriptor, create_owner_only_dir, ensure_owner_only_dir,
-    pipe_security_descriptor, set_create_mode_owner_only, set_endpoint_mode_owner_only,
-    set_file_owner_only, verify_endpoint_trusted, verify_object_owner_is_current_user,
-    with_socket_umask,
+    pipe_security_descriptor, set_create_mode_owner_only, set_create_mode_owner_only_readable,
+    set_endpoint_mode_owner_only, set_file_owner_only, verify_endpoint_trusted,
+    verify_object_owner_is_current_user, with_socket_umask,
 };
 
 /// Decide whether an endpoint owned by `owner_sid` is trusted, given that we are
@@ -148,6 +149,17 @@ pub(crate) const SITE_AUDIT: &[PermissionSite] = &[
         ),
     },
     PermissionSite {
+        function: "set_create_mode_owner_only_readable",
+        unix: "the same OpenOptionsExt::mode(0o600); read access comes from .read(true), which \
+               the mode does not touch",
+        windows: WindowsCounterpart::Enforced(
+            "OpenOptionsExt::access_mode(GENERIC_READ | GENERIC_WRITE | WRITE_DAC) — the \
+             write-only mask plus the read a caller needs to inspect a file before rewriting it \
+             on the same handle (issue #331). WRITE_DAC is kept, so set_file_owner_only still \
+             applies the DACL before the first content byte, with the same empty-file residual.",
+        ),
+    },
+    PermissionSite {
         function: "set_file_owner_only",
         unix: "fchmod(0o600) on the open handle, re-asserted before the atomic rename",
         windows: WindowsCounterpart::Enforced(
@@ -202,6 +214,7 @@ mod tests {
         let _: fn(&Path) -> std::io::Result<()> = ensure_owner_only_dir;
         let _: fn(&Path) -> std::io::Result<()> = create_owner_only_dir;
         let _: fn(&mut std::fs::OpenOptions) = set_create_mode_owner_only;
+        let _: fn(&mut std::fs::OpenOptions) = set_create_mode_owner_only_readable;
         let _: fn(&std::fs::File) -> std::io::Result<()> = set_file_owner_only;
         let _: fn(&Path) -> std::io::Result<()> = set_endpoint_mode_owner_only;
         let _: fn(&Path) -> Result<(), String> = verify_endpoint_trusted;
@@ -209,7 +222,7 @@ mod tests {
 
         assert_eq!(
             SITE_AUDIT.len(),
-            7,
+            8,
             "every exported fsperm seam function needs exactly one audit row"
         );
         for site in SITE_AUDIT {

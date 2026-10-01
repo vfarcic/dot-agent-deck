@@ -699,6 +699,10 @@ A `work-done` the deck cannot match to a task the orchestrator delegated reaches
 - the task was sent more than seven days ago;
 - `pane restart` dropped the task the worker owed.
 
+### The report went to a different file than `work-done-<role>.md`
+
+A file the deck did not write was already at `.dot-agent-deck/work-done-<role>.md`, usually because the worker saved its own report there. The deck leaves that file as it is and saves the report to a new file in the same `.dot-agent-deck` directory. The orchestrator's pane, in the TUI and in the desktop app alike, is told where the report is and that the existing file was left alone, since it may hold more of the worker's report. To avoid this, have workers save their reports under another name; the reporting instructions the deck gives them already suggest one.
+
 ### The orchestrator does not know its workers, or a dispatched orchestration is refused
 
 The orchestrator learns its roles and how to delegate from a context file the deck writes into `.dot-agent-deck/`. The deck will not write it into a `.dot-agent-deck` that is a symlink, or that grants write access to group or other and cannot be fixed with `chmod`. A dispatched orchestration is then not started, and the dispatcher is told why: the reason names the symlink, or the directory's mode and `chmod go-w`. An orchestration started from the TUI still opens, but its orchestrator is not given that context. Replace a symlinked `.dot-agent-deck` with a real directory in the project, or run `chmod go-w .dot-agent-deck`, then start the orchestration again.

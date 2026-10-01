@@ -10466,6 +10466,17 @@ pub fn write_late_announcing_agent(
 /// input processing. It logs each marker-free line as `received|…`, then logs
 /// `submitted|paste` after the single hook invocation so callers can reconstruct
 /// the exact submitted text without weakening duplicate-delivery assertions.
+///
+/// The paste is JSON-escaped ONCE, when it closes ([`LATE_ANNOUNCE_PASTE_JSON`]),
+/// not line by line. Its submit report has to land inside the deck's
+/// confirmation floor for Claude Code (`FAST_CONFIRMATION_LATENCY`, 2 s), past
+/// which the deck correctly spends its one replacement payload and a caller
+/// counting copies sees two. A subshell plus `sed` per line was ~90 fork/execs
+/// for a dispatcher seed before the hook could even run, and under a starved
+/// runner that alone outran the floor (`prompt/new-pane/017`, measured at 81 of
+/// 128 runs red with the CPU oversubscribed). Real Claude Code reports a paste
+/// with one hook exec, so the stand-in now costs what the agent it stands in
+/// for costs, and no more.
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn write_late_announcing_paste_agent(
@@ -10492,7 +10503,9 @@ pub fn write_late_announcing_paste_agent(
              paste_close=$(printf '\\033[201~')\n\
              in_paste=0\n\
              json_prompt=''\n\
+             raw_prompt=''\n\
              separator=''\n\
+             newline='\n'\n\
              while IFS= read -r line; do\n\
              \x20 if [ \"$in_paste\" -eq 0 ]; then\n\
              \x20\x20 case \"$line\" in\n\
@@ -10508,18 +10521,20 @@ pub fn write_late_announcing_paste_agent(
              \x20\x20 esac\n\
              \x20 fi\n\
              \x20 printf 'received|%s\\n' \"$line\" >> \"$log\"\n\
-             \x20 {json_escape}\n\
              \x20 if [ \"$in_paste\" -eq 1 ]; then\n\
-             \x20\x20 json_prompt=\"${{json_prompt}}${{separator}}${{json_line}}\"\n\
-             \x20\x20 separator='\\n'\n\
+             \x20\x20 raw_prompt=\"${{raw_prompt}}${{separator}}${{line}}\"\n\
+             \x20\x20 separator=$newline\n\
              \x20\x20 if [ \"$paste_done\" -eq 1 ]; then\n\
+             \x20\x20\x20 {paste_json}\n\
              \x20\x20\x20 {submitted}\
              \x20\x20\x20 printf 'submitted|paste\\n' >> \"$log\"\n\
              \x20\x20\x20 in_paste=0\n\
+             \x20\x20\x20 raw_prompt=''\n\
              \x20\x20\x20 json_prompt=''\n\
              \x20\x20\x20 separator=''\n\
              \x20\x20 fi\n\
              \x20 else\n\
+             \x20\x20 {json_escape}\n\
              \x20\x20 json_prompt=$json_line\n\
              \x20\x20 {submitted}\
              \x20\x20 printf 'submitted|line\\n' >> \"$log\"\n\
@@ -10528,6 +10543,7 @@ pub fn write_late_announcing_paste_agent(
              done\n",
             prologue = late_announce_prologue(log_name, announce_after_secs),
             json_escape = LATE_ANNOUNCE_JSON_ESCAPE,
+            paste_json = LATE_ANNOUNCE_PASTE_JSON,
         ),
     )
 }
@@ -10597,6 +10613,16 @@ pub fn write_late_announcing_real_agent(
 /// `e2e_dispatcher_mode::write_default_command_config`'s for TOML.
 #[cfg(unix)]
 const LATE_ANNOUNCE_JSON_ESCAPE: &str = r#"json_line=$(printf '%s' "$line" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:cntrl:]]//g')"#;
+
+/// [`LATE_ANNOUNCE_JSON_ESCAPE`] applied to a whole paste in one pass: the same
+/// three per-line edits on `$raw_prompt` (its lines joined by real newlines),
+/// then the lines joined with a JSON `\n` escape — the text the line-by-line
+/// version built, for two forks instead of two per line. `printf '%s\n'` gives
+/// `sed` a terminated last line, so a paste ending in an empty line keeps its
+/// trailing `\n`, and `$!N` rather than a bare `N` keeps a one-line paste on BSD
+/// `sed`, which drops the pattern space when `N` runs out of input.
+#[cfg(unix)]
+const LATE_ANNOUNCE_PASTE_JSON: &str = r#"json_prompt=$(printf '%s\n' "$raw_prompt" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:cntrl:]]//g' | sed -e ':a' -e '$!N' -e '$!ba' -e 's/\n/\\n/g')"#;
 
 /// One `dot-agent-deck hook` invocation for the late-announcing fixtures.
 ///

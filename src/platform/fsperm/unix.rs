@@ -55,11 +55,47 @@ pub fn with_socket_umask<T>(f: impl FnOnce() -> T) -> T {
     }
 
     let _guard = UMASK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    #[cfg(all(test, target_os = "linux"))]
+    confine_umask_to_this_thread();
     // SAFETY: `umask(2)` is a thread-safe libc call that simply swaps a
     // per-process value. `Restore` puts the previous mask back as soon as `f`
     // is done, so other code (file creation elsewhere) is unaffected.
     let _restore = Restore(unsafe { libc::umask(0o177) });
     f()
+}
+
+/// Test builds only: give the calling thread a umask of its own, so a
+/// [`with_socket_umask`] flip on it is invisible to every other thread.
+///
+/// Plain `cargo test` runs a crate's tests as threads of ONE process, and the
+/// `0o177` the flip sets is process-wide: any sibling test that created a
+/// directory inside that window got it at `0o600`, with no search bit, and then
+/// died with `EACCES` writing into its own temp root. Measured on 2026-10-01 as
+/// `platform::paths::tests::resolve_binary_name_strips_the_replaced_binary_marker_only_when_the_file_is_gone`
+/// failing at its `std::fs::write` while a daemon test bound its socket.
+/// nextest never saw it, because every test there has a process of its own.
+///
+/// On Linux the umask lives in the per-task `fs_struct` (with the cwd and the
+/// root), and `unshare(CLONE_FS)` gives the calling thread a private copy of
+/// it, so the flip and its restore then happen on that copy alone. The kernel
+/// still creates the socket inode under this thread's `0o177`, so what the
+/// tests observe of the bind is unchanged. The thread also stops sharing the
+/// cwd: a later `set_current_dir` elsewhere no longer moves it, nor its own
+/// anyone else. libtest gives every test a fresh thread, and a runtime a test
+/// builds lives and dies with that test, so the threads this reaches belong to
+/// the test that bound.
+///
+/// Best effort: if the call is refused (a seccomp filter, say) the flip is
+/// process-wide exactly as before. Not compiled into a production build, which
+/// is one process per daemon and has no sibling test to protect; other Unix
+/// targets have no per-thread umask, so a plain `cargo test` there keeps the
+/// window this closes on Linux.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn confine_umask_to_this_thread() {
+    // SAFETY: `unshare(2)` with `CLONE_FS` only detaches this thread's
+    // filesystem attributes into a private copy; it takes no pointer and is
+    // permitted to an unprivileged thread of a multi-threaded process.
+    let _ = unsafe { libc::unshare(libc::CLONE_FS) };
 }
 
 /// Create `dir` (recursively) with mode 0o700 **and re-apply the mode to
@@ -380,6 +416,14 @@ pub fn create_owner_only_dir(dir: &Path) -> std::io::Result<()> {
 pub fn set_create_mode_owner_only(opts: &mut std::fs::OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
     opts.mode(0o600);
+}
+
+/// [`set_create_mode_owner_only`] for a caller that also reads through the
+/// handle. On Unix the mode says nothing about the handle's access, which
+/// `.read(true)` already sets, so the two are the same; the Windows counterpart
+/// is where they differ (issue #331).
+pub fn set_create_mode_owner_only_readable(opts: &mut std::fs::OpenOptions) {
+    set_create_mode_owner_only(opts);
 }
 
 /// Re-assert owner-only (0o600) permissions on an already-open file. Defense in
@@ -1092,8 +1136,46 @@ mod tests {
     /// Reads the mask the only way `umask(2)` offers: swap a value in and put
     /// it straight back. Sound here for the same reason the rest of this
     /// module's process-global work is — nextest is process-per-test.
+    /// Scenario: Hold a socket-umask flip open on one thread while a second
+    /// thread creates a directory, and assert that directory still carries its
+    /// owner search bit — the flip is the binding thread's alone, so a sibling
+    /// test under plain `cargo test` cannot be handed a `0o600` temp root it
+    /// then gets `EACCES` writing into.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_socket_umask_flip_does_not_reach_another_threads_directories() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("made-during-the-flip");
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let binder = std::thread::spawn(move || {
+            with_socket_umask(|| {
+                inside_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+            })
+        });
+        inside_rx.recv().expect("the binder is inside its flip");
+        let made = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+        done_tx.send(()).unwrap();
+        binder.join().expect("binder");
+        made.expect("create the directory");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "a directory made on another thread during the flip came out {mode:o}; \
+             at 0o600 nothing can be created inside it"
+        );
+    }
+
     #[test]
     fn a_panicking_body_still_restores_the_process_umask() {
+        // Read the mask on this thread's own copy: the swap below would
+        // otherwise move every sibling test's umask under plain `cargo test`,
+        // and `with_socket_umask` confines it anyway, so reading before and
+        // after from different copies would compare two different masks.
+        #[cfg(target_os = "linux")]
+        confine_umask_to_this_thread();
         fn current() -> libc::mode_t {
             // SAFETY: `umask(2)` swaps a per-process value and cannot fail;
             // the second call puts back what the first read.
