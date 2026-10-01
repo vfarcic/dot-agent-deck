@@ -80,8 +80,15 @@ pub struct VoiceDeck {
     /// `EndpointIdentity::wire_id()` — the same `deckId` the overview keys its
     /// groups on and `openNewAgent` preselects.
     pub id: String,
-    /// What the overview calls it: "Local deck", or `user@host[:port]`.
+    /// What the overview calls it: "Local deck", a remote deck's name in the
+    /// shared deck list (issue #1426), or `user@host[:port]` for a remote deck
+    /// with no usable name.
     pub label: String,
+    /// A remote deck's `user@host[:port]` when [`Self::label`] is its name,
+    /// so a deck is still found by its host ("switch to the build box")
+    /// after it is named something else. `None` for the local deck and for a
+    /// deck labelled by its address already.
+    pub address: Option<String>,
     /// Whether it is the local endpoint.
     pub local: bool,
     /// Why this deck cannot take a new agent, in the words the New agent

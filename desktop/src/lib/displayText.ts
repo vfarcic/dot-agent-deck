@@ -451,15 +451,13 @@ function uptimeLabel(elapsed: number): string {
 }
 
 /**
- * What a deck is CALLED on screen — and it is never "daemon" (PRD #741 M9's
- * vocabulary rule, which #742 inherits).
+ * What a deck is CALLED on screen.
  *
- * A local deck is "Local deck", exactly as it was when there was only one. A
- * remote one is named by its address, because that is what distinguishes it
- * from the other decks beside it and it is the same string the user typed into
- * the settings row. `Endpoint::describe()` renders a remote deck as
- * `user@host[:port]`, every byte of which came through a validated ASCII
- * charset — it goes through this module anyway, because bounding a
+ * A local deck is "Local daemon", exactly as it was when there was only one. A
+ * remote one is called by its name in the shared deck list when it has one
+ * (issue #1426) — the name `dot-agent-deck connect` takes, and the one the user
+ * chose when adding it — and otherwise by its address, `Endpoint::describe()`'s
+ * `user@host[:port]`. Both go through this module, because bounding a
  * daemon-supplied string at the render seam is the rule and not a judgement
  * about any one field.
  *
@@ -477,7 +475,8 @@ function uptimeLabel(elapsed: number): string {
  * the pane's sentence. It falls back to the same words the addressless case
  * already uses.
  */
-export function deckName(connection: Pick<ConnectionView, "deckKind" | "socketPath">): string {
+export function deckName(connection: Pick<ConnectionView, "deckKind" | "socketPath" | "name">): string {
   if (connection.deckKind !== "remote") return "Local daemon";
-  return connection.socketPath ? displayIdentity(connection.socketPath, DISPLAY_LIMITS.path, "Remote daemon") : "Remote daemon";
+  const address = connection.socketPath ? displayIdentity(connection.socketPath, DISPLAY_LIMITS.path, "Remote daemon") : "Remote daemon";
+  return connection.name ? displayIdentity(connection.name, DISPLAY_LIMITS.name, address) : address;
 }

@@ -341,9 +341,8 @@ export function mintEndpointId(): string {
 }
 
 /**
- * How a deck is named on screen, derived from its address exactly as
- * `RemoteEndpoint::describe()` derives it: `user@host`, with `:port` appended
- * when the port is not 22.
+ * A deck's ADDRESS as text, derived exactly as `RemoteEndpoint::describe()`
+ * derives it: `user@host`, with `:port` appended when the port is not 22.
  *
  * Sanitised on the way out even though every stored byte came through a charset
  * that excludes the bidi codepoints. The seam is here because this string is
@@ -351,9 +350,21 @@ export function mintEndpointId(): string {
  * only control characters is a label a reordering character walks through — the
  * same reason `dto::safe_display_text` exists on the other side.
  */
-export function describeEndpoint(row: RemoteEndpointDto): string {
+export function endpointAddress(row: RemoteEndpointDto): string {
   const userHost = row.user ? `${row.user}@${row.host}` : row.host;
   return sanitizeText(row.port === DEFAULT_SSH_PORT ? userHost : `${userHost}:${row.port}`);
+}
+
+/**
+ * How a deck is named on screen: its name in the shared deck list when it has
+ * one (issue #1426), otherwise its {@link endpointAddress}.
+ *
+ * The name is a validated slug on the Rust side (`DeckName`); it is sanitised
+ * here anyway, for the reason `endpointAddress` gives.
+ */
+export function describeEndpoint(row: RemoteEndpointDto): string {
+  const name = row.name ? sanitizeText(row.name) : "";
+  return name || endpointAddress(row);
 }
 
 /** A blank row, ready for the user to fill in. */
@@ -464,6 +475,12 @@ export interface DeckChoice {
   token: string;
   selection: DeckSelection;
   label: string;
+  /**
+   * The deck's address, present exactly when {@link label} is its name rather
+   * than its address (issue #1426) — what Settings shows beside the name, so the
+   * user can still tell which machine a name points at.
+   */
+  address?: string;
 }
 
 /**
@@ -494,10 +511,13 @@ export function deckChoices(section: EndpointSettingsDto | undefined): DeckChoic
     { token: LOCAL_ENDPOINT_SELECTION, selection: LOCAL_DECK_SELECTION, label: "This machine" },
   ];
   for (const row of section?.remote ?? []) {
+    const label = describeEndpoint(row) || "New daemon";
+    const address = endpointAddress(row);
     choices.push({
       token: row.id,
       selection: { kind: "one", id: row.id },
-      label: describeEndpoint(row) || "New daemon",
+      label,
+      ...(address && address !== label ? { address } : {}),
     });
   }
   return choices;
@@ -521,7 +541,8 @@ function sameEndpointRow(left: RemoteEndpointDto, right: RemoteEndpointDto): boo
     && left.user === right.user
     && left.identity === right.identity
     && left.jump === right.jump
-    && left.socket === right.socket;
+    && left.socket === right.socket
+    && (left.name ?? null) === (right.name ?? null);
 }
 
 /** Whether two endpoint sections say the same thing, row order included. */

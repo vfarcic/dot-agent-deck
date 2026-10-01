@@ -164,6 +164,13 @@ pub struct ObservedDeckDto {
     /// than of the handshake. It decides whether the group is called "Local
     /// deck" or called by its address.
     pub deck_kind: &'static str,
+    /// A remote deck's name in the shared deck list — what `dot-agent-deck
+    /// connect <name>` takes (issue #1426). Absent for the local deck and for
+    /// a remote deck whose stored name is not a valid deck name, which is
+    /// then named by [`Self::label`]. A validated slug
+    /// ([`dot_agent_deck::deck_list::DeckName`]), so it needs no scrubbing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// One configured-but-unaddressed deck, as the fleet view renders it.
@@ -180,6 +187,10 @@ pub struct UnconfiguredDeckDto {
     /// [`crate::settings::SelectionFallback::NoRemoteSocket`], which says the
     /// same thing in the selector's.
     pub reason: String,
+    /// The row's name in the shared deck list, as [`ObservedDeckDto::name`]
+    /// carries a connectable deck's (issue #1426).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1649,6 +1660,10 @@ struct AppliedSelection {
     /// endpoint that cannot exist; [`observed_fleet`] is the one reader that
     /// wants both, and it is the display set.
     unconfigured: Vec<crate::settings::UnconfiguredDeck>,
+    /// Each connectable remote row's name in the shared deck list, by the
+    /// identity of the endpoint it describes (issue #1426) — what
+    /// [`deck_name`] reads. Only rows with a usable name are here.
+    names: Vec<(dot_agent_deck::daemon_client::EndpointIdentity, String)>,
 }
 
 impl Default for AppliedSelection {
@@ -1662,6 +1677,7 @@ impl Default for AppliedSelection {
             observed: vec![crate::local_deck::local_endpoint()],
             unconfigured: Vec::new(),
             observed_generation: 0,
+            names: Vec::new(),
         }
     }
 }
@@ -1775,6 +1791,7 @@ pub(crate) fn apply_settings_selection(
             observed,
             unconfigured: settings.unconfigured_decks(),
             observed_generation: previous.observed_generation + u64::from(departed),
+            names: deck_names(settings),
         });
     }
     deck
@@ -2136,6 +2153,7 @@ pub(crate) fn unconfigured_fleet() -> Vec<UnconfiguredDeckDto> {
             deck_id: unconfigured_deck_id(&deck.id),
             label: safe_display_text(deck.label),
             reason: UNCONFIGURED_DECK_REASON.to_string(),
+            name: deck.name.map(|name| name.as_str().to_string()),
         })
         .collect()
 }
@@ -2158,6 +2176,36 @@ pub(crate) fn unconfigured_fleet() -> Vec<UnconfiguredDeckDto> {
 /// `fleet` with nothing here to name it would otherwise be an unnameable group.
 /// Deriving from here cannot produce one — every entry carries its own name —
 /// and the next arrival restates all three.
+/// The name a deck the fleet observes has in the shared deck list (issue
+/// #1426), under the applied document — `None` for the local deck and for a
+/// remote row with no usable name.
+///
+/// Matched by [`EndpointIdentity`], the fleet's own key, never by
+/// `describe()`, for [`deck_is_observed`]'s reason.
+pub(crate) fn deck_name(endpoint: &Endpoint) -> Option<String> {
+    let key = endpoint.identity();
+    applied_selection()
+        .names
+        .into_iter()
+        .find(|(identity, _)| *identity == key)
+        .map(|(_, name)| name)
+}
+
+/// Every connectable remote row's name, keyed by its endpoint's identity.
+fn deck_names(
+    settings: &crate::settings::DesktopSettings,
+) -> Vec<(dot_agent_deck::daemon_client::EndpointIdentity, String)> {
+    settings
+        .endpoints
+        .iter()
+        .flat_map(|endpoints| endpoints.remote.iter())
+        .filter_map(|row| {
+            let name = row.name.as_ref()?.as_str().to_string();
+            Some((Endpoint::Remote(row.endpoint()?).identity(), name))
+        })
+        .collect()
+}
+
 /// Whether the applied selection is All Decks — [`DesktopSnapshot::all_decks`].
 pub(crate) fn all_decks_applied() -> bool {
     selected_deck().all_decks
@@ -2170,6 +2218,7 @@ pub(crate) fn observed_fleet_decks() -> Vec<ObservedDeckDto> {
             deck_id: deck_wire_id(endpoint),
             label: deck_path_text(endpoint),
             deck_kind: selection_fields(endpoint).0,
+            name: deck_name(endpoint),
         })
         .collect()
 }
@@ -2549,6 +2598,97 @@ mod tests {
             assert!(
                 stated.iter().all(|deck| !deck.deck_id.starts_with("deck-")),
                 "an unconfigured id must never look like a real one: {stated:?}"
+            );
+        });
+    }
+
+    /// Issue #1426: the fleet on the wire carries each remote deck's name from
+    /// the shared deck list, beside the address label and the key — a named
+    /// connectable deck, a named socketless one, a remote with no usable name
+    /// (no `name` at all) and the local deck (never one).
+    #[test]
+    fn the_wire_fleet_carries_each_remote_deck_s_name() {
+        use crate::settings::{EndpointId, EndpointSettings, RemoteEndpointSettings, Selection};
+        use dot_agent_deck::deck_list::DeckName;
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+
+        let row = |id: &str, host: &str, name: Option<&str>, socket: bool| {
+            let mut row = RemoteEndpointSettings::new(
+                EndpointId::parse(id).expect("a valid id"),
+                Hostname::parse(host).expect("a valid host"),
+            );
+            row.name = name.map(|name| DeckName::parse(name).expect("a valid name"));
+            if socket {
+                row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+            }
+            row
+        };
+        let settings = crate::settings::DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![
+                    row(
+                        "named0000000001",
+                        "build-box.example.com",
+                        Some("build-box"),
+                        true,
+                    ),
+                    row("plain0000000001", "plain.example.com", None, true),
+                    row("halfway00000001", "relay.example.com", Some("relay"), false),
+                ],
+                selection: Selection::All,
+            }),
+            ..crate::settings::DesktopSettings::default()
+        };
+
+        with_selection(&settings, || {
+            let named: Vec<(&str, String, Option<String>)> = observed_fleet_decks()
+                .into_iter()
+                .map(|entry| (entry.deck_kind, entry.label, entry.name))
+                .collect();
+            assert_eq!(
+                named.iter().filter(|(kind, _, _)| *kind == "local").count(),
+                1
+            );
+            assert!(
+                named
+                    .iter()
+                    .filter(|(kind, _, _)| *kind == "local")
+                    .all(|(_, _, name)| name.is_none()),
+                "the local deck has no registry name: {named:?}"
+            );
+            let remote: Vec<_> = named
+                .iter()
+                .filter(|(kind, _, _)| *kind == "remote")
+                .map(|(_, label, name)| (label.as_str(), name.as_deref()))
+                .collect();
+            assert_eq!(
+                remote,
+                [
+                    ("build-box.example.com", Some("build-box")),
+                    ("plain.example.com", None),
+                ],
+                "the label stays the address; the name rides beside it"
+            );
+
+            let unconfigured = unconfigured_fleet();
+            assert_eq!(unconfigured.len(), 1);
+            assert_eq!(unconfigured[0].label, "relay.example.com");
+            assert_eq!(unconfigured[0].name.as_deref(), Some("relay"));
+
+            let json = serde_json::to_value(observed_fleet_decks()).expect("serializes");
+            let names: Vec<_> = json
+                .as_array()
+                .expect("an array")
+                .iter()
+                .map(|entry| entry.get("name").cloned())
+                .collect();
+            assert!(
+                names.contains(&Some(serde_json::json!("build-box"))),
+                "sent as `name`: {json}"
+            );
+            assert!(
+                names.contains(&None),
+                "absent, not null, without one: {json}"
             );
         });
     }

@@ -2508,6 +2508,167 @@ async fn desktop_set_settings(
     ))
 }
 
+/// Rename a remote deck (issue #1426) and return the settings as they are now
+/// on disk — the same shape [`desktop_set_settings`] answers with.
+///
+/// `deck` is the row as the window shows it — the settings document's own row,
+/// so it arrives through the same validating types a save does; `name` is the
+/// new name. The shared library does the rename ([`crate::decks::rename`]): it
+/// validates the name, refuses one another deck has, and keeps the deck's id,
+/// so the selection and everything keyed on the deck still name it. The row
+/// is found by `deck`'s id and renamed only while it still has `deck`'s
+/// address and name: an id derived from a name can pass to another deck, and
+/// the window must not rename a deck it never showed.
+///
+/// A refusal rejects with the sentence the rename form shows as it is — the
+/// library's own wording, the same one [`desktop_check_deck_name`] gives. When
+/// the row is no longer the deck the window showed, or is no longer in the
+/// deck list at all ([`crate::decks::refusal_shows_disk`]), the rejection also carries
+/// the settings re-read from disk (a [`crate::dto::DesktopSettingsSaveError::Partial`],
+/// as a save's conflict does), so the window shows the list as it is. A
+/// failure to read or write the deck list rejects with a sentence that names
+/// no path; the path goes to the app's log.
+///
+/// The applied selection is re-read afterwards so the fleet view's deck names
+/// ([`crate::dto::ObservedDeckDto::name`]) show the new name, and a snapshot
+/// is emitted to carry it.
+#[tauri::command]
+async fn desktop_rename_deck(
+    app: AppHandle,
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck: crate::settings::RemoteEndpointSettings,
+    name: String,
+) -> Result<DesktopSettings, crate::dto::DesktopSettingsSaveError> {
+    use dot_agent_deck::deck_list::RenameDeckError;
+    ensure_main_webview(&webview)?;
+    // Bounded before it is handed on: nothing longer can be a valid name.
+    if name.len() > dot_agent_deck::deck_list::MAX_DECK_NAME_BYTES {
+        return Err(RenameDeckError::InvalidName(
+            dot_agent_deck::deck_list::DeckNameError::TooLong { len: name.len() },
+        )
+        .to_string()
+        .into());
+    }
+    let renamed = tauri::async_runtime::spawn_blocking(move || {
+        crate::decks::rename(&crate::decks::remotes_path(), &deck, &name)?;
+        Ok::<_, RenameDeckError>(crate::settings::load_snapshot().settings)
+    })
+    .await
+    .map_err(|error| {
+        eprintln!("desktop decks: the rename task did not complete: {error}");
+        "Renaming the deck did not complete. Try again.".to_string()
+    })?;
+    let written = match renamed {
+        Ok(written) => written,
+        Err(error) if crate::decks::refusal_shows_disk(&error) => {
+            let message = error.to_string();
+            let Ok(disk) =
+                tauri::async_runtime::spawn_blocking(|| crate::settings::load_snapshot().settings)
+                    .await
+            else {
+                return Err(message.into());
+            };
+            apply_selection(&app, &state, &disk).await;
+            return Err(crate::dto::DesktopSettingsSaveError::Partial(
+                crate::dto::DesktopPartialSettingsSave {
+                    message,
+                    written: disk,
+                },
+            ));
+        }
+        Err(error) => return Err(rename_error_message(error).into()),
+    };
+    apply_selection(&app, &state, &written).await;
+    refresh_and_emit(&app, &state.daemon).await;
+    Ok(written)
+}
+
+/// What the webview is told about a refused or failed rename: the library's
+/// sentence for a refusal, and a path-free one for a registry failure.
+fn rename_error_message(error: dot_agent_deck::deck_list::RenameDeckError) -> String {
+    use dot_agent_deck::deck_list::RenameDeckError;
+    match error {
+        RenameDeckError::Config(error) => {
+            let error = crate::settings::deck_list_error(error);
+            eprintln!("{}", error.detail());
+            safe_message(error.public())
+        }
+        refused => refused.to_string(),
+    }
+}
+
+/// The name a deck at `host` (and `user`) gets when it is added without one —
+/// what the add form pre-fills (issue #1426). The shared library derives it
+/// against the deck list as it is now, exactly as a save that carries no name
+/// would.
+///
+/// Rejects with the host's (or user's) own validation sentence when either is
+/// not a valid value, and with a path-free sentence when the deck list cannot
+/// be read.
+#[tauri::command]
+async fn desktop_default_deck_name(
+    webview: Webview,
+    host: String,
+    user: Option<String>,
+) -> Result<String, String> {
+    use dot_agent_deck::remote_tunnel::{Hostname, SshUser};
+    ensure_main_webview(&webview)?;
+    let host = Hostname::parse(&host).map_err(|error| error.to_string())?;
+    let user = user
+        .filter(|user| !user.is_empty())
+        .map(|user| SshUser::parse(&user))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::decks::default_name(&crate::decks::remotes_path(), &host, user.as_ref())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(deck_list_read_error)
+}
+
+/// Whether `name` can be a deck's name — `null` when it can, otherwise the
+/// sentence the save or the rename would refuse it with (issue #1426).
+///
+/// So the add and rename forms can check a name as it is typed without a copy
+/// of the rule: the shared library stays the one authority on what a deck name
+/// is. `id` is the deck being renamed (its own current name is no clash);
+/// omit it for a deck being added.
+#[tauri::command]
+async fn desktop_check_deck_name(
+    webview: Webview,
+    name: String,
+    id: Option<String>,
+) -> Result<Option<String>, String> {
+    ensure_main_webview(&webview)?;
+    let id = id
+        .map(|id| crate::settings::EndpointId::parse(&id))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    if name.len() > dot_agent_deck::deck_list::MAX_DECK_NAME_BYTES {
+        return Ok(Some(
+            dot_agent_deck::deck_list::RenameDeckError::InvalidName(
+                dot_agent_deck::deck_list::DeckNameError::TooLong { len: name.len() },
+            )
+            .to_string(),
+        ));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::decks::check_name(&crate::decks::remotes_path(), &name, id.as_ref())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(deck_list_read_error)
+}
+
+/// A deck-list read failure as the webview sees it: no path, no file bytes.
+fn deck_list_read_error(error: dot_agent_deck::remote::RemoteConfigError) -> String {
+    let error = crate::settings::deck_list_error(error);
+    eprintln!("{}", error.detail());
+    safe_message(error.public())
+}
+
 /// The three credential commands (PRD #802 M4), and the one that is missing.
 ///
 /// # There is no `desktop_load_secret`, deliberately
@@ -3261,6 +3422,7 @@ fn selector_voice_decks(
             ),
             id: local,
             label: "Local daemon".to_string(),
+            address: None,
             local: true,
         },
         voice::VoiceDeckSelection {
@@ -3288,13 +3450,18 @@ fn selector_voice_decks(
             ),
         };
         let unavailable = Some(step_reason(&id).unwrap_or_else(|| fallback.to_string()));
+        let address = (!label.trim().is_empty()).then_some(label);
+        // Issue #1426: called by its name when it has one, answering to its
+        // address as well — the same shape `voice_decks` gives it.
+        let (label, address) = match (&row.name, address) {
+            (Some(name), address) => (name.as_str().to_string(), address),
+            (None, Some(address)) => (address, None),
+            (None, None) => ("Remote daemon".to_string(), None),
+        };
         listed.push((
             voice::VoiceDeck {
-                label: if label.trim().is_empty() {
-                    "Remote daemon".to_string()
-                } else {
-                    label
-                },
+                label,
+                address,
                 id,
                 local: false,
                 unavailable,
@@ -3340,8 +3507,11 @@ fn selector_voice_decks(
 /// deck reference exists to name a deck OTHER than the one in view.
 ///
 /// The label is `deckName`'s (`desktop/src/lib/displayText.ts`): "Local deck"
-/// for the local endpoint, the `user@host[:port]` label for a remote one — so a
-/// report or an ambiguity sentence names a deck the way the screen does.
+/// for the local endpoint, and for a remote one its name in the deck list, or
+/// its `user@host[:port]` address when it has no usable name (issue #1426) — so
+/// a report or an ambiguity sentence names a deck the way the screen does. A
+/// named deck still answers to its address, but only the label is sent to the
+/// Commands endpoint ([`voice::prompt::state`]).
 ///
 /// **Eligibility is the webview's `deck_step`**, the New agent dialog's deck
 /// step as it stands ([`voice::VoiceDeckChoice`] says why that one piece is
@@ -3363,18 +3533,19 @@ fn voice_decks(
                     None => Some(voice::DECK_NOT_REPORTED.to_string()),
                 }
             });
+            let address = (!local && !deck.label.trim().is_empty()).then(|| deck.label.clone());
+            let (label, address) = match (&deck.name, address) {
+                // Issue #1426: a named remote deck is called by its name, and
+                // still answers to its address.
+                (Some(name), address) if !local => (name.clone(), address),
+                (_, Some(address)) => (address, None),
+                _ if local => ("Local daemon".to_string(), None),
+                _ => ("Remote daemon".to_string(), None),
+            };
             voice::VoiceDeck {
                 id: deck.deck_id.clone(),
-                label: if local || deck.label.trim().is_empty() {
-                    if local {
-                        "Local daemon"
-                    } else {
-                        "Remote daemon"
-                    }
-                    .to_string()
-                } else {
-                    deck.label.clone()
-                },
+                label,
+                address,
                 local,
                 unavailable,
             }
@@ -4973,6 +5144,9 @@ pub fn run() {
             desktop_features,
             desktop_get_settings,
             desktop_set_settings,
+            desktop_rename_deck,
+            desktop_default_deck_name,
+            desktop_check_deck_name,
             desktop_test_endpoint,
             desktop_set_zoom,
             desktop_run_action,
@@ -5398,6 +5572,7 @@ mod tests {
             deck_id: local_key.clone(),
             label: "/run/deck.sock".to_string(),
             deck_kind: "local",
+            name: None,
         }];
         let step: Vec<voice::VoiceDeckChoice> =
             serde_json::from_value(serde_json::json!([{ "deckId": local_key }]))
@@ -5445,9 +5620,12 @@ mod tests {
             }),
             "the key and the jump host are part of the address"
         );
-        // The address is the row less its id — the set the webview's
-        // `REMOTE_ADDRESS_FIELDS` names — so a field added to the row without
-        // one here reddens this rather than slipping past the rebind guard.
+        // The address is the row less its id and its name — the set the
+        // webview's `REMOTE_ADDRESS_FIELDS` names — so a field added to the
+        // row without one here reddens this rather than slipping past the
+        // rebind guard. The name is not part of the address: a rename keeps
+        // the deck the token names (issue #1426) — nor is `name_digest`, which
+        // only fingerprints a stored name the rule refuses.
         let keys = |value: serde_json::Value| {
             let mut keys: Vec<String> = value
                 .as_object()
@@ -5467,7 +5645,7 @@ mod tests {
             jump: Some("j".to_string()),
         };
         let mut row_fields = keys(serde_json::to_value(&endpoints.remote[0]).expect("serializes"));
-        row_fields.retain(|field| field != "id");
+        row_fields.retain(|field| !["id", "name", "name_digest"].contains(&field.as_str()));
         assert_eq!(
             keys(serde_json::to_value(&every_field).expect("serializes")),
             row_fields
@@ -5514,6 +5692,68 @@ mod tests {
     /// decks keep the declared reason word for word, take the unlisted deck as
     /// not yet reported, and with no declaration treat every deck as eligible.
     /// An oversized or unknown-shaped declaration is refused.
+    /// Issue #1426: a remote deck the shared deck list names is called by that
+    /// name — from the observed fleet and from the selector's rows alike — and
+    /// keeps its address to be found by; one with no usable name is called by
+    /// its address, as before.
+    #[test]
+    fn voice_decks_call_a_named_remote_deck_by_its_name() {
+        use crate::settings::{EndpointId, EndpointSettings, RemoteEndpointSettings, Selection};
+        use dot_agent_deck::deck_list::DeckName;
+        use dot_agent_deck::remote_tunnel::Hostname;
+
+        let observed = [
+            crate::dto::ObservedDeckDto {
+                deck_id: "deck-local".to_string(),
+                label: "/run/deck.sock".to_string(),
+                deck_kind: "local",
+                name: None,
+            },
+            crate::dto::ObservedDeckDto {
+                deck_id: "deck-prod".to_string(),
+                label: "deploy@build-box".to_string(),
+                deck_kind: "remote",
+                name: Some("production".to_string()),
+            },
+            crate::dto::ObservedDeckDto {
+                deck_id: "deck-plain".to_string(),
+                label: "ops@plain".to_string(),
+                deck_kind: "remote",
+                name: None,
+            },
+        ];
+        let mut decks = voice_decks(&observed, None);
+        let called: Vec<(&str, Option<&str>)> = decks
+            .iter()
+            .map(|deck| (deck.label.as_str(), deck.address.as_deref()))
+            .collect();
+        assert_eq!(
+            called,
+            [
+                ("Local daemon", None),
+                ("production", Some("deploy@build-box")),
+                ("ops@plain", None),
+            ]
+        );
+
+        let mut row = RemoteEndpointSettings::new(
+            EndpointId::parse("lab0000000000001").unwrap(),
+            Hostname::parse("lab.example.com").unwrap(),
+        );
+        row.name = Some(DeckName::parse("bench").unwrap());
+        let endpoints = EndpointSettings {
+            remote: vec![row],
+            selection: Selection::Local,
+        };
+        let selections = selector_voice_decks(Some(&endpoints), &mut decks, None);
+        let bench = decks
+            .iter()
+            .find(|deck| deck.label == "bench")
+            .expect("the selector's named row is listed by its name");
+        assert_eq!(bench.address.as_deref(), Some("lab.example.com"));
+        assert_eq!(selections[&bench.id].token, "lab0000000000001");
+    }
+
     #[test]
     fn voice_decks_take_eligibility_from_the_declared_deck_step() {
         let observed =
@@ -5521,6 +5761,7 @@ mod tests {
                 deck_id: deck_id.to_string(),
                 label: label.to_string(),
                 deck_kind,
+                name: None,
             };
         let fleet = [
             observed("deck-local", "/run/deck.sock", "local"),

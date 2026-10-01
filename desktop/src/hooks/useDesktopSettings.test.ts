@@ -341,3 +341,43 @@ describe("useDesktopSettings partial save", () => {
     expect(bases[1]).toEqual(onDisk);
   });
 });
+
+describe("useDesktopSettings save outcomes and rename refusal", () => {
+  /// Scenario: A save reports whether it reached disk, including the disk document on a partial failure, without rejecting its caller.
+  it("resolves a save outcome for success and partial failure", async () => {
+    const { pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings);
+
+    let success!: ReturnType<typeof result.current.save>;
+    await act(async () => { success = result.current.save(withMode("dark")); });
+    await act(async () => { pending[0].resolve(withMode("dark")); });
+    expect(await success).toEqual({ saved: true });
+
+    let failure!: ReturnType<typeof result.current.save>;
+    await act(async () => { failure = result.current.save(withMode("light")); });
+    const onDisk = { ...withMode("dark"), zoom: { level: 1.5 } };
+    await act(async () => { pending[1].reject(new PartialSettingsSaveError("Deck list changed", onDisk)); });
+    expect(await failure).toEqual({ saved: false, disk: onDisk });
+    expect(result.current.settings).toEqual(onDisk);
+
+    let ordinaryFailure!: ReturnType<typeof result.current.save>;
+    await act(async () => { ordinaryFailure = result.current.save(withMode("light")); });
+    await act(async () => { pending[2].reject(new Error("disk full")); });
+    expect(await ordinaryFailure).toEqual({ saved: false });
+  });
+
+  /// Scenario: A stale rename fails while another window changes the deck list, so this window shows the disk list and the caller receives the refusal.
+  it("adopts a partial rename refusal's disk document and rethrows it", async () => {
+    const { result } = await loadedHook(vi.fn(async (settings: DesktopSettingsDto) => settings));
+    const disk = {
+      ...DEFAULT_DESKTOP_SETTINGS,
+      endpoints: { remote: [{ id: "deck0000000000aa", host: "other-host", port: 22, name: "other" }], selection: "local" },
+    };
+    const refusal = new PartialSettingsSaveError("That deck changed since this window loaded it.", disk);
+    let pending!: Promise<DesktopSettingsDto>;
+    act(() => { pending = result.current.apply!(() => Promise.reject(refusal)); });
+
+    await expect(pending).rejects.toBe(refusal);
+    await waitFor(() => expect(result.current.settings).toEqual(disk));
+  });
+});
