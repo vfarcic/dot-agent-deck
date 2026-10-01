@@ -1755,6 +1755,8 @@ The install downloads 399 MiB and unpacks to about 927 MB under `~/.cache/ms-pla
 
 There is no `pnpm build` to run first: the Playwright `webServer` builds and serves in one command, so the bundle under test is always current. A failing run writes a trace and a screenshot under `desktop/test-results/`; open one with `pnpm exec playwright show-trace <path>`.
 
+**The `webkit-warm-up` project.** Every run that includes the `webkit` project first runs `e2e/webkit-warm-up.setup.ts`, because `webkit` depends on it, so the list shows one more test than the specs hold. It loads the fixture, enters the deck and opens an agent pane, and asserts nothing. It is there because the first WebKit test on a CI runner pays the runner's first use of WebKit. That took 5.1–19.0s across 21 green runs, against 1–2.5s for each WebKit test after it, and twice it ran past the 30-second test budget and reddened `agent-pane-modal.spec.ts`, which sorts first. The warm-up pays that cost under a three-minute budget instead and logs how long it took. `--project=chromium` does not run it. The file's header has the traces this was read from.
+
 **One devbox gotcha.** Inside a `devbox shell` or `devbox run`, nix's `glibc-bin` puts its own `ldconfig` ahead of the system one on `PATH`, and that `ldconfig` reads a cache file that does not exist. Playwright's host-requirement check then reports every shared library as missing — `libglib-2.0.so.0` included, on a machine that plainly has it — and refuses to launch WebKit. The libraries are fine; the lookup is not. Put the system one first for the run:
 
 ```sh
