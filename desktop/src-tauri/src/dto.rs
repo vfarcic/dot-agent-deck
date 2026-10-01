@@ -2937,6 +2937,7 @@ mod tests {
             // Codex, and `codex` is what a codex daemon resolves.
             cli_name: Some("codex".into()),
             crashed: None,
+            orchestrator_context_path: None,
         }
     }
 

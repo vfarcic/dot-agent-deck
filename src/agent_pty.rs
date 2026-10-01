@@ -792,6 +792,43 @@ pub fn is_windows_absolute_path(value: &str) -> bool {
     bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && is_sep(bytes[2])
 }
 
+/// Issue #1395: whether a daemon-supplied orchestrator context path is one the
+/// TUI may re-arm an orchestration rooted at `project_dir` from — exactly
+/// `<project_dir>/.dot-agent-deck/orchestrator-context-<32 hex>.md`.
+///
+/// The one check both intake paths apply: a live
+/// [`OrchestrationSurface::context_path`] ([`validate_orchestration_surface`],
+/// against the surface's own `cwd`) and a hydrated
+/// [`AgentRecord::orchestrator_context_path`] (`partition_hydrated_panes` in
+/// `src/ui.rs`, against the bucket's orchestration cwd). Audit round 2: shape
+/// alone was not enough — a surface for project A naming project B's context
+/// file was adopted, and A's re-arm then republished B's task to A's
+/// coordinator.
+///
+/// Both values must be absolute and control-free
+/// ([`is_valid_orchestration_cwd`]) and carry no `.` or `..` segment, and the
+/// path must then match [`crate::orchestrator_context::own_context_file_name`]'s
+/// lexical rule. Never the fixed-path mirror, which the TUI already falls back
+/// to without being told. Nothing is resolved on disk: a symlink in the path is
+/// kept from choosing the file by the re-arm's read, which opens the name
+/// relative to the project instead of following this path.
+pub fn is_own_context_path(project_dir: &str, context_path: &str) -> bool {
+    let has_dot_segment = |value: &str| {
+        value
+            .split(std::path::is_separator)
+            .any(|segment| segment == "." || segment == "..")
+    };
+    is_valid_orchestration_cwd(project_dir)
+        && is_valid_orchestration_cwd(context_path)
+        && !has_dot_segment(project_dir)
+        && !has_dot_segment(context_path)
+        && crate::orchestrator_context::own_context_file_name(
+            std::path::Path::new(project_dir),
+            std::path::Path::new(context_path),
+        )
+        .is_some()
+}
+
 /// PRD #120 (H1/M1/L2): wire-boundary validation for the live
 /// [`OrchestrationSurface`] broadcast, mirroring [`validate_tab_membership`]
 /// for the reconnect path. The receive path
@@ -820,6 +857,9 @@ pub fn is_windows_absolute_path(value: &str) -> bool {
 ///   [`validate_tab_membership`]).
 /// - **L2:** `cwd` drives `load_project_config` and is the bucket key, so it
 ///   must be a valid ABSOLUTE orchestration cwd → reject otherwise.
+/// - **Issue #1395:** `context_path` is read back by the tab's re-arm and has a
+///   defined `None` fallback (the fixed-path mirror), so a value that is not an
+///   absolute, control-free per-publish context path is nulled out.
 ///
 /// A surface left with no roles after the per-role drops is rejected: an
 /// orchestration always has ≥1 role, and a zero-role surface can only build a
@@ -858,6 +898,17 @@ pub fn validate_orchestration_surface(
         .is_some_and(|t| !is_valid_display_name(t))
     {
         surface.display_title = None;
+    }
+    // Issue #1395: the context path is read back by the tab's re-arm, and its
+    // absence has a defined fallback (the fixed-path mirror), so a value that
+    // is not a per-publish context file of THIS surface's own project is
+    // nulled out rather than dropping the tab. `cwd` was validated above.
+    if surface
+        .context_path
+        .as_deref()
+        .is_some_and(|p| !is_own_context_path(&surface.cwd, p))
+    {
+        surface.context_path = None;
     }
     // Drop any role that would OOM the synthesis allocation (role_index over the
     // cap) or smuggle control bytes into the tab via a non-empty role_name. An
@@ -3327,6 +3378,22 @@ pub struct AgentRecord {
     /// optional field on this struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crashed: Option<bool>,
+    /// Issue #1395 item 1: the per-publish orchestrator context file
+    /// (`.dot-agent-deck/orchestrator-context-<id>.md`) this pane's
+    /// orchestration was started with — set only on the orchestration's START
+    /// role, by the `ListAgents` handler from what the daemon recorded at the
+    /// start ([`crate::state::AppState::attach_orchestrator_context_paths`]).
+    /// A TUI hydrating the tab re-arms compaction and `/clear` from this file
+    /// instead of the fixed-path mirror, which a later preparation in the same
+    /// project may have overwritten.
+    ///
+    /// `None` for every other pane, for a start role the daemon has no record
+    /// for (a TUI-launched `Ctrl+n` tab, which publishes its own context), and
+    /// from a daemon predating this field — in which case the TUI falls back to
+    /// the mirror exactly as before. Additive optional, so no
+    /// `PROTOCOL_VERSION` bump — same basis as `live` and `crashed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_context_path: Option<String>,
 }
 
 impl AgentRecord {
@@ -12062,6 +12129,7 @@ impl AgentPtyRegistry {
             // reaches no client at all.
             cli_name: None,
             crashed: agent.crashed,
+            orchestrator_context_path: None,
         })
     }
 
@@ -12414,6 +12482,10 @@ impl AgentPtyRegistry {
                 // `AgentRecord::cli_name`.
                 cli_name: None,
                 crashed: agent.crashed,
+                // Issue #1395: the registry does not know it; the `ListAgents`
+                // handler stamps it from `AppState`. See
+                // `AgentRecord::orchestrator_context_path`.
+                orchestrator_context_path: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -14296,6 +14368,7 @@ mod spawn_tests {
             display_title: None,
             orchestration_id: None,
             roles: vec![surface_role(0, "orchestrator"), surface_role(1, "worker")],
+            context_path: None,
         }
     }
 
@@ -14346,6 +14419,7 @@ mod spawn_tests {
             display_title: None,
             orchestration_id: None,
             roles: vec![surface_role(ORCHESTRATION_ROLE_INDEX_MAX + 1, "rogue")],
+            context_path: None,
         };
         assert!(validate_orchestration_surface(surface).is_none());
     }
@@ -14414,6 +14488,65 @@ mod spawn_tests {
         assert!(validated.roles.iter().all(|r| r.role_name != "\x1b[31mpwn"));
     }
 
+    /// Issue #1395: a per-publish context path directly under the surface's
+    /// own `cwd` survives; anything else — relative, control bytes, the
+    /// fixed-path mirror, any other name, another project's file (audit round
+    /// 2), a `.`/`..` detour — is nulled out without dropping the surface.
+    #[test]
+    fn validate_orchestration_surface_nulls_a_malformed_context_path() {
+        const NAME: &str = "orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        let cwd = well_formed_surface().cwd;
+        let good = format!("{cwd}/.dot-agent-deck/{NAME}");
+        let mut surface = well_formed_surface();
+        surface.context_path = Some(good.clone());
+        let validated = validate_orchestration_surface(surface).expect("valid surface");
+        assert_eq!(validated.context_path.as_deref(), Some(good.as_str()));
+
+        for bad in [
+            format!(".dot-agent-deck/{NAME}"),
+            format!("{cwd}\x1b[31m/.dot-agent-deck/{NAME}"),
+            format!("{cwd}/.dot-agent-deck/orchestrator-context.md"),
+            format!("/work/other-project/.dot-agent-deck/{NAME}"),
+            format!("{cwd}/sub/../.dot-agent-deck/{NAME}"),
+            format!("{cwd}/./.dot-agent-deck/{NAME}"),
+            format!("{cwd}/.dot-agent-deck/../../issue-2/.dot-agent-deck/{NAME}"),
+            "/etc/passwd".to_string(),
+            String::new(),
+        ] {
+            let mut surface = well_formed_surface();
+            surface.context_path = Some(bad.clone());
+            let validated =
+                validate_orchestration_surface(surface).expect("a bad path keeps the surface");
+            assert_eq!(validated.context_path, None, "{bad:?} must be nulled");
+        }
+    }
+
+    /// Issue #1395 audit round 2: the shared intake check. A project with a
+    /// `.`/`..` segment, or a relative one, has no own context path at all.
+    #[test]
+    fn is_own_context_path_requires_a_clean_absolute_project() {
+        const NAME: &str = "orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        assert!(is_own_context_path(
+            "/p",
+            &format!("/p/.dot-agent-deck/{NAME}")
+        ));
+        assert!(is_own_context_path(
+            "/p/",
+            &format!("/p/.dot-agent-deck/{NAME}")
+        ));
+        for (project, path) in [
+            ("/p/../q", format!("/p/../q/.dot-agent-deck/{NAME}")),
+            ("/p/.", format!("/p/./.dot-agent-deck/{NAME}")),
+            ("p", format!("p/.dot-agent-deck/{NAME}")),
+            ("/p", format!("/q/.dot-agent-deck/{NAME}")),
+        ] {
+            assert!(
+                !is_own_context_path(project, &path),
+                "{project:?} / {path:?} must be refused"
+            );
+        }
+    }
+
     // An empty role_name is the older-daemon wire shape — synthesis falls back
     // to a `role-{i}` placeholder, so it must NOT be dropped.
     #[test]
@@ -14424,6 +14557,7 @@ mod spawn_tests {
             display_title: None,
             orchestration_id: None,
             roles: vec![surface_role(0, "")],
+            context_path: None,
         };
         let validated = validate_orchestration_surface(surface).expect("empty role_name accepted");
         assert_eq!(validated.roles.len(), 1);
@@ -17459,6 +17593,7 @@ mod spawn_tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         }
     }
 
@@ -17543,6 +17678,7 @@ mod spawn_tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -17569,6 +17705,33 @@ mod spawn_tests {
             .expect("older daemon shape must decode via #[serde(default)] on rows/cols");
         assert_eq!(back.rows, 0);
         assert_eq!(back.cols, 0);
+    }
+
+    /// Issue #1395 item 1: `orchestrator_context_path` is additive optional —
+    /// an older daemon's record (no key) decodes as `None`, and `None` puts no
+    /// key on the wire, so an older client sees the shape it always has.
+    #[test]
+    fn agent_record_orchestrator_context_path_is_additive_optional() {
+        let legacy_json = r#"{"id": "1"}"#;
+        let back: AgentRecord =
+            serde_json::from_str(legacy_json).expect("a record without the field must decode");
+        assert_eq!(back.orchestrator_context_path, None);
+        let wire = serde_json::to_value(&back).unwrap();
+        assert!(
+            wire.get("orchestrator_context_path").is_none(),
+            "None must be omitted from the wire: {wire}"
+        );
+
+        let with_path = AgentRecord {
+            orchestrator_context_path: Some("/p/.dot-agent-deck/x.md".into()),
+            ..back
+        };
+        let json = serde_json::to_string(&with_path).unwrap();
+        let round: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            round.orchestrator_context_path.as_deref(),
+            Some("/p/.dot-agent-deck/x.md")
+        );
     }
 
     #[test]
@@ -18498,6 +18661,7 @@ mod spawn_tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

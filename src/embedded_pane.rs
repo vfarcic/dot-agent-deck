@@ -62,6 +62,16 @@ pub struct HydratedPane {
     /// agent that never emitted an event — falls back to today's placeholder
     /// seeding via [`crate::state::AppState::seed_hydrated_session`].
     pub live: Option<crate::state::SessionSnapshot>,
+    /// Issue #1395 item 1: the per-publish context file the daemon recorded
+    /// for this pane's orchestration — present only on a start-role pane
+    /// ([`crate::agent_pty::AgentRecord::orchestrator_context_path`]). The
+    /// rebuilt tab carries it so compaction and `/clear` re-arm from the tab's
+    /// own file — when it names a per-publish file directly under that
+    /// orchestration's own cwd ([`crate::agent_pty::is_own_context_path`],
+    /// checked where the tab is partitioned). `None` (any other pane, or an
+    /// older daemon), or a path that fails that check, keeps the fixed-path
+    /// mirror fallback.
+    pub orchestrator_context_path: Option<std::path::PathBuf>,
 }
 
 /// Commands the per-pane I/O task drains from `input_rx`. `Input` carries
@@ -1694,6 +1704,10 @@ impl EmbeddedPaneController {
                 tab_membership: record.tab_membership.clone(),
                 agent_type: record.agent_type.clone(),
                 live: record.live.clone(),
+                orchestrator_context_path: record
+                    .orchestrator_context_path
+                    .as_deref()
+                    .map(std::path::PathBuf::from),
             });
         }
         hydrated

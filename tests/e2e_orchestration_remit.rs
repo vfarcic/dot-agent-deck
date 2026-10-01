@@ -36,6 +36,8 @@ mod common;
 use std::time::Duration;
 
 use common::TuiDeck;
+use dot_agent_deck::agent_pty::TabMembership;
+use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::{
     AgentEvent, AgentType, CLEAR_SESSION_START_METADATA_KEY, CLEAR_SESSION_START_METADATA_VALUE,
     EventType, Writable,
@@ -1412,5 +1414,222 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
         after_reassert.contains(TASK_SENTINEL),
         "the dispatched task must survive a compaction re-assertion rather than being wiped \
          by the no-task rewrite; context file after re-assertion:\n{after_reassert}"
+    );
+}
+
+/// Scenario: Prepare two briefs in one project, start only the first run, and
+/// attach a fresh TUI after the daemon has started its panes. Compaction of
+/// the hydrated start-role tab republishes the first brief, not the later mirror.
+#[spec("orchestration/remit/008")]
+#[test]
+#[cfg(unix)]
+fn orchestration_remit_008_hydrated_tab_rearms_from_its_own_context() {
+    assert_attached_tab_rearms_from_own_context(false);
+}
+
+/// Scenario: Attach a TUI before the first orchestration starts, then prepare
+/// a second brief in the same project. When the live-surfaced first tab
+/// compacts, it republishes its own brief instead of the later mirror.
+#[spec("orchestration/remit/009")]
+#[test]
+#[cfg(unix)]
+fn orchestration_remit_009_live_surface_rearms_from_its_own_context() {
+    assert_attached_tab_rearms_from_own_context(true);
+}
+
+#[cfg(unix)]
+fn assert_attached_tab_rearms_from_own_context(live_surface: bool) {
+    let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
+    let project = common::harness_tempdir().expect("create hydrated orchestration project");
+    std::fs::write(
+        project.path().join(".dot-agent-deck.toml"),
+        include_str!("fixtures/remit-reassert-orchestration/.dot-agent-deck.toml"),
+    )
+    .expect("write orchestration config");
+    write_executable(
+        &project.path().join("orchestrator-remit.sh"),
+        ORCHESTRATOR_REMIT_SCRIPT,
+    );
+    let cwd = std::fs::canonicalize(project.path()).expect("canonical project path");
+    let cwd_wire = cwd.to_string_lossy().into_owned();
+    let prepare = |task: &str| {
+        let response = daemon
+            .send_attach_request(&AttachRequest::PrepareWorkflow {
+                path: cwd_wire.clone(),
+                orchestration: "remit-reassert".into(),
+                task: task.into(),
+                config_revision: None,
+            })
+            .expect("prepare over the daemon socket");
+        assert!(response.ok, "prepare {task} failed: {:?}", response.error);
+        response.workflow_prepared.expect("prepared binding")
+    };
+    let (first_brief, second_brief, title, run_id) = if live_surface {
+        (
+            "FIRST-LIVE-BRIEF-009",
+            "SECOND-MIRROR-BRIEF-009",
+            "Live first run",
+            "remit-live-first-009",
+        )
+    } else {
+        (
+            "FIRST-HYDRATED-BRIEF-008",
+            "SECOND-MIRROR-BRIEF-008",
+            "Hydrated first run",
+            "remit-hydrated-first-008",
+        )
+    };
+    let first = prepare(first_brief);
+    let second = (!live_surface).then(|| prepare(second_brief));
+    let mirror = cwd.join(".dot-agent-deck/orchestrator-context.md");
+    let launch_deck = || {
+        TuiDeck::builder()
+            .with_pty_size(120, 40)
+            .with_env(
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                daemon.attach_socket.to_string_lossy().to_string(),
+            )
+            .with_env(
+                "DOT_AGENT_DECK_SOCKET",
+                daemon.hook_socket.to_string_lossy().to_string(),
+            )
+            .launch_with_fixture("minimal")
+    };
+    let deck = live_surface.then(&launch_deck);
+    if let Some(deck) = &deck {
+        deck.wait_for_string("No active agents");
+    }
+
+    for (role_index, role) in first.roles.iter().enumerate() {
+        let command = if role.start {
+            "./orchestrator-remit.sh"
+        } else {
+            "cat"
+        };
+        let response = daemon
+            .send_attach_request(&AttachRequest::StartPreparedAgent {
+                prep_token: first.token.clone(),
+                command: Some(command.into()),
+                cwd: Some(cwd_wire.clone()),
+                rows: 24,
+                cols: 80,
+                env: vec![(
+                    "DOT_AGENT_DECK_PANE_ID".into(),
+                    format!("{run_id}-{role_index}"),
+                )],
+                display_name: Some(role.name.clone()),
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: "remit-reassert".into(),
+                    role_index,
+                    role_name: role.name.clone(),
+                    is_start_role: role.start,
+                    orchestration_cwd: Some(cwd_wire.clone()),
+                    display_title: Some(title.into()),
+                    orchestration_id: Some(run_id.into()),
+                }),
+                agent_type: None,
+                seed: None,
+                use_configured_command: false,
+            })
+            .expect("start prepared role over the daemon socket");
+        assert!(
+            response.ok,
+            "start {} failed: {:?}",
+            role.name, response.error
+        );
+    }
+    let record = role_agent_record(&daemon.attach_socket, "orchestrator");
+    let pane_id = record.pane_id_env.expect("start role pane id");
+
+    let second = second.unwrap_or_else(|| prepare(second_brief));
+    assert_ne!(first.context_path, second.context_path);
+    assert!(
+        std::fs::read_to_string(&mirror)
+            .expect("read the later compatibility mirror")
+            .contains(second_brief),
+        "the mirror must hold the later brief before compaction"
+    );
+    let deck = deck.unwrap_or_else(launch_deck);
+    deck.wait_until_grid("first orchestration tab", |grid| {
+        grid.lines().next().is_some_and(|tabs| tabs.contains(title))
+    });
+    assert!(
+        wait_for_applied(
+            &daemon.attach_socket,
+            &pane_id,
+            INJECTED_EVENT_APPLIED_TIMEOUT,
+            |s| { s.live_target.is_some() }
+        ),
+        "the start role did not publish its live target before compaction; grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    let before: std::collections::HashSet<_> = std::fs::read_dir(cwd.join(".dot-agent-deck"))
+        .expect("list context files before compaction")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    let event = AgentEvent {
+        session_id: format!("{run_id}-compaction"),
+        agent_type: AgentType::Codex,
+        event_type: EventType::Compacting,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: std::collections::HashMap::new(),
+        pane_id: Some(pane_id.clone()),
+        agent_id: Some(record.id),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    };
+    common::write_hook_line(
+        &daemon.hook_socket,
+        &serde_json::to_string(&event).expect("serialize compaction event"),
+    )
+    .expect("inject compaction into the daemon");
+    assert!(
+        wait_for_applied(
+            &daemon.attach_socket,
+            &pane_id,
+            Duration::from_secs(10),
+            |s| { s.status == dot_agent_deck::state::SessionStatus::Compacting }
+        ),
+        "daemon did not apply the first run's start-role compaction; records: {:?}",
+        common::agent_records_on(&daemon.attach_socket)
+    );
+
+    let rearmed = || {
+        std::fs::read_dir(cwd.join(".dot-agent-deck"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                !before.contains(path)
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with("orchestrator-context-") && name.ends_with(".md")
+                        })
+            })
+    };
+    assert!(
+        common::wait_until(REASSERTION_DELIVERY_TIMEOUT, || rearmed().is_some()),
+        "first tab never published a new context after compaction; grid:\n{}",
+        deck.snapshot_grid()
+    );
+    let rearmed_path = rearmed().expect("new context path");
+    let content = std::fs::read_to_string(&rearmed_path).expect("read rearmed context");
+    assert!(
+        content.contains(first_brief) && !content.contains(second_brief),
+        "the first tab must rearm from its own file, not the later mirror; {}: first={}, second={}",
+        rearmed_path.display(),
+        content.contains(first_brief),
+        content.contains(second_brief)
     );
 }

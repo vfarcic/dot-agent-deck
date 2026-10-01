@@ -3073,6 +3073,14 @@ pub struct OrchestrationHydrationBucket {
     /// [`Self::identity`].
     pub orchestration_id: Option<String>,
     pub role_slots: Vec<OrchestrationRoleSlot>,
+    /// Issue #1395 item 1: the per-publish context file the daemon recorded for
+    /// this orchestration, read off its start-role pane's record or its start
+    /// role's live surface, and kept only when it names a file directly under
+    /// this bucket's `cwd` ([`crate::agent_pty::is_own_context_path`]). Set on
+    /// the rebuilt tab so its re-arm reads the tab's own file; `None` (an older
+    /// daemon, a non-start surface, a path into another project) keeps the
+    /// mirror fallback.
+    pub context_path: Option<std::path::PathBuf>,
 }
 
 impl OrchestrationHydrationBucket {
@@ -3713,6 +3721,7 @@ pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition
                                 // `OrchestrationHydrationBucket::identity`.
                                 orchestration_id: orchestration_id.clone(),
                                 role_slots: Vec::new(),
+                                context_path: None,
                             });
                         i
                     }
@@ -3722,6 +3731,17 @@ pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition
                 // that omitted it: keep the first non-`None` value we see.
                 if out.orchestration_buckets[idx].display_title.is_none() {
                     out.orchestration_buckets[idx].display_title = display_title.clone();
+                }
+                // Issue #1395: only the start role's record carries it, and it
+                // is adopted only when it names a context file of THIS
+                // orchestration's own project — a path into another project
+                // would re-arm this tab with that project's task.
+                let bucket = &mut out.orchestration_buckets[idx];
+                if bucket.context_path.is_none() {
+                    bucket.context_path = h.orchestrator_context_path.clone().filter(|p| {
+                        p.to_str()
+                            .is_some_and(|p| crate::agent_pty::is_own_context_path(&bucket.cwd, p))
+                    });
                 }
                 out.orchestration_buckets[idx]
                     .role_slots
@@ -5797,6 +5817,61 @@ fn apply_pane_closure(
     ui.mark_session_dirty();
 }
 
+/// Issue #1395 item 1: point a live-surfaced orchestration tab at the context
+/// file its surface carries. A surface with none — a non-start role's, or one
+/// from an older daemon — leaves whatever path the tab already holds, so a
+/// later role's surface never reverts the tab to the fixed-path mirror.
+fn adopt_surfaced_context_path(
+    tab_manager: &mut TabManager,
+    tab_index: usize,
+    bucket: &OrchestrationHydrationBucket,
+) {
+    if let Some(path) = bucket.context_path.clone() {
+        tab_manager.set_orchestration_context_path(tab_index, Some(path));
+    }
+}
+
+/// Issue #1395 (Qodo on PR #1444): a surface whose role panes a tab already
+/// owns is otherwise dropped whole, and with it any context path it carries.
+/// That loses the path when startup hydration built the tab from a record
+/// listed before the daemon recorded the start role's path, and the start
+/// role's surface — the one carrying it — arrives afterwards: the tab would
+/// then re-arm from the shared mirror for its whole life.
+///
+/// So adopt the path here, but only into a tab that (a) owns one of this
+/// surface's role panes, (b) is the same orchestration instance by
+/// [`TabManager::orchestration_tab_is`], and (c) has no path yet. Never
+/// overwrite one: a tab that already knows its file learned it from the
+/// daemon's own record at hydration, from its start, or from a later re-arm
+/// publish, and a surface queued before any of those is no newer.
+fn adopt_context_path_into_owning_tab(
+    tab_manager: &mut TabManager,
+    surface: &OrchestrationSurface,
+) {
+    let Some(path) = surface.context_path.as_deref() else {
+        return;
+    };
+    let owner = surface.roles.iter().find_map(|r| {
+        tab_manager.tab_index_for_pane(&r.pane_id).filter(|&i| {
+            tab_manager.orchestration_tab_is(
+                i,
+                &surface.cwd,
+                &surface.name,
+                surface.orchestration_id.as_deref(),
+            )
+        })
+    });
+    let Some(owner) = owner else {
+        return;
+    };
+    if let Some(Tab::Orchestration {
+        context_path: None, ..
+    }) = tab_manager.tabs().get(owner)
+    {
+        tab_manager.set_orchestration_context_path(owner, Some(PathBuf::from(path)));
+    }
+}
+
 /// Build one live orchestration tab from a daemon [`OrchestrationSurface`].
 /// Idempotent on the role pane ids, so a duplicate broadcast (or a race with a
 /// reconnect that already hydrated the tab) doesn't double-build.
@@ -5818,6 +5893,7 @@ fn surface_one_orchestration(
         .iter()
         .any(|r| tab_manager.tab_index_for_pane(&r.pane_id).is_some());
     if already_built {
+        adopt_context_path_into_owning_tab(tab_manager, &surface);
         tracing::debug!(
             cwd = %surface.cwd,
             orchestration = %surface.name,
@@ -5853,6 +5929,9 @@ fn surface_one_orchestration(
                 is_start_role: r.is_start_role,
             })
             .collect(),
+        // Issue #1395: the start role's surface carries the file the daemon
+        // recorded for it; any other surface (or an older daemon) carries none.
+        context_path: surface.context_path.as_deref().map(PathBuf::from),
     };
     let project_config = load_project_config(Path::new(&surface.cwd)).map_err(|e| e.to_string());
     let local = project_config
@@ -6131,6 +6210,10 @@ fn surface_one_orchestration(
                 "live orchestration surface: grew existing tab with newly-spawned role(s)"
             );
         }
+        // Issue #1395: an attach start surfaces one role at a time, so the
+        // start role's surface may arrive after the tab was built from another
+        // role's. Take its path then; a surface without one leaves the tab's.
+        adopt_surfaced_context_path(tab_manager, existing_tab_index, &bucket);
         // Issue #554 (Greptile on PR #1281): a role spawned into a tab whose
         // config changed since it opened is drift too — the new pane is
         // labelled from the current file while the daemon registered the name
@@ -6218,6 +6301,9 @@ fn surface_one_orchestration(
         Some(orch_idx),
     ) {
         Ok((tab_index, _)) => {
+            // Issue #1395 item 1: re-arm this tab from the file its coordinator
+            // was started with, as a hydrated or `Ctrl+n` tab does.
+            adopt_surfaced_context_path(tab_manager, tab_index, &bucket);
             if let Some(warning) = drift_warning {
                 tracing::warn!(
                     cwd = %surface.cwd,
@@ -13064,6 +13150,10 @@ pub fn run_tui(
                     if first_orchestration_tab_index.is_none() {
                         first_orchestration_tab_index = Some(tab_index);
                     }
+                    // Issue #1395 item 1: re-arm this tab from the file its
+                    // coordinator was started with, as a Ctrl+n tab does.
+                    tab_manager
+                        .set_orchestration_context_path(tab_index, bucket.context_path.clone());
                     if let Some(warning) = drift_warning {
                         surface_orchestration_config_drift(
                             &mut ui,
@@ -24081,6 +24171,154 @@ mod tests {
         );
     }
 
+    /// Issue #1395 item 1: a live-surfaced tab takes the context path its start
+    /// role's surface carries, and a later surface without one — a worker's,
+    /// or an older daemon's — leaves that path in place rather than reverting
+    /// the tab to the fixed-path mirror.
+    #[test]
+    fn a_surface_without_a_context_path_does_not_clear_the_tabs() {
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let cfg = OrchestrationConfig {
+            default: false,
+            name: "team".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "worker".to_string(),
+                    command: "cat".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        };
+        let (tab_index, _) = tm
+            .open_orchestration_tab_with_existing_role_panes(
+                &cfg,
+                "/work",
+                vec![Some("lead".into()), Some("coder".into())],
+                None,
+                None,
+            )
+            .expect("open the tab");
+        let tab_path = |tm: &TabManager| match &tm.tabs()[tab_index] {
+            Tab::Orchestration { context_path, .. } => context_path.clone(),
+            _ => panic!("expected an orchestration tab"),
+        };
+        let bucket = |context_path: Option<PathBuf>| OrchestrationHydrationBucket {
+            cwd: "/work".into(),
+            orchestration_name: "team".into(),
+            display_title: None,
+            orchestration_id: None,
+            role_slots: Vec::new(),
+            context_path,
+        };
+        let own = PathBuf::from(
+            "/work/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md",
+        );
+
+        assert_eq!(tab_path(&tm), None, "a fresh tab starts on the mirror");
+        adopt_surfaced_context_path(&mut tm, tab_index, &bucket(Some(own.clone())));
+        assert_eq!(tab_path(&tm).as_deref(), Some(own.as_path()));
+        adopt_surfaced_context_path(&mut tm, tab_index, &bucket(None));
+        assert_eq!(
+            tab_path(&tm).as_deref(),
+            Some(own.as_path()),
+            "a surface without a path must not clear the tab's own"
+        );
+    }
+
+    /// Issue #1395 (Qodo on PR #1444): a start role's surface that arrives
+    /// after startup hydration already built its tab — from a record listed
+    /// before the daemon recorded the path — takes that path into the tab,
+    /// rather than being dropped whole by the already-built guard. It never
+    /// overwrites a path the tab already holds, and never lands in a tab of a
+    /// different orchestration instance that happens to own the pane id.
+    #[test]
+    fn an_already_built_tab_adopts_a_late_surfaced_context_path_only_when_unset() {
+        let cfg = OrchestrationConfig {
+            default: false,
+            name: "team".to_string(),
+            roles: vec![OrchestrationRoleConfig {
+                agent: None,
+                name: "orchestrator".to_string(),
+                command: "cat".to_string(),
+                start: true,
+                description: None,
+                prompt_template: None,
+                clear: false,
+            }],
+        };
+        let open = |orchestration_id: Option<&str>| {
+            let mut tm = TabManager::new(Arc::new(CapturingPaneController::new()));
+            let (tab_index, _) = tm
+                .open_orchestration_tab_with_existing_role_panes(
+                    &cfg,
+                    "/work",
+                    vec![Some("lead".into())],
+                    None,
+                    orchestration_id,
+                )
+                .expect("open the tab");
+            (tm, tab_index)
+        };
+        let tab_path = |tm: &TabManager, i: usize| match &tm.tabs()[i] {
+            Tab::Orchestration { context_path, .. } => context_path.clone(),
+            _ => panic!("expected an orchestration tab"),
+        };
+        let own = "/work/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        let other =
+            "/work/.dot-agent-deck/orchestrator-context-fedcba9876543210fedcba9876543210.md";
+        let surface =
+            |orchestration_id: Option<&str>, context_path: Option<&str>| OrchestrationSurface {
+                name: "team".into(),
+                cwd: "/work".into(),
+                display_title: None,
+                orchestration_id: orchestration_id.map(str::to_string),
+                roles: vec![crate::event::OrchestrationSurfaceRole {
+                    pane_id: "lead".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                }],
+                context_path: context_path.map(str::to_string),
+            };
+
+        // Hydration built the tab with no path; the start role's surface
+        // carries one: adopted.
+        let (mut tm, i) = open(Some("inst-a"));
+        adopt_context_path_into_owning_tab(&mut tm, &surface(Some("inst-a"), Some(own)));
+        assert_eq!(tab_path(&tm, i), Some(PathBuf::from(own)));
+
+        // The tab already knows its file: a surface never overwrites it.
+        adopt_context_path_into_owning_tab(&mut tm, &surface(Some("inst-a"), Some(other)));
+        assert_eq!(tab_path(&tm, i), Some(PathBuf::from(own)));
+
+        // A surface of another orchestration instance naming the same pane id
+        // (a reused slot) leaves this tab alone.
+        let (mut tm, i) = open(Some("inst-a"));
+        adopt_context_path_into_owning_tab(&mut tm, &surface(Some("inst-b"), Some(own)));
+        assert_eq!(tab_path(&tm, i), None);
+        adopt_context_path_into_owning_tab(&mut tm, &surface(None, Some(own)));
+        assert_eq!(tab_path(&tm, i), None);
+
+        // A surface with no path changes nothing.
+        let (mut tm, i) = open(None);
+        adopt_context_path_into_owning_tab(&mut tm, &surface(None, None));
+        assert_eq!(tab_path(&tm, i), None);
+    }
+
     /// Issue #717: the close-confirmation preview asks the daemon about EVERY
     /// pane a confirmed close would tear down, because a multi-role
     /// orchestration shares one dispatched worktree across its role panes and
@@ -25820,6 +26058,7 @@ mod tests {
             tab_membership: membership,
             agent_type: None,
             live: None,
+            orchestrator_context_path: None,
         }
     }
 
@@ -26044,6 +26283,52 @@ mod tests {
         assert_eq!(bucket.cwd, orch_cwd);
         assert_eq!(bucket.orchestration_name, "tdd-cycle");
         assert_eq!(bucket.role_slots.len(), 3);
+    }
+
+    /// Issue #1395 audit round 2: a hydrated start role's context path is kept
+    /// only when it names a per-publish file directly under the bucket's own
+    /// orchestration cwd; another project's file, a `..` detour or the mirror
+    /// leaves the bucket on the mirror fallback.
+    #[test]
+    fn partition_keeps_only_a_context_path_under_the_orchestrations_own_project() {
+        const NAME: &str = "orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        let start = |path: &str| {
+            let mut pane = hydrated(
+                "1",
+                "a-1",
+                Some("/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/proj".into()),
+                    display_title: None,
+                    orchestration_id: None,
+                }),
+            );
+            pane.orchestrator_context_path = Some(PathBuf::from(path));
+            pane
+        };
+        let own = format!("/proj/.dot-agent-deck/{NAME}");
+        let p = partition_hydrated_panes(&[start(&own)]);
+        assert_eq!(
+            p.orchestration_buckets[0].context_path.as_deref(),
+            Some(Path::new(&own))
+        );
+        for bad in [
+            format!("/other/.dot-agent-deck/{NAME}"),
+            format!("/proj/sub/../.dot-agent-deck/{NAME}"),
+            format!("/proj/.dot-agent-deck/../../other/.dot-agent-deck/{NAME}"),
+            format!("/proj/sub/.dot-agent-deck/{NAME}"),
+            "/proj/.dot-agent-deck/orchestrator-context.md".to_string(),
+        ] {
+            let p = partition_hydrated_panes(&[start(&bad)]);
+            assert_eq!(
+                p.orchestration_buckets[0].context_path, None,
+                "{bad:?} must not be adopted"
+            );
+        }
     }
 
     /// Scenario: Hydrate two tabs with the same orchestration name and cwd,
@@ -27295,6 +27580,7 @@ mod tests {
                     is_start_role: false,
                 },
             ],
+            context_path: None,
         };
         let chosen = resolve_orch_config_for_hydration(Some(local.clone()), &bucket);
         assert_eq!(
@@ -42072,6 +42358,7 @@ mod config_drift_tests {
                     is_start_role: *i == 0,
                 })
                 .collect(),
+            context_path: None,
         }
     }
 

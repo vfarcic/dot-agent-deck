@@ -1119,6 +1119,34 @@ pub fn orchestration_identity_of_record(
     })
 }
 
+/// Issue #1395 item 2: delete an ended orchestration's context file off the
+/// caller's thread — on Tokio's blocking pool when a runtime is current, else
+/// on a plain thread — so [`AppState::unregister_pane`], which runs under the
+/// state write lock, never performs the IO itself. Failures are logged; the
+/// 14-day sweep stays the backstop.
+fn spawn_context_removal(path: std::path::PathBuf) {
+    let remove = move || {
+        if let Err(e) = crate::orchestrator_context::remove_ended_orchestration_context(&path) {
+            tracing::warn!(
+                path = %path.display(),
+                reason = %e,
+                "could not remove an ended orchestration's context file; the retention \
+                 sweep will remove it later"
+            );
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(remove);
+        }
+        Err(_) => {
+            let _ = std::thread::Builder::new()
+                .name("context-removal".into())
+                .spawn(remove);
+        }
+    }
+}
+
 /// Issue #555: the directory half of an orchestration title's uniqueness key,
 /// resolved so that a symlink, a `..` component or any other alias of a
 /// directory is the SAME key as the directory itself — the same best-effort
@@ -1444,6 +1472,19 @@ pub struct AppState {
     /// Daemon-only, like the routing map beside it: the TUI's `AppState` never
     /// routes and never populates it.
     pub orchestration_titles: HashMap<OrchestrationIdentity, OrchestrationTitle>,
+    /// Issue #1395: the per-publish orchestrator context file each
+    /// orchestration's coordinator was started with, keyed by the same
+    /// identity as [`Self::orchestration_titles`]. Written only by the daemon's
+    /// own start paths from what THEY published or bound
+    /// ([`Self::record_orchestration_context`]) — never from a client-supplied
+    /// value — and read twice: the `ListAgents` reply stamps it onto the start
+    /// role's record ([`Self::attach_orchestrator_context_paths`]) so a
+    /// hydrated tab re-arms from its own file, and [`Self::unregister_pane`]
+    /// deletes the file once the orchestration's last pane closes
+    /// ([`Self::take_ended_orchestration_context`]).
+    ///
+    /// Daemon-only, like the routing map beside it.
+    pub orchestration_context_paths: HashMap<OrchestrationIdentity, std::path::PathBuf>,
     /// PRD #120: orchestrations the daemon spawned WHILE this TUI is attached
     /// (the issue-dispatch path), queued for the TUI event loop to build into
     /// live tabs. The daemon publishes a
@@ -10586,6 +10627,104 @@ impl AppState {
         self.orchestration_titles.get(identity).cloned()
     }
 
+    /// Issue #1395: record the per-publish context file `identity`'s
+    /// coordinator was started with. Called by the daemon's start paths with
+    /// the path from their own preparation binding or publish.
+    pub fn record_orchestration_context(
+        &mut self,
+        identity: &OrchestrationIdentity,
+        context_path: std::path::PathBuf,
+    ) {
+        self.orchestration_context_paths
+            .insert(identity.clone(), context_path);
+    }
+
+    /// Issue #1395 item 1: stamp each live start-role record with the context
+    /// file its orchestration was started with, so a TUI hydrating that tab
+    /// re-arms from the tab's own file rather than the fixed-path mirror.
+    ///
+    /// Only a record whose pane this daemon registered as the orchestrator
+    /// seat, AND whose own membership names the identity that pane is
+    /// registered under, is stamped — a pane id is a reusable slot, so a stale
+    /// map entry must not lend its path to an unrelated successor on the same
+    /// id. Every other record is left `None`.
+    pub fn attach_orchestrator_context_paths(&self, records: &mut [crate::agent_pty::AgentRecord]) {
+        for record in records {
+            record.orchestrator_context_path = record
+                .pane_id_env
+                .as_deref()
+                .filter(|pane| self.orchestrator_pane_ids.contains(*pane))
+                .and_then(|pane| self.pane_orchestration_map.get(pane))
+                .filter(|identity| {
+                    orchestration_identity_of_record(record).as_ref() == Some(*identity)
+                })
+                .and_then(|identity| self.orchestration_context_paths.get(identity))
+                .map(|path| path.to_string_lossy().into_owned());
+        }
+    }
+
+    /// Issue #1395 item 2: once no pane maps to `identity` any more, forget
+    /// its context file and answer it for deletion — unless another live
+    /// orchestration still references the same file, in which case the entry
+    /// is dropped and `None` is answered. Never the fixed-path mirror (the
+    /// deletion helper refuses any other name shape too).
+    ///
+    /// Bookkeeping under the state lock; the caller does the unlink after
+    /// releasing it ([`Self::unregister_pane`]).
+    ///
+    /// **A path answered for deletion has its preparation tokens revoked first**
+    /// (Qodo on PR #1444). A token is not consumed by a start — one launch
+    /// presents it once per role — so for [`crate::prep_token::PREP_TOKEN_TTL`]
+    /// after the preparation a start presenting it re-verifies against, and
+    /// then records, this same file. Left live, such a start arriving between
+    /// this answer and the deferred unlink would record the file for a new
+    /// orchestration and the unlink would delete a live coordinator's context.
+    /// Revoked here, under the same lock that decided "no live orchestration
+    /// references it", any start that fetches its binding afterwards is
+    /// refused as stale. Taking the token store's mutex while holding the state
+    /// lock is safe: that mutex is a leaf, held only inside `prep_token`'s own
+    /// functions, none of which touches the state.
+    ///
+    /// What revocation does not reach, precisely: a start that fetched its
+    /// binding BEFORE this revoke, passed its re-verification (which reads the
+    /// file back by inode and digest) BEFORE the unlink, and records after it.
+    /// Its coordinator is spawned against a file the unlink then removes. That
+    /// needs a second start from the same token to be mid-flight, between its
+    /// re-verification and its `record_orchestration_context`, at the instant
+    /// the last pane of another orchestration started from that token closes.
+    /// A start that re-verifies after the unlink is refused, so no start
+    /// begins on a file that is already gone. The daemon's own `spawn` path records
+    /// only a file it has just published under a fresh random name, so no
+    /// start by that path can name this file at all.
+    pub fn take_ended_orchestration_context(
+        &mut self,
+        identity: &OrchestrationIdentity,
+    ) -> Option<std::path::PathBuf> {
+        // Still running, or another of its roles is mid-start (the same
+        // in-flight claim that keeps its title held).
+        let held = self
+            .pane_orchestration_map
+            .values()
+            .any(|id| id == identity)
+            || self
+                .orchestration_titles
+                .get(identity)
+                .is_some_and(|held| held.pending_claims > 0);
+        if held {
+            return None;
+        }
+        let path = self.orchestration_context_paths.remove(identity)?;
+        let still_referenced = self
+            .orchestration_context_paths
+            .values()
+            .any(|other| *other == path);
+        if still_referenced {
+            return None;
+        }
+        crate::prep_token::revoke_context_path(&path);
+        Some(path)
+    }
+
     fn prune_orchestration_title(&mut self, identity: &OrchestrationIdentity) {
         let held = self
             .orchestration_titles
@@ -10765,6 +10904,12 @@ impl AppState {
             // Issue #555 / #962: the title goes when the last pane of its
             // orchestration does.
             self.prune_orchestration_title(&identity);
+            // Issue #1395 item 2: and so does its per-publish context file.
+            // Decided here, under the caller's lock; the unlink runs on a
+            // blocking thread so no caller holds the state lock across IO.
+            if let Some(path) = self.take_ended_orchestration_context(&identity) {
+                spawn_context_removal(path);
+            }
         }
     }
 
@@ -12029,6 +12174,9 @@ pub async fn handle_spawn_role_with_state(
             role_name: signal.role.clone(),
             is_start_role: false,
         }],
+        // Issue #1395: a spawned role is never the start role, which alone
+        // carries the context path.
+        context_path: None,
     }));
 
     SpawnRoleResponse {
@@ -14173,6 +14321,152 @@ mod tests {
             1,
             "the pane-keyed counter still counts it; only the agent-keyed witness needs an id"
         );
+    }
+
+    /// Issue #1395 item 2: an ended orchestration's context file is answered
+    /// for deletion only once its last pane is gone, and never while another
+    /// live orchestration still references the same file.
+    #[test]
+    fn an_ended_orchestration_context_is_released_only_when_unreferenced() {
+        let mut state = AppState::default();
+        let shared = std::path::PathBuf::from(
+            "/p/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md",
+        );
+        let own = std::path::PathBuf::from(
+            "/p/.dot-agent-deck/orchestrator-context-fedcba9876543210fedcba9876543210.md",
+        );
+        register_role_pane(&mut state, "a0", "orchestrator", true, instance("a"));
+        register_role_pane(&mut state, "a1", "worker", false, instance("a"));
+        register_role_pane(&mut state, "b0", "orchestrator", true, instance("b"));
+        register_role_pane(&mut state, "c0", "orchestrator", true, instance("c"));
+        state.record_orchestration_context(&instance("a"), shared.clone());
+        state.record_orchestration_context(&instance("b"), shared.clone());
+        state.record_orchestration_context(&instance("c"), own.clone());
+
+        // `a` still has a pane: nothing is released and its entry stays.
+        state.pane_orchestration_map.remove("a0");
+        assert_eq!(state.take_ended_orchestration_context(&instance("a")), None);
+        assert!(
+            state
+                .orchestration_context_paths
+                .contains_key(&instance("a"))
+        );
+
+        // `a` ends, but live `b` references the same file: forget, keep file.
+        state.pane_orchestration_map.remove("a1");
+        assert_eq!(state.take_ended_orchestration_context(&instance("a")), None);
+        assert!(
+            !state
+                .orchestration_context_paths
+                .contains_key(&instance("a"))
+        );
+
+        // `c` ends and nobody else names its file: released for deletion.
+        state.pane_orchestration_map.remove("c0");
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("c")),
+            Some(own)
+        );
+        // `b` still runs, untouched.
+        assert_eq!(
+            state.orchestration_context_paths.get(&instance("b")),
+            Some(&shared)
+        );
+    }
+
+    /// Issue #1395 (Qodo on PR #1444): a preparation token is reusable within
+    /// its TTL, so it could hand an ended orchestration's context file to a new
+    /// start just before that file's deferred unlink. Answering the file for
+    /// deletion therefore revokes the token first; while another orchestration
+    /// still records the file, nothing is answered and the token stays usable.
+    #[test]
+    fn releasing_an_ended_context_revokes_the_tokens_that_could_reuse_it() {
+        let path = std::path::PathBuf::from(format!(
+            "/p/.dot-agent-deck/orchestrator-context-{}.md",
+            crate::prep_token::random_hex128()
+        ));
+        let token = crate::prep_token::issue(crate::prep_token::PrepBinding {
+            project_dir: std::path::PathBuf::from("/p"),
+            project_identity: None,
+            config_revision: "fnv1a128-00".to_string(),
+            orchestration: "loop".to_string(),
+            context_path: path.clone(),
+            context_identity: None,
+            context_digest: "ctx-fnv1a128-00".to_string(),
+            coordinator_prompt: String::new(),
+        });
+
+        let mut state = AppState::default();
+        register_role_pane(&mut state, "a0", "orchestrator", true, instance("a"));
+        register_role_pane(&mut state, "b0", "orchestrator", true, instance("b"));
+        state.record_orchestration_context(&instance("a"), path.clone());
+        // A second start from the same token already recorded the same file.
+        state.record_orchestration_context(&instance("b"), path.clone());
+
+        // `a` ends while `b` still records the file: kept, token still live.
+        state.pane_orchestration_map.remove("a0");
+        assert_eq!(state.take_ended_orchestration_context(&instance("a")), None);
+        assert!(
+            crate::prep_token::binding(&token).is_some(),
+            "a file still in use keeps the token that minted it"
+        );
+
+        // `b` ends and nothing records it: answered for deletion, and the token
+        // can no longer start a successor on the file about to be removed.
+        state.pane_orchestration_map.remove("b0");
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("b")),
+            Some(path)
+        );
+        assert!(
+            crate::prep_token::binding(&token).is_none(),
+            "a reused token must not re-verify against a file answered for deletion"
+        );
+    }
+
+    /// Issue #1395 item 1: the `ListAgents` stamp lands on the start role's
+    /// record only — never on a worker, and never on a record whose own
+    /// membership names a different orchestration than the one its (reused)
+    /// pane id is registered under.
+    #[test]
+    fn the_context_path_is_stamped_on_the_start_role_record_only() {
+        let mut state = AppState::default();
+        let path = std::path::PathBuf::from(
+            "/p/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md",
+        );
+        register_role_pane(&mut state, "p0", "orchestrator", true, instance("a"));
+        register_role_pane(&mut state, "p1", "worker", false, instance("a"));
+        register_role_pane(&mut state, "p2", "orchestrator", true, instance("a"));
+        state.record_orchestration_context(&instance("a"), path.clone());
+
+        let record = |pane: &str, token: &str, start: bool| {
+            let mut r: crate::agent_pty::AgentRecord =
+                serde_json::from_str(r#"{"id":"1"}"#).unwrap();
+            r.pane_id_env = Some(pane.to_string());
+            r.tab_membership = Some(crate::agent_pty::TabMembership::Orchestration {
+                name: "tdd-cycle".into(),
+                role_index: usize::from(!start),
+                role_name: if start { "orchestrator" } else { "worker" }.into(),
+                is_start_role: start,
+                orchestration_cwd: Some("/p".into()),
+                display_title: None,
+                orchestration_id: Some(token.to_string()),
+            });
+            r
+        };
+        let mut records = vec![
+            record("p0", "a", true),
+            record("p1", "a", false),
+            // A successor on a reused pane id, from another orchestration.
+            record("p2", "other", true),
+        ];
+        state.attach_orchestrator_context_paths(&mut records);
+        assert_eq!(
+            records[0].orchestrator_context_path.as_deref(),
+            Some(path.to_string_lossy().as_ref())
+        );
+        assert_eq!(records[1].orchestrator_context_path, None);
+        assert_eq!(records[2].orchestrator_context_path, None);
     }
 
     /// Issues #555 / #962: the daemon's title store, at the rules the
