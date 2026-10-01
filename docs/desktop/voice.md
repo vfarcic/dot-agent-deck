@@ -25,7 +25,9 @@ To avoid the Docker step, choose **OpenAI — needs an OpenAI API key** under **
 
 ## Using it
 
-What the app did with each thing you said appears beside the Voice button and stays until the next one. When a command can be reversed, an **Undo** button is shown beside it for ten seconds.
+What the app did with each thing you said appears beside the Voice button and stays until the next one. When a command can be reversed, an **Undo** button is shown beside it for ten seconds. While voice is on, that row at the bottom of the window is larger, so you can read it from where you sit, and a long message wraps onto more lines instead of being cut off; it returns to its usual size when you turn voice off.
+
+Sounds that are not speech, such as typing on the keyboard, a cough or noise in the room, are ignored: nothing is typed or run for them, and what is shown beside the Voice button stays as it was.
 
 What you can do by voice, by screen:
 
@@ -50,7 +52,7 @@ Nothing is typed, and the app says why, if a confirmation is open, or if the pan
 
 If what you said names more than one thing on screen, for example "open the agent" with several agents on the dashboard, the app does not guess. It lists the matches as numbered buttons beside the Voice button, with a **Cancel** button and a countdown, and waits for you to choose:
 
-![The agent dashboard with voice on and "open the agent" heard: beside the Voice button, the sentence saying "agent" matches more than one agent, then the numbered buttons 1. Plan / architecture and 2. Desktop implementation, a Cancel button and a 20 s countdown](/img/voice-choice-desktop.png)
+![The agent dashboard with voice on and "open the agent" heard: beside the Voice button, the sentence saying "agent" matches more than one agent, and under it the numbered buttons 1. Plan / architecture and 2. Desktop implementation, a Cancel button and a 20 s countdown](/img/voice-choice-desktop.png)
 
 - **Say the number**: "two", "2", "number two", "option two", "the second one" or "the last one", on its own.
 - **Say the name** of one of the listed entries on its own, such as "Desktop implementation". A sentence that only contains a listed name, such as "stop Planner", is not an answer: the list closes and that sentence runs as a new command.
@@ -78,6 +80,7 @@ While typing mode is on:
 
 - **Typing to** *agent* is shown at the top of the agent's pane and beside the Voice button, with a reminder of what to say to stop and to send, and a **Stop typing** button.
 - Nothing is sent to the agent until you say "send it" (or "send", "submit", "enter", "press enter", "go ahead", "finished", "end") on its own, or press `Enter` yourself. After a send, typing mode stays on, so you can dictate the next prompt the same way.
+- If you stop talking for four seconds with words typed but not yet sent, “send it” to send is highlighted as a reminder. It never sends anything itself; the highlight goes away when you speak again, send, or stop typing.
 - Only a handful of things you can say still act as commands, and only when you say them on their own: "type off" (or "typing off", "stop typing", "dictation off", "stop dictation", "done typing"), the send phrases above, and "voice off" (or "mute", "mic off", "stop listening", "stop voice"). Said inside a longer sentence, such as "tell the reviewer to send it when the tests pass", they are typed like anything else. Other commands, such as opening a screen, do not work until you stop typing.
 - If you speak for 30 seconds without a pause, what you said is still typed, and the app tells you it reached the limit.
 
@@ -143,5 +146,6 @@ What went wrong is shown beside the Voice button.
 | Commands that name agents or directories never work | **Names** is set to **Withheld**. | Set it to **Shared**, or use the screen instead. |
 | A command runs nothing and says the agent, daemon, screen or list changed | What it was about changed while the app was working out what you said, or after a numbered list appeared. | Say the command again. |
 | "type off" was typed into the prompt instead of stopping typing mode | The app misheard it. | Nothing was sent: press **Stop typing** and delete the words. |
+| You said something and nothing happened, with nothing shown | The app took it for noise rather than speech, usually because it was very short or quiet. | Say it again a little louder or closer to the microphone. |
 | Answers are cut off or not understood with a reasoning model | **Max tokens** is too low for its reasoning. | Raise **Max tokens**. |
 | "no microphone was found on this machine", or "the microphone would not open (…)" | No input device, or the app may not use it. | Connect a microphone and check it is the system's input device; on macOS, allow the app under System Settings → Privacy & Security → Microphone. Then press **Voice** again. |
