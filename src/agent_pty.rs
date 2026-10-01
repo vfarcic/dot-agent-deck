@@ -9492,6 +9492,32 @@ impl AgentPtyRegistry {
     where
         Fut: std::future::Future<Output = bool>,
     {
+        self.write_and_submit_guarded_first_write_capped_detailed(
+            pane_id,
+            text,
+            expected_agent_id,
+            revalidate,
+            started,
+            cap_ceiling,
+        )
+        .await
+        .map(|sent| sent.detail.outcome())
+    }
+
+    /// [`Self::write_and_submit_guarded_first_write_capped`], keeping the
+    /// refusal reason and reporting how long the write waited for the draft.
+    pub async fn write_and_submit_guarded_first_write_capped_detailed<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: &str,
+        revalidate: impl FnOnce() -> Fut,
+        started: Instant,
+        cap_ceiling: Duration,
+    ) -> Result<FirstWriteSend, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
         self.write_guarded(
             pane_id,
             text,
@@ -9508,7 +9534,6 @@ impl AgentPtyRegistry {
             || {},
         )
         .await
-        .map(|sent| sent.detail.outcome())
     }
 
     /// [`Self::write_and_submit_guarded_first_write_detailed`] with a deadline
@@ -20069,21 +20094,27 @@ mod spawn_tests {
             !registry.draft_pending(PANE),
             "the user's Enter after our paste closed was read as paste content"
         );
-        let started = Instant::now();
+        // The write's own report of its draft wait, not its wall clock: every
+        // submit spends the `SUBMIT_DELAY` floor and then waits for its echo,
+        // so a starved runner took a write that never waited past `CAP`
+        // (build-macos, 2026-09-30). A ceiling far above `CAP` keeps a stall
+        // before the first decision from reaching the cap and writing without
+        // a wait, which would hide a draft the model wrongly still holds.
         let next = registry
-            .write_and_submit_guarded_first_write_capped(
+            .write_and_submit_guarded_first_write_capped_detailed(
                 PANE,
                 "ISSUE-544-NEXT",
                 &agent,
                 || async { true },
                 Instant::now(),
-                CAP,
+                Duration::from_secs(10),
             )
             .await
             .expect("next write");
-        assert_eq!(next, GuardedSend::Applied);
-        assert!(
-            started.elapsed() < CAP,
+        assert_eq!(next.detail.outcome(), GuardedSend::Applied);
+        assert_eq!(
+            next.deferred,
+            Duration::ZERO,
             "the next first write waited for a draft the agent already submitted"
         );
         registry.shutdown_all();
