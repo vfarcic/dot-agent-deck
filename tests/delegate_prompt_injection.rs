@@ -2519,12 +2519,16 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
     daemon.registry.shutdown_all();
 }
 
-/// Scenario: Delegate with `clear = true` to a worker the deck respawns as a wrapped Codex, on a paused clock. The worker's wrapper reports only its weak output-settled fact, so the delegate gate holds it for the whole 30 s upgrade window and then releases on it with the ordinary 1000 ms buffer; 300 ms into that buffer the strong raw-input fact arrives. Assert the pointer has NOT reached the worker when the ordinary buffer would have ended, and does reach it once the 5000 ms interface buffer measured from the strong fact has passed. Run, like a developer runs it, with a deck's endpoints in the environment — a decoy here — and assert the wrapped worker never reaches that deck: it did, as a `worker-pane` ghost card on the user's real dashboard (PR #1451).
+/// Scenario: Delegate with `clear = true` to a worker the deck respawns as a wrapped Codex, on a paused clock. The worker's wrapper reports only its weak output-settled fact, so the delegate gate holds it for the whole 30 s upgrade window and then releases on it with the ordinary 1000 ms buffer; 300 ms into that buffer the strong raw-input fact arrives. Assert the pointer has NOT reached the worker when the ordinary buffer would have ended, does reach it once the 5000 ms interface buffer measured from the strong fact has passed, and that the wrapped worker never reaches the decoy deck standing in for the developer's own.
 #[spec("orchestration/delegate/039")]
 #[test]
 #[cfg(unix)]
 fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_flight() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // Run as a developer runs it, from inside a deck pane with that deck's
+    // endpoints in the environment: this test's wrapped worker reached the
+    // real deck that way and showed up as a `worker-pane` ghost card on the
+    // user's dashboard (PR #1451).
     let real_deck = DecoyDeck::bind();
     let _real = real_deck.ambient();
     let _env = EnvGuard::set(&[
