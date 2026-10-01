@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Profiler } from "react";
 import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID, resolveFixtureVoice } from "../data/fixture";
 import {
   DEFAULT_DESKTOP_SETTINGS,
@@ -396,6 +397,25 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId(`terminal-${second.value}`)).toBeVisible();
     expect(resolveVoice).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
+  });
+
+  /** Scenario: when a numbered choice first appears over the dashboard, its commit already hides the background agent numbers, so no two visible lists claim the same number. */
+  it("hides background agent numbers in the choice dialog's opening commit", async () => {
+    const voice = microphone(["open the agent"]);
+    const snapshot = createFixtureSnapshot("connected");
+    const resolveVoice: ResolveVoice = vi.fn(async (utterance) => utterance === "open the agent" ? choice() : noMatch(utterance));
+    const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot] });
+    let numbersOnFirstDialogCommit: string[] | undefined;
+    render(<Profiler id="choice-opening" onRender={() => {
+      if (numbersOnFirstDialogCommit !== undefined || !document.querySelector('.voice-choice[role="dialog"]')) return;
+      numbersOnFirstDialogCommit = Array.from(document.querySelectorAll('.overview-row[data-voice-number]'))
+        .map((row) => row.getAttribute("aria-label") ?? "");
+    }}><DeckShell runtime={deck} initialView={{ kind: "overview" }} /></Profiler>);
+    await turnVoiceOn();
+    expect(document.querySelectorAll('.overview-row[data-voice-number]').length).toBeGreaterThan(0);
+    await completeUtterance();
+    expect(screen.getByRole("dialog", { name: "Which agent?" })).toBeVisible();
+    expect(numbersOnFirstDialogCommit).toEqual([]);
   });
 
   /** Scenario: saying a whole ordinal, offered label, or the planner agent's supplied spoken name
@@ -1976,6 +1996,48 @@ describe("sticky dictation in the open agent pane", () => {
     await flush();
     expect(deck.sendTerminalInput).toHaveBeenNthCalledWith(2, { deckId, agentId: coderId }, VOICE_DICTATION_SUBMIT);
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(2);
+  });
+
+  /** Scenario: a trailing send is waiting for its prompt write when the user starts speaking again. The old send is cancelled, so finishing that write must not press Enter. */
+  it("does not submit a trailing send after a newer utterance begins", async () => {
+    const prompt = "What's the weather over there?";
+    const resolveVoice = vi.fn(async (utterance: string) => utterance === "type on"
+      ? modeOn
+      : resolveFixtureVoice(utterance, "agent", true));
+    const { voice, deck } = start({}, resolveVoice);
+    let finishWrite!: () => void;
+    (deck.sendTerminalInput as ReturnType<typeof vi.fn>).mockImplementation(async (_target: unknown, data: string) => {
+      if (data === `${prompt} `) await new Promise<void>((resolve) => { finishWrite = resolve; });
+    });
+    await enter(voice);
+    voice.deliver(`${prompt} Send it.`);
+    await completeUtterance();
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, `${prompt} `);
+    voice.speak();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+    await act(async () => { finishWrite(); });
+    await flush();
+    expect(deck.sendTerminalInput).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
+  });
+
+  /** Scenario: a standalone spoken send waits for an earlier text write. Speaking again cancels that send, so a late write completion cannot press Enter. */
+  it("does not submit a standalone send after a newer utterance begins", async () => {
+    const { voice, deck } = start({ "send it": dispatch("submit_prompt", "submitAgentPrompt", "Sent — still typing to Coder.", "send it") });
+    let finishWrite!: () => void;
+    (deck.sendTerminalInput as ReturnType<typeof vi.fn>).mockImplementation(async (_target: unknown, data: string) => {
+      if (data === "slow words ") await new Promise<void>((resolve) => { finishWrite = resolve; });
+    });
+    await enter(voice);
+    voice.deliver("slow words");
+    await completeUtterance();
+    voice.deliver("send it");
+    await completeUtterance();
+    expect(deck.sendTerminalInput).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
+    voice.speak();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+    await act(async () => { finishWrite(); });
+    await flush();
+    expect(deck.sendTerminalInput).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
   });
 
   /** Scenario: in typing mode the user dictates a sentence and then says

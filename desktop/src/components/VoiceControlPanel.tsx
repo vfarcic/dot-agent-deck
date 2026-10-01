@@ -1039,6 +1039,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * against it.
    */
   const heardNumbers = useRef<VoiceNumberedListDto | undefined>(undefined);
+  /**
+   * PR #1451 round 3 review (Qodo) — the {@link VoiceContext} standing when
+   * {@link heardNumbers} was taken: the declaration a bare number is held to,
+   * so an answer that comes back after the screen, the dialog, the mode or the
+   * selected daemon moved is refused through {@link contextLost} like any
+   * other answer, even when the numbered rows still look the same.
+   */
+  const heardContext = useRef<VoiceContext | undefined>(undefined);
   const { declareVoiceScreen, resolveVoice, answerVoiceChoice, answerVoiceNumber, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
   /* Issue #1198 — the list of what can be said leaves out the deck while the
      deck is hidden, even from its "elsewhere" half: it is not somewhere else,
@@ -1158,6 +1166,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const panelStateRef = useRef<VoicePanelState>(IDLE);
   const dictationChanged = useRef(onDictationChange);
   dictationChanged.current = onDictationChange;
+  const choiceChanged = useRef(onChoiceChange);
+  choiceChanged.current = onChoiceChange;
   /**
    * PRD #1260 review — the dictation mode's generation: bumped on every entry
    * to and exit from `dictating`. A cycle notes it when it declares, and after
@@ -1205,6 +1215,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     panelStateRef.current = next;
     setPanelStateState(next);
     if (was.kind === "dictating" || next.kind === "dictating") dictationChanged.current?.(next.kind === "dictating" ? next.target : undefined);
+    /* PR #1451 round 3 review — told in the same tick as the state itself, so
+       the host's update batches into the commit that first renders the choice
+       and the lists behind it never show their numbers beside the choice's
+       own. The effect on `choiceShown` below stays as the backstop. */
+    if ((was.kind === "awaitingChoice") !== (next.kind === "awaitingChoice")) choiceChanged.current?.(next.kind === "awaitingChoice");
   }, [setNudge]);
   /** The host's view of the pane and the deck, for the entry check. */
   const paneRef = useRef(pane);
@@ -1237,6 +1252,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * pressed. Cleared with every epoch bump.
    */
   const sending = useRef<{ aim: Pending; declared: VoiceContext } | undefined>(undefined);
+  /**
+   * PR #1451 round 3 review — a spoken send ("send it", or a trailing send
+   * sentence) waiting for its earlier writes to land before it presses Enter.
+   * The poll calls it off on new speech exactly like a countdown, and the
+   * {@link sendEpoch} it noted refuses the Enter once anything else did.
+   * Cleared with every epoch bump.
+   */
+  const deferredSubmit = useRef(false);
 
   /**
    * The screen is read at submit time rather than closed over, so a navigation
@@ -1271,6 +1294,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     confirmation: confirmationRef.current,
     incarnations: agentIncarnationsRef.current?.() ?? {},
   }), []);
+  /** Take the numbered list on screen as the one heard, with the context it stands in. */
+  const hearNumbers = useCallback(() => {
+    heardNumbers.current = numberedRef.current?.();
+    heardContext.current = current();
+  }, [current]);
   /**
    * The declared context of the dispatch running right now, so the pane seams
    * it reaches synchronously (`typeIntoAgent`, `submitAgentPrompt`,
@@ -1293,9 +1321,15 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
          numbered list ("next page" renumbers it), and the user's next words
          are about the screen that command produced. So the list is taken
          again once that render has landed, as it is at every silent poll. */
-      window.setTimeout(() => { heardNumbers.current = numberedRef.current?.(); }, 0);
+      /* The re-read is a macrotask so it runs after React has committed what
+         the dispatch set — and it reads the list that commit declared ONLY
+         because `useNumberedList` publishes from a LAYOUT effect, which runs
+         inside the commit. A passive `useEffect` there could still be pending
+         when this fires, so this would re-read the list from before the
+         command. Do not downgrade it. */
+      window.setTimeout(hearNumbers, 0);
     }
-  }, [onDispatch]);
+  }, [hearNumbers, onDispatch]);
   /** The pane seams' gate: the dispatch's declaration against now, for writes to `aim`. */
   const paneLost = useCallback((aim: AgentAddress) => contextLost(dispatching.current ?? current(), current(), { pane: aim }), [current]);
 
@@ -1474,6 +1508,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const cancelPendingSend = useCallback(() => {
     sendEpoch.current += 1;
     sending.current = undefined;
+    deferredSubmit.current = false;
     clearSendTimer();
   }, [clearSendTimer]);
   /** Take the nudge down and stop its clock; `sent` also forgets the unsent words. */
@@ -1558,6 +1593,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * PR #1451 (Qodo) — a write that failed has already said so (and ended
    * typing mode); the Enter is then dropped rather than submitting what was in
    * the prompt before, and so is one whose pane or mode moved while it waited.
+   *
+   * PR #1451 round 3 review — and so is one the user talked over or that was
+   * otherwise called off: the deferred Enter notes {@link sendEpoch}, and new
+   * speech, a newer utterance or any cancellation moves it.
    */
   const submitAfterWrites = useCallback((aim: Pending) => {
     const written = lastWrite.current;
@@ -1568,7 +1607,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     }
     const declared = current();
     const generation = modeGeneration.current;
+    const epoch = sendEpoch.current;
+    deferredSubmit.current = true;
     void written.then((ok) => {
+      if (sendEpoch.current !== epoch) return;
+      deferredSubmit.current = false;
       if (!ok || modeGeneration.current !== generation || contextLost(declared, current(), { pane: aim })) return;
       void submitDictation(aim);
     });
@@ -1714,11 +1757,19 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * through the same dispatch and the same target checks. No backend was
    * asked anything, so no timing is shown.
    */
-  const runNumbered = useCallback((entry: VoiceNumberedEntryDto, transcript: string) => {
+  const runNumbered = useCallback((entry: VoiceNumberedEntryDto, transcript: string, declared: VoiceContext, refusal: (lost: Lost) => string) => {
     const outcome = numberedOutcome(entry, transcript);
+    /* PR #1451 round 3 review (Qodo) — held to the context the number was
+       said in, like a resolved dispatch: an agent entry to the deck and the
+       incarnation declared then. */
+    const lost = dispatchLost(declared, current(), outcome.params);
+    if (lost) {
+      setProblem(refusal(lost));
+      return;
+    }
     setResult({ outcome, resolveMs: null, backend: NUMBERS_BACKEND });
     refusedRef.current = false;
-    const dispatched = dispatchDeclared(outcome, current());
+    const dispatched = dispatchDeclared(outcome, declared);
     if (refusedRef.current) setResult(undefined);
     else if (!dispatched) setProblem(NOTHING_DISPATCHED);
     else if (dispatched.undo) setUndo({ run: dispatched.undo });
@@ -1742,7 +1793,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       setProblem(VOICE_NUMBERS_CHOICE_MOVED_ON);
       return;
     }
-    runNumbered(entry, offer.outcome.transcript);
+    runNumbered(entry, offer.outcome.transcript, offer.declared, choiceRefusal);
   }, [current, runNumbered]);
 
   /**
@@ -1751,7 +1802,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * the number first. With a confirmation open, or more items than a choice
    * shows, it is only refused.
    */
-  const offerNumbered = useCallback((utterance: string, heard: VoiceNumberedListDto, numbers: number[]) => {
+  const offerNumbered = useCallback((utterance: string, heard: VoiceNumberedListDto, numbers: number[], declared: VoiceContext) => {
     const entries = numbers.flatMap((number) => heard.entries[number - 1] ?? []);
     const first = entries[0];
     const labels = entries.map((entry) => `“${entry.label}”`).join(" or ");
@@ -1779,9 +1830,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     setResult({ outcome, resolveMs: null, backend: NUMBERS_BACKEND });
     setPanelState({
       kind: "awaitingChoice",
-      offer: { outcome, backend: NUMBERS_BACKEND, declared: current(), deadline: Date.now() + VOICE_CHOICE_WINDOW_MS, numbered: { heard, entries } },
+      offer: { outcome, backend: NUMBERS_BACKEND, declared, deadline: Date.now() + VOICE_CHOICE_WINDOW_MS, numbered: { heard, entries } },
     });
-  }, [current, setPanelState]);
+  }, [setPanelState]);
 
   /**
    * PR #1451 round 3, change 3 — answer `utterance` if it is a bare number
@@ -1801,6 +1852,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const heard = heardNumbers.current;
     const read = numberedRef.current;
     if (heard === undefined || read === undefined || heard.entries.length === 0) return false;
+    const declared = heardContext.current ?? current();
     setPhase("resolving");
     let verdict: VoiceNumberAnswerDto;
     try {
@@ -1813,16 +1865,25 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (!ours()) return true;
     if (verdict.kind === "not_number") return false;
     if (verdict.kind !== "stale" && read().generation !== heard.generation) verdict = { kind: "stale" };
-    if (verdict.kind === "stale") setProblem(VOICE_NUMBERS_MOVED_ON);
-    else if (verdict.kind === "out_of_range") setProblem(voiceNumberNotShown(verdict.number));
-    else if (verdict.kind === "ambiguous") offerNumbered(utterance, heard, verdict.numbers);
+    if (verdict.kind === "stale") {
+      setProblem(VOICE_NUMBERS_MOVED_ON);
+      return true;
+    }
+    if (verdict.kind === "out_of_range") {
+      setProblem(voiceNumberNotShown(verdict.number));
+      return true;
+    }
+    /* The gate for acting on the answer at all, as for a resolved one. */
+    const lost = contextLost(declared, current(), { answer: true });
+    if (lost) setProblem(answerRefusal(lost));
+    else if (verdict.kind === "ambiguous") offerNumbered(utterance, heard, verdict.numbers, declared);
     else {
       const entry = heard.entries[verdict.number - 1];
       if (entry === undefined) setProblem(voiceNumberNotShown(verdict.number));
-      else runNumbered(entry, utterance);
+      else runNumbered(entry, utterance, declared, answerRefusal);
     }
     return true;
-  }, [answerVoiceNumber, offerNumbered, runNumbered, setPhase]);
+  }, [answerVoiceNumber, current, offerNumbered, runNumbered, setPhase]);
 
   /**
    * PRD #1261 — run the ORIGINAL command with the chosen entry, once.
@@ -1895,8 +1956,6 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     Keyed on the offer, so a new offer restarts it and a closed one stops it.
   */
   const offered = panelState.kind === "awaitingChoice" ? panelState.offer : undefined;
-  const choiceChanged = useRef(onChoiceChange);
-  choiceChanged.current = onChoiceChange;
   const choiceShown = offered !== undefined;
   useEffect(() => { choiceChanged.current?.(choiceShown); }, [choiceShown]);
   useEffect(() => () => { choiceChanged.current?.(false); }, []);
@@ -1944,7 +2003,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     try {
       await voiceStart();
       if (!ours()) return;
-      heardNumbers.current = numberedRef.current?.();
+      hearNumbers();
       setPhase("listening");
     } catch (cause) {
       if (!ours()) return;
@@ -1952,7 +2011,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       setOn(false);
       setProblem(sentenceOf(cause));
     }
-  }, [setOn, setPhase, voiceStart]);
+  }, [hearNumbers, setOn, setPhase, voiceStart]);
 
   /**
    * One transcript, resolved and — if it is a command that runs here — run.
@@ -2238,7 +2297,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (!onRef.current || phaseRef.current !== "listening") return;
     /* PR #1451 round 3, change 3 — nobody has spoken into this recording yet,
        so what is on screen now is still what the coming words are about. */
-    if (status.speech === false) heardNumbers.current = numberedRef.current?.();
+    if (status.speech === false) hearNumbers();
     /*
       PRD #802 D6 — *"a visible countdown the user can cancel by continuing to
       speak"*, and this is the seam that notices the speaking.
@@ -2256,7 +2315,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       new utterance is appended, which is the moment there is something new to
       send.
     */
-    if (pendingRef.current && status.speech && sendTimer.current !== undefined) cancelPendingSend();
+    if (status.speech && (deferredSubmit.current || (pendingRef.current && sendTimer.current !== undefined))) cancelPendingSend();
     /* PR #1451 — the nudge to send: speaking takes it down, and a pause with
        words still unsent starts its clock again. The clock is otherwise started
        by the write that typed them, so this re-arms it only after a pause that
@@ -2281,7 +2340,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       return;
     }
     if (status.state === "done") await takeUtterance();
-  }, [armNudge, cancelPendingSend, discardCapped, stopNudge, takeUtterance, voiceStatus]);
+  }, [armNudge, cancelPendingSend, discardCapped, hearNumbers, stopNudge, takeUtterance, voiceStatus]);
 
   /*
     The poll, reached through a ref so the interval below survives a re-render.

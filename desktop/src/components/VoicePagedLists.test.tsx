@@ -192,4 +192,28 @@ describe("visible pages for voice-selected lists", () => {
     await turnOnVoice();
     expect(screen.queryByText(/Page \d+ of \d+/i)).toBeNull();
   });
+
+  /** Scenario: two daemons have agents with the same id. Naming the one visible on page one opens it, even though its namesake on another daemon is on a later page. */
+  it("opens a visible named agent despite an off-page agent with the same id", async () => {
+    const voice = microphone();
+    const fleet = createFixtureFleet("voice-pages");
+    const selected = fleet[0].agents[0];
+    expect(fleet.slice(1).some((deck) => deck.agents.some((agent) => agent.id === selected.id))).toBe(true);
+    const deck = runtime(voice, true);
+    deck.snapshot = fleet[0];
+    deck.fleet = fleet;
+    deck.resolveVoice = vi.fn(async (transcript: string): Promise<VoiceResultDto> => ({
+      backend: "stub", resolveMs: 21,
+      outcome: { kind: "dispatch", transcript, action: "open_agent", invoke: "openAgent", sentence: `Opening ${selected.displayName}.`, params: [
+        { name: "agent", kind: "agent_ref", spoken: selected.displayName, value: selected.id, label: selected.displayName },
+      ] },
+    }));
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+    expect(screen.getByText(/Page 1 of [2-9]\d*/i)).toBeVisible();
+    expect(screen.getByRole("button", { name: new RegExp(`open ${selected.displayName} agent`, "i") })).toBeVisible();
+    await speak(voice, `open ${selected.displayName}`);
+    expect(screen.queryByTestId("agent-pane-overlay"), screen.getByTestId("voice-report").textContent ?? "no voice report").not.toBeNull();
+    expect(screen.getByTestId(`terminal-${selected.id}`)).toBeVisible();
+  });
 });

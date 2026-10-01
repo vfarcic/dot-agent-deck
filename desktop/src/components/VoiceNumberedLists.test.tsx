@@ -5,6 +5,7 @@ import { createFixtureSnapshot } from "../data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type VoiceResultDto, type VoiceStatusDto, type VoiceTranscriptionDto } from "../lib/bridge";
 import type { DeckRuntimeState } from "../types";
 import { VOICE_STATUS_POLL_MS } from "./VoiceControlPanel";
+import type { VoiceNumberAnswerDto } from "../lib/voiceNumbers";
 
 vi.mock("./TerminalViewport", () => ({
   TerminalViewport: ({ agentId }: { agentId: string }) => <div data-testid={`terminal-${agentId}`} />,
@@ -107,5 +108,42 @@ describe("numbered voice lists through the dashboard", () => {
     expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
     expect(screen.getByTestId("voice-report")).toHaveTextContent(/moved on|changed/i);
     expect(resolveVoice).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: the displayed agents change and return to their original order while a number is being answered. The old utterance is stale even though the list looks the same again. */
+  it("refuses an answer after its numbered list changes away and back", async () => {
+    const voice = microphone();
+    const snapshot = createFixtureSnapshot("docs");
+    const { runtime } = makeRuntime(voice, snapshot);
+    let finishAnswer!: (answer: VoiceNumberAnswerDto) => void;
+    runtime.answerVoiceNumber = vi.fn(() => new Promise<VoiceNumberAnswerDto>((resolve) => { finishAnswer = resolve; }));
+    const view = render(<DeckShell runtime={runtime} initialView={{ kind: "overview" }} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("voice-trigger")); });
+    voice.deliver("three");
+    await poll();
+    const changed = { ...snapshot, agents: snapshot.agents.slice(1) };
+    view.rerender(<DeckShell runtime={{ ...runtime, snapshot: changed, fleet: [changed] }} initialView={{ kind: "overview" }} />);
+    view.rerender(<DeckShell runtime={runtime} initialView={{ kind: "overview" }} />);
+    await act(async () => { finishAnswer({ kind: "selected", number: 3 }); });
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/moved on|changed/i);
+  });
+
+  /** Scenario: a spoken number is pending while the selected daemon changes. Even with identical dashboard rows, the answer belongs to the old context and must not open an agent. */
+  it("refuses a number answered after the selected daemon changes", async () => {
+    const voice = microphone();
+    const snapshot = createFixtureSnapshot("docs");
+    const { runtime } = makeRuntime(voice, snapshot);
+    let finishAnswer!: (answer: VoiceNumberAnswerDto) => void;
+    runtime.answerVoiceNumber = vi.fn(() => new Promise<VoiceNumberAnswerDto>((resolve) => { finishAnswer = resolve; }));
+    const view = render(<DeckShell runtime={runtime} initialView={{ kind: "overview" }} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("voice-trigger")); });
+    voice.deliver("three");
+    await poll();
+    const switched = { ...snapshot, connection: { ...snapshot.connection, deckId: "another-daemon" } };
+    view.rerender(<DeckShell runtime={{ ...runtime, snapshot: switched }} initialView={{ kind: "overview" }} />);
+    await act(async () => { finishAnswer({ kind: "selected", number: 3 }); });
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/moved on|changed/i);
   });
 });

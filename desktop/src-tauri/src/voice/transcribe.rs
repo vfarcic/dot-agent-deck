@@ -701,7 +701,8 @@ pub fn parse_response(payload: &Value) -> Result<Transcript, TranscriptionError>
 /// Whether two retained segments need a space between them once a dropped
 /// segment no longer sits there. Whisper usually starts a segment with its own
 /// space, but not always, and without one the neighbouring words would merge.
-/// No space goes before punctuation the next segment begins with.
+/// No space goes before punctuation the next segment begins with, nor before
+/// an apostrophe, which continues the word before it ("don" + "'t").
 fn needs_separator(before: &str, next: &str) -> bool {
     let (Some(last), Some(first)) = (before.chars().last(), next.chars().next()) else {
         return false;
@@ -710,7 +711,7 @@ fn needs_separator(before: &str, next: &str) -> bool {
         && !first.is_whitespace()
         && !matches!(
             first,
-            ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '…'
+            ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '…' | '\'' | '’'
         )
 }
 
@@ -1657,6 +1658,20 @@ mod tests {
         ]))
         .expect("parses");
         assert_eq!(transcript.text(), "Open the door, please.");
+    }
+
+    /// Scenario: a no-speech segment is dropped between a word stem and an apostrophe-led ending. The retained speech reads as one contraction, with no inserted space.
+    #[test]
+    fn voice_transcribe_joins_apostrophe_after_dropped_no_speech() {
+        for ending in ["'t go", "’t go"] {
+            let transcript = parse_response(&verbose(&[
+                ("don", 0.05, -0.2),
+                ("noise", 0.91, -0.4),
+                (ending, 0.04, -0.2),
+            ]))
+            .expect("parses");
+            assert_eq!(transcript.text(), format!("don{ending}"));
+        }
     }
 
     /// The request asks for `verbose_json`, which is where a whisper model's

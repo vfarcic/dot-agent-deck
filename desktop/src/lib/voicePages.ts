@@ -114,8 +114,15 @@ export function offPageSentence(label: string, page: number, current: number): s
  * an agent, a directory, a Mode chip or a daemon the list shows on a page that
  * is not showing. Matched by identity (`value`, and for an agent its deck),
  * never by words, since the params are already resolved.
+ *
+ * An agent's identity is COMPOSITE (PR #1451 round 3 review): two daemons can
+ * each run an agent with the same id. A param the backend resolved carries no
+ * deck of its own — Rust resolves it against the selected daemon — so it is
+ * that daemon's agent, `selectedDeckId`. An agent param whose deck is known
+ * neither way names no off-page item: it is never matched against whichever
+ * daemon's namesake happens to sit on another page.
  */
-export function offPageTarget(params: readonly VoiceResolvedParamDto[], elsewhere: readonly VoiceOffPageItem[]): VoiceOffPageItem | undefined {
+export function offPageTarget(params: readonly VoiceResolvedParamDto[], elsewhere: readonly VoiceOffPageItem[], selectedDeckId?: string): VoiceOffPageItem | undefined {
   const kinds: Partial<Record<VoiceResolvedParamDto["kind"], readonly VoiceNumberedKind[]>> = {
     agent_ref: ["agent"],
     dir_ref: ["directory", "parent"],
@@ -125,8 +132,9 @@ export function offPageTarget(params: readonly VoiceResolvedParamDto[], elsewher
   for (const param of params) {
     const wanted = kinds[param.kind];
     if (!wanted) continue;
+    const deckId = param.deckId ?? selectedDeckId;
     const item = elsewhere.find((candidate) => wanted.includes(candidate.kind) && candidate.value === param.value
-      && (candidate.kind !== "agent" || param.deckId === undefined || candidate.deckId === param.deckId));
+      && (candidate.kind !== "agent" || (deckId !== undefined && candidate.deckId === deckId)));
     if (item) return item;
   }
   return undefined;

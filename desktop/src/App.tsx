@@ -834,7 +834,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
        the dashboard's page 2, resolved by Rust against the whole deck) is
        refused with that page, and nothing runs. */
     const pager = readPager();
-    const offPage = pager && offPageTarget(outcome.params, pager.elsewhere);
+    const offPage = pager && offPageTarget(outcome.params, pager.elsewhere, selectedDeckId);
     if (pager && offPage) {
       panelVoiceContext.current?.reportRefused?.(offPageSentence(offPage.label, offPage.page, pager.page));
       return {};
@@ -862,12 +862,19 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   /**
    * PR #1451 round 3, change 3 — the numbered list on screen: the New agent
    * dialog's while it declares one, the screen's otherwise (see
-   * `useVoiceNumbers`). The generation moves whenever what is read differs
-   * from the last read, so the panel can tell a list that changed between
-   * the moment the user began to speak and the answer.
+   * `useVoiceNumbers`). The generation moves whenever the list on screen
+   * changes, so the panel can tell a list that changed between the moment the
+   * user began to speak and the answer.
+   *
+   * PR #1451 round 3 review — counted at every PUBLISH that changes what is
+   * on screen, not only when a read sees a difference: a list that went A → B
+   * → A between two reads is a different list to the user, who watched the
+   * numbers move, and an answer about the first A must be refused.
    */
   const numberedLayers = useRef<Partial<Record<NumberedLayer, readonly VoiceNumberedEntryDto[]>>>({});
+  const numberedChanges = useRef(0);
   const numberedRead = useRef<VoiceNumberedListDto>(NO_NUMBERED_LIST);
+  const numberedReadAt = useRef(0);
   /* Whether the dialog layer numbers anything — the New agent dialog, or the
      open Daemon selector — so the screen under it shows no numbers then: a
      number names one item on screen (change 4). */
@@ -875,15 +882,19 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const [dialogNumbered, setDialogNumbered] = useState(false);
   const numbering = useMemo<VoiceNumbering>(() => ({
     publish: (layer, entries) => {
-      numberedLayers.current[layer] = entries;
+      const layers = numberedLayers.current;
+      const before = layers.dialog ?? layers.screen ?? [];
+      layers[layer] = entries;
+      if (!sameNumberedEntries(before, layers.dialog ?? layers.screen ?? [])) numberedChanges.current += 1;
       if (layer === "dialog") setDialogNumbered(entries !== undefined);
     },
   }), []);
   const readNumbered = useCallback((): VoiceNumberedListDto => {
     const layers = numberedLayers.current;
     const entries = layers.dialog ?? layers.screen ?? [];
-    if (!sameNumberedEntries(entries, numberedRead.current.entries)) {
+    if (numberedReadAt.current !== numberedChanges.current || !sameNumberedEntries(entries, numberedRead.current.entries)) {
       numberedRead.current = { generation: numberedRead.current.generation + 1, entries: [...entries] };
+      numberedReadAt.current = numberedChanges.current;
     }
     return numberedRead.current;
   }, []);

@@ -57,6 +57,11 @@ export const DialogNumbered = createContext(false);
  * and — for the `screen` layer — no dialog over it numbers its own.
  */
 export function useNumbersShown(layer: NumberedLayer = "dialog"): boolean {
+  /* Every hook is called on every render: a `useContext` behind `&&` is
+     skipped while voice is off, and React then reads the hooks after it out of
+     order (the "change in the order of Hooks" warning). */
+  const voiceOn = useVoiceOn();
+  const choiceOpen = useContext(VoiceChoiceOpen);
   const covered = useContext(DialogNumbered) && layer === "screen";
-  return useVoiceOn() && !useContext(VoiceChoiceOpen) && !covered;
+  return voiceOn && !choiceOpen && !covered;
 }
