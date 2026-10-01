@@ -38,6 +38,17 @@
 import type { ComponentType } from "react";
 import type { DesktopSettingsDto } from "./bridge";
 
+/**
+ * What became of one save, for a panel that has to act on it (issue #1426's add
+ * form). A save's own UI — the document applied at once, the failure sentence
+ * in `saveError` — happens whether or not anyone reads this.
+ *
+ * `disk` is set when the failure replaced the document on screen with the one
+ * on disk (the deck list changed outside the app, so what the window held was
+ * stale): a deck the save added is then not on screen unless it is on disk.
+ */
+export type SaveOutcome = { saved: true } | { saved: false; disk?: DesktopSettingsDto };
+
 /** What every settings panel is handed. */
 export interface SettingsPanelProps {
   /** The whole document, so a panel can read a sibling section if it must. */
@@ -58,8 +69,11 @@ export interface SettingsPanelProps {
    * difference between the two is what the hook treats as your edit. A write
    * that builds on some OTHER snapshot — one kept across an `await` — passes it
    * as `from`, so the difference is measured against what it actually edited.
+   *
+   * May return a promise of the {@link SaveOutcome}, which never rejects; most
+   * panels ignore it.
    */
-  onSave: (next: DesktopSettingsDto, from?: DesktopSettingsDto) => void;
+  onSave: (next: DesktopSettingsDto, from?: DesktopSettingsDto) => void | Promise<SaveOutcome>;
   /**
    * Why the settings document cannot be written right now, as a **complete
    * sentence** — render it verbatim rather than composing around it.

@@ -16,6 +16,15 @@
 //! different text into the same kind of agent. So both call the `compose_*`
 //! functions below and neither formats a seed of its own.
 //!
+//! **The deck's command word is composed in, not baked in (issue #1385).** Each
+//! seed tells an agent to run a deck verb (`schedule add`, `dispatch`), and the
+//! agent's shell runs it later with its own `$PATH`, which can resolve a bare
+//! `dot-agent-deck` to a different binary than the deck that seeded it — the
+//! #549 defect. So the templates below carry [`DECK_BIN_SLOT`] where the command
+//! word goes, and the public functions swap in
+//! [`crate::platform::paths::binary_name`], the running deck's absolute path.
+//! The product name in prose ("for dot-agent-deck") is not a command and stays.
+//!
 //! What stays out: the TUI's `BuiltinOption` wrapper and its blank-command
 //! fallback (`ui::resolve_authoring_command`). The fallback is deliberately
 //! client-side — the daemon gives an empty `command` the meaning it always had
@@ -27,13 +36,34 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ScheduledTask;
 
+/// Where a seed template names the deck's command word; replaced by
+/// [`with_deck_command_word`]. Single-pass [`str::replace`], so a path that
+/// happened to contain this text could not be re-expanded.
+const DECK_BIN_SLOT: &str = "{bin}";
+
+/// `template` with every [`DECK_BIN_SLOT`] replaced by the running deck's
+/// command word — its absolute path, quoted for a POSIX shell when it needs to
+/// be, and free of backticks and control characters, so it sits safely inside
+/// the seeds' inline code spans.
+fn with_deck_command_word(template: &str) -> String {
+    template.replace(DECK_BIN_SLOT, &crate::platform::paths::binary_name())
+}
+
 /// PRD #127 M3.2: the crisp seed prompt delivered (gated, like orchestrations)
 /// to the "schedule" authoring agent. It instructs the agent to converse with
 /// the user, then call the validated `dot-agent-deck schedule add` CLI — it
 /// NEVER freehand-edits the TOML. Carries the field list, the exact invocation,
 /// the validation rules, the test-in-session affordance, and the
 /// confirm-before-write requirement.
-pub const SCHEDULE_AUTHORING_SEED_PROMPT: &str = "\
+///
+/// The deck's command word is [`crate::platform::paths::binary_name`] (issue
+/// #1385); see the module doc.
+pub fn schedule_authoring_seed_prompt() -> String {
+    with_deck_command_word(SCHEDULE_AUTHORING_SEED_PROMPT)
+}
+
+/// [`schedule_authoring_seed_prompt`] with [`DECK_BIN_SLOT`] still in it.
+const SCHEDULE_AUTHORING_SEED_PROMPT: &str = "\
 You are helping the user create a cron-scheduled prompt for dot-agent-deck. \
 This is a throwaway authoring session: converse to build ONE schedule entry, write it, then you are done.
 
@@ -49,20 +79,28 @@ Collect these fields:
 
 Rules:
 - NEVER edit the TOML file directly. ALWAYS write via the validated CLI, which checks the cron, expands paths, and writes the global config atomically:
-  dot-agent-deck schedule add --name <name> --cron <cron> --working-dir <dir> --command <cmd> --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>] [--shape <single|orchestration|orchestration:NAME>]
+  {bin} schedule add --name <name> --cron <cron> --working-dir <dir> --command <cmd> --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>] [--shape <single|orchestration|orchestration:NAME>]
 - The user can TEST the prompt in THIS session before committing — offer to run it now and show them the result (\"run it now, show me\").
 - CONFIRM the full entry (every field) with the user before you call `schedule add`.
 - AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — when the schedule fires, a single-agent run surfaces live in its own pane on the deck, while an orchestration-targeted run appears in its tab when the deck is (re)opened.";
 
 /// PRD #120: the seed prompt for the flag-gated `schedule: issues` authoring
-/// option. DISTINCT from [`SCHEDULE_AUTHORING_SEED_PROMPT`]: it authors an
+/// option. DISTINCT from [`schedule_authoring_seed_prompt`]: it authors an
 /// ISSUE-DISPATCH task — on each fire the daemon enumerates a repo's open issues
 /// and dispatches one agent per issue into a per-issue worktree — so it gathers
 /// the GitHub knobs (`repo`, `max_per_run`, optional `label`/`query`) and calls
 /// `dot-agent-deck schedule add --repo …` (NOT the plain `schedule add --name`
 /// single-spawn form). The `{{issue_number}}` placeholder in the prompt template
 /// is substituted per issue at fire time.
-pub const ISSUE_DISPATCH_AUTHORING_SEED_PROMPT: &str = "\
+///
+/// The deck's command word is [`crate::platform::paths::binary_name`] (issue
+/// #1385); see the module doc.
+pub fn issue_dispatch_authoring_seed_prompt() -> String {
+    with_deck_command_word(ISSUE_DISPATCH_AUTHORING_SEED_PROMPT)
+}
+
+/// [`issue_dispatch_authoring_seed_prompt`] with [`DECK_BIN_SLOT`] still in it.
+const ISSUE_DISPATCH_AUTHORING_SEED_PROMPT: &str = "\
 You are helping the user create a SCHEDULED GITHUB ISSUE-DISPATCH task for dot-agent-deck. \
 This is a throwaway authoring session: converse to build ONE issue-dispatch schedule, write it, then you are done.
 
@@ -81,7 +119,7 @@ Collect these fields:
 
 Rules:
 - NEVER edit the TOML file directly. ALWAYS write via the validated CLI, which checks the cron, validates the repo slug, expands paths, and writes the global config atomically:
-  dot-agent-deck schedule add --repo <owner/name> --max-per-run <N> --name <name> --cron <cron> --working-dir <dir> --prompt <template> [--label <label>] [--query <query>]
+  {bin} schedule add --repo <owner/name> --max-per-run <N> --name <name> --cron <cron> --working-dir <dir> --prompt <template> [--label <label>] [--query <query>]
 - Do NOT pass --command: an issue-dispatch task needs none (the per-issue agent command comes from each cloned repo's config / the deck's default_command).
 - CONFIRM the full entry (every field, especially repo and max_per_run) with the user before you call `schedule add`.
 - AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — when the schedule fires, each dispatched issue surfaces live as its own tab on the deck.";
@@ -97,12 +135,20 @@ Rules:
 /// do the work yourself") — that was cut: the deck does not own the user's
 /// workflow, and the last line actively forbade the pane from doing anything else
 /// the user asked. See the Design record in `prds/220-…md`.
-pub const DISPATCHER_SEED_PROMPT: &str = "\
-You are an ordinary assistant with one extra effector available: the `dot-agent-deck dispatch` verb, which starts an isolated line of work in its own git worktree. Help the user with whatever they ask, exactly as you normally would. When they say to START something as a separate line of work, reach for `dispatch` rather than doing that work here.
+///
+/// The deck's command word is [`crate::platform::paths::binary_name`] (issue
+/// #1385); see the module doc.
+pub fn dispatcher_seed_prompt() -> String {
+    with_deck_command_word(DISPATCHER_SEED_PROMPT)
+}
+
+/// [`dispatcher_seed_prompt`] with [`DECK_BIN_SLOT`] still in it.
+const DISPATCHER_SEED_PROMPT: &str = "\
+You are an ordinary assistant with one extra effector available: the `{bin} dispatch` verb, which starts an isolated line of work in its own git worktree. Help the user with whatever they ask, exactly as you normally would. When they say to START something as a separate line of work, reach for `dispatch` rather than doing that work here.
 
 ## The verb
-  dot-agent-deck dispatch <name> [--task <text>] [--task-file <path>] (--single | --orchestration [<name>])
-  dot-agent-deck dispatch --list-targets
+  {bin} dispatch <name> [--task <text>] [--task-file <path>] (--single | --orchestration [<name>])
+  {bin} dispatch --list-targets
 
 - <name> is a short slug naming this line of work (e.g. `fix-auth-bug`, `prd-220`). It names the worktree and its branch.
 - --task carries the prompt the isolated agent receives. --task-file reads that text from a file (or `-` for stdin) instead; the two are mutually exclusive.
@@ -111,7 +157,7 @@ You are an ordinary assistant with one extra effector available: the `dot-agent-
 A unit can start as ONE agent or as a multi-role ORCHESTRATION (a team that divides the work). Which one the user wants is not inferable from the request: \"work on these three features\" usually wants a team per feature, while \"verify these three PRs\" usually wants one agent each — and both arrive here as the same words. Guessing wrong is expensive and visible.
 
 So, before dispatching:
-1. Run `dot-agent-deck dispatch --list-targets`. It prints the shapes this repo actually offers (always `single`, plus each orchestration by name). Once per session is enough — its answer describes the repo, not the unit.
+1. Run `{bin} dispatch --list-targets`. It prints the shapes this repo actually offers (always `single`, plus each orchestration by name). Once per session is enough — its answer describes the repo, not the unit.
 2. If more than one is offered, show the user the list and ask which they want — ONCE PER UNIT, since the shape follows from what that unit is doing. Starting several at once is one prompt with a line per unit, not one question for the batch. If only `single` is offered, say so and use it — there is nothing to ask.
 3. Pass their answer for that unit on its own dispatch: `--single`, or `--orchestration <name>`.
 
@@ -131,7 +177,7 @@ One answer can cover several units when the user gives one — take it and stop 
 - A <name> is single-use. Removing a worktree keeps its branch, so re-dispatching the same name is refused while agent/dispatch-<name> still exists — pick a different name, or delete that branch once you are done with it.
 - Relay the path that `dispatch` reports for each line of work, so the user can follow it.";
 
-/// The `schedule` seed: [`SCHEDULE_AUTHORING_SEED_PROMPT`] plus `working_dir` as
+/// The `schedule` seed: [`schedule_authoring_seed_prompt`] plus `working_dir` as
 /// the schedule's `working_dir` DEFAULT, so the agent's `schedule add` targets
 /// the directory it was started in unless the user names another (PRD #170).
 ///
@@ -147,7 +193,7 @@ pub fn compose_schedule_seed(existing: Option<&ScheduledTask>, working_dir: &Pat
         "{seed}\n\n\
          working_dir DEFAULT: {dir} (the directory this authoring session was launched in) \
          — use it as the schedule's working_dir unless the user names another.",
-        seed = SCHEDULE_AUTHORING_SEED_PROMPT,
+        seed = schedule_authoring_seed_prompt(),
         dir = working_dir.display(),
     );
     match existing {
@@ -166,10 +212,13 @@ pub fn compose_schedule_seed(existing: Option<&ScheduledTask>, working_dir: &Pat
                  - enabled: {enabled}\n\
                  - shape: {shape}\n\
                  Start from these values and write changes with \
-                 `dot-agent-deck schedule update --name {name} ...` (NOT `add`). \
+                 `{bin} schedule update --name {name} ...` (NOT `add`). \
                  RENAME IS FORBIDDEN — the name {name:?} is fixed (it is the reuse-tab key); \
                  to rename, remove this schedule and add a new one.",
                 base = base,
+                // Issue #1385: the running deck's command word, like the
+                // `schedule add` line in the base seed above.
+                bin = crate::platform::paths::binary_name(),
                 name = t.name,
                 cron = t.cron,
                 // PRD #170 finding 3: the PICKED dir (not the row's stale stored
@@ -192,7 +241,7 @@ pub fn compose_schedule_seed(existing: Option<&ScheduledTask>, working_dir: &Pat
     }
 }
 
-/// The `schedule: issues` seed (PRD #120): [`ISSUE_DISPATCH_AUTHORING_SEED_PROMPT`]
+/// The `schedule: issues` seed (PRD #120): [`issue_dispatch_authoring_seed_prompt`]
 /// plus `working_dir` as the workspace `working_dir` DEFAULT, exactly like the
 /// plain schedule seed. There is no Edit form — the TUI manager's Add/Edit is the
 /// plain-schedule door, and issue-dispatch authoring is always created fresh.
@@ -201,18 +250,18 @@ pub fn compose_issue_dispatch_seed(working_dir: &Path) -> String {
         "{seed}\n\n\
          working_dir DEFAULT: {dir} (the directory this authoring session was launched in) \
          — use it as the schedule's working_dir unless the user names another.",
-        seed = ISSUE_DISPATCH_AUTHORING_SEED_PROMPT,
+        seed = issue_dispatch_authoring_seed_prompt(),
         dir = working_dir.display(),
     )
 }
 
-/// The `dispatcher` seed (PRD #220): [`DISPATCHER_SEED_PROMPT`] plus the pane's
+/// The `dispatcher` seed (PRD #220): [`dispatcher_seed_prompt`] plus the pane's
 /// own `working_dir`, since the seed's `../<repo>-dispatch-…` layout is relative
 /// to it and the agent otherwise has to infer it.
 pub fn compose_dispatcher_seed(working_dir: &Path) -> String {
     format!(
         "{seed}\n\nworking_dir: {dir}\n\nThe repo at that path is the main worktree — the one dispatched worktrees are created as siblings of.",
-        seed = DISPATCHER_SEED_PROMPT,
+        seed = dispatcher_seed_prompt(),
         dir = working_dir.display(),
     )
 }
@@ -503,21 +552,89 @@ mod tests {
     fn each_kind_composes_its_own_constant_plus_the_working_dir() {
         let dir = Path::new("/srv/picked dir");
         for (kind, constant) in [
-            (AuthoringKind::Schedule, SCHEDULE_AUTHORING_SEED_PROMPT),
+            (AuthoringKind::Schedule, schedule_authoring_seed_prompt()),
             (
                 AuthoringKind::ScheduleIssues,
-                ISSUE_DISPATCH_AUTHORING_SEED_PROMPT,
+                issue_dispatch_authoring_seed_prompt(),
             ),
-            (AuthoringKind::Dispatcher, DISPATCHER_SEED_PROMPT),
+            (AuthoringKind::Dispatcher, dispatcher_seed_prompt()),
         ] {
             let seed = kind.compose_seed(dir);
             assert!(
-                seed.starts_with(constant),
+                seed.starts_with(&constant),
                 "{kind:?}: the seed opens with its own constant"
             );
             assert!(
                 seed[constant.len()..].contains("/srv/picked dir"),
                 "{kind:?}: the directory is appended after the constant"
+            );
+        }
+    }
+
+    /// Compose every authoring seed — `schedule` (add and edit),
+    /// `schedule: issues` and `dispatcher` — and check that each deck verb it
+    /// tells the agent to run names the running deck by `binary_name()`, the
+    /// absolute path, and never by the bare `dot-agent-deck` an agent's own
+    /// `$PATH` could resolve to a different binary (issue #1385).
+    #[test]
+    fn every_seed_names_the_running_deck_by_its_path() {
+        let bin = crate::platform::paths::binary_name();
+        assert_ne!(
+            bin, "dot-agent-deck",
+            "this test only proves anything when the test binary's own path differs from the \
+             bare literal the seeds used to carry"
+        );
+        let dir = Path::new("/srv/repo");
+        let editing = ScheduledTask {
+            name: "digest".to_string(),
+            cron: "0 9 * * *".to_string(),
+            working_dir: "/srv/repo".to_string(),
+            command: Some("claude".to_string()),
+            prompt: "summarise".to_string(),
+            new_tab_per_fire: false,
+            enabled: true,
+            shape: None,
+            issue_dispatch: None,
+        };
+        let cases = [
+            (
+                compose_schedule_seed(None, dir),
+                vec!["schedule add --name <name>"],
+            ),
+            (
+                compose_schedule_seed(Some(&editing), dir),
+                vec![
+                    "schedule add --name <name>",
+                    "schedule update --name digest",
+                ],
+            ),
+            (
+                compose_issue_dispatch_seed(dir),
+                vec!["schedule add --repo <owner/name>"],
+            ),
+            (
+                compose_dispatcher_seed(dir),
+                vec![
+                    "dispatch <name> [--task",
+                    "dispatch --list-targets",
+                    "dispatch` verb",
+                ],
+            ),
+        ];
+        for (seed, invocations) in cases {
+            for invocation in invocations {
+                assert!(
+                    seed.contains(&format!("{bin} {invocation}")),
+                    "the seed must name the running deck ({bin:?}) before {invocation:?}:\n{seed}"
+                );
+                assert!(
+                    !seed.contains(&format!("dot-agent-deck {invocation}")),
+                    "the seed must not name the deck by its bare name before {invocation:?}:\n{seed}"
+                );
+            }
+            assert!(
+                !seed.contains(DECK_BIN_SLOT),
+                "no command-word slot may survive composition:\n{seed}"
             );
         }
     }

@@ -2434,6 +2434,17 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     };
   }
 
+  /// Scenario: A named remote deck keeps its CLI name in the fleet header while the local deck keeps its familiar label.
+  it("shows the remote deck name in the fleet", () => {
+    const fleet = createFixtureFleet("fleet");
+    fleet[1] = { ...fleet[1], connection: { ...fleet[1].connection, ...{ name: "production" } } };
+    render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={vi.fn()} />);
+
+    const sections = deckSections();
+    expect(within(sections[0]).getByTestId("daemon-identity")).toHaveTextContent("Local daemon");
+    expect(within(sections[1]).getByTestId("daemon-identity")).toHaveTextContent("production");
+  });
+
   // Test-plan item 13.
   it("renders one sibling section per observed deck, each holding only its own deck's agents", () => {
     const { fleet } = renderFleet();
@@ -2586,8 +2597,9 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
   function fleetWithUnconfigured(): DeckSnapshot[] {
     const answering = createFixtureFleet("fleet").filter((deck) => deck.connection.status === "connected");
     expect(answering).toHaveLength(2);
+    const unconfigured = { deckId: "unconfigured-halfway", label: "relay.example.com", name: "relay", reason: "Not configured yet — press Test connection in Settings." };
     const halfway = unconfiguredDeckSnapshot(
-      { deckId: "unconfigured-halfway", label: "relay.example.com", reason: "Not configured yet — press Test connection in Settings." },
+      unconfigured,
       9,
       "0.1.0",
     );
@@ -2610,7 +2622,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
 
   /**
    * Scenario: the same fleet, looking at the third deck's section. It is a
-   * group of its own, named by its address, saying it is not configured — not
+   * group of its own, named by its CLI name, saying it is not configured — not
    * absent, and not a daemon reporting zero agents.
    *
    * The words are the settings panel's rather than the disconnected note's:
@@ -2618,6 +2630,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
    * listening on the configured socket" and "start one from the daemon screen"
    * would both be false.
    */
+  /// Scenario: A named but unconfigured remote deck uses its name in the fleet group.
   it("renders the unconfigured deck as its own group saying what is missing", () => {
     const fleet = fleetWithUnconfigured();
     render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={vi.fn()} />);
@@ -2626,7 +2639,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     expect(sections).toHaveLength(3);
     const halfway = sections[2];
     expect(halfway).toHaveAttribute("data-daemon-id", "unconfigured-halfway");
-    expect(within(halfway).getByTestId("daemon-identity")).toHaveTextContent("relay.example.com");
+    expect(within(halfway).getByTestId("daemon-identity")).toHaveTextContent(/^relay$/);
 
     const note = within(halfway).getByTestId("overview-unconfigured");
     expect(note).toHaveTextContent("Daemon not configured");
@@ -2676,7 +2689,8 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
   function fleetWithPending(): DeckSnapshot[] {
     const [answering] = createFixtureFleet("fleet");
     expect(answering.connection.status).toBe("connected");
-    const waiting = pendingDeckSnapshot({ deckId: "deck-00000000000e0d03", label: "ops@edge-3", deckKind: "remote" }, 9, "0.1.0");
+    const observed = { deckId: "deck-00000000000e0d03", label: "ops@edge-3", name: "edge", deckKind: "remote" as const };
+    const waiting = pendingDeckSnapshot(observed, 9, "0.1.0");
     return [answering, waiting];
   }
 
@@ -2727,7 +2741,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
 
   /**
    * Scenario: the same fleet, looking at the second deck's section. It is a
-   * group of its own, named by its address, saying it is being waited for —
+   * group of its own, named by its CLI name, saying it is being waited for —
    * not absent, not an error, and not a daemon reporting zero agents.
    *
    * The words are the empty state's register rather than the disconnected
@@ -2735,6 +2749,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
    * configured socket" is false, and there is no action for the reader to take,
    * so the note offers no button at all.
    */
+  /// Scenario: A named remote deck pending its first report uses its name in the fleet group.
   it("renders the daemon that has not reported as its own group saying it is being waited for", () => {
     const fleet = fleetWithPending();
     render(<AgentOverview runtime={runtime({ snapshot: fleet[0], fleet })} onNavigate={vi.fn()} />);
@@ -2744,9 +2759,9 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     const waiting = sections[1];
     expect(waiting).toHaveAttribute("data-daemon-id", "deck-00000000000e0d03");
     expect(waiting).toHaveAttribute("data-deck-connected", "no");
-    // Named by its address. Without the crate's `observed` list this would read
+    // Named by its CLI name. Without the crate's `observed` list this would read
     // "Local daemon" — `deckName` has only `deckKind` to go on.
-    expect(within(waiting).getByTestId("daemon-identity")).toHaveTextContent("ops@edge-3");
+    expect(within(waiting).getByTestId("daemon-identity")).toHaveTextContent(/^edge$/);
 
     const note = within(waiting).getByTestId("overview-pending");
     expect(note).toHaveTextContent("Waiting for this daemon");

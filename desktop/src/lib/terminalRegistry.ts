@@ -188,10 +188,64 @@ export function stripAnsi(raw: string): string {
 // then constant-false in any other build and the minifier drops it, and
 // `desktop-web` greps its own `pnpm build` output for `__dadDriver` so a bundle
 // built the ordinary way cannot quietly start carrying it. It exposes the same
-// text the Reader overlay already shows a user, and it writes nothing.
+// text the Reader overlay already shows a user, where that text is painted, and
+// it writes nothing.
+/** xterm's private services, for the driver seam's diagnostics only. */
+function xtermInternals(terminal: Terminal): { _selectionService?: Record<string, unknown> } | undefined {
+  return (terminal as unknown as { _core?: ReturnType<typeof xtermInternals> })._core;
+}
+
 if (import.meta.env.VITE_DAD_DRIVER_SEAM === "1") {
   (window as Window & { __dadDriver?: unknown }).__dadDriver = {
     terminalTexts: () =>
       [...terminals.entries()].map(([key, terminal]) => ({ key, text: terminalSnapshotText(terminal) })),
+    // Issue #1403 — where each terminal's visible rows are painted, so a
+    // scenario can drag across a row the way a person selects text. One entry
+    // per viewport row (not re-joined like the snapshot above, so row `i` is
+    // screen row `i`), plus the grid and the screen's box in viewport pixels,
+    // and what xterm currently holds as its selection, so a scenario can tell
+    // a drag that selected nothing from a copy that did not land.
+    terminalScreens: () =>
+      [...terminals.entries()].map(([key, terminal]) => {
+        const buffer = terminal.buffer.active;
+        const lines: string[] = [];
+        for (let row = 0; row < terminal.rows; row += 1) {
+          lines.push(buffer.getLine(buffer.viewportY + row)?.translateToString(true) ?? "");
+        }
+        const box = terminal.element?.querySelector(".xterm-screen")?.getBoundingClientRect();
+        const rect = box ? { left: box.left, top: box.top, width: box.width, height: box.height } : null;
+        return { key, cols: terminal.cols, rows: terminal.rows, lines, rect, selection: terminal.getSelection() };
+      }),
+    // Issue #1403 — record, into `window.__dadSelectionTrace`, every time xterm
+    // clears a terminal's selection and every resize, each with the stack that
+    // caused it, so a drag whose selection vanishes says what removed it. This
+    // is how a focus claim's resize was found clearing `terminal_002`'s
+    // selection. It wraps a private xterm method, which is tolerable only in
+    // this build-gated seam. Idempotent.
+    traceSelection: () => {
+      const trace = ((window as Window & { __dadSelectionTrace?: unknown[] }).__dadSelectionTrace ??= []);
+      for (const terminal of terminals.values()) {
+        const service = xtermInternals(terminal)?._selectionService as
+          | (Record<string, unknown> & { clearSelection: () => void; __dadTraced?: boolean })
+          | undefined;
+        if (!service || service.__dadTraced) continue;
+        service.__dadTraced = true;
+        const stack = () =>
+          (new Error().stack ?? "")
+            .split("\n")
+            .slice(2, 30)
+            .map((frame) => frame.trim().replace(/@tauri:\/\/localhost\/assets\//, "@"))
+            // xterm's own event plumbing says nothing about who asked.
+            .filter((frame) => !/^(_deliver|_deliverQueue|fire|resize)@/.test(frame))
+            .join(" < ");
+        const clear = service.clearSelection.bind(service);
+        service.clearSelection = () => {
+          trace.push(["clear", Math.round(performance.now()), terminal.cols, terminal.rows, stack()]);
+          clear();
+        };
+        terminal.onResize(({ cols, rows }) => trace.push(["resize", Math.round(performance.now()), cols, rows, stack()]));
+      }
+      return trace.length;
+    },
   };
 }

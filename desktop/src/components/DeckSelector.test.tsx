@@ -134,6 +134,21 @@ describe("DeckSelector", () => {
     expect(within(menu).getByTestId(`deck-selector-option-${BUILD_BOX}`)).toBeInTheDocument();
   });
 
+  /// Scenario: The selector shows the CLI name for a named remote deck, its address for a legacy deck, and keeps the local label.
+  it("shows remote deck names with address fallback without changing This machine", async () => {
+    const endpoints = twoDaemons(BUILD_BOX);
+    endpoints.remote = endpoints.remote.map((row, index) => ({ ...row, name: index === 0 ? "build" : null }));
+    await mountShell({
+      desktopFeatures: fixtureDesktopFeatures(""),
+      getSettings: vi.fn(async () => ({ settings: settingsWith(endpoints) })),
+    });
+
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent(/^build$/);
+    const menu = await openMenu();
+    expect(within(menu).getAllByRole("radio").map((option) => option.textContent))
+      .toEqual(["All daemons", "This machine", "build", "relay.example.com:2222"]);
+  });
+
   it("names the stored selection on the trigger, not merely inside the menu", async () => {
     await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith(twoDaemons(BUILD_BOX)) })) });
     expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("vf@build-box.example.com");

@@ -51,6 +51,7 @@ The desktop app has a few keyboard shortcuts of its own. None of the TUI's [keyb
 | --- | --- | --- |
 | `Ctrl+N` / `⌘N` | Dashboard, with no agent pane open and no text field focused | Opens [New agent](new-agent.md) |
 | `Escape` | Agent pane, when you are not typing in its terminal | Closes the pane and returns to the Dashboard |
+| `Ctrl+Shift+C` / `⌘C` | An agent's terminal, with text selected | Copies the selected text. Plain `Ctrl+C` still goes to the agent as an interrupt |
 | `Escape` | Settings | Closes Settings |
 | `Escape` | New agent | Clears the directory filter; otherwise closes the dialog, keeping a draft |
 | `Ctrl` / `⌘` with `=`, `+`, `-`, `0` | Everywhere | Zoom (above) |

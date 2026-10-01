@@ -279,3 +279,38 @@ describe("TerminalViewport editing shortcuts follow the platform the webview rep
     expect(sent).toEqual(["pasted text"]);
   });
 });
+
+describe("TerminalViewport copy and editing keys share one terminal (issues 1403 and 1422)", () => {
+  /**
+   * Scenario: on each platform, open an agent's terminal, press the copy chord
+   * (Cmd+C on macOS, Ctrl+Shift+C elsewhere), then that platform's "start of
+   * line" or "delete the previous word" shortcut. The copy chord sends nothing
+   * to the agent, and the editing shortcut that follows still reaches it, so
+   * the copy listener and the editing-key handler do not swallow each other's
+   * keys.
+   */
+  it.each<[string, "mac" | "windows" | "linux", Key, Key, string]>([
+    ["macOS", "mac", { key: "c", code: "KeyC", keyCode: 67, metaKey: true }, arrowLeft({ metaKey: true }), "\x01"],
+    [
+      "Windows",
+      "windows",
+      { key: "C", code: "KeyC", keyCode: 67, ctrlKey: true, shiftKey: true },
+      backspace({ ctrlKey: true }),
+      "\x17",
+    ],
+    [
+      "Linux",
+      "linux",
+      { key: "C", code: "KeyC", keyCode: 67, ctrlKey: true, shiftKey: true },
+      backspace({ ctrlKey: true }),
+      "\x17",
+    ],
+  ])("%s", (_name, platform, copyChord, editKey, bytes) => {
+    onPlatform(platform);
+    const { sent, press } = mountTerminal();
+    press(copyChord);
+    expect(sent).toEqual([]);
+    press(editKey);
+    expect(sent).toEqual([bytes]);
+  });
+});

@@ -13,8 +13,33 @@
  * and everything maps into it.
  */
 
-/** The dot-agent-deck CLI binary the extension shells. */
+/**
+ * The bare dot-agent-deck CLI name — the FALLBACK the extension shells when the
+ * deck did not name itself (see {@link resolveDeckBin}). A bare name is looked
+ * up in Pi's own `$PATH`, which can reach a different `dot-agent-deck` than the
+ * deck that spawned this pane (issue #1385, following #549).
+ */
 export const DECK_BIN = "dot-agent-deck";
+
+/**
+ * The environment variable the deck sets on every agent it spawns, holding its
+ * own absolute executable path (`platform::paths::DOT_AGENT_DECK_EXE` on the
+ * Rust side). MUST stay in sync with that constant.
+ */
+export const DECK_EXE_ENV = "DOT_AGENT_DECK_EXE";
+
+/**
+ * The CLI the extension shells: the deck's own absolute path from
+ * {@link DECK_EXE_ENV} when the deck set one, otherwise the bare
+ * {@link DECK_BIN} — so an older deck that sets nothing keeps working exactly
+ * as before. The value is used verbatim (argv exec, no shell), so a path with
+ * spaces needs no quoting. `env` is a parameter rather than `process.env` so
+ * this module stays import- and global-free and unit-testable.
+ */
+export function resolveDeckBin(env: Readonly<Record<string, string | undefined>>): string {
+	const exe = env[DECK_EXE_ENV];
+	return typeof exe === "string" && exe.trim().length > 0 ? exe : DECK_BIN;
+}
 
 /**
  * Canonical agent lifecycle states accepted by
@@ -204,11 +229,11 @@ export interface ExecOutcome {
  * when the command failed (non-zero exit), or `null` on success. Kept pure so
  * the exact error text is unit-testable.
  */
-export function execFailureMessage(argv: string[], outcome: ExecOutcome): string | null {
+export function execFailureMessage(argv: string[], outcome: ExecOutcome, bin: string = DECK_BIN): string | null {
 	if (outcome.code === 0) {
 		return null;
 	}
-	const cmd = [DECK_BIN, ...argv].join(" ");
+	const cmd = [bin, ...argv].join(" ");
 	const detail = (outcome.stderr ?? "").trim() || (outcome.stdout ?? "").trim();
 	const suffix = detail ? `: ${detail}` : "";
 	return `\`${cmd}\` failed with exit code ${outcome.code}${suffix}`;
@@ -216,11 +241,18 @@ export function execFailureMessage(argv: string[], outcome: ExecOutcome): string
 
 /**
  * Build a clear error message for a spawn failure — e.g. the `dot-agent-deck`
- * binary is not on PATH (ENOENT). Pure and unit-testable.
+ * binary is not on PATH, or the path the deck named is gone (ENOENT). Pure and
+ * unit-testable.
  */
-export function spawnFailureMessage(argv: string[], err: unknown): string {
-	const cmd = [DECK_BIN, ...argv].join(" ");
+export function spawnFailureMessage(argv: string[], err: unknown, bin: string = DECK_BIN): string {
+	const cmd = [bin, ...argv].join(" ");
 	const reason = err instanceof Error ? err.message : String(err);
-	const hint = reason.includes("ENOENT") ? ` (is \`${DECK_BIN}\` installed and on PATH?)` : "";
+	// The PATH hint only makes sense for a bare name; a path the deck supplied
+	// that fails with ENOENT is a missing file, not a PATH miss.
+	const hint = !reason.includes("ENOENT")
+		? ""
+		: bin === DECK_BIN
+			? ` (is \`${DECK_BIN}\` installed and on PATH?)`
+			: ` (does \`${bin}\` still exist?)`;
 	return `Failed to run \`${cmd}\`${hint}: ${reason}`;
 }

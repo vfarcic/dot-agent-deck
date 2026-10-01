@@ -43,7 +43,35 @@ DOT_AGENT_DECK_LOG=1 dot-agent-deck
 
 Check that it worked: after the deck starts, `grep 'login-shell PATH' /tmp/dot-agent-deck.log` finds the line the daemon writes at startup (`applied login-shell PATH to the daemon environment`, or `no login-shell PATH captured`). If that line is missing, the daemon was started without the variable.
 
-A daemon the deck starts in the background also writes its standard output and error to `daemon.log` in the deck's state directory: `$XDG_STATE_HOME/dot-agent-deck/daemon.log` when `XDG_STATE_HOME` is set, otherwise `~/.local/state/dot-agent-deck/daemon.log`, and `%LOCALAPPDATA%\dot-agent-deck\daemon.log` on Windows (`DOT_AGENT_DECK_STATE_DIR` replaces the directory). The log described above is the more useful of the two; `daemon.log` is often empty. Attach the relevant excerpts when you file an issue. [Configuration](configuration.md) lists the other environment variables.
+A daemon the deck starts in the background also writes its standard output and error to `daemon.log` in the deck's state directory: `$XDG_STATE_HOME/dot-agent-deck/daemon.log` when `XDG_STATE_HOME` is set, otherwise `~/.local/state/dot-agent-deck/daemon.log`, and `%LOCALAPPDATA%\dot-agent-deck\daemon.log` on Windows (`DOT_AGENT_DECK_STATE_DIR` replaces the directory). It is not the debug log: it holds what the daemon prints rather than logs, such as a crash message or the `[scheduler]` notices [schedules](scheduled-tasks.md) print as they run (an issue dispatched or skipped, a run that failed, a configuration error). The log described above is the more useful of the two; without schedules, `daemon.log` is often empty. Attach the relevant excerpts of both when you file an issue. [Configuration](configuration.md) lists the other environment variables.
+
+#### With the desktop app
+
+*Applies to the desktop app.*
+
+The desktop app writes no log file of its own. The log to collect is the **daemon's**, and the daemon has to be started with `DOT_AGENT_DECK_LOG` set. Restarting only the app does not turn the log on, because the app does not restart the daemon. The desktop app is built for macOS (Apple Silicon) and Linux (amd64); there is no Windows build.
+
+The app connects to a daemon you started (see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)), so start that daemon with logging on:
+
+1. If a daemon is already running, stop it with `dot-agent-deck daemon stop`. It refuses while agents are running, so finish or close them first; see [Recycling the daemon](#recycling-the-daemon).
+2. Start a daemon with the variable set, in a terminal:
+
+   ```bash
+   DOT_AGENT_DECK_LOG=1 dot-agent-deck daemon serve
+   ```
+
+   On macOS with no CLI installed, use the app's own copy:
+
+   ```bash
+   DOT_AGENT_DECK_LOG=1 "/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck" daemon serve
+   ```
+
+   Starting the TUI instead works too: `DOT_AGENT_DECK_LOG=1 dot-agent-deck`.
+3. Press **Reconnect** in the app. A `daemon serve` that nothing connects to exits after about 30 seconds, so reconnect promptly.
+
+The log lands at `/tmp/dot-agent-deck.log` on both macOS and Linux, or at the path you gave the variable, and the `login-shell PATH` line described above confirms that the daemon logs. `RUST_LOG` ([below](#turning-the-verbosity-up)) goes on the same command, for example `RUST_LOG=dot_agent_deck=debug DOT_AGENT_DECK_LOG=1 dot-agent-deck daemon serve`. For a [remote daemon](desktop/daemons.md), start it on its host the same way; the log is then on that host.
+
+With the `experimental` flag on, the app can start a daemon itself, with **Start daemon** or **Replace daemon**. That daemon gets the variables only when the app itself was launched with them. On Linux, that means starting the app from a terminal, for example `DOT_AGENT_DECK_LOG=1 dot-agent-deck-desktop`. An app opened from the macOS Dock or Finder, or from a Linux application menu, does not get variables exported in your shell profile, so a daemon it starts has no log. In that case, start the daemon yourself as above.
 
 #### Turning the verbosity up
 

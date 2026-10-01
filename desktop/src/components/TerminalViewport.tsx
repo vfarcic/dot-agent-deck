@@ -3,6 +3,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import type { SendResult, TerminalBuffer, TerminalFeed } from "../types";
+import { writeClipboardText } from "../lib/clipboard";
+import { isTerminalCopyChord } from "../lib/terminalCopy";
 import { agentKeySequence, keyPlatform, leavesPasteToWebview } from "../lib/terminalKeys";
 import { registerRefit, registerTerminal, unregisterRefit, unregisterTerminal } from "../lib/terminalRegistry";
 
@@ -83,6 +85,7 @@ export function TerminalViewport({
   applied,
   onFocus,
 }: TerminalViewportProps) {
+  const wrapperRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | undefined>(undefined);
   const lastStreamRef = useRef<TerminalBuffer | undefined>(undefined);
@@ -211,6 +214,39 @@ export function TerminalViewport({
     const inputDisposable = terminal.onData((data) => {
       if (!readOnlyRef.current) onInputRef.current(data);
     });
+    // Issue #1403 — copy the selection with `Ctrl+Shift+C` / `Cmd+C`.
+    //
+    // A capture-phase listener on the wrapper runs before xterm's own `keydown`
+    // on its helper textarea, so stopping the chord here means xterm never
+    // evaluates it and nothing reaches the agent. xterm would send nothing for
+    // either chord today, but `preventDefault` also claims the webview's own
+    // reaction to it, and a copy key that could ever leak a byte into an agent
+    // is not one to leave to a library's key table. Plain `Ctrl+C` is not the
+    // chord and passes through untouched as the agent's interrupt.
+    //
+    // Deliberately a DOM listener rather than `attachCustomKeyEventHandler`:
+    // xterm keeps exactly one custom handler per terminal, and taking the slot
+    // for copy would silently collide with anything else that needs it.
+    const wrapper = wrapperRef.current;
+    const onCopyKey = (event: KeyboardEvent) => {
+      if (!isTerminalCopyChord(event)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const selection = terminal.getSelection();
+      // Nothing selected leaves the clipboard as it was. A write the platform
+      // refuses has no better outcome than the unchanged clipboard it leaves.
+      if (selection) void writeClipboardText(selection).catch(() => undefined);
+    };
+    // A read-only pane's textarea is `disabled` and cannot take focus, and
+    // xterm's selection handler cancels the press that would otherwise have
+    // focused something — so without this the chord after a drag would land
+    // on whatever held focus before, never on this pane. The wrapper takes it
+    // instead, which is all the chord needs.
+    const onPress = () => {
+      if (readOnlyRef.current) wrapper?.focus({ preventScroll: true });
+    };
+    wrapper?.addEventListener("keydown", onCopyKey, true);
+    wrapper?.addEventListener("mousedown", onPress, true);
     // Issue #1422 — the keys xterm would encode differently from the TUI
     // (Ctrl+Enter and Shift+Enter above all: xterm sends the submitting CR for
     // both), or in a form the agents do not act on (the platform's editing
@@ -218,9 +254,9 @@ export function TerminalViewport({
     // `onData`, so it passes the same input gates as a key xterm sent itself.
     //
     // Copy is not handled here, and this handler claims neither copy chord:
-    // issue #1403's Ctrl+Shift+C / Cmd+C (its PR #1440) is a capture-phase
-    // listener on the wrapper, which sees the key before xterm or this
-    // handler does. Keep Ctrl+Shift+C and Cmd+C out of both tables below.
+    // issue #1403's Ctrl+Shift+C / Cmd+C is the capture-phase listener on the
+    // wrapper above, which sees the key before xterm or this handler does.
+    // Keep Ctrl+Shift+C and Cmd+C out of both tables below.
     //
     // The platform is the webview's (what `navigator` reports), read once per
     // terminal: it decides which chords are the user's editing and paste keys.
@@ -305,6 +341,8 @@ export function TerminalViewport({
       window.cancelAnimationFrame(frame);
       observer.disconnect();
       inputDisposable.dispose();
+      wrapper?.removeEventListener("keydown", onCopyKey, true);
+      wrapper?.removeEventListener("mousedown", onPress, true);
       unregisterRefit(deckId, agentId, fit);
       unregisterTerminal(deckId, agentId, terminal);
       webglAddon?.dispose();
@@ -432,7 +470,11 @@ export function TerminalViewport({
 
   return (
     <div
+      ref={wrapperRef}
       className="terminal-viewport"
+      // Focusable only by script (see `onPress` above), so a read-only pane can
+      // receive the copy chord; it adds no tab stop.
+      tabIndex={-1}
       data-testid={`terminal-${agentId}`}
       data-input-state={inputState}
       onFocusCapture={onFocus}

@@ -57,7 +57,7 @@ const POINTER_NEEDLE: &str = "Read .dot-agent-deck/work-done-coder.md for their 
 /// The #448 label. Spelled out here rather than imported from `src/` so a silent
 /// rewording of the daemon's own template fails these tests instead of following
 /// them — the same discipline as `idle_worker_detector.rs`'s `IDLE_NEEDLE`.
-const UNSOLICITED_NEEDLE: &str = "you have no outstanding delegation to that worker";
+const UNSOLICITED_NEEDLE: &str = "the deck has no outstanding delegation to that worker on record";
 
 /// The #433 label, for a commissioned completion whose file could not be written.
 const UNFILED_NEEDLE: &str = "could not write .dot-agent-deck/work-done-coder.md";
@@ -1315,4 +1315,83 @@ fn dispatch_return_007_report_past_the_inline_bound_is_recoverable_in_full() {
             });
         assert_holds_the_full_framed_report(&path, &report);
     });
+}
+
+/// Issue #505: what the unsolicited label used to assert about who tasked the
+/// worker. The deck cannot know either of these: it knows only that its own record
+/// holds no outstanding delegation for the worker, and a commission can be missing
+/// from that record for reasons that have nothing to do with a person — an
+/// abandoned pane close sweeps it, for one. Spelled out rather than imported, like
+/// the needles above, so the test pins the words an orchestrator actually reads.
+const FALSE_PROVENANCE_CLAIMS: &[&str] = &[
+    "You did not commission this work",
+    "most likely tasked directly by a person",
+    "you have no outstanding delegation",
+];
+
+/// Scenario: Delegate to `coder`, then start a close of one pane of the pair — the worker's in one run, the orchestrator's in the other — and abandon it, the way a failed `StopAgent` does, leaving both agents live. When the worker then reports `work-done`, the orchestrator pane must receive its report without being told it did not commission the work or that a person most likely tasked the worker: the deck lost its record of the delegation, and says only that.
+#[spec("orchestration/work-done/011")]
+#[test]
+fn work_done_011_abandoned_close_does_not_make_the_deck_deny_a_real_delegation() {
+    for (arm, closing_pane) in [
+        ("an abandoned close of the worker's pane", WORKER_PANE),
+        ("an abandoned close of the orchestrator's pane", ORCH_PANE),
+    ] {
+        runtime().block_on(async {
+            // Both delegation watches off, and an empty `roles` list so `clear`
+            // resolves to nothing and the delegate dispatches to the live `cat`
+            // without respawning it — the same shape as `002`, so the only thing
+            // standing between this completion and the ordinary pointer is the
+            // commission the close swept.
+            let harness = WorkDoneHarness::new(Some(
+                "worker_response_timeout_minutes = 0\n\n[[orchestrations]]\nname = \"unused\"\nroles = []\n",
+            ))
+            .await;
+            harness.delegate().await;
+            assert!(
+                harness.registry.owes_delegation_commission(WORKER_PANE),
+                "{arm}: control — the delegate must have recorded a commission before the close \
+                 attempt, or the test is not about a lost one"
+            );
+
+            // The close `StopAgent` makes, abandoned: `closed = false` is what it
+            // passes when `close_agent` fails.
+            drop(harness.registry.begin_pane_close(closing_pane));
+            drop(harness.registry.finish_pane_close(closing_pane, false));
+
+            harness
+                .work_done(&format!("Finished the delegated task. {FRESH_SENTINEL}"))
+                .await;
+            let snapshot = harness
+                .wait_for_orchestrator(
+                    |snapshot| {
+                        snapshot.contains(REPORT_FRAME_NEEDLE) && snapshot.contains(FRESH_SENTINEL)
+                    },
+                    Duration::from_secs(5),
+                )
+                .await;
+            assert!(
+                snapshot.contains(REPORT_FRAME_NEEDLE) && snapshot.contains(FRESH_SENTINEL),
+                "{arm}: control — the worker's report must still reach the orchestrator; \
+                 snapshot = {snapshot:?}"
+            );
+            for claim in FALSE_PROVENANCE_CLAIMS {
+                assert!(
+                    !snapshot.contains(claim),
+                    "{arm}: the orchestrator DID commission this work, so the deck must not tell \
+                     it {claim:?} — its record of the delegation was lost, nothing more; \
+                     snapshot = {snapshot:?}"
+                );
+            }
+            assert!(
+                snapshot.contains(UNSOLICITED_NEEDLE),
+                "{arm}: with no commission on record the completion still carries the \
+                 unsolicited label, worded as what the deck can assert; snapshot = {snapshot:?}"
+            );
+            assert!(
+                !snapshot.contains(POINTER_NEEDLE),
+                "{arm}: nothing was filed, so nothing may be pointed at; snapshot = {snapshot:?}"
+            );
+        });
+    }
 }
