@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import shared from "../../../tests/fixtures/editing-shortcuts.json";
 import { agentKeySequence, keyPlatform, leavesPasteToWebview, type TerminalKey } from "./terminalKeys";
 
 const key = (fields: Partial<TerminalKey> & { key: string }): TerminalKey => ({
@@ -11,41 +12,41 @@ const key = (fields: Partial<TerminalKey> & { key: string }): TerminalKey => ({
 
 describe("agentKeySequence (issue #1422)", () => {
   it("leaves every key xterm already encodes like the TUI to xterm", () => {
-    expect(agentKeySequence(key({ key: "Enter" }), "linux")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "Enter", altKey: true }), "linux")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "c", ctrlKey: true }), "linux")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "/" }), "linux")).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Enter" }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Enter", altKey: true }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "c", ctrlKey: true }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "/" }))).toBeUndefined();
   });
 
   it("never claims a Cmd/Super chord", () => {
-    expect(agentKeySequence(key({ key: "Enter", metaKey: true }), "linux")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "Enter", metaKey: true, ctrlKey: true }), "linux")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "/", metaKey: true, ctrlKey: true }), "linux")).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Enter", metaKey: true }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Enter", metaKey: true, ctrlKey: true }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "/", metaKey: true, ctrlKey: true }))).toBeUndefined();
   });
 
   it("never claims a key while an input method is composing", () => {
-    expect(agentKeySequence(key({ key: "Enter", shiftKey: true, isComposing: true }), "linux")).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Enter", shiftKey: true, isComposing: true }))).toBeUndefined();
   });
 
   it("does not read AltGr (Ctrl+Alt) as Ctrl+/", () => {
-    expect(agentKeySequence(key({ key: "/", ctrlKey: true, altKey: true }), "linux")).toBeUndefined();
+    expect(agentKeySequence(key({ key: "/", ctrlKey: true, altKey: true }))).toBeUndefined();
   });
 
   it("leaves AltGr, which Windows reports as Ctrl+Alt, to xterm", () => {
     const altGraph = (name: string) => name === "AltGraph";
-    expect(agentKeySequence(key({ key: "Enter", ctrlKey: true, altKey: true, getModifierState: altGraph }), "linux")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "Enter", ctrlKey: true, altKey: true, shiftKey: true, getModifierState: altGraph }), "linux")).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Enter", ctrlKey: true, altKey: true, getModifierState: altGraph }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Enter", ctrlKey: true, altKey: true, shiftKey: true, getModifierState: altGraph }))).toBeUndefined();
     // A genuine Ctrl+Alt+Enter, with no AltGr reported, is still translated.
-    expect(agentKeySequence(key({ key: "Enter", ctrlKey: true, altKey: true, getModifierState: () => false }), "linux")).toBe("\x1b[13;7u");
+    expect(agentKeySequence(key({ key: "Enter", ctrlKey: true, altKey: true, getModifierState: () => false }))).toBe("\x1b[13;7u");
   });
 
   it("accepts Ctrl+/ where the layout puts / on a shifted key", () => {
-    expect(agentKeySequence(key({ key: "/", ctrlKey: true, shiftKey: true }), "linux")).toBe("\x1f");
+    expect(agentKeySequence(key({ key: "/", ctrlKey: true, shiftKey: true }))).toBe("\x1f");
   });
 
   it("carries Shift, Alt and Ctrl in the CSI u modifier parameter", () => {
-    expect(agentKeySequence(key({ key: "Enter", shiftKey: true, altKey: true }), "linux")).toBe("\x1b[13;4u");
-    expect(agentKeySequence(key({ key: "Enter", shiftKey: true, altKey: true, ctrlKey: true }), "linux")).toBe("\x1b[13;8u");
+    expect(agentKeySequence(key({ key: "Enter", shiftKey: true, altKey: true }))).toBe("\x1b[13;4u");
+    expect(agentKeySequence(key({ key: "Enter", shiftKey: true, altKey: true, ctrlKey: true }))).toBe("\x1b[13;8u");
   });
 });
 
@@ -75,49 +76,37 @@ describe("keyPlatform: what the webview reports, not the daemon's host", () => {
   });
 });
 
-describe("agentKeySequence: platform editing shortcuts (issue #1422)", () => {
-  it("maps macOS's Cmd line keys and Option+Delete to bytes every agent's line editor acts on", () => {
-    expect(agentKeySequence(key({ key: "ArrowLeft", metaKey: true }), "mac")).toBe("\x01");
-    expect(agentKeySequence(key({ key: "ArrowRight", metaKey: true }), "mac")).toBe("\x05");
-    expect(agentKeySequence(key({ key: "Backspace", metaKey: true }), "mac")).toBe("\x15");
-    expect(agentKeySequence(key({ key: "Delete", altKey: true }), "mac")).toBe("\x1bd");
+describe("agentKeySequence: editing shortcuts (issue #1422)", () => {
+  it("maps the Cmd/Super line keys to bytes every agent's line editor acts on", () => {
+    expect(agentKeySequence(key({ key: "ArrowLeft", metaKey: true }))).toBe("\x01");
+    expect(agentKeySequence(key({ key: "ArrowRight", metaKey: true }))).toBe("\x05");
+    expect(agentKeySequence(key({ key: "Backspace", metaKey: true }))).toBe("\x15");
   });
 
-  it("maps Ctrl+Backspace and Ctrl+Delete to word deletes on Windows and Linux", () => {
-    for (const platform of ["windows", "linux"] as const) {
-      expect(agentKeySequence(key({ key: "Backspace", ctrlKey: true }), platform)).toBe("\x17");
-      expect(agentKeySequence(key({ key: "Delete", ctrlKey: true }), platform)).toBe("\x1bd");
-    }
+  it("maps Ctrl+Backspace, Ctrl+Delete and Alt+Delete to word deletes", () => {
+    expect(agentKeySequence(key({ key: "Backspace", ctrlKey: true }))).toBe("\x17");
+    expect(agentKeySequence(key({ key: "Delete", ctrlKey: true }))).toBe("\x1bd");
+    expect(agentKeySequence(key({ key: "Delete", altKey: true }))).toBe("\x1bd");
   });
 
   it("leaves the keys xterm already sends correctly to xterm", () => {
-    expect(agentKeySequence(key({ key: "ArrowLeft", altKey: true }), "mac")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "Backspace", altKey: true }), "mac")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "ArrowLeft", ctrlKey: true }), "linux")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "Home" }), "windows")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "Backspace" }), "mac")).toBeUndefined();
-  });
-
-  it("keeps each platform's chords to that platform", () => {
-    // Super+Left on Linux and Windows is the window manager's, not Cmd+Left.
-    expect(agentKeySequence(key({ key: "ArrowLeft", metaKey: true }), "linux")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "Backspace", metaKey: true }), "windows")).toBeUndefined();
-    // Ctrl+Backspace is not a macOS editing key; xterm's BS stays.
-    expect(agentKeySequence(key({ key: "Backspace", ctrlKey: true }), "mac")).toBeUndefined();
-    // Alt+Delete is not a Windows or Linux editing key.
-    expect(agentKeySequence(key({ key: "Delete", altKey: true }), "linux")).toBeUndefined();
+    expect(agentKeySequence(key({ key: "ArrowLeft", altKey: true }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Backspace", altKey: true }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "ArrowLeft", ctrlKey: true }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Home" }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Backspace" }))).toBeUndefined();
   });
 
   it("claims only the bare chord, not one with extra modifiers", () => {
-    expect(agentKeySequence(key({ key: "ArrowLeft", metaKey: true, shiftKey: true }), "mac")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "Backspace", metaKey: true, altKey: true }), "mac")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "Backspace", ctrlKey: true, shiftKey: true }), "linux")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "Delete", ctrlKey: true, altKey: true }), "windows")).toBeUndefined();
+    expect(agentKeySequence(key({ key: "ArrowLeft", metaKey: true, shiftKey: true }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Backspace", metaKey: true, altKey: true }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Backspace", ctrlKey: true, shiftKey: true }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Delete", ctrlKey: true, altKey: true }))).toBeUndefined();
   });
 
   it("never claims a key while an input method is composing", () => {
-    expect(agentKeySequence(key({ key: "Backspace", metaKey: true, isComposing: true }), "mac")).toBeUndefined();
-    expect(agentKeySequence(key({ key: "Backspace", ctrlKey: true, isComposing: true }), "linux")).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Backspace", metaKey: true, isComposing: true }))).toBeUndefined();
+    expect(agentKeySequence(key({ key: "Backspace", ctrlKey: true, isComposing: true }))).toBeUndefined();
   });
 });
 
@@ -152,8 +141,41 @@ describe("leaves the copy chords to issue #1403's listener", () => {
   it("claims neither Ctrl+Shift+C nor Cmd+C on any platform", () => {
     for (const platform of ["mac", "windows", "linux"] as const) {
       for (const chord of [key({ key: "C", ctrlKey: true, shiftKey: true }), key({ key: "c", metaKey: true })]) {
-        expect(agentKeySequence(chord, platform)).toBeUndefined();
+        expect(agentKeySequence(chord)).toBeUndefined();
         expect(leavesPasteToWebview(chord, platform)).toBe(false);
+      }
+    }
+  });
+});
+
+describe("the editing shortcuts are the TUI's table (tests/fixtures/editing-shortcuts.json)", () => {
+  type Row = { key: string; modifiers: string[]; bytes: string };
+  const held = (row: Pick<Row, "key" | "modifiers">): TerminalKey =>
+    key({
+      key: row.key,
+      shiftKey: row.modifiers.includes("shift"),
+      ctrlKey: row.modifiers.includes("ctrl"),
+      altKey: row.modifiers.includes("alt"),
+      metaKey: row.modifiers.includes("super"),
+    });
+  const names = ["shift", "ctrl", "alt", "super"];
+  const keys = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Backspace", "Delete", "Home", "End"];
+
+  // `agentKeySequence` takes no platform: these hold on every one, as in the TUI.
+  it("translates every row the TUI translates, to the same bytes", () => {
+    for (const row of shared.translated as Row[]) {
+      expect(agentKeySequence(held(row)), `${row.modifiers.join("+")}+${row.key}`).toBe(row.bytes);
+    }
+  });
+
+  it("translates no editing chord the TUI leaves alone", () => {
+    for (const name of keys) {
+      for (let mask = 0; mask < 1 << names.length; mask++) {
+        const modifiers = names.filter((_, i) => mask & (1 << i));
+        const row = (shared.translated as Row[]).find(
+          (candidate) => candidate.key === name && [...candidate.modifiers].sort().join() === [...modifiers].sort().join(),
+        );
+        expect(agentKeySequence(held({ key: name, modifiers })), `${modifiers.join("+")}+${name}`).toBe(row?.bytes);
       }
     }
   });

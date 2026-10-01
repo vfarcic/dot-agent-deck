@@ -1,6 +1,6 @@
 # Keyboard Shortcuts
 
-Everything on this page is the TUI's. The desktop app has its own shortcuts, listed on [Desktop app → Settings](desktop/settings.md#keyboard-shortcuts); `keybindings.toml` does not affect it.
+Everything on this page is the TUI's, except [Editing an agent's prompt](#editing-an-agents-prompt), which works the same in both clients. The desktop app has its own shortcuts, listed on [Desktop app → Settings](desktop/settings.md#keyboard-shortcuts); `keybindings.toml` does not affect it.
 
 Press `?` in command mode to see the shortcuts in the TUI. The overlay and the bottom button bar are generated from your active [keybindings](#customizing-keybindings), so they show your real keys.
 
@@ -111,16 +111,23 @@ A pane the deck starts is empty at first, so there is nothing above the agent's 
 
 ## Editing an agent's prompt
 
-While you type in a pane, the agent's prompt answers to your platform's usual text-editing shortcuts, in every supported agent, and they do what they do in the [desktop app](desktop/settings.md#editing-and-pasting-in-an-agents-prompt):
+While you type in an agent's prompt, in the TUI or in the [desktop app](desktop/settings.md#editing-and-pasting-in-an-agents-prompt), these text-editing shortcuts work in every supported agent, and each does the same in both clients on every platform:
 
-| To | macOS | Linux, and Windows through WSL |
-| --- | --- | --- |
-| Go to the start / end of the line | `⌘←` / `⌘→` | `Home` / `End` |
-| Move one word left / right | `⌥←` / `⌥→` | `Ctrl+←` / `Ctrl+→` |
-| Delete to the start of the line | `⌘⌫` | |
-| Delete the previous word | `⌥⌫` | `Ctrl+Backspace` |
-| Delete the next word | `⌥⌦` (`fn+⌥⌫` on a laptop keyboard) | `Ctrl+Delete` |
-| Paste | `⌘V` | `Ctrl+Shift+V` (`Ctrl+V` too, in Windows Terminal) |
+| To | Press |
+| --- | --- |
+| Go to the start / end of the line | `Home` / `End`, or `⌘←` / `⌘→` |
+| Move one word left / right | `Ctrl+←` / `Ctrl+→`, or `Alt+←` / `Alt+→` (`⌥←` / `⌥→` on a Mac) |
+| Delete to the start of the line | `⌘⌫` |
+| Delete the previous word | `Ctrl+Backspace`, or `Alt+Backspace` (`⌥⌫`) |
+| Delete the next word | `Ctrl+Delete`, or `Alt+Delete` (`⌥⌦`, `fn+⌥⌫` on a laptop keyboard) |
+
+`⌘` is the Windows key on Windows and the Super key on Linux. Your system keeps some of these chords for itself before either client sees them: macOS switches Spaces on `Ctrl+←` / `Ctrl+→`, and Windows and most Linux desktops arrange windows on the Windows key or Super with an arrow. On Linux the desktop app cannot see the Super key at all, so there `Super+←` arrives as a plain `←`; use `Home` and `End`.
+
+"Line" means the line the cursor is on, so in a message of several lines these keys stay on that line. Agents differ in small ways: moving a word right in OpenCode lands on the start of the next word, where the other agents stop at the end of the current one, and deleting the next word in OpenCode and Devin also removes the space after it.
+
+Paste is not in the table, because each client pastes the way its platform does: in the TUI with your terminal's paste key, and in the desktop app with `⌘V` on macOS, `Ctrl+V` or `Ctrl+Shift+V` on Windows and `Ctrl+Shift+V` on Linux. `Ctrl+V` goes to the agent wherever it is not the paste key, and Claude Code, for one, pastes an image with it.
+
+### In the TUI: what your terminal passes on
 
 None of these is a deck shortcut, so the deck never takes them while you type. The TUI acts on a key only if your terminal passes it on, and some terminals keep these keys for themselves or send them as a plainer key. Where one does nothing, or deletes or moves by a single character, set your terminal up as below.
 
@@ -131,9 +138,9 @@ None of these is a deck shortcut, so the deck never takes them while you type. T
   - Alacritty: `[keyboard]` `bindings = [{ key = "Backspace", mods = "Control", chars = "\u0017" }]`
   - foot: under `[text-bindings]`, `\x17 = Control+BackSpace`
   - Konsole: in a copy of the profile's keyboard layout, `key Backspace +Control : "\x17"`
-- **Paste** is your terminal's: its paste key puts the text into the agent's prompt. `Ctrl+V` goes to the agent wherever the terminal does not keep it, as it does in the desktop app on macOS and Linux; Claude Code, for one, pastes an image with it.
+- **`⌘` chords on Linux and Windows.** The TUI reads the Super or Windows key only from a terminal that passes it on under the enhanced keyboard protocol, such as kitty. Most terminals do not, so use `Home`, `End` and the `Ctrl` chords there.
 
-**Check it worked:** type a few words into the agent's prompt, without sending them, and press your platform's "delete the previous word" shortcut. The last word disappears.
+**Check it worked:** type a few words into the agent's prompt, without sending them, and press `Ctrl+Backspace` or `Alt+Backspace` (`⌥⌫`). The last word disappears.
 
 ## Directory Picker
 

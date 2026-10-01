@@ -6780,10 +6780,12 @@ fn ctrl_c0_byte(c: char) -> Option<u8> {
 /// Option+Delete as `ESC ESC[3~`, which Codex and Devin type as `[3~`.
 ///
 /// Only the bare chord is translated (Ctrl+Shift+Backspace is not), as on the
-/// desktop. Unlike the desktop, the table does not depend on the platform:
-/// the deck cannot tell which keyboard is in front of the user — over SSH the
+/// desktop. The table does not depend on the platform, in either client: the
+/// deck cannot tell which keyboard is in front of the user — over SSH the
 /// machine it runs on is not the one being typed on — and no chord here means
-/// something else on another platform. Cmd arrives as SUPER only from a
+/// something else on another platform. Both clients' tests read the table
+/// from `tests/fixtures/editing-shortcuts.json`, so a row changed here alone
+/// fails `keyevent_editing_chords_match_the_shared_table`. Cmd arrives as SUPER only from a
 /// terminal speaking the kitty keyboard protocol that does not keep Cmd chords
 /// for itself; Ctrl+Backspace arrives as `Backspace + CONTROL` only under that
 /// protocol too, since a legacy terminal sends it as BS, the same byte as
@@ -32888,6 +32890,110 @@ mod tests {
                 Some(*expected),
                 "{code:?} with {modifiers:?}"
             );
+        }
+    }
+
+    /// Issue #1422: the TUI's editing shortcuts are the shared table in
+    /// `tests/fixtures/editing-shortcuts.json`, which the desktop app's tests
+    /// read too. Every row is sent as its bytes, and `editing_chord_bytes`
+    /// translates exactly the `translated` rows: a chord added on this side
+    /// only, or dropped from it, fails here instead of drifting from the
+    /// desktop.
+    #[test]
+    fn keyevent_editing_chords_match_the_shared_table() {
+        let table: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/editing-shortcuts.json"
+        )))
+        .expect("the shared editing-shortcut table parses");
+        let code_for = |key: &str| match key {
+            "ArrowLeft" => KeyCode::Left,
+            "ArrowRight" => KeyCode::Right,
+            "ArrowUp" => KeyCode::Up,
+            "ArrowDown" => KeyCode::Down,
+            "Backspace" => KeyCode::Backspace,
+            "Delete" => KeyCode::Delete,
+            "Home" => KeyCode::Home,
+            "End" => KeyCode::End,
+            other => panic!("the shared table names a key this test cannot map: {other}"),
+        };
+        let modifier_for = |name: &str| match name {
+            "ctrl" => KeyModifiers::CONTROL,
+            "alt" => KeyModifiers::ALT,
+            "shift" => KeyModifiers::SHIFT,
+            "super" => KeyModifiers::SUPER,
+            other => panic!("the shared table names a modifier this test cannot map: {other}"),
+        };
+        let rows = |list: &str| -> Vec<(KeyCode, KeyModifiers, Vec<u8>)> {
+            table[list]
+                .as_array()
+                .unwrap_or_else(|| panic!("the shared table has a `{list}` list"))
+                .iter()
+                .map(|row| {
+                    let modifiers = row["modifiers"]
+                        .as_array()
+                        .expect("a row's modifiers are a list")
+                        .iter()
+                        .map(|name| modifier_for(name.as_str().expect("a modifier is a name")))
+                        .fold(KeyModifiers::NONE, KeyModifiers::union);
+                    let bytes = row["bytes"].as_str().expect("a row's bytes are a string");
+                    (
+                        code_for(row["key"].as_str().expect("a row names its key")),
+                        modifiers,
+                        bytes.as_bytes().to_vec(),
+                    )
+                })
+                .collect()
+        };
+        let translated = rows("translated");
+        let standard = rows("standard");
+        assert!(!translated.is_empty() && !standard.is_empty());
+
+        for (code, modifiers, bytes) in translated.iter().chain(&standard) {
+            assert_eq!(
+                keyevent_to_bytes(&KeyEvent::new(*code, *modifiers)).as_deref(),
+                Some(bytes.as_slice()),
+                "{code:?} with {modifiers:?}"
+            );
+        }
+
+        let keys = [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Enter,
+            KeyCode::Char('a'),
+        ];
+        let bits = [
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::HYPER,
+            KeyModifiers::META,
+        ];
+        for code in keys {
+            for mask in 0u32..(1 << bits.len()) {
+                let modifiers = bits
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .fold(KeyModifiers::NONE, |held, (_, bit)| held.union(*bit));
+                let expected = translated
+                    .iter()
+                    .find(|(c, m, _)| *c == code && *m == modifiers)
+                    .map(|(_, _, bytes)| bytes.as_slice());
+                assert_eq!(
+                    editing_chord_bytes(&KeyEvent::new(code, modifiers)),
+                    expected,
+                    "{code:?} with {modifiers:?}: the TUI translates exactly the shared table's chords"
+                );
+            }
         }
     }
 

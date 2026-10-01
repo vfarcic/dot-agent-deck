@@ -1,5 +1,27 @@
+import { readFileSync } from "node:fs";
 import { expect, test, type Page } from "@playwright/test";
 import { enterDeck } from "./support/overview";
+
+interface SharedShortcut {
+  key: string;
+  modifiers: string[];
+  bytes: string;
+  action: string;
+}
+
+/**
+ * The editing shortcuts both clients send the same bytes for, on every
+ * platform: the TUI's own tests read this file too (issue #1422).
+ */
+const sharedShortcuts = JSON.parse(
+  readFileSync(new URL("../../tests/fixtures/editing-shortcuts.json", import.meta.url), "utf8"),
+) as { translated: SharedShortcut[]; standard: SharedShortcut[] };
+
+/** A shared-table row as a Playwright chord: `super` is Meta (Cmd, the Windows key). */
+function chordFor(row: SharedShortcut): string {
+  const names: Record<string, string> = { ctrl: "Control", alt: "Alt", shift: "Shift", super: "Meta" };
+  return [...row.modifiers.map((modifier) => names[modifier]), row.key].join("+");
+}
 
 interface RecordingWindow {
   __dadE2eTerminals?: { element?: HTMLElement; onData(listener: (data: string) => void): unknown }[];
@@ -192,6 +214,23 @@ test.describe("agent terminal input", () => {
       expect(await sentFor("Control+Backspace")).toEqual(["\x17"]);
       expect(await sentFor("Control+Delete")).toEqual(["\x1bd"]);
       expect(await sentFor("Backspace")).toEqual(["\x7f"]);
+    });
+  }
+
+  /**
+   * Scenario: with the webview reporting macOS, then Windows, then Linux,
+   * press every editing shortcut in the table the TUI uses in the writable
+   * agent's terminal — another platform's included, such as Ctrl+Backspace
+   * on a Mac or Alt+Delete on Linux. Each reaches the agent as exactly the
+   * bytes the TUI sends for it (issue #1422).
+   */
+  for (const platform of ["MacIntel", "Win32", "Linux x86_64"] as const) {
+    test(`sends the TUI's editing shortcuts unchanged on ${platform}`, async ({ page }) => {
+      await reportPlatform(page, platform);
+      const sentFor = await openWritableTerminal(page);
+      for (const row of [...sharedShortcuts.translated, ...sharedShortcuts.standard]) {
+        expect(await sentFor(chordFor(row)), `${chordFor(row)} (${row.action})`).toEqual([row.bytes]);
+      }
     });
   }
 

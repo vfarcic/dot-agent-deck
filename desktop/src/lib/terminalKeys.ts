@@ -8,18 +8,21 @@
  * to xterm, so an app-level shortcut or a key xterm already sends correctly is
  * untouched.
  *
- * Two kinds of exception. The modified Enters and Ctrl+/ match
- * `keyevent_to_bytes` in `src/ui.rs`, so the same keypress means the same thing
- * to an agent whichever client it was typed into. The platform editing
- * shortcuts (Cmd+Left on macOS, Ctrl+Backspace on Windows and Linux, …) are
- * bytes each supported agent's input box was measured to act on;
- * `docs/develop/desktop-gui.md` has the per-agent table.
+ * Every exception matches `keyevent_to_bytes` in `src/ui.rs`, so the same
+ * keypress means the same thing to an agent whichever client it was typed into:
+ * the modified Enters, Ctrl+/, and the editing shortcuts (Cmd+Left,
+ * Ctrl+Backspace, …), whose bytes each supported agent's input box was
+ * measured to act on (`docs/develop/desktop-gui.md` has the per-agent table).
+ * The editing shortcuts are one table on every platform, as they are in the
+ * TUI, and both clients' tests check it against
+ * `tests/fixtures/editing-shortcuts.json`. Only the paste key depends on the
+ * platform, because the paste is the webview's and not a byte sequence.
  */
 
 import type { BrowserPlatformHints } from "./platform";
 
 /**
- * Which platform's editing shortcuts apply. Read from what the webview reports
+ * Which platform's paste key applies. Read from what the webview reports
  * (`navigator`), never from the daemon's host: the keyboard in front of the
  * user is the webview's, and a Mac driving a Linux daemon still types Cmd+Left.
  *
@@ -73,30 +76,35 @@ function only(key: TerminalKey, ...held: Modifier[]): boolean {
 }
 
 /**
- * The platform's line-editing chords that xterm.js sends nothing for, or sends
- * as a key the agents read differently: Cmd+Left/Right as nothing at all,
- * Cmd+Backspace as a one-character DEL, Ctrl+Backspace as BS (also a
- * one-character delete in every agent), and Ctrl+Delete / Option+Delete as
- * `ESC[3;<m>~`, which Claude Code and Pi do not read as a word delete. The
+ * The line-editing chords xterm.js sends nothing for, or sends as a key the
+ * agents read differently, mapped to the bytes the TUI sends for them
+ * (`editing_chord_bytes` in `src/ui.rs`): Cmd/Super+Left and Right as nothing
+ * at all, Cmd/Super+Backspace as a one-character DEL, Ctrl+Backspace as BS
+ * (also a one-character delete in every agent), and Ctrl+Delete / Alt+Delete
+ * as `ESC[3;<m>~`, which Claude Code and Pi do not read as a word delete. The
  * replacements are readline's: Ctrl+A, Ctrl+E, Ctrl+U, Ctrl+W and `ESC d`.
  *
- * Home/End, Ctrl/Option+Left/Right and Option+Backspace are not here: xterm's
- * own bytes for them already work in every agent.
+ * The same rows on every platform, as in the TUI: none of these chords means
+ * something else on another platform, so Ctrl+Backspace deletes a word on a
+ * Mac too, and Alt+Delete on Windows and Linux. Meta is Cmd on macOS and the
+ * Windows key under WebView2. WebKitGTK reports no Super modifier at all — it
+ * delivers Super+Left as a bare Left — so on Linux the Super rows never match,
+ * and the window manager usually takes those chords first anyway.
+ *
+ * Home/End, Ctrl/Alt+Left/Right and Alt+Backspace are not here: xterm's own
+ * bytes for them are already the TUI's.
  */
-function editingSequence(key: TerminalKey, platform: KeyPlatform): string | undefined {
-  if (platform === "mac") {
-    if (only(key, "meta")) {
-      if (key.key === "ArrowLeft") return "\x01"; // start of line
-      if (key.key === "ArrowRight") return "\x05"; // end of line
-      if (key.key === "Backspace") return "\x15"; // delete to start of line
-    }
-    if (only(key, "alt") && key.key === "Delete") return `${ESC}d`; // delete next word
-    return undefined;
+function editingSequence(key: TerminalKey): string | undefined {
+  if (only(key, "meta")) {
+    if (key.key === "ArrowLeft") return "\x01"; // start of line
+    if (key.key === "ArrowRight") return "\x05"; // end of line
+    if (key.key === "Backspace") return "\x15"; // delete to start of line
   }
   if (only(key, "ctrl")) {
     if (key.key === "Backspace") return "\x17"; // delete previous word
     if (key.key === "Delete") return `${ESC}d`; // delete next word
   }
+  if (only(key, "alt") && key.key === "Delete") return `${ESC}d`; // delete next word
   return undefined;
 }
 
@@ -116,17 +124,17 @@ function editingSequence(key: TerminalKey, platform: KeyPlatform): string | unde
  * - **Ctrl+/**: US (0x1f), what xterm (the terminal), GNOME Terminal and the
  *   TUI send. xterm.js sends nothing at all for it.
  *
- * - **The platform's line-editing chords** (`editingSequence` above).
+ * - **The line-editing chords** (`editingSequence` above).
  *
- * Claims no Cmd/Super chord other than macOS's Cmd+Left, Cmd+Right and
- * Cmd+Backspace: the rest belong to the app and the OS. Never claims a key
+ * Claims no Cmd/Super chord other than Cmd/Super+Left, +Right and +Backspace:
+ * the rest belong to the app and the OS. Never claims a key
  * while an input method is composing: Enter there commits the composition.
  * Never claims a key pressed with AltGr: Windows reports AltGr as Ctrl+Alt, so
  * AltGr+Enter would otherwise be sent as Ctrl+Alt+Enter.
  */
-export function agentKeySequence(key: TerminalKey, platform: KeyPlatform): string | undefined {
+export function agentKeySequence(key: TerminalKey): string | undefined {
   if (key.isComposing || key.getModifierState?.("AltGraph")) return undefined;
-  const editing = editingSequence(key, platform);
+  const editing = editingSequence(key);
   if (editing !== undefined) return editing;
   if (key.metaKey) return undefined;
   if (key.key === "Enter" && (key.shiftKey || key.ctrlKey)) {

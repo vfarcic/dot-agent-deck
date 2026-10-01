@@ -66,19 +66,12 @@ To start a new line without sending the message, press `Shift+Enter` or `Ctrl+J`
 
 #### Editing and pasting in an agent's prompt
 
-The agent's prompt answers to your platform's usual text-editing shortcuts, in every supported agent:
+The agent's prompt answers to the same text-editing shortcuts as in the TUI, in every supported agent, on every platform: `Home` / `End` or `⌘←` / `⌘→` for the start and end of the line, `Ctrl+←` / `Ctrl+→` or `⌥←` / `⌥→` to move by a word, `⌘⌫` to delete to the start of the line, `Ctrl+Backspace` or `⌥⌫` to delete the previous word, and `Ctrl+Delete` or `⌥⌦` to delete the next one. Outside a Mac, `⌥` is `Alt` and `⌘` is the Windows key. [Editing an agent's prompt](../keyboard-shortcuts.md#editing-an-agents-prompt) has the table, which chords your system keeps for itself, and how agents differ. On Linux the app cannot see the Super key, so `Super+←` arrives as a plain `←`; use `Home` and `End` there.
 
-| To | macOS | Windows | Linux |
-| --- | --- | --- | --- |
-| Go to the start / end of the line | `⌘←` / `⌘→` | `Home` / `End` | `Home` / `End` |
-| Move one word left / right | `⌥←` / `⌥→` | `Ctrl+←` / `Ctrl+→` | `Ctrl+←` / `Ctrl+→` |
-| Delete to the start of the line | `⌘⌫` | | |
-| Delete the previous word | `⌥⌫` | `Ctrl+Backspace` | `Ctrl+Backspace` |
-| Delete the next word | `⌥⌦` (`fn+⌥⌫` on a laptop keyboard) | `Ctrl+Delete` | `Ctrl+Delete` |
-| Paste | `⌘V` | `Ctrl+V` or `Ctrl+Shift+V` | `Ctrl+Shift+V` |
+Paste follows the computer you are typing on, not the machine the agent runs on:
 
-The TUI does the same for every key your terminal passes on to it; [Editing an agent's prompt](../keyboard-shortcuts.md#editing-an-agents-prompt) says how to set your terminal up. The app follows the computer you are typing on, not the machine the agent runs on: on a Mac connected to a Linux daemon, `⌘←` still goes to the start of the line. "Line" means the line the cursor is on, so in a message of several lines these keys stay on that line.
-
-Agents differ in small ways. Moving a word right in OpenCode lands on the start of the next word, where the other agents stop at the end of the current one, and deleting the next word in OpenCode and Devin also removes the space after it.
+| macOS | Windows | Linux |
+| --- | --- | --- |
+| `⌘V` | `Ctrl+V` or `Ctrl+Shift+V` | `Ctrl+Shift+V` |
 
 `Ctrl+V` pastes only on Windows. On macOS and Linux it goes to the agent, which may have its own use for it — Claude Code, for one, pastes an image with it.

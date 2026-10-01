@@ -249,7 +249,7 @@ export function TerminalViewport({
     wrapper?.addEventListener("mousedown", onPress, true);
     // Issue #1422 — the keys xterm would encode differently from the TUI
     // (Ctrl+Enter and Shift+Enter above all: xterm sends the submitting CR for
-    // both), or in a form the agents do not act on (the platform's editing
+    // both), or in a form the agents do not act on (the editing
     // chords, such as Cmd+Left). `terminal.input` routes the replacement through
     // `onData`, so it passes the same input gates as a key xterm sent itself.
     //
@@ -259,7 +259,8 @@ export function TerminalViewport({
     // Keep Ctrl+Shift+C and Cmd+C out of both tables below.
     //
     // The platform is the webview's (what `navigator` reports), read once per
-    // terminal: it decides which chords are the user's editing and paste keys.
+    // terminal: it decides the paste key. The editing keys are one table on
+    // every platform, the TUI's.
     const platform = keyPlatform();
     terminal.attachCustomKeyEventHandler((event) => {
       // The platform's paste key: keep xterm from encoding it (on Windows it
@@ -267,7 +268,7 @@ export function TerminalViewport({
       // uncancelled, so the webview pastes into xterm's textarea and xterm's
       // own paste handling sends the text to the agent.
       if (leavesPasteToWebview(event, platform)) return false;
-      const sequence = agentKeySequence(event, platform);
+      const sequence = agentKeySequence(event);
       if (sequence === undefined) return true;
       // Claim the key the way xterm claims one it sends: no newline typed into
       // its helper textarea, and no bubbling to the app's window shortcuts.

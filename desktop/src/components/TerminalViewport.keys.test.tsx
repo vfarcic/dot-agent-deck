@@ -31,6 +31,7 @@ vi.mock("@xterm/addon-fit", () => ({
   } as unknown as typeof import("@xterm/addon-fit").FitAddon,
 }));
 
+import shared from "../../../tests/fixtures/editing-shortcuts.json";
 import { TerminalViewport } from "./TerminalViewport";
 
 // xterm's browser service watches the device pixel ratio through
@@ -94,7 +95,7 @@ afterEach(() => vi.restoreAllMocks());
 /**
  * Make the webview report `platform` the way each engine does, before the
  * terminal mounts: WebKit on macOS says `MacIntel`, WebView2 says `Win32`, and
- * WebKitGTK says `Linux x86_64`. The terminal decides the platform's shortcuts
+ * WebKitGTK says `Linux x86_64`. The terminal decides the platform's paste key
  * from this, never from the daemon's host.
  */
 function onPlatform(platform: "mac" | "windows" | "linux") {
@@ -109,6 +110,22 @@ const forwardDelete = (mods: Partial<Key> = {}): Key => ({ key: "Delete", code: 
 const home: Key = { key: "Home", code: "Home", keyCode: 36 };
 const end: Key = { key: "End", code: "End", keyCode: 35 };
 const keyV = (mods: Partial<Key> = {}): Key => ({ key: "v", code: "KeyV", keyCode: 86, ...mods });
+
+/** A row of the shared editing-shortcut table, as the browser delivers it. */
+function sharedKey(row: { key: string; modifiers: string[] }): Key {
+  const keyCodes: Record<string, number> = { ArrowLeft: 37, ArrowRight: 39, Backspace: 8, Delete: 46, Home: 36, End: 35 };
+  const keyCode = keyCodes[row.key];
+  if (keyCode === undefined) throw new Error(`no key code for ${row.key}`);
+  return {
+    key: row.key,
+    code: row.key,
+    keyCode,
+    shiftKey: row.modifiers.includes("shift"),
+    ctrlKey: row.modifiers.includes("ctrl"),
+    altKey: row.modifiers.includes("alt"),
+    metaKey: row.modifiers.includes("super"),
+  };
+}
 
 describe("TerminalViewport keystrokes reach the agent as the TUI sends them (issue #1422)", () => {
   /**
@@ -197,7 +214,7 @@ describe("TerminalViewport keystrokes reach the agent as the TUI sends them (iss
   });
 });
 
-describe("TerminalViewport editing shortcuts follow the platform the webview reports (issue #1422)", () => {
+describe("TerminalViewport editing and paste shortcuts (issue #1422)", () => {
   /**
    * Scenario: on each platform, open an agent's terminal, type into the
    * agent's prompt and use that platform's own editing shortcuts — jump to the
@@ -237,15 +254,35 @@ describe("TerminalViewport editing shortcuts follow the platform the webview rep
   });
 
   /**
-   * Scenario: on Linux or Windows, where the Windows key is the operating
-   * system's, press Win+Left. The desktop app does not read it as macOS's
-   * Cmd+Left, so nothing reaches the agent.
+   * Scenario: on every platform, open an agent's terminal and press each
+   * editing shortcut in the table the TUI uses (`tests/fixtures/editing-shortcuts.json`)
+   * — including another platform's, such as Ctrl+Backspace on a Mac or
+   * Alt+Delete on Linux. Each reaches the agent as exactly the bytes the TUI
+   * sends for it, so a shortcut does the same thing in both clients.
    */
-  it("leaves Super+Left alone outside macOS", () => {
-    onPlatform("linux");
+  it.each(
+    (["mac", "windows", "linux"] as const).flatMap((platform) =>
+      [...shared.translated, ...shared.standard].map(
+        (row) => [`${platform}: ${[...row.modifiers, row.key].join("+")} (${row.action})`, platform, row] as const,
+      ),
+    ),
+  )("%s", (_name, platform, row) => {
+    onPlatform(platform);
     const { sent, press } = mountTerminal();
-    press(arrowLeft({ metaKey: true }));
-    expect(sent).toEqual([]);
+    press(sharedKey(row));
+    expect(sent).toEqual([row.bytes]);
+  });
+
+  /**
+   * Scenario: on Windows, press Win+Backspace in an agent's terminal. WebView2
+   * reports the Windows key as Meta, so the chord reaches the agent as the
+   * TUI's "delete to the start of the line" rather than a one-character delete.
+   */
+  it("reads the Windows key as the TUI's Super on Windows", () => {
+    onPlatform("windows");
+    const { sent, press } = mountTerminal();
+    press(backspace({ metaKey: true }));
+    expect(sent).toEqual(["\x15"]);
   });
 
   /**
