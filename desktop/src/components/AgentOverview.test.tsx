@@ -60,6 +60,13 @@ const HOSTILE_CODEPOINTS = [
   "\u200e", "\u200f", "\u061c",
 ];
 
+/** What a reader sees without opening any `<details>`: the element's text with every disclosure removed. */
+function textOutsideDisclosures(element: HTMLElement): string {
+  const copy = element.cloneNode(true) as HTMLElement;
+  copy.querySelectorAll("details").forEach((disclosure) => disclosure.remove());
+  return copy.textContent ?? "";
+}
+
 function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
   const base = createFixtureSnapshot("crowded");
   return {
@@ -1725,13 +1732,23 @@ describe("AgentOverview", () => {
    * declared break, not a stamp difference. Reported against v0.43.0, whose
    * hint read "Only the build stamps differ" under a contract mismatch.
    */
+  /*
+   * Found by hand on 2026-10-01 (PR #1451): the overview showed `contract
+   * mismatch: the daemon is behind this app across 505-…. Protocol 10 matched
+   * on both sides, so the frames decode — …`, which no user can act on. The
+   * message below is the plain sentence `daemon_bridge.rs` now produces, and
+   * the slug and protocol number travel in `detail` instead. What is asserted
+   * is what a reader sees OUTSIDE the disclosure: no developer vocabulary, and
+   * every button the note offers named with what it does.
+   */
   it("offers Connect anyway on the overview across a declared contract break", async () => {
     const snapshot = createFixtureSnapshot("error");
     snapshot.connection = {
       ...snapshot.connection,
       daemonDetected: true,
       runningAgentCount: 9,
-      message: "contract mismatch: the daemon is behind this app across 708-worker-failure-reports-submitted. Protocol 10 matched on both sides, so the frames decode — but a declared compatibility break sits between these two builds, so a field can be read with the wrong meaning rather than failing outright. Builds: desktop is 0.43.0, daemon is 0.42.0. The daemon reports 9 live agents; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
+      message: "This daemon is older than this app. The two can still exchange information, but the app could misread some of what the daemon reports, so it has not connected. Update the daemon to this app's version.",
+      detail: "The daemon lacks these declared compatibility breaks: 708-worker-failure-reports-submitted. Both sides speak protocol 10. Builds: app 0.43.0, daemon 0.42.0.",
       buildStampMismatchOnly: true,
     };
     const runAction = vi.fn(async () => ({ ok: true }) as import("../types").DeckActionResult);
@@ -1739,15 +1756,27 @@ describe("AgentOverview", () => {
     const deck = runtime({ mode: "live", snapshot, runAction, reconnect });
     render(<AgentOverview runtime={deck} onNavigate={vi.fn()} />);
 
-    expect(screen.getByTestId("overview-incompatible")).toBeVisible();
-    const hint = within(screen.getByTestId("overview-incompatible")).getByText(/reports 9 running agents/);
-    expect(hint).not.toHaveTextContent("Only the build stamps differ");
-    expect(hint).toHaveTextContent("a declared compatibility break separates this daemon from this app");
+    const note = screen.getByTestId("overview-incompatible");
+    expect(note).toBeVisible();
+    expect(note).toHaveTextContent("This daemon is older than this app");
+    const visible = textOutsideDisclosures(note);
+    expect(visible).not.toMatch(/contract|protocol|mismatch|handshake|declared|wire|build stamp/i);
+    expect(visible).not.toContain("708-worker-failure-reports-submitted");
+    for (const button of within(note).getAllByRole("button")) {
+      const label = button.textContent?.trim() ?? "";
+      expect(visible, `the note explains its "${label}" button`).toMatch(new RegExp(`${label} (uses|tries|goes|stops) `));
+    }
+    const detail = within(note).getByTestId("connection-detail");
+    expect(detail.tagName).toBe("DETAILS");
+    expect(within(detail).getByText("Technical details")).toBeInTheDocument();
+    expect(detail).toHaveTextContent("708-worker-failure-reports-submitted");
+    expect(detail).toHaveTextContent("Both sides speak protocol 10");
+
     fireEvent.click(screen.getByTestId("overview-connect-anyway"));
     expect(runAction).not.toHaveBeenCalled();
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("The wire protocol matched on both sides");
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("a declared compatibility break separates the two builds");
-    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("stamp difference");
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent("may show some of this daemon's information wrongly");
+    expect(dialog.textContent).not.toMatch(/contract|protocol|mismatch|declared|wire|stamp/i);
     fireEvent.click(screen.getAllByRole("button", { name: "Connect anyway" }).at(-1)!);
 
     await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch" }));

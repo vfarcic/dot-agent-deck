@@ -72,6 +72,8 @@ export interface DesktopSnapshotDto {
     /** Issue #1240: the deck honours the directory browser's listing options. */
     listingOptions?: boolean;
     error?: string;
+    /** The technical half of `error` — break names, protocol numbers, builds — for a disclosure, never the sentence. */
+    errorDetail?: string;
     clientProtocolVersion: number;
     serverProtocolVersion?: number;
     clientBuildVersion: string;
@@ -1868,7 +1870,7 @@ function fixtureAcceptsPath(path: string): boolean {
 }
 
 /** The sentence the live crate's `newAgentReason` carries for a deck without `list-directories` (PRD #1223 U1), repeated by the fixture's older decks. */
-export const FIXTURE_NO_LISTING_REASON = "This daemon does not advertise list-directories, so it cannot be browsed for a directory to start in. Create agents on it from the TUI on its host, or upgrade the daemon.";
+export const FIXTURE_NO_LISTING_REASON = "This daemon is too old to let this app browse its folders, so new agents cannot be started on it from here. Start them from a terminal on its machine, or update the daemon.";
 
 /** What a fixture deck says about a path that names no directory it has, in the daemon's own `unresolved` wording. */
 /** The live crate's `CONFIGURED_ROLE_COMMAND_UNSUPPORTED`, repeated by the fixture's older and non-Unix decks (PRD #1223 M6). */
@@ -2051,15 +2053,22 @@ export function modeScopedKey(base: string): string {
  * for EVERY incompatible status, which is wrong for the far more common
  * build-stamp case and would have told a user to look at a protocol version
  * that matched (issue #801). It now says which of the two checks failed, using
- * the same flag the Connect anyway affordance is gated on.
+ * the same flag the Connect anyway affordance is gated on — in the user's terms
+ * (CLAUDE.md rule 21), with the numbers left to {@link fallbackConnectionDetail}.
  */
 function fallbackConnectionMessage(connection: DesktopSnapshotDto["connection"]): string {
   if (connection.status === "connected") return "Daemon responding";
   if (connection.status !== "incompatible") return "Daemon unavailable";
   if (connection.buildStampMismatchOnly) {
-    return `Build mismatch: desktop is ${connection.clientBuildVersion}, daemon is ${connection.daemonBuildVersion ?? "unreported"}.`;
+    return "This daemon and this app are different versions. The two can still exchange information, but the app could misread some of what the daemon reports, so it has not connected. Run the same version of both.";
   }
-  return `Protocol mismatch: desktop v${connection.clientProtocolVersion}, daemon v${connection.serverProtocolVersion ?? "unknown"}`;
+  return "This daemon and this app are different versions and cannot work together. Run the same version of both.";
+}
+
+/** The technical half of {@link fallbackConnectionMessage}, for the Technical details disclosure. */
+function fallbackConnectionDetail(connection: DesktopSnapshotDto["connection"]): string | undefined {
+  if (connection.status !== "incompatible") return undefined;
+  return `Protocol: app ${connection.clientProtocolVersion}, daemon ${connection.serverProtocolVersion ?? "not reported"}. Builds: app ${connection.clientBuildVersion}, daemon ${connection.daemonBuildVersion ?? "not reported"}.`;
 }
 
 /**
@@ -2232,6 +2241,9 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       deckId: dto.connection.deckId,
       socketPath: dto.connection.socketPath,
       message: dto.connection.error ?? fallbackConnectionMessage(dto.connection),
+      // Paired with the message it explains: the crate's own detail with the
+      // crate's sentence, the synthesised one only with the synthesised sentence.
+      detail: dto.connection.error === undefined ? fallbackConnectionDetail(dto.connection) : dto.connection.errorDetail,
       daemonDetected: dto.connection.status === "connected" || dto.connection.status === "incompatible",
       runningAgentCount: dto.connection.runningAgentCount,
       buildStampMismatchOnly: dto.connection.buildStampMismatchOnly,

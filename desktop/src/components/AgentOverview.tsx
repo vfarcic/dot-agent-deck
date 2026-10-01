@@ -6,6 +6,8 @@ import { modeScopedKey } from "../lib/bridge";
 import { VOICE_ACTIONS, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
+import { ConnectionDetail } from "./ConnectionDetail";
+import { CONNECT_ANYWAY_BODY, incompatibleRemedy } from "../lib/connectionRemedy";
 import { NewAgentDialog, NO_DIALOG_FOR_DECK, NO_DIALOG_TO_DISCARD, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
 import type { NewAgentDraft } from "../lib/newAgentDraft";
 import { DeckSelector } from "./DeckSelector";
@@ -1064,8 +1066,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const requestConnectAnyway = () => {
     if (mode !== "live" || !connection.buildStampMismatchOnly) return;
     setConfirm({
-      title: "Connect to a differently-built daemon?",
-      body: "The wire protocol matched on both sides, so this daemon and this app agree on the shape of everything they exchange. But a declared compatibility break separates the two builds — a field whose meaning changed while its shape did not — so some of what this daemon reports can be read with the wrong meaning. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
+      title: "Connect to a daemon from a different version?",
+      body: CONNECT_ANYWAY_BODY,
       label: "Connect anyway",
       busyLabel: "Connecting…",
       action: async () => {
@@ -1479,11 +1481,13 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
         <p>{message ?? DECK_STATE_FALLBACK.incompatible}</p>
         <p className="overview-note-hint">
           {connection.runningAgentCount === undefined
-            ? "A daemon answered the handshake, but this build cannot read its agent list. Nothing is listed rather than guessed."
-            : `A daemon answered the handshake and reports ${connection.runningAgentCount} running ${connection.runningAgentCount === 1 ? "agent" : "agents"}, but this build cannot read them. Nothing is listed rather than guessed.`}
-          {onOpenDeck && " Start, stop and replace live on the Daemons screen."}
-          {onConnectAnyway && " The wire protocol agreed, so you can still connect to this daemon as it is — but a declared compatibility break separates this daemon from this app, so read what it reports with that in mind."}
+            ? "This app cannot show this daemon's agents until the two match, so nothing is listed rather than guessed."
+            : `The daemon reports ${connection.runningAgentCount} running ${connection.runningAgentCount === 1 ? "agent" : "agents"}, but this app cannot show ${connection.runningAgentCount === 1 ? "it" : "them"} until the two match, so nothing is listed rather than guessed.`}
+          {" "}
+          {/* Names exactly the buttons rendered below, with what each does (CLAUDE.md rule 21). */}
+          {incompatibleRemedy(connection, { openDaemons: Boolean(onOpenDeck), connectAnyway: Boolean(onConnectAnyway), reconnect: true })}
         </p>
+        <ConnectionDetail detail={connection.detail} />
         {overrideError && <p className="overview-note-hint" data-testid="overview-connect-anyway-error">{overrideError}</p>}
         <div>
           {onOpenDeck && <button className="button secondary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open daemons</button>}

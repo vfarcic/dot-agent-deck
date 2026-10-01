@@ -68,7 +68,7 @@ const STATES: StateExpectation[] = [
     note: "overview-incompatible",
     lampClass: "connection-error",
     agents: "—",
-    daemonState: "Protocol handshake failed. Desktop expects v6; daemon reported v5.",
+    daemonState: "This daemon is older than this app, and the two cannot work together. Update the daemon to this app's version.",
   },
 ];
 

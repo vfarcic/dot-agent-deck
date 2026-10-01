@@ -510,6 +510,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .connection-banner > div { display: flex; flex-direction: column; gap: 2px; }
 .connection-banner strong { font-size: 11px; }
 .connection-banner span { font-size: 10px; }
+.connection-detail { font-size: 10px; }
+.connection-detail summary { cursor: pointer; width: fit-content; }
+.connection-detail > span { display: block; margin-top: 2px; overflow-wrap: anywhere; }
+.overview-note .connection-detail { font-size: 12px; color: var(--muted); }
 .connection-banner .button { margin-left: auto; }
 .connection-actions { margin-left: auto; display: flex !important; flex-direction: row !important; gap: 6px !important; }
 .connection-actions .button { margin-left: 0; }

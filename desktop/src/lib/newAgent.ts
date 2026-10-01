@@ -35,7 +35,7 @@ export const DECK_STATE_FALLBACK = {
   loading: "Reading the daemon's agent list.",
   unconfigured: "This daemon has no address yet.",
   disconnected: "No daemon is listening on the configured socket.",
-  incompatible: "A daemon answered but this build cannot speak to it.",
+  incompatible: "This daemon and this app are different versions and cannot work together.",
 } as const;
 
 /**

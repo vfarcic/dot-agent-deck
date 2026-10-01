@@ -953,7 +953,7 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
   const connection = connected
     ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding" }
     : state === "error"
-      ? { status: "error" as const, message: "Protocol handshake failed. Desktop expects v6; daemon reported v5." }
+      ? { status: "error" as const, daemonDetected: true, message: "This daemon is older than this app, and the two cannot work together. Update the daemon to this app's version.", detail: "The app speaks protocol 6; the daemon reports protocol 5." }
       : { status: "disconnected" as const, message: "No daemon is listening on the configured socket." };
 
   const fleet = state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : agents;

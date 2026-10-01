@@ -130,6 +130,13 @@ export interface ConnectionView {
   pending?: boolean;
   message?: string;
   /**
+   * The technical half of an incompatible daemon's `message`: the declared
+   * compatibility breaks by name, the protocol number on each side and the two
+   * builds. A user cannot act on any of it, so it is shown only behind a
+   * Technical details disclosure, never in the sentence.
+   */
+  detail?: string;
+  /**
    * Which kind of deck this connection is to (PRD #741 M7): `"local"` for a
    * daemon on this machine, `"remote"` for one reached over an ssh tunnel.
    *

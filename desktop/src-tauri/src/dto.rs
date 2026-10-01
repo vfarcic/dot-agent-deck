@@ -233,6 +233,12 @@ pub struct DesktopConnection {
     pub deck_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The technical half of [`Self::error`] for an incompatible daemon: the
+    /// declared breaks by name, the protocol number on each side, the two
+    /// builds. The webview shows it behind a Technical details disclosure and
+    /// never in the sentence, which says only what a user can act on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
     pub client_protocol_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_protocol_version: Option<u32>,
@@ -2304,6 +2310,7 @@ pub(crate) fn disconnected_snapshot(
             socket_path: deck_path_text(endpoint),
             deck_id: deck_wire_id(endpoint),
             error: Some(safe_message(error)),
+            error_detail: None,
             client_protocol_version: PROTOCOL_VERSION,
             server_protocol_version: None,
             client_build_version: dot_agent_deck::build_id::local_build_id(),

@@ -272,13 +272,15 @@ The app looks for the daemon at the same default socket as the TUI. If you set `
 
 ### Keep the app and the daemon on the same release
 
-When it connects, the app compares its protocol and its declared compatibility breaks with the daemon's:
+When it connects, the app checks whether it and the daemon can work together:
 
 | Situation | What the Dashboard shows | What to do |
 |---|---|---|
-| Same protocol, no compatibility break between the two builds | Connects normally | Nothing |
-| Same protocol, one side declares a compatibility break the other lacks | **Incompatible daemon**, naming the break and which side is behind, with **Connect anyway** | Upgrade the older side. **Connect anyway** connects for this session, but the app may misread some of what the daemon reports. |
-| Different protocol | **Incompatible daemon**, no Connect anyway | Upgrade the older side, then restart the daemon with the matching binary: `dot-agent-deck daemon restart`, then start it again with the TUI or `daemon serve` |
+| The two are compatible | Connects normally | Nothing |
+| The two can exchange information, but one of them is older and the app could misread some of what the daemon reports | **Incompatible daemon**, saying which of the two is older, with **Connect anyway** | Update the older one. **Connect anyway** connects until you quit the app, but some of what the daemon shows may be wrong. |
+| The two cannot work together | **Incompatible daemon**, saying which of the two is older, without Connect anyway | Update the older one, then restart the daemon with the matching binary: `dot-agent-deck daemon restart`, then start it again with the TUI or `daemon serve` |
+
+**Technical details** under the message shows the exact versions on each side, which is what to include in a bug report.
 
 `daemon restart` refuses while agents or orchestration roles are live; see [Recycling the local daemon](#recycling-the-local-daemon). Upgrade the CLI and the desktop app together to avoid all of this.
 

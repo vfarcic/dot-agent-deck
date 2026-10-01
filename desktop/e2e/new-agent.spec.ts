@@ -340,7 +340,7 @@ test.describe("the New agent flow", () => {
     const dialog = page.getByTestId("new-agent-dialog");
     const remote = page.getByTestId("new-agent-deck-list").locator(`[data-deck-id="${REMOTE_DECK}"]`);
     await expect(remote).toHaveAttribute("aria-disabled", "true");
-    await expect(remote).toContainText("does not advertise list-directories");
+    await expect(remote).toContainText("too old to let this app browse its folders");
     // Playwright will not click an `aria-disabled` element, which is the point;
     // the click is dispatched to prove the row itself ignores it too.
     await remote.dispatchEvent("click");

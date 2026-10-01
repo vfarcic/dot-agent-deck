@@ -43,6 +43,8 @@ import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel, type VoicePane } from "./components/VoiceControlPanel";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
+import { CONNECT_ANYWAY_BODY, incompatibleRemedy } from "./lib/connectionRemedy";
+import { ConnectionDetail } from "./components/ConnectionDetail";
 import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
@@ -1391,6 +1393,19 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
    */
   const remoteDeck = snapshot.connection.deckKind === "remote";
   const canControlDaemon = !remoteDeck && (snapshot.connection.status === "connected" || snapshot.connection.daemonDetected === true);
+  /*
+   * The connection banner's buttons, decided once so the buttons it renders and
+   * the sentence that explains them (`incompatibleRemedy`) cannot disagree. An
+   * incompatible daemon is `error` WITH `daemonDetected` — a daemon answered and
+   * was refused; `error` without it is the app's own bridge failing.
+   */
+  const incompatibleDaemon = snapshot.connection.status === "error" && snapshot.connection.daemonDetected === true;
+  const replaceable = mode === "live" && !remoteDeck && incompatibleDaemon;
+  const offersReplace = replaceable && snapshot.connection.runningAgentCount === 0;
+  const offersConnectAnyway = mode === "live" && snapshot.connection.status === "error" && snapshot.connection.buildStampMismatchOnly === true;
+  const bannerRemedy = incompatibleDaemon
+    ? incompatibleRemedy(snapshot.connection, { replaceDaemon: offersReplace, replaceWithheld: replaceable && !offersReplace, connectAnyway: offersConnectAnyway, reconnect: true })
+    : undefined;
 
   const coordinator = snapshot.agents.find((agent) => agent.isStartRole);
 
@@ -1593,8 +1608,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const requestConnectAnyway = () => {
     if (!snapshot.connection.buildStampMismatchOnly) return;
     setConfirm({
-      title: "Connect to a differently-built daemon?",
-      body: "The wire protocol matched on both sides, so this daemon and this app agree on the shape of everything they exchange. But a declared compatibility break separates the two builds — a field whose meaning changed while its shape did not — so some of what this daemon reports can be read with the wrong meaning. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
+      title: "Connect to a daemon from a different version?",
+      body: CONNECT_ANYWAY_BODY,
       label: "Connect anyway",
       busyLabel: "Connecting…",
       action: async () => {
@@ -1603,7 +1618,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           // The allowance is read by the NEXT handshake, so the reconnect is
           // what actually connects; the crate caches no verdict.
           await runtime.reconnect();
-          setNotice("Connected to the differently-built daemon. The mismatch stays in the connection banner for this session.");
+          setNotice("Connected anyway. The warning stays at the top of this screen until you quit the app.");
         } catch (cause) {
           setNotice(cause instanceof Error ? cause.message : String(cause));
         }
@@ -1868,7 +1883,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         {(snapshot.connection.status !== "connected" || snapshot.connection.buildStampMismatchOnly || snapshot.connection.selectionFallback) && (
           <div className={`connection-banner connection-${snapshot.connection.status}`} role="alert">
             {snapshot.connection.status === "loading" ? <RefreshCw className="spin" size={16} /> : <ShieldAlert size={16} />}
-            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? (snapshot.connection.selectionFallback ? "Using the daemon on this machine" : "Connected to a differently-built daemon") : snapshot.connection.status === "error" ? "Desktop bridge error" : "Daemon disconnected"}</strong><span data-testid="connection-banner-message">{snapshot.connection.message && displayText(snapshot.connection.message, DISPLAY_LIMITS.message)}</span>{/*
+            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? (snapshot.connection.selectionFallback ? "Using the daemon on this machine" : "Connected to a daemon from a different version") : incompatibleDaemon ? "Incompatible daemon" : snapshot.connection.status === "error" ? "Desktop bridge error" : "Daemon disconnected"}</strong><span data-testid="connection-banner-message">{snapshot.connection.message && displayText(snapshot.connection.message, DISPLAY_LIMITS.message)}</span>{bannerRemedy && <span data-testid="connection-banner-remedy">{bannerRemedy}</span>}<ConnectionDetail detail={snapshot.connection.detail} />{/*
               PRD #741 M7. The stored selection could not be honoured, so the
               app is on the local deck — and it says which of the two reasons it
               was. This is why the banner's condition now includes it: a
@@ -1876,7 +1891,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
               the substitution would be silent, and acting on the wrong machine's
               agents is the outcome that makes it worth a row.
             */}{snapshot.connection.selectionFallback && <span data-testid="selection-fallback">{displayText(snapshot.connection.selectionFallback, DISPLAY_LIMITS.message)}</span>}{/* PRD #741 M7: why Start and Replace are absent, said once, where they would have been. */}{remoteDeck && snapshot.connection.localOnlyReason && <span data-testid="remote-deck-notice">{displayText(snapshot.connection.localOnlyReason, DISPLAY_LIMITS.message)}</span>}</div>
-            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && !remoteDeck && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{mode === "live" && !remoteDeck && snapshot.connection.daemonDetected && snapshot.connection.status === "error" && snapshot.connection.runningAgentCount === 0 && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{mode === "live" && snapshot.connection.status === "error" && snapshot.connection.buildStampMismatchOnly && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
+            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && !remoteDeck && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{offersReplace && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{offersConnectAnyway && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
           </div>
         )}
 
