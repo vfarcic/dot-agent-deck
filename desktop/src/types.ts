@@ -850,7 +850,13 @@ export type DeckAction =
   | { type: "start_daemon" }
   | { type: "stop_daemon"; force?: boolean }
   | { type: "restart_daemon" }
-  | { type: "allow_build_mismatch" }
+  /**
+   * Connect anyway (issue #801). `deckId` names the deck whose refusal the
+   * user pressed it on (issue #1472); the crate connects to THAT deck and
+   * rejects with the reason when it still cannot. Absent means the selected
+   * deck.
+   */
+  | { type: "allow_build_mismatch"; deckId?: string }
   /**
    * The Runs screen's launch. `taskPrompt` may be empty (issue #1044): the deck
    * then composes a coordinator context with no task section and the

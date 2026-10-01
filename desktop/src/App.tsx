@@ -1498,11 +1498,12 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       label: "Connect anyway",
       busyLabel: "Connecting…",
       action: async () => {
+        const deckId = snapshot.connection.deckId;
         try {
-          await runtime.runAction({ type: "allow_build_mismatch" });
-          // The allowance is read by the NEXT handshake, so the reconnect is
-          // what actually connects; the crate caches no verdict.
-          await runtime.reconnect();
+          // The crate handshakes this deck again, emits its snapshot and
+          // rejects with the reason if it still did not connect (issue #1472),
+          // so the notice below is only reached once it has.
+          await runtime.runAction({ type: "allow_build_mismatch", ...(deckId === undefined ? {} : { deckId }) });
           setNotice("Connected to the differently-built daemon. The mismatch stays in the connection banner for this session.");
         } catch (cause) {
           setNotice(cause instanceof Error ? cause.message : String(cause));

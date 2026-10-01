@@ -148,7 +148,8 @@ pub(crate) mod test_override {
 
         /// Scenario: every source file in the crate is read, comment lines
         /// skipped. Outside this module no line calls `Endpoint::local()` and
-        /// no line names `DOT_AGENT_DECK_ATTACH_SOCKET`, so no reader bypasses
+        /// no line names `DOT_AGENT_DECK_ATTACH_SOCKET` other than a
+        /// `Command::env` handing it to a spawned child, so no reader bypasses
         /// the seam and no test goes back to moving the local deck for the
         /// whole process.
         #[test]
@@ -170,8 +171,16 @@ pub(crate) mod test_override {
                     if line.trim_start().starts_with("//") {
                         continue;
                     }
+                    // A `Command::env` on a spawned CHILD is exempt: it moves no
+                    // deck in this process and reads none, which is what the
+                    // sweep protects. `daemon_bridge`'s opt-in older-daemon test
+                    // (issue #1472) starts a daemon that way, and `daemon serve`
+                    // takes its socket from nothing else.
+                    let child_env = line
+                        .trim_start()
+                        .starts_with(".env(\"DOT_AGENT_DECK_ATTACH_SOCKET\"");
                     if line.contains("Endpoint::local()")
-                        || line.contains("DOT_AGENT_DECK_ATTACH_SOCKET")
+                        || (line.contains("DOT_AGENT_DECK_ATTACH_SOCKET") && !child_env)
                     {
                         offenders.push(format!(
                             "{}:{}: {}",

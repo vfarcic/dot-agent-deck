@@ -990,7 +990,13 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "overview" });
   }, [voiceContext]);
   const [confirm, setConfirm] = useState<ConfirmState>();
-  const [overrideError, setOverrideError] = useState<string>();
+  /**
+   * Why Connect anyway did not connect, and on WHICH deck (issue #1472). Keyed
+   * by the deck it was pressed on, because that is where the reader is looking:
+   * a refused deck in a fleet is rarely the selected one, and an error filed
+   * under the selection was rendered on a group nobody had clicked.
+   */
+  const [overrideError, setOverrideError] = useState<{ deckId: string | undefined; message: string }>();
   /**
    * PRD #1223 U4 — see {@link StopControlsContext}. The deck an agent is on is
    * `daemonId`, the wire id every deck-targeted action names; the connection
@@ -1045,11 +1051,15 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * it.
    *
    * The allowance is this APP's, not one deck's — `allow_build_mismatch` sets a
-   * process-wide flag the next handshake reads — so it stays one control on the
-   * selected deck's group rather than one per deck in a fleet.
+   * process-wide flag every later handshake reads. What is per deck is the
+   * refusal the user pressed it on, so the gate reads THAT deck's connection
+   * and the action names it (issue #1472): the crate connects to that deck and
+   * rejects with the reason when it still cannot. Reading the SELECTED deck's
+   * connection here is what made the button do nothing at all on a refused
+   * deck beside a healthy, selected local one.
    */
-  const requestConnectAnyway = () => {
-    if (mode !== "live" || !connection.buildStampMismatchOnly) return;
+  const requestConnectAnyway = (refused: ConnectionView) => {
+    if (mode !== "live" || !refused.buildStampMismatchOnly) return;
     setConfirm({
       title: "Connect to a differently-built daemon?",
       body: "The wire protocol matched on both sides, so this daemon and this app agree on the shape of everything they exchange. But a declared compatibility break separates the two builds — a field whose meaning changed while its shape did not — so some of what this daemon reports can be read with the wrong meaning. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
@@ -1058,12 +1068,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       action: async () => {
         setOverrideError(undefined);
         try {
-          await runtime.runAction({ type: "allow_build_mismatch" });
-          // The allowance is read by the NEXT handshake, so the reconnect is
-          // what actually connects; the crate caches no verdict.
-          await runtime.reconnect();
+          // The crate handshakes the deck again and emits its snapshot, so the
+          // group turns into the connected deck on its own; no reconnect, which
+          // would re-establish the whole fleet to show one deck.
+          await runtime.runAction({ type: "allow_build_mismatch", ...(refused.deckId === undefined ? {} : { deckId: refused.deckId }) });
         } catch (cause) {
-          setOverrideError(cause instanceof Error ? cause.message : String(cause));
+          setOverrideError({ deckId: refused.deckId, message: cause instanceof Error ? cause.message : String(cause) });
         }
       },
     });
@@ -1146,8 +1156,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               fleetSize={decks.length}
               onOpenDeck={openDeck}
               onReconnect={() => void runtime.reconnect()}
-              overrideError={deck.snapshot.connection.deckId === connection.deckId ? overrideError : undefined}
-              onConnectAnyway={mode === "live" && deck.snapshot.connection.buildStampMismatchOnly ? requestConnectAnyway : undefined}
+              overrideError={overrideError && deck.snapshot.connection.deckId === overrideError.deckId ? overrideError.message : undefined}
+              onConnectAnyway={mode === "live" && deck.snapshot.connection.buildStampMismatchOnly ? () => requestConnectAnyway(deck.snapshot.connection) : undefined}
               onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId }) : undefined}
             />
           ))}
@@ -1452,6 +1462,8 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
       <OverviewNote className={noteClass} testId="overview-disconnected" icon={<ShieldAlert size={24} />} title="Daemon disconnected">
         <p>{message ?? DECK_STATE_FALLBACK.disconnected}</p>
         <p className="overview-note-hint">Nothing can be said about the fleet until a daemon answers, so this list is blank rather than stale. {onOpenDeck ? "Start one from the Daemons screen, then reconnect." : "Start one, then reconnect."}</p>
+        {/* Issue #1472: a deck that stopped answering during Connect anyway lands here, and the reason must land with it. */}
+        {overrideError && <p className="overview-note-hint" data-testid="overview-connect-anyway-error">{overrideError}</p>}
         <div>
           {onOpenDeck && <button className="button secondary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open daemons</button>}
           <button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button>

@@ -1213,6 +1213,50 @@ pub(crate) async fn get_snapshot(links: &DaemonLinks) -> DesktopSnapshot {
     snapshot_of(crate::dto::DeckScope::selected().endpoint(), links).await
 }
 
+/// Connect anyway (issue #801), answered for the deck the user pressed it on
+/// (issue #1472).
+///
+/// Arms the session allowance and handshakes `endpoint` again. The snapshot it
+/// returns is what that deck now looks like, so the caller reports what
+/// actually happened instead of assuming the connection came up: before #1472
+/// the action handed back the SELECTED deck's snapshot, which said nothing
+/// about a refused deck the overview had offered the button on.
+///
+/// The `invalidate_all` is carried over from #801's handler unchanged. It is
+/// not what lets the deck connect — a refusal is never held (see
+/// [`DaemonLinks::trusted`]), so the next handshake reads the allowance anyway —
+/// and the tests here pass without it; it re-classifies every deck under the
+/// new allowance at once rather than leaving that to each link's revalidation.
+pub(crate) async fn connect_anyway(links: &DaemonLinks, endpoint: &Endpoint) -> DesktopSnapshot {
+    allow_build_mismatch_this_session();
+    links.invalidate_all().await;
+    snapshot_of(endpoint, links).await
+}
+
+/// Why [`connect_anyway`] did not leave the deck connected, in the words the
+/// user reads, or `None` when it did.
+///
+/// The deck's own connection message still says what the daemon reported; this
+/// is the sentence for the button the user just pressed, so it says what went
+/// wrong and what to do rather than repeating the handshake.
+pub(crate) fn connect_anyway_failure(connection: &DesktopConnection) -> Option<String> {
+    match connection.status {
+        ConnectionStatus::Connected => None,
+        ConnectionStatus::Disconnected => Some(
+            "Could not connect to this daemon: it stopped answering. Check that it is still running, then press Reconnect."
+                .into(),
+        ),
+        ConnectionStatus::Incompatible if !connection.build_stamp_mismatch_only => Some(
+            "Could not connect to this daemon: it now runs a build this app cannot talk to at all, which Connect anyway cannot get past. Run a daemon from the same release as the app."
+                .into(),
+        ),
+        ConnectionStatus::Incompatible => Some(
+            "Could not connect to this daemon. Press Reconnect to try again; if it is still refused, run a daemon from the same release as the app."
+                .into(),
+        ),
+    }
+}
+
 /// [`get_snapshot`] against a named deck rather than the selected one.
 ///
 /// Split out at M4(a) so the snapshot path can be driven against a scripted
@@ -6447,5 +6491,221 @@ start = true
             on_local.is_empty(),
             "nothing reached the local deck: {on_local:?}"
         );
+    }
+
+    /// A daemon from an older release, run from its own binary in a private
+    /// directory, and killed by its own pid when the test ends — never by a
+    /// pattern another daemon on the machine could match (CLAUDE.md rule 12).
+    #[cfg(unix)]
+    struct OlderDaemon {
+        child: std::process::Child,
+        dir: std::path::PathBuf,
+        socket: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl OlderDaemon {
+        /// `None` when `DOT_AGENT_DECK_OLDER_DAEMON_BIN` is unset, so the test
+        /// that needs one can print `SKIP:` and return.
+        fn start(tag: &str) -> Option<Self> {
+            let binary = std::env::var_os("DOT_AGENT_DECK_OLDER_DAEMON_BIN")?;
+            let (dir, socket) = scratch_socket(tag);
+            let home = dir.join("home");
+            std::fs::create_dir_all(&home).expect("create the sandbox home");
+            let child = std::process::Command::new(binary)
+                .args(["daemon", "serve"])
+                .env("HOME", &home)
+                .env("DOT_AGENT_DECK_ATTACH_SOCKET", &socket)
+                .env("DOT_AGENT_DECK_SOCKET", dir.join("h"))
+                .env("DOT_AGENT_DECK_STATE_DIR", dir.join("state"))
+                .env("DOT_AGENT_DECK_SESSION", dir.join("session.toml"))
+                .env("DOT_AGENT_DECK_SCHEDULES", dir.join("schedules.toml"))
+                .env("DOT_AGENT_DECK_LOG", dir.join("deck.log"))
+                .env("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0")
+                .env("DOT_AGENT_DECK_EXPERIMENTAL", "0")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the older daemon");
+            let daemon = Self { child, dir, socket };
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !daemon.socket.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the older daemon never bound {}",
+                    daemon.socket.display()
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Some(daemon)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for OlderDaemon {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Issue #1472, against a REAL daemon from an older release rather than a
+    /// scripted reply: the pairing the maintainer hit, where `PROTOCOL_VERSION`
+    /// matches and a declared compatibility break the older build lacks
+    /// separates the two.
+    ///
+    /// Opt-in, because CI has no older binary to hand it: point
+    /// `DOT_AGENT_DECK_OLDER_DAEMON_BIN` at an installed release that predates
+    /// this build's newest `CONTRACT_BREAKS` entry. Without it the test prints
+    /// `SKIP:` and returns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_anyway_connects_a_real_older_daemon_refused_over_a_contract_break() {
+        let Some(older) = OlderDaemon::start("older") else {
+            eprintln!(
+                "SKIP: set DOT_AGENT_DECK_OLDER_DAEMON_BIN to an older release's binary to run this"
+            );
+            return;
+        };
+        let _guard = AllowanceGuard::acquire();
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&older.socket));
+
+        let refused = snapshot_of(&endpoint, &links).await;
+        assert_eq!(
+            refused.connection.status,
+            ConnectionStatus::Incompatible,
+            "the older daemon must be refused first, or this is not the reported pairing: {:?}",
+            refused.connection.error
+        );
+        assert!(
+            refused.connection.build_stamp_mismatch_only,
+            "a contract break with an equal protocol is what offers Connect anyway: {:?}",
+            refused.connection.error
+        );
+
+        let connected = connect_anyway(&links, &endpoint).await;
+
+        assert_eq!(
+            connected.connection.status,
+            ConnectionStatus::Connected,
+            "Connect anyway must connect: {:?}",
+            connected.connection.error
+        );
+        assert_eq!(connect_anyway_failure(&connected.connection), None);
+        assert!(
+            connected
+                .connection
+                .error
+                .as_deref()
+                .is_some_and(|caveat| caveat.contains("Connected anyway for this session")),
+            "the mismatch stays on screen after connecting: {:?}",
+            connected.connection.error
+        );
+
+        // And the user can work with it: an agent started through the link is
+        // listed on the next snapshot.
+        let daemon = links.trusted(&endpoint).await.expect("the connected link");
+        let agent_id = daemon
+            .client
+            .start_agent(dot_agent_deck::daemon_client::StartAgentOptions {
+                command: Some("cat".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("start an agent on the older daemon");
+        let listed = snapshot_of(&endpoint, &links).await;
+        assert!(
+            listed.agents.iter().any(|agent| agent.id == agent_id),
+            "the agent started on the older daemon is listed: {:?}",
+            listed
+                .agents
+                .iter()
+                .map(|agent| &agent.id)
+                .collect::<Vec<_>>()
+        );
+        daemon
+            .client
+            .stop_agent(&agent_id)
+            .await
+            .expect("stop the agent");
+    }
+
+    /// Issue #1472, the success half over a scripted socket so it runs
+    /// everywhere: a deck one declared break behind is refused, Connect anyway
+    /// handshakes it again and lists its agents, and nothing is reported as a
+    /// failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_anyway_connects_the_refused_deck_and_reports_no_failure() {
+        let _guard = AllowanceGuard::acquire();
+        let (dir, socket) = scratch_socket("ca-ok");
+        let listener = bind_trusted(&socket);
+        let listing = AttachResponse::agent_records(vec![listed_agent("agent-a", "pane-a")]);
+        let daemon = tokio::spawn(scripted_daemon_sequence(
+            listener,
+            vec![
+                hello_from_a_deck_one_declared_break_behind(),
+                hello_from_a_deck_one_declared_break_behind(),
+                listing,
+            ],
+        ));
+        let links = DaemonLinks::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+
+        let refused = snapshot_of(&endpoint, &links).await;
+        assert_eq!(refused.connection.status, ConnectionStatus::Incompatible);
+
+        let connected = connect_anyway(&links, &endpoint).await;
+        assert_eq!(connected.connection.status, ConnectionStatus::Connected);
+        assert_eq!(connected.agents.len(), 1, "the deck's agents are listed");
+        assert_eq!(connect_anyway_failure(&connected.connection), None);
+        assert_eq!(daemon.await.expect("no panic"), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Issue #1472: a deck that stopped answering by the time the user
+    /// confirmed is reported, in words that say what to do — never announced
+    /// as connected.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_anyway_reports_a_deck_that_stopped_answering() {
+        let _guard = AllowanceGuard::acquire();
+        let (dir, socket) = scratch_socket("ca-gone");
+        let links = DaemonLinks::default();
+
+        let snapshot = connect_anyway(&links, &Endpoint::Local(LocalEndpoint::at(&socket))).await;
+
+        assert_eq!(snapshot.connection.status, ConnectionStatus::Disconnected);
+        let failure = connect_anyway_failure(&snapshot.connection).expect("a failure is reported");
+        assert!(failure.contains("stopped answering"), "{failure}");
+        assert!(failure.contains("Reconnect"), "{failure}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Issue #1472: the allowance never reaches a protocol difference, so a
+    /// deck that turned out to speak another protocol is reported as one the
+    /// button cannot help with rather than left looking refused for no reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_anyway_reports_a_protocol_difference_it_cannot_get_past() {
+        let _guard = AllowanceGuard::acquire();
+        let (dir, socket) = scratch_socket("ca-proto");
+        let listener = bind_trusted(&socket);
+        let daemon = tokio::spawn(scripted_daemon_sequence(
+            listener,
+            vec![AttachResponse::hello(PROTOCOL_VERSION + 1)],
+        ));
+        let links = DaemonLinks::default();
+
+        let snapshot = connect_anyway(&links, &Endpoint::Local(LocalEndpoint::at(&socket))).await;
+
+        assert_eq!(snapshot.connection.status, ConnectionStatus::Incompatible);
+        assert!(!snapshot.connection.build_stamp_mismatch_only);
+        let failure = connect_anyway_failure(&snapshot.connection).expect("a failure is reported");
+        assert!(failure.contains("cannot get past"), "{failure}");
+        assert_eq!(daemon.await.expect("no panic"), 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
