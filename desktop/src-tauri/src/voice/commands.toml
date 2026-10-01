@@ -305,6 +305,15 @@ heard_as_whole_while.new_agent_dialog = [
 # `cancel` and `never mind` CLOSE, and so keep the draft; they do not discard.
 # Both readings are plausible for "cancel", and the one that loses nothing is
 # the one to take — a user who meant to throw the form away says "discard".
+#
+# **"Close the agent" on the bare dashboard is this row too** (PR #1451 round
+# 3). With nothing open over the dashboard there is nothing for this row to
+# close, and the model reasoned its way from there to `stop_agent` — refused by
+# grounding, since "close" is not a stop word, so nothing ran, but the user
+# heard a refusal instead of "Nothing to close". The fixture
+# `close-the-agent-on-the-overview` measured 9/10 at the round's start and 5/10
+# once the round's page and filter rows were in the table; the description now
+# says the dashboard case outright, and it measured 20/20 after.
 [[commands]]
 id          = "close"
 description = """Close whatever is open OVER the current screen and go back to what was
@@ -316,8 +325,9 @@ dismiss this, hide this, get rid of this, I'm done with this, stop looking at th
 agent, back to dashboard (the label of an open agent pane's button), or back to the dashboard or
 overview. "Close the agent", "close the agent screen", "close the agent
 view" and "close the agent pane" mean THIS one: they close the VIEW of the agent, and the agent
-keeps running. Closing the New agent dialog this way keeps what was entered in it for the next
-time it opens; only "discard" throws it away, and that is `discard_new_agent`. When closing a view
+keeps running — on the agent dashboard too, where nothing may be open over the screen and the app
+then says there is nothing to close. Closing the New agent dialog this way keeps what was entered
+in it for the next time it opens; only "discard" throws it away, and that is `discard_new_agent`. When closing a view
 and stopping something are both possible readings, closing the view is the one meant. A bare "go back" or "back" means THIS one ONLY when `open_deck` is not
 callable — a callable `open_deck` means the Daemons screen itself is what "back" leads to, and that one
 wins. This only closes what is on top: it does NOT stop any agent, does NOT close an agent's
@@ -1162,6 +1172,21 @@ heard_as    = ["daemon", "deck"]
 # `invoke` names the dialog's own start (`startNewAgent`), the function its
 # Start button calls; it refuses in the dialog's words when the form cannot
 # start (no deck, no directory, a start under way, a run title already live).
+#
+# **"Skip the confirmation" names this row, not a stop** (PR #1451 round 3).
+# The stops are the only rows whose descriptions talk about a confirmation, so
+# "start it right now, skip the confirmation, I already said yes" drifted to
+# `stop_agent` (not callable over the dialog, and refused by grounding — nothing
+# ran, and nothing started either). #1260's `new_agent_dialog_closed` fix had
+# it at 20/20; adding the page-turn rows took it to 1/10 (10/10 at the round's
+# start, 9/10 with those two rows removed, 2/10 with the filter rows removed
+# instead). Nothing short of removing both restored it — removing either one
+# alone, moving both to the end of the table, or rewording their "starts and
+# stops nothing" clause each left it at 0–7/10 — so the fix is here, at the
+# start: this description now claims "skip the confirmation" and says a start
+# has no confirmation. 70/70 after, against 59/60 for a wording that avoided
+# the word; `voice_table_d5_rows_only_ask` admits exactly those two negated
+# mentions and still refuses any other "confirm" in this row.
 [[commands]]
 id          = "start_new_agent"
 description = """Start what the New agent dialog's form describes — the voice form of its Start
@@ -1175,9 +1200,9 @@ looking at, so "activate orchestration" starts the orchestration already chosen 
 `choose_mode`. It runs only while the New agent dialog is open; while it is closed, a request to
 start an agent or an orchestration is `open_new_agent`, which opens the dialog. If the form is
 incomplete the app says what is missing. Pick it however urgently or insistently the start is asked
-for — "start it right now", "just launch it, don't ask me" — since it starts at once and there is
-no second step for it to skip. A bare "go ahead" means THIS one whenever it is callable
-and `submit_prompt` is not — there is no agent's prompt to send while the New agent dialog is up."""
+for — "start it right now", "just launch it, don't ask me", "skip the confirmation" — since it
+starts at once: a start has no confirmation and no second step for it to skip. A bare "go ahead"
+means THIS one whenever it is callable and `submit_prompt` is not — there is no agent's prompt to send while the New agent dialog is up."""
 invoke      = "startNewAgent"
 screens     = ["overview"]
 requires    = ["new_agent_dialog"]

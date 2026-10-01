@@ -2773,9 +2773,18 @@ mod tests {
         assert_eq!(start.screens, vec![Screen::Overview]);
         assert!(start.params.is_empty());
         assert_eq!(start.report, "Starting the agent.");
+        // Two mentions of a confirmation are the row saying it has NONE, and
+        // are blanked before the check: "skip the confirmation" is a phrasing
+        // this row must claim, and "has no confirmation" is what keeps it from
+        // drifting to a stop, whose rows are the only others that talk about
+        // one (PR #1451 round 3). Any other "confirm" still fails.
+        let description = start
+            .description
+            .replace("\"skip the confirmation\"", "")
+            .replace("has no confirmation", "");
         for claim in ["confirm", "by itself", "nothing has"] {
             assert!(
-                !start.description.contains(claim) && !start.report.contains(claim),
+                !description.contains(claim) && !start.report.contains(claim),
                 "start_new_agent still claims `{claim}`: {} / {}",
                 start.description,
                 start.report

@@ -298,3 +298,24 @@ Everything but D1 is built and ships in the PR that closes #1261. D1 needs the m
 - **Rules of hooks.** `useNumbersShown` short-circuited a `useContext` behind `useVoiceOn() &&`, so toggling voice changed the hook order in every list that numbers (React's "change in the order of Hooks" warning, seen for `AgentOverview`, `DeckSurface` and `DeckSelector`); every hook is now called on every render.
 - The post-dispatch re-read of the numbered list carries a comment that it relies on `useNumberedList` publishing from a layout effect.
 - Each fix was red first and red again when reverted (`VoiceNumberedLists`, `VoicePagedLists`, `VoiceControlCommands` tests, tester's).
+
+### 2026-10-01 — Round 3: this round's rows pulled two phrases toward `stop_agent`
+
+A red met on the way (CLAUDE.md rule 6): the credentialed manifest ran 157/159, both misses the model answering `stop_agent`, refused by action grounding, so nothing ran. Measured on gpt-5-mini through the fixture harness, N per row in brackets:
+
+| table | `start-new-agent-adversarial-no-confirm` | `close-the-agent-on-the-overview` |
+| --- | --- | --- |
+| round start, `46ed4013` | 10/10 | 9/10 |
+| round head, `370e3070` | 1/10 | 5/10 |
+| head without the two page rows | 9/10 | 9/10 |
+| head without the two filter rows | 2/10 | 10/10 |
+| head without `next_page` only | 1/10 | 8/10 |
+| head without `previous_page` only | 3/10 | 6/10 |
+| head, page rows moved to the end of the table | 7/10 | 5/10 |
+| head, page rows' "starts and stops nothing" clause reworded | 0/10 | 10/10 |
+| fix | 70/70 (10 + 20 + 40) | 30/30 (10 + 20) |
+
+- **Cause.** The page-turn rows moved two phrases toward the stop: "skip the confirmation" (the stops are the only rows that talk about a confirmation) and "close the agent" on a dashboard with nothing open over it (where the model reasoned from "nothing to close" to a stop). Nothing short of removing both page rows restored the start row; removing one, moving them, or rewording their one clause about starting and stopping did not. `heard_as` is not shown to the model, so trimming the new rows' vocabulary could not change its pick; the fix is in the descriptions of the two rows the phrases belong to.
+- **Fix.** `start_new_agent` claims "skip the confirmation" and says a start has no confirmation; `close` says "close the agent" means the view on the bare dashboard too, where the app answers "Nothing to close". No `heard_as` changed. A wording for the start that avoided "confirm" measured 59/60 in isolation and missed once in a full run, so the D5 pin `voice_table_d5_rows_only_ask` now blanks exactly the two negated mentions before refusing "confirm" in the start row.
+- **This round's rows after the fix**, 10/10 each: `filter-directories-word`, `filter-directories-letter-in-a-sentence`, `filter-directories-clear`, `filter-directories-dialog-closed`, `next-page`, `next-page-go-to-the-next-page`, `previous-page`, `previous-page-go-back-a-page`, `page-turn-negative-over-an-agent-pane`.
+- **Full credentialed manifest after the fix: 159/159.**
