@@ -1019,6 +1019,17 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // existing delivery MEANS -- inert text becomes model input -- and it takes
     // effect when the daemon starts on the new build.
     "1337-respawn-failure-report-submitted",
+    // Issue #505, at 10 without moving it -- #1337's shape: the text of an
+    // existing delivery changed, nothing on the wire did. The daemon's label on
+    // an unsolicited `work-done` told the orchestrator "you have no outstanding
+    // delegation to that worker" and "You did not commission this work - the
+    // worker was most likely tasked directly by a person", which was false
+    // whenever the commission ledger lost a real delegation (an abandoned pane
+    // close sweeps it). A newer daemon says only that the deck has no delegation
+    // to that worker on record, and that it cannot tell who tasked it -- so an
+    // orchestrator instruction or script matching the old words stops matching.
+    // It takes effect when the daemon starts on the new build.
+    "505-unsolicited-work-done-label-reworded",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.

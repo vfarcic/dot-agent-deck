@@ -7182,6 +7182,21 @@ impl AgentPtyRegistry {
     /// **not** restored. Losing a watch fails safe (no idle prompt for a worker
     /// whose pane we just tried to kill); resurrecting one could nag about a
     /// delegation whose pane the user explicitly asked to close.
+    ///
+    /// Issue #505: the commission ledger is not restored either, although losing
+    /// a commission does not fail safe the way losing a watch does — the worker's
+    /// genuinely delegated `work-done` then arrives as unsolicited. A restore is
+    /// not safe here, because a failed close is rarely a live agent: `StopAgent`
+    /// passes `closed = false` when `close_agent` answers `NotFound`, which means
+    /// the agent it was asked to stop is no longer in the registry, or when the
+    /// blocking task failed after `close_agent` had already removed the record.
+    /// Either way the pane may by now hold a successor, and a restored commission
+    /// would be credited to it — the pane-id-reuse laundering
+    /// [`Self::drain_commissions_touching`] and
+    /// [`Self::retire_commissions_of_replaced_agent`] exist to prevent. What
+    /// #505 fixed instead is the prose: the unsolicited label says only that
+    /// the deck holds no delegation on record, not that nobody made one
+    /// (`compose_work_done_feedback` in `state.rs`).
     pub fn finish_pane_close(&self, pane_id: &str, closed: bool) -> Vec<OutstandingDelegation> {
         let mut tracker = self.delegations.lock().unwrap();
         drop(tracker.close_waiters.remove(pane_id));
