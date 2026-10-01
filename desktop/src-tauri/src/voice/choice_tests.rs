@@ -296,7 +296,10 @@ fn choice_refuses_bare_controls_that_collide_with_another_spoken_name() {
         candidate(ParamKind::AgentRef, "agent-other", "Other"),
     ];
     assert_eq!(
-        [answer("two", &offered, &live), answer("cancel", &offered, &live)],
+        [
+            answer("two", &offered, &live),
+            answer("cancel", &offered, &live)
+        ],
         [ChoiceAnswer::Refused, ChoiceAnswer::Refused]
     );
     assert_eq!(
