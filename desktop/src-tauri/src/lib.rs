@@ -2954,7 +2954,9 @@ async fn desktop_voice_start(
     // open for the life of the app. The ticket is what stops a timer outliving
     // its own utterance and closing the next one.
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(voice::MAX_UTTERANCE).await;
+        // Not always the whole cap: a microphone kept open since the last
+        // utterance has been recording this one since then (PR #1451).
+        tokio::time::sleep(ticket.remaining()).await;
         // Blocking for the reason the open above is: releasing the device
         // joins its thread, which is as slow as the platform's teardown.
         let _ = tauri::async_runtime::spawn_blocking(move || hold.cap_reached(ticket)).await;

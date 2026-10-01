@@ -719,6 +719,60 @@ describe("voice control panel", () => {
     expect(screen.getByText("Heard: “Set the command to be.” — no matching action.")).toBeVisible();
   });
 
+  /** Scenario: something the user did not mean as a command is misheard, and straight after it they say a complete command. The command runs; the misheard words do not swallow it (Qodo on PR #1451). */
+  it("runs a complete command said straight after words that matched nothing", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([
+      { outcome: heard("Thanks for watching.") },
+      { outcome: heard("show me every agent"), status: { speech: true } },
+    ]);
+    const resolveVoice = joiningResolver();
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS * 2); });
+
+    expect(resolveVoice.mock.calls.map(([utterance]) => utterance)).toEqual(["Thanks for watching.", "Thanks for watching show me every agent", "show me every agent"]);
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.queryByText(/no matching action/)).not.toBeInTheDocument();
+  });
+
+  /** Scenario: a command paused in the middle still matches nothing once joined. The whole sentence is reported at once rather than waiting for more (Qodo on PR #1451). */
+  it("reports a joined sentence that still matches nothing at once", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([
+      { outcome: heard("Set the command to be.") },
+      { outcome: heard("devbox run agent"), status: { speech: true } },
+    ]);
+    render(<DeckShell runtime={runtime(joiningResolver(), voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS * 2); });
+
+    expect(screen.getByText("Heard: “Set the command to be devbox run agent” — no matching action.")).toBeVisible();
+  });
+
+  /** Scenario: after a joined sentence that matched nothing, the user goes on speaking. What they say next is worked out on its own, not joined onto the failed sentence (Qodo on PR #1451). */
+  it("does not join onto a joined sentence that matched nothing", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([
+      { outcome: heard("Set the command to be.") },
+      { outcome: heard("devbox run agent"), status: { speech: true } },
+      { outcome: heard("show me every agent"), status: { speech: true } },
+    ]);
+    const resolveVoice = joiningResolver();
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS * 4); });
+
+    expect(resolveVoice.mock.calls.map(([utterance]) => utterance)).toEqual(["Set the command to be.", "Set the command to be devbox run agent", "devbox run agent", "show me every agent"]);
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+  });
+
   /** Scenario: the user says something that matches no command, then turns voice off before the app has said so. Nothing about it appears afterwards. */
   it("drops a held command when voice is turned off", async () => {
     vi.useFakeTimers();

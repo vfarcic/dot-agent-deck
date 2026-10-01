@@ -1743,7 +1743,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * against the screen the user just left, which is the `unavailable` outcome
    * misfiring in the one direction nobody would notice.
    */
-  const resolveOne = useCallback(async (utterance: string, ours: () => boolean) => {
+  const resolveOne = useCallback(async (utterance: string, ours: () => boolean, alone?: string) => {
     if (!resolveVoice) return;
     /* PRD #1261 — a pending choice is answered first, locally, with no
        Commands backend call. Declared first, as a resolve is, so the answer
@@ -1818,22 +1818,45 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       /* PR #1451 — the first half of a command cut by a pause matches
          nothing on its own. Rather than say so at once, wait a moment for the
          rest; the next utterance joins it (`takeUtterance`). Not while
-         typing, where every utterance is the user's own words. */
+         typing, where every utterance is the user's own words.
+
+         A JOINED sentence (`alone` is the new words in it) is never held
+         again, so joins cannot chain. If it still matches nothing, the new
+         words are tried on their own — the first half may have been words
+         that were never meant as a command, and the user's next command must
+         not be swallowed by them (Qodo on the PR). If those match nothing
+         either, the joined sentence is the report, since it is everything the
+         user said. */
+      let final = answer;
       if (declaredDictation === undefined && HOLDABLE_OUTCOMES.has(answer.outcome.kind)) {
-        clearHeld();
-        held.current = { answer, transcript: utterance, continued: false };
-        heldTimer.current = window.setTimeout(() => {
-          heldTimer.current = undefined;
-          if (held.current && !held.current.continued) reportHeld();
-        }, VOICE_JOIN_WINDOW_MS);
-        return;
+        if (alone === undefined) {
+          clearHeld();
+          held.current = { answer, transcript: utterance, continued: false };
+          heldTimer.current = window.setTimeout(() => {
+            heldTimer.current = undefined;
+            if (held.current && !held.current.continued) reportHeld();
+          }, VOICE_JOIN_WINDOW_MS);
+          return;
+        }
+        declareVoiceScreen?.(declared.screen, declared.directories, declared.newAgent, endpointsRef.current?.(), declaredDictation);
+        const own = await resolveVoice(alone);
+        if (!ours()) return;
+        if (!HOLDABLE_OUTCOMES.has(own.outcome.kind)) {
+          const ownLost = dispatchLost(declared, current(), own.outcome.kind === "dispatch" ? own.outcome.params : []);
+          if (ownLost) {
+            setProblem(answerRefusal(ownLost));
+            return;
+          }
+          final = own;
+          setCapture({ sentence: heardSentence(alone), transcript: alone });
+        }
       }
-      setResult(answer);
-      if (answer.outcome.kind === "param_ambiguous") {
-        offerChoice(answer, declared);
-      } else if (answer.outcome.kind === "dispatch") {
+      setResult(final);
+      if (final.outcome.kind === "param_ambiguous") {
+        offerChoice(final, declared);
+      } else if (final.outcome.kind === "dispatch") {
         refusedRef.current = false;
-        const dispatched = dispatchDeclared(answer.outcome, declared);
+        const dispatched = dispatchDeclared(final.outcome, declared);
         /* What the dispatch reached refused it, in its own sentence, so the
            outcome's sentence — "Showing …", written before anything ran — is
            now false, and an Undo would reverse nothing. The refusal is the
@@ -1894,7 +1917,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         const joined = joinUtterances(waiting.transcript, transcription.outcome.transcript);
         forget();
         setCapture({ sentence: heardSentence(joined), transcript: joined });
-        await resolveOne(joined, ours);
+        await resolveOne(joined, ours, transcription.outcome.transcript);
         if (!ours()) return;
         await listen(ours);
         return;
