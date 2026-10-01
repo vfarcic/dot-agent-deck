@@ -50,6 +50,8 @@ Instead of writing the command yourself, you can describe the job to an agent th
 
 The authoring agent runs the command in the form's **Command** field, which is pre-filled from [`default_command`](configuration.md#set-the-command-new-agents-start-with); if that is empty, `claude` is used.
 
+It saves the schedule by running `schedule add` (or `schedule update` when editing) by the deck's full path, such as `/home/you/.local/bin/dot-agent-deck schedule add …`, so the schedule reaches this deck whatever the agent's own `PATH` holds. If you let the agent run commands through a permission rule, write the rule against the path shown in its pane: a Claude Code allow rule such as `Bash(dot-agent-deck schedule:*)` does not match it.
+
 **TUI, from the Schedules manager.** Press `s` on the dashboard (`S` also works, and the key can be remapped as `open_scheduled_tasks`; see [Keyboard Shortcuts](keyboard-shortcuts.md)), or click **[Schedules s]**. Press `a` (**[Add a]**), pick a directory (it becomes the schedule's default working directory), confirm the **New Schedule** form's **Dir** and **Command** fields, and the authoring agent starts in that directory. `Esc` or **[Cancel]** returns to the manager.
 
 **TUI, from the New Agent form.** Press `Ctrl+n`, choose a directory, and cycle the **Mode** field past your project's orchestrations to **schedule** (shown with the hint `authoring (one-off)`).

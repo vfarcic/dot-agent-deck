@@ -2701,6 +2701,7 @@ mod tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         }
     }
 
@@ -4022,10 +4023,10 @@ mod tests {
     // These run the PRODUCTION attach server in-process, twice, on two sockets.
     // What that adds over the scripted pair, item by item:
     //
-    //   - `bind_attach_listener` creates the inode with the production
-    //     umask-before-`bind(2)` dance, so `verify_endpoint_trusted`'s uid and
-    //     exactly-`0o600` predicate runs against a socket a real server made
-    //     rather than one `bind_trusted` restated the mode on afterwards;
+    //   - the listener is the production `IpcListener` the real server
+    //     accepts on, and `verify_endpoint_trusted`'s uid and exactly-`0o600`
+    //     predicate runs against its inode (made owner-only without the
+    //     production umask flip — see `RealDeck` for why);
     //   - the `Hello` reply, its `running_agents` summary and its capability
     //     advertisement are the daemon's own, not a fixture's;
     //   - `ListAgents` is the real handler joining a real `AgentPtyRegistry`
@@ -4040,34 +4041,29 @@ mod tests {
     // production server over a Unix socket and driving real agents through it.
     // -----------------------------------------------------------------------
 
-    /// One real daemon: the production attach server, bound by production code,
-    /// serving a real registry over a real Unix socket.
+    /// One real daemon: the production attach server serving a real registry
+    /// over a real Unix socket.
     ///
     /// **The bind happens on the calling thread, not inside the spawned task**,
     /// which is why nothing here polls for the socket to appear:
-    /// [`bind_attach_listener`] creates the inode before `start` returns and
-    /// `serve_attach` is handed the listener it created. The perf probe's
+    /// the inode exists before `start` returns and `serve_attach` is handed
+    /// the listener that created it. The perf probe's
     /// connect-until-it-works loop exists because it calls
     /// `run_attach_server_with_counter`, which binds inside the task; splitting
     /// the bind from the accept loop removes the race rather than waiting it
     /// out.
     ///
-    /// [`bind_attach_listener`] flips the **process** umask around its
-    /// `bind(2)`, which `scripted_daemon` above deliberately avoids. That is
-    /// safe here and the difference is the test runner: `cargo test-fast` is
-    /// nextest, which is process-per-test, so the flip is private to this test.
-    /// Under a plain `cargo test` the whole module shares one process and the
-    /// flip is momentary but global — and it is accepted rather than avoided,
-    /// because a socket this test created some other way would not be the thing
-    /// the trust check is supposed to be running against.
-    ///
-    /// "Momentary" is a property of the production helper rather than of this
-    /// call site, and since PRD #742 M11 it holds on the unwind path too:
-    /// `platform::fsperm::with_socket_umask` restores from a `Drop`, so a body
-    /// that panicked could not leave the process at `0o177`. Nothing here needs
-    /// a scope guard of its own — unlike `project/resolve/002`'s cwd, the flip
-    /// is confined to one `bind(2)` inside production code and is already back
-    /// before `start` returns.
+    /// **It does not bind with [`bind_attach_listener`]**, which flips the
+    /// **process** umask around its `bind(2)`: under a plain `cargo test` the
+    /// whole crate shares one process, and a sibling's `create_dir_all` landing
+    /// inside the flip made a directory with no execute bit, whose next `bind`
+    /// failed `EACCES` (issue #1078). [`crate::test_listener::bind_owner_only`]
+    /// makes the same inode — this user's socket at exactly `0o600`, which is
+    /// what `verify_endpoint_trusted` checks — without the flip, by making the
+    /// socket's directory owner-only before binding in it. What these
+    /// tests no longer exercise is the flip itself, the production helper's way
+    /// of creating the inode owner-only with no bind-then-chmod window; the
+    /// root crate's own tests cover that helper.
     ///
     /// [`bind_attach_listener`]: dot_agent_deck::daemon_protocol::bind_attach_listener
     #[cfg(unix)]
@@ -4085,14 +4081,15 @@ mod tests {
     #[cfg(unix)]
     impl RealDeck {
         fn start(tag: &str) -> Self {
-            use dot_agent_deck::daemon_protocol::{bind_attach_listener, serve_attach};
+            use dot_agent_deck::daemon_protocol::serve_attach;
             let (dir, socket) = scratch_socket(tag);
             let registry = Arc::new(dot_agent_deck::agent_pty::AgentPtyRegistry::new());
             // The initial receiver is dropped immediately: a broadcast channel
             // stays open with none, and every reader in these tests is a real
             // `SubscribeEvents` connection the daemon subscribes on its own.
             let (events, _initial) = tokio::sync::broadcast::channel(64);
-            let listener = bind_attach_listener(&socket).expect("bind the real attach socket");
+            let listener = crate::test_listener::bind_owner_only(&socket)
+                .expect("bind the real attach socket");
             let server = {
                 let registry = Arc::clone(&registry);
                 let events = events.clone();
@@ -4158,8 +4155,8 @@ mod tests {
     /// independent `AgentPtyRegistry` id counters, which is where it comes from
     /// in production. The `Hello` each deck answers is the daemon's own, so the
     /// classification, the capability capture and the running-agent summary are
-    /// all on the real path, and `verify_endpoint_trusted` runs against an inode
-    /// `bind_attach_listener` created.
+    /// all on the real path, and `verify_endpoint_trusted` runs against a real
+    /// server's owner-only inode.
     ///
     /// **What it does not prove.** Two LOCAL decks differ in their describe
     /// string as well as in their identity, so this pair is separable either
@@ -4465,13 +4462,13 @@ mod tests {
     /// production attach server and the assertion is a whole `snapshot_of` —
     /// handshake, capability capture and a real `ListAgents` join — so a
     /// regression that unqueued the handshake and requeued the listing would be
-    /// caught. The stalled side's inode is created by `bind_attach_listener`,
-    /// so the trust check it passes on the way in is the production one.
+    /// caught. The stalled side's inode is owner-only, so the trust check it
+    /// passes on the way in is the production one.
     ///
     /// **What is scripted here, stated rather than implied.** Only the
     /// *withholding of the reply*. A real daemon always answers, so a
     /// deterministic stall cannot be built out of one — the connection is
-    /// accepted on a production-bound listener and then simply not served, which
+    /// accepted on a production `IpcListener` and then simply not served, which
     /// is the condition being modelled (a daemon wedged before its reply) and
     /// not a fixture standing in for one. The `accepted` oneshot is what makes
     /// it deterministic: the healthy deck is not asked for anything until the
@@ -4484,11 +4481,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn an_unresponsive_deck_does_not_queue_a_real_decks_whole_snapshot() {
-        use dot_agent_deck::daemon_protocol::{bind_attach_listener, read_frame};
+        use dot_agent_deck::daemon_protocol::read_frame;
 
         let (stalled_dir, stalled_socket) = scratch_socket("m9-stall");
-        let stalled_listener =
-            bind_attach_listener(&stalled_socket).expect("bind the stalled deck's socket");
+        let stalled_listener = crate::test_listener::bind_owner_only(&stalled_socket)
+            .expect("bind the stalled deck's socket");
         let healthy = RealDeck::start("m9-healthy");
         let healthy_agent = healthy.spawn_agent("pane-healthy");
 
@@ -4654,11 +4651,11 @@ mod tests {
     // membership test above). So the "other" deck is a remote row whose
     // transport `EndpointTunnels::insert_route` points at a second production
     // attach server — the forwarded socket an `ssh -L` would hand the client,
-    // with the ssh hop taken out. The local deck is the first server, reached
-    // through `DOT_AGENT_DECK_ATTACH_SOCKET` because no document can name it;
-    // that write is process-global, which is safe under nextest's
-    // process-per-test model and is the precedent `terminal::tests` set for
-    // the same reason.
+    // with the ssh hop taken out. The local deck is the first server, and
+    // because no document can name it, it is moved with `crate::local_deck`'s
+    // per-thread test seam — not `DOT_AGENT_DECK_ATTACH_SOCKET`, which is
+    // process-global and moved the local deck for every sibling test under a
+    // plain `cargo test` (issue #1078).
     // -----------------------------------------------------------------------
 
     /// An All Decks document with one remote row, and the endpoint that row
@@ -4713,26 +4710,30 @@ mod tests {
             .expect("the second row is connectable")
     }
 
-    /// Make `local` the app's local deck and apply `settings`, asserting the
+    /// Make `local` this test's local deck and apply `settings`, asserting the
     /// fixture really selects All Decks with the local deck in force — the
-    /// state under which the old arm went to the wrong deck.
+    /// state under which the old arm went to the wrong deck. The local deck
+    /// moves back when the returned guard drops; the selection stays applied,
+    /// so the caller holds `SELECTION_LOCK`.
     #[cfg(unix)]
-    fn apply_all_decks_over(local: &RealDeck, settings: &crate::settings::DesktopSettings) {
+    fn apply_all_decks_over(
+        local: &RealDeck,
+        settings: &crate::settings::DesktopSettings,
+    ) -> crate::local_deck::test_override::LocalDeckOverride {
         let socket = local
             .endpoint
             .as_local()
             .expect("a RealDeck is local")
             .path()
             .to_path_buf();
-        // SAFETY: under nextest this test owns its process, so no other thread
-        // is reading the environment here. See the section comment above.
-        unsafe { std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket) };
+        let local_deck = crate::local_deck::test_override::point_local_deck_at(&socket);
         crate::dto::apply_settings_selection(settings);
         assert_eq!(
             crate::dto::selected_endpoint().identity(),
             local.endpoint.identity(),
             "fixture: All Decks resolves to the local deck, which is the real daemon `local`"
         );
+        local_deck
     }
 
     /// A plain `cat` agent with a name no fixture agent carries, so where it
@@ -4781,7 +4782,7 @@ mod tests {
         let local_agent = local.spawn_agent("pane-local");
         let remote_agent = remote.spawn_agent("pane-remote");
         let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
         state
             .tunnels
@@ -4861,7 +4862,7 @@ mod tests {
         let local = RealDeck::start("m3-refuse-local");
         let remote = RealDeck::start("m3-refuse-remote");
         let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
         state
             .tunnels
@@ -4884,7 +4885,7 @@ mod tests {
             }),
             ..crate::settings::DesktopSettings::default()
         };
-        apply_all_decks_over(&local, &without_row);
+        let _local_deck_again = apply_all_decks_over(&local, &without_row);
         let departed =
             crate::start_agent_action(&state, &remote_wire, plain_start("m3-departed")).await;
 
@@ -4980,7 +4981,7 @@ mod tests {
         let local = RealDeck::start("1083-all-local");
         let local_agent = local.spawn_agent("pane-local");
         let (settings, _remote) = all_decks_with_one_remote_row("build-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
 
         let launched = crate::activate_orchestration_action(&state, runs_launch(&local.dir)).await;
@@ -5081,7 +5082,7 @@ mod tests {
             "the two registries mint the same first id"
         );
         let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
         state
             .tunnels
@@ -5142,7 +5143,7 @@ mod tests {
         let builder = remote.spawn_agent("pane-builder");
         let bystander = remote.spawn_agent("pane-bystander");
         let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
         state
             .tunnels
@@ -5336,7 +5337,7 @@ mod tests {
         let tree = listing_tree(&remote.dir);
         configure_default_command(&remote.dir, "remote-default --flag");
         let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         local.kill_server();
         let state = crate::terminal::DesktopState::default();
         state
@@ -5468,7 +5469,7 @@ mod tests {
         let older = OlderDeck::start("m4-old-remote");
         let tree = listing_tree(&local.dir);
         let (settings, remote_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
         state
             .tunnels
@@ -5563,7 +5564,7 @@ mod tests {
         let outside = std::fs::canonicalize(&outside).expect("canonicalize the link's target");
         std::os::unix::fs::symlink(&outside, tree.join("link")).expect("create the symlink");
         let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
         state
             .tunnels
@@ -5644,7 +5645,7 @@ mod tests {
         let local = RealDeck::start("i1240-old-local");
         let older = OlderDeck::withholding("i1240-old-remote", &[CAP_LIST_DIRECTORIES_OPTIONS]);
         let (settings, remote_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
         state
             .tunnels
@@ -5725,7 +5726,7 @@ mod tests {
         let remote = RealDeck::start("m7-land-remote");
         let workdir = listing_tree(&remote.dir);
         let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
         state
             .tunnels
@@ -5807,7 +5808,7 @@ mod tests {
         let older = OlderDeck::withholding("m7-old-remote", &[CAP_AUTHORING_KIND]);
         let workdir = listing_tree(&local.dir);
         let (settings, remote_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
         state
             .tunnels
@@ -5907,7 +5908,7 @@ mod tests {
         let local = RealDeck::start("d2-relative-local");
         let older = OlderDeck::start("d2-relative-remote");
         let (settings, remote_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
         state
             .tunnels
@@ -6082,7 +6083,7 @@ start = true
         let project = configured_orchestration_project(&remote.dir);
         let ordinary = listing_tree(&remote.dir).join("alpha");
         let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
         state
             .tunnels
@@ -6239,7 +6240,7 @@ start = true
         let project = namesake_orchestration_project(&local.dir);
         let project_wire = project.to_str().expect("a UTF-8 path").to_string();
         let (settings, _unused_remote) = all_decks_with_one_remote_row("v4-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
         let local_wire = deck_wire_id(&local.endpoint);
 
@@ -6361,7 +6362,7 @@ start = true
         let project_wire = project.to_str().expect("a UTF-8 path").to_string();
         let (mut settings, older_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
         let oldest_endpoint = add_remote_row(&mut settings, "oldest-box.example.com");
-        apply_all_decks_over(&local, &settings);
+        let _local_deck = apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
         state
             .tunnels

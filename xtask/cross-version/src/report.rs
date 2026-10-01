@@ -514,7 +514,8 @@ impl Evidence {
                      private bubblewrap namespace, and each line below is a check that \
                      was measured and held: the mount, PID, network, IPC, UTS and user namespaces \
                      are private; `/tmp` and `/run/user/<uid>` (both endpoint roots) and \
-                     `/var/tmp` are sandbox directories; the operator's home is an empty tmpfs \
+                     `/var/tmp` are sandbox directories; `/var/lib/docker`, when the host has \
+                     one, and the operator's home are empty tmpfs mounts, the home \
                      with only the sandbox bound back into it; the rest of `/` is bound read-only; and \
                      the environment is built from an allowlist. \
                      `docs/develop/cross-version-harness.md` says what this does not cover.\n"

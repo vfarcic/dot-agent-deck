@@ -28,7 +28,7 @@
 import { useState } from "react";
 import { FileCog, X } from "lucide-react";
 import type { DesktopSettingsDto } from "../lib/bridge";
-import type { SettingsSection } from "../lib/settingsContract";
+import type { SettingsPanelProps, SettingsSection } from "../lib/settingsContract";
 import { SETTINGS_SECTIONS } from "../lib/settingsRegistry";
 import type { RuntimeMode } from "../types";
 
@@ -36,7 +36,7 @@ interface SettingsSheetProps {
   open: boolean;
   onClose: () => void;
   settings: DesktopSettingsDto;
-  onSave: (next: DesktopSettingsDto, from?: DesktopSettingsDto) => void;
+  onSave: SettingsPanelProps["onSave"];
   saveError?: string;
   /** Where the document lives; absent in the browser preview and if the read failed. */
   path?: string;

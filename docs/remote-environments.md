@@ -323,10 +323,10 @@ The desktop app shows a remote daemon's agents alongside the local ones, reached
 
 1. Install the deck on the host, most simply with `dot-agent-deck remote add my-vm deck@198.51.100.10` from a machine with the CLI.
 2. Keep a daemon running on the host. A daemon with no agents exits about 30 seconds after its last client disconnects, so either leave agents running under it (start them with `connect` and detach), or run a daemon with the idle shutdown off, as [Keep the daemon running](remote-requirements.md#keep-the-daemon-running) shows.
-3. In the app, open **Settings → Daemons**, press **Add a daemon**, fill in **Host** (and **User**, **Port**, **Key file** or **Jump host** as needed), and press **Test connection**, which also finds the daemon's socket.
+3. In the app, open **Settings → Daemons**, press **Add a daemon**, fill in **Host** (and **User**, **Port**, **Key file** or **Jump host** as needed), check the suggested **Deck name**, and press **Add this daemon**. Then press **Test connection**, which also finds the daemon's socket.
 4. Pick the daemon in the **Daemon** selector on the Dashboard, or **All daemons**.
 
-![Settings → Daemons with a remote daemon, build-box, chosen in the Daemon row beside All daemons and This machine, its Host filled in, the other fields showing their placeholders, and Test connection below, not yet pressed](/img/settings-daemons-desktop.png)
+![Settings → Daemons with a remote daemon named build, its address build-box beside the name, chosen in the Daemon row beside All daemons and This machine; below it the Deck name field reads build with a Rename button, Host is filled in, the other fields show their placeholders, and Test connection is not yet pressed](/img/settings-daemons-desktop.png)
 
 [Daemons](desktop/daemons.md) explains the fields and every **Test connection** result. The app runs ssh non-interactively too, so the same key and host-key rules as `remote add` apply.
 
@@ -334,7 +334,7 @@ The desktop app shows a remote daemon's agents alongside the local ones, reached
 
 The CLI and the desktop app read and write the same registry file. A remote added with `remote add` appears in the app, and a daemon added in the app appears in `remote list` and opens with `connect <name>`. Each client edits one entry at a time under a lock, so an edit from one does not undo the other's. Removing a daemon in the app is the same as `remote remove`: the host is not touched.
 
-- The app does not ask for a name. It uses the host, lowercased, with characters a name cannot hold replaced by `-` (for example `build.example.com`); if that is taken, `<user>-<host>`, then `<host>-2`, `<host>-3` and so on. Use that name with `connect`.
+- The app shows each daemon by its name, the one `connect <name>` takes. When you add a daemon it suggests the host, lowercased, with characters a name cannot hold replaced by `-` (for example `build.example.com`); if that is taken, `<user>-<host>`, then `<host>-2`, `<host>-3` and so on. Keep it or type your own. A daemon can be renamed later in **Settings → Daemons**, and `connect` takes the new name straight away.
 - `remote list` shows `unmanaged` as the version of a daemon added in the app, because the CLI did not install its binary. `dot-agent-deck remote upgrade <name>` installs and manages it from then on.
 - `connect` does not use a **Jump host** set in the app. For a host reachable only through a bastion, add a `ProxyJump` line for it to `~/.ssh/config`; `connect` runs your system `ssh`, which reads it.
 - Changing a daemon's **Host**, **User** or **Port** in the app forgets the recorded install method and binary path, so `connect` runs `~/.local/bin/dot-agent-deck` until the next `remote upgrade`. Changing **Key file** or **Jump host** keeps them. The CLI has no command that edits an entry.

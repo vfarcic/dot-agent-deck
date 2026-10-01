@@ -1119,6 +1119,34 @@ pub fn orchestration_identity_of_record(
     })
 }
 
+/// Issue #1395 item 2: delete an ended orchestration's context file off the
+/// caller's thread — on Tokio's blocking pool when a runtime is current, else
+/// on a plain thread — so [`AppState::unregister_pane`], which runs under the
+/// state write lock, never performs the IO itself. Failures are logged; the
+/// 14-day sweep stays the backstop.
+fn spawn_context_removal(path: std::path::PathBuf) {
+    let remove = move || {
+        if let Err(e) = crate::orchestrator_context::remove_ended_orchestration_context(&path) {
+            tracing::warn!(
+                path = %path.display(),
+                reason = %e,
+                "could not remove an ended orchestration's context file; the retention \
+                 sweep will remove it later"
+            );
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(remove);
+        }
+        Err(_) => {
+            let _ = std::thread::Builder::new()
+                .name("context-removal".into())
+                .spawn(remove);
+        }
+    }
+}
+
 /// Issue #555: the directory half of an orchestration title's uniqueness key,
 /// resolved so that a symlink, a `..` component or any other alias of a
 /// directory is the SAME key as the directory itself — the same best-effort
@@ -1444,6 +1472,19 @@ pub struct AppState {
     /// Daemon-only, like the routing map beside it: the TUI's `AppState` never
     /// routes and never populates it.
     pub orchestration_titles: HashMap<OrchestrationIdentity, OrchestrationTitle>,
+    /// Issue #1395: the per-publish orchestrator context file each
+    /// orchestration's coordinator was started with, keyed by the same
+    /// identity as [`Self::orchestration_titles`]. Written only by the daemon's
+    /// own start paths from what THEY published or bound
+    /// ([`Self::record_orchestration_context`]) — never from a client-supplied
+    /// value — and read twice: the `ListAgents` reply stamps it onto the start
+    /// role's record ([`Self::attach_orchestrator_context_paths`]) so a
+    /// hydrated tab re-arms from its own file, and [`Self::unregister_pane`]
+    /// deletes the file once the orchestration's last pane closes
+    /// ([`Self::take_ended_orchestration_context`]).
+    ///
+    /// Daemon-only, like the routing map beside it.
+    pub orchestration_context_paths: HashMap<OrchestrationIdentity, std::path::PathBuf>,
     /// PRD #120: orchestrations the daemon spawned WHILE this TUI is attached
     /// (the issue-dispatch path), queued for the TUI event loop to build into
     /// live tabs. The daemon publishes a
@@ -2508,8 +2549,10 @@ enum WorkDoneReportChannel {
     /// Solicited completion whose report never reached disk — no cwd recorded,
     /// the directory could not be created, or the write failed (issue #433).
     Unfiled,
-    /// The orchestrator has no outstanding delegation this completion could be
+    /// The deck holds no outstanding delegation this completion could be
     /// answering (issue #448). The canonical file is deliberately left untouched.
+    /// That is a fact about the deck's record, not about who tasked the worker
+    /// (issue #505) — see [`compose_work_done_feedback`].
     Unsolicited,
 }
 
@@ -2774,10 +2817,22 @@ impl WorkDoneDelivery {
 /// text at the moment it gives up on the file.
 ///
 /// **An unsolicited completion is labelled, not suppressed** (#448). The
-/// orchestrator is told plainly that it commissioned nothing, so it can judge the
-/// report instead of re-planning on it as delivered work — and nothing is
-/// dropped, which matters because "no commission" can also mean a delegate that
-/// landed while a pane was closing.
+/// orchestrator is told that the deck has no delegation to that worker on
+/// record, so it can judge the report instead of re-planning on it as delivered
+/// work — and nothing is dropped, which matters because "no commission" can also
+/// mean a delegate that landed while a pane was closing.
+///
+/// **The label asserts only what the deck knows** (#505). It used to tell the
+/// orchestrator "You did not commission this work - the worker was most likely
+/// tasked directly by a person", which was false whenever the ledger lost a
+/// commission the orchestrator really made: a pane close that was attempted and
+/// then abandoned sweeps the ledger and restores nothing
+/// ([`crate::agent_pty::AgentPtyRegistry::finish_pane_close`] says why), and a
+/// delegate whose commission was refused mid-close never records one. The deck
+/// cannot tell those apart from a person tasking the worker, so the prose names
+/// both possibilities and leaves the judgement to the one party that knows what
+/// it sent. It carries no value the prose did not already carry: the role name
+/// appears where it always has, and nothing new is interpolated.
 ///
 /// The role name stays bare in the prose, as it is in the pointer wording this
 /// replaces and as it must be in the file path itself. Quoting IT as untrusted
@@ -2842,13 +2897,14 @@ fn compose_work_done_feedback(
              there, so any file at it is an EARLIER delegation's report or a partial write."
         ),
         WorkDoneReportChannel::Unsolicited => format!(
-            "Worker {safe_role} reported completing a task, but you have no outstanding delegation \
-             to that worker (dot-agent-deck daemon report, not a message from a person or an \
-             agent). You did not commission this work - the worker was most likely tasked directly \
-             by a person - so treat what follows as information about what that worker did, not as \
-             a task of yours coming back, and do not re-plan on the assumption that you asked for \
-             it. Nothing was written to .dot-agent-deck/work-done-{safe_role}.md, so an earlier \
-             delegation's report there is left intact."
+            "Worker {safe_role} reported completing a task, but the deck has no outstanding \
+             delegation to that worker on record (dot-agent-deck daemon report, not a message \
+             from a person or an agent). The deck cannot tell who tasked the worker: a person may \
+             have tasked it directly, or the deck may have lost its record of a delegation you \
+             sent. Treat what follows as information about what that worker did, and count it as \
+             one of your tasks coming back only if it matches a delegation you sent and are still \
+             waiting on. Nothing was written to .dot-agent-deck/work-done-{safe_role}.md, so an \
+             earlier delegation's report there is left intact."
         ),
     };
     let tail = match quote_untrusted_report(summary) {
@@ -3151,6 +3207,51 @@ fn release_undelivered_commission(
             role = %role,
             reason,
             "delegate: released the commission for an undelivered task pointer"
+        );
+    }
+}
+
+/// Issue #1423: the counterpart to [`release_undelivered_commission`] for the
+/// idle-worker record (PRD #126), and the single place that invariant is
+/// spelled out:
+///
+/// > **Every path that arms a delegation's idle-worker record and then fails to
+/// > deliver its task pointer must retire it.**
+///
+/// The record is armed in `handle_delegate`'s synchronous fan-out, beside the
+/// commission and for the same delegation, so it outlives every exit that
+/// delivers nothing. Left armed, the only things that retire it are its own
+/// timeout, a pane close, or the agent-exit sweep — and the sweep needs a bound
+/// worker agent id, which the exits taken before the identity resolves never
+/// bind. So `worker_response_timeout_minutes` later the orchestrator was told a
+/// worker had gone idle on a task that never reached it.
+///
+/// Conditional on the delegation's generation, never an unconditional remove:
+/// a newer delegate to the same worker replaces the record while this dispatch
+/// is queued, and taking that one would disarm a live watch. `None` — the
+/// detector was off, or arming was refused — has nothing to retire.
+///
+/// Routed through one helper for [`release_undelivered_commission`]'s reason:
+/// the retirement sites are exactly the callers of this function. The audit of
+/// `dispatch_one_owned`'s exits is recorded at the top of that function.
+fn retire_undelivered_idle_worker_record(
+    registry: &AgentPtyRegistry,
+    worker_pane_id: &str,
+    delegation_seq: Option<u64>,
+    reason: &'static str,
+) {
+    let Some(seq) = delegation_seq else {
+        return;
+    };
+    if registry
+        .take_outstanding_delegation_if(worker_pane_id, seq)
+        .is_some()
+    {
+        tracing::debug!(
+            pane_id = %worker_pane_id,
+            seq,
+            reason,
+            "delegate: retired the idle-worker record for an undelivered task pointer"
         );
     }
 }
@@ -7605,6 +7706,29 @@ async fn bind_dispatched_commission(
 ///    an unresolved identity, `WrongSession`, `Stale`, `NoLiveTarget` (a draft
 ///    wait that ended on a replaced worker among them), refused user input, or
 ///    `Err`.
+///
+/// # The idle-worker record's no-delivery invariant
+///
+/// Issue #1423. The PRD #126 record `handle_delegate` armed for this delegation
+/// (`delegation_seq`) is retired through
+/// [`retire_undelivered_idle_worker_record`], by generation, on every exit that
+/// releases the commission, numbered as the noted delivery's are:
+///
+/// 1. **The pi-native `clear = true` return** — keeps it: the seed is a
+///    delivery, so a `work-done` is owed.
+/// 2. **The dead-replacement return** — retires.
+/// 3. **The readiness-buffer close return** — retires, belt-and-braces:
+///    `begin_pane_close` drained the pane's records already.
+/// 4. **The respawn-error return** — retires.
+/// 5. **The tail** — retires whenever the send did not deliver, as the
+///    commission's exit 5 releases; `Ambiguous` keeps it for the same reason.
+///
+/// One cost, accepted: a delegation armed over an older one that was still
+/// owed (`--supersede`) replaced that older record, and retiring the newer one
+/// leaves the older unwatched. Where the worker was respawned or replaced the
+/// older task died with it; the residue is a refused send to the same live
+/// worker, where a watch that fires on the undelivered task instead is the
+/// false report this invariant exists to stop.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_one_owned(
     registry: Arc<AgentPtyRegistry>,
@@ -8358,6 +8482,15 @@ async fn dispatch_one_owned(
                         &target_role,
                         "the clear=true replacement worker never became live",
                     );
+                    // Issue #1423, idle-worker audit exit 2: the same debt, as
+                    // the PRD #126 watch holds it. The EOF sweep cannot retire
+                    // it: the worker id is bound only after this exit.
+                    retire_undelivered_idle_worker_record(
+                        &registry,
+                        &pane_id,
+                        delegation_seq,
+                        "the clear=true replacement worker never became live",
+                    );
                     // Issue #687, silence audit exit 2: the generation this
                     // watch was armed for is not the pane's live agent any more
                     // and will never be handed a pointer, so its record must not
@@ -8627,6 +8760,15 @@ async fn dispatch_one_owned(
                                 reserved_silence.take(),
                                 "the worker pane began closing during the readiness buffer",
                             );
+                            // Issue #1423, idle-worker audit exit 3: likewise
+                            // already drained by `begin_pane_close`, and retired
+                            // anyway for the same reason.
+                            retire_undelivered_idle_worker_record(
+                                &registry,
+                                &pane_id,
+                                delegation_seq,
+                                "the worker pane began closing during the readiness buffer",
+                            );
                             // Noted-delivery audit exit 3: the close keeps an
                             // unbound delivery for the dispatch in flight
                             // (`forget_pane`), so this dispatch drops it.
@@ -8832,6 +8974,15 @@ async fn dispatch_one_owned(
                     &registry,
                     &pane_id,
                     &target_role,
+                    "respawn failed for clear=true",
+                );
+                // Issue #1423, idle-worker audit exit 4: and the PRD #126
+                // watch's copy of that debt. No worker id is ever bound on this
+                // exit, so the EOF sweep can never retire it.
+                retire_undelivered_idle_worker_record(
+                    &registry,
+                    &pane_id,
+                    delegation_seq,
                     "respawn failed for clear=true",
                 );
                 // Skip the post-respawn prompt write — there is
@@ -9321,6 +9472,14 @@ async fn dispatch_one_owned(
             &registry,
             &pane_id,
             &target_role,
+            "the identity gate refused the task pointer",
+        );
+        // Issue #1423, idle-worker audit exit 5: the pointer reached no one, so
+        // the worker owes no `work-done` and must not be reported idle for one.
+        retire_undelivered_idle_worker_record(
+            &registry,
+            &pane_id,
+            delegation_seq,
             "the identity gate refused the task pointer",
         );
         // Noted-delivery audit exit 5: the pointer reached no one, whether the
@@ -10742,6 +10901,104 @@ impl AppState {
         self.orchestration_titles.get(identity).cloned()
     }
 
+    /// Issue #1395: record the per-publish context file `identity`'s
+    /// coordinator was started with. Called by the daemon's start paths with
+    /// the path from their own preparation binding or publish.
+    pub fn record_orchestration_context(
+        &mut self,
+        identity: &OrchestrationIdentity,
+        context_path: std::path::PathBuf,
+    ) {
+        self.orchestration_context_paths
+            .insert(identity.clone(), context_path);
+    }
+
+    /// Issue #1395 item 1: stamp each live start-role record with the context
+    /// file its orchestration was started with, so a TUI hydrating that tab
+    /// re-arms from the tab's own file rather than the fixed-path mirror.
+    ///
+    /// Only a record whose pane this daemon registered as the orchestrator
+    /// seat, AND whose own membership names the identity that pane is
+    /// registered under, is stamped — a pane id is a reusable slot, so a stale
+    /// map entry must not lend its path to an unrelated successor on the same
+    /// id. Every other record is left `None`.
+    pub fn attach_orchestrator_context_paths(&self, records: &mut [crate::agent_pty::AgentRecord]) {
+        for record in records {
+            record.orchestrator_context_path = record
+                .pane_id_env
+                .as_deref()
+                .filter(|pane| self.orchestrator_pane_ids.contains(*pane))
+                .and_then(|pane| self.pane_orchestration_map.get(pane))
+                .filter(|identity| {
+                    orchestration_identity_of_record(record).as_ref() == Some(*identity)
+                })
+                .and_then(|identity| self.orchestration_context_paths.get(identity))
+                .map(|path| path.to_string_lossy().into_owned());
+        }
+    }
+
+    /// Issue #1395 item 2: once no pane maps to `identity` any more, forget
+    /// its context file and answer it for deletion — unless another live
+    /// orchestration still references the same file, in which case the entry
+    /// is dropped and `None` is answered. Never the fixed-path mirror (the
+    /// deletion helper refuses any other name shape too).
+    ///
+    /// Bookkeeping under the state lock; the caller does the unlink after
+    /// releasing it ([`Self::unregister_pane`]).
+    ///
+    /// **A path answered for deletion has its preparation tokens revoked first**
+    /// (Qodo on PR #1444). A token is not consumed by a start — one launch
+    /// presents it once per role — so for [`crate::prep_token::PREP_TOKEN_TTL`]
+    /// after the preparation a start presenting it re-verifies against, and
+    /// then records, this same file. Left live, such a start arriving between
+    /// this answer and the deferred unlink would record the file for a new
+    /// orchestration and the unlink would delete a live coordinator's context.
+    /// Revoked here, under the same lock that decided "no live orchestration
+    /// references it", any start that fetches its binding afterwards is
+    /// refused as stale. Taking the token store's mutex while holding the state
+    /// lock is safe: that mutex is a leaf, held only inside `prep_token`'s own
+    /// functions, none of which touches the state.
+    ///
+    /// What revocation does not reach, precisely: a start that fetched its
+    /// binding BEFORE this revoke, passed its re-verification (which reads the
+    /// file back by inode and digest) BEFORE the unlink, and records after it.
+    /// Its coordinator is spawned against a file the unlink then removes. That
+    /// needs a second start from the same token to be mid-flight, between its
+    /// re-verification and its `record_orchestration_context`, at the instant
+    /// the last pane of another orchestration started from that token closes.
+    /// A start that re-verifies after the unlink is refused, so no start
+    /// begins on a file that is already gone. The daemon's own `spawn` path records
+    /// only a file it has just published under a fresh random name, so no
+    /// start by that path can name this file at all.
+    pub fn take_ended_orchestration_context(
+        &mut self,
+        identity: &OrchestrationIdentity,
+    ) -> Option<std::path::PathBuf> {
+        // Still running, or another of its roles is mid-start (the same
+        // in-flight claim that keeps its title held).
+        let held = self
+            .pane_orchestration_map
+            .values()
+            .any(|id| id == identity)
+            || self
+                .orchestration_titles
+                .get(identity)
+                .is_some_and(|held| held.pending_claims > 0);
+        if held {
+            return None;
+        }
+        let path = self.orchestration_context_paths.remove(identity)?;
+        let still_referenced = self
+            .orchestration_context_paths
+            .values()
+            .any(|other| *other == path);
+        if still_referenced {
+            return None;
+        }
+        crate::prep_token::revoke_context_path(&path);
+        Some(path)
+    }
+
     fn prune_orchestration_title(&mut self, identity: &OrchestrationIdentity) {
         let held = self
             .orchestration_titles
@@ -10921,6 +11178,12 @@ impl AppState {
             // Issue #555 / #962: the title goes when the last pane of its
             // orchestration does.
             self.prune_orchestration_title(&identity);
+            // Issue #1395 item 2: and so does its per-publish context file.
+            // Decided here, under the caller's lock; the unlink runs on a
+            // blocking thread so no caller holds the state lock across IO.
+            if let Some(path) = self.take_ended_orchestration_context(&identity) {
+                spawn_context_removal(path);
+            }
         }
     }
 
@@ -12185,6 +12448,9 @@ pub async fn handle_spawn_role_with_state(
             role_name: signal.role.clone(),
             is_start_role: false,
         }],
+        // Issue #1395: a spawned role is never the start role, which alone
+        // carries the context path.
+        context_path: None,
     }));
 
     SpawnRoleResponse {
@@ -14331,6 +14597,152 @@ mod tests {
         );
     }
 
+    /// Issue #1395 item 2: an ended orchestration's context file is answered
+    /// for deletion only once its last pane is gone, and never while another
+    /// live orchestration still references the same file.
+    #[test]
+    fn an_ended_orchestration_context_is_released_only_when_unreferenced() {
+        let mut state = AppState::default();
+        let shared = std::path::PathBuf::from(
+            "/p/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md",
+        );
+        let own = std::path::PathBuf::from(
+            "/p/.dot-agent-deck/orchestrator-context-fedcba9876543210fedcba9876543210.md",
+        );
+        register_role_pane(&mut state, "a0", "orchestrator", true, instance("a"));
+        register_role_pane(&mut state, "a1", "worker", false, instance("a"));
+        register_role_pane(&mut state, "b0", "orchestrator", true, instance("b"));
+        register_role_pane(&mut state, "c0", "orchestrator", true, instance("c"));
+        state.record_orchestration_context(&instance("a"), shared.clone());
+        state.record_orchestration_context(&instance("b"), shared.clone());
+        state.record_orchestration_context(&instance("c"), own.clone());
+
+        // `a` still has a pane: nothing is released and its entry stays.
+        state.pane_orchestration_map.remove("a0");
+        assert_eq!(state.take_ended_orchestration_context(&instance("a")), None);
+        assert!(
+            state
+                .orchestration_context_paths
+                .contains_key(&instance("a"))
+        );
+
+        // `a` ends, but live `b` references the same file: forget, keep file.
+        state.pane_orchestration_map.remove("a1");
+        assert_eq!(state.take_ended_orchestration_context(&instance("a")), None);
+        assert!(
+            !state
+                .orchestration_context_paths
+                .contains_key(&instance("a"))
+        );
+
+        // `c` ends and nobody else names its file: released for deletion.
+        state.pane_orchestration_map.remove("c0");
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("c")),
+            Some(own)
+        );
+        // `b` still runs, untouched.
+        assert_eq!(
+            state.orchestration_context_paths.get(&instance("b")),
+            Some(&shared)
+        );
+    }
+
+    /// Issue #1395 (Qodo on PR #1444): a preparation token is reusable within
+    /// its TTL, so it could hand an ended orchestration's context file to a new
+    /// start just before that file's deferred unlink. Answering the file for
+    /// deletion therefore revokes the token first; while another orchestration
+    /// still records the file, nothing is answered and the token stays usable.
+    #[test]
+    fn releasing_an_ended_context_revokes_the_tokens_that_could_reuse_it() {
+        let path = std::path::PathBuf::from(format!(
+            "/p/.dot-agent-deck/orchestrator-context-{}.md",
+            crate::prep_token::random_hex128()
+        ));
+        let token = crate::prep_token::issue(crate::prep_token::PrepBinding {
+            project_dir: std::path::PathBuf::from("/p"),
+            project_identity: None,
+            config_revision: "fnv1a128-00".to_string(),
+            orchestration: "loop".to_string(),
+            context_path: path.clone(),
+            context_identity: None,
+            context_digest: "ctx-fnv1a128-00".to_string(),
+            coordinator_prompt: String::new(),
+        });
+
+        let mut state = AppState::default();
+        register_role_pane(&mut state, "a0", "orchestrator", true, instance("a"));
+        register_role_pane(&mut state, "b0", "orchestrator", true, instance("b"));
+        state.record_orchestration_context(&instance("a"), path.clone());
+        // A second start from the same token already recorded the same file.
+        state.record_orchestration_context(&instance("b"), path.clone());
+
+        // `a` ends while `b` still records the file: kept, token still live.
+        state.pane_orchestration_map.remove("a0");
+        assert_eq!(state.take_ended_orchestration_context(&instance("a")), None);
+        assert!(
+            crate::prep_token::binding(&token).is_some(),
+            "a file still in use keeps the token that minted it"
+        );
+
+        // `b` ends and nothing records it: answered for deletion, and the token
+        // can no longer start a successor on the file about to be removed.
+        state.pane_orchestration_map.remove("b0");
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("b")),
+            Some(path)
+        );
+        assert!(
+            crate::prep_token::binding(&token).is_none(),
+            "a reused token must not re-verify against a file answered for deletion"
+        );
+    }
+
+    /// Issue #1395 item 1: the `ListAgents` stamp lands on the start role's
+    /// record only — never on a worker, and never on a record whose own
+    /// membership names a different orchestration than the one its (reused)
+    /// pane id is registered under.
+    #[test]
+    fn the_context_path_is_stamped_on_the_start_role_record_only() {
+        let mut state = AppState::default();
+        let path = std::path::PathBuf::from(
+            "/p/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md",
+        );
+        register_role_pane(&mut state, "p0", "orchestrator", true, instance("a"));
+        register_role_pane(&mut state, "p1", "worker", false, instance("a"));
+        register_role_pane(&mut state, "p2", "orchestrator", true, instance("a"));
+        state.record_orchestration_context(&instance("a"), path.clone());
+
+        let record = |pane: &str, token: &str, start: bool| {
+            let mut r: crate::agent_pty::AgentRecord =
+                serde_json::from_str(r#"{"id":"1"}"#).unwrap();
+            r.pane_id_env = Some(pane.to_string());
+            r.tab_membership = Some(crate::agent_pty::TabMembership::Orchestration {
+                name: "tdd-cycle".into(),
+                role_index: usize::from(!start),
+                role_name: if start { "orchestrator" } else { "worker" }.into(),
+                is_start_role: start,
+                orchestration_cwd: Some("/p".into()),
+                display_title: None,
+                orchestration_id: Some(token.to_string()),
+            });
+            r
+        };
+        let mut records = vec![
+            record("p0", "a", true),
+            record("p1", "a", false),
+            // A successor on a reused pane id, from another orchestration.
+            record("p2", "other", true),
+        ];
+        state.attach_orchestrator_context_paths(&mut records);
+        assert_eq!(
+            records[0].orchestrator_context_path.as_deref(),
+            Some(path.to_string_lossy().as_ref())
+        );
+        assert_eq!(records[1].orchestrator_context_path, None);
+        assert_eq!(records[2].orchestrator_context_path, None);
+    }
+
     /// Issues #555 / #962: the daemon's title store, at the rules the
     /// behavioural tests (`orchestration/identity/007`, `/008`,
     /// `orchestration/delegate/022`) cannot each reach with one orchestration:
@@ -15848,9 +16260,11 @@ mod tests {
         );
     }
 
-    /// Issue #448: a completion the orchestrator never commissioned is LABELLED,
-    /// not suppressed — it arrives, it says what it is, and it does not pretend to
-    /// be delegated work coming back.
+    /// Issue #448: a completion with no commission on record is LABELLED, not
+    /// suppressed — it arrives, it says what it is, and it does not pretend to be
+    /// delegated work coming back. Issue #505: nor does it pretend to know that
+    /// the orchestrator did NOT delegate it, because a lost commission reads the
+    /// same as none.
     #[test]
     fn compose_work_done_feedback_unsolicited_labels_the_report_without_dropping_it() {
         let feedback = compose_work_done_feedback(
@@ -15861,14 +16275,29 @@ mod tests {
         );
 
         assert!(
-            feedback.contains("no outstanding delegation"),
-            "the orchestrator must be told nothing was outstanding: {feedback:?}"
+            feedback.contains("the deck has no outstanding delegation to that worker on record"),
+            "the orchestrator must be told the deck's record holds nothing outstanding: \
+             {feedback:?}"
         );
         assert!(
-            feedback.contains("did not commission this work")
-                && feedback.contains("do not re-plan"),
-            "the label has to say what NOT to do with it, which is the whole defect: {feedback:?}"
+            feedback.contains(
+                "count it as one of your tasks coming back only if it matches a \
+                 delegation you sent"
+            ),
+            "the label has to say what NOT to do with it, which is the whole #448 defect: \
+             {feedback:?}"
         );
+        for claim in [
+            "You did not commission this work",
+            "most likely tasked directly by a person",
+            "you have no outstanding delegation",
+        ] {
+            assert!(
+                !feedback.contains(claim),
+                "#505: the deck cannot know who tasked the worker, so it must not assert \
+                 {claim:?}: {feedback:?}"
+            );
+        }
         assert!(
             !feedback.contains(WORK_DONE_POINTER),
             "nothing was filed, so nothing may be pointed at: {feedback:?}"
@@ -18705,6 +19134,10 @@ mod tests {
     /// delegated to a pane with no agent; once the dispatch gives up, an ack of
     /// the id written into the task file, from a stranger or an unidentified
     /// sender, is answered `Unknown` and nothing is kept for the pane.
+    ///
+    /// Issue #1423: the delegation's idle-worker record goes with it. Left
+    /// armed, it reported the worker idle `worker_response_timeout_minutes`
+    /// later, on a task the worker was never given.
     #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_one_owned_drops_its_noted_delivery_when_the_respawn_fails() {
@@ -18722,6 +19155,15 @@ mod tests {
         let cwd_str = cwd.path().to_string_lossy().into_owned();
         let registry = Arc::new(AgentPtyRegistry::new());
         let (event_tx, _event_rx) = broadcast::channel(16);
+        let armed = registry
+            .arm_outstanding_delegation(
+                WORKER_PANE,
+                "coder",
+                "respawn-fails-orch",
+                "orch-agent",
+                None,
+            )
+            .expect("arm the delegation's idle-worker record");
 
         dispatch_one_owned(
             registry.clone(),
@@ -18736,7 +19178,7 @@ mod tests {
             "probe task".to_string(),
             Some(cwd_str),
             None,
-            PointerQueueClock::new(registry.clone(), WORKER_PANE.to_string(), None),
+            PointerQueueClock::new(registry.clone(), WORKER_PANE.to_string(), Some(armed.seq)),
             None,
             None,
             None,
@@ -18746,6 +19188,12 @@ mod tests {
         assert!(
             registry.agent_records().is_empty(),
             "precondition: the respawn must have failed"
+        );
+        assert_eq!(
+            registry.outstanding_delegation_seq(WORKER_PANE),
+            None,
+            "issue #1423: a delegation whose respawn failed delivered nothing, so its \
+             idle-worker record must not stay armed to report the worker idle later"
         );
         let task_file = tokio::fs::read_to_string(
             cwd.path()
@@ -18859,7 +19307,14 @@ mod tests {
             armed.seq
         };
 
-        delegate().await;
+        let first = delegate().await;
+        // Issue #1423 control: a DELIVERED delegation keeps its idle-worker
+        // record — only the no-delivery exits retire it.
+        assert_eq!(
+            registry.outstanding_delegation_seq(WORKER_PANE),
+            Some(first),
+            "a delivered delegation's idle-worker record must stay armed"
+        );
         assert_eq!(settled(2).await, 2, "the first delegation was not reported");
         let second = delegate().await;
         assert_eq!(
@@ -18898,37 +19353,51 @@ mod tests {
     /// that actually completed. Pin the fix by confirming nothing is left in
     /// the map: a `retire_silence_watch` on the same pane immediately after
     /// the refusal must see `Nothing`, not a record to spend a retirement on.
+    ///
+    /// Issue #1423: the same holds for the delegation's idle-worker record,
+    /// which `handle_delegate` armed before this dispatch ran and which would
+    /// otherwise report the worker idle on a task it was never given. Only
+    /// THIS delegation's record goes: a newer delegation to the same worker
+    /// keeps its own.
     #[tokio::test]
     async fn dispatch_one_owned_cancels_silence_watch_when_worker_identity_is_unresolved() {
         let registry = Arc::new(AgentPtyRegistry::new());
         let (event_tx, _event_rx) = broadcast::channel(16);
         let worker_pane = "worker-pane-no-agent-silence-watch";
+        let dispatch = |seq: u64| {
+            dispatch_one_owned(
+                registry.clone(),
+                event_tx.clone(),
+                None,
+                "orch-pane".to_string(),
+                "worker-role".to_string(),
+                worker_pane.to_string(),
+                "probe task".to_string(),
+                None,
+                Some(SilenceWatch {
+                    window: std::time::Duration::from_secs(60),
+                    target: SilenceReportTarget {
+                        pane_id: "orch-pane".to_string(),
+                        agent_id: None,
+                        orchestration: None,
+                    },
+                    redeliveries: None,
+                    retry_done: None,
+                }),
+                PointerQueueClock::new(registry.clone(), worker_pane.to_string(), Some(seq)),
+                None,
+                None,
+                None,
+            )
+        };
+        let arm = || {
+            registry
+                .arm_outstanding_delegation(worker_pane, "worker-role", "orch-pane", "orch", None)
+                .expect("arm the delegation's idle-worker record")
+        };
 
-        dispatch_one_owned(
-            registry.clone(),
-            event_tx,
-            None,
-            "orch-pane".to_string(),
-            "worker-role".to_string(),
-            worker_pane.to_string(),
-            "probe task".to_string(),
-            None,
-            Some(SilenceWatch {
-                window: std::time::Duration::from_secs(60),
-                target: SilenceReportTarget {
-                    pane_id: "orch-pane".to_string(),
-                    agent_id: None,
-                    orchestration: None,
-                },
-                redeliveries: None,
-                retry_done: None,
-            }),
-            PointerQueueClock::new(registry.clone(), worker_pane.to_string(), None),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let armed = arm();
+        dispatch(armed.seq).await;
 
         assert!(
             matches!(
@@ -18937,6 +19406,24 @@ mod tests {
             ),
             "an identity-unresolved refusal must cancel the silence watch it armed, not leave a \
              taskless record behind to inflate the next watch's `superseded` counter"
+        );
+        assert_eq!(
+            registry.outstanding_delegation_seq(worker_pane),
+            None,
+            "issue #1423: the identity gate refused the task pointer, so the delegation's \
+             idle-worker record must not stay armed to report the worker idle later"
+        );
+
+        // Control: a newer delegation armed over this one while it was queued
+        // owns the record now, and an older dispatch's refusal must leave it.
+        let older = arm();
+        let newer = arm();
+        dispatch(older.seq).await;
+        assert_eq!(
+            registry.outstanding_delegation_seq(worker_pane),
+            Some(newer.seq),
+            "issue #1423: an older delegation's undelivered exit must not retire a newer \
+             delegation's idle-worker record"
         );
     }
 

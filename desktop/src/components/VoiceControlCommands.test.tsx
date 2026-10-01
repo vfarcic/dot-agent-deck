@@ -2935,6 +2935,9 @@ describe("switch deck by voice, against settings edited mid-flight", () => {
     await flush();
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "new-box" } });
     await flush();
+    // Issue #1426: a valid draft is stored once the user confirms it.
+    fireEvent.click(screen.getByTestId("save-new-deck"));
+    await flush();
     // Adding a deck selects it; choosing the local deck again means the switch
     // below moves the selection rather than landing on the no-op guard.
     fireEvent.click(screen.getByTestId("deck-choice-local").querySelector("input")!);

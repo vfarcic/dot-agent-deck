@@ -23,10 +23,8 @@ vi.mock("./components/TerminalViewport", () => ({
 import { DeckShell } from "./App";
 
 /**
- * The second deck, described exactly as the crate describes a remote one —
- * `Endpoint::describe()` renders `user@host[:port]` and never a socket path, so
- * `deckName` prints this string verbatim and the pane's sentence has to contain
- * it.
+ * The second deck's address, which stays available even when the pane shows
+ * the configured name instead.
  */
 const REMOTE_DECK_ID = "deck-00000000000000b2";
 const REMOTE_DECK_LABEL = "dev@build-box";
@@ -75,7 +73,7 @@ const PANE_AGENT_STATUS = createFixtureSnapshot("connected").agents.find((agent)
  * what `remoteStatus` itself produces, and conflating them is what let the two
  * be treated alike.
  */
-function harness(remoteStatus: "connected" | "disconnected" = "connected", retired?: string, selection: string = ALL_ENDPOINT_SELECTION) {
+function harness(remoteStatus: "connected" | "disconnected" = "connected", retired?: string, selection: string = ALL_ENDPOINT_SELECTION, name?: string) {
   const local = createFixtureSnapshot("connected");
   const remote: DeckSnapshot = {
     ...local,
@@ -84,6 +82,7 @@ function harness(remoteStatus: "connected" | "disconnected" = "connected", retir
       deckId: REMOTE_DECK_ID,
       socketPath: REMOTE_DECK_LABEL,
       deckKind: "remote",
+      ...{ name },
       status: remoteStatus,
       message: remoteStatus === "connected" ? "Daemon responding" : REMOTE_DECK_FAILURE,
     },
@@ -206,9 +205,10 @@ describe("a pane with no terminal", () => {
    * three affordances asserted below are that decision: the status says `last
    * seen`, `data-agent-record` says `held`, and the sentence dates the report.
    */
+  /// Scenario: A named remote deck stops answering while its agent pane is open, and the notice uses that deck name.
   it("replaces an unreachable deck's terminal with an explicit state naming that daemon", async () => {
     const paneView = { kind: "agent" as const, deckId: REMOTE_DECK_ID, agentId: "planner", from: "overview" as const };
-    const answering = harness("connected");
+    const answering = harness("connected", undefined, ALL_ENDPOINT_SELECTION, "production");
     const { rerender } = render(<DeckShell runtime={answering.runtime("local")} initialView={paneView} />);
     await waitFor(() => expect(answering.setShownTerminals).toHaveBeenCalledTimes(1));
 
@@ -218,7 +218,7 @@ describe("a pane with no terminal", () => {
     expect(answering.setShownTerminals).toHaveBeenLastCalledWith([{ deckId: REMOTE_DECK_ID, agentId: "planner" }]);
 
     viewportProps.length = 0;
-    const lost = harness("disconnected");
+    const lost = harness("disconnected", undefined, ALL_ENDPOINT_SELECTION, "production");
     await act(async () => { rerender(<DeckShell runtime={lost.runtime("local")} initialView={paneView} />); });
 
     const pane = screen.getByTestId("agent-pane-overlay");
@@ -233,7 +233,7 @@ describe("a pane with no terminal", () => {
     // Which deck, and why. Named the way the rest of the UI names it —
     // `deckName`, which is also the overview group header — and carrying the
     // deck's own failure sentence rather than a guess.
-    expect(absent).toHaveTextContent(REMOTE_DECK_LABEL);
+    expect(absent).toHaveTextContent("production");
     expect(absent).toHaveTextContent(/no live connection/i);
     expect(absent).toHaveTextContent(REMOTE_DECK_FAILURE);
     // And it does NOT say the old thing, which was about selection and is now

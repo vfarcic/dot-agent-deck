@@ -34,7 +34,7 @@ const WORKER_ROLE: &str = "worker";
 
 /// The #448 label, spelled out here rather than imported from `src/` so a silent
 /// rewording of the daemon's template fails this test instead of following it.
-const UNSOLICITED_NEEDLE: &str = "you have no outstanding delegation to that worker";
+const UNSOLICITED_NEEDLE: &str = "the deck has no outstanding delegation to that worker on record";
 
 /// The daemon's provenance clause — an orchestrator agent could write prose about
 /// a worker, but not a verbatim self-identification as a daemon report.
