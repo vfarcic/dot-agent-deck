@@ -41,13 +41,6 @@ const POLL_MS = 100;
 const SELECT_MS = 15_000;
 
 /**
- * Issue #1403 — how many drags `selectRow` makes when a grid resize undoes
- * one. A focus claim resizes the grid at most once per focus-in, so the second
- * drag is the one expected to land; the third is margin.
- */
-const SELECT_ATTEMPTS = 3;
-
-/**
  * Issue #1403 — how long a terminal's grid must hold still after a click
  * before a drag on it is trusted. The resize it waits out (the window's focus
  * claim, see `selectRow`) landed within 10ms of the press on a GitHub runner,
@@ -410,49 +403,19 @@ export class Deck {
    * (PRD #1105). When that changes the grid's row count, xterm drops any
    * selection in progress, so a drag started by that same press selects
    * nothing. The click lets that settle, and the row is measured again after
-   * it, because a new grid moves the rows.
-   *
-   * The click is not enough on a GitHub runner. There the claim's resize still
-   * arrived 6–13ms after the DRAG's press, the click before it having claimed
-   * nothing the page could see (issue #1457 asks whether a person meets the
-   * same). So a drag that selects nothing while the page recorded a grid resize
-   * after it began is done again on the new grid, the way a person whose
-   * selection vanished would, up to `SELECT_ATTEMPTS` times. A drag that
-   * selects nothing with no resize to explain it fails at once. Either failure
-   * carries the mouse events the page saw during the last drag and every
-   * selection clear and resize, with the stack that caused it.
+   * it, because a new grid moves the rows. When the selection still does not
+   * appear, the error carries the mouse events the page saw during the drag
+   * and every selection clear and resize, with the stack that caused it.
    */
   async selectRow(text: string): Promise<void> {
-    for (let attempt = 1; ; attempt += 1) {
-      const outcome = await this.dragAcrossRow(text);
-      if (outcome === "selected") return;
-      const why =
-        outcome === "resized"
-          ? `the terminal's grid resized during the drag, so it selected nothing (attempt ${attempt} of ${SELECT_ATTEMPTS})`
-          : `timed out after ${SELECT_MS}ms waiting for the drag to select ${text}`;
-      if (outcome === "resized" && attempt < SELECT_ATTEMPTS) {
-        // In the log, so a passing run still says whether issue #1457's resize happened.
-        console.log(`selectRow: ${why}; dragging again`);
-        continue;
-      }
-      const seen = await this.session
-        .execute<unknown>("return { events: window.__dadPointerLog, trace: window.__dadSelectionTrace };")
-        .catch((probe: unknown) => String(probe));
-      throw new Error(`${why}; the page saw ${JSON.stringify(seen)}`);
-    }
-  }
-
-  /** One click-settle-drag of `selectRow`, and whether it selected `text`, was undone by a resize, or neither. */
-  private async dragAcrossRow(text: string): Promise<"selected" | "resized" | "nothing"> {
     const before = await waitFor(`${text} on its own row`, () => this.rowSpan(text));
     await this.session.clickAt(before.from);
     await this.gridSettled();
     const span = await waitFor(`${text} on its own row after the click`, () => this.rowSpan(text));
     // Installed once per page; each call only empties the pointer record. The
-    // selection trace runs from `traceTerminals` and is never emptied, so its
-    // length here marks where this drag's entries begin.
+    // selection trace runs from `traceTerminals` and is never emptied.
     await this.traceTerminals();
-    const mark = await this.session.execute<number>(
+    await this.session.execute(
       `window.__dadPointerLog = [];
        if (!window.__dadPointerProbe) {
          window.__dadPointerProbe = true;
@@ -464,24 +427,16 @@ export class Deck {
              }
            }, { capture: true });
          }
-       }
-       return window.__dadSelectionTrace.length;`,
+       }`,
     );
     await this.session.drag(span.from, span.to);
     try {
-      return await waitFor(
-        `the drag to select ${text}`,
-        async () => {
-          if (await this.hasSelection(text)) return "selected" as const;
-          const resized = await this.session.execute<boolean>(
-            `return window.__dadSelectionTrace.slice(${mark}).some((entry) => entry[0] === "resize");`,
-          );
-          return resized ? ("resized" as const) : undefined;
-        },
-        SELECT_MS,
-      );
-    } catch {
-      return "nothing";
+      await waitFor(`the drag to select ${text}`, () => this.hasSelection(text), SELECT_MS);
+    } catch (error) {
+      const seen = await this.session
+        .execute<unknown>("return { events: window.__dadPointerLog, trace: window.__dadSelectionTrace };")
+        .catch((probe: unknown) => String(probe));
+      throw new Error(`${(error as Error).message}; the page saw ${JSON.stringify(seen)}`);
     }
   }
 
