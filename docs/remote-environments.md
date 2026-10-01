@@ -185,11 +185,11 @@ Remote 'my-vm' runs 0.43.0; you have 0.44.0 (2 running agents). Upgrade and conn
 
 ### Hosts where Homebrew installed the deck
 
-`remote add` and `remote upgrade` first look for a Homebrew install on the host: `brew list --formula dot-agent-deck` succeeding with `brew` found on the host's `PATH` or under `/opt/homebrew`, `/usr/local` or `/home/linuxbrew/.linuxbrew`. When one exists:
+`remote add` and `remote upgrade` first look for an installed Homebrew formula on the host, either `dot-agent-deck` or `dot-agent-deck-beta`. They find Homebrew on the host's `PATH` or under `/opt/homebrew`, `/usr/local` or `/home/linuxbrew/.linuxbrew`. When a formula owns the install:
 
 - Nothing is downloaded to `~/.local/bin`. The registry records the install method as `homebrew` and the binary as `<prefix>/bin/dot-agent-deck`, and `connect`, `remote doctor` and `hooks install` run that binary.
 - `remote add` registers the version the Homebrew install reports. If it differs from `--version`, it says so.
-- `remote upgrade` runs `brew upgrade dot-agent-deck` on the host. Homebrew installs its tap's latest release and cannot install a chosen one, so `--version` is not honoured; the command records the version that landed and says so if it differs.
+- `remote upgrade` upgrades the installed formula (`dot-agent-deck` or `dot-agent-deck-beta`) on the host. Homebrew installs its tap's latest release and cannot install a chosen one, so `--version` is not honoured; the command records the version that landed and says so if it differs.
 - With `--no-install`, the Homebrew install must report exactly `--version`.
 
 If the host has both a Homebrew install and `~/.local/bin/dot-agent-deck`, the command uses the Homebrew one, leaves the other file alone, and prints the `ssh … 'rm ~/.local/bin/dot-agent-deck'` command to remove it. Remove it, because an older `dot-agent-deck` client runs that path on `connect`.
