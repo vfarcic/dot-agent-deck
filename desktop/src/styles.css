@@ -165,11 +165,14 @@
      order would win over it unconditionally. See `.voice-row` for what each one
      is and which surfaces subtract it. */
   --voice-row-height: 40px;
-  /* The row's least height while voice is ON (PR #1451): half as large again,
-     like its text. It grows past this when a sentence wraps, and then
+  /* The row's least height while voice is ON (PR #1451): the resting height,
+     a constant rather than `--voice-row-height` itself, because that variable
+     is overwritten with the row's measured height while voice is on and a
+     least height that read it could only ever grow. The row grows past this
+     when its larger text needs more, or a sentence wraps, and then
      `VoiceControlPanel` writes the measured height into `--voice-row-height`
      on the root, so every surface below still keeps clear of it. */
-  --voice-row-height-on: 60px;
+  --voice-row-min-height: 40px;
   /* The rail's height when it is a BOTTOM bar, which it is only under
      `max-width: 680px`. Zero everywhere else, so the row sits on the window's
      own bottom edge. */
@@ -1588,20 +1591,21 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 @keyframes voice-nudge { 50% { box-shadow: 0 0 0 3px var(--amber-rim); } }
 @media (prefers-reduced-motion: reduce) { .voice-send-hint[data-nudge="on"] { animation: none; } }
 
-/* PR #1451 — while voice is ON the row is half as large again, so what it says
-   can be read at a glance from the keyboard. Every size below is 1.5 times its
-   resting value above, and the row's least height is `--voice-row-height-on`.
+/* PR #1451 — while voice is ON what the row SAYS is half as large again, so it
+   can be read at a glance from the keyboard. Every text size below is 1.5
+   times its resting value above. The Voice button keeps its resting size: a
+   1.5x button made the row taller than its text, and the difference was empty
+   space (the maintainer's hand test). So the row is only as tall as what it
+   holds, never under `--voice-row-min-height`.
 
    **It wraps instead of eliding while on**, which is a change to the row's
    contract rather than an exception to it: the reservation every other surface
    makes is `--voice-row-height`, and while voice is on that is the row's
-   measured height (see `--voice-row-height-on`), so a wrapped sentence grows
+   measured height (see `--voice-row-min-height`), so a wrapped sentence grows
    the reservation with it instead of running under the screen. At a narrow
    window the larger text would otherwise lose most of a sentence to the
    ellipsis. Off, none of this applies and the row is its resting 40px. */
-.voice-row[data-voice="on"] { height: auto; min-height: var(--voice-row-height-on); padding-top: 8px; padding-bottom: 8px; }
-.voice-row[data-voice="on"] .voice-trigger { min-height: 39px; padding: 0 16px; border-radius: 20px; font-size: 16.5px; }
-.voice-row[data-voice="on"] .voice-trigger svg { width: 24px; height: 24px; }
+.voice-row[data-voice="on"] { height: auto; min-height: var(--voice-row-min-height); padding-top: 4px; padding-bottom: 4px; }
 .voice-row[data-voice="on"] .voice-report-card { flex-wrap: wrap; row-gap: 4px; column-gap: 15px; }
 .voice-row[data-voice="on"] .voice-sentence,
 .voice-row[data-voice="on"] .voice-dictation,

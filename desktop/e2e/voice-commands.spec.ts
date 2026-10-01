@@ -158,9 +158,9 @@ test.describe("the empty report row", () => {
   /**
    * Scenario: press Voice in the preview and read the row before it has heard
    * anything. It names the phrase that lists everything, the phrase that
-   * stops, and the button — and it fits the row rather than growing it. The
-   * row is half as large again while voice is on (PR #1451), so that is the
-   * size it must keep: the hint fills one line of it, not two.
+   * stops, and the button — and it fits the reserved row rather than growing
+   * it, even at the larger size the row's text takes while voice is on
+   * (PR #1451).
    */
   test("names both ways out and does not grow the row", async ({ page }) => {
     // A script with nothing in it: the fixture then hears nothing at all, which
@@ -179,7 +179,7 @@ test.describe("the empty report row", () => {
 
     const after = await page.locator(".voice-row").boundingBox();
     expect(before, "the voice row has no layout box").not.toBeNull();
-    expect(after!.height, "the empty-state hint grew the reserved row").toBeCloseTo(before!.height * 1.5, 0);
+    expect(after!.height, "the empty-state hint grew the reserved row").toBeCloseTo(before!.height, 0);
   });
 });
 

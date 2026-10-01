@@ -228,10 +228,18 @@ test.describe("the voice row is reserved space", () => {
   async function rowSize(page: Page) {
     return page.evaluate(() => {
       const row = document.querySelector<HTMLElement>(".voice-row");
+      const trigger = document.querySelector<HTMLElement>(".voice-trigger");
       const label = document.querySelector<HTMLElement>(".voice-trigger span");
-      if (!row || !label) throw new Error("the voice row is not mounted");
+      if (!row || !trigger || !label) throw new Error("the voice row is not mounted");
+      const style = getComputedStyle(row);
+      const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom) + parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth);
       return {
         height: row.getBoundingClientRect().height,
+        // The tallest thing the row holds, so a row taller than this plus its
+        // own padding is holding empty space.
+        tallest: Math.max(...[...row.children].map((child) => child.getBoundingClientRect().height)),
+        padding,
+        button: { width: trigger.getBoundingClientRect().width, height: trigger.getBoundingClientRect().height },
         label: parseFloat(getComputedStyle(label).fontSize),
         sentences: [...row.querySelectorAll<HTMLElement>(".voice-sentence")].map((sentence) => parseFloat(getComputedStyle(sentence).fontSize)),
         reserved: parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--voice-row-height")),
@@ -241,11 +249,12 @@ test.describe("the voice row is reserved space", () => {
 
   /**
    * Scenario: PR #1451 — turn voice on and let the fixture's utterance report.
-   * The row and its text are half as large again while voice is on, the page
-   * reserves the row's real height, and turning voice off returns the row and
-   * the reservation to their resting 40px.
+   * The status text is half as large again while the Voice button keeps its
+   * size, the row is no taller than what it holds, and the page reserves the
+   * row's real height; turning voice off returns the text and the reservation
+   * to their resting sizes.
    */
-  test("is half as large again while voice is on and back to its resting size when off", async ({ page }) => {
+  test("has half-as-large-again text and an unchanged button while voice is on", async ({ page }) => {
     await openWithSpeech(page);
     const off = await rowSize(page);
     expect(off.height).toBeCloseTo(40, 0);
@@ -254,8 +263,11 @@ test.describe("the voice row is reserved space", () => {
     await voiceButton(page).click();
     await expect(page.getByText("Opening the agent dashboard.")).toBeVisible();
     const on = await rowSize(page);
-    expect(on.height / off.height).toBeGreaterThanOrEqual(1.5);
-    expect(on.label / off.label).toBeCloseTo(1.5, 2);
+    // The maintainer's hand test: a 1.5x button left the row taller than its
+    // text, all of it empty. The button keeps its resting size.
+    expect(on.label).toBe(off.label);
+    expect(on.button.height).toBeCloseTo(off.button.height, 0);
+    expect(on.height, "the voice row holds empty space").toBeLessThanOrEqual(on.tallest + on.padding + 1);
     expect(on.sentences.length).toBeGreaterThan(0);
     for (const size of on.sentences) expect(size).toBeCloseTo(16.5, 2);
     expect(on.reserved).toBeCloseTo(on.height, 0);
