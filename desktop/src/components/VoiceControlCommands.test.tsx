@@ -2220,6 +2220,31 @@ describe("sticky dictation in the open agent pane", () => {
     expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "unsent words ");
   });
 
+  /** Scenario: Qodo on PR #1451 — in typing mode the words of one utterance
+   * are still being written when "send it" arrives. If that write then fails,
+   * Enter is never pressed, so nothing already in the prompt is submitted;
+   * when it succeeds, Enter follows it. */
+  it("presses a spoken send only after the typed words are written", async () => {
+    for (const outcome of ["fails", "succeeds"] as const) {
+      let settle!: (ok: boolean) => void;
+      const { voice, deck, unmount } = start({ "send it": dispatch("submit_prompt", "submitAgentPrompt", "Sent — still typing to Coder.", "send it") });
+      (deck.sendTerminalInput as ReturnType<typeof vi.fn>).mockImplementation(async (_target: unknown, data: string) => {
+        if (data === "slow words ") await new Promise<void>((resolve, reject) => { settle = (ok) => (ok ? resolve() : reject(new Error("the terminal refused the write"))); });
+      });
+      await enter(voice);
+      voice.deliver("slow words");
+      await completeUtterance();
+      voice.deliver("send it");
+      await completeUtterance();
+      expect(deck.sendTerminalInput, outcome).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
+      await act(async () => { settle(outcome === "succeeds"); });
+      await flush();
+      if (outcome === "fails") expect(deck.sendTerminalInput, outcome).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
+      else expect(deck.sendTerminalInput, outcome).toHaveBeenLastCalledWith({ deckId, agentId: coderId }, VOICE_DICTATION_SUBMIT);
+      unmount();
+    }
+  });
+
   /** Scenario: Qodo on PR #1451 — with typing mode on and words unsent, the
    * user switches coder's pane to its Diff tab, so the prompt is no longer on
    * screen. Typing mode ends and says why; nothing further is typed, and a

@@ -1075,6 +1075,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const setNudge = useCallback((next: boolean) => { nudgeShown.current = next; setNudgeState(next); }, []);
   const nudgeTimer = useRef<number | undefined>(undefined);
   const unsent = useRef(false);
+  /**
+   * PR #1451 (Qodo) — the last typed write, settled to whether it landed. A
+   * spoken send waits for it: an Enter queued behind a write that then fails
+   * would submit whatever was in the prompt before.
+   */
+  const lastWrite = useRef<Promise<boolean> | undefined>(undefined);
   const setPanelState = useCallback((next: VoicePanelState) => {
     const was = panelStateRef.current;
     if (was.kind === "dictating" || next.kind === "dictating") {
@@ -2175,7 +2181,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
          it, and a same-id replacement ends the mode, so it names the pane's
          incarnation as well. */
       const generation = modeGeneration.current;
-      void sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed).then(
+      const write = sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed);
+      lastWrite.current = write.then(() => true, () => false);
+      void write.then(
         /* PR #1451 — words are in the prompt and unsent: start the pause
            clock for the nudge to send. A write from a mode that has since
            ended arms nothing. */
@@ -2202,7 +2210,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     cancelPendingSend();
     const epoch = sendEpoch.current;
     sending.current = { aim, declared: dispatching.current ?? current() };
-    void sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed).then(
+    const write = sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed);
+    lastWrite.current = write.then(() => true, () => false);
+    void write.then(
       () => {
         /* Called off while the words were being written — see `sendEpoch` —
            or the gate no longer holds now that they are. */
@@ -2239,8 +2249,23 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       reportRefused(answerRefusal(lost));
       return;
     }
-    void submitDictation({ deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId });
-  }, [cancelPendingSend, paneLost, reportRefused, setPending, stopNudge, submitDictation]);
+    const aim = { deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId };
+    /* PR #1451 (Qodo) — after the words this Enter is meant to send. A write
+       that failed has already said so (and ended typing mode); the Enter is
+       then dropped rather than submitting what was in the prompt before, and
+       so is one whose pane or mode moved while it waited. */
+    const written = lastWrite.current;
+    if (written === undefined) {
+      void submitDictation(aim);
+      return;
+    }
+    const declared = current();
+    const generation = modeGeneration.current;
+    void written.then((ok) => {
+      if (!ok || modeGeneration.current !== generation || contextLost(declared, current(), { pane: aim })) return;
+      void submitDictation(aim);
+    });
+  }, [cancelPendingSend, current, paneLost, reportRefused, setPending, stopNudge, submitDictation]);
 
   /** Say there was nothing on top to close. See {@link VOICE_NOTHING_TO_CLOSE}. */
   const reportNothingToClose = useCallback(() => setProblem(VOICE_NOTHING_TO_CLOSE), []);
