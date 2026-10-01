@@ -1506,12 +1506,13 @@ impl RemoteInstall {
 /// exits 0.
 ///
 /// A Homebrew install is recognised by asking Homebrew, not by the shape of a
-/// path: `brew list --formula dot-agent-deck` succeeds only when the formula
-/// is installed, and `<prefix>/bin/dot-agent-deck` must exist, which is the
-/// link `brew install` creates. `brew` is looked for on `PATH` first and then
+/// path: `brew list --formula` must succeed for one of `formulas`, and
+/// `<prefix>/bin/dot-agent-deck` must exist. Upgrade checks the stable formula;
+/// connect's fallback checks stable and beta (both link the same binary name).
+/// `brew` is looked for on `PATH` first and then
 /// at each of [`HOMEBREW_PREFIXES`], because the `PATH` of a non-interactive
 /// ssh command usually lacks it.
-fn install_probe_command() -> String {
+fn install_probe_command(formulas: &str) -> String {
     let brews: Vec<String> = HOMEBREW_PREFIXES
         .iter()
         .map(|prefix| format!("{prefix}/bin/brew"))
@@ -1521,7 +1522,10 @@ fn install_probe_command() -> String {
             "if [ -x {local_bin} ]; then echo local-bin=present; else echo local-bin=; fi; ",
             "for dad_brew in \"$(command -v brew 2>/dev/null)\" {brews}; do ",
             "[ -n \"$dad_brew\" ] && [ -x \"$dad_brew\" ] || continue; ",
-            "\"$dad_brew\" list --formula dot-agent-deck >/dev/null 2>&1 || continue; ",
+            "dad_found=; for dad_formula in {formulas}; do ",
+            "if \"$dad_brew\" list --formula \"$dad_formula\" >/dev/null 2>&1; ",
+            "then dad_found=1; break; fi; done; ",
+            "[ -n \"$dad_found\" ] || continue; ",
             "dad_prefix=$(\"$dad_brew\" --prefix 2>/dev/null) || continue; ",
             "[ -x \"$dad_prefix/bin/dot-agent-deck\" ] || continue; ",
             "echo \"homebrew=$dad_prefix\"; exit 0; ",
@@ -1529,6 +1533,7 @@ fn install_probe_command() -> String {
             "echo homebrew="
         ),
         local_bin = REMOTE_INSTALL_PATH,
+        formulas = formulas,
         brews = brews.join(" "),
     )
 }
@@ -1541,7 +1546,11 @@ pub(crate) fn discover_homebrew_binary(
     executor: &dyn SshExecutor,
     target: &SshTarget,
 ) -> Result<Option<RemoteBinaryPath>, SshError> {
-    let probe = executor.run_capped(target, &install_probe_command(), 8 * 1024)?;
+    let probe = executor.run_capped(
+        target,
+        &install_probe_command("dot-agent-deck dot-agent-deck-beta"),
+        8 * 1024,
+    )?;
     if probe.truncated || probe.output.status != 0 {
         return Ok(None);
     }
@@ -1558,7 +1567,7 @@ fn detect_install(
     executor: &dyn SshExecutor,
     target: &SshTarget,
 ) -> Result<RemoteInstall, RemoteAddError> {
-    let probe = executor.run(target, &install_probe_command())?;
+    let probe = executor.run(target, &install_probe_command("dot-agent-deck"))?;
     let probe_failed = |detail: &str| RemoteAddError::InstallProbeFailed {
         status: probe.status,
         detail: scrub_remote_text(detail),
@@ -3265,6 +3274,41 @@ mod homebrew_remote_tests {
                 upgrade_reporting_to(&opts, &self.shell(brew_at), &self.registry, &mut out);
             (result, String::from_utf8(out).unwrap())
         }
+    }
+
+    #[test]
+    fn connect_discovery_finds_beta_only_homebrew_without_changing_upgrade_detection() {
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: None,
+            tap: "0.44.0-rc.1",
+            brew_upgrade_fails: false,
+        });
+        write_script(
+            &remote.brew_prefix.join("bin/brew"),
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n--prefix) echo '{prefix}' ;;\nlist) [ \"$2\" = --formula ] && [ \"$3\" = dot-agent-deck-beta ] ;;\n*) exit 1 ;;\nesac\n",
+                prefix = remote.brew_prefix.display(),
+            ),
+        );
+        write_script(
+            &remote.brew_binary(),
+            &deck_script("0.44.0-rc.1", &remote.log),
+        );
+        let shell = remote.shell(BrewAt::OnPath);
+        let target = SshTarget::parse("user@mac", 22, None);
+        assert_eq!(
+            discover_homebrew_binary(&shell, &target)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            remote.brew_binary().to_str().unwrap()
+        );
+        assert_eq!(
+            detect_install(&shell, &target).unwrap().homebrew_prefix,
+            None,
+            "remote upgrade must not mistake a beta-only formula for the stable formula"
+        );
     }
 
     /// The issue's report: a brew-installed remote, upgraded with `remote

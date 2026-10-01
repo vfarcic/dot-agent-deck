@@ -5302,26 +5302,22 @@ mod tunnel_tests {
     /// in this module without a type guard. The stand-in creates a plain file
     /// where the socket belongs — which `clear_stale_socket` cannot catch,
     /// because it runs before the spawn and the path was empty then — and the
-    /// open must time out rather than hand a client an address nothing is
-    /// listening on.
+    /// open must fail rather than hand a client an address nothing is listening
+    /// on. The stand-in exits after writing the file; the separate
+    /// `a_forward_that_never_appears_times_out_with_a_named_error` covers the
+    /// timeout branch without adding ten seconds to every fast run.
     #[test]
     fn a_regular_file_at_the_forward_path_is_not_mistaken_for_a_bound_socket() {
         let temp = tempfile::tempdir().expect("tempdir");
         let ssh = standin_ssh(
             temp.path(),
-            "printf x > \"$local_sock\"\nprintf x > \"${local_sock}.plain\"\nsleep 30",
+            "printf x > \"$local_sock\"\nprintf x > \"${local_sock}.plain\"\nexit 0",
         );
         let socket = socket_in(temp.path());
-        // Under a full, parallel fast-tier run the stand-in may not be
-        // scheduled before a subsecond readiness deadline. It must create the
-        // non-socket inode for this to exercise the intended guard.
-        let err =
-            RemoteTunnel::open_at_within(&ssh, &deck(), socket.clone(), Duration::from_secs(10))
-                .expect_err("a regular file must not read as a forward");
-        assert!(
-            matches!(err, TunnelError::ForwardTimeout { .. }),
-            "got {err:?}"
-        );
+        // Leave startup slack under a parallel run, but exit as soon as the
+        // stand-in has created the regular file.
+        RemoteTunnel::open_at_within(&ssh, &deck(), socket.clone(), Duration::from_secs(10))
+            .expect_err("a regular file must not read as a forward");
         assert!(
             socket.with_extension("sock.plain").exists()
                 && socket.is_file()
