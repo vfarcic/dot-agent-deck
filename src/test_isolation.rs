@@ -145,9 +145,14 @@ ctor::declarative::ctor! {
 pub fn detach_from_any_live_deck() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
+        // Set NOW: only what a test put back after `detach_before_main` ran.
+        let still_set: Vec<&str> = DECK_ENDPOINT_VARS
+            .into_iter()
+            .filter(|v| std::env::var_os(v).is_some())
+            .collect();
         let mut leaked: Vec<&str> = CLEARED_BEFORE_MAIN.get().cloned().unwrap_or_default();
-        for var in DECK_ENDPOINT_VARS {
-            if std::env::var_os(var).is_some() && !leaked.contains(&var) {
+        for var in &still_set {
+            if !leaked.contains(var) {
                 leaked.push(var);
             }
         }
@@ -162,14 +167,15 @@ pub fn detach_from_any_live_deck() {
                 leaked.join(", ")
             );
         }
-        for var in leaked {
+        for var in still_set {
             // SAFETY: nextest runs one test per process and this is called from
             // the test body before it spawns anything, via a `OnceLock` so it
             // happens exactly once per process. Plain `cargo test` runs every
             // test as a thread of ONE process, where that argument does not
-            // hold; there this writes only when the run inherited a variable
-            // (it was started from inside a deck pane), so an ordinary run
-            // never moves the environment under another test's thread.
+            // hold; there this writes only a variable that is set right now —
+            // which, since `detach_before_main` cleared the inherited ones,
+            // means one a test set itself — so an ordinary run never moves the
+            // environment under another test's thread.
             unsafe { std::env::remove_var(var) };
         }
     });
@@ -342,9 +348,11 @@ mod tests {
     const DETACH_CHILD: &str = "DAD_TEST_ISOLATION_DETACH_CHILD";
 
     /// Scenario: Start a fresh copy of this test binary with every deck
-    /// identity variable set to a value that mimics a live deck, have it call
-    /// the unit-test detach hook, and assert every one of them is gone — the
-    /// `src/` half of `harness_clears_inherited_deck_endpoints`.
+    /// identity variable set to a value that mimics a live deck, assert every
+    /// one of them is already gone when the test body starts — cleared before
+    /// `main` — and recorded as inherited, then have it call the unit-test
+    /// detach hook and assert it names them in its note — the `src/` half of
+    /// `harness_clears_inherited_deck_endpoints`.
     ///
     /// The variables go into a CHILD's environment rather than this one's.
     /// Under plain `cargo test` every test is a thread of one process, so a
@@ -356,10 +364,18 @@ mod tests {
     #[test]
     fn detach_clears_inherited_deck_endpoints() {
         if std::env::var_os(DETACH_CHILD).is_some() {
+            // Issue #1473: `detach_before_main` has already run, so the proof
+            // that they were inherited is its record, not the environment.
+            let cleared = CLEARED_BEFORE_MAIN.get().cloned().unwrap_or_default();
             for var in DECK_ENDPOINT_VARS {
                 assert!(
-                    std::env::var_os(var).is_some(),
-                    "{var} was not inherited, so the detach below proves nothing"
+                    cleared.contains(&var),
+                    "{var} was not inherited, so the detach below proves nothing \
+                     (cleared before main: {cleared:?})"
+                );
+                assert!(
+                    std::env::var_os(var).is_none(),
+                    "{var} reached the test body — the before-main detach did not clear it"
                 );
             }
 
