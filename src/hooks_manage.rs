@@ -1409,7 +1409,7 @@ mod tests {
         let a = a_dir.path().join(DEFAULT_BINARY_NAME);
         let b = b_dir.path().join(DEFAULT_BINARY_NAME);
         for path in [&a, &b] {
-            std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("seed binary");
+            crate::test_isolation::write_script(path, b"#!/bin/sh\nexit 0\n").expect("seed binary");
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -1589,7 +1589,7 @@ mod tests {
     fn stand_in_claude(dir: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join("claude");
-        std::fs::write(&path, body).unwrap();
+        crate::test_isolation::write_script(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }

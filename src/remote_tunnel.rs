@@ -4645,7 +4645,7 @@ mod tunnel_tests {
              local_sock=${{spec%%:*}}\n\
              {body}\n"
         );
-        std::fs::write(&script, text).expect("write the stand-in");
+        crate::test_isolation::write_script(&script, text).expect("write the stand-in");
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
             .expect("make it executable");
@@ -5306,19 +5306,41 @@ mod tunnel_tests {
     /// listening on.
     #[test]
     fn a_regular_file_at_the_forward_path_is_not_mistaken_for_a_bound_socket() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let ssh = standin_ssh(temp.path(), "printf x > \"$local_sock\"\nsleep 30");
-        let socket = socket_in(temp.path());
-        let err =
-            RemoteTunnel::open_at_within(&ssh, &deck(), socket.clone(), Duration::from_millis(300))
+        // The window is paid in full — the open must time out — and its length is
+        // not what is asserted. It only has to hold the stand-in's start and its
+        // `printf`, and a flat 300 ms did not when 20 copies of this module ran at
+        // once: the open timed out before the file existed, so the premise failed
+        // with nothing wrong in the code. A load-scaled window does not help, since
+        // the load average lags exactly that kind of burst. So the premise is read
+        // off the file itself — created before the open returned — and only a run
+        // whose stand-in was too slow to meet it tries once more with a wider
+        // window. The property is never retried: a build that took the file for a
+        // forward fails `expect_err` on the first attempt that saw the file.
+        for window in [Duration::from_millis(300), Duration::from_secs(3)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let ssh = standin_ssh(temp.path(), "printf x > \"$local_sock\"\nsleep 30");
+            let socket = socket_in(temp.path());
+            let err = RemoteTunnel::open_at_within(&ssh, &deck(), socket.clone(), window)
                 .expect_err("a regular file must not read as a forward");
-        assert!(
-            matches!(err, TunnelError::ForwardTimeout { .. }),
-            "got {err:?}"
-        );
-        assert!(
-            socket.exists() && !is_socket_at(&socket),
-            "the premise: the stand-in did create a non-socket inode there"
+            let returned = std::time::SystemTime::now();
+            assert!(
+                matches!(err, TunnelError::ForwardTimeout { .. }),
+                "got {err:?}"
+            );
+            let made_in_time = std::fs::symlink_metadata(&socket)
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|made| made <= returned);
+            if made_in_time {
+                assert!(
+                    !is_socket_at(&socket),
+                    "the stand-in's inode is a regular file, not a socket"
+                );
+                return;
+            }
+        }
+        panic!(
+            "the premise never held: the stand-in did not create its file before the open \
+             timed out, even with a 3 s window"
         );
     }
 
@@ -5574,6 +5596,26 @@ mod tunnel_tests {
         )
         .expect("sidecar");
 
+        // The premise, waited for rather than assumed: `spawn` returns once the
+        // child's close-on-exec status pipe closes, and the kernel closes it in
+        // `begin_new_exec`, before the new image's argument area is set up. In
+        // that window `/proc/<pid>/cmdline` reads EMPTY, so a sweep run straight
+        // after `spawn` correctly declines to kill a process whose command line
+        // names nothing — measured under 20 concurrent copies of this module,
+        // the stray then outlived the wait below. A real orphan is long past
+        // its exec by the time any sweep reaches it.
+        let socket_text = orphan.to_string_lossy().into_owned();
+        assert!(
+            wait_until(
+                || {
+                    std::fs::read(format!("/proc/{stray_pid}/cmdline"))
+                        .is_ok_and(|raw| String::from_utf8_lossy(&raw).contains(&socket_text))
+                },
+                crate::test_budget::load_scaled(Duration::from_secs(5))
+            ),
+            "the stand-in's command line never named the socket"
+        );
+
         assert_eq!(reap_orphaned_tunnels(dir), 1);
         assert!(
             wait_until(
@@ -5743,7 +5785,7 @@ mod tunnel_tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(dir).expect("create the stand-in directory");
         let bin = dir.join("dot-agent-deck");
-        std::fs::write(&bin, script).expect("write the stand-in");
+        crate::test_isolation::write_script(&bin, script).expect("write the stand-in");
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
             .expect("make the stand-in executable");
         dir.to_path_buf()

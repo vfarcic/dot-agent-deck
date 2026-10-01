@@ -1636,16 +1636,24 @@ export const FIXTURE_VOICE_UTTERANCE = FIXTURE_VOICE_COMMANDS[0].phrases[0];
  *
  * With no parameter it is the single canned utterance the preview has always
  * had, so every existing page and test sees exactly what it saw before.
+ *
+ * Blank phrases are dropped, and a `?voice=` that held only blank ones is an
+ * EMPTY script: a microphone that hears nothing at all. It used to fall back to
+ * the canned utterance instead, so the browser spec that asks for silence to
+ * read the empty-state hint got a real utterance on the first status poll. The
+ * hint was then replaced, and the spec passed only when it read the hint
+ * before that poll landed.
  */
 export function fixtureVoiceScript(search: string): string[] {
-  const query = new URLSearchParams(search);
-  const spoken = query.getAll("voice").filter((phrase) => phrase.trim() !== "");
-  if (spoken.length > 0) return spoken;
-  /* PR #1451 round 3, change 4 — the crowded paging state is about what voice
-     SHOWS (pages, numbers, markers), so its microphone says nothing unless a
-     spec scripts it: the default line would navigate away from the screen
-     under test the moment voice turns on. */
-  return query.get("state") === "voice-pages" ? [] : [FIXTURE_VOICE_UTTERANCE];
+  const params = new URLSearchParams(search);
+  if (!params.has("voice")) {
+    /* PR #1451 round 3, change 4 — the crowded paging state is about what voice
+       SHOWS (pages, numbers, markers), so its microphone says nothing unless a
+       spec scripts it: the default line would navigate away from the screen
+       under test the moment voice turns on. */
+    return params.get("state") === "voice-pages" ? [] : [FIXTURE_VOICE_UTTERANCE];
+  }
+  return params.getAll("voice").filter((phrase) => phrase.trim() !== "");
 }
 
 /**

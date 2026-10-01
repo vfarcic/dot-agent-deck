@@ -219,7 +219,9 @@ describe("VOICE_ACTIONS", () => {
     });
     fireEvent.click(screen.getByTestId("deck-selector-toggle"));
     const menu = await screen.findByTestId("deck-selector-menu");
-    fireEvent.click(within(menu).getByTestId(`deck-selector-option-${remoteId}`));
+    // Waited for: the menu can open before `getSettings` lands, and only then
+    // does it list the remote deck.
+    fireEvent.click(await within(menu).findByTestId(`deck-selector-option-${remoteId}`));
 
     await waitFor(() => expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("vf@build-box.example.com"));
     expect(saveSettings).toHaveBeenCalledTimes(1);

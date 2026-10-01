@@ -30,6 +30,17 @@ export default defineConfig({
     // them.
     exclude: [...configDefaults.exclude, "e2e/**", "driver/**"],
     setupFiles: ["./src/test/setup.ts"],
+    // A ceiling, not a pace: a passing test waits no longer for it. vitest's
+    // default of 5s is an idle machine's budget, and under the parallel load
+    // this repo's agents put on one box (load averages of 90 to 130 on 16
+    // cores, measured 2026-10-01) nine `App.test.tsx` scenarios that pass
+    // alone ran 5–10s and timed out. A timed-out test is also not cancelled:
+    // its remaining steps keep firing into `document.body` while the next test
+    // renders, so one timeout can surface as a different failure in a
+    // neighbour (those runs also failed "Found multiple elements" beside the
+    // timeouts). Testing Library's own wait budget is raised beside this, in
+    // `src/test/setup.ts`.
+    testTimeout: 30_000,
     css: true,
   },
 });
