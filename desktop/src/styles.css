@@ -574,7 +574,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-assignment { min-height: 50px; padding: 7px 11px; border-bottom: 1px solid var(--line); background: var(--paper); }
 .agent-assignment > span { color: var(--faint); font-size: 7px; font-weight: 800; letter-spacing: .12em; }
 .agent-assignment p { margin: 3px 0 0; display: -webkit-box; overflow: hidden; color: var(--ink-soft); font-size: 9.5px; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
-.agent-instruments { min-height: 40px; display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--line); }
+/* One equal column per reading rather than a fixed four: with the agent
+   details hidden (issue #1400) a live tile shows two, TIME and TOOLS. */
+.agent-instruments { min-height: 40px; display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; border-bottom: 1px solid var(--line); }
 .agent-instruments > div { padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; border-right: 1px solid var(--line); }
 .agent-instruments > div:last-child { border: 0; }
 .agent-instruments span { color: var(--faint); font-size: 6.5px; font-weight: 800; letter-spacing: .1em; }

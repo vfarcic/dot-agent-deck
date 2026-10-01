@@ -407,6 +407,12 @@ export interface DesktopFeatures {
   showPrompts: boolean;
   showOrchestrations: boolean;
   showAgentProfiles: boolean;
+  /**
+   * Issue #1400 — the agent screen's Diff, Checks, Delegations and Artifacts
+   * tabs and its ATT, MODEL and USAGE fields, which a live daemon supplies
+   * nothing for today. Off leaves Terminal as the only tab.
+   */
+  showAgentDetails: boolean;
 }
 
 /** Every experimental surface hidden — the shipped default, and what fixture mode answers unless `?experimental=1`. */
@@ -416,6 +422,7 @@ export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
   showPrompts: false,
   showOrchestrations: false,
   showAgentProfiles: false,
+  showAgentDetails: false,
 };
 
 /**

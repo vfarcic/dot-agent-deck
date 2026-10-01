@@ -1343,6 +1343,7 @@ pub struct DesktopFeatures {
     pub show_prompts: bool,
     pub show_orchestrations: bool,
     pub show_agent_profiles: bool,
+    pub show_agent_details: bool,
 }
 
 impl DesktopFeatures {
@@ -1356,6 +1357,7 @@ impl DesktopFeatures {
             show_prompts: features::show_desktop_prompts(),
             show_orchestrations: features::show_desktop_orchestrations(),
             show_agent_profiles: features::show_desktop_agent_profiles(),
+            show_agent_details: features::show_desktop_agent_details(),
         }
     }
 }
@@ -4030,6 +4032,7 @@ mod tests {
                 show_prompts: false,
                 show_orchestrations: false,
                 show_agent_profiles: false,
+                show_agent_details: false,
             }
         );
 
@@ -4042,6 +4045,7 @@ mod tests {
                 show_prompts: true,
                 show_orchestrations: true,
                 show_agent_profiles: true,
+                show_agent_details: true,
             }
         );
     }
@@ -4056,6 +4060,7 @@ mod tests {
             show_prompts: true,
             show_orchestrations: false,
             show_agent_profiles: true,
+            show_agent_details: false,
         })
         .expect("serialises");
         assert_eq!(
@@ -4066,6 +4071,7 @@ mod tests {
                 "showPrompts": true,
                 "showOrchestrations": false,
                 "showAgentProfiles": true,
+                "showAgentDetails": false,
             })
         );
     }
