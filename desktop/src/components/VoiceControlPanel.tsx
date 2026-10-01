@@ -919,6 +919,9 @@ interface VoiceControlPanelProps {
   /** PRD #1260 — told when the dictation mode starts or ends, so the host can
    * mark the pane it is typing into. */
   onDictationChange?: (target: Pending | undefined) => void;
+  /** PR #1451, round 3 — told when voice turns on or off, so the host can
+   * share it with the lists that render differently while it is on. */
+  onVoiceChange?: (on: boolean) => void;
   /**
    * PRD #1261 review, round 4 — the incarnation (`spawnedAtMs`) of every
    * agent on the selected deck as the host sees it now, by agent id; absent or
@@ -971,7 +974,7 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, selectedDeckId, confirmationOpen = false, onDictationChange, agentIncarnations }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, selectedDeckId, confirmationOpen = false, onDictationChange, onVoiceChange, agentIncarnations }: VoiceControlPanelProps) {
   /* Held in a ref so the resolve and the overlay read the host's latest getter
      without either callback being rebuilt when the host re-renders. */
   const directoriesRef = useRef(directories);
@@ -1041,6 +1044,16 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   */
   const onRef = useRef(false);
   const setOn = useCallback((next: boolean) => { onRef.current = next; setOnState(next); }, []);
+
+  /* PR #1451, round 3 — the host mirrors whether voice is on for the lists
+     that render differently while it is (`hooks/useVoiceOn.ts`). Reported
+     after the commit that changed it, and as `false` when the panel goes
+     away, so no list is left showing voice's numbers for a panel that is
+     gone. */
+  const voiceChanged = useRef(onVoiceChange);
+  voiceChanged.current = onVoiceChange;
+  useEffect(() => { voiceChanged.current?.(on); }, [on]);
+  useEffect(() => () => voiceChanged.current?.(false), []);
 
   /*
     PR #1451 — while voice is on the row is half as large again and its

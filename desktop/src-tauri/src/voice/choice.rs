@@ -160,11 +160,7 @@ pub fn answer(utterance: &str, offered: &[ResolvedParam], live: &ChoiceLive) -> 
         return ChoiceAnswer::Cancelled;
     }
     if let Some(ordinal) = ordinal {
-        let at = match ordinal {
-            Ordinal::Last => offered.len().checked_sub(1),
-            Ordinal::Nth(number) => number.checked_sub(1),
-        };
-        return match at.and_then(|at| offered.get(at)) {
+        return match ordinal.index(offered.len()).map(|at| &offered[at]) {
             Some(candidate) => still_live(candidate, live),
             None => ChoiceAnswer::Refused,
         };
@@ -172,17 +168,34 @@ pub fn answer(utterance: &str, offered: &[ResolvedParam], live: &ChoiceLive) -> 
     by_name(utterance, &words, offered, live)
 }
 
-/// A whole-utterance ordinal.
+/// A whole-utterance ordinal. Shared beyond the choice (PR #1451, round 3)
+/// so a bare number said against any numbered list on screen is read by the
+/// same rules as an answer to a choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ordinal {
+pub(crate) enum Ordinal {
+    /// The 1-based position said: "two", "2", "the second".
     Nth(usize),
+    /// "the last one".
     Last,
+}
+
+impl Ordinal {
+    /// The 0-based index this ordinal names in a list of `len` entries, or
+    /// `None` when it names none of them: "zero", or past the end.
+    pub(crate) fn index(self, len: usize) -> Option<usize> {
+        let at = match self {
+            Ordinal::Last => len.checked_sub(1),
+            Ordinal::Nth(number) => number.checked_sub(1),
+        };
+        at.filter(|&at| at < len)
+    }
 }
 
 /// `words` read as an ordinal, or `None` when they are anything else: "two",
 /// "2", "number two", "option 2", "the second", "the second one", "2nd", "the
-/// last one". Whole-utterance, so "open the second tab" is not one.
-fn ordinal(words: &[String]) -> Option<Ordinal> {
+/// last one". Whole-utterance, so "open the second tab" is not one; `words`
+/// are what [`whole_utterance`] makes of the transcript.
+pub(crate) fn ordinal(words: &[String]) -> Option<Ordinal> {
     let mut rest: &[String] = words;
     if rest.first().is_some_and(|word| word == "the") {
         rest = &rest[1..];

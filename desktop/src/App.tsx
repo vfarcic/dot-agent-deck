@@ -56,6 +56,7 @@ import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRecord";
 import { useZoom } from "./hooks/useZoom";
 import { useShellOverlays, type RailScreen, type ScreenOverlays } from "./hooks/useShellOverlays";
+import { VoiceOn } from "./hooks/useVoiceOn";
 import { agentKey } from "./lib/agentKey";
 import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
@@ -626,6 +627,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     () => (dictating && agentView && dictating.deckId === agentView.deckId && dictating.agentId === agentView.agentId ? { agentId: dictating.agentId, label: dictating.label } : undefined),
     [agentView, dictating],
   );
+  /** PR #1451, round 3 — whether voice is on, shared with the lists that render differently while it is. */
+  // voice-registry-exempt: a mirror of the voice panel's own toggle, written only by its report so lists can render for it; voice itself is turned on by the panel's button
+  const [voiceOn, setVoiceOn] = useState(false);
   /**
    * PRD #802 M6 — run one resolved voice command, and answer with how to undo it.
    *
@@ -871,13 +875,15 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     or re-created by a navigation.
   */
   return (
-    <PaneDictation.Provider value={paneDictation}>
-      {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
-      <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
-      {screenNode}
-      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} onDictationChange={setDictating} agentIncarnations={readAgentIncarnations} />
-      <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
-    </PaneDictation.Provider>
+    <VoiceOn.Provider value={voiceOn}>
+      <PaneDictation.Provider value={paneDictation}>
+        {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
+        <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
+        {screenNode}
+        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} onDictationChange={setDictating} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} />
+        <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
+      </PaneDictation.Provider>
+    </VoiceOn.Provider>
   );
 }
 
