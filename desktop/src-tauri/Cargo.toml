@@ -204,9 +204,11 @@ getrandom = "0.4"
 # is added to `tauri-deps/flake.nix` or the `apt-get` blocks; `objc2-app-kit`
 # on macOS; `clipboard-win` on Windows. Most of the rest is `image` and its
 # decoders, from arboard's default `image-data` feature, which the plugin
-# turns on and a dependent cannot turn off. Pinned at 2.3.3 rather than the
-# newest 2.4.0, which was three days old when this was written and inside the
-# four days `renovate.json` holds a Tauri crate.
+# turns on and a dependent cannot turn off. The requirement is `^2.3.3`, the
+# release chosen when this was added (2.4.0 was then still inside the hold
+# below); `Cargo.lock` decides the
+# version actually built, and Renovate moves it within that range once a
+# release has cleared the four days `renovate.json` holds a Tauri crate.
 tauri-plugin-clipboard-manager = "2.3.3"
 
 [dev-dependencies]
