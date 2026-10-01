@@ -430,7 +430,11 @@ export class Deck {
         outcome === "resized"
           ? `the terminal's grid resized during the drag, so it selected nothing (attempt ${attempt} of ${SELECT_ATTEMPTS})`
           : `timed out after ${SELECT_MS}ms waiting for the drag to select ${text}`;
-      if (outcome === "resized" && attempt < SELECT_ATTEMPTS) continue;
+      if (outcome === "resized" && attempt < SELECT_ATTEMPTS) {
+        // In the log, so a passing run still says whether issue #1457's resize happened.
+        console.log(`selectRow: ${why}; dragging again`);
+        continue;
+      }
       const seen = await this.session
         .execute<unknown>("return { events: window.__dadPointerLog, trace: window.__dadSelectionTrace };")
         .catch((probe: unknown) => String(probe));
