@@ -329,6 +329,16 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    * directory is then not restored (the open effect says so).
    */
   const [highlight, setHighlight] = useState<string | undefined>(() => preselectedDeck(deckChoices(runtime.fleet), initialDeckId ?? draft?.deckId));
+  /**
+   * A highlighted deck that stops being usable while the dialog is open leaves
+   * the list, so the highlight must not stay on it: Enter would then act on a
+   * row nobody can see. It moves to the first deck still listed, or clears
+   * when none is.
+   */
+  useEffect(() => {
+    if (highlight === undefined || usable.some((choice) => choice.deckId === highlight)) return;
+    setHighlight(usable[0]?.deckId);
+  }, [usable, highlight]);
   /** What the open put back and what it could not (#1247); absent for a fresh form. */
   const [restoreNotes, setRestoreNotes] = useState<string[]>();
   const [deckNotice, setDeckNotice] = useState<string>();
@@ -1570,7 +1580,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
       if (usable.length) setHighlight(usable[(index <= 0 ? usable.length : index) - 1].deckId);
     } else if (event.key === "Enter") {
       event.preventDefault();
-      chooseDeck(choices.find((choice) => choice.deckId === highlight));
+      chooseDeck(usable.find((choice) => choice.deckId === highlight));
     }
   };
 

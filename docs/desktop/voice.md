@@ -35,7 +35,7 @@ What you can do by voice, by screen:
 | --- | --- |
 | Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog); list the commands; turn voice off |
 | Dashboard | Open Settings; switch which daemon the app shows; open an agent's pane; open New agent; stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
-| New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; choose a Mode chip or the agent to run; set the Name; start; discard |
+| New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; start; discard |
 | An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off |
 
 While voice is on, the agents, daemons, directories and modes on screen are numbered, and saying a number chooses one; see [Choosing by number](#choosing-by-number). When what you said matches more than one thing on screen, the app lists the matches for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things).
@@ -47,6 +47,10 @@ A command that names an agent, such as "stop the planner" or "close the review o
 Nothing is typed or sent, and the app says why, if a confirmation is open, if the pane is showing another tab instead of the agent's terminal, or if the pane on screen is no longer the one you were looking at when you spoke — for example because you opened another agent while the app was still working out what you said. Once the words are typed, the send is called off, and the app says so, if before it happens you close the pane, open another screen or agent, switch daemons, or a confirmation opens: the words stay in the agent's prompt, unsent. It is also called off if the agent in the pane is replaced by a new one. Telling a replacement apart needs a daemon that reports when each agent started; with one that does not, the app cannot tell a replacement from the original agent.
 
 **While voice is on, the app keeps the computer from going to sleep from inactivity**, because speaking produces no keyboard or mouse input. The display can still turn off. On Linux this goes through systemd-logind; a desktop environment whose power manager ignores logind may still suspend.
+
+## Filtering directories
+
+While the New agent dialog shows a directory, say "filter" followed by what to look for, such as "filter docs" or "filter by api". The app puts that text in the **Filter** box, exactly as if you had typed it, and the list shows only the directories whose names contain it, in upper or lower case. Longer requests work too: "show only those starting with letter D" sets the filter to `d`, which, as when you type it, also keeps names that have a `d` anywhere else. The app says what it applied, for example *Filtering by “d”.* It uses only words you said: if what you asked for is not in your words, the filter is left as it was and the app says so. Say "clear filter" to empty the box and show every directory again.
 
 ## Choosing by number
 

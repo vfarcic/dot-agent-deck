@@ -381,6 +381,29 @@ describe("New agent dialog — deck field (PRD #1223 M4)", () => {
     expect(runtime.listDirectories).toHaveBeenCalledWith(third, undefined);
     await waitFor(() => expect(directoryList()).toHaveFocus());
   });
+
+  /**
+   * Scenario: while the daemon field is focused, its highlighted remote daemon
+   * disconnects and disappears from the usable list. The highlight moves to
+   * the remaining visible daemon, and Enter chooses that daemon's directory.
+   */
+  it("moves the highlight to a visible daemon when the highlighted one disconnects", async () => {
+    const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE)] });
+    const { rerenderWith } = renderDialog(runtime);
+    await waitFor(() => expect(deckList()).toHaveFocus());
+    fireEvent.keyDown(deckList(), { key: "j" });
+    fireEvent.keyDown(deckList(), { key: "ArrowDown" });
+    expect(deckList().querySelector("[aria-selected='true']")).toHaveAttribute("data-deck-id", REMOTE);
+
+    rerenderWith({ ...runtime, fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE, { status: "disconnected" })] });
+    expect(within(deckList()).getAllByRole("option")).toHaveLength(1);
+    await waitFor(() => expect(deckList().querySelector("[aria-selected='true']")).toHaveAttribute("data-deck-id", LOCAL));
+    fireEvent.keyDown(deckList(), { key: "Enter" });
+
+    await currentPath("/home/dev");
+    expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, undefined);
+    expect(runtime.listDirectories).not.toHaveBeenCalledWith(REMOTE, undefined);
+  });
 });
 
 describe("New agent dialog — directory browser (PRD #1223 M4)", () => {

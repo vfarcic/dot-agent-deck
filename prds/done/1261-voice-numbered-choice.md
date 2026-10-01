@@ -155,6 +155,8 @@ Answers are local, so the fixtures cover only the first utterance (reaching `par
 
 - [x] **Round 3, change 3 — Numbers on lists while voice is on.** The dashboard's agent rows (one sequence across every daemon), the Daemons screen's tiles (agreeing with the `1`–`4` keys) and the New agent dialog's daemons, directories and Mode chips (one sequence in reading order) show a number before each item while voice is on; with voice off they look as before. A bare spoken number selects the item showing it, answered locally against the declared on-screen list with no Commands call; a list that changed while the number was being said, and a number no item shows, are refused; a count that is also another item's name offers the numbered choice. Number keys select on the dashboard and the dialog's lists, never in a field. Rust, vitest and Playwright tests.
 
+- [x] **Round 3, change 5 — Filter the directories by voice.** "filter \<text\>" sets the New agent browser's Filter box as if typed, and "clear filter" empties it (`filter_directories`, `clear_directory_filter`, both requiring the directory listing). The model extracts the text from a longer request ("show only those starting with letter D" is "d"); `voice::filter::grounded_filter_text` keeps it only if the user said it, and the report quotes what was applied. Matching stays contains, case-insensitive, for typing and voice alike. Rust, vitest and Playwright tests; the browser fixture carries both rows.
+
 **Deferred.**
 
 D1 below is deferred, not done: "close the agent" and every other reading the Commands backend settles into ONE action still never offers a choice, because the backend's answer cannot carry a second action until PRD #1184's schema lands.
@@ -266,3 +268,11 @@ Everything but D1 is built and ships in the PR that closes #1261. D1 needs the m
 - **Number keys** select only where a digit means nothing else: the dashboard and the dialog's daemon list, directory list and Mode chips; never Filter, Name or Command. The Daemons screen keeps its `1`–`4`, and tile numbers are in the same order. Daemon tiles now carry an accessible name (their role).
 - **Shaped for paging (change 4):** a paged listing declares its current page only, so numbers restart at 1 per page and a page turn is a new generation; the answer rule needs no change.
 - Tests: Rust `voice::numbers` (valid, not a number, out of range, stale, collision, the wire shape) and `voice_numbered_lists_are_bounded`; vitest `VoiceNumberedLists.test.tsx`, Playwright `voice-numbered-lists.spec.ts` (tester's). No phrase-fixture row: a bare number never reaches the model, and "open number three" is an ordinary command with nothing new to pin.
+
+### 2026-10-01 — PR #1451 round 3, change 5: filtering the directories by voice
+
+- **Two rows, both gated on the directory listing** (decision D5): `filter_directories` takes a new `filter_text` param and reports "Filtering by “\<text\>”."; `clear_directory_filter` reports "Filter cleared.". With no listing declared each is refused with its own hint ("Not here — filtering needs the New agent dialog's directory listing; …").
+- **Grounded, not trusted.** The model picks the text; `voice::filter::grounded_filter_text` accepts it only when its words occur in the transcript, adjacent and in order, or when it is one letter named after "letter". Anything else is `param_unresolved` and the box is left alone.
+- **One change path.** The dialog sets the box through the same `changeFilter` a keystroke takes, and refuses a browser that moved on since the utterance was judged. Typing and voice both match "contains, case-insensitive"; a Playwright test pins a typed capital `D` to the same listing as a spoken `d`.
+- **The browser fixture carries both rows**, with `requires` honoured from the declared listing and a small stand-in for the model's extraction (a named letter, else the words after the opener) held to the same grounding rule.
+- Tests: Rust `voice::filter` and four phrase fixtures (gpt-5-mini, 3 runs); vitest `VoiceControlCommands.test.tsx`; Playwright `voice-filter.spec.ts` (tester's).

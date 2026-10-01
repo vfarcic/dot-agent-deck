@@ -684,12 +684,34 @@ pub fn parse_response(payload: &Value) -> Result<Transcript, TranscriptionError>
     if !segments.iter().any(no_speech) {
         return Ok(Transcript::new(text.trim()));
     }
-    let kept: String = segments
+    let mut kept = String::new();
+    for piece in segments
         .iter()
         .filter(|segment| !no_speech(segment))
         .filter_map(|segment| segment["text"].as_str())
-        .collect();
+    {
+        if needs_separator(&kept, piece) {
+            kept.push(' ');
+        }
+        kept.push_str(piece);
+    }
     Ok(Transcript::new(kept.trim()))
+}
+
+/// Whether two retained segments need a space between them once a dropped
+/// segment no longer sits there. Whisper usually starts a segment with its own
+/// space, but not always, and without one the neighbouring words would merge.
+/// No space goes before punctuation the next segment begins with.
+fn needs_separator(before: &str, next: &str) -> bool {
+    let (Some(last), Some(first)) = (before.chars().last(), next.chars().next()) else {
+        return false;
+    };
+    !last.is_whitespace()
+        && !first.is_whitespace()
+        && !matches!(
+            first,
+            ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '…'
+        )
 }
 
 /// What a non-2xx reply becomes.
@@ -1618,6 +1640,23 @@ mod tests {
         ]))
         .expect("parses");
         assert_eq!(transcript.text(), "Add a test for the parser.");
+    }
+
+    /// Scenario: a no-speech segment is removed from a verbose reply between
+    /// spoken segments whose text has no boundary spaces. The remaining words
+    /// stay separated, while a segment already starting with space or
+    /// punctuation keeps its original spacing.
+    #[test]
+    fn voice_transcribe_separates_retained_segments_after_dropping_no_speech() {
+        let transcript = parse_response(&verbose(&[
+            ("Open", 0.05, -0.2),
+            ("noise", 0.91, -0.4),
+            ("the", 0.04, -0.2),
+            (" door,", 0.03, -0.2),
+            ("please.", 0.02, -0.2),
+        ]))
+        .expect("parses");
+        assert_eq!(transcript.text(), "Open the door, please.");
     }
 
     /// The request asks for `verbose_json`, which is where a whisper model's

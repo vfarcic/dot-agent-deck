@@ -72,7 +72,8 @@ describe("numbered voice lists through the dashboard", () => {
     voice.deliver("three");
     await poll();
     expect(resolveVoice).not.toHaveBeenCalled();
-    expect(screen.getByTestId("agent-pane-overlay")).toHaveTextContent("Contract review");
+    expect(screen.getByTestId("agent-pane-overlay").querySelector(".agent-assignment p"))
+      .toHaveTextContent("Check the payment API for breaking changes.");
   });
 
   /** Scenario: the spoken number names both the first displayed position and an agent named orchestrator-1 in another position. The app offers both choices rather than guessing either agent. */

@@ -173,7 +173,8 @@ test.describe("numbered lists while voice is on", () => {
       await selectOverview(page);
       await turnOnVoice(page);
       await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
-      await expect(page.getByTestId("agent-pane-overlay")).toContainText("Contract review");
+      await expect(page.getByTestId("agent-pane-overlay").locator(".agent-assignment p"))
+        .toHaveText("Check the payment API for breaking changes.");
       await expect(page.getByRole("dialog", { name: "Which agent?" })).toHaveCount(0);
     });
   }

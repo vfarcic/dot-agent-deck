@@ -1,5 +1,6 @@
 import type { VoiceCommandDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
 import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, WorkflowStage } from "../types";
+import { voicePagesFleet } from "./fixtureCrowded";
 
 /**
  * The fixture's stand-in for a deck identity — used as BOTH `deckId` and
@@ -43,7 +44,7 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet" | "voice-pages";
 
 export const DEFAULT_PROFILES: AgentProfile[] = [
   {
@@ -884,6 +885,7 @@ function fleetDeck(
  */
 export function createFixtureFleet(state: FixtureState = "connected"): DeckSnapshot[] {
   if (state === "docs-fleet") return docsFleet();
+  if (state === "voice-pages") return voicePagesFleet(createFixtureSnapshot("crowded"));
   if (state !== "fleet") return [createFixtureSnapshot(state)];
   return [
     fleetDeck(
@@ -948,7 +950,7 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
   // `fleet` is a THREE-deck scenario and has no single snapshot, so a caller
   // asking for one gets the deck the single-deck screens are on — never the
   // disconnected fall-through an unlisted state would otherwise land in.
-  if (state === "fleet" || state === "docs-fleet") return createFixtureFleet(state)[0];
+  if (state === "fleet" || state === "docs-fleet" || state === "voice-pages") return createFixtureFleet(state)[0];
   const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs";
   const connection = connected
     ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding" }
@@ -1066,6 +1068,12 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
    * resolver.
    */
   readonly openers?: readonly string[];
+  /**
+   * `commands.toml`'s `requires = ["directory_listing"]`: callable only while
+   * the webview has declared a directory listing, and otherwise refused with
+   * the row's own hint — the same `Not here — <hint>.` Rust renders.
+   */
+  readonly requires?: "directory_listing";
 }> = [
   {
     phrases: ["show me every agent", "show me all the agents", "show me everything"],
@@ -1198,6 +1206,32 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     unavailableHint: "sending a prompt needs an agent's pane open — open one first",
     report: "Sent.",
   },
+  {
+    // PR #1451 round 3, change 5 — the New agent browser's Filter box.
+    // Matched by OPENER, `commands.toml`'s `heard_as` for the row; the text
+    // is then picked out of the utterance by {@link fixtureFilterText} and
+    // kept only if `voice::filter::grounded_filter_text` would keep it. The
+    // picking is the one part a model does in a live build, so the preview's
+    // version is deliberately small: a named letter, or what follows the
+    // opener.
+    phrases: [],
+    openers: ["filter", "show only", "only show", "narrow"],
+    action: "filter_directories",
+    invoke: "filterDirectories",
+    screens: ["overview"],
+    requires: "directory_listing",
+    unavailableHint: "filtering needs the New agent dialog's directory listing; say “new agent” and choose a daemon first",
+    report: "Filtering by “{text}”.",
+  },
+  {
+    phrases: ["clear filter", "clear the filter", "remove the filter", "reset the filter", "no filter", "show all directories"],
+    action: "clear_directory_filter",
+    invoke: "clearDirectoryFilter",
+    screens: ["overview"],
+    requires: "directory_listing",
+    unavailableHint: "clearing the filter needs the New agent dialog's directory listing; say “new agent” and choose a daemon first",
+    report: "Filter cleared.",
+  },
 ];
 
 /**
@@ -1213,11 +1247,11 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
  * honest about what this stand-in is — a matcher over a fixed list — and is
  * what a preview reader most needs to know.
  */
-export function fixtureVoiceCommands(screen: VoiceScreen): VoiceCommandDto[] {
+export function fixtureVoiceCommands(screen: VoiceScreen, directoryListing = false): VoiceCommandDto[] {
   return FIXTURE_VOICE_COMMANDS.map((command) => ({
     id: command.action,
     description: `Say ${command.phrases.map((phrase) => `“${phrase}”`).join(", ")}.`,
-    callable: command.screens.includes(screen),
+    callable: fixtureCallable(command, screen, directoryListing),
     unavailable_hint: command.unavailableHint,
     params: [],
   }));
@@ -1268,7 +1302,7 @@ const FIXTURE_VOICE_TIE = {
  * would be the preview inventing a measurement, which is the same fabrication
  * `resolve_ms: None` exists to refuse on the Rust side.
  */
-export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dictating = false): VoiceResultDto {
+export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dictating = false, directoryListing = false): VoiceResultDto {
   const spoken = utterance.trim().toLowerCase();
   const stub = { resolveMs: null, backend: "stub" } as const;
   /* PRD #1260 — while the dictation mode is on the real pipeline asks no model
@@ -1330,10 +1364,28 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
   if (!command) {
     return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
   }
-  if (!command.screens.includes(screen)) {
+  if (!fixtureCallable(command, screen, directoryListing)) {
     return {
       ...stub,
       outcome: { kind: "unavailable", transcript: utterance, action: command.action, hint: command.unavailableHint, sentence: `Not here — ${command.unavailableHint}.` },
+    };
+  }
+  if (command.action === "filter_directories") {
+    const opener = command.openers!.find((candidate) => fixtureOpening(utterance, candidate) !== undefined);
+    const text = opener === undefined ? undefined : fixtureFilterText(utterance, fixtureOpening(utterance, opener)!);
+    if (text === undefined) {
+      return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
+    }
+    return {
+      ...stub,
+      outcome: {
+        kind: "dispatch",
+        transcript: utterance,
+        action: command.action,
+        invoke: command.invoke,
+        params: [{ name: "text", kind: "filter_text", spoken: text, value: text, label: text }],
+        sentence: command.report.replace("{text}", text),
+      },
     };
   }
   /* The typed text is a slice of the UTTERANCE, never of anything this module
@@ -1355,6 +1407,40 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
       sentence: text === undefined ? command.report : `Typed: “${text}”.`,
     },
   };
+}
+
+/** Whether `command` can run on `screen`, given whether a directory listing is declared. */
+function fixtureCallable(command: (typeof FIXTURE_VOICE_COMMANDS)[number], screen: VoiceScreen, directoryListing: boolean): boolean {
+  return command.screens.includes(screen) && (command.requires !== "directory_listing" || directoryListing);
+}
+
+/**
+ * The Filter box's text out of what followed the opener: a letter named after
+ * "letter" ("show only those starting with letter D" is "d"), or else the rest
+ * less a leading "by" ("filter by api" is "api"). Kept only if
+ * {@link fixtureGroundedFilterText} keeps it, which is the half of the live
+ * path this reproduces exactly.
+ */
+function fixtureFilterText(utterance: string, rest: string): string | undefined {
+  const letter = /\bletter\s+(\p{L})(?![\p{L}\p{N}])/iu.exec(rest);
+  const value = letter ? letter[1] : rest.replace(/^by\s+/iu, "");
+  return fixtureGroundedFilterText(utterance, value);
+}
+
+/**
+ * `voice::filter::grounded_filter_text`: the value, trimmed of what is not a
+ * letter or digit and lowercased, made only of letters, digits, spaces and the
+ * joiners `-` `_` `.`, and said — its words adjacent in the transcript, or one
+ * letter named straight after "letter". Spelled letter names ("letter dee")
+ * are Rust's alone; the preview has no model that would produce one.
+ */
+function fixtureGroundedFilterText(transcript: string, value: string): string | undefined {
+  const text = value.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "").toLowerCase();
+  if (text === "" || !/^[\p{L}\p{N} ._-]+$/u.test(text)) return undefined;
+  const wanted = fixtureSpokenWords(text);
+  const said = fixtureSpokenWords(transcript);
+  const adjacent = said.some((_, at) => wanted.length > 0 && wanted.every((word, offset) => said[at + offset] === word));
+  return adjacent ? text.split(/\s+/u).join(" ") : undefined;
 }
 
 /**

@@ -1,4 +1,5 @@
 import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
 import { agentKey } from "./agentKey";
@@ -2304,7 +2305,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-fleet"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-fleet", "voice-pages"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
@@ -2313,6 +2314,7 @@ class FixtureDeckBridge implements DeckBridge {
    * every scenario but `fleet`, which is the three-deck one.
    */
   private fleet: DeckFleet;
+  private readonly fixtureState: FixtureState;
   private fleetListeners = new Set<FleetListener>();
   private terminalListeners = new Set<TerminalListener>();
   private fixtureStep = 0;
@@ -2354,6 +2356,7 @@ class FixtureDeckBridge implements DeckBridge {
   constructor() {
     const requestedState = new URLSearchParams(window.location.search).get("state");
     const state = FIXTURE_STATES.find((candidate) => candidate === requestedState) ?? "connected";
+    this.fixtureState = state;
     this.fleet = createFixtureFleet(state);
     const older = new URLSearchParams(window.location.search).get("older");
     if (older === "1" || older === "all") this.olderDecks = "all";
@@ -2741,10 +2744,14 @@ class FixtureDeckBridge implements DeckBridge {
   /** PRD #1260 — the dictation mode declared with that screen, if it is on. */
   private voiceDictation: VoiceDictationTargetDto | undefined;
 
-  /* The preview's vocabulary has no directory rows, so a declared browser is
-     accepted and has nothing to feed. */
-  declareVoiceScreen(screen: VoiceScreen, _directories?: VoiceDirectoriesDto, _newAgent?: VoiceNewAgentDto, _deckStep?: VoiceDeckChoiceDto[], _endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void {
+  /** Whether a directory listing was declared with that screen (PR #1451 round 3, change 5). */
+  private voiceDirectoryListing = false;
+
+  /* The preview's directory rows (the Filter box's two) need only to know a
+     listing is showing; the rows themselves feed nothing here. */
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, _newAgent?: VoiceNewAgentDto, _deckStep?: VoiceDeckChoiceDto[], _endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void {
     this.voiceScreen = screen;
+    this.voiceDirectoryListing = directories !== undefined;
     this.voiceDictation = dictation;
   }
 
@@ -2758,7 +2765,7 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     await Promise.resolve();
-    return resolveFixtureVoice(utterance, this.voiceScreen, this.voiceDictation !== undefined);
+    return resolveFixtureVoice(utterance, this.voiceScreen, this.voiceDictation !== undefined, this.voiceDirectoryListing);
   }
 
   /** PRD #1261 — the preview has no Rust side, so the webview's own port answers. */
@@ -2781,9 +2788,9 @@ class FixtureDeckBridge implements DeckBridge {
    * run — which is fewer rows than a live build has, and saying so is the point
    * of a preview rather than a shortcoming of one.
    */
-  async voiceCommands(screen: VoiceScreen): Promise<VoiceCommandDto[]> {
+  async voiceCommands(screen: VoiceScreen, directories?: VoiceDirectoriesDto): Promise<VoiceCommandDto[]> {
     await Promise.resolve();
-    return fixtureVoiceCommands(screen);
+    return fixtureVoiceCommands(screen, directories !== undefined);
   }
 
   /**
@@ -2931,7 +2938,7 @@ class FixtureDeckBridge implements DeckBridge {
     if (path !== undefined && !fixtureAcceptsPath(path)) throw new Error(FIXTURE_PASTED_PATH_REFUSAL);
     const home = FIXTURE_HOMES[deckId] ?? "/home/dev";
     const wanted = path === undefined ? home : path.replace(/\/+/g, "/").replace(/(.)\/$/, "$1");
-    const directory = fixtureDirectoryTree(home).get(wanted);
+    const directory = (this.fixtureState === "voice-pages" ? voicePagesDirectory(wanted) : undefined) ?? fixtureDirectoryTree(home).get(wanted);
     if (!directory) throw new Error(FIXTURE_UNRESOLVED_REFUSAL);
     return {
       kind: "listing",
@@ -2985,7 +2992,7 @@ class FixtureDeckBridge implements DeckBridge {
     this.connectedDeck(deckId);
     if (this.withholdsConfiguredRoles(deckId)) return { kind: "unsupported", reason: FIXTURE_CONFIGURED_ROLES_UNSUPPORTED };
     const home = FIXTURE_HOMES[deckId] ?? "/home/dev";
-    const orchestrations = fixtureProjectOrchestrations(home, path);
+    const orchestrations = (this.fixtureState === "voice-pages" ? voicePagesOrchestrations(path) : undefined) ?? fixtureProjectOrchestrations(home, path);
     if (!orchestrations) return { kind: "not_project" };
     return { kind: "project", path, displayPath: path, displayName: path.split("/").at(-1) ?? path, orchestrations, configRevision: "fixture-revision" };
   }
