@@ -572,7 +572,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### status/badge/002 — A quota-blocked card visibly names its depleted credits and uses the error colour (issue #714).
 - **Layer:** L1 (ratatui buffer with an insta snapshot).
 - **Agent:** none (a fixed structured `CreditsDepleted` session fixture).
-- **Asserts:** Blocked badge, credits reason line, and red border on the rendered card.
+- **Asserts:** Blocked badge, credits reason line, and red border on the rendered card; a full Blocked card keeps its last tool line visible at Compact, Normal, and Spacious densities. When the card is also orphaned, both status rows and the newest tool remain visible at every density, and the first surviving prompt line carries `Prmt:` (two prompts survive at Spacious density).
 - **Does not assert:** the daemon's quota classifier or a live agent.
 - **Platform coverage:** mac+linux+windows.
 
