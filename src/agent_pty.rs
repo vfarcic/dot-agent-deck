@@ -2189,6 +2189,21 @@ fn pump_reader(
             Err(_) => break,
         }
     }
+    // Issue #868: must run regardless of whether `pane_id_env` is set — a
+    // dashboard pane crashes just as much as an orchestration one, and the
+    // block below (release/sweep/notify) only fires when a pane id exists.
+    //
+    // And BEFORE `exited` is published, so the crash verdict is settled by the
+    // time anyone can see the agent as gone: a reader that observes `exited`
+    // (a `SeqCst` load) and then takes the registry lock sees `crashed` too.
+    // The other order left a window in which an exited agent read as not
+    // crashed — measured as
+    // `pump_reader_marks_natural_exit_as_crashed_but_not_deliberate_close`
+    // failing under plain `cargo test`, and reachable by a `pane restart`
+    // refusal check landing in it.
+    if let Some(registry) = registry.upgrade() {
+        registry.mark_agent_crashed(&agent_id);
+    }
     exited.store(true, Ordering::SeqCst);
     change_notify.notify_one();
     // Issue #584: release anyone waiting on THIS agent's liveness before the
@@ -2197,12 +2212,6 @@ fn pump_reader(
     // a fixed 30 s window. A dropped registry leaves nothing to wake.
     if let Some(registry) = registry.upgrade() {
         registry.signal_agent_exit(&agent_id);
-    }
-    // Issue #868: must run regardless of whether `pane_id_env` is set — a
-    // dashboard pane crashes just as much as an orchestration one, and the
-    // block below (release/sweep/notify) only fires when a pane id exists.
-    if let Some(registry) = registry.upgrade() {
-        registry.mark_agent_crashed(&agent_id);
     }
     if let Some(pane_id) = pane_id_env.as_deref()
         && let Some(registry) = registry.upgrade()
@@ -9492,6 +9501,32 @@ impl AgentPtyRegistry {
     where
         Fut: std::future::Future<Output = bool>,
     {
+        self.write_and_submit_guarded_first_write_capped_detailed(
+            pane_id,
+            text,
+            expected_agent_id,
+            revalidate,
+            started,
+            cap_ceiling,
+        )
+        .await
+        .map(|sent| sent.detail.outcome())
+    }
+
+    /// [`Self::write_and_submit_guarded_first_write_capped`], keeping the
+    /// refusal reason and reporting how long the write waited for the draft.
+    pub async fn write_and_submit_guarded_first_write_capped_detailed<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: &str,
+        revalidate: impl FnOnce() -> Fut,
+        started: Instant,
+        cap_ceiling: Duration,
+    ) -> Result<FirstWriteSend, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
         self.write_guarded(
             pane_id,
             text,
@@ -9508,7 +9543,6 @@ impl AgentPtyRegistry {
             || {},
         )
         .await
-        .map(|sent| sent.detail.outcome())
     }
 
     /// [`Self::write_and_submit_guarded_first_write_detailed`] with a deadline
@@ -16878,7 +16912,8 @@ mod spawn_tests {
         use std::os::unix::fs::PermissionsExt as _;
         fn script(dir: &std::path::Path, name: &str, marker: &str) {
             let path = dir.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\necho x > {marker}\n")).expect("script");
+            crate::test_isolation::write_script(&path, format!("#!/bin/sh\necho x > {marker}\n"))
+                .expect("script");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
 
@@ -16977,7 +17012,8 @@ mod spawn_tests {
                         .expect("move the verified directory away");
                     std::fs::create_dir(&dir).expect("put a replacement at the verified path");
                     let decoy = dir.join(name);
-                    std::fs::write(&decoy, b"#!/bin/sh\necho x > wrong\n").expect("decoy");
+                    crate::test_isolation::write_script(&decoy, b"#!/bin/sh\necho x > wrong\n")
+                        .expect("decoy");
                     std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755))
                         .expect("chmod");
                 }
@@ -17027,7 +17063,8 @@ mod spawn_tests {
         let dir = root.path().join("d");
         std::fs::create_dir(&dir).expect("create the project dir");
         let script = dir.join("bad-interp");
-        std::fs::write(&script, b"#!/nonexistent/dad-1233-interpreter\n").expect("script");
+        crate::test_isolation::write_script(&script, b"#!/nonexistent/dad-1233-interpreter\n")
+            .expect("script");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let verified =
             crate::project_resolve::VerifiedProjectDir::open(&dir).expect("open the project dir");
@@ -17099,7 +17136,7 @@ mod spawn_tests {
         let dir = root.path().join("d");
         std::fs::create_dir(&dir).expect("create the project dir");
         let script = dir.join("no-interp");
-        std::fs::write(&script, b"echo x > marker\n").expect("script");
+        crate::test_isolation::write_script(&script, b"echo x > marker\n").expect("script");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let path = dir.to_str().expect("utf-8 tempdir");
         let marker = dir.join("marker");
@@ -17149,7 +17186,7 @@ mod spawn_tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("create tempdir");
         let here = dir.path().join("here");
-        std::fs::write(&here, b"").expect("a program in the cwd");
+        crate::test_isolation::write_script(&here, b"").expect("a program in the cwd");
         // Executable, so the probe in front of the rewrite lets it through.
         std::fs::set_permissions(&here, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let cwd = dir.path().as_os_str();
@@ -20069,21 +20106,27 @@ mod spawn_tests {
             !registry.draft_pending(PANE),
             "the user's Enter after our paste closed was read as paste content"
         );
-        let started = Instant::now();
+        // The write's own report of its draft wait, not its wall clock: every
+        // submit spends the `SUBMIT_DELAY` floor and then waits for its echo,
+        // so a starved runner took a write that never waited past `CAP`
+        // (build-macos, 2026-09-30). A ceiling far above `CAP` keeps a stall
+        // before the first decision from reaching the cap and writing without
+        // a wait, which would hide a draft the model wrongly still holds.
         let next = registry
-            .write_and_submit_guarded_first_write_capped(
+            .write_and_submit_guarded_first_write_capped_detailed(
                 PANE,
                 "ISSUE-544-NEXT",
                 &agent,
                 || async { true },
                 Instant::now(),
-                CAP,
+                Duration::from_secs(10),
             )
             .await
             .expect("next write");
-        assert_eq!(next, GuardedSend::Applied);
-        assert!(
-            started.elapsed() < CAP,
+        assert_eq!(next.detail.outcome(), GuardedSend::Applied);
+        assert_eq!(
+            next.deferred,
+            Duration::ZERO,
             "the next first write waited for a draft the agent already submitted"
         );
         registry.shutdown_all();
@@ -23338,7 +23381,8 @@ mod spawn_tests {
                 .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
                 .with_ansi(false)
                 .finish();
-            let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+            let _subscriber_guard =
+                crate::test_isolation::capture_tracing_on_this_thread(subscriber);
             shutting_down.shutdown_all_graceful(Duration::from_millis(0));
             done.store(true, Ordering::SeqCst);
         });
@@ -23453,7 +23497,8 @@ mod spawn_tests {
             .finish();
         let started = Instant::now();
         {
-            let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+            let _subscriber_guard =
+                crate::test_isolation::capture_tracing_on_this_thread(subscriber);
             registry.shutdown_all_graceful(Duration::from_millis(0));
         }
         let elapsed = started.elapsed();
@@ -23556,7 +23601,7 @@ mod spawn_tests {
             .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
             .with_ansi(false)
             .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
 
         // Armed for the agent that owns the pane RIGHT NOW, exactly as the two
         // production callers arm it at spawn/respawn time.
@@ -23723,7 +23768,7 @@ mod spawn_tests {
             .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
             .with_ansi(false)
             .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
 
         arm_seed_fallback(registry.clone(), PANE.to_string(), original.clone(), GRACE);
 
