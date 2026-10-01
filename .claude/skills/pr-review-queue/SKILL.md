@@ -422,7 +422,9 @@ WHAT TO DO
   it until green and mentioning it is neither exit. On your own PR, ask the
   user for the fix or the quarantine through the pre-push gate below and push
   it once they say yes; until it is pushed, list the red under what remains,
-  never as resolved.
+  never as resolved. Before proposing a fix for a red this PR did not cause,
+  check whether an open PR already fixes it (`gh pr list --search '<test
+  name>'`); if one does, name it and leave the red to that PR.
 - END with what remains: what you verified, what you fixed, what is still open,
   and who it is waiting on.
 

@@ -4492,7 +4492,7 @@ fn dispatch_023_delegate_waits_for_unsent_worker_draft() {
 
             harness.send_worker_user_bytes(b"\r").await;
             // Issue #1383: the pointer ends in its delivery id,
-            // `[delivery d-xxxxxxxx]`, so a whole pointer line ends in `]`.
+            // `[delivery d-xxxxxxxx]`, and only that line carries a `]`.
             let delivered = wait_for_snapshot_needle(
                 &harness.registry,
                 &harness.worker_agent_id,
@@ -4501,29 +4501,20 @@ fn dispatch_023_delegate_waits_for_unsent_worker_draft() {
             )
             .await;
             let text = String::from_utf8_lossy(&delivered);
-            // The worker is a cooked-mode `cat`, so the snapshot holds the
-            // PTY's echo of each line AND cat's copy of it, and cat's copy of
-            // the draft line can land inside the pointer's echo, before its
-            // `\r` — measured under load as
-            // `Read … [delivery d-…]draft-544-sentinel-still-typing\r\n`.
-            // That is two submitted lines interleaved on screen, not one
-            // glued line, so look for each as a whole line anywhere rather
-            // than taking the first line that starts like the pointer.
-            let lines: Vec<&str> = text.split("\r\n").collect();
-            let pointer_line = lines
-                .iter()
-                .copied()
+            let pointer_line = text
+                .split("\r\n")
                 .find(|line| {
-                    line.starts_with(
-                        "Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-",
-                    ) && line.ends_with(']')
+                    line.starts_with("Read .dot-agent-deck/worker-task-coder.md for your task.")
                 })
                 .unwrap_or_default();
             assert!(
-                lines.contains(&"draft-544-sentinel-still-typing")
-                    && !pointer_line.is_empty()
-                    && !text.contains("draft-544-sentinelRead")
-                    && !text.contains("draft-544-sentinel-still-typingRead"),
+                text.contains("draft-544-sentinel-still-typing\r\n")
+                    && pointer_line.starts_with(
+                        "Read .dot-agent-deck/worker-task-coder.md for your task. [delivery d-"
+                    )
+                    && pointer_line.ends_with(']')
+                    && text.contains(&format!("{pointer_line}\r\n"))
+                    && !text.contains("draft-544-sentinelRead"),
                 "user draft and automatic pointer were not separate submitted lines: {text:?}"
             );
         });

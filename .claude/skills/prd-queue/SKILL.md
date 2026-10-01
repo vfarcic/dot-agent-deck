@@ -480,7 +480,9 @@ GATES — CLAUDE.md is the authority, this is the summary:
   fix it in this PR, or quarantine it (a named owner, an expiry issue, and
   `#[ignore = "quarantined: <owner>, #<issue>"]` on the test), and say in your
   report which you did for each one. Rerunning it until green and mentioning
-  it in the report is neither.
+  it in the report is neither. Before fixing a red your change did not cause,
+  check whether an open PR already fixes it (`gh pr list --search '<test
+  name>'`); if one does, name that PR in your report and leave the red to it.
 - Rule 9: if this PRD adds a new user-visible surface, ask about the
   experimental flag before building it.
 - Rule 12: if it touches the daemon, the TUI↔daemon protocol, orchestration or
@@ -623,8 +625,11 @@ lifecycle, and it covers what /prd-full does not.
   quarantined (a named owner, an expiry issue, and
   `#[ignore = "quarantined: <owner>, #<issue>"]` on the test), and your report
   says which for each one. Rerunning it until green and mentioning it is
-  neither. Your role template does not say this, so tell whoever you delegate
-  to, and treat a worker's report of a red it re-ran to green as unfinished.
+  neither. Before fixing a red this PRD did not cause, check whether an open
+  PR already fixes it (`gh pr list --search '<test name>'`); if one does, name
+  that PR in your report and leave the red to it. Your role template does not
+  say this, so tell whoever you delegate to, and treat a worker's report of a
+  red it re-ran to green as unfinished.
 - STOP CONDITION. Your workflow's step 7 pauses for the user's merge go-ahead.
   Under dispatch that pause is where this unit ENDS: send the merge-gate
   notification, report, and stop. Do not merge, and do not delegate a merge.
