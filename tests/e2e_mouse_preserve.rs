@@ -196,8 +196,9 @@ fn preserve_modal_click_miss_is_consumed() {
 /// so clicking it must be a no-op, exactly like pressing `g` with no cards.
 /// The config-gen prompt must NOT open, and the "no active agent session"
 /// status that the RequestConfigGen action would otherwise set must NOT appear
-/// — i.e. the disabled button records no clickable rect. (Build-checked here;
-/// not run in the fast tier.)
+/// — i.e. the disabled button records no clickable rect. Opening and closing
+/// the help overlay afterwards orders the check after the click. (Build-checked
+/// here; not run in the fast tier.)
 #[test]
 fn preserve_disabled_button_is_inert() {
     // PRD #127: 200 cols so the dashboard bar renders the FULL (dimmed)
@@ -220,13 +221,30 @@ fn preserve_disabled_button_is_inert() {
     deck.send_bytes(b"?");
     deck.wait_for_string("works from any pane");
 
+    // Close the overlay and wait for the dashboard's own empty-state line to
+    // be painted back over it. The deck writes one frame at a time, top row
+    // first, so seeing ANY cell of this later frame proves the whole help
+    // frame — bottom status row included — has already landed. Snapshotting
+    // the help frame itself is the race this test used to lose under load: a
+    // half-drawn overlay could leave rows unwritten, so nothing read from it
+    // was a complete picture of the state after the click.
+    deck.send_bytes(b"?");
+    deck.wait_until_grid("help closed and the empty dashboard repainted", |g| {
+        !g.contains("works from any pane") && g.contains("No active agents. Press")
+    });
+
+    // Match the status RequestConfigGen sets on an empty dashboard verbatim:
+    // a bare "No active agent" is also a prefix of the empty dashboard's own
+    // "No active agents. Press …" line, which is on screen right now. The
+    // status lives 15s (`STATUS_MESSAGE_TTL`) and replaces the bottom bar, so
+    // had the click fired it, it would still be on screen here.
     let grid = deck.snapshot_grid();
     assert!(
         !grid.contains("No orchestration config found"),
         "clicking the disabled Generate button must not open the config-gen prompt:\n{grid}"
     );
     assert!(
-        !grid.contains("No active agent"),
+        !grid.contains("No active agent to send prompt to"),
         "clicking the disabled Generate button must be a true no-op (no RequestConfigGen side effect):\n{grid}"
     );
 }
