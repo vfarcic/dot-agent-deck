@@ -393,6 +393,8 @@ fn project_dir_walks_up_to_the_nearest_ancestor_config() {
 
 #[test]
 fn project_dir_prefers_the_nearest_config_over_a_higher_one() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _env = ExperimentalEnvGuard::set(None);
     // An outer project containing an inner one — a workspace with a crate that
     // carries its own config, or a git worktree checked out inside a repo. The
     // inner config is the one you are working in, so it must win.

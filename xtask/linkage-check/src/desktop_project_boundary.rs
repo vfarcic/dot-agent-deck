@@ -154,7 +154,7 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     "deck_list",
     "event",
     // Issue #1198, argued rather than added quietly. The desktop names two
-    // things here: the five `show_desktop_*` wrappers, one per surface the
+    // things here: the six `show_desktop_*` wrappers, one per surface the
     // app hides behind the `experimental` flag (CLAUDE.md rule 9 puts every
     // gate behind a wrapper in this module, so a desktop-side copy of the
     // flag read would be the second list the rule exists to prevent), and

@@ -2533,6 +2533,36 @@ describe("sticky dictation in the open agent pane", () => {
     expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
   });
 
+  /** Scenario: issue #1400 — coder's pane is left on its Diff tab, then the
+   * agent details are hidden, so the pane falls back to showing its terminal.
+   * The voice panel reads the tab the pane shows, not the one it stored, so
+   * "type on" starts typing to coder instead of refusing a terminal that is on
+   * screen — from the deck screen's pane and from the overview's. */
+  it.each([
+    ["the deck screen", { kind: "deck" } as const],
+    ["the overview", { kind: "overview" } as const],
+  ])("treats a pane whose hidden stored tab fell back to the terminal as showing it, on %s", async (_where, initialView) => {
+    const voice = microphone([]);
+    const resolveVoice: ResolveVoice = vi.fn(async (said: string) => said === "type on" ? modeOn : inModeText(said));
+    const snapshot = createFixtureSnapshot("crowded");
+    const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot] });
+    const { rerender } = render(<DeckShell runtime={deck} initialView={initialView} />);
+    fireEvent.click(screen.getByRole("button", { name: /open coder agent/i }));
+    await turnVoiceOn();
+    const pane = screen.getByTestId("agent-pane-overlay");
+    await act(async () => { fireEvent.click(within(pane).getByRole("tab", { name: "Diff" })); });
+    voice.deliver("type on");
+    await completeUtterance();
+    expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/terminal is not shown/i);
+    rerender(<DeckShell runtime={{ ...deck, desktopFeatures: { ...fixtureDesktopFeatures("?experimental=1"), showAgentDetails: false } }} initialView={initialView} />);
+    await flush();
+    expect(within(screen.getByTestId("agent-pane-overlay")).getAllByRole("tab").map((tab) => tab.getAttribute("aria-label"))).toEqual(["Terminal"]);
+    voice.deliver("type on");
+    await completeUtterance();
+    expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
+  });
+
   /** Scenario: the daemon replaces Coder without an empty fleet snapshot and
    * reuses its deck and agent ids. Dictation ends before words reach that new terminal. */
   it("ends dictation when the same-id pane agent has a new spawn time", async () => {

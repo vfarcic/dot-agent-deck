@@ -1349,6 +1349,7 @@ pub struct DesktopFeatures {
     pub show_prompts: bool,
     pub show_orchestrations: bool,
     pub show_agent_profiles: bool,
+    pub show_agent_details: bool,
 }
 
 impl DesktopFeatures {
@@ -1362,6 +1363,7 @@ impl DesktopFeatures {
             show_prompts: features::show_desktop_prompts(),
             show_orchestrations: features::show_desktop_orchestrations(),
             show_agent_profiles: features::show_desktop_agent_profiles(),
+            show_agent_details: features::show_desktop_agent_details(),
         }
     }
 }
@@ -3957,7 +3959,9 @@ mod tests {
 
         let one = selecting_a_remote_deck();
         let all = observing_all(&["build-box.example.com", "laptop.example.com"]);
-        // The two legal answers, each read while nothing else is writing.
+        // The two reference shapes, each read while nothing else is writing.
+        // The local endpoint's wire id may change during the loop if an old
+        // daemon's fallback socket appears or disappears on this host.
         apply_settings_selection(&one);
         let fleet_of_one = observed_fleet();
         apply_settings_selection(&all);
@@ -3983,9 +3987,12 @@ mod tests {
                     while WRITING.load(Ordering::SeqCst) {
                         let fleet = observed_fleet();
                         assert!(
-                            fleet == fleet_of_one || fleet == fleet_of_all,
+                            fleet == fleet_of_one
+                                || (fleet.len() == fleet_of_all.len()
+                                    && fleet[1..] == fleet_of_all[1..]),
                             "a fleet must describe ONE applied document: {fleet:?} is neither \
-                             {fleet_of_one:?} nor {fleet_of_all:?}"
+                             {fleet_of_one:?} nor the three-deck fleet with remote tail {:?}",
+                            &fleet_of_all[1..]
                         );
                     }
                 });
@@ -4032,6 +4039,7 @@ mod tests {
                 show_prompts: false,
                 show_orchestrations: false,
                 show_agent_profiles: false,
+                show_agent_details: false,
             }
         );
 
@@ -4044,6 +4052,7 @@ mod tests {
                 show_prompts: true,
                 show_orchestrations: true,
                 show_agent_profiles: true,
+                show_agent_details: true,
             }
         );
     }
@@ -4058,6 +4067,7 @@ mod tests {
             show_prompts: true,
             show_orchestrations: false,
             show_agent_profiles: true,
+            show_agent_details: false,
         })
         .expect("serialises");
         assert_eq!(
@@ -4068,6 +4078,7 @@ mod tests {
                 "showPrompts": true,
                 "showOrchestrations": false,
                 "showAgentProfiles": true,
+                "showAgentDetails": false,
             })
         );
     }
