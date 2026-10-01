@@ -1019,6 +1019,17 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // existing delivery MEANS -- inert text becomes model input -- and it takes
     // effect when the daemon starts on the new build.
     "1337-respawn-failure-report-submitted",
+    // Issue #505, at 10 without moving it -- #1337's shape: the text of an
+    // existing delivery changed, nothing on the wire did. The daemon's label on
+    // an unsolicited `work-done` told the orchestrator "you have no outstanding
+    // delegation to that worker" and "You did not commission this work - the
+    // worker was most likely tasked directly by a person", which was false
+    // whenever the commission ledger lost a real delegation (an abandoned pane
+    // close sweeps it). A newer daemon says only that the deck has no delegation
+    // to that worker on record, and that it cannot tell who tasked it -- so an
+    // orchestrator instruction or script matching the old words stops matching.
+    // It takes effect when the daemon starts on the new build.
+    "505-unsolicited-work-done-label-reworded",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -3684,6 +3695,9 @@ async fn handle_connection(
             {
                 let guard = state.read().await;
                 guard.attach_live_sessions(&mut records);
+                // Issue #1395 item 1: the start role's own context file, so a
+                // hydrating TUI re-arms from it rather than from the mirror.
+                guard.attach_orchestrator_context_paths(&mut records);
             }
             // Issue #770: report the orchestration role registrations whose pane
             // still has a live agent, so `daemon stop` can refuse to destroy
@@ -3888,6 +3902,11 @@ async fn handle_connection(
             // whatever the pathname names by the time the PTY forks.
             #[cfg(unix)]
             let mut prepared_dir: Option<crate::project_resolve::VerifiedProjectDir> = None;
+            // Issue #1395: the per-publish context file this preparation bound,
+            // taken from the daemon's own binding (never from the request) so
+            // the start role's `ListAgents` record can name it and the file can
+            // be removed when the orchestration ends.
+            let mut prepared_context_path: Option<std::path::PathBuf> = None;
             if let Some(token) = prepared_token.as_deref() {
                 let Some(binding) = crate::prep_token::binding(token) else {
                     write_resp(
@@ -3925,6 +3944,7 @@ async fn handle_connection(
                 // the start runs its configured command. Taken before the
                 // binding moves into the check below.
                 let coordinator_prompt = binding.coordinator_prompt.clone();
+                let bound_context_path = binding.context_path.clone();
                 // Filesystem work, so it goes through the same bounded blocking
                 // pool every other project verb uses — one call, one permit, and
                 // never from inside a task that already holds one.
@@ -3939,6 +3959,7 @@ async fn handle_connection(
                             prepared_dir = Some(verified.project_dir);
                         }
                         configured_role = Some((verified.role, coordinator_prompt));
+                        prepared_context_path = Some(bound_context_path);
                         None
                     }
                     Ok(Err(refusal)) => {
@@ -4331,6 +4352,13 @@ async fn handle_connection(
                         if title_claim.is_some() {
                             state.release_orchestration_title_claim(&identity);
                         }
+                        // Issue #1395: only the start role carries the
+                        // coordinator's context, so only it records the file.
+                        if meta.is_start_role
+                            && let Some(path) = prepared_context_path
+                        {
+                            state.record_orchestration_context(&identity, path);
+                        }
                     }
                     // PRD #1223: announce the start to every attached TUI, not
                     // only to the client that sent it — a desktop start was
@@ -4338,7 +4366,15 @@ async fn handle_connection(
                     // record is published and the role registered, before the
                     // reply. See `crate::spawn::surface_attach_started_agent`
                     // for what is emitted and why the sending TUI is unaffected.
-                    if let Some(record) = registry.agent_record_any(&id) {
+                    if let Some(mut record) = registry.agent_record_any(&id) {
+                        // Issue #1395 item 1: the start role's surface carries
+                        // the context file recorded just above, so a live tab
+                        // re-arms from its own file. Stamped from daemon state
+                        // only — the `ListAgents` rule — never from the request.
+                        state
+                            .read()
+                            .await
+                            .attach_orchestrator_context_paths(std::slice::from_mut(&mut record));
                         crate::spawn::surface_attach_started_agent(
                             &event_tx,
                             &record,
@@ -7871,6 +7907,7 @@ mod tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -7892,6 +7929,7 @@ mod tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -8061,6 +8099,7 @@ mod tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("AgentRecord deserializes");
@@ -8420,6 +8459,7 @@ mod tests {
             spawned_at_ms: None,
             cli_name: Some("claude".into()),
             crashed: None,
+            orchestrator_context_path: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).expect("serializes"))

@@ -53,7 +53,11 @@ export default defineConfig({
   },
   projects: [
     { name: "chromium", use: { ...devices["Desktop Chrome"] } },
-    { name: "webkit", use: { ...devices["Desktop Safari"] } },
+    // The first WebKit launch on a runner is slow enough to eat a spec's whole
+    // budget, so it happens here first, outside any spec. The file's own header
+    // has the measurements.
+    { name: "webkit-warm-up", testMatch: /webkit-warm-up\.setup\.ts/, use: { ...devices["Desktop Safari"] } },
+    { name: "webkit", use: { ...devices["Desktop Safari"] }, dependencies: ["webkit-warm-up"] },
   ],
   webServer: {
     // Build then serve, as one command, so there is no ordering trap where a

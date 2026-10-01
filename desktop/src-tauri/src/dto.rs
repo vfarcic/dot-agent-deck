@@ -164,6 +164,13 @@ pub struct ObservedDeckDto {
     /// than of the handshake. It decides whether the group is called "Local
     /// deck" or called by its address.
     pub deck_kind: &'static str,
+    /// A remote deck's name in the shared deck list — what `dot-agent-deck
+    /// connect <name>` takes (issue #1426). Absent for the local deck and for
+    /// a remote deck whose stored name is not a valid deck name, which is
+    /// then named by [`Self::label`]. A validated slug
+    /// ([`dot_agent_deck::deck_list::DeckName`]), so it needs no scrubbing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// One configured-but-unaddressed deck, as the fleet view renders it.
@@ -180,6 +187,10 @@ pub struct UnconfiguredDeckDto {
     /// [`crate::settings::SelectionFallback::NoRemoteSocket`], which says the
     /// same thing in the selector's.
     pub reason: String,
+    /// The row's name in the shared deck list, as [`ObservedDeckDto::name`]
+    /// carries a connectable deck's (issue #1426).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1571,7 +1582,7 @@ pub(crate) struct SelectedDeck {
 impl Default for SelectedDeck {
     fn default() -> Self {
         Self {
-            endpoint: Endpoint::local(),
+            endpoint: crate::local_deck::local_endpoint(),
             fallback: None,
             all_decks: false,
         }
@@ -1651,6 +1662,10 @@ struct AppliedSelection {
     /// endpoint that cannot exist; [`observed_fleet`] is the one reader that
     /// wants both, and it is the display set.
     unconfigured: Vec<crate::settings::UnconfiguredDeck>,
+    /// Each connectable remote row's name in the shared deck list, by the
+    /// identity of the endpoint it describes (issue #1426) — what
+    /// [`deck_name`] reads. Only rows with a usable name are here.
+    names: Vec<(dot_agent_deck::daemon_client::EndpointIdentity, String)>,
 }
 
 impl Default for AppliedSelection {
@@ -1661,9 +1676,10 @@ impl Default for AppliedSelection {
     fn default() -> Self {
         Self {
             selected: SelectedDeck::default(),
-            observed: vec![Endpoint::local()],
+            observed: vec![crate::local_deck::local_endpoint()],
             unconfigured: Vec::new(),
             observed_generation: 0,
+            names: Vec::new(),
         }
     }
 }
@@ -1683,33 +1699,33 @@ impl Default for AppliedSelection {
 static APPLIED_SELECTION: std::sync::RwLock<Option<AppliedSelection>> =
     std::sync::RwLock::new(None);
 
-/// Serializes the TESTS that write [`APPLIED_SELECTION`], wherever they live.
+/// Serializes the TESTS that write [`APPLIED_SELECTION`], or read it back and
+/// depend on the answer, wherever they live.
 ///
 /// [`apply_settings_selection`] is a process-global write, so a test that makes
 /// one and asserts on what it reads back needs every other test's write to be
-/// outside its own window. Under nextest each test owns its process and this is
-/// always free; under a plain `cargo test` the crate's tests are threads in one
-/// process and this is the only thing keeping those writes out of each other's
-/// windows.
+/// outside its own window. So does a test that only publishes a terminal
+/// session: [`DeckScope::revalidate`] refuses a publish when the observed
+/// generation moved, and a sibling's write moves it. Under nextest each test
+/// owns its process and this is always free; under a plain `cargo test` the
+/// crate's tests are threads in one process and this is the only thing keeping
+/// those writes out of each other's windows.
 ///
 /// It lives here rather than in [`tests`] because the writers do not: issue
 /// #1078 found eight tests across `endpoint_test::tests` and `lib::tests`
 /// writing the global without it, six of them by way of
-/// `lib::retarget_selection`.
+/// `lib::retarget_selection`, and then the `terminal::tests` that write or
+/// revalidate against it.
 ///
-/// **It is one of three process-globals `cargo test --lib` raced on, not the
-/// only one**, so taking it does not on its own make that command green —
-/// measured, with the tests that move the other two excluded, at 6 runs red
-/// before this lock and 6 green after. The other two are the
-/// `DOT_AGENT_DECK_ATTACH_SOCKET` override that `endpoint_test::tests` sets
-/// process-wide (every `Endpoint::local()` in the crate reads it, and only
-/// `endpoint_test` holds `ATTACH_ENV_LOCK` while it moves) and the umask
-/// `bind_attach_listener` flips inside `daemon_bridge::tests`' `RealDeck`
-/// (documented and accepted there). Both need their own change and neither is
-/// what this guards.
+/// **It is one of three process-globals `cargo test --lib` raced on**, and it
+/// is the only one a lock serialises. The other two are removed rather than
+/// locked: the local deck's address, which tests move with
+/// [`crate::local_deck`]'s per-thread seam instead of the process-wide
+/// `DOT_AGENT_DECK_ATTACH_SOCKET` that every production read resolved; and the
+/// process umask, which the tests that run a real attach server no longer flip
+/// (`crate::test_listener`).
 ///
-/// **Async-aware on purpose**, matching `endpoint_test::tests`'
-/// `ATTACH_ENV_LOCK`: most of the writers are `#[tokio::test]`s that hold the
+/// **Async-aware on purpose**: most of the writers are `#[tokio::test]`s that hold the
 /// selection across an `.await`, and a `std::sync::MutexGuard` doing that is
 /// `clippy::await_holding_lock` — an error under the workspace's `-D warnings`.
 /// It also has no poisoning, so a test that panics mid-selection releases the
@@ -1777,6 +1793,7 @@ pub(crate) fn apply_settings_selection(
             observed,
             unconfigured: settings.unconfigured_decks(),
             observed_generation: previous.observed_generation + u64::from(departed),
+            names: deck_names(settings),
         });
     }
     deck
@@ -2138,6 +2155,7 @@ pub(crate) fn unconfigured_fleet() -> Vec<UnconfiguredDeckDto> {
             deck_id: unconfigured_deck_id(&deck.id),
             label: safe_display_text(deck.label),
             reason: UNCONFIGURED_DECK_REASON.to_string(),
+            name: deck.name.map(|name| name.as_str().to_string()),
         })
         .collect()
 }
@@ -2160,6 +2178,36 @@ pub(crate) fn unconfigured_fleet() -> Vec<UnconfiguredDeckDto> {
 /// `fleet` with nothing here to name it would otherwise be an unnameable group.
 /// Deriving from here cannot produce one — every entry carries its own name —
 /// and the next arrival restates all three.
+/// The name a deck the fleet observes has in the shared deck list (issue
+/// #1426), under the applied document — `None` for the local deck and for a
+/// remote row with no usable name.
+///
+/// Matched by [`EndpointIdentity`], the fleet's own key, never by
+/// `describe()`, for [`deck_is_observed`]'s reason.
+pub(crate) fn deck_name(endpoint: &Endpoint) -> Option<String> {
+    let key = endpoint.identity();
+    applied_selection()
+        .names
+        .into_iter()
+        .find(|(identity, _)| *identity == key)
+        .map(|(_, name)| name)
+}
+
+/// Every connectable remote row's name, keyed by its endpoint's identity.
+fn deck_names(
+    settings: &crate::settings::DesktopSettings,
+) -> Vec<(dot_agent_deck::daemon_client::EndpointIdentity, String)> {
+    settings
+        .endpoints
+        .iter()
+        .flat_map(|endpoints| endpoints.remote.iter())
+        .filter_map(|row| {
+            let name = row.name.as_ref()?.as_str().to_string();
+            Some((Endpoint::Remote(row.endpoint()?).identity(), name))
+        })
+        .collect()
+}
+
 /// Whether the applied selection is All Decks — [`DesktopSnapshot::all_decks`].
 pub(crate) fn all_decks_applied() -> bool {
     selected_deck().all_decks
@@ -2172,6 +2220,7 @@ pub(crate) fn observed_fleet_decks() -> Vec<ObservedDeckDto> {
             deck_id: deck_wire_id(endpoint),
             label: deck_path_text(endpoint),
             deck_kind: selection_fields(endpoint).0,
+            name: deck_name(endpoint),
         })
         .collect()
 }
@@ -2551,6 +2600,97 @@ mod tests {
             assert!(
                 stated.iter().all(|deck| !deck.deck_id.starts_with("deck-")),
                 "an unconfigured id must never look like a real one: {stated:?}"
+            );
+        });
+    }
+
+    /// Issue #1426: the fleet on the wire carries each remote deck's name from
+    /// the shared deck list, beside the address label and the key — a named
+    /// connectable deck, a named socketless one, a remote with no usable name
+    /// (no `name` at all) and the local deck (never one).
+    #[test]
+    fn the_wire_fleet_carries_each_remote_deck_s_name() {
+        use crate::settings::{EndpointId, EndpointSettings, RemoteEndpointSettings, Selection};
+        use dot_agent_deck::deck_list::DeckName;
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+
+        let row = |id: &str, host: &str, name: Option<&str>, socket: bool| {
+            let mut row = RemoteEndpointSettings::new(
+                EndpointId::parse(id).expect("a valid id"),
+                Hostname::parse(host).expect("a valid host"),
+            );
+            row.name = name.map(|name| DeckName::parse(name).expect("a valid name"));
+            if socket {
+                row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+            }
+            row
+        };
+        let settings = crate::settings::DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![
+                    row(
+                        "named0000000001",
+                        "build-box.example.com",
+                        Some("build-box"),
+                        true,
+                    ),
+                    row("plain0000000001", "plain.example.com", None, true),
+                    row("halfway00000001", "relay.example.com", Some("relay"), false),
+                ],
+                selection: Selection::All,
+            }),
+            ..crate::settings::DesktopSettings::default()
+        };
+
+        with_selection(&settings, || {
+            let named: Vec<(&str, String, Option<String>)> = observed_fleet_decks()
+                .into_iter()
+                .map(|entry| (entry.deck_kind, entry.label, entry.name))
+                .collect();
+            assert_eq!(
+                named.iter().filter(|(kind, _, _)| *kind == "local").count(),
+                1
+            );
+            assert!(
+                named
+                    .iter()
+                    .filter(|(kind, _, _)| *kind == "local")
+                    .all(|(_, _, name)| name.is_none()),
+                "the local deck has no registry name: {named:?}"
+            );
+            let remote: Vec<_> = named
+                .iter()
+                .filter(|(kind, _, _)| *kind == "remote")
+                .map(|(_, label, name)| (label.as_str(), name.as_deref()))
+                .collect();
+            assert_eq!(
+                remote,
+                [
+                    ("build-box.example.com", Some("build-box")),
+                    ("plain.example.com", None),
+                ],
+                "the label stays the address; the name rides beside it"
+            );
+
+            let unconfigured = unconfigured_fleet();
+            assert_eq!(unconfigured.len(), 1);
+            assert_eq!(unconfigured[0].label, "relay.example.com");
+            assert_eq!(unconfigured[0].name.as_deref(), Some("relay"));
+
+            let json = serde_json::to_value(observed_fleet_decks()).expect("serializes");
+            let names: Vec<_> = json
+                .as_array()
+                .expect("an array")
+                .iter()
+                .map(|entry| entry.get("name").cloned())
+                .collect();
+            assert!(
+                names.contains(&Some(serde_json::json!("build-box"))),
+                "sent as `name`: {json}"
+            );
+            assert!(
+                names.contains(&None),
+                "absent, not null, without one: {json}"
             );
         });
     }
@@ -2939,6 +3079,7 @@ mod tests {
             // Codex, and `codex` is what a codex daemon resolves.
             cli_name: Some("codex".into()),
             crashed: None,
+            orchestrator_context_path: None,
         }
     }
 
@@ -3389,7 +3530,8 @@ mod tests {
 
     #[test]
     fn disconnected_snapshot_is_fixture_safe_and_sanitized() {
-        let snapshot = disconnected_snapshot(&Endpoint::local(), "offline\u{1b}[31m");
+        let snapshot =
+            disconnected_snapshot(&crate::local_deck::local_endpoint(), "offline\u{1b}[31m");
         assert_eq!(snapshot.connection.status, ConnectionStatus::Disconnected);
         assert_eq!(snapshot.connection.error.as_deref(), Some("offline[31m"));
         assert!(snapshot.agents.is_empty());

@@ -87,6 +87,15 @@ export interface ConnectionView {
    */
   socketPath?: string;
   /**
+   * A remote deck's NAME in the shared deck list (issue #1426) — what `deckName`
+   * shows in place of {@link socketPath}, which stays the deck's address.
+   *
+   * Carried by the bridge from the crate's `observed`/`unconfigured` lists, by
+   * `deckId`, because a deck's own snapshot does not state it. Absent for the
+   * local deck and for a remote deck with no usable name.
+   */
+  name?: string;
+  /**
    * This deck is CONFIGURED but has no address yet (PRD #742 M12) — a stored
    * row whose socket path `Test connection` has not filled in.
    *
@@ -1284,6 +1293,17 @@ export interface DeckRuntimeState {
   forgetSecret: (
     id: import("./lib/bridge").VoiceSecretId,
   ) => Promise<import("./lib/bridge").SecretStatusDto>;
+  /**
+   * Deck naming (issue #1426): rename a stored deck, derive the name an added
+   * one would get, and check a name against the shared library's rule.
+   *
+   * Optional, like the voice seam below: a runtime without them renders the
+   * Daemons settings with no name field and no rename, and an added deck takes
+   * the name the library derives when it is saved.
+   */
+  renameDeck?: (deck: import("./lib/bridge").RemoteEndpointDto, name: string) => Promise<import("./lib/bridge").DesktopSettingsDto>;
+  defaultDeckName?: (host: string, user?: string) => Promise<string>;
+  checkDeckName?: (name: string, id?: string) => Promise<string | null>;
   /**
    * Voice control (PRD #802 M6): resolve one utterance into an outcome carrying
    * the sentence to show, and drive the microphone that can produce one.

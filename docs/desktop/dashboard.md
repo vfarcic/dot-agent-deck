@@ -59,7 +59,10 @@ To watch or talk to one agent:
 
 1. Click its row, or its open control (`Open <name> agent`). Its live terminal opens in a full-window pane over the Dashboard.
 2. Type into the terminal as you would into the TUI's pane.
-3. Press `Escape`, or **Back to dashboard**, to close the pane. The agent keeps running.
+3. To copy the agent's output, select it with the mouse and press `Ctrl+Shift+C` (`⌘C` on macOS). Plain `Ctrl+C` still goes to the agent as an interrupt, even while text is selected.
+4. Press `Escape`, or **Back to dashboard**, to close the pane. The agent keeps running.
+
+The TUI copies differently: a mouse drag in a pane copies when you release the button, and whether that reaches your clipboard depends on your terminal.
 
 The pane's header names the agent by its type (for example Codex), or by its role when it belongs to an orchestration, rather than by the display name its row shows. Beside that is its status, and below it the agent's command and its model, which reads `Unavailable` because the daemon does not report one.
 

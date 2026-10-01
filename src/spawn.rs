@@ -728,9 +728,11 @@ pub async fn spawn(
             // issue #600 already established for this branch — `Err` from `spawn`
             // means "nothing is running" — instead of inventing a second,
             // half-started outcome beside it.
-            let prompt = match req.compose_orchestrator_context {
+            // Issue #1395: the published file is kept beside the prompt so the
+            // orchestrator's role registration below can record it.
+            let (prompt, context_path) = match req.compose_orchestrator_context {
                 Some(attendance) => {
-                    crate::orchestrator_context::prepare_orchestrator_context(
+                    let prepared = crate::orchestrator_context::prepare_orchestrator_context(
                         &orch_config,
                         Path::new(&req.working_dir),
                         Some(req.prompt.as_str()),
@@ -762,13 +764,13 @@ pub async fn spawn(
                             ),
                         });
                         SpawnError::OrchestratorContext(e)
-                    })?
-                    .prompt
+                    })?;
+                    (prepared.prompt, Some(prepared.context_path))
                 }
                 // #120 / #127: unchanged — the prompt is delivered verbatim, and
                 // nothing is composed, so there is nothing to refuse. See
                 // `compose_orchestrator_context` for why this is not flipped here.
-                None => req.prompt.clone(),
+                None => (req.prompt.clone(), None),
             };
             let mut agents = Vec::with_capacity(roles.len());
             // PRD #127 readiness gate: SUBSCRIBE before any pane is spawned so
@@ -954,6 +956,13 @@ pub async fn spawn(
                         identity.clone(),
                         Some(req.working_dir.as_str()),
                     );
+                    // Issue #1395: the orchestrator's own context file, for its
+                    // `ListAgents` record and for removal when this ends.
+                    if idx == orch_idx
+                        && let Some(path) = context_path.clone()
+                    {
+                        state.record_orchestration_context(&identity, path);
+                    }
                 }
                 agents.push(SpawnedAgent {
                     id,
@@ -980,6 +989,10 @@ pub async fn spawn(
                     &roles,
                     &agents,
                     &orchestration_id,
+                    // Issue #1395: the file this spawn published for its
+                    // orchestrator — the same value recorded above — so a live
+                    // tab re-arms from it rather than from the mirror.
+                    context_path.as_deref(),
                 );
                 // …and give every role card its ROLE NAME, the same way the
                 // single-agent branch names its card: a synthetic `SessionStart`
@@ -1637,6 +1650,21 @@ async fn deliver(
             );
             return;
         }
+        // Issue #547: deliberately NO payload-record release here, although
+        // this outcome ends the delivery. Of the refusals that reach this arm
+        // only `ambiguous partial write` can have left a record, and since issue
+        // #876 it leaves one ONLY while its bytes are believed still in the box:
+        // a partial write the drain erased records nothing, so there is nothing
+        // to release. A record that does exist is the one guard between those
+        // stranded bytes and a later delivery of the same text submitting them
+        // together with the user's unsent draft — the decision
+        // `crate::state::settle_one_shot_payload_record` makes for the one-shot
+        // callers (issue #715), for the same reason. The cost is a later
+        // identical delivery refused and reported on the card until
+        // `PAYLOAD_RECORD_TTL`. Releasing on every other refusal would be wrong
+        // too: they wrote nothing, so a release would consume a CONCURRENT
+        // delivery's record of the same bytes (issue #424 S2). Pinned by
+        // `scheduler/dispatch/026`.
         GuardedOutcome::Refused(reason) => {
             tracing::warn!(
                 pane_id,
@@ -2918,6 +2946,12 @@ pub(crate) fn surface_attach_started_agent(
                     role_name: role_name.clone(),
                     is_start_role: *is_start_role,
                 }],
+                // Issue #1395: stamped onto the start role's record by the
+                // caller from daemon state; `None` for every other role.
+                context_path: record
+                    .orchestrator_context_path
+                    .clone()
+                    .filter(|_| *is_start_role),
             };
             let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(surface));
             // After the surface, as `spawn` orders it, so the tab exists before
@@ -3035,6 +3069,7 @@ fn dispatched_orchestration_display_title(name: &str, cwd: &str) -> Option<Strin
 /// TUI attaches to the live PTY — it resolves the pane id through `list_agents`
 /// rather than via a registry agent id, so no `agent_id` rides on the wire.
 /// Delivery is best-effort: `send` errs only when there are no subscribers.
+#[allow(clippy::too_many_arguments)]
 fn surface_spawned_orchestration(
     event_tx: &broadcast::Sender<BroadcastMsg>,
     name: &str,
@@ -3047,6 +3082,7 @@ fn surface_spawned_orchestration(
     roles: &[RoleSpawn],
     agents: &[SpawnedAgent],
     orchestration_id: &str,
+    context_path: Option<&Path>,
 ) {
     let surface_roles = roles
         .iter()
@@ -3064,6 +3100,7 @@ fn surface_spawned_orchestration(
         display_title,
         orchestration_id: Some(orchestration_id.to_string()),
         roles: surface_roles,
+        context_path: context_path.map(|p| p.to_string_lossy().into_owned()),
     };
     let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(surface));
 }
@@ -5759,7 +5796,7 @@ mod tests {
             .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
             .with_ansi(false)
             .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
 
         let (event_tx, event_rx) = broadcast::channel(8);
         tokio::time::pause();
@@ -6063,6 +6100,183 @@ mod tests {
             String::from_utf8_lossy(&released)
         );
         registry.shutdown_all();
+    }
+
+    /// Scenario: Deliver a scheduled prompt into three panes whose first write goes differently: one stops part-way and its bytes are erased again, one stops part-way and its bytes stay in the input box, and one goes through. After the user types into each, a later delivery of the same prompt goes through into the first and third, and is refused with a notice on the card in the second, where it would otherwise submit the leftover bytes with the user's draft.
+    #[spec("scheduler/dispatch/026")]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_026_ambiguous_first_write_guards_only_while_its_bytes_are_stranded() {
+        use crate::agent_pty::HealingFaultyWriter;
+
+        const DRAINED_PANE: &str = "issue-547-drained-pane";
+        const STRANDED_PANE: &str = "issue-547-stranded-pane";
+        const APPLIED_PANE: &str = "issue-547-applied-pane";
+        // Plain printable ASCII, so issue #876's drain can prove an exact undo —
+        // and the same fixed text on both deliveries, which is the ordinary case
+        // the issue names (a scheduled card fires the same prompt every time).
+        const PROMPT: &str = "Read .dot-agent-deck/worker-task-coder.md for your task.";
+        // The stranded pane's prompt carries a non-ASCII byte, which the drain
+        // declines to erase (a partial write can cut a multi-byte character in
+        // half, so "one byte written" stops meaning "one erase"). That is the
+        // stranded case with the PTY still ALIVE — its writer recovers — so a
+        // later delivery that was wrongly admitted would really land in the box
+        // on top of the fragment, and the byte log below can see it. The other
+        // stranded cause, a PTY whose slave has gone, cannot accept that later
+        // write either way, so it would prove nothing about the record.
+        const STRANDED_PROMPT: &str = "⚠ Read .dot-agent-deck/worker-task-coder.md for your task.";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let notices: Arc<std::sync::Mutex<Vec<DeliveryNotice>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = notices.clone();
+        registry.set_delivery_notice_sink(Arc::new(move |notice| {
+            recorded.lock().unwrap().push(notice);
+        }));
+        let drained_agent = spawn_byte_target(&registry, DRAINED_PANE);
+        let stranded_agent = spawn_byte_target(&registry, STRANDED_PANE);
+        let applied_agent = spawn_byte_target(&registry, APPLIED_PANE);
+
+        let payload_len = crate::pane_input::encode_pane_payload(PROMPT)
+            .expect("encode")
+            .len();
+        let stranded_len = crate::pane_input::encode_pane_payload(STRANDED_PROMPT)
+            .expect("encode")
+            .len();
+        // The two faulted writers accept the whole payload, refuse the submit CR
+        // — the ambiguous shape that leaves the ENTIRE payload in the box — and
+        // then recover; they differ only in whether the drain may erase what
+        // landed. The control never faults, so all three panes are observed the
+        // same way: through the byte log of what reached the PTY.
+        let (drained_writer, drained_log) = HealingFaultyWriter::healing(payload_len);
+        let (stranded_writer, stranded_log) = HealingFaultyWriter::healing(stranded_len);
+        let (clean, applied_log) = HealingFaultyWriter::healing(usize::MAX);
+        // Held to the end: dropping a displaced `UnixMasterWriter` sends EOF into
+        // the stand-in and kills it (see the seam's own doc).
+        let _displaced = (
+            registry
+                .replace_agent_writer_for_test(&drained_agent, Box::new(drained_writer))
+                .await,
+            registry
+                .replace_agent_writer_for_test(&stranded_agent, Box::new(stranded_writer))
+                .await,
+            registry
+                .replace_agent_writer_for_test(&applied_agent, Box::new(clean))
+                .await,
+        );
+        let panes = [
+            (DRAINED_PANE, &drained_agent, &drained_log, PROMPT),
+            (
+                STRANDED_PANE,
+                &stranded_agent,
+                &stranded_log,
+                STRANDED_PROMPT,
+            ),
+            (APPLIED_PANE, &applied_agent, &applied_log, PROMPT),
+        ];
+
+        // Delivery 1, through the production scheduled path. No event bus, so
+        // an `Applied` first write is final and released on the spot — the
+        // control's baseline — and an ambiguous one takes the first-write
+        // `Refused("ambiguous partial write")` arm issue #547 is about.
+        for (pane, agent, _, prompt) in panes {
+            run_delivery(
+                &registry,
+                pane.to_string(),
+                agent.to_string(),
+                None,
+                prompt.to_string(),
+                false,
+            )
+            .await;
+        }
+        let first_writes: Vec<usize> = panes
+            .iter()
+            .map(|(_, _, log, _)| log.lock().unwrap().len())
+            .collect();
+        assert_eq!(
+            first_writes,
+            vec![payload_len * 2, stranded_len, payload_len + 1],
+            "precondition: the drained pane took the payload and one erase per byte, the \
+             stranded pane took the payload and not one erase, and the control took the payload \
+             and its CR — so the first two first writes really were ambiguous, as the production \
+             classification decided, and only the first had its bytes taken back out"
+        );
+        let partial_write_notices = |notices: &[DeliveryNotice]| -> Vec<String> {
+            notices
+                .iter()
+                .filter(|n| n.detail.contains("stopped part-way"))
+                .map(|n| n.pane_id.clone())
+                .collect()
+        };
+        assert_eq!(
+            partial_write_notices(&notices.lock().unwrap()),
+            vec![STRANDED_PANE.to_string()],
+            "precondition: only the pane still holding a fragment is told so on its card"
+        );
+
+        // The user types into every pane. A clock stamp only — no bytes and no
+        // draft bit — so delivery 2 is not held by issue #544's draft wait, and
+        // the one thing that can refuse it is a payload record of delivery 1.
+        for (pane, _, _, _) in panes {
+            registry.note_user_input(pane);
+        }
+
+        // Delivery 2: a later, unrelated scheduled delivery of the same bytes.
+        for (pane, agent, _, prompt) in panes {
+            run_delivery(
+                &registry,
+                pane.to_string(),
+                agent.to_string(),
+                None,
+                prompt.to_string(),
+                false,
+            )
+            .await;
+        }
+        let refused: Vec<String> = notices
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| n.detail.contains("neither written again nor submitted"))
+            .map(|n| n.pane_id.clone())
+            .collect();
+        let second_writes: Vec<usize> = panes
+            .iter()
+            .zip(&first_writes)
+            .map(|((_, _, log, _), before)| log.lock().unwrap().len() - before)
+            .collect();
+        registry.shutdown_all();
+
+        assert_eq!(
+            second_writes[0],
+            payload_len + 1,
+            "the drained pane's first write left nothing of ours in its input box, so it left no \
+             payload record, and the later delivery of the same bytes must go through — refusing \
+             it would cost the user a prompt to guard a pane that is already clean (issue #547, \
+             resolved by issue #876's drain)"
+        );
+        assert_eq!(
+            second_writes[1], 0,
+            "the stranded pane's first write left the payload in its input box, so the later \
+             delivery of the same bytes must write NOTHING: admitting it would submit the leftover \
+             bytes together with the user's unsent draft as one turn (issues #715, #876). That \
+             record is the only guard those bytes have, which is why the first-write refusal must \
+             not release it"
+        );
+        assert_eq!(
+            refused,
+            vec![STRANDED_PANE.to_string()],
+            "the refusal must be REPORTED on the stranded pane's card — fail closed and visible — \
+             and on no other pane"
+        );
+        assert_eq!(
+            second_writes[2],
+            payload_len + 1,
+            "control: an `Applied` first write is released at once, so the same user typing does \
+             not refuse a later delivery here — the refusal above is a property of the stranded \
+             outcome, not of the harness"
+        );
     }
 
     /// Scenario: Abandon a spawn prompt against its exact pane owner, then replace that owner and exhaust the 256-watch cap for a new delivery. Abandonment must report state without pane bytes, a stale report must not mark the replacement, and the 257th delivery must visibly report that it is unwatched.
@@ -7628,6 +7842,7 @@ mod tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         }
     }
 
@@ -7726,6 +7941,34 @@ mod tests {
                 .map(String::as_str),
             Some("builder")
         );
+    }
+
+    /// Issue #1395 item 1: the start role's surface carries the context path
+    /// stamped onto its record from daemon state; a non-start role's never
+    /// does, even if its record somehow carried one.
+    #[test]
+    fn attach_started_surface_carries_the_context_path_for_the_start_role_only() {
+        let path =
+            "/work/team/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        let (tx, mut rx) = broadcast::channel(8);
+        for start in [true, false] {
+            let mut membership = orchestration_membership("lead");
+            if let TabMembership::Orchestration { is_start_role, .. } = &mut membership {
+                *is_start_role = start;
+            }
+            let mut record = attach_record(Some("desktop-ab-0"), Some("lead"), Some(membership));
+            record.orchestrator_context_path = Some(path.into());
+            surface_attach_started_agent(&tx, &record, None);
+            let msgs = drain(&mut rx);
+            let Some(BroadcastMsg::OrchestrationSurface(surface)) = msgs.first() else {
+                panic!("expected a surface first, got {msgs:?}");
+            };
+            assert_eq!(
+                surface.context_path.as_deref(),
+                start.then_some(path),
+                "start role = {start}"
+            );
+        }
     }
 
     /// PRD #1223: nothing is announced for a pane with no pane id, a mode pane,
@@ -7982,7 +8225,7 @@ mod tests {
             .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
             .with_ansi(false)
             .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
 
         // Both halves run on this task, not on a spawned one, so the delivery's
         // `warn!` lands in the thread-local subscriber above.

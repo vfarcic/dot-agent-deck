@@ -3,6 +3,6 @@
   "identifier": "default",
   "description": "Core permissions for the local dot-agent-deck desktop window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "clipboard-manager:allow-write-text"]
 }
 

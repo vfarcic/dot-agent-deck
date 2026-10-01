@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { basename } from "node:path";
 import { test } from "node:test";
 import { type Deck, waitFor, withDeck } from "./harness.ts";
-import { ENTER, type Element } from "./webdriver.ts";
+import { CONTROL, ENTER, type Element, META, SHIFT } from "./webdriver.ts";
 
 const connected = '[data-testid="daemon-group"][data-deck-connected="yes"]';
 
@@ -124,6 +124,79 @@ test("terminal_001 a shell started from New agent runs a typed command in a real
     assert.equal(agents[0].cwd, deck.project);
   });
 });
+
+/// Scenario: in a shell agent's pane, print a line, click into the terminal and
+/// select the line by dragging the mouse across it, and press Ctrl+Shift+C, then find exactly that line on the
+/// system clipboard; select a second line and copy it with Cmd (Meta)+C the
+/// same way. The copies are made over a half-typed command, and pressing Enter
+/// afterwards runs it unchanged — so neither copy sent the agent an interrupt or
+/// a single stray byte. Last, the control: plain Ctrl+C over a selection still
+/// interrupts, and throws a half-typed command away.
+test("terminal_002 selected terminal text copies to the clipboard without reaching the agent", async () => {
+  const command = "bash --noprofile --norc";
+  await withDeck("terminal_002", { daemonFirst: true, defaultCommand: command }, async (deck) => {
+    await deck.element(connected, "the deck group to report connected");
+    const input = await openShellPane(deck);
+    await deck.traceTerminals();
+
+    // Computed by the shell, so the line on screen, and on the clipboard, can
+    // only have come from the PTY rather than from what was typed.
+    await deck.session.type(input, `echo dad-copy-$((6*7))-ok${ENTER}`);
+    const first = "dad-copy-42-ok";
+    await waitFor(`${first} on its own row`, () => deck.rowSpan(first));
+
+    // Half a command, not yet run: an interrupt would throw it away, and any
+    // byte the gesture leaked would land in it.
+    await deck.session.type(input, "echo still-typing-$((2+3))");
+    await deck.selectRow(first);
+    await deck.session.chord([CONTROL, SHIFT, "c"]);
+    await waitFor(`the clipboard to hold ${first}`, async () => (await deck.clipboardText()) === first);
+
+    // macOS's gesture. Its engine is out of this tier's reach (WKWebView has no
+    // WebDriver), but the chord is decided in the page, and this runs that code.
+    await deck.session.type(input, ENTER);
+    const second = "still-typing-5";
+    await waitFor(`${second} on its own row, the half-typed command run unchanged`, () => deck.rowSpan(second));
+    await deck.selectRow(second);
+    await deck.session.chord([META, "c"]);
+    await waitFor(`the clipboard to hold ${second}`, async () => (await deck.clipboardText()) === second);
+
+    // The control. Plain Ctrl+C belongs to the agent even while text is
+    // selected: bash abandons the half-typed line and prints a fresh prompt.
+    await deck.session.type(input, "echo must-not-run");
+    await deck.selectRow(first);
+    await deck.session.chord([CONTROL, "c"]);
+    await deck.session.type(input, `echo after-interrupt-$((3+4))${ENTER}`);
+    await waitFor("the next command's output", async () => (await deck.rowSpan("after-interrupt-7")) !== undefined);
+    const text = (await deck.terminalTexts()).map(({ text }) => text).join("\n");
+    assert.ok(!text.split("\n").includes("must-not-run"), `Ctrl+C did not interrupt the half-typed command:\n${text}`);
+    assert.equal(await deck.clipboardText(), second, "plain Ctrl+C copied the selection");
+  });
+});
+
+/** Start `default_command` from New agent and return its pane's enabled xterm input, at the shell's first prompt. */
+async function openShellPane(deck: Deck): Promise<Element> {
+  await deck.session.click(await deck.element('[data-testid="overview-new-agent"]'));
+  await deck.textOf(
+    '[data-testid="new-agent-current-path"]',
+    (t) => t.trim() === deck.project,
+    `the browser to open at the deck's default_dir ${deck.project}`,
+  );
+  await deck.session.click(await deck.element('[data-testid="new-agent-use-directory"]'));
+  await waitForValue(deck, await deck.element('[data-testid="new-agent-name"]'), basename(deck.project), "the Name field");
+  await deck.session.click(await deck.element('[data-testid="new-agent-start"]'));
+  await deck.element(
+    '[data-testid="agent-pane-overlay"] .agent-terminal-stack[data-terminal-state="attached"]',
+    "the pane's terminal to attach",
+  );
+  await waitFor("the shell's prompt to reach xterm", async () =>
+    (await deck.terminalTexts()).some(({ text }) => text.includes("$")),
+  );
+  return deck.element(
+    '[data-testid="agent-pane-overlay"] textarea.xterm-helper-textarea:not([disabled])',
+    "xterm's input to be enabled",
+  );
+}
 
 async function waitForValue(deck: Deck, element: Element, expected: string, description: string): Promise<void> {
   await waitFor(description, async () => (await deck.session.property(element, "value")) === expected);

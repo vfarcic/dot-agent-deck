@@ -32,11 +32,36 @@ export { WAIT_MS };
 /** Polling cadence inside `waitFor`. Not a wait in its own right. */
 const POLL_MS = 100;
 
+/**
+ * Issue #1403 — how long a finished drag may take to show up as xterm's
+ * selection. xterm makes the selection while it handles the drag, so this only
+ * absorbs a slow runner, and a drag that selected nothing fails at once rather
+ * than as a clipboard that never filled, `WAIT_MS` later.
+ */
+const SELECT_MS = 15_000;
+
+/**
+ * Issue #1403 — how long a terminal's grid must hold still after a click
+ * before a drag on it is trusted. The resize it waits out (the window's focus
+ * claim, see `selectRow`) landed within 10ms of the press on a GitHub runner,
+ * so this is margin, not a measured bound.
+ */
+const SETTLE_MS = 1_000;
+
+/**
+ * How many drags `selectRow` makes when a resize of the grid during the drag
+ * cleared what it selected. The focus claim that causes that resize happens
+ * once per focus-in, so a second drag is the one that counts and a third is
+ * margin.
+ */
+const DRAG_ATTEMPTS = 3;
+
 const paths = {
   app: process.env.DAD_DRIVER_APP ?? join(REPO_ROOT, "target", "debug", "dot-agent-deck-desktop"),
   daemon: process.env.DAD_DRIVER_DAEMON ?? join(REPO_ROOT, "target", "debug", "dot-agent-deck"),
   tauriDriver: process.env.DAD_DRIVER_TAURI_DRIVER ?? "tauri-driver",
   nativeDriver: process.env.DAD_DRIVER_NATIVE_DRIVER ?? "WebKitWebDriver",
+  xclip: process.env.DAD_DRIVER_XCLIP ?? "xclip",
   results: process.env.DAD_DRIVER_RESULTS ?? join(REPO_ROOT, "desktop", "driver-results"),
 };
 
@@ -129,6 +154,16 @@ async function stopChild(child: ChildProcess | undefined): Promise<void> {
 }
 
 /** What a scenario's deck is configured with. */
+/** One mounted terminal, as the build-gated seam's `terminalScreens()` reports it. */
+type TerminalScreen = {
+  key: string;
+  cols: number;
+  rows: number;
+  lines: string[];
+  rect: { left: number; top: number; width: number; height: number } | null;
+  selection: string;
+};
+
 export type DeckOptions = {
   /** Start the daemon before the window opens. `false` leaves it to `startDaemon()`. */
   daemonFirst: boolean;
@@ -331,6 +366,186 @@ export class Deck {
     return texts;
   }
 
+  /**
+   * Issue #1403 — two viewport points on the first visible row, of any mounted
+   * terminal, whose text is exactly `text`: `from` in its first cell and `to`
+   * at the screen's right edge, so a drag between them selects the whole row.
+   * The drag runs to the edge rather than to the last character because
+   * xterm rounds a pointer to a cell boundary — measured, a drag ending on the
+   * last character's centre left that character out — and a selection past
+   * the end of a row's text copies no trailing blanks. Read through the same
+   * build-time seam as `terminalTexts`, since the WebGL renderer leaves no row
+   * text in the DOM to measure instead.
+   */
+  async rowSpan(text: string): Promise<{ from: { x: number; y: number }; to: { x: number; y: number } } | undefined> {
+    for (const { cols, rows, lines, rect } of await this.terminalScreens()) {
+      const row = lines.findIndex((line) => line === text);
+      if (row < 0 || !rect || cols < 1 || rows < 1) continue;
+      const cell = { width: rect.width / cols, height: rect.height / rows };
+      const y = rect.top + (row + 0.5) * cell.height;
+      return {
+        from: { x: rect.left + 0.5 * cell.width, y },
+        to: { x: rect.left + rect.width - 1, y },
+      };
+    }
+    return undefined;
+  }
+
+  /**
+   * Issue #1403 — whether any mounted terminal's xterm holds exactly `text` as
+   * its selection. Checked between a drag and the copy chord, so a failure
+   * says which of the two did not happen.
+   */
+  async hasSelection(text: string): Promise<boolean> {
+    return (await this.terminalScreens()).some(({ selection }) => selection === text);
+  }
+
+  /**
+   * Issue #1403 — select the row whose text is exactly `text` the way a person
+   * does: click into the terminal, then drag across the row, and wait for xterm
+   * to hold `text` as its selection.
+   *
+   * The first click matters. WebDriver types into the page without the window
+   * holding focus, so a press is also the window's focus-in, and on a focus-in
+   * the app claims this terminal's size on its daemon (PRD #1105). When that
+   * changes the grid's row count, xterm drops any selection in progress, so a
+   * drag started by that same press selects nothing (#1457 asks whether a
+   * person can hit this). The click lets that settle, and the row is measured
+   * again after it, because a new grid moves the rows.
+   *
+   * The click is not always the press that focuses the window. In five
+   * failed runs on GitHub runners the grid held still for the whole settle
+   * after the click and the resize landed 5-10ms after the DRAG's press
+   * instead, so a drag that
+   * ends with no selection after the grid resized during it is made again,
+   * once the grid has settled at the new size and the row has been measured on
+   * it, up to `DRAG_ATTEMPTS` drags. A drag that selected nothing with no
+   * resize to explain it fails at once. Either failure carries the mouse events
+   * the page saw during the last drag and every selection clear and resize,
+   * with the stack that caused it.
+   */
+  async selectRow(text: string): Promise<void> {
+    const before = await waitFor(`${text} on its own row`, () => this.rowSpan(text));
+    await this.session.clickAt(before.from);
+    // Installed once per page. The selection trace is never emptied.
+    await this.traceTerminals();
+    for (let attempt = 1; ; attempt += 1) {
+      await this.gridSettled();
+      const span = await waitFor(`${text} on its own row after the grid settled`, () => this.rowSpan(text));
+      // Installed once per page; each drag only empties the pointer record,
+      // and reads the page clock that a resize in the trace is stamped with.
+      const draggedAt = await this.session.execute<number>(
+        `window.__dadPointerLog = [];
+         if (!window.__dadPointerProbe) {
+           window.__dadPointerProbe = true;
+           for (const type of ["mousedown", "mousemove", "mouseup"]) {
+             document.addEventListener(type, (e) => {
+               if (window.__dadPointerLog.length < 60) {
+                 const mods = (e.shiftKey ? "S" : "") + (e.ctrlKey ? "C" : "") + (e.altKey ? "A" : "") + (e.metaKey ? "M" : "");
+                 window.__dadPointerLog.push([type, Math.round(performance.now()), Math.round(e.clientX), Math.round(e.clientY), e.buttons, e.detail, mods]);
+               }
+             }, { capture: true });
+           }
+         }
+         return Math.floor(performance.now());`,
+      );
+      await this.session.drag(span.from, span.to);
+      let outcome: "selected" | "resized";
+      try {
+        outcome = await waitFor(
+          `the drag to select ${text}`,
+          async () => {
+            if (await this.hasSelection(text)) return "selected" as const;
+            if (await this.resizedSince(draggedAt)) return "resized" as const;
+            return undefined;
+          },
+          SELECT_MS,
+        );
+      } catch (error) {
+        throw new Error(`${(error as Error).message}; the page saw ${await this.selectionRecord()}`);
+      }
+      if (outcome === "selected") return;
+      if (attempt >= DRAG_ATTEMPTS) {
+        throw new Error(
+          `the grid resized during each of ${attempt} drags to select ${text}; the page saw ${await this.selectionRecord()}`,
+        );
+      }
+      console.warn(`selectRow: the grid resized during drag ${attempt} to select ${text}; dragging again once it settles`);
+    }
+  }
+
+  /** Whether any mounted terminal resized at or after `since` on the page's clock. */
+  private async resizedSince(since: number): Promise<boolean> {
+    return this.session.execute<boolean>(
+      `return (window.__dadSelectionTrace || []).some((entry) => entry[0] === "resize" && entry[1] >= ${since});`,
+    );
+  }
+
+  /** The last drag's mouse events and the selection trace, for a failure message. */
+  private async selectionRecord(): Promise<string> {
+    const seen = await this.session
+      .execute<unknown>("return { events: window.__dadPointerLog, trace: window.__dadSelectionTrace };")
+      .catch((probe: unknown) => String(probe));
+    return JSON.stringify(seen);
+  }
+
+  /**
+   * Issue #1403 — start recording every selection clear and resize of the
+   * mounted terminals, and the window's focus changes, into the record a failed
+   * `selectRow` reports. Idempotent; call it as soon as a terminal is mounted
+   * so the record covers the whole scenario.
+   */
+  async traceTerminals(): Promise<void> {
+    await this.session.execute(
+      `window.__dadSelectionTrace = window.__dadSelectionTrace || [];
+       window.__dadDriver.traceSelection();
+       if (!window.__dadFocusProbe) {
+         window.__dadFocusProbe = true;
+         for (const type of ["focus", "blur"]) {
+           window.addEventListener(type, (e) => {
+             if (e.target === window) window.__dadSelectionTrace.push(["window-" + type, Math.round(performance.now())]);
+           });
+         }
+       }`,
+    );
+  }
+
+  /** Until every mounted terminal's grid and box have held still for `SETTLE_MS`. */
+  private async gridSettled(): Promise<void> {
+    let last = "";
+    let since = Date.now();
+    await waitFor("the terminal's grid to settle", async () => {
+      const now = JSON.stringify((await this.terminalScreens()).map(({ cols, rows, rect }) => [cols, rows, rect]));
+      if (now !== last) {
+        last = now;
+        since = Date.now();
+      }
+      return Date.now() - since >= SETTLE_MS;
+    });
+  }
+
+  private async terminalScreens(): Promise<TerminalScreen[]> {
+    const screens = await this.session.execute<TerminalScreen[] | null>(
+      "return window.__dadDriver ? window.__dadDriver.terminalScreens() : null",
+    );
+    if (screens === null) {
+      throw new Error("the bundle carries no driver seam: build it with VITE_DAD_DRIVER_SEAM=1 (docs/develop/desktop-gui.md)");
+    }
+    return screens;
+  }
+
+  /**
+   * Issue #1403 — the SYSTEM clipboard's text, read by `xclip` from outside
+   * the app, on the display the window is on. Not `navigator.clipboard` in the
+   * page: that would ask the same webview whose clipboard path is under test,
+   * and a read there needs a permission this app never grants. `null` when
+   * nothing owns the clipboard yet, which `xclip` reports as a failure.
+   */
+  async clipboardText(): Promise<string | null> {
+    const { code, stdout } = await run(paths.xclip, ["-selection", "clipboard", "-o"], this.env);
+    return code === 0 ? stdout : null;
+  }
+
   /** The daemon's own view of its agents, from the CLI rather than the window. */
   async daemonAgents(): Promise<{ cwd?: string; label?: string }[]> {
     const { code, stdout } = await run(paths.daemon, ["daemon", "status", "--json"], this.env);
@@ -367,6 +582,7 @@ export class Deck {
       writeFileSync(join(dir, "screenshot.png"), Buffer.from(await this.session.screenshot(), "base64"));
       writeFileSync(join(dir, "page.txt"), await this.session.execute<string>("return document.body.innerText"));
       writeFileSync(join(dir, "terminals.json"), JSON.stringify(await this.terminalTexts(), null, 2));
+      writeFileSync(join(dir, "terminal-screens.json"), JSON.stringify(await this.terminalScreens(), null, 2));
     } catch (error) {
       writeFileSync(join(dir, "capture-error.txt"), String(error));
     }

@@ -724,7 +724,21 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    let permit = project_fs_limit()
+    run_bounded_in(project_fs_limit(), f).await
+}
+
+/// [`run_bounded`] against an explicit `limit` rather than the daemon-wide one.
+///
+/// The daemon-wide semaphore is process-global, so under plain `cargo test`,
+/// which runs a crate's tests as threads of one process, a test that holds its
+/// permits starves an unrelated test's tight deadline. The tests that pin the
+/// bound's own behaviour therefore bring a semaphore of their own.
+async fn run_bounded_in<T, F>(limit: &Arc<Semaphore>, f: F) -> Result<T, ProjectResolveError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = limit
         .clone()
         .acquire_owned()
         .await
@@ -854,11 +868,24 @@ where
     F: FnOnce(&ReplyLatch) -> (T, Option<AfterReply>) + Send + 'static,
     T: Send + 'static,
 {
-    let permit =
-        match tokio::time::timeout_at(deadline, project_fs_limit().clone().acquire_owned()).await {
-            Err(_elapsed) => return Ok(Err(Expired::NoPermit)),
-            Ok(permit) => permit.map_err(|_| ProjectResolveError::Internal)?,
-        };
+    run_bounded_answer_in(project_fs_limit(), deadline, f).await
+}
+
+/// [`run_bounded_answer`] against an explicit `limit`; see [`run_bounded_in`]
+/// for why the tests need one.
+async fn run_bounded_answer_in<T, F>(
+    limit: &Arc<Semaphore>,
+    deadline: tokio::time::Instant,
+    f: F,
+) -> Result<Result<T, Expired>, ProjectResolveError>
+where
+    F: FnOnce(&ReplyLatch) -> (T, Option<AfterReply>) + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = match tokio::time::timeout_at(deadline, limit.clone().acquire_owned()).await {
+        Err(_elapsed) => return Ok(Err(Expired::NoPermit)),
+        Ok(permit) => permit.map_err(|_| ProjectResolveError::Internal)?,
+    };
     let latch = Arc::new(ReplyLatch::default());
     let work_latch = Arc::clone(&latch);
     let (tx, mut rx) = tokio::sync::oneshot::channel();
@@ -2357,6 +2384,16 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// A project permit pool of the production size that belongs to one test.
+    ///
+    /// The daemon-wide pool is process-global: under plain `cargo test` a test
+    /// that saturates it starves another test's 100 ms deadline into
+    /// `Expired::NoPermit`. A test that asserts on the bound's own timing
+    /// therefore runs against this instead.
+    fn own_project_permits() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(MAX_CONCURRENT_PROJECT_READS))
+    }
+
     const SMALL_PROJECT: &str = r#"
 [[orchestrations]]
 name = "loop"
@@ -2446,6 +2483,7 @@ command = "cat"
             spawned_at_ms,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         }
     }
 
@@ -2697,12 +2735,14 @@ command = "cat"
             .build()
             .expect("runtime");
         let n = MAX_CONCURRENT_PROJECT_READS * 4;
+        let limit = own_project_permits();
         let results: Vec<bool> = runtime.block_on(async move {
             let mut handles = Vec::new();
             for _ in 0..n {
                 let path = root.clone();
+                let limit = Arc::clone(&limit);
                 handles.push(tokio::spawn(async move {
-                    run_bounded(move || resolve_project(&path).is_ok())
+                    run_bounded_in(&limit, move || resolve_project(&path).is_ok())
                         .await
                         .expect("the bounded call must complete rather than be starved")
                 }));
@@ -3381,14 +3421,16 @@ command = "cat"
     /// gives up at its deadline and never runs the work.
     #[tokio::test]
     async fn run_bounded_answer_gives_up_at_the_deadline_without_running_the_work() {
-        let held = project_fs_limit()
+        let limit = own_project_permits();
+        let held = limit
             .clone()
             .acquire_many_owned(MAX_CONCURRENT_PROJECT_READS as u32)
             .await
             .expect("saturate the project permits");
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran_inner = std::sync::Arc::clone(&ran);
-        let outcome = run_bounded_answer(
+        let outcome = run_bounded_answer_in(
+            &limit,
             tokio::time::Instant::now() + Duration::from_millis(50),
             move |_| {
                 ran_inner.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3408,7 +3450,8 @@ command = "cat"
         );
 
         drop(held);
-        let outcome = run_bounded_answer(
+        let outcome = run_bounded_answer_in(
+            &limit,
             tokio::time::Instant::now() + Duration::from_secs(10),
             |latch| (latch.commit().then_some(42), None),
         )
@@ -3422,18 +3465,20 @@ command = "cat"
     /// does finish, its commit is refused, which is what makes it withdraw.
     #[tokio::test]
     async fn run_bounded_answer_answers_on_time_and_abandons_a_stalled_work() {
+        let limit = own_project_permits();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let (committed_tx, committed_rx) = std::sync::mpsc::channel::<bool>();
         let started = tokio::time::Instant::now();
-        let outcome = run_bounded_answer(started + Duration::from_millis(100), move |latch| {
-            // Stands in for a filesystem call that stalls past the deadline.
-            let _ = release_rx.recv_timeout(Duration::from_secs(30));
-            let committed = latch.commit();
-            let _ = committed_tx.send(committed);
-            (committed, None)
-        })
-        .await
-        .expect("no internal error");
+        let outcome =
+            run_bounded_answer_in(&limit, started + Duration::from_millis(100), move |latch| {
+                // Stands in for a filesystem call that stalls past the deadline.
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                let committed = latch.commit();
+                let _ = committed_tx.send(committed);
+                (committed, None)
+            })
+            .await
+            .expect("no internal error");
         assert_eq!(
             outcome,
             Err(Expired::Abandoned),
@@ -3464,21 +3509,28 @@ command = "cat"
     /// stalls past the deadline neither delays nor changes the answer.
     #[tokio::test]
     async fn run_bounded_answer_answers_before_a_stalled_after_reply() {
+        let limit = own_project_permits();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let (ran_tx, ran_rx) = std::sync::mpsc::channel::<()>();
         let started = tokio::time::Instant::now();
-        let outcome = run_bounded_answer(started + Duration::from_millis(100), move |latch| {
-            let after: AfterReply = Box::new(move || {
-                let _ = release_rx.recv_timeout(Duration::from_secs(30));
-                let _ = ran_tx.send(());
-            });
-            (latch.commit(), Some(after))
-        })
-        .await
-        .expect("no internal error");
+        // The deadline is generous on purpose. It plays no part in the property:
+        // an answer that waited for the after-reply work would wait out its 30 s
+        // stall whatever the deadline, and the elapsed check below catches that.
+        // At 100 ms it only measured how fast a loaded box starts a blocking
+        // thread, and answered `Abandoned` when it did not start in time.
+        let outcome =
+            run_bounded_answer_in(&limit, started + Duration::from_secs(10), move |latch| {
+                let after: AfterReply = Box::new(move || {
+                    let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                    let _ = ran_tx.send(());
+                });
+                (latch.commit(), Some(after))
+            })
+            .await
+            .expect("no internal error");
         assert_eq!(outcome, Ok(true), "the committed answer is delivered");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(20),
             "the answer did not wait for the after-reply work ({:?})",
             started.elapsed()
         );

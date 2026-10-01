@@ -15,6 +15,9 @@
 //!   NOT PTY injection) and drives a full orchestration LIVE (pi → native
 //!   `delegate` → real `claude` Haiku worker → sentinel + work-done). See its own
 //!   section below.
+//! * `pi/live/003` — issue #1385: the extension shells the deck that spawned it
+//!   (`DOT_AGENT_DECK_EXE`), not a decoy `dot-agent-deck` placed first on PATH.
+//!   No prompt, so no model call and no credential.
 //!
 //! ## Why this is separate from `e2e_pi_orchestrator.rs`
 //! The `chain-smoke/pi/001` + `scheduler/pi/001` tests are HEADLESS: an
@@ -114,8 +117,12 @@ fn check_pi_available() -> Result<(), String> {
 
 /// PATH for the spawned deck (→ daemon → pi child) with the freshly-built
 /// `dot-agent-deck` binary's dir prepended to the host PATH, so the extension's
-/// `dot-agent-deck agent-event` resolves. `CARGO_BIN_EXE_dot-agent-deck` is set
-/// by Cargo at integration-test build time to the binary under test.
+/// `dot-agent-deck agent-event` resolves. Since issue #1385 the extension names
+/// the deck by the `DOT_AGENT_DECK_EXE` it is spawned with and consults PATH
+/// only without it (`pi/live/003` pins that); the prepend is kept so any other
+/// bare-name lookup in the chain also reaches the build under test.
+/// `CARGO_BIN_EXE_dot-agent-deck` is set by Cargo at integration-test build
+/// time to the binary under test.
 fn path_with_binary_dir() -> String {
     let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
     let bin_dir = std::path::Path::new(bin)
@@ -644,5 +651,123 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
         deck.wait_for_stream_string_within(ORCH_SENTINEL_NAME, Duration::from_secs(20));
     eprintln!(
         "pi-inject-orch soft signal: sentinel {ORCH_SENTINEL_NAME:?} seen live on grid = {saw_sentinel_grid}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// pi/live/003 — the extension shells the deck that spawned it, not whatever
+// `dot-agent-deck` Pi's own PATH resolves (issue #1385, following #549).
+// ---------------------------------------------------------------------------
+
+/// `pi` on PATH, nothing else: `pi/live/003` sends no prompt, so pi makes no
+/// model call and needs no credential — its `session_start` fires at boot
+/// whether or not it is authenticated. Unix-only, like the one test using it.
+#[cfg(unix)]
+fn check_pi_installed() -> Result<(), String> {
+    let ok = std::process::Command::new("pi")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err("pi CLI not installed (could not invoke `pi --version`)".into())
+    }
+}
+
+/// Scenario: Put a DECOY `dot-agent-deck` first on the deck's PATH — a script
+/// that only appends its arguments to a log and exits 0, standing in for an
+/// older or unrelated install an agent's shell could find first — and leave
+/// the freshly built binary OFF the PATH. Launch the real deck with
+/// `DOT_AGENT_DECK_EXPERIMENTAL=1` and a restored pane running a bare `pi`
+/// with no prompt, then detach to the dashboard. Pi's `session_start` makes the
+/// bundled extension report status and pull its seed; because the deck exports
+/// its own absolute path in `DOT_AGENT_DECK_EXE`, those calls reach the real
+/// deck, so the card takes the `Pi ·` identity that only an `agent-event` from
+/// the extension can give it, and the decoy is never run.
+#[spec("pi/live/003")]
+#[cfg(unix)]
+#[test]
+fn pi_live_003_extension_shells_the_spawning_deck_not_the_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    skip_unless!(check_pi_installed());
+
+    let decoy_root = common::harness_tempdir().expect("create decoy dir");
+    let decoy_bin = decoy_root.path().join("bin");
+    std::fs::create_dir_all(&decoy_bin).expect("create decoy bin dir");
+    let decoy_log = decoy_root.path().join("decoy-invocations.log");
+    let decoy = decoy_bin.join("dot-agent-deck");
+    std::fs::write(
+        &decoy,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            decoy_log.display()
+        ),
+    )
+    .expect("write decoy dot-agent-deck");
+    std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755))
+        .expect("make decoy executable");
+
+    // The decoy first, then the host PATH (so `pi` resolves) with the built
+    // binary's directory deliberately NOT added — unlike `pi/live/001`, which
+    // prepends it and so could not tell the two lookups apart.
+    let path = format!(
+        "{}:{}",
+        decoy_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 50)
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .with_env("PATH", path)
+        // Empty pane name, so the card title is the agent-type identity.
+        .with_continue_session("", "pi")
+        .launch_with_fixture("minimal");
+
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    // Subscribe as soon as the pane exists (so the daemon's attach socket does
+    // too) and before pi has finished booting — its Node start and extension
+    // load take seconds — so the extension's first report is not missed.
+    let events = deck.subscribe_events();
+    deck.send_bytes(b"\x04"); // Ctrl+D → dashboard
+    deck.wait_for_string("Dir:");
+
+    // What only the extension's `agent-event` can put on the daemon's wire: a
+    // Pi frame carrying the injected agent id under the CLI's `<pane>-session`
+    // key. The card-surfacing `SessionStart` the daemon emits at spawn is also
+    // typed Pi (from the command), but keys on the bare pane id and carries no
+    // agent id, so it cannot satisfy this.
+    let from_extension = events.try_wait_for(
+        |e| {
+            e.agent_type == dot_agent_deck::event::AgentType::Pi
+                && e.agent_id.is_some()
+                && e.session_id.ends_with("-session")
+        },
+        Duration::from_secs(120),
+    );
+    let decoy_calls = std::fs::read_to_string(&decoy_log).unwrap_or_default();
+    assert!(
+        decoy_calls.is_empty(),
+        "the Pi extension ran the `dot-agent-deck` on PATH instead of the deck that spawned it \
+         (DOT_AGENT_DECK_EXE); the decoy received:\n{decoy_calls}"
+    );
+    assert!(
+        from_extension.is_some(),
+        "no `agent-event` from the Pi extension reached the deck within 120s, so it did not \
+         shell the deck named by DOT_AGENT_DECK_EXE. Broadcast so far: {:?}\nFinal grid:\n{}",
+        events.snapshot(),
+        deck.snapshot_grid()
+    );
+    // The user-visible half: the card carries the first-class Pi identity.
+    assert!(
+        deck.wait_for_grid_string_within("Pi ·", Duration::from_secs(30)),
+        "the Pi pane's card never showed the `Pi ·` identity.\nFinal grid:\n{}",
+        deck.snapshot_grid()
     );
 }

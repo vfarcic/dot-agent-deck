@@ -888,25 +888,10 @@ pub fn set_test_current_exe_override(path: PathBuf) {
 /// absolute-path spelling are unit-testable with a synthetic executable path,
 /// without needing a real unusable `current_exe()`.
 fn resolve_binary_name(current_exe: std::io::Result<PathBuf>) -> String {
-    let Ok(path) = current_exe else {
+    let Some(path_str) = resolve_executable_path(current_exe) else {
         return DEFAULT_BINARY_NAME.to_string();
     };
-    // A path with no usable file name is not a path to an executable, so it is
-    // treated as unusable rather than spelled.
-    if path.file_name().and_then(|name| name.to_str()).is_none() {
-        return DEFAULT_BINARY_NAME.to_string();
-    }
-    // Issue #560: absolutise BEFORE quoting. `current_exe()` is only
-    // guaranteed absolute on Linux (`/proc/self/exe`); on macOS it reports the
-    // invocation path, so this is where a relative `./target/release/…` would
-    // otherwise reach the generated command word. Purely lexical plus the cwd,
-    // and deliberately not `canonicalize` — see [`binary_name`]'s doc.
-    let Ok(absolute) = std::path::absolute(&path) else {
-        return DEFAULT_BINARY_NAME.to_string();
-    };
-    let Some(path_str) = absolute.to_str().map(strip_replaced_binary_suffix) else {
-        return DEFAULT_BINARY_NAME.to_string();
-    };
+    let path_str = path_str.as_str();
     if !is_prose_safe_path(path_str) {
         // Not silent: the bare name this falls back to is resolved through the
         // agent's own `$PATH`, which is the #549 exposure, so the operator has
@@ -922,6 +907,48 @@ fn resolve_binary_name(current_exe: std::io::Result<PathBuf>) -> String {
     }
     posix_command_word(path_str, cfg!(windows)).unwrap_or_else(|| DEFAULT_BINARY_NAME.to_string())
 }
+
+/// Pure seam behind [`executable_path`] and the first half of
+/// [`resolve_binary_name`]: `current_exe()`'s result as an absolute UTF-8 path
+/// with Linux's ` (deleted)` suffix dropped, or `None` when it is unusable (an
+/// error, no file name, not valid UTF-8, or not absolutisable).
+fn resolve_executable_path(current_exe: std::io::Result<PathBuf>) -> Option<String> {
+    let path = current_exe.ok()?;
+    // A path with no usable file name is not a path to an executable, so it is
+    // treated as unusable rather than spelled.
+    path.file_name().and_then(|name| name.to_str())?;
+    // Issue #560: absolutise BEFORE quoting. `current_exe()` is only
+    // guaranteed absolute on Linux (`/proc/self/exe`); on macOS it reports the
+    // invocation path, so this is where a relative `./target/release/…` would
+    // otherwise reach the generated command word. Purely lexical plus the cwd,
+    // and deliberately not `canonicalize` — see [`binary_name`]'s doc.
+    let absolute = std::path::absolute(&path).ok()?;
+    absolute
+        .to_str()
+        .map(|path_str| strip_replaced_binary_suffix(path_str).to_string())
+}
+
+/// The running deck's own absolute path, UNQUOTED — for a consumer that execs
+/// it as argv rather than typing it into a shell, which is what the Pi
+/// extension does with [`DOT_AGENT_DECK_EXE`] (issue #1385). [`binary_name`]
+/// is the same file spelled as a POSIX command word, and quoting that for a
+/// shell would name a different file when handed to `execve` as-is.
+///
+/// `None` exactly where [`binary_name`] would fall back to the bare name for a
+/// reason other than prose safety: an argv consumer does not embed the path in
+/// text, so a backtick or control character does not disqualify it here.
+pub fn executable_path() -> Option<String> {
+    resolve_executable_path(effective_current_exe())
+}
+
+/// The environment variable every spawned agent receives holding
+/// [`executable_path`] — the deck that spawned it (issue #1385). The bundled Pi
+/// extension (`pi-extension/src/orchestrator.ts`) execs `delegate`,
+/// `work-done`, `agent-event` and `get-seed` through it instead of the bare
+/// name, which Pi's own `$PATH` could resolve to a different `dot-agent-deck`
+/// (the #549 exposure). The extension falls back to the bare name when it is
+/// absent, so an older deck that does not set it still works.
+pub const DOT_AGENT_DECK_EXE: &str = "DOT_AGENT_DECK_EXE";
 
 /// Whether `path` can be interpolated into the generated **text** — not just
 /// the shell — without changing the text around it. Shell quoting makes any
@@ -2167,6 +2194,29 @@ mod tests {
         }
     }
 
+    /// Issue #1385: the argv spelling handed to the Pi extension is the same
+    /// absolute file [`resolve_binary_name`] names, but UNQUOTED — `execve`
+    /// would read shell quotes as part of the file name — and it is `None`
+    /// wherever the command word falls back for an unusable `current_exe()`.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_executable_path_is_the_unquoted_absolute_path() {
+        assert_eq!(
+            resolve_executable_path(Ok(PathBuf::from("/usr/local/bin/dot-agent-deck copy"))),
+            Some("/usr/local/bin/dot-agent-deck copy".to_string())
+        );
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from("/usr/local/bin/dot-agent-deck copy"))),
+            "'/usr/local/bin/dot-agent-deck copy'",
+            "the command word for the same file is the quoted spelling"
+        );
+        assert_eq!(
+            resolve_executable_path(Err(std::io::Error::other("no such process"))),
+            None
+        );
+        assert_eq!(resolve_executable_path(Ok(PathBuf::from("/"))), None);
+    }
+
     /// A file name carrying shell metacharacters, whitespace or a leading `-`
     /// (the browser-download and Finder-duplicate cases from issue
     /// prageethw/dot-agent-deck#253 review F2 / audit F1) still yields the
@@ -2503,8 +2553,9 @@ mod tests {
         let name = "delegate-019-shared-name";
         let shadow_candidate = shadow_dir.join(name);
         let real_candidate = real_dir.join(name);
-        std::fs::write(&shadow_candidate, b"#!/bin/sh\necho shadow\n").unwrap();
-        std::fs::write(&real_candidate, b"#!/bin/sh\necho real\n").unwrap();
+        crate::test_isolation::write_script(&shadow_candidate, b"#!/bin/sh\necho shadow\n")
+            .unwrap();
+        crate::test_isolation::write_script(&real_candidate, b"#!/bin/sh\necho real\n").unwrap();
 
         let word = resolve_binary_name(Ok(real_candidate.clone()));
         // #561: on Windows the word carries the forward-slash respelling, so the
@@ -3519,7 +3570,7 @@ mod tests {
     fn write_stub_executable(path: &Path) {
         std::fs::create_dir_all(path.parent().expect("candidate has a parent"))
             .expect("create candidate dir");
-        std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write candidate");
+        crate::test_isolation::write_script(path, b"#!/bin/sh\nexit 0\n").expect("write candidate");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -42,6 +42,8 @@ dot-agent-deck dispatch <name> --task-file <file> --single
 dot-agent-deck dispatch <name> --task-file <file> --orchestration '<orchestration-name>'
 ```
 
+It runs these, and `dispatch --list-targets`, by the deck's full path, such as `/home/you/.local/bin/dot-agent-deck dispatch …`, so they reach this deck whatever the agent's own `PATH` holds. If you let the agent run commands through a permission rule, write the rule against the path shown in the dispatcher's pane: a Claude Code allow rule such as `Bash(dot-agent-deck dispatch:*)` does not match it.
+
 ### Write the request so the unit can act on it
 
 - **The task must stand on its own.** The unit is a fresh agent that cannot see the dispatcher's conversation. State the goal and the expected outcome.

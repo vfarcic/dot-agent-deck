@@ -2619,6 +2619,7 @@ mod tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         }
     }
 
@@ -3361,7 +3362,8 @@ mod tests {
     fn stub_devbox(dir: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("devbox-stub");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write devbox stand-in");
+        crate::test_isolation::write_script(&path, format!("#!/bin/sh\n{body}\n"))
+            .expect("write devbox stand-in");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("chmod devbox stand-in");
         path

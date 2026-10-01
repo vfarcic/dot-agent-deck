@@ -792,6 +792,43 @@ pub fn is_windows_absolute_path(value: &str) -> bool {
     bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && is_sep(bytes[2])
 }
 
+/// Issue #1395: whether a daemon-supplied orchestrator context path is one the
+/// TUI may re-arm an orchestration rooted at `project_dir` from — exactly
+/// `<project_dir>/.dot-agent-deck/orchestrator-context-<32 hex>.md`.
+///
+/// The one check both intake paths apply: a live
+/// [`OrchestrationSurface::context_path`] ([`validate_orchestration_surface`],
+/// against the surface's own `cwd`) and a hydrated
+/// [`AgentRecord::orchestrator_context_path`] (`partition_hydrated_panes` in
+/// `src/ui.rs`, against the bucket's orchestration cwd). Audit round 2: shape
+/// alone was not enough — a surface for project A naming project B's context
+/// file was adopted, and A's re-arm then republished B's task to A's
+/// coordinator.
+///
+/// Both values must be absolute and control-free
+/// ([`is_valid_orchestration_cwd`]) and carry no `.` or `..` segment, and the
+/// path must then match [`crate::orchestrator_context::own_context_file_name`]'s
+/// lexical rule. Never the fixed-path mirror, which the TUI already falls back
+/// to without being told. Nothing is resolved on disk: a symlink in the path is
+/// kept from choosing the file by the re-arm's read, which opens the name
+/// relative to the project instead of following this path.
+pub fn is_own_context_path(project_dir: &str, context_path: &str) -> bool {
+    let has_dot_segment = |value: &str| {
+        value
+            .split(std::path::is_separator)
+            .any(|segment| segment == "." || segment == "..")
+    };
+    is_valid_orchestration_cwd(project_dir)
+        && is_valid_orchestration_cwd(context_path)
+        && !has_dot_segment(project_dir)
+        && !has_dot_segment(context_path)
+        && crate::orchestrator_context::own_context_file_name(
+            std::path::Path::new(project_dir),
+            std::path::Path::new(context_path),
+        )
+        .is_some()
+}
+
 /// PRD #120 (H1/M1/L2): wire-boundary validation for the live
 /// [`OrchestrationSurface`] broadcast, mirroring [`validate_tab_membership`]
 /// for the reconnect path. The receive path
@@ -820,6 +857,9 @@ pub fn is_windows_absolute_path(value: &str) -> bool {
 ///   [`validate_tab_membership`]).
 /// - **L2:** `cwd` drives `load_project_config` and is the bucket key, so it
 ///   must be a valid ABSOLUTE orchestration cwd → reject otherwise.
+/// - **Issue #1395:** `context_path` is read back by the tab's re-arm and has a
+///   defined `None` fallback (the fixed-path mirror), so a value that is not an
+///   absolute, control-free per-publish context path is nulled out.
 ///
 /// A surface left with no roles after the per-role drops is rejected: an
 /// orchestration always has ≥1 role, and a zero-role surface can only build a
@@ -858,6 +898,17 @@ pub fn validate_orchestration_surface(
         .is_some_and(|t| !is_valid_display_name(t))
     {
         surface.display_title = None;
+    }
+    // Issue #1395: the context path is read back by the tab's re-arm, and its
+    // absence has a defined fallback (the fixed-path mirror), so a value that
+    // is not a per-publish context file of THIS surface's own project is
+    // nulled out rather than dropping the tab. `cwd` was validated above.
+    if surface
+        .context_path
+        .as_deref()
+        .is_some_and(|p| !is_own_context_path(&surface.cwd, p))
+    {
+        surface.context_path = None;
     }
     // Drop any role that would OOM the synthesis allocation (role_index over the
     // cap) or smuggle control bytes into the tab via a non-empty role_name. An
@@ -1789,6 +1840,20 @@ fn spawn_with_dir(
         );
     }
 
+    // Issue #1385: name THIS deck to the child by its absolute path, so the Pi
+    // extension execs the deck that spawned it rather than whatever its own
+    // `$PATH` resolves the bare name to. Every child gets it, not only a
+    // detected Pi, because a project wrapper (`devbox run agent`) can launch Pi
+    // without the command naming it. Applied straight to `cmd` for the lifetime
+    // tag's reason — a replayed `spawn_env` would carry the previous
+    // generation's binary across a daemon upgrade — and removed when there is
+    // no usable path, so a value inherited from an enclosing deck's pane never
+    // names a different deck.
+    match crate::platform::paths::executable_path() {
+        Some(path) => cmd.env(crate::platform::paths::DOT_AGENT_DECK_EXE, path),
+        None => cmd.env_remove(crate::platform::paths::DOT_AGENT_DECK_EXE),
+    }
+
     // Issue #1233 item 2: as late as the parent can decide it. See `spawn_in`.
     #[cfg(unix)]
     if let Some(dir) = verified_dir {
@@ -2124,6 +2189,21 @@ fn pump_reader(
             Err(_) => break,
         }
     }
+    // Issue #868: must run regardless of whether `pane_id_env` is set — a
+    // dashboard pane crashes just as much as an orchestration one, and the
+    // block below (release/sweep/notify) only fires when a pane id exists.
+    //
+    // And BEFORE `exited` is published, so the crash verdict is settled by the
+    // time anyone can see the agent as gone: a reader that observes `exited`
+    // (a `SeqCst` load) and then takes the registry lock sees `crashed` too.
+    // The other order left a window in which an exited agent read as not
+    // crashed — measured as
+    // `pump_reader_marks_natural_exit_as_crashed_but_not_deliberate_close`
+    // failing under plain `cargo test`, and reachable by a `pane restart`
+    // refusal check landing in it.
+    if let Some(registry) = registry.upgrade() {
+        registry.mark_agent_crashed(&agent_id);
+    }
     exited.store(true, Ordering::SeqCst);
     change_notify.notify_one();
     // Issue #584: release anyone waiting on THIS agent's liveness before the
@@ -2132,12 +2212,6 @@ fn pump_reader(
     // a fixed 30 s window. A dropped registry leaves nothing to wake.
     if let Some(registry) = registry.upgrade() {
         registry.signal_agent_exit(&agent_id);
-    }
-    // Issue #868: must run regardless of whether `pane_id_env` is set — a
-    // dashboard pane crashes just as much as an orchestration one, and the
-    // block below (release/sweep/notify) only fires when a pane id exists.
-    if let Some(registry) = registry.upgrade() {
-        registry.mark_agent_crashed(&agent_id);
     }
     if let Some(pane_id) = pane_id_env.as_deref()
         && let Some(registry) = registry.upgrade()
@@ -3327,6 +3401,22 @@ pub struct AgentRecord {
     /// optional field on this struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crashed: Option<bool>,
+    /// Issue #1395 item 1: the per-publish orchestrator context file
+    /// (`.dot-agent-deck/orchestrator-context-<id>.md`) this pane's
+    /// orchestration was started with — set only on the orchestration's START
+    /// role, by the `ListAgents` handler from what the daemon recorded at the
+    /// start ([`crate::state::AppState::attach_orchestrator_context_paths`]).
+    /// A TUI hydrating the tab re-arms compaction and `/clear` from this file
+    /// instead of the fixed-path mirror, which a later preparation in the same
+    /// project may have overwritten.
+    ///
+    /// `None` for every other pane, for a start role the daemon has no record
+    /// for (a TUI-launched `Ctrl+n` tab, which publishes its own context), and
+    /// from a daemon predating this field — in which case the TUI falls back to
+    /// the mirror exactly as before. Additive optional, so no
+    /// `PROTOCOL_VERSION` bump — same basis as `live` and `crashed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_context_path: Option<String>,
 }
 
 impl AgentRecord {
@@ -6858,6 +6948,18 @@ impl AgentPtyRegistry {
         }
     }
 
+    /// Issue #1423: the generation of `worker_pane_id`'s armed idle-worker
+    /// record, or `None` when no delegation to that pane is outstanding.
+    /// Read-only, so a check cannot itself retire the record it is checking.
+    pub fn outstanding_delegation_seq(&self, worker_pane_id: &str) -> Option<u64> {
+        self.delegations
+            .lock()
+            .unwrap()
+            .records
+            .get(worker_pane_id)
+            .map(|record| record.seq)
+    }
+
     /// PRD #126: a `work-done` arrived from `worker_pane_id`, so that pane's
     /// outstanding delegation is resolved and the pane owes no idle prompt —
     /// including every older generation carried in
@@ -7103,6 +7205,21 @@ impl AgentPtyRegistry {
     /// **not** restored. Losing a watch fails safe (no idle prompt for a worker
     /// whose pane we just tried to kill); resurrecting one could nag about a
     /// delegation whose pane the user explicitly asked to close.
+    ///
+    /// Issue #505: the commission ledger is not restored either, although losing
+    /// a commission does not fail safe the way losing a watch does — the worker's
+    /// genuinely delegated `work-done` then arrives as unsolicited. A restore is
+    /// not safe here, because a failed close is rarely a live agent: `StopAgent`
+    /// passes `closed = false` when `close_agent` answers `NotFound`, which means
+    /// the agent it was asked to stop is no longer in the registry, or when the
+    /// blocking task failed after `close_agent` had already removed the record.
+    /// Either way the pane may by now hold a successor, and a restored commission
+    /// would be credited to it — the pane-id-reuse laundering
+    /// [`Self::drain_commissions_touching`] and
+    /// [`Self::retire_commissions_of_replaced_agent`] exist to prevent. What
+    /// #505 fixed instead is the prose: the unsolicited label says only that
+    /// the deck holds no delegation on record, not that nobody made one
+    /// (`compose_work_done_feedback` in `state.rs`).
     pub fn finish_pane_close(&self, pane_id: &str, closed: bool) -> Vec<OutstandingDelegation> {
         let mut tracker = self.delegations.lock().unwrap();
         drop(tracker.close_waiters.remove(pane_id));
@@ -9384,6 +9501,32 @@ impl AgentPtyRegistry {
     where
         Fut: std::future::Future<Output = bool>,
     {
+        self.write_and_submit_guarded_first_write_capped_detailed(
+            pane_id,
+            text,
+            expected_agent_id,
+            revalidate,
+            started,
+            cap_ceiling,
+        )
+        .await
+        .map(|sent| sent.detail.outcome())
+    }
+
+    /// [`Self::write_and_submit_guarded_first_write_capped`], keeping the
+    /// refusal reason and reporting how long the write waited for the draft.
+    pub async fn write_and_submit_guarded_first_write_capped_detailed<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: &str,
+        revalidate: impl FnOnce() -> Fut,
+        started: Instant,
+        cap_ceiling: Duration,
+    ) -> Result<FirstWriteSend, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
         self.write_guarded(
             pane_id,
             text,
@@ -9400,7 +9543,6 @@ impl AgentPtyRegistry {
             || {},
         )
         .await
-        .map(|sent| sent.detail.outcome())
     }
 
     /// [`Self::write_and_submit_guarded_first_write_detailed`] with a deadline
@@ -12050,6 +12192,7 @@ impl AgentPtyRegistry {
             // reaches no client at all.
             cli_name: None,
             crashed: agent.crashed,
+            orchestrator_context_path: None,
         })
     }
 
@@ -12402,6 +12545,10 @@ impl AgentPtyRegistry {
                 // `AgentRecord::cli_name`.
                 cli_name: None,
                 crashed: agent.crashed,
+                // Issue #1395: the registry does not know it; the `ListAgents`
+                // handler stamps it from `AppState`. See
+                // `AgentRecord::orchestrator_context_path`.
+                orchestrator_context_path: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -14284,6 +14431,7 @@ mod spawn_tests {
             display_title: None,
             orchestration_id: None,
             roles: vec![surface_role(0, "orchestrator"), surface_role(1, "worker")],
+            context_path: None,
         }
     }
 
@@ -14334,6 +14482,7 @@ mod spawn_tests {
             display_title: None,
             orchestration_id: None,
             roles: vec![surface_role(ORCHESTRATION_ROLE_INDEX_MAX + 1, "rogue")],
+            context_path: None,
         };
         assert!(validate_orchestration_surface(surface).is_none());
     }
@@ -14402,6 +14551,65 @@ mod spawn_tests {
         assert!(validated.roles.iter().all(|r| r.role_name != "\x1b[31mpwn"));
     }
 
+    /// Issue #1395: a per-publish context path directly under the surface's
+    /// own `cwd` survives; anything else — relative, control bytes, the
+    /// fixed-path mirror, any other name, another project's file (audit round
+    /// 2), a `.`/`..` detour — is nulled out without dropping the surface.
+    #[test]
+    fn validate_orchestration_surface_nulls_a_malformed_context_path() {
+        const NAME: &str = "orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        let cwd = well_formed_surface().cwd;
+        let good = format!("{cwd}/.dot-agent-deck/{NAME}");
+        let mut surface = well_formed_surface();
+        surface.context_path = Some(good.clone());
+        let validated = validate_orchestration_surface(surface).expect("valid surface");
+        assert_eq!(validated.context_path.as_deref(), Some(good.as_str()));
+
+        for bad in [
+            format!(".dot-agent-deck/{NAME}"),
+            format!("{cwd}\x1b[31m/.dot-agent-deck/{NAME}"),
+            format!("{cwd}/.dot-agent-deck/orchestrator-context.md"),
+            format!("/work/other-project/.dot-agent-deck/{NAME}"),
+            format!("{cwd}/sub/../.dot-agent-deck/{NAME}"),
+            format!("{cwd}/./.dot-agent-deck/{NAME}"),
+            format!("{cwd}/.dot-agent-deck/../../issue-2/.dot-agent-deck/{NAME}"),
+            "/etc/passwd".to_string(),
+            String::new(),
+        ] {
+            let mut surface = well_formed_surface();
+            surface.context_path = Some(bad.clone());
+            let validated =
+                validate_orchestration_surface(surface).expect("a bad path keeps the surface");
+            assert_eq!(validated.context_path, None, "{bad:?} must be nulled");
+        }
+    }
+
+    /// Issue #1395 audit round 2: the shared intake check. A project with a
+    /// `.`/`..` segment, or a relative one, has no own context path at all.
+    #[test]
+    fn is_own_context_path_requires_a_clean_absolute_project() {
+        const NAME: &str = "orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        assert!(is_own_context_path(
+            "/p",
+            &format!("/p/.dot-agent-deck/{NAME}")
+        ));
+        assert!(is_own_context_path(
+            "/p/",
+            &format!("/p/.dot-agent-deck/{NAME}")
+        ));
+        for (project, path) in [
+            ("/p/../q", format!("/p/../q/.dot-agent-deck/{NAME}")),
+            ("/p/.", format!("/p/./.dot-agent-deck/{NAME}")),
+            ("p", format!("p/.dot-agent-deck/{NAME}")),
+            ("/p", format!("/q/.dot-agent-deck/{NAME}")),
+        ] {
+            assert!(
+                !is_own_context_path(project, &path),
+                "{project:?} / {path:?} must be refused"
+            );
+        }
+    }
+
     // An empty role_name is the older-daemon wire shape — synthesis falls back
     // to a `role-{i}` placeholder, so it must NOT be dropped.
     #[test]
@@ -14412,6 +14620,7 @@ mod spawn_tests {
             display_title: None,
             orchestration_id: None,
             roles: vec![surface_role(0, "")],
+            context_path: None,
         };
         let validated = validate_orchestration_surface(surface).expect("empty role_name accepted");
         assert_eq!(validated.roles.len(), 1);
@@ -16703,7 +16912,8 @@ mod spawn_tests {
         use std::os::unix::fs::PermissionsExt as _;
         fn script(dir: &std::path::Path, name: &str, marker: &str) {
             let path = dir.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\necho x > {marker}\n")).expect("script");
+            crate::test_isolation::write_script(&path, format!("#!/bin/sh\necho x > {marker}\n"))
+                .expect("script");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
 
@@ -16802,7 +17012,8 @@ mod spawn_tests {
                         .expect("move the verified directory away");
                     std::fs::create_dir(&dir).expect("put a replacement at the verified path");
                     let decoy = dir.join(name);
-                    std::fs::write(&decoy, b"#!/bin/sh\necho x > wrong\n").expect("decoy");
+                    crate::test_isolation::write_script(&decoy, b"#!/bin/sh\necho x > wrong\n")
+                        .expect("decoy");
                     std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755))
                         .expect("chmod");
                 }
@@ -16852,7 +17063,8 @@ mod spawn_tests {
         let dir = root.path().join("d");
         std::fs::create_dir(&dir).expect("create the project dir");
         let script = dir.join("bad-interp");
-        std::fs::write(&script, b"#!/nonexistent/dad-1233-interpreter\n").expect("script");
+        crate::test_isolation::write_script(&script, b"#!/nonexistent/dad-1233-interpreter\n")
+            .expect("script");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let verified =
             crate::project_resolve::VerifiedProjectDir::open(&dir).expect("open the project dir");
@@ -16924,7 +17136,7 @@ mod spawn_tests {
         let dir = root.path().join("d");
         std::fs::create_dir(&dir).expect("create the project dir");
         let script = dir.join("no-interp");
-        std::fs::write(&script, b"echo x > marker\n").expect("script");
+        crate::test_isolation::write_script(&script, b"echo x > marker\n").expect("script");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let path = dir.to_str().expect("utf-8 tempdir");
         let marker = dir.join("marker");
@@ -16974,7 +17186,7 @@ mod spawn_tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("create tempdir");
         let here = dir.path().join("here");
-        std::fs::write(&here, b"").expect("a program in the cwd");
+        crate::test_isolation::write_script(&here, b"").expect("a program in the cwd");
         // Executable, so the probe in front of the rewrite lets it through.
         std::fs::set_permissions(&here, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let cwd = dir.path().as_os_str();
@@ -17092,6 +17304,47 @@ mod spawn_tests {
         };
         assert!(matches!(err, AgentPtyError::PreparedDirChanged(_)));
         assert!(registry.is_empty(), "a refused spawn must register nothing");
+    }
+
+    /// Issue #1385: every child is told the spawning deck's own absolute path in
+    /// `DOT_AGENT_DECK_EXE`, and that value wins over one inherited from an
+    /// enclosing deck's pane and over a caller-supplied (replayed) one.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_names_the_running_deck_in_dot_agent_deck_exe() {
+        let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let key = crate::platform::paths::DOT_AGENT_DECK_EXE;
+        let expected =
+            crate::platform::paths::executable_path().expect("the test binary has a usable path");
+        let prior = std::env::var(key).ok();
+        // SAFETY: serialized by ENV_TEST_LOCK and restored before asserting.
+        unsafe {
+            std::env::set_var(key, "/an/enclosing/deck/dot-agent-deck");
+        }
+        let pty = spawn(SpawnOptions {
+            command: Some(
+                "sh -c '[ \"$DOT_AGENT_DECK_EXE\" = \"$EXPECTED_EXE\" ] && exit 42; exit 1'",
+            ),
+            env: vec![
+                ("EXPECTED_EXE".into(), expected.clone()),
+                (key.into(), "/a/replayed/spawn-env/dot-agent-deck".into()),
+            ],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+        let mut child = pty.child;
+        let status = child.wait().expect("wait should succeed");
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert_eq!(
+            status.exit_code(),
+            42,
+            "the child must see {key}={expected:?}, not an inherited or replayed value"
+        );
     }
 
     #[test]
@@ -17447,6 +17700,7 @@ mod spawn_tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         }
     }
 
@@ -17531,6 +17785,7 @@ mod spawn_tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -17557,6 +17812,33 @@ mod spawn_tests {
             .expect("older daemon shape must decode via #[serde(default)] on rows/cols");
         assert_eq!(back.rows, 0);
         assert_eq!(back.cols, 0);
+    }
+
+    /// Issue #1395 item 1: `orchestrator_context_path` is additive optional —
+    /// an older daemon's record (no key) decodes as `None`, and `None` puts no
+    /// key on the wire, so an older client sees the shape it always has.
+    #[test]
+    fn agent_record_orchestrator_context_path_is_additive_optional() {
+        let legacy_json = r#"{"id": "1"}"#;
+        let back: AgentRecord =
+            serde_json::from_str(legacy_json).expect("a record without the field must decode");
+        assert_eq!(back.orchestrator_context_path, None);
+        let wire = serde_json::to_value(&back).unwrap();
+        assert!(
+            wire.get("orchestrator_context_path").is_none(),
+            "None must be omitted from the wire: {wire}"
+        );
+
+        let with_path = AgentRecord {
+            orchestrator_context_path: Some("/p/.dot-agent-deck/x.md".into()),
+            ..back
+        };
+        let json = serde_json::to_string(&with_path).unwrap();
+        let round: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            round.orchestrator_context_path.as_deref(),
+            Some("/p/.dot-agent-deck/x.md")
+        );
     }
 
     #[test]
@@ -18486,6 +18768,7 @@ mod spawn_tests {
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -19823,21 +20106,27 @@ mod spawn_tests {
             !registry.draft_pending(PANE),
             "the user's Enter after our paste closed was read as paste content"
         );
-        let started = Instant::now();
+        // The write's own report of its draft wait, not its wall clock: every
+        // submit spends the `SUBMIT_DELAY` floor and then waits for its echo,
+        // so a starved runner took a write that never waited past `CAP`
+        // (build-macos, 2026-09-30). A ceiling far above `CAP` keeps a stall
+        // before the first decision from reaching the cap and writing without
+        // a wait, which would hide a draft the model wrongly still holds.
         let next = registry
-            .write_and_submit_guarded_first_write_capped(
+            .write_and_submit_guarded_first_write_capped_detailed(
                 PANE,
                 "ISSUE-544-NEXT",
                 &agent,
                 || async { true },
                 Instant::now(),
-                CAP,
+                Duration::from_secs(10),
             )
             .await
             .expect("next write");
-        assert_eq!(next, GuardedSend::Applied);
-        assert!(
-            started.elapsed() < CAP,
+        assert_eq!(next.detail.outcome(), GuardedSend::Applied);
+        assert_eq!(
+            next.deferred,
+            Duration::ZERO,
             "the next first write waited for a draft the agent already submitted"
         );
         registry.shutdown_all();
@@ -23092,7 +23381,8 @@ mod spawn_tests {
                 .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
                 .with_ansi(false)
                 .finish();
-            let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+            let _subscriber_guard =
+                crate::test_isolation::capture_tracing_on_this_thread(subscriber);
             shutting_down.shutdown_all_graceful(Duration::from_millis(0));
             done.store(true, Ordering::SeqCst);
         });
@@ -23207,7 +23497,8 @@ mod spawn_tests {
             .finish();
         let started = Instant::now();
         {
-            let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+            let _subscriber_guard =
+                crate::test_isolation::capture_tracing_on_this_thread(subscriber);
             registry.shutdown_all_graceful(Duration::from_millis(0));
         }
         let elapsed = started.elapsed();
@@ -23310,7 +23601,7 @@ mod spawn_tests {
             .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
             .with_ansi(false)
             .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
 
         // Armed for the agent that owns the pane RIGHT NOW, exactly as the two
         // production callers arm it at spawn/respawn time.
@@ -23477,7 +23768,7 @@ mod spawn_tests {
             .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
             .with_ansi(false)
             .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
 
         arm_seed_fallback(registry.clone(), PANE.to_string(), original.clone(), GRACE);
 

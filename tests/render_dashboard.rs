@@ -1149,9 +1149,11 @@ fn palette_session(status: SessionStatus) -> SessionState {
     }
 }
 
-/// Scenario: Render a dashboard card whose agent is blocked because its credits
-/// are depleted, then render a stats bar with one blocked agent. The card must
-/// show a Blocked badge and credit reason, and both surfaces must use the error colour.
+/// Scenario: Render a credits-depleted Blocked card and blocked stats bar,
+/// checking the badge, reason, and error colour. At every density, a full
+/// Blocked card keeps its credit reason and newest tool line visible. An
+/// Orphaned+Blocked card keeps both status rows, its newest tool line, and the
+/// `Prmt:` label on the first visible prompt at every density.
 #[spec("status/badge/002")]
 #[test]
 fn status_badge_002_blocked_card_snapshot() {
@@ -1203,6 +1205,85 @@ fn status_badge_002_blocked_card_snapshot() {
             "blocked stats segment must use the error colour:\n{}",
             buffer_to_color_text(&stats_buffer)
         );
+    }
+
+    let mut full = filled_session();
+    for density in [
+        CardDensityKind::Normal,
+        CardDensityKind::Spacious,
+        CardDensityKind::Compact,
+    ] {
+        let render = |session: &SessionState| {
+            buffer_to_text(&render_card_to_buffer(
+                session,
+                Some("quota-worker"),
+                Some(1),
+                density,
+                0,
+                render_now(),
+                false,
+                80,
+                density.rendered_height(),
+            ))
+        };
+        let control = render(&full);
+        assert!(
+            control.contains("Bash — cargo test"),
+            "control card lost its last tool line at {density:?}:\n{control}"
+        );
+        full.status = SessionStatus::Blocked;
+        full.blocked = session.blocked.clone();
+        let blocked = render(&full);
+        assert!(
+            blocked.contains("Credits"),
+            "Blocked card lost its reason at {density:?}:\n{blocked}"
+        );
+        if density != CardDensityKind::Compact {
+            for tool in ["Read — src/main.rs", "Edit — src/ui.rs"] {
+                assert!(
+                    blocked.contains(tool),
+                    "Blocked card clipped a tool line at {density:?}:\n{blocked}"
+                );
+            }
+        }
+        assert!(
+            blocked.contains("Bash — cargo test"),
+            "Blocked card clipped its last tool line at {density:?}:\n{blocked}"
+        );
+
+        full.orchestration_orphaned = true;
+        let orphaned_blocked = render(&full);
+        for status in ["Orphaned — delegation unavailable", "Credits"] {
+            assert!(
+                orphaned_blocked.contains(status),
+                "Orphaned+Blocked card lost {status} at {density:?}:\n{orphaned_blocked}"
+            );
+        }
+        assert!(
+            orphaned_blocked.contains("Bash — cargo test"),
+            "Orphaned+Blocked card clipped its newest tool at {density:?}:\n{orphaned_blocked}"
+        );
+        let first_visible_prompt = orphaned_blocked.lines().find(|row| {
+            ["first prompt", "second prompt", "third prompt"]
+                .iter()
+                .any(|prompt| row.contains(prompt))
+        });
+        if density == CardDensityKind::Spacious {
+            assert!(
+                orphaned_blocked.contains("second prompt")
+                    && orphaned_blocked.contains("third prompt"),
+                "Spacious Orphaned+Blocked card must retain its two newest prompts:\n{orphaned_blocked}"
+            );
+        }
+        if let Some(row) = first_visible_prompt {
+            assert!(
+                row.contains("Prmt: "),
+                "first visible prompt lost its Prmt: label at {density:?}:\n{orphaned_blocked}"
+            );
+        }
+        full.orchestration_orphaned = false;
+        full.status = SessionStatus::Working;
+        full.blocked = None;
     }
 }
 

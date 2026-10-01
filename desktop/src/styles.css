@@ -926,6 +926,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .deck-choice label { min-width: 0; display: flex; align-items: center; gap: 8px; cursor: pointer; }
 .deck-choice label > span { overflow: hidden; color: var(--ink); font-family: "JetBrains Mono", monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .deck-choice input { accent-color: var(--teal); }
+/* A named deck's address (issue #1426): beside the name and quieter than it,
+   so the name reads first and the machine it points at is still in view. */
+.deck-choice-address { min-width: 0; overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+/* A deck row's confirming button — Rename, or Add this daemon — under the
+   controls it acts on, starting where they start: the 132px label column plus
+   the 16px gutter. Not a `.settings-row`, which is one label and one control. */
+.deck-row-actions { padding-left: 148px; display: flex; align-items: center; gap: 7px; }
 .add-deck { min-height: 30px; display: flex; align-items: center; justify-content: center; gap: 6px; border: 1px dashed var(--teal-rim); border-radius: 4px; color: var(--teal); background: var(--teal-wash); cursor: pointer; font-size: 9px; font-weight: 700; }
 /* The chosen deck's own fields. A rule above them rather than a card around
    them: the rows inside are the same two-column rows as everywhere else, and a
@@ -1167,6 +1174,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
   /* The stacked row has no label column, so the problem line has nothing to
      align under. */
   .settings-hint.is-problem { margin-left: 0; }
+  .deck-row-actions { padding-left: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -692,12 +692,16 @@ An orchestrator that runs `work-done` without `--done` reports to nobody; it sho
 
 ### The orchestrator is told a report was "unsolicited"
 
-A `work-done` that answers no task the orchestrator delegated reaches it labelled as unsolicited, and `.dot-agent-deck/work-done-<role>.md` is not updated. Causes:
+A `work-done` the deck cannot match to a task the orchestrator delegated reaches it labelled as unsolicited, and `.dot-agent-deck/work-done-<role>.md` is not updated. Causes:
 
 - you gave the worker a task directly by typing in its pane, and it reported again. Give tasks through the orchestrator instead;
 - the task never reached the worker (the orchestrator saw `⚠ delegated worker respawn failed` or `⚠ delegated worker never came up`);
 - the task was sent more than seven days ago;
 - `pane restart` dropped the task the worker owed.
+
+### The report went to a different file than `work-done-<role>.md`
+
+A file the deck did not write was already at `.dot-agent-deck/work-done-<role>.md`, usually because the worker saved its own report there. The deck leaves that file as it is and saves the report to a new file in the same `.dot-agent-deck` directory. The orchestrator's pane, in the TUI and in the desktop app alike, is told where the report is and that the existing file was left alone, since it may hold more of the worker's report. To avoid this, have workers save their reports under another name; the reporting instructions the deck gives them already suggest one.
 
 ### The orchestrator does not know its workers, or a dispatched orchestration is refused
 

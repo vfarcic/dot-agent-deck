@@ -218,7 +218,7 @@ To see where the running daemon is listening, run `dot-agent-deck daemon endpoin
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DOT_AGENT_DECK_LOG` | unset (no log file) | Turns on the log file for the process that has it, including a daemon it starts. `1` or an empty value writes to `/tmp/dot-agent-deck.log` on macOS and Linux and to `dot-agent-deck.log` in the temp directory on Windows; any other value is the file path. The file is appended to. |
+| `DOT_AGENT_DECK_LOG` | unset (no log file) | Turns on the log file for the process that has it, including a daemon it starts. `1` or an empty value writes to `/tmp/dot-agent-deck.log` on macOS and Linux and to `dot-agent-deck.log` in the temp directory on Windows; any other value is the file path. The file is appended to. The daemon reads it only when it starts, so a daemon that is already running has to be restarted to pick it up; see [Troubleshooting › Enabling Debug Logs](troubleshooting.md#enabling-debug-logs), which also covers the desktop app. |
 | `RUST_LOG` | `error,dot_agent_deck=info` | Verbosity of that log, in [`tracing` filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html), added after the default: `RUST_LOG=dot_agent_deck=debug` raises the deck to debug. It does nothing unless `DOT_AGENT_DECK_LOG` is also set. |
 
 A daemon started in the background also writes its standard output and error to `daemon.log` in the state directory above, whether or not `DOT_AGENT_DECK_LOG` is set. [Troubleshooting](troubleshooting.md#enabling-debug-logs) explains how to capture a useful log.

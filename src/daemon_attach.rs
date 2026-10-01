@@ -119,8 +119,9 @@ pub enum AttachError {
 }
 
 /// If `socket_path` doesn't exist, run `spawn_fn` to start a detached
-/// daemon, then poll for the socket file at `poll_interval` until either
-/// it appears (Ok) or `poll_timeout` elapses (`DaemonStartTimeout`).
+/// daemon, then poll at `poll_interval` until either the socket accepts a
+/// connection (Ok) or `poll_timeout` elapses (`DaemonStartTimeout`). The file
+/// appearing is not enough: it exists from `bind(2)`, before `listen(2)`.
 ///
 /// Concurrent callers serialize on an exclusive `flock(2)` over
 /// `<state_dir>/spawn.lock` so only one of them runs `spawn_fn`; losers see
@@ -231,7 +232,15 @@ where
         if crate::platform::ipc::LOCAL_ENDPOINT_PRESENCE.is_daemon_owned_inode() {
             if endpoint_entry_present(socket_path) {
                 verify_socket_trusted(socket_path)?;
-                return Ok(());
+                // The inode appears at `bind(2)`, a moment before the daemon's
+                // `listen(2)`, and a connect in between is refused. Our caller
+                // connects straight away (the build-version handshake), so a
+                // daemon preempted in that gap on a loaded machine used to fail
+                // startup with "Connection refused". Ready means accepting a
+                // connection; until then keep polling.
+                if probe_socket_alive(socket_path).await {
+                    return Ok(());
+                }
             }
         } else if probe_socket_alive(socket_path).await {
             return Ok(());
@@ -613,16 +622,20 @@ mod tests {
         // what the poll loop then finds.
         let fresh = root.path().join("fresh.sock");
         let fresh_for_spawn = fresh.clone();
+        let fresh_holder = Arc::new(std::sync::Mutex::new(None));
+        let fresh_holder_for_spawn = Arc::clone(&fresh_holder);
         ensure_daemon_running(
             &LocalEndpoint::at(&fresh),
             &state,
             move || {
-                // Dropping the handle closes the fd but leaves the inode, which
-                // is all the post-spawn branch looks at — it re-checks presence
-                // and trust, and deliberately does not probe (a daemon that has
-                // bound but not yet accepted is still a daemon).
-                let _listener = std::os::unix::net::UnixListener::bind(&fresh_for_spawn)?;
+                // The post-spawn branch re-checks presence and trust, then
+                // probes, so the listener must outlive this closure: a dropped
+                // one leaves an inode nobody listens on, which is not a daemon.
+                // It need not accept — a listening socket's backlog completes
+                // the probe's connect before any `accept`.
+                let listener = std::os::unix::net::UnixListener::bind(&fresh_for_spawn)?;
                 crate::platform::fsperm::set_endpoint_mode_owner_only(&fresh_for_spawn)?;
+                *fresh_holder_for_spawn.lock().unwrap() = Some(listener);
                 Ok(())
             },
             Duration::from_millis(5),
@@ -630,5 +643,122 @@ mod tests {
         )
         .await
         .expect("an absent endpoint must be spawned for, not refused");
+        drop(fresh_holder);
+    }
+
+    /// A Unix socket bound with `bind(2)` but not yet `listen(2)`ed: the inode
+    /// is on disk at `0o600` and every `connect(2)` is refused. That is the
+    /// state a freshly spawned daemon is in for the instant between the two
+    /// calls inside `UnixListener::bind`. Returns the fd, which the caller
+    /// later `listen`s on (or closes).
+    #[cfg(unix)]
+    fn bind_without_listening(path: &Path) -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        // SAFETY: plain socket/bind syscalls on a zeroed `sockaddr_un` whose
+        // path fits (asserted), with the fd owned by the returned `OwnedFd`.
+        unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+            let owned = std::os::fd::OwnedFd::from_raw_fd(fd);
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            let bytes = path.as_os_str().as_bytes();
+            assert!(bytes.len() < addr.sun_path.len(), "socket path too long");
+            for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+                *dst = *src as libc::c_char;
+            }
+            let rc = libc::bind(
+                fd,
+                std::ptr::addr_of!(addr).cast(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            );
+            assert_eq!(rc, 0, "bind: {}", std::io::Error::last_os_error());
+            owned
+        }
+    }
+
+    /// The post-spawn poll must not report the daemon ready until it is
+    /// LISTENING, not merely bound. Lazy-spawn's caller connects straight away
+    /// (the build-version handshake), so returning on the inode alone handed it
+    /// a socket that refused the connection whenever the daemon was preempted
+    /// between `bind(2)` and `listen(2)` — the startup failure
+    /// `build-version handshake probe failed: Connection refused (os error
+    /// 111)` seen under heavy load. Here the stand-in daemon binds, then
+    /// listens only after a delay; the first connect after `Ok` must succeed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_daemon_running_waits_for_a_listener_not_just_the_inode() {
+        use std::os::fd::AsRawFd;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = root.path().join("state");
+        let sock = root.path().join("slow.sock");
+        let sock_for_spawn = sock.clone();
+        let (fd_tx, fd_rx) = std::sync::mpsc::channel();
+
+        let listener_thread = std::thread::spawn(move || {
+            let fd: std::os::fd::OwnedFd = fd_rx.recv().expect("spawn_fn sends the fd");
+            std::thread::sleep(Duration::from_millis(300));
+            // SAFETY: `fd` is a bound AF_UNIX stream socket this thread owns.
+            let rc = unsafe { libc::listen(fd.as_raw_fd(), 16) };
+            assert_eq!(rc, 0, "listen: {}", std::io::Error::last_os_error());
+            fd // keep it open until the test is done
+        });
+
+        ensure_daemon_running(
+            &LocalEndpoint::at(&sock),
+            &state,
+            move || {
+                let fd = bind_without_listening(&sock_for_spawn);
+                crate::platform::fsperm::set_endpoint_mode_owner_only(&sock_for_spawn)?;
+                fd_tx.send(fd).expect("listener thread is waiting");
+                Ok(())
+            },
+            Duration::from_millis(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a daemon that starts listening within the budget is ready");
+
+        std::os::unix::net::UnixStream::connect(&sock).expect(
+            "lazy-spawn reported the daemon ready, so the caller's first connect must succeed",
+        );
+        drop(listener_thread.join().expect("listener thread"));
+    }
+
+    /// And the converse: an inode that never starts listening is not a daemon,
+    /// so the poll runs out its budget with `DaemonStartTimeout` (naming the
+    /// log to read) instead of returning `Ok` for the caller's connect to fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_daemon_running_times_out_on_an_inode_that_never_listens() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = root.path().join("state");
+        let sock = root.path().join("mute.sock");
+        let sock_for_spawn = sock.clone();
+        let holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let holder_for_spawn = std::sync::Arc::clone(&holder);
+
+        let error = ensure_daemon_running(
+            &LocalEndpoint::at(&sock),
+            &state,
+            move || {
+                let fd = bind_without_listening(&sock_for_spawn);
+                crate::platform::fsperm::set_endpoint_mode_owner_only(&sock_for_spawn)?;
+                *holder_for_spawn.lock().unwrap() = Some(fd);
+                Ok(())
+            },
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("a bound socket nobody listens on must not read as a ready daemon");
+        assert!(
+            matches!(error, AttachError::DaemonStartTimeout { .. }),
+            "{error}"
+        );
+        drop(holder);
     }
 }

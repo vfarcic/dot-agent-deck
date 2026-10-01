@@ -1488,6 +1488,7 @@ impl DaemonClient {
                     // derivation this field exists to remove.
                     cli_name: None,
                     crashed: None,
+                    orchestrator_context_path: None,
                 })
                 .collect(),
             schedule_revision,
@@ -4999,7 +5000,8 @@ start = true
         let client = DaemonClient::new(path);
         let scratch = crate::test_temp::tempdir().expect("scratch dir");
         let pi = scratch.path().join("pi");
-        std::fs::write(&pi, "#!/bin/sh\nexec sleep 30\n").expect("write the pi stand-in");
+        crate::test_isolation::write_script(&pi, "#!/bin/sh\nexec sleep 30\n")
+            .expect("write the pi stand-in");
         std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o755))
             .expect("make the pi stand-in executable");
         let cwd = scratch.path().to_str().expect("scratch paths are UTF-8");
@@ -5632,6 +5634,7 @@ start = true
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         sanitize_record_tab_membership(&mut rec);
         let name = rec
@@ -5695,6 +5698,7 @@ start = true
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -5721,6 +5725,7 @@ start = true
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(

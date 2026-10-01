@@ -1195,6 +1195,36 @@ describe("FixtureDeckBridge scenarios", () => {
     await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false });
   });
 
+  /**
+   * Scenario: the preview's microphone, scripted from the URL. A `?voice=`
+   * holding only blank phrases is a microphone that hears nothing, so polls
+   * after a start keep reporting `recording` and never an utterance. A real
+   * phrase is heard on the first poll, and no `?voice=` at all still says the
+   * one canned utterance.
+   */
+  it("hears nothing from a ?voice= script that holds only blank phrases", async () => {
+    const { createDeckBridge, FIXTURE_SETTINGS_KEY } = await import("./bridge");
+    const { fixtureVoiceScript, FIXTURE_VOICE_UTTERANCE } = await import("../data/fixture");
+    expect(fixtureVoiceScript("?fixture=1")).toEqual([FIXTURE_VOICE_UTTERANCE]);
+    expect(fixtureVoiceScript("?fixture=1&voice=%20%20%20%20")).toEqual([]);
+    expect(fixtureVoiceScript("?fixture=1&voice=&voice=send%20it")).toEqual(["send it"]);
+
+    window.localStorage.setItem(FIXTURE_SETTINGS_KEY, JSON.stringify({ version: 1, voice: { activation: "toggle", intent: "claude", transcription: "remote" } }));
+    try {
+      window.history.replaceState({}, "", "/?fixture=1&voice=%20%20%20%20");
+      const silent = createDeckBridge("fixture");
+      await silent.voiceStart();
+      for (let poll = 0; poll < 3; poll += 1) expect((await silent.voiceStatus()).state).toBe("recording");
+
+      window.history.replaceState({}, "", "/?fixture=1&voice=send%20it");
+      const speaking = createDeckBridge("fixture");
+      await speaking.voiceStart();
+      expect((await speaking.voiceStatus()).state).toBe("done");
+    } finally {
+      window.localStorage.removeItem(FIXTURE_SETTINGS_KEY);
+    }
+  });
+
   it("treats ?state=empty as a healthy daemon owning nothing, not as a disconnected one", async () => {
     window.history.replaceState({}, "", "/?fixture=1&state=empty");
     const { createDeckBridge } = await import("./bridge");
@@ -2880,6 +2910,31 @@ describe("desktop settings (PRD 803)", () => {
     await bridge.dispose();
   });
 
+  /// Scenario: A rename sends the row this window saw, and a stale-row refusal carries the current disk list back to the window.
+  it("passes the whole deck to rename and converts a partial refusal", async () => {
+    const { TauriDeckBridge, DEFAULT_DESKTOP_SETTINGS } = await import("./bridge");
+    const { PartialSettingsSaveError } = await import("./settingsError");
+    const deck = { id: "deck0000000000aa", host: "build-box", port: 22, name: "build" };
+    const disk = {
+      ...DEFAULT_DESKTOP_SETTINGS,
+      endpoints: { remote: [{ ...deck, host: "replacement-box" }], selection: deck.id },
+    };
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_rename_deck") {
+        throw { message: "That deck changed since this window loaded it.", written: disk };
+      }
+      return { ok: true };
+    });
+    const bridge = new TauriDeckBridge();
+
+    const cause = await bridge.renameDeck(deck, "production").catch((error: unknown) => error);
+    expect(invoke).toHaveBeenCalledWith("desktop_rename_deck", { deck, name: "production" });
+    expect(cause).toBeInstanceOf(PartialSettingsSaveError);
+    expect((cause as InstanceType<typeof PartialSettingsSaveError>).message).toBe("That deck changed since this window loaded it.");
+    expect((cause as InstanceType<typeof PartialSettingsSaveError>).written.endpoints?.remote).toEqual(disk.endpoints.remote);
+    await bridge.dispose();
+  });
+
   it("keeps fixture settings in unscoped localStorage and never invokes Tauri", async () => {
     const { createDeckBridge, DEFAULT_DESKTOP_SETTINGS, FIXTURE_SETTINGS_KEY, modeScopedKey } = await import("./bridge");
     const bridge = createDeckBridge("fixture");
@@ -2945,6 +3000,7 @@ describe("desktop settings (PRD 803)", () => {
    *
    * So absence stays absence, and presence round-trips.
    */
+  /// Scenario: A settings round trip keeps deck names, including a null legacy name, while preserving section absence.
   it("round-trips the endpoints section and never fabricates one", async () => {
     const { normalizeDesktopSettings } = await import("./bridge");
 
@@ -2958,8 +3014,8 @@ describe("desktop settings (PRD 803)", () => {
       appearance: { mode: "dark" },
       endpoints: {
         remote: [
-          { host: "build-box", id: "deck0000000000aa", port: 2222, user: "deploy", identity: "~/.ssh/id_ed25519", jump: "bastion", socket: "/run/user/1000/dot-agent-deck-attach.sock" },
-          { host: "ci-box", id: "deck0000000000bb", port: 22 },
+          { host: "build-box", id: "deck0000000000aa", name: "build", port: 2222, user: "deploy", identity: "~/.ssh/id_ed25519", jump: "bastion", socket: "/run/user/1000/dot-agent-deck-attach.sock" },
+          { host: "ci-box", id: "deck0000000000bb", name: null, port: 22 },
         ],
         selection: "deck0000000000aa",
       },

@@ -455,14 +455,16 @@ jobs:
           cache: pnpm
           cache-dependency-path: desktop/pnpm-lock.yaml
       # The desktop crate's build set — the same six packages as `build`, whose
-      # comment names the other places that declare it — plus the two this job
+      # comment names the other places that declare it — plus the three this job
       # alone needs at run time: `webkit2gtk-driver` is WebKitWebDriver for the
-      # SAME WebKitGTK the app links against, and `xvfb` is the display.
+      # SAME WebKitGTK the app links against, `xvfb` is the display, and
+      # `xclip` reads that display's clipboard from outside the app for
+      # `terminal_002` (issue #1403).
       - run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev \
-            webkit2gtk-driver xvfb
+            webkit2gtk-driver xvfb xclip
       # From crates.io source with its own lockfile, not a prebuilt binary:
       # tauri-driver publishes none, and a third-party build cache would be a
       # binary this job then executes on trust alone. rust-cache keeps
@@ -596,9 +598,16 @@ jobs:
       # `3.x` spec as `finalize`, and DAD_REQUIRE_GO_TASK on the nextest step
       # turns a skip into a failure — without it a missing install would read
       # as green.
+      #
+      # `repo-token` because the action resolves `3.x` through GitHub's API and
+      # has no default token: unauthenticated, it shares the runner IP's
+      # 60-requests-an-hour limit and fails the job on `API rate limit
+      # exceeded` (PR #1465's `build`, run 36814458923). The token is this
+      # workflow's read-only one (`permissions:` above).
       - uses: arduino/setup-task@c0bc642852239c2689f73f4ea6459c29405f3c52 # v3.0.0
         with:
           version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       # `cargo nextest run`, NOT `cargo test` — the same runner as the
       # `cargo test-fast` local gate, and as build-macos/build-windows which
       # already use it. `cargo test` runs the whole tier in ONE process with
