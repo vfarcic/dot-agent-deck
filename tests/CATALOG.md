@@ -2077,6 +2077,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the pop on a `?`-error return or a panic unwind from inside the event loop (both need a real terminal whose I/O fails, so the guard mechanism is covered by the L1 `ui::tests::keyboard_enhancement_*` tests instead); that a real terminal honors the pushed mode.
 - **Platform coverage:** mac+linux.
 
+##### embed/key-forwarding/003 — The platform editing shortcuts reach a focused pane as the bytes the desktop app's agent terminal sends for them (issue #1422).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness), in `tests/e2e_pane_input.rs`.
+- **Agent:** none — the pane runs a byte recorder (`stty raw -echo; exec cat -u > keys.log`), because the subject is the bytes the deck forwards, not what an agent does with them. What each of the five supported agents does with those bytes was measured by hand and is in `docs/develop/desktop-gui.md` ("Keys in an agent's terminal").
+- **Asserts:** writing to the deck's PTY the encoding a terminal emits for each key — CSI u for Ctrl+Backspace and the Super/Cmd chords, the xterm modifier form for the rest — the recorder receives ETB for Ctrl+Backspace, `ESC d` for Ctrl+Delete and Alt/Option+Delete, `ESC[1;3D` / `ESC[1;3C` for Alt/Option+Left/Right, and SOH / ENQ / NAK for Super/Cmd+Left / Right / Backspace, which is what the desktop sends; and, unchanged, Home, End, Ctrl+Left/Right, Alt+Backspace, Shift+Enter, Ctrl+Enter, Ctrl+/, the bytes a macOS terminal sends for Option+Left/Right (`ESC b` / `ESC f`) and the readline bytes a terminal set up for macOS text editing sends (Ctrl+A, Ctrl+E, Ctrl+U, Ctrl+W, `ESC d`), a legacy terminal's BS, and a bracketed paste's text. The deck must still be in the pane afterwards, so none of those keys was taken by a deck shortcut.
+- **Does not assert:** what a real terminal emits for a physical key (the sequences are injected already encoded, and a terminal may keep a chord, Cmd above all, for itself); what an agent does with the bytes; the desktop side, which is `desktop/src/components/TerminalViewport.keys.test.tsx` and `desktop/e2e/agent-terminal-input.spec.ts`.
+- **Platform coverage:** mac+linux.
+
 ### Hook delivery
 
 #### hooks/delivery
