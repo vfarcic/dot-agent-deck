@@ -7402,15 +7402,36 @@ const DECK_ENDPOINT_VARS: [&str; 5] = [
 /// Removing the vars from the test process itself covers every spawn path at
 /// once, including ones added later, because there is nothing left to inherit.
 ///
+/// **And removing them is not enough either** (issue #1473): with the variables
+/// gone, the endpoint resolvers fall back to `$XDG_RUNTIME_DIR/dot-agent-deck.sock`
+/// — the developer's live daemon — or, with `XDG_RUNTIME_DIR` unset, to
+/// `${TMPDIR:-/tmp}/dot-agent-deck-<uid>/` and the legacy `/tmp` spellings.
+/// `orchestration/delegate/039` called this function and its wrapped Codex worker
+/// still posted a `SessionStart` there: the ghost "Codex" card. So
+/// [`detach_before_main`] also points `XDG_RUNTIME_DIR` beneath `/dev/null`,
+/// where nothing can exist ([`unreachable_runtime_dir`]); with it set, the resolvers
+/// never reach the `TMPDIR` or legacy rungs, so one write closes all three — for
+/// this process and every child that inherits its environment.
+///
+/// **Both halves run before `main`**, in [`detach_before_main`], so a test that
+/// never calls this function — or [`init_test_env`], or [`TuiDeck::builder`] —
+/// is covered too. This function remains as the place the note is printed and
+/// re-scrubs the identity variables for a test that set them itself; it leaves
+/// `XDG_RUNTIME_DIR` alone, so a test that chose its own runtime dir keeps it.
+/// It does not cover a child started with `env_clear`, which inherits neither
+/// half — the deck launches below set their endpoints explicitly for that.
+///
 /// Tests that need an endpoint set it explicitly per-child (`Command::env`), so
 /// removing the ambient value changes nothing for them.
 fn detach_from_any_live_deck() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
-        let leaked: Vec<&str> = DECK_ENDPOINT_VARS
-            .into_iter()
-            .filter(|v| std::env::var_os(v).is_some())
-            .collect();
+        let mut leaked: Vec<&str> = CLEARED_BEFORE_MAIN.get().cloned().unwrap_or_default();
+        for var in DECK_ENDPOINT_VARS {
+            if std::env::var_os(var).is_some() && !leaked.contains(&var) {
+                leaked.push(var);
+            }
+        }
         if !leaked.is_empty() {
             // Loud on purpose: the run is now safe, but the contributor should
             // know their shell was pointed at a live deck.
@@ -7430,10 +7451,54 @@ fn detach_from_any_live_deck() {
             // (`spawn_inprocess_daemon`, and `delegate_prompt_injection.rs`'s
             // `#[tokio::test(flavor = "multi_thread")]` body). What is true is
             // that these are idempotent setup-time writes of values no library
-            // thread in this process reads, before anything is spawned.
+            // thread in this process reads, before anything is spawned — and
+            // since issue #1473 they are normally no-ops, because
+            // [`detach_before_main`] already removed them.
             unsafe { std::env::remove_var(var) };
         }
     });
+}
+
+/// Where [`detach_before_main`] points `XDG_RUNTIME_DIR`: a path beneath
+/// `/dev/null`, so every lookup through it fails with `ENOTDIR` and no entry
+/// can ever exist there — nothing another user could plant as a symlink back to
+/// the live runtime dir, and nothing left behind. Mirrors
+/// `src/test_isolation.rs`'s function of the same name, which has the reasoning;
+/// the two cannot share it because that one is `#[cfg(test)]` in the library.
+#[cfg(unix)]
+fn unreachable_runtime_dir() -> PathBuf {
+    PathBuf::from("/dev/null/dot-agent-deck-test-no-live-deck")
+}
+
+/// The identity variables [`detach_before_main`] found set, so the note in
+/// [`detach_from_any_live_deck`] can still name them.
+static CLEARED_BEFORE_MAIN: OnceLock<Vec<&'static str>> = OnceLock::new();
+
+ctor::declarative::ctor! {
+    /// Issue #1473: detach every test process that links this harness from any
+    /// live deck before `main` — scrub [`DECK_ENDPOINT_VARS`] and redirect
+    /// `XDG_RUNTIME_DIR` (see [`detach_from_any_live_deck`]).
+    ///
+    /// Prints nothing: stderr is not promised to be usable before `main`.
+    #[ctor(unsafe)]
+    fn detach_before_main() {
+        let leaked: Vec<&'static str> = DECK_ENDPOINT_VARS
+            .into_iter()
+            .filter(|v| std::env::var_os(v).is_some())
+            .collect();
+        // SAFETY: a constructor runs before `main`, while this process has one
+        // thread, so nothing can observe the environment mid-write — the
+        // guarantee the `remove_var` in `detach_from_any_live_deck` can only
+        // state as a residual.
+        unsafe {
+            for var in DECK_ENDPOINT_VARS {
+                std::env::remove_var(var);
+            }
+            #[cfg(unix)]
+            std::env::set_var("XDG_RUNTIME_DIR", unreachable_runtime_dir());
+        }
+        let _ = CLEARED_BEFORE_MAIN.set(leaked);
+    }
 }
 
 /// Issue #668: the wrapped-agent lifetime bound, in a file small enough for the

@@ -2560,9 +2560,13 @@ async fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_fli
     // which is what makes the pane a wrapper host in the deck's own launch
     // record. This registry has no hook socket, so the registry hands that
     // wrapper an endpoint that leads nowhere and the two interface facts below
-    // are the test's to place in time. Before PR #1451 it handed it NO
-    // endpoint, and the wrapper reported to the default one — the developer's
-    // live deck, as a `worker-pane` ghost card; `DecoyDeck` now catches that.
+    // are the test's to place in time. The wrapper does still report — a
+    // fork-time `SessionStart` — and before PR #1451 the registry handed it NO
+    // endpoint, so it resolved the platform default: the developer's live deck,
+    // as a ghost "Codex" `worker-pane` card. Issue #1473 separately redirects
+    // that default for the whole test process (`common::detach_before_main`);
+    // `DecoyDeck::ambient` puts a live-looking `XDG_RUNTIME_DIR` back on top of
+    // that redirect, so this test still proves the registry's own pin holds.
     // `app-server` is the hook-listing probe; see `scheduler/spawn/010`.
     write_executable(
         &bin_dir.join("codex"),

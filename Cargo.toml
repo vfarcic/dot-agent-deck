@@ -139,6 +139,13 @@ xtask-docs = { path = "xtask/docs" }
 # Issue #1322: `tests/e2e_docs_screenshots.rs` renders the harness's vt100
 # screen to HTML with this crate's renderer, for `cargo docs-screenshots`.
 xtask-screenshots = { path = "xtask/screenshots" }
+# Issue #1473: both live-deck isolation guards (`src/test_isolation.rs`,
+# `tests/common/mod.rs`) detach the test process before `main`, so a test that
+# never calls a guard — including one written later — still cannot inherit or
+# resolve a route to the developer's running deck. Already in the lockfile via
+# `tauri-utils`, with the same `default-features = false`, so this adds no
+# crate to the build.
+ctor = { version = "1.0", default-features = false }
 
 # PRD #42 M1: `libc` is Unix-only. Every `libc::` reference lives behind a
 # `#[cfg(unix)]` path (mostly `src/platform/*/unix.rs`), so on Windows the
