@@ -5968,6 +5968,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** a real agent's interpretation of the seed or its hook timing.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/dispatch/026 — An ambiguous FIRST write of a scheduled delivery keeps its payload record only while its bytes are still in the input box; erased back out, a later delivery of the same prompt goes through (issue #547).
+- **Layer:** L1 (the production scheduled `deliver` path via `run_delivery`, no event bus, against three `/bin/cat` byte targets whose PTY writers are swapped for `HealingFaultyWriter`s so the `Ambiguous` outcome, issue #876's drain and the payload record are all produced by the production code, plus the delivery-notice sink).
+- **Agent:** none (`cat` targets).
+- **Asserts:** three panes each receive a scheduled delivery whose first write goes a different way, checked on the writer's byte log: accepted and then erased again (one erase per payload byte), accepted with its erase declined because the prompt carries a non-ASCII byte (payload only, and a "stopped part-way" `DeliveryNotice` on that pane alone), and a clean `Applied` control (payload plus CR). After a user-input stamp on every pane (clock only, so issue #544's draft wait stays out of it), a later delivery of the same bytes through the same path writes the full payload plus CR into the erased pane and the control, and writes nothing into the stranded pane. The stranded pane's refusal publishes the user-input `DeliveryNotice` on that pane and on no other. Measured red both ways: releasing the record in `deliver`'s first-write `Refused` arm (issue #547's suggested direction 1) lets the later delivery land 61 bytes on top of the fragment, and recording the drained write as the code did before #876 refuses the erased pane's later delivery, which is #547's symptom as filed.
+- **Does not assert:** the stranded cause where the PTY's slave has gone (a writer that never recovers accepts no later write either way, so the byte log could not tell a kept record from a released one); the confirmation loop's ambiguous REPLACEMENT write, which likewise takes no `PayloadRecordRelease`; `PAYLOAD_RECORD_TTL` lapsing; that a real agent's editor honours the erases (`prompt/pane-input/038`).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/pi
 
 ##### scheduler/pi/001 — A SCHEDULED, UNATTENDED real `pi` job (no TUI client attached) boots and its bundled extension reports the Pi pane's status via `agent-event`, re-broadcast on the daemon's event stream (PRD #201 M4.2).
