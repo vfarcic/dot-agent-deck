@@ -128,7 +128,7 @@ None of these is a deck shortcut, so the deck never takes them while you type. T
 - **`⌥←`, `⌥→` and `⌥⌫` on macOS.** These need the terminal to treat Option as Alt (Meta). If `⌥←` types a character instead, turn that on: in iTerm2, set **Left Option key** to **Esc+** or use the Natural Text Editing preset above; in Terminal.app, **Use Option as Meta key** in the profile's Keyboard settings.
 - **`Ctrl+Backspace`.** Terminals send it as a one-character backspace unless the enhanced ("kitty") keyboard protocol is on. The TUI turns that protocol on in a terminal that supports it, such as kitty, Ghostty, foot, Alacritty 0.13 or later, iTerm2, Windows Terminal 1.25 or later, and WezTerm with `enable_kitty_keyboard = true`. GNOME Terminal and Konsole do not support it, and inside tmux the TUI does not turn it on. There, bind `Ctrl+Backspace` to send `Ctrl+W` (`0x17`), or press `Ctrl+W` or `Alt+Backspace` instead:
   - Windows Terminal (`settings.json`, `actions`): `{ "command": { "action": "sendInput", "input": "\u0017" }, "keys": "ctrl+backspace" }`
-  - Alacritty: `[keyboard]` `bindings = [{ key = "Back", mods = "Control", chars = "\u0017" }]`
+  - Alacritty: `[keyboard]` `bindings = [{ key = "Backspace", mods = "Control", chars = "\u0017" }]`
   - foot: under `[text-bindings]`, `\x17 = Control+BackSpace`
   - Konsole: in a copy of the profile's keyboard layout, `key Backspace +Control : "\x17"`
 - **Paste** is your terminal's: its paste key puts the text into the agent's prompt. `Ctrl+V` goes to the agent wherever the terminal does not keep it, as it does in the desktop app on macOS and Linux; Claude Code, for one, pastes an image with it.
