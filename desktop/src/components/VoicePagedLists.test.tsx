@@ -101,12 +101,23 @@ describe("visible pages for voice-selected lists", () => {
     expect(voicePagesOrchestrations("/home/dev/docs")).toHaveLength(12);
   });
 
-  /** Scenario: with Voice off, the directory browser keeps every returned child in its scrolling list and has no page marker. */
-  it("keeps the ordinary scrolling directory list when voice is off", async () => {
+  /** Scenario: with Voice off, the directory browser keeps every child in its scrolling list. After keyboard navigation to a later row, turning Voice on shows that row's page, and Enter opens the row the user can see. */
+  it("keeps the ordinary scrolling directory list and reveals its cursor when voice turns on", async () => {
     render(<DeckShell runtime={runtime(microphone())} initialView={{ kind: "overview" }} />);
     await openBrowser();
-    expect(within(screen.getByTestId("new-agent-directory-list")).getAllByRole("option")).toHaveLength(NAMES.length + 1);
+    const list = screen.getByTestId("new-agent-directory-list");
+    expect(within(list).getAllByRole("option")).toHaveLength(NAMES.length + 1);
     expect(screen.queryByText(/Page \d+ of \d+/i)).toBeNull();
+    for (let index = 0; index < 20; index += 1) fireEvent.keyDown(list, { key: "ArrowDown" });
+    const selectedPath = `${HOME}/${NAMES[20]}`;
+    expect(within(list).getByRole("option", { selected: true })).toHaveAttribute("data-path", selectedPath);
+
+    await turnOnVoice();
+    expect(screen.getByTestId("new-agent-directory-page")).toHaveTextContent(/Page 2 of \d+/i);
+    expect(within(list).getByRole("option", { selected: true })).toHaveAttribute("data-path", selectedPath);
+    fireEvent.keyDown(list, { key: "Enter" });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("new-agent-current-path")).toHaveTextContent(selectedPath);
   });
 
   /** Scenario: a long directory has one visible page at a time while Voice is on. The marker identifies the page and hidden children have no selectable row. */
