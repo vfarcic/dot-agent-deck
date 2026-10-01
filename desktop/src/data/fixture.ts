@@ -1526,7 +1526,9 @@ export function fixtureVoiceHeard(transcript: string = FIXTURE_VOICE_UTTERANCE):
     outcome: {
       kind: "heard",
       transcript,
-      sentence: `Heard: “${transcript}”.`,
+      // Rendered as Rust's `heard_sentence` renders it: no colon, and no
+      // second full stop after a transcript that already ends a sentence.
+      sentence: `Heard “${transcript}”${/[.?!…]$/.test(transcript) ? "" : "."}`,
     },
     transcribeMs: null,
     backend: "stub",

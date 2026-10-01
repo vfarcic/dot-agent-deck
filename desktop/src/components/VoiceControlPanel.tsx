@@ -978,8 +978,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const [known, setKnown] = useState(() => voiceStatus === undefined);
   /** A refusal, an instruction, or one of this file's own sentences. */
   const [problem, setProblem] = useState<string>();
-  /** The transcription stage's own sentence — what was heard, or why nothing was. */
-  const [capture, setCapture] = useState<string>();
+  /**
+   * The transcription stage's own sentence — what was heard, or why nothing
+   * was — and, when something was heard, the transcript it quotes. The
+   * transcript is kept so the row can tell whether the answer that follows
+   * already quotes it (see `captureShown`).
+   */
+  const [capture, setCapture] = useState<{ sentence: string; transcript?: string }>();
   const [result, setResult] = useState<VoiceResultDto>();
   /*
     Wrapped in an object rather than held bare: `useState` treats a function
@@ -1818,7 +1823,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         /* PRD #1260 — a capped segment reaches here only while dictating,
            where it is the user's own words rather than a runaway command. */
         if (capped) setProblem(VOICE_CAP_TYPED);
-        setCapture(transcription.outcome.sentence);
+        setCapture({
+          sentence: transcription.outcome.sentence,
+          transcript: transcription.outcome.kind === "heard" ? transcription.outcome.transcript : undefined,
+        });
       }
       /* **One path, where there used to be a fork.** An utterance is resolved,
          full stop. Whether it ends up typed into an agent is the resolver's
@@ -2378,6 +2386,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const dictatingLabel = dictating ? displayText(dictating.label, DISPLAY_LIMITS.name) : undefined;
   /* PRD #1261 — the numbered choice on offer, if there is one. */
   const choice = panelState.kind === "awaitingChoice" ? panelState.offer : undefined;
+  /* PR #1451's hand test — what was heard is said ONCE. The capture sentence
+     is what the row shows while the answer is being worked out; an answer
+     whose own sentence quotes the transcript ("Heard: “…” — no matching
+     action.") replaces it, rather than the row reading the transcript twice.
+     An answer that names its effect instead ("Opening the agent dashboard.")
+     keeps it, because then it is the only place the words are. */
+  const captureShown = capture !== undefined
+    && !(result !== undefined && capture.transcript !== undefined && result.outcome.sentence.includes(`“${capture.transcript}”`));
   const emptyState = indicator === "on" && dictating === undefined && choice === undefined && pending === undefined && problem === undefined && capture === undefined && result === undefined;
   const reporting = note !== undefined || dictating !== undefined || choice !== undefined || pending !== undefined || problem !== undefined || capture !== undefined || result !== undefined;
 
@@ -2592,7 +2608,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
               rather than a second copy from somewhere upstream.
             */}
             {problem && <p className="voice-sentence" title={displayText(problem, DISPLAY_LIMITS.message)}>{displayText(problem, DISPLAY_LIMITS.message)}</p>}
-            {capture && <p className="voice-sentence" title={displayText(capture, DISPLAY_LIMITS.message)}>{displayText(capture, DISPLAY_LIMITS.message)}</p>}
+            {captureShown && <p className="voice-sentence" title={displayText(capture.sentence, DISPLAY_LIMITS.message)}>{displayText(capture.sentence, DISPLAY_LIMITS.message)}</p>}
             {result && (
               <>
                 <p className="voice-sentence" title={displayText(result.outcome.sentence, DISPLAY_LIMITS.message)}>{displayText(result.outcome.sentence, DISPLAY_LIMITS.message)}</p>

@@ -614,6 +614,39 @@ describe("voice control panel", () => {
     expect(screen.getByText(sentence).textContent).toBe(sentence);
   });
 
+  /** Scenario: "Devbox run agent." is heard and matches nothing. The report quotes it once, in the no-match sentence, rather than once as heard and again as unmatched. */
+  it("reports what it heard once when the answer already quotes it (PR #1451 hand test)", async () => {
+    vi.useFakeTimers();
+    const utterance = "Devbox run agent.";
+    const sentence = `Heard: “${utterance}” — no matching action.`;
+    // The capture sentence exactly as Rust's `handle_audio` renders it.
+    const voice = automaticVoice({ kind: "heard", transcript: utterance, sentence: `Heard “${utterance}”` });
+    const resolveVoice = resolver(result({ kind: "no_match", transcript: utterance, sentence }));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+
+    const report = screen.getByTestId("voice-report").textContent ?? "";
+    expect(report.split(utterance).length - 1, report).toBe(1);
+    expect(screen.getByText(sentence)).toBeVisible();
+  });
+
+  /** Scenario: a command is heard and runs, and its report names the effect rather than the words. What was heard stays on screen beside it, once. */
+  it("keeps what it heard beside an answer that does not quote it", async () => {
+    vi.useFakeTimers();
+    const utterance = "show me every agent";
+    const voice = automaticVoice({ kind: "heard", transcript: utterance, sentence: `Heard “${utterance}”.` });
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+
+    const report = screen.getByTestId("voice-report").textContent ?? "";
+    expect(report.split(utterance).length - 1, report).toBe(1);
+    expect(screen.getByText(DISPATCH.sentence)).toBeVisible();
+  });
+
   /** Scenario: a slow Claude result reports its backend and 4.2-second latency together beside the sentence. */
   it("shows backend and latency together", async () => {
     vi.useFakeTimers();

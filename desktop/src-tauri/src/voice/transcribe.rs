@@ -154,6 +154,17 @@ fn not_enough_speech(measure: SpeechMeasure) -> (String, String) {
     (detail, NOTHING_HEARD.into())
 }
 
+/// `Heard “<transcript>”.` — with no full stop of its own after a transcript
+/// that already ends a sentence, which whisper's usually does (PR #1451's hand
+/// test read `Heard “Devbox run agent.”.`).
+fn heard_sentence(transcript: &str) -> String {
+    let ends_a_sentence = transcript.ends_with(['.', '?', '!', '…']);
+    format!(
+        "Heard “{transcript}”{}",
+        if ends_a_sentence { "" } else { "." }
+    )
+}
+
 /// Why a transcriber could not answer.
 ///
 /// Split the way [`super::resolver::IntentError`] is, and for the same reason:
@@ -920,7 +931,7 @@ pub async fn handle_audio(transcriber: &dyn Transcriber, audio: &Pcm16) -> Voice
             sentence: NOTHING_HEARD.into(),
         },
         Ok(transcript) => TranscriptionOutcome::Heard {
-            sentence: format!("Heard “{}”.", transcript.text()),
+            sentence: heard_sentence(transcript.text()),
             transcript,
         },
         Err(TranscriptionError::NotConfigured(detail)) => {
@@ -1250,6 +1261,23 @@ mod tests {
         assert_eq!(result.backend, "stub");
         assert_eq!(result.audio_ms, 1_000);
         assert!(result.transcribe_ms.is_some());
+    }
+
+    /// PR #1451's hand test: whisper ends a sentence with a full stop, and the
+    /// report added one of its own after the closing quote — `Heard “Devbox
+    /// run agent.”.` A transcript that already ends a sentence gets no second
+    /// stop; one that does not still gets one.
+    #[tokio::test]
+    async fn voice_transcribe_adds_no_second_full_stop_after_a_transcript_that_has_one() {
+        for (spoken, sentence) in [
+            ("Devbox run agent.", "Heard “Devbox run agent.”"),
+            ("What can I say?", "Heard “What can I say?”"),
+            ("Stop typing!", "Heard “Stop typing!”"),
+            ("show me the tester", "Heard “show me the tester”."),
+        ] {
+            let result = handle_audio(&StubTranscriber::hearing(spoken), &audio(16_000)).await;
+            assert_eq!(result.sentence(), sentence, "{spoken:?}");
+        }
     }
 
     #[tokio::test]
