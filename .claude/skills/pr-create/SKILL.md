@@ -19,6 +19,7 @@ This file is **project-local and owned by this repository** — it was forked ou
 ## 1. Before the PR
 
 - CLAUDE.md is the authority on the gates. As of writing: `cargo fmt --check` and `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings` before every commit, `cargo test-fast` per task, plus the tests covering what you touched — **name those in the PR body**, since part of the tier runs on no runner anywhere. Read the rules rather than trusting this list.
+- **A red you met along the way is yours** (CLAUDE.md rule 6), whoever caused it and even if it passed on a retry: after rule 6's isolation rerun, fix it in this PR or quarantine it (a named owner, an expiry issue, and `#[ignore = "quarantined: <owner>, #<issue>"]` on the test), and **say in the PR body which, for each one**. Rerunning it until green and mentioning it is neither; `.claude/skills/verify-pr/SKILL.md` Phase 5 has the mechanics.
 - **Changelog fragment**: `changelog.d/<issue>.<type>.md`, type one of `breaking|feature|bugfix|doc|misc`. Release notes are built from these, not from PR labels.
 - **User docs** (rule 21): a user page under `docs/` the PR touches, and the changelog fragment, say what the user does, sees and configures; implementation detail and issue history go to `docs/develop/` or nowhere, fixed in this PR.
 - **Rule 12** if the change touches the daemon, protocol, orchestration or hooks: answer the `PROTOCOL_VERSION`-vs-`.breaking.md` question explicitly in the PR body, including the cross-version manual test. A `.breaking.md` fragment also needs its `CONTRACT_BREAKS` entry in `src/daemon_protocol.rs` (issue #801) — `xtask/linkage-check` fails the build without it.
@@ -37,6 +38,8 @@ Wait for the check-runs. `gh pr checks <n>` reports both CI and the reviewer's o
 **The wait must be bounded.** An automated reviewer that is out of quota, uninstalled, or broken produces **no check-run at all** — there is no message and no failed state, so "wait until it appears" never terminates. Measured on this repo 2026-08-23: an exhausted Greptile quota produced zero comments *and* zero check-runs, indistinguishable from the app being gone.
 
 So: give the reviewer a budget (~15 minutes from PR creation is ample; it normally lands in 3–5). If no reviewer check-run exists when the budget expires, **proceed and say so explicitly in your report** — "no automated review was obtained" is a result. Do not hang, and do not report the gate as passed. Never block on a reviewer that is not configured here at all.
+
+**A check that goes red here falls under the same rule as one met locally** (step 1): a test that fails in CI and then passes on `gh run rerun` is a flaky test you have now met, so it gets a fix or a quarantine in this PR, not just the green rerun.
 
 **A green check-run is not the review.** The findings live only in the inline comments:
 
@@ -79,7 +82,7 @@ Push fixes **before** requesting review (step 2). Greptile does not re-review �
 
 ## 5. Hand off
 
-Report and stop: PR URL, check status, each finding and what you did about it, and whether an automated review was obtained at all.
+Report and stop: PR URL, check status, each finding and what you did about it, each red you met and whether it was fixed or quarantined, and whether an automated review was obtained at all.
 
 **Arm auto-merge only when nothing downstream gates the merge.** `gh pr merge <n> --auto --squash` waits for exactly what a manual merge needs — the approval, the **required** checks, every thread resolved — so against a bare hand-off it is not a bypass.
 
@@ -92,4 +95,4 @@ So the default is **do not arm**; arm only when you are the last gate. If you we
 ## Reference
 
 - `docs/develop/governance.md` — the ruleset, bypass actors, who may merge, the emergency override.
-- CLAUDE.md rules 2, 5, 8, 12, 13.
+- CLAUDE.md rules 2, 5, 6, 8, 12, 13.
