@@ -171,7 +171,7 @@ test.describe("visible pages for voice-selected lists", () => {
     await decks.first().click();
     await page.getByTestId("new-agent-use-directory").click();
     await expect(page.getByTestId("new-agent-modes").getByRole("button")).toHaveCount(3);
-    await expect(page.getByTestId("new-agent-dialog").getByText(/Page \d+ of \d+/i)).toHaveCount(0);
+    await expect(page.getByTestId("new-agent-mode-page")).toHaveCount(0);
   });
 
   /** Scenario: the Daemons screen pages its fifteen tiles with Voice on, and the four tiles on page one bear the same numbers as their focus keys. */
