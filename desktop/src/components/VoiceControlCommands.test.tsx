@@ -40,6 +40,7 @@ import {
   VOICE_CHOICE_DIALOG_MOVED_ON,
   VOICE_CHOICE_SCREEN_MOVED_ON,
   NOTHING_DISPATCHED,
+  VOICE_CHOICE_DECK_MOVED_ON,
   VOICE_DICTATION_SEND_MS,
   VOICE_SEND_NUDGE_MS,
   VOICE_NOTHING_TO_CLOSE,
@@ -4457,6 +4458,40 @@ describe("switch deck by voice, against settings edited mid-flight", () => {
     expect(store.current.endpoints?.remote[0].host).toBe("other-box");
     expect(screen.getByTestId("voice-report")).toHaveTextContent("That daemon changed in Settings since you asked for it — try again.");
     expect(screen.getByTestId("voice-report")).not.toHaveTextContent("Showing deploy@build-box.");
+  });
+
+  /** Scenario: Qodo on PR #1451 — the user is offered the local daemon and
+   * the build box, and before answering the app comes to show another deck.
+   * Choosing "2. deploy@build-box" from the stale offer runs nothing and says
+   * the deck changed; the stored selection is untouched. */
+  it("refuses a deck choice after the selected deck changed", async () => {
+    const utterance = "switch deck to local or build";
+    const candidates = [
+      { name: "deck", kind: "deck_ref", spoken: "local or build", value: "local", label: "Local daemon" },
+      { name: "deck", kind: "deck_ref", spoken: "local or build", value: ROW_ID, label: "deploy@build-box",
+        deckIdentity: { host: "build-box", user: "deploy", port: 22, socket: "/run/deck.sock" } },
+    ];
+    const resolveVoice: ResolveVoice = vi.fn(async () => ({ resolveMs: 21, backend: "stub", outcome: {
+      kind: "param_ambiguous", transcript: utterance, action: "switch_deck", invoke: "switchDeck",
+      param: "deck", spoken: "local or build", matches: candidates.map((candidate) => candidate.label), candidates,
+      params: [], sentence: "Heard: “switch deck to local or build” — you named more than one daemon: Local daemon, deploy@build-box.",
+    } } as unknown as VoiceResultDto));
+    const store = storeWithBuildBox();
+    const deck = runtime(resolveVoice, microphone([utterance]), { getSettings: store.getSettings, saveSettings: store.saveSettings });
+    const { rerender } = render(<DeckShell runtime={deck} />);
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(screen.getByRole("button", { name: "2. deploy@build-box" })).toBeVisible();
+
+    const elsewhere = { ...deck.snapshot, connection: { ...deck.snapshot.connection, deckId: "deck-elsewhere" } };
+    rerender(<DeckShell runtime={{ ...deck, snapshot: elsewhere, fleet: [elsewhere] }} />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "2. deploy@build-box" }));
+    await flush();
+
+    expect(store.current.endpoints?.selection).toBe("local");
+    expect(store.saveSettings).not.toHaveBeenCalled();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(VOICE_CHOICE_DECK_MOVED_ON);
   });
 
   /**

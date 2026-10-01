@@ -595,19 +595,24 @@ pub fn multipart_body(audio: &Pcm16, model: &str, boundary: &str) -> Vec<u8> {
 
 /// The `response_format` a request asks `model` for.
 ///
-/// `verbose_json` for a whisper-family model — OpenAI's `whisper-1` and the
-/// local container's `faster-whisper` builds — because that is where the
-/// model's own per-segment `no_speech_prob` lives, which [`parse_response`]
-/// reads to drop the training artefacts Whisper produces on non-speech. Plain
-/// `json` for everything else: OpenAI's `gpt-4o-transcribe` models refuse
-/// `verbose_json` with a 400, and a configured model must not start failing
-/// because of a guard it does not need the same way. Both formats carry the
-/// same top-level `text`, so a server that ignores the request still parses.
+/// `verbose_json` by default, because that is where a whisper-family model's
+/// per-segment `no_speech_prob` lives, which [`parse_response`] reads to drop
+/// the training artefacts Whisper produces on non-speech. It is chosen by
+/// what is known NOT to support it rather than by what is known to: a whisper
+/// build is often served under a bare id (`large-v3`, `tiny.en`), so a name
+/// test for "whisper" left the guard off for exactly those (Qodo on PR #1451).
+///
+/// Plain `json` only for OpenAI's `gpt-*` transcription models
+/// (`gpt-4o-transcribe`, `gpt-4o-mini-transcribe`), which refuse
+/// `verbose_json` with a 400; a configured model must not start failing
+/// because of a guard. Both formats carry the same top-level `text`, so a
+/// server that ignores the request still parses, and one that returns no
+/// `segments` simply gets no segment guard.
 pub fn response_format_for(model: &str) -> &'static str {
-    if model.to_ascii_lowercase().contains("whisper") {
-        "verbose_json"
-    } else {
+    if model.to_ascii_lowercase().starts_with("gpt-") {
         "json"
+    } else {
+        "verbose_json"
     }
 }
 
@@ -1587,16 +1592,21 @@ mod tests {
         assert_eq!(transcript.text(), "Add a test for the parser.");
     }
 
-    /// The request asks a whisper-family model for `verbose_json`, which is
-    /// where its per-segment confidence lives, and every other model for plain
-    /// `json` — OpenAI's `gpt-4o-transcribe` refuses `verbose_json` outright,
-    /// and a configured model must not start failing because of a guard.
+    /// The request asks for `verbose_json`, which is where a whisper model's
+    /// per-segment confidence lives, from every model but OpenAI's `gpt-*`
+    /// transcription family — `gpt-4o-transcribe` refuses `verbose_json`
+    /// outright, and a configured model must not start failing because of a
+    /// guard.
     #[test]
     fn voice_transcribe_asks_a_whisper_model_for_its_confidence() {
         let boundary = "b";
         for (model, format) in [
             ("whisper-1", "verbose_json"),
             ("Systran/faster-whisper-tiny.en", "verbose_json"),
+            // Qodo on PR #1451: a whisper build served under a bare id, as
+            // local faster-whisper servers often name them, is still asked.
+            ("large-v3", "verbose_json"),
+            ("tiny.en", "verbose_json"),
             ("gpt-4o-transcribe", "json"),
             ("gpt-4o-mini-transcribe", "json"),
         ] {

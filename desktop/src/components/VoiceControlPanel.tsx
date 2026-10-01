@@ -635,6 +635,10 @@ const AGENT_TARGETING_KINDS: ReadonlySet<string> = new Set(["agent_ref", "orches
 function dispatchLost(was: VoiceContext, now: VoiceContext, params: readonly VoiceResolvedParamDto[]): Lost | undefined {
   const lost = contextLost(was, now, { answer: true });
   if (lost) return lost;
+  /* PR #1451 (Qodo) — a deck named in the outcome is chosen relative to the
+     deck selected when it was declared; once that moved, the choice is stale
+     whatever it names, exactly as an agent target on the old deck is. */
+  if (params.some((param) => param.kind === "deck_ref") && now.deck !== was.deck) return { code: "deck", why: "the deck changed" };
   for (const param of params) {
     if (!AGENT_TARGETING_KINDS.has(param.kind)) continue;
     const moved = contextLost(was, now, { agent: param.value });
