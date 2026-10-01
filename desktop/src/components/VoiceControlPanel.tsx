@@ -1076,17 +1076,26 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const nudgeTimer = useRef<number | undefined>(undefined);
   const unsent = useRef(false);
   /**
-   * PR #1451 (Qodo) — the last typed write, settled to whether it landed. A
-   * spoken send waits for it: an Enter queued behind a write that then fails
-   * would submit whatever was in the prompt before.
+   * PR #1451 (Qodo) — every typed write since the last send, settled to
+   * whether ALL of them landed. A spoken send waits for it: an Enter queued
+   * behind a write that then fails would submit whatever was in the prompt
+   * before. A send consumes it, and typing mode's entry and exit clear it, so
+   * one failure is not held against every later send.
    */
   const lastWrite = useRef<Promise<boolean> | undefined>(undefined);
+  const trackWrite = useCallback((write: Promise<unknown>) => {
+    const landed = write.then(() => true, () => false);
+    const before = lastWrite.current;
+    lastWrite.current = before === undefined ? landed : Promise.all([before, landed]).then(([a, b]) => a && b);
+  }, []);
   const setPanelState = useCallback((next: VoicePanelState) => {
     const was = panelStateRef.current;
     if (was.kind === "dictating" || next.kind === "dictating") {
       modeGeneration.current += 1;
-      /* PR #1451 — every entry and exit starts the nudge from nothing. */
+      /* PR #1451 — every entry and exit starts the nudge, and the writes a
+         spoken send waits for, from nothing. */
       unsent.current = false;
+      lastWrite.current = undefined;
       if (nudgeTimer.current !== undefined) window.clearTimeout(nudgeTimer.current);
       nudgeTimer.current = undefined;
       setNudge(false);
@@ -2182,7 +2191,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
          incarnation as well. */
       const generation = modeGeneration.current;
       const write = sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed);
-      lastWrite.current = write.then(() => true, () => false);
+      trackWrite(write);
       void write.then(
         /* PR #1451 — words are in the prompt and unsent: start the pause
            clock for the nudge to send. A write from a mode that has since
@@ -2211,7 +2220,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const epoch = sendEpoch.current;
     sending.current = { aim, declared: dispatching.current ?? current() };
     const write = sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed);
-    lastWrite.current = write.then(() => true, () => false);
+    trackWrite(write);
     void write.then(
       () => {
         /* Called off while the words were being written — see `sendEpoch` —
@@ -2230,7 +2239,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         setProblem(sentenceOf(cause));
       },
     );
-  }, [armNudge, armSend, callOffLostSend, cancelPendingSend, current, endDictation, paneLost, reportRefused, sendTerminalInput, setPanelState, setPending]);
+  }, [armNudge, armSend, callOffLostSend, cancelPendingSend, current, endDictation, paneLost, reportRefused, sendTerminalInput, setPanelState, setPending, trackWrite]);
 
   /**
    * Press Enter in the open agent's prompt, because the user said to.
@@ -2255,6 +2264,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        then dropped rather than submitting what was in the prompt before, and
        so is one whose pane or mode moved while it waited. */
     const written = lastWrite.current;
+    lastWrite.current = undefined;
     if (written === undefined) {
       void submitDictation(aim);
       return;

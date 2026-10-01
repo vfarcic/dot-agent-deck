@@ -2245,6 +2245,75 @@ describe("sticky dictation in the open agent pane", () => {
     }
   });
 
+  /** Scenario: Qodo on PR #1451, round two — two utterances are being written
+   * at once and the EARLIER one is the slow one; "send it" waits for both, not
+   * only the latest. Then that earlier write fails, so the send is dropped and
+   * typing mode ends; back in typing mode, the next "send it" presses Enter as
+   * usual, because the failure is not held against every later send. */
+  it("waits for every outstanding write and does not hold a failure against later sends", async () => {
+    let settle!: (ok: boolean) => void;
+    const { voice, deck } = start({ "send it": dispatch("submit_prompt", "submitAgentPrompt", "Sent — still typing to Coder.", "send it") });
+    (deck.sendTerminalInput as ReturnType<typeof vi.fn>).mockImplementation(async (_target: unknown, data: string) => {
+      if (data === "slow words ") await new Promise<void>((resolve, reject) => { settle = (ok) => (ok ? resolve() : reject(new Error("the terminal refused the write"))); });
+    });
+    await enter(voice);
+    voice.deliver("slow words");
+    await completeUtterance();
+    voice.deliver("quick words");
+    await completeUtterance();
+    voice.deliver("send it");
+    await completeUtterance();
+    expect(deck.sendTerminalInput).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
+    await act(async () => { settle(false); });
+    await flush();
+    expect(deck.sendTerminalInput).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
+    expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
+
+    voice.deliver("type on");
+    await completeUtterance();
+    voice.deliver("send it");
+    await completeUtterance();
+    expect(deck.sendTerminalInput).toHaveBeenLastCalledWith({ deckId, agentId: coderId }, VOICE_DICTATION_SUBMIT);
+  });
+
+  /** Scenario: Qodo on PR #1451, round two — a failed write is forgotten
+   * once it can no longer matter. In typing mode it ends the mode, and after
+   * "type on" the next "send it" presses Enter. Outside typing mode the first
+   * "send it" after a failed one-shot write is dropped (nothing landed to
+   * send), and the one after it presses Enter as usual. */
+  it("forgets a failed write once typing mode restarts or a send has passed it", async () => {
+    const send = { "send it": dispatch("submit_prompt", "submitAgentPrompt", "Sent.", "send it") };
+    const refuse = (deck: DeckRuntimeState) => (deck.sendTerminalInput as ReturnType<typeof vi.fn>).mockImplementation(async (_target: unknown, data: string) => {
+      if (data === "refused words ") throw new Error("the terminal refused the write");
+    });
+
+    const mode = start(send);
+    refuse(mode.deck);
+    await enter(mode.voice);
+    mode.voice.deliver("refused words");
+    await completeUtterance();
+    expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
+    mode.voice.deliver("type on");
+    await completeUtterance();
+    mode.voice.deliver("send it");
+    await completeUtterance();
+    expect(mode.deck.sendTerminalInput).toHaveBeenLastCalledWith({ deckId, agentId: coderId }, VOICE_DICTATION_SUBMIT);
+    mode.unmount();
+
+    const oneShot = start(send);
+    refuse(oneShot.deck);
+    fireEvent.click(screen.getByRole("button", { name: /open coder agent/i }));
+    await turnVoiceOn();
+    oneShot.voice.deliver("refused words");
+    await completeUtterance();
+    oneShot.voice.deliver("send it");
+    await completeUtterance();
+    expect(oneShot.deck.sendTerminalInput).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
+    oneShot.voice.deliver("send it");
+    await completeUtterance();
+    expect(oneShot.deck.sendTerminalInput).toHaveBeenLastCalledWith({ deckId, agentId: coderId }, VOICE_DICTATION_SUBMIT);
+  });
+
   /** Scenario: Qodo on PR #1451 — with typing mode on and words unsent, the
    * user switches coder's pane to its Diff tab, so the prompt is no longer on
    * screen. Typing mode ends and says why; nothing further is typed, and a
