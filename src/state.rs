@@ -16568,7 +16568,7 @@ mod tests {
             .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
             .with_ansi(false)
             .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
 
         let state = two_same_name_cwd_tabs(true);
         // Named twice, so ONE call reaches both warnings: the first pass finds
@@ -18544,7 +18544,7 @@ mod tests {
             .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
             .with_ansi(false)
             .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
 
         // A registry with no agent ever spawned onto this pane: the ordinary,
         // non-racy production shape of "identity unresolved". `cwd: None`
@@ -19507,7 +19507,7 @@ while True:
             }
         }
         let captured = CapturedLog::default();
-        let _subscriber = tracing::subscriber::set_default(
+        let _subscriber = crate::test_isolation::capture_tracing_on_this_thread(
             tracing_subscriber::fmt()
                 .with_writer(captured.clone())
                 .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)

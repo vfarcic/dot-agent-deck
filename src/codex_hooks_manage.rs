@@ -2065,7 +2065,7 @@ mod tests {
                 .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
                 .with_ansi(false)
                 .finish();
-            let guard = tracing::subscriber::set_default(subscriber);
+            let guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
             warn_if_our_own_entry_was_unrecognisable(entries, home.path(), &expected);
             drop(guard);
             String::from_utf8(captured.0.lock().unwrap().clone()).expect("captured log is UTF-8")

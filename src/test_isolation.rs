@@ -84,10 +84,14 @@ pub fn detach_from_any_live_deck() {
                 leaked.join(", ")
             );
         }
-        for var in DECK_ENDPOINT_VARS {
+        for var in leaked {
             // SAFETY: nextest runs one test per process and this is called from
             // the test body before it spawns anything, via a `OnceLock` so it
-            // happens exactly once per process.
+            // happens exactly once per process. Plain `cargo test` runs every
+            // test as a thread of ONE process, where that argument does not
+            // hold; there this writes only when the run inherited a variable
+            // (it was started from inside a deck pane), so an ordinary run
+            // never moves the environment under another test's thread.
             unsafe { std::env::remove_var(var) };
         }
     });
@@ -159,30 +163,109 @@ pub fn pin_unreachable_endpoints(mut env: Vec<(String, String)>) -> Vec<(String,
     env
 }
 
+/// Install `subscriber` as THIS thread's default for as long as the guard
+/// lives. Every unit test that captures tracing output installs it through
+/// here rather than with `tracing::subscriber::set_default` directly.
+///
+/// **Why a bare `set_default` loses events under plain `cargo test`.**
+/// tracing-core caches each callsite's interest the first time any thread hits
+/// it, and while exactly one dispatcher is registered it computes that interest
+/// from the registering thread's OWN default rather than from every live
+/// dispatcher. So with a test's capture subscriber the only one registered, a
+/// different test's thread — one with no subscriber — that reaches a log site
+/// first caches "never" for it, and the capturing test's own event at that
+/// site is then dropped before its subscriber is asked. nextest never sees it,
+/// because every test has its own process and so its own callsite cache.
+/// Measured on `ingest_005_…`: the capture held every escaped site but one,
+/// `Received event`, which other daemon tests reach without a subscriber.
+///
+/// The remedy is to make sure the one-dispatcher case never applies while a
+/// capture is live: a second dispatcher is registered once, for the life of
+/// the process, before any capture is installed. With two live, every callsite
+/// registration combines all of them, the capture included. The extra one is
+/// a [`tracing::subscriber::NoSubscriber`], which is no thread's default, so it
+/// receives nothing and changes nothing a test observes.
+pub fn capture_tracing_on_this_thread<S>(subscriber: S) -> tracing::subscriber::DefaultGuard
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    static SECOND_DISPATCHER: OnceLock<tracing::Dispatch> = OnceLock::new();
+    SECOND_DISPATCHER
+        .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    tracing::subscriber::set_default(subscriber)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Scenario: Set every deck identity variable to a value that mimics a
-    /// live deck, call the unit-test detach hook, and assert every one of them
-    /// is gone — the `src/` half of `harness_clears_inherited_deck_endpoints`.
+    /// Marks the re-executed copy of this test binary that runs the detach
+    /// with the variables already in its environment.
+    const DETACH_CHILD: &str = "DAD_TEST_ISOLATION_DETACH_CHILD";
+
+    /// Scenario: Start a fresh copy of this test binary with every deck
+    /// identity variable set to a value that mimics a live deck, have it call
+    /// the unit-test detach hook, and assert every one of them is gone — the
+    /// `src/` half of `harness_clears_inherited_deck_endpoints`.
+    ///
+    /// The variables go into a CHILD's environment rather than this one's.
+    /// Under plain `cargo test` every test is a thread of one process, so a
+    /// `set_var` here would point every concurrently running test at a
+    /// pretend deck, and the `OnceLock` inside the detach has usually already
+    /// fired for an earlier test, which made this fail on every such run.
+    /// Setting them before the child starts is also the honest shape of the
+    /// condition: a test process inherits them, it does not acquire them.
     #[test]
     fn detach_clears_inherited_deck_endpoints() {
-        for var in DECK_ENDPOINT_VARS {
-            // SAFETY: single-threaded test body in its own nextest process,
-            // before anything is spawned.
-            unsafe { std::env::set_var(var, "/run/user/1000/pretend-live-deck") };
+        if std::env::var_os(DETACH_CHILD).is_some() {
+            for var in DECK_ENDPOINT_VARS {
+                assert!(
+                    std::env::var_os(var).is_some(),
+                    "{var} was not inherited, so the detach below proves nothing"
+                );
+            }
+
+            detach_from_any_live_deck();
+
+            for var in DECK_ENDPOINT_VARS {
+                assert!(
+                    std::env::var_os(var).is_none(),
+                    "{var} survived the unit-test detach — a spawned child would \
+                     inherit it and could post hook events into a live deck"
+                );
+            }
+            return;
         }
 
-        detach_from_any_live_deck();
-
-        for var in DECK_ENDPOINT_VARS {
-            assert!(
-                std::env::var_os(var).is_none(),
-                "{var} survived the unit-test detach — a spawned child would \
-                 inherit it and could post hook events into a live deck"
-            );
-        }
+        let name = "test_isolation::tests::detach_clears_inherited_deck_endpoints";
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(DETACH_CHILD, "1")
+        .envs(
+            DECK_ENDPOINT_VARS
+                .into_iter()
+                .map(|var| (var, "/run/user/1000/pretend-live-deck")),
+        )
+        .output()
+        .expect("re-execute the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the detach left a deck variable behind:\n{stdout}\n{stderr}"
+        );
+        // libtest exits 0 when the filter matches nothing, so prove the child
+        // actually ran the detach half.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child did not run {name}:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stderr.contains("note: detaching this test process from a live deck"),
+            "the child must report what it cleared:\n{stderr}"
+        );
     }
 
     /// Scenario: Pin the endpoints onto an env that already names the pane id
@@ -235,5 +318,126 @@ mod tests {
                 "a pin must not be the default hook endpoint: {value}"
             );
         }
+    }
+
+    /// The writer a capture test hands its subscriber: every byte, in order.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// One log site both threads below reach, so they share its cached interest.
+    fn reach_the_shared_log_site(who: &str) {
+        tracing::info!(who, "capture race probe");
+    }
+
+    /// Scenario: Install a capture subscriber on one thread, let a second
+    /// thread with no subscriber reach a log site first, then emit at that same
+    /// site from the capturing thread, and assert the capture holds the event.
+    ///
+    /// Without the second dispatcher [`capture_tracing_on_this_thread`]
+    /// registers, the subscriber-less thread caches "never" for the site and
+    /// the capturing thread's event is dropped. That is deterministic in a
+    /// process of its own, which is what nextest gives this test; under plain
+    /// `cargo test` it depends on what the other tests have registered.
+    #[test]
+    fn a_capture_keeps_a_log_site_another_thread_reached_first() {
+        let captured = CapturedLog::default();
+        let (installed_tx, installed_rx) = std::sync::mpsc::channel::<()>();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+
+        let capturing = std::thread::spawn({
+            let captured = captured.clone();
+            move || {
+                let _guard = capture_tracing_on_this_thread(
+                    tracing_subscriber::fmt()
+                        .with_writer(captured)
+                        .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+                        .with_ansi(false)
+                        .finish(),
+                );
+                installed_tx.send(()).unwrap();
+                reached_rx.recv().unwrap();
+                reach_the_shared_log_site("capturing");
+            }
+        });
+        let bare = std::thread::spawn(move || {
+            installed_rx.recv().unwrap();
+            reach_the_shared_log_site("bare");
+            reached_tx.send(()).unwrap();
+        });
+        bare.join().unwrap();
+        capturing.join().unwrap();
+
+        let raw = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            raw.contains("capture race probe") && raw.contains("capturing"),
+            "the capturing thread's event was dropped because another thread \
+             reached the site first: {raw:?}"
+        );
+        assert!(
+            !raw.contains("\"bare\"") && !raw.contains("who=\"bare\""),
+            "a capture is this thread's alone: {raw:?}"
+        );
+    }
+
+    /// Scenario: Read every `.rs` file under `src/` and fail if any line that
+    /// is not a comment installs a thread subscriber with
+    /// `tracing::subscriber::set_default` outside this module — every capture
+    /// has to go through [`capture_tracing_on_this_thread`] or it can lose
+    /// events under plain `cargo test`.
+    #[test]
+    fn every_unit_test_capture_goes_through_the_seam() {
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        assert!(
+            files.len() > 50,
+            "the sweep found too few files to mean anything"
+        );
+
+        let needle = ["tracing::subscriber::", "set_default("].concat();
+        let mut offenders = Vec::new();
+        for file in files {
+            if file.ends_with("test_isolation.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).expect("read source");
+            for (n, line) in text.lines().enumerate() {
+                if !line.trim_start().starts_with("//") && line.contains(&needle) {
+                    offenders.push(format!("{}:{}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "install a capture with crate::test_isolation::capture_tracing_on_this_thread, \
+             not a bare set_default: {offenders:#?}"
+        );
     }
 }

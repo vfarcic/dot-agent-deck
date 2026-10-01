@@ -20069,22 +20069,25 @@ mod spawn_tests {
             !registry.draft_pending(PANE),
             "the user's Enter after our paste closed was read as paste content"
         );
-        let started = Instant::now();
+        // Asserted on the time the write spent waiting for a draft, not on its
+        // wall clock: a write with nothing pending still pays `SUBMIT_DELAY`
+        // and the echo gate, which on a loaded box alone ran past `CAP` and
+        // failed this with no draft wait at all.
         let next = registry
-            .write_and_submit_guarded_first_write_capped(
+            .write_and_submit_guarded_first_write_detailed(
                 PANE,
                 "ISSUE-544-NEXT",
                 &agent,
                 || async { true },
                 Instant::now(),
-                CAP,
             )
             .await
             .expect("next write");
-        assert_eq!(next, GuardedSend::Applied);
+        assert_eq!(next.detail.outcome(), GuardedSend::Applied);
         assert!(
-            started.elapsed() < CAP,
-            "the next first write waited for a draft the agent already submitted"
+            next.deferred.is_zero(),
+            "the next first write waited {:?} for a draft the agent already submitted",
+            next.deferred
         );
         registry.shutdown_all();
     }
@@ -23338,7 +23341,8 @@ mod spawn_tests {
                 .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
                 .with_ansi(false)
                 .finish();
-            let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+            let _subscriber_guard =
+                crate::test_isolation::capture_tracing_on_this_thread(subscriber);
             shutting_down.shutdown_all_graceful(Duration::from_millis(0));
             done.store(true, Ordering::SeqCst);
         });
@@ -23453,7 +23457,8 @@ mod spawn_tests {
             .finish();
         let started = Instant::now();
         {
-            let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+            let _subscriber_guard =
+                crate::test_isolation::capture_tracing_on_this_thread(subscriber);
             registry.shutdown_all_graceful(Duration::from_millis(0));
         }
         let elapsed = started.elapsed();
@@ -23556,7 +23561,7 @@ mod spawn_tests {
             .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
             .with_ansi(false)
             .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
 
         // Armed for the agent that owns the pane RIGHT NOW, exactly as the two
         // production callers arm it at spawn/respawn time.
@@ -23723,7 +23728,7 @@ mod spawn_tests {
             .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
             .with_ansi(false)
             .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
 
         arm_seed_fallback(registry.clone(), PANE.to_string(), original.clone(), GRACE);
 
