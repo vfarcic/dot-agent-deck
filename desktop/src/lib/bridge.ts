@@ -2060,7 +2060,7 @@ function fallbackConnectionMessage(connection: DesktopSnapshotDto["connection"])
   if (connection.status === "connected") return "Daemon responding";
   if (connection.status !== "incompatible") return "Daemon unavailable";
   if (connection.buildStampMismatchOnly) {
-    return "This daemon and this app are different versions. The two can still exchange information, but the app could misread some of what the daemon reports, so it has not connected. Run the same version of both.";
+    return "This daemon and this app are different versions. The app has not connected, because it could misread some of what this daemon reports. Run the same version of both.";
   }
   return "This daemon and this app are different versions and cannot work together. Run the same version of both.";
 }

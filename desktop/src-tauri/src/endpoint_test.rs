@@ -340,7 +340,7 @@ fn message_for(state: EndpointTestState, deck: &str, info: Option<&HandshakeInfo
         EndpointTestState::ContractDiffers => info
             .and_then(|info| info.error.clone())
             .unwrap_or_else(|| {
-                format!("{deck} answered, but it is a different version from this app and the app could misread some of what it reports.")
+                format!("{deck} answered, but it is a different version from this app, so the app has not connected: it could misread some of what that daemon reports.")
             }),
         EndpointTestState::ProtocolRefused => info
             .and_then(|info| info.error.clone())

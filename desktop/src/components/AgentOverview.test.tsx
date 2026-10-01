@@ -1764,7 +1764,7 @@ describe("AgentOverview", () => {
       ...snapshot.connection,
       daemonDetected: true,
       runningAgentCount: 9,
-      message: "This daemon is older than this app. The two can still exchange information, but the app could misread some of what the daemon reports, so it has not connected. Update the daemon to this app's version.",
+      message: "This daemon is older than this app. The app has not connected, because it could misread some of what this daemon reports. Update the daemon to this app's version.",
       detail: "The daemon lacks these declared compatibility breaks: 708-worker-failure-reports-submitted. Both sides speak protocol 10. Builds: app 0.43.0, daemon 0.42.0.",
       buildStampMismatchOnly: true,
     };

@@ -976,7 +976,7 @@ fn classify_handshake(
                 contract.older.remedy()
             ),
             BuildMismatchAllowance::Refuse => format!(
-                "{who}. The two can still exchange information, but the app could misread some of what the daemon reports, so it has not connected. {}",
+                "{who}. The app has not connected, because it could misread some of what this daemon reports. {}",
                 contract.older.remedy()
             ),
         };
@@ -1724,9 +1724,17 @@ mod tests {
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.expect("the refusal says why");
         assert!(
-            error.contains("could misread some of what the daemon reports"),
+            error.contains("could misread some of what this daemon reports"),
             "what a decoding wire cannot rule out is stated rather than implied: {error}"
         );
+        // The refusal comes first, as a fact (maintainer, PR #1451): "the two
+        // can still exchange information" read as "it will connect", which it
+        // does not unless the user chooses Connect anyway.
+        assert!(
+            error.starts_with("This daemon is older than this app. The app has not connected"),
+            "the refusal leads: {error}"
+        );
+        assert!(!error.contains("exchange information"), "{error}");
         // Which buttons to press depends on the screen — Replace daemon is
         // only rendered for a local deck — so the crate's sentence names none
         // and the webview adds the ones it shows (`connectionRemedy.ts`).

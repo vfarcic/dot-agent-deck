@@ -49,7 +49,7 @@ A field whose value the app refuses (a character ssh would misread, a key path t
 | Result | What to do |
 | --- | --- |
 | `<daemon> answered and is compatible with this app.` | Nothing: the daemon is ready. |
-| `This daemon is older than this app. The two can still exchange information, but the app could misread …` (or `This app is older than the daemon. …`) | Update the older of the two so both run the same version. Until then the Dashboard offers **Connect anyway**, which uses the daemon as it is until you quit the app. |
+| `This daemon is older than this app. The app has not connected, because it could misread …` (or `This app is older than the daemon. …`) | Update the older of the two so both run the same version. Until then the Dashboard offers **Connect anyway**, which uses the daemon as it is until you quit the app. |
 | `This daemon is older than this app, and the two cannot work together.` (or `This app is older than the daemon, …`) | Update the older of the two so both run the same version. Nothing overrides this. |
 | `This daemon and this app are different versions. …` | Each has changes the other lacks, which usually means two development builds. Run the same version of both. |
 | `The daemon turned this app away.` | Test again in a moment. If it keeps happening, restart the daemon on its host. |

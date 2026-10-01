@@ -1,7 +1,7 @@
 import type { ConnectionView } from "../types";
 
 /** The Connect anyway confirmation, shared by the Daemons screen and the dashboard so the two cannot drift. */
-export const CONNECT_ANYWAY_BODY = "This daemon and this app are different versions. They can still exchange information, but this app may show some of this daemon's information wrongly. Agent Deck will connect and keep a warning on screen until you quit the app; nothing is remembered after that.";
+export const CONNECT_ANYWAY_BODY = "This daemon and this app are different versions, so this app may show some of this daemon's information wrongly. Agent Deck will connect and keep a warning on screen until you quit the app; nothing is remembered after that.";
 
 /**
  * Which recovery buttons a screen actually renders beside an incompatible

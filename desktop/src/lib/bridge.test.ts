@@ -975,7 +975,7 @@ describe("TauriDeckBridge", () => {
     delete stampOnly.connection.error;
     const stampMapped = mapDesktopSnapshot(stampOnly).connection;
     // In the user's terms (CLAUDE.md rule 21); the builds go to the disclosure.
-    expect(stampMapped.message).toContain("could misread some of what the daemon reports");
+    expect(stampMapped.message).toContain("could misread some of what this daemon reports");
     expect(stampMapped.message).not.toMatch(/mismatch|protocol|v0\.3/i);
     expect(stampMapped.detail).toContain("Builds: app v0.38.0-50-gf118e99, daemon v0.39.0.");
 
