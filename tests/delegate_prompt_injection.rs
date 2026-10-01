@@ -3045,6 +3045,44 @@ const NO_SIGNAL_POINTER_CEILING: Duration = Duration::from_secs(12);
 #[cfg(unix)]
 const UNDECLARED_LAUNCHER_WAIT_FLOOR: Duration = Duration::from_secs(30);
 
+/// How far `orchestration/delegate/030`'s undeclared-launcher arm walks virtual
+/// time before it concludes the pointer was never delivered.
+///
+/// That arm is expected to deliver at the 30 s timeout plus the ordinary
+/// 1000 ms buffer, ~31 s, and it used to share [`MEASURED_LATENCY_CEILING`]'s
+/// 34 s with the other two arms. That left it three steps past its expected
+/// delivery, where the other arms, expected at ~8 s, get twenty-six. Each step
+/// gives the write's real round trip (the deck's write, the kernel echo, the
+/// PTY pump thread) only ~60 ms of real time to show up, so three steps is
+/// ~200 ms, and a starved box does not always manage that: on 2026-10-01 a full
+/// `cargo test-fast` failed this arm with an EMPTY snapshot at 34 s, under a
+/// load context reading STARVED (cpu some 97.2% of the window). Sixty gives it
+/// the same headroom past its expected delivery the other arms already have.
+/// It is paid only on the failing path, since the walk stops the moment the
+/// pointer is seen, and it leaves the arm's real assertion, the
+/// [`UNDECLARED_LAUNCHER_WAIT_FLOOR`], untouched.
+#[cfg(unix)]
+const UNDECLARED_LAUNCHER_WALK_CEILING: Duration = Duration::from_secs(60);
+
+/// How long `orchestration/delegate/030` keeps looking on the REAL clock, with
+/// the virtual clock held, before it lets its walk step past a bound it asserts
+/// against: the [`NO_SIGNAL_POINTER_CEILING`] for the two arms that bound
+/// delivery from above, and its walk ceiling for every arm.
+///
+/// The walk gives each virtual second only ~60 ms of real time, and the write it
+/// is waiting for still needs a real round trip (the deck's write, the kernel
+/// echo, the PTY pump thread) before the snapshot shows it. Near a bound that
+/// round trip decides the verdict: an arm three or four steps short of it has
+/// ~200-300 ms of real time left, which a starved box does not always give (see
+/// [`UNDECLARED_LAUNCHER_WALK_CEILING`] for the failure that showed it).
+///
+/// Holding the clock is what makes this honest: no virtual time passes while it
+/// waits, so a pointer that shows up now was written at or before the bound,
+/// and `virtual_elapsed` still reports the bound rather than something smaller.
+/// A green run never reaches either bound and pays nothing.
+#[cfg(unix)]
+const BOUNDARY_REAL_GRACE: Duration = Duration::from_secs(10);
+
 /// Scenario: Delegate with `clear = true` to a worker whose agent emits no readiness event of any kind before its first prompt (OpenCode's measured behaviour), with no operator buffer configured, then walk a paused Tokio clock forward a second at a time. The task pointer must reach the pane inside twelve virtual seconds rather than after the 30 s dead wait, and no sooner than seven — the shipped 8000 ms no-signal buffer, which is how the run proves the skip resolved THAT buffer rather than the ordinary 1000 ms one (issue #243). The same worker is then run behind a launcher script the deck cannot see through: undeclared it still waits the 30 s out, and declared `agent = "opencode"` it gets the same prompt delivery as the bare binary (issue #1243).
 #[spec("orchestration/delegate/030")]
 #[test]
@@ -3235,19 +3273,28 @@ async fn delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner(
     // overshoots by `TIMER_TICK_SLACK` (#402) so crossing a deadline never
     // depends on where its arming instant fell inside a millisecond.
     let step = Duration::from_secs(1);
+    let (walk_ceiling, upper_bound) = if case == NoSignalCase::UndeclaredLauncher {
+        (UNDECLARED_LAUNCHER_WALK_CEILING, None)
+    } else {
+        (MEASURED_LATENCY_CEILING, Some(NO_SIGNAL_POINTER_CEILING))
+    };
+    let pointer_seen = || {
+        snapshot_contains(
+            &registry.snapshot(&new_agent_id).unwrap_or_default(),
+            POINTER,
+        )
+    };
     let mut virtual_elapsed = Duration::ZERO;
     let delivered = loop {
-        if poll_until_after_time_advance(Duration::from_millis(60), || {
-            snapshot_contains(
-                &registry.snapshot(&new_agent_id).unwrap_or_default(),
-                POINTER,
-            )
-        })
-        .await
-        {
+        if poll_until_after_time_advance(Duration::from_millis(60), pointer_seen).await {
             break true;
         }
-        if virtual_elapsed >= MEASURED_LATENCY_CEILING {
+        // See `BOUNDARY_REAL_GRACE`: the clock stays where it is.
+        let at_bound = virtual_elapsed >= walk_ceiling || upper_bound == Some(virtual_elapsed);
+        if at_bound && poll_until_after_time_advance(BOUNDARY_REAL_GRACE, pointer_seen).await {
+            break true;
+        }
+        if virtual_elapsed >= walk_ceiling {
             break false;
         }
         advance_and_run(step + TIMER_TICK_SLACK).await;
@@ -3262,7 +3309,7 @@ async fn delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner(
     assert!(
         delivered,
         "[{case:?}] a worker whose agent emits no readiness event ever received its delegated \
-         task pointer at all, within {MEASURED_LATENCY_CEILING:?} of virtual time; snapshot = {:?}",
+         task pointer at all, within {walk_ceiling:?} of virtual time; snapshot = {:?}",
         String::from_utf8_lossy(&snapshot)
     );
     // The WARN that names the remedy (issue #1243): the measured symptom sat
@@ -3441,6 +3488,24 @@ async fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
     }
 }
 
+/// How long `orchestration/delegate/013` waits, on the REAL clock, for the
+/// silence notice to land in the orchestrator pane once the pointer has reached
+/// the worker.
+///
+/// A ceiling on a wait, not a latency bound: the wait returns the moment the
+/// notice and its terminator are both in the pane, so a green run pays only the
+/// 600 ms window the test pins plus the notice's own round trip, and nothing
+/// this test asserts is about how soon the notice arrives. That round trip runs
+/// through the daemon's tasks, the orchestrator pane's `cat -u`, and the PTY
+/// pump thread, all on a real clock. It was 3 s, which left ~2.4 s past the
+/// window for that chain, and that was not enough: on 2026-10-01 a full
+/// `cargo test-fast` failed this test with only the observer's own readiness
+/// marker in the pane, under a load context reading STARVED (cpu some 95.6% of
+/// the window). Ten seconds keeps the failure path bounded while no longer
+/// asking a starved box to finish that chain in under 2.4 s.
+#[cfg(unix)]
+const SILENCE_NOTICE_BUDGET: Duration = Duration::from_secs(10);
+
 /// Issue #702: what the orchestrator observer prints once `stty raw -echo` has
 /// returned. It is followed by a bare LF, and the byte the pane delivers after
 /// it is read as PROOF that the line discipline really is raw — see
@@ -3597,7 +3662,7 @@ impl SilentWorkerArm {
         let notice = wait_for_silence_notice(
             &self.registry,
             &self.orchestrator_agent_id,
-            Duration::from_secs(3),
+            SILENCE_NOTICE_BUDGET,
         )
         .await;
         assert!(
