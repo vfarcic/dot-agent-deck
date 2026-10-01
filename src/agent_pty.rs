@@ -6858,6 +6858,18 @@ impl AgentPtyRegistry {
         }
     }
 
+    /// Issue #1423: the generation of `worker_pane_id`'s armed idle-worker
+    /// record, or `None` when no delegation to that pane is outstanding.
+    /// Read-only, so a check cannot itself retire the record it is checking.
+    pub fn outstanding_delegation_seq(&self, worker_pane_id: &str) -> Option<u64> {
+        self.delegations
+            .lock()
+            .unwrap()
+            .records
+            .get(worker_pane_id)
+            .map(|record| record.seq)
+    }
+
     /// PRD #126: a `work-done` arrived from `worker_pane_id`, so that pane's
     /// outstanding delegation is resolved and the pane owes no idle prompt —
     /// including every older generation carried in
