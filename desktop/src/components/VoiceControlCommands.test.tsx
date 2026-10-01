@@ -2915,6 +2915,17 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
         if (!directories?.hasParent && !options.forced) return unavailable("go_to_parent", "going up needs the New agent dialog showing a directory below the top; choose a daemon and open a directory first");
         return dispatch("go_to_parent", "goToParentDirectory", "Going up.", utterance);
       }
+      /* PR #1451 round 3, change 5 — the Filter box: Rust has already held
+         the text to the transcript, so what arrives is the grounded value. */
+      if (utterance.startsWith("filter ")) {
+        const text = utterance.slice("filter ".length).toLowerCase();
+        if (!directories && !options.forced) return unavailable("filter_directories", "filtering needs the New agent dialog's directory listing; say “new agent” and choose a daemon first");
+        return dispatch("filter_directories", "filterDirectories", `Filtering by “${text}”.`, utterance, [{ name: "text", kind: "filter_text", spoken: text, value: text, label: text }]);
+      }
+      if (utterance === "clear filter") {
+        if (!directories && !options.forced) return unavailable("clear_directory_filter", "clearing the filter needs the New agent dialog's directory listing; say “new agent” and choose a daemon first");
+        return dispatch("clear_directory_filter", "clearDirectoryFilter", "Filter cleared.", utterance);
+      }
       if (utterance === "use this directory") {
         if (!directories && !options.forced) return unavailable("use_this_directory", "choosing a directory needs the New agent dialog's directory listing; say “new agent” and choose a daemon first");
         return dispatch("use_this_directory", "useThisDirectory", "Using this directory.", utterance);
@@ -2976,6 +2987,60 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
     expect(listDirectories).toHaveBeenLastCalledWith(deckId, "/home/dev/billing");
     expect(currentPath()).toBe("/home/dev/billing");
     expect(screen.getByTestId("voice-report")).toHaveTextContent("Opening billing.");
+  });
+
+  /**
+   * Scenario: open the New agent dialog and say "filter DO". The Filter box
+   * shows "do" as if typed, only the directories containing it stay listed,
+   * the next utterance declares just those, and the report says what was
+   * applied.
+   */
+  it("filters the directory listing by voice as if typed", async () => {
+    const voice = microphone([]);
+    const { deck, declarations } = browsingDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openBrowser();
+
+    voice.deliver("filter DO");
+    await completeUtterance();
+    await flush();
+
+    expect(screen.getByTestId("new-agent-filter")).toHaveValue("do");
+    const list = screen.getByTestId("new-agent-directory-list");
+    expect(list.querySelector("[data-path='/home/dev/docs']")).not.toBeNull();
+    expect(list.querySelector("[data-path='/home/dev/billing']")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Filtering by “do”.");
+
+    voice.deliver("use this directory");
+    await completeUtterance();
+    await flush();
+    expect(declarations.at(-1)?.entries).toEqual([{ name: "docs", path: "/home/dev/docs" }]);
+  });
+
+  /**
+   * Scenario: type "bill" into the Filter box, then say "clear filter". The box
+   * empties, every directory is listed again, and the report says "Filter
+   * cleared."
+   */
+  it("clears the directory filter by voice", async () => {
+    const voice = microphone([]);
+    const { deck } = browsingDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openBrowser();
+    fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "bill" } });
+    const list = () => screen.getByTestId("new-agent-directory-list");
+    expect(list().querySelector("[data-path='/home/dev/docs']")).toBeNull();
+
+    voice.deliver("clear filter");
+    await completeUtterance();
+    await flush();
+
+    expect(screen.getByTestId("new-agent-filter")).toHaveValue("");
+    expect(list().querySelector("[data-path='/home/dev/docs']")).not.toBeNull();
+    expect(list().querySelector("[data-path='/home/dev/billing']")).not.toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Filter cleared.");
   });
 
   /** Scenario: a numbered directory was offered from one browser listing, then

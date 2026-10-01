@@ -509,6 +509,8 @@ pub(crate) mod tests {
                 "open_dir".to_string(),
                 "go_to_parent".to_string(),
                 "use_this_directory".to_string(),
+                "filter_directories".to_string(),
+                "clear_directory_filter".to_string(),
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),
@@ -538,6 +540,8 @@ pub(crate) mod tests {
                 "deck".to_string(),
                 "prefix".to_string(),
                 "dir".to_string(),
+                // The directory Filter box (PR #1451 round 3, change 5).
+                "text".to_string(),
                 "mode".to_string(),
                 "agent_type".to_string(),
                 "orchestration".to_string(),

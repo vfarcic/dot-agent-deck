@@ -315,6 +315,8 @@ mod tests {
                 "open_dir",
                 "go_to_parent",
                 "use_this_directory",
+                "filter_directories",
+                "clear_directory_filter",
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
@@ -390,6 +392,10 @@ mod tests {
             json!(["string", "null"])
         );
         assert_eq!(
+            schema["properties"]["params"]["properties"]["text"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
             schema["properties"]["params"]["required"],
             // `deck` ahead of `prefix` since PRD #1195's `switch_deck` row,
             // which sits above the dictation pair in the table.
@@ -398,6 +404,7 @@ mod tests {
                 "deck",
                 "prefix",
                 "dir",
+                "text",
                 "mode",
                 "agent_type",
                 "orchestration"

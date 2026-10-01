@@ -109,6 +109,18 @@ impl fmt::Display for Screen {
 /// than a matter of care: every value of this kind goes through
 /// [`super::dictation::strip_opening`], which either finds the marked words at
 /// the front of our own transcript or refuses.
+///
+/// [`ParamKind::FilterText`] resolves against the transcript too, from the
+/// other side (PR #1451 round 3, change 5): the text for the New agent dialog's
+/// directory Filter box. "show only those starting with letter D" means `d`,
+/// and no boundary in that sentence has `d` alone after it, so here the model
+/// DOES supply the value — and [`super::filter::grounded_filter_text`] holds it
+/// to the user's words before anything reaches the box: its words must occur in
+/// the transcript, adjacent and in order, or a single letter must be spelled
+/// after the word "letter". A value the user did not say is refused, never
+/// applied. That is acceptable here where it is not for dictation because the
+/// value goes into a visible filter box, changes only which directories are
+/// listed, and is quoted back in the report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParamKind {
@@ -119,10 +131,11 @@ pub enum ParamKind {
     AgentTypeRef,
     OrchestrationRef,
     SpokenPrefix,
+    FilterText,
 }
 
 impl ParamKind {
-    pub const ALL: [ParamKind; 7] = [
+    pub const ALL: [ParamKind; 8] = [
         ParamKind::AgentRef,
         ParamKind::DeckRef,
         ParamKind::DirRef,
@@ -130,6 +143,7 @@ impl ParamKind {
         ParamKind::AgentTypeRef,
         ParamKind::OrchestrationRef,
         ParamKind::SpokenPrefix,
+        ParamKind::FilterText,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -141,6 +155,7 @@ impl ParamKind {
             ParamKind::AgentTypeRef => "agent_type_ref",
             ParamKind::OrchestrationRef => "orchestration_ref",
             ParamKind::SpokenPrefix => "spoken_prefix",
+            ParamKind::FilterText => "filter_text",
         }
     }
 
@@ -167,7 +182,7 @@ impl ParamKind {
             | ParamKind::OrchestrationRef => true,
             // The user's own words, verified against the transcript; nothing
             // observed is involved.
-            ParamKind::SpokenPrefix => false,
+            ParamKind::SpokenPrefix | ParamKind::FilterText => false,
         }
     }
 }
@@ -1334,6 +1349,13 @@ mod tests {
                 ("open_dir", "openDirectory", vec!["overview"]),
                 ("go_to_parent", "goToParentDirectory", vec!["overview"]),
                 ("use_this_directory", "useThisDirectory", vec!["overview"]),
+                // The browser's Filter box (PR #1451 round 3, change 5).
+                ("filter_directories", "filterDirectories", vec!["overview"]),
+                (
+                    "clear_directory_filter",
+                    "clearDirectoryFilter",
+                    vec!["overview"]
+                ),
                 // The rest of the New agent form — `overview`, plus
                 // `requires = ["new_agent_form"]` (PRD #1223).
                 ("choose_mode", "chooseNewAgentMode", vec!["overview"]),
@@ -1650,7 +1672,7 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains(
-                "`agent_ref`, `deck_ref`, `dir_ref`, `mode_ref`, `agent_type_ref`, `orchestration_ref`, `spoken_prefix`"
+                "`agent_ref`, `deck_ref`, `dir_ref`, `mode_ref`, `agent_type_ref`, `orchestration_ref`, `spoken_prefix`, `filter_text`"
             ),
             "{message}"
         );
@@ -2449,6 +2471,11 @@ mod tests {
             ParamKind::parse("agent_type_ref"),
             Some(ParamKind::AgentTypeRef)
         );
+        assert_eq!(ParamKind::parse("filter_text"), Some(ParamKind::FilterText));
+        assert!(
+            !ParamKind::FilterText.names_something_observed(),
+            "filter text is the user's own words, not an observed name"
+        );
         assert_eq!(ParamKind::parse("agentRef"), None);
         assert_eq!(ParamKind::parse("deckRef"), None);
         assert_eq!(ParamKind::parse("dirRef"), None);
@@ -2548,6 +2575,33 @@ mod tests {
         assert!(confirm.params.is_empty());
         assert_eq!(confirm.report, "Using this directory.");
 
+        // PR #1451 round 3, change 5: the Filter box, set to text the model
+        // takes from the user's words and the app holds against them.
+        let filter = table
+            .row("filter_directories")
+            .expect("filter_directories is in the table");
+        assert_eq!(filter.invoke, "filterDirectories");
+        assert_eq!(filter.screens, vec![Screen::Overview]);
+        assert_eq!(filter.requires, vec![Requirement::DirectoryListing]);
+        assert_eq!(
+            filter.params,
+            vec![ParamSpec {
+                name: "text".to_string(),
+                kind: ParamKind::FilterText,
+                optional: false,
+            }]
+        );
+        assert_eq!(filter.report, "Filtering by \u{201c}{text}\u{201d}.");
+
+        let clear = table
+            .row("clear_directory_filter")
+            .expect("clear_directory_filter is in the table");
+        assert_eq!(clear.invoke, "clearDirectoryFilter");
+        assert_eq!(clear.screens, vec![Screen::Overview]);
+        assert_eq!(clear.requires, vec![Requirement::DirectoryListing]);
+        assert!(clear.params.is_empty());
+        assert_eq!(clear.report, "Filter cleared.");
+
         // The directory rows require the browser, and nothing else in the
         // table does.
         let needs_browser: Vec<&str> = table
@@ -2565,7 +2619,13 @@ mod tests {
             .collect();
         assert_eq!(
             needs_browser,
-            vec!["open_dir", "go_to_parent", "use_this_directory"]
+            vec![
+                "open_dir",
+                "go_to_parent",
+                "use_this_directory",
+                "filter_directories",
+                "clear_directory_filter",
+            ]
         );
     }
 
@@ -3082,7 +3142,12 @@ mod tests {
         let with_parent = listing(true);
         let at_root = listing(false);
         let row = |id: &str| table.row(id).expect("present");
-        for id in ["open_dir", "use_this_directory"] {
+        for id in [
+            "open_dir",
+            "use_this_directory",
+            "filter_directories",
+            "clear_directory_filter",
+        ] {
             assert!(
                 !row(id).callable(Screen::Overview, None, None),
                 "{id}: dialog closed"

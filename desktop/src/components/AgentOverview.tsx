@@ -923,6 +923,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       openDirectory: (target: VoiceDispatchTarget) => move((slot) => slot.openDirectory(target)),
       goToParentDirectory: (target: VoiceDispatchTarget) => move((slot) => slot.goToParentDirectory(target)),
       useThisDirectory: (target: VoiceDispatchTarget) => move((slot) => slot.useThisDirectory(target)),
+      filterDirectories: (target: VoiceDispatchTarget) => move((slot) => slot.filterDirectories(target)),
+      clearDirectoryFilter: (target: VoiceDispatchTarget) => move((slot) => slot.clearDirectoryFilter(target)),
       chooseNewAgentMode: (target: VoiceDispatchTarget) => fill((slot) => slot.chooseNewAgentMode(target)),
       chooseNewAgentType: (target: VoiceDispatchTarget) => fill((slot) => slot.chooseNewAgentType(target)),
       nameNewAgent: (target: VoiceDispatchTarget) => fill((slot) => slot.nameNewAgent(target)),

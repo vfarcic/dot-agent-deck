@@ -988,6 +988,16 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   const searching = deck?.listingOptions === true && listing?.truncated === true && filter !== "" && searchedHere === undefined && searchError === undefined;
 
   /**
+   * The Filter box's one change path — a keystroke in it and a spoken "filter
+   * …" / "clear filter" alike: the text, a cleared search error, and the cursor
+   * back at the top of the narrowed listing.
+   */
+  const changeFilter = (value: string) => {
+    setFilter(value);
+    setSearchError(undefined);
+    setCursor(0);
+  };
+  /**
    * PRD #1223 — the directory browser by voice. Each move calls the function
    * the browser's own control calls (a click on a row, the `..` row / `h`, the
    * Use this directory button / Space) and nothing else, so voice and the
@@ -1035,6 +1045,24 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     const refused = browserMovedOn(target);
     if (refused !== undefined) return refused;
     confirmCurrent();
+    return undefined;
+  };
+  /**
+   * PR #1451 round 3, change 5 — the Filter box by voice, "as if typed": the
+   * box's own change path, so the cursor returns to the top and a truncated
+   * listing searches the deck exactly as a keystroke would. The text is what
+   * Rust accepted from the user's words; "clear filter" empties the box.
+   */
+  const voiceFilterDirectories = (target: VoiceDispatchTarget): string | undefined => {
+    const refused = browserMovedOn(target);
+    if (refused !== undefined) return refused;
+    changeFilter(target.filterText ?? "");
+    return undefined;
+  };
+  const voiceClearDirectoryFilter = (target: VoiceDispatchTarget): string | undefined => {
+    const refused = browserMovedOn(target);
+    if (refused !== undefined) return refused;
+    changeFilter("");
     return undefined;
   };
   /**
@@ -1140,6 +1168,8 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
       openDirectory: voiceOpenDirectory,
       goToParentDirectory: voiceGoToParent,
       useThisDirectory: voiceUseThisDirectory,
+      filterDirectories: voiceFilterDirectories,
+      clearDirectoryFilter: voiceClearDirectoryFilter,
       /* PRD #1223 — present while mounted; its `form` only while the fields
          are live, carrying the chips and picker entries AS OFFERED on this
          render — a disabled namesake orchestration chip is not among them,
@@ -1644,11 +1674,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
               spellCheck={false}
               autoCapitalize="off"
               autoCorrect="off"
-              onChange={(event) => {
-                setFilter(event.target.value);
-                setSearchError(undefined);
-                setCursor(0);
-              }}
+              onChange={(event) => changeFilter(event.target.value)}
               onKeyDown={onFilterKeyDown}
             />
             {deck?.listingOptions && (

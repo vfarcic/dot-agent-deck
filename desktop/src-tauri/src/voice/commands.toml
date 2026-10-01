@@ -131,7 +131,8 @@
 #                    (`voice_table_no_row_is_exempt_from_action_grounding`).
 #   [[commands.params]]  name + kind, `kind` from the closed resolver set
 #                    (`agent_ref`, `deck_ref`, `dir_ref`, `mode_ref`,
-#                    `agent_type_ref`, `orchestration_ref`, `spoken_prefix`).
+#                    `agent_type_ref`, `orchestration_ref`, `spoken_prefix`,
+#                    `filter_text`).
 #                    `optional =
 #                    true` lets the row dispatch when the model supplies no
 #                    value; a value that fails is dropped with a note saying
@@ -819,6 +820,62 @@ heard_as    = [
   "use", "pick", "choose", "select", "this is the one", "this one", "that one",
   "this directory", "this folder",
 ]
+
+# PR #1451 round 3, change 5 — the directory browser's Filter box by voice,
+# "as if typed": the dialog's own `onChange` path, so the box shows the text,
+# the cursor goes back to the top and a truncated listing searches the deck,
+# exactly as typing it would. The box matches names that CONTAIN the text,
+# ignoring case, for typing and voice alike.
+#
+# **The model extracts the value, and `filter_text` holds it to the transcript.**
+# "show only those starting with letter D" means `d`, and no boundary in that
+# sentence has `d` alone after it, so `spoken_prefix`'s slicing cannot express
+# it. The model supplies the text instead, and the app accepts it only when its
+# words occur in what was heard, adjacent and in order — or, for one letter,
+# when the user spelled it after the word "letter" (`voice/filter.rs`). Text the
+# user did not say is refused and the box keeps what it had, so a directory
+# named to steer the model cannot fill it. The report quotes what was applied.
+#
+# Neither row starts, opens or chooses anything: the listing narrows or widens
+# and every directory is one word away from coming back.
+[[commands]]
+id          = "filter_directories"
+description = """In the New agent dialog's directory browser, show only the listed directories
+whose names contain some text — the browser's Filter box. Use for filter docs, filter by api,
+show only those starting with letter D, only show the ones with test in them, narrow it to
+billing. Set `text` to the text to filter by and nothing else, taken from the user's own words: a
+word or words they said ("filter docs" is "docs"), or a letter they named ("starting with letter
+D" is "d", "filter by the letter b" is "b"). Never add a word the user did not say, and never a
+directory name from the listing unless the user said it. It replaces what the Filter box held. It
+moves nothing, chooses nothing and starts nothing. Not for emptying the box
+(`clear_directory_filter`) and not for opening a directory (`open_dir`)."""
+invoke      = "filterDirectories"
+screens     = ["overview"]
+requires    = ["directory_listing"]
+unavailable_hint = "filtering needs the New agent dialog's directory listing; say “new agent” and choose a daemon first"
+report      = "Filtering by “{text}”."
+asks_to     = "filter the directories"
+try_saying  = "filter {text}"
+heard_as    = ["filter", "show only", "only show", "narrow"]
+
+  [[commands.params]]
+  name = "text"
+  kind = "filter_text"
+
+[[commands]]
+id          = "clear_directory_filter"
+description = """In the New agent dialog's directory browser, empty the Filter box so every
+directory in the listing shows again. Use for clear filter, clear the filter, remove the filter,
+reset the filter, no filter, or show all directories. It moves nothing, chooses nothing and starts
+nothing."""
+invoke      = "clearDirectoryFilter"
+screens     = ["overview"]
+requires    = ["directory_listing"]
+unavailable_hint = "clearing the filter needs the New agent dialog's directory listing; say “new agent” and choose a daemon first"
+report      = "Filter cleared."
+asks_to     = "clear the filter"
+try_saying  = "clear filter"
+heard_as    = ["clear", "remove", "reset", "no filter", "show all"]
 
 # PRD #1223 — the rest of the New agent form by voice: Mode, the agent's
 # command, and Name.

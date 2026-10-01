@@ -1169,6 +1169,7 @@ mod tests {
                 "agent_type_ref",
                 "deck_ref",
                 "dir_ref",
+                "filter_text",
                 "mode_ref",
                 "orchestration_ref",
                 "spoken_prefix",

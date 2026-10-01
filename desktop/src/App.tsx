@@ -725,6 +725,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     /* PRD #1223 — the child a `dir_ref` resolved to, against the browser's
        children on screen: its `value` is the deck's own path for it. */
     const namedDirectory = outcome.params.find((param) => param.kind === "dir_ref");
+    /* PR #1451 round 3, change 5 — the Filter box's text, which Rust accepted
+       only because the user said it. */
+    const filterText = outcome.params.find((param) => param.kind === "filter_text");
     /* PRD #1223 — the Mode chip and the agent entry a `mode_ref` and an
        `agent_type_ref` resolved to, against the form AS DECLARED: `value` is
        the id the dialog selects by. */
@@ -760,6 +763,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           : { preselectDeckId: namedDeck.value })
         : {}),
       ...(namedDirectory ? { directoryPath: namedDirectory.value } : {}),
+      ...(filterText ? { filterText: filterText.value } : {}),
       /* What the utterance was judged against, so a directory move can refuse
          a browser that has moved on since (see the member's own comment). */
       ...(declaredDirectories ? { declaredDirectories: { deckId: declaredDirectories.deckId, path: declaredDirectories.path } } : {}),

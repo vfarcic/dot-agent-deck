@@ -291,6 +291,14 @@ export type VoiceActionContext = {
   goToParentDirectory: (target: VoiceDispatchTarget) => string | undefined;
   useThisDirectory: (target: VoiceDispatchTarget) => string | undefined;
   /**
+   * PR #1451 round 3, change 5 — the browser's Filter box: set it to
+   * `target.filterText`, or empty it, through the path a keystroke in the box
+   * takes. Each re-checks the browser the utterance was judged against, as the
+   * moves above do, and answers a refusal in the dialog's words.
+   */
+  filterDirectories: (target: VoiceDispatchTarget) => string | undefined;
+  clearDirectoryFilter: (target: VoiceDispatchTarget) => string | undefined;
+  /**
    * PRD #1223 — the rest of the New agent form by voice: choose the Mode chip
    * a `mode_ref` resolved to (`target.modeId`), set Command to the default
    * command of the agent an `agent_type_ref` resolved to
@@ -730,6 +738,29 @@ export const VOICE_ACTIONS = {
     },
   },
 
+  /* PR #1451 round 3, change 5 — the browser's Filter box. Narrowing or
+     widening the listing starts and chooses nothing, and typing in the box is
+     unchanged: it calls the same dialog function. */
+  filterDirectories: {
+    label: "Filter the New agent browser's directories",
+    voice: true,
+    needs: ["filterDirectories", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "filterDirectories" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.filterDirectories(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  clearDirectoryFilter: {
+    label: "Clear the New agent browser's directory filter",
+    voice: true,
+    needs: ["clearDirectoryFilter", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "clearDirectoryFilter" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.clearDirectoryFilter(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
   /* PRD #1223 — the three `new_agent_form` rows: Mode, Agent and Name. None
      starts anything, so none is in PRD #802 D5's confirmation set; the manual
      chips, picker and Name input are unchanged and call the same functions.
@@ -914,6 +945,14 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    */
   directoryPath?: string;
   /**
+   * The text for the directory browser's Filter box — what a row's
+   * `filter_text` param resolved to (PR #1451 round 3, change 5). The model
+   * extracted it ("letter D" is `d`) and Rust accepted it only because the
+   * user said it, so an entry reading this member reads the user's own words
+   * or nothing. Lowercase; the box matches case-insensitively.
+   */
+  filterText?: string;
+  /**
    * The directory browser the utterance was JUDGED against: the deck and the
    * listing `path` the webview declared with it (PRD #1223), or absent when it
    * declared none.
@@ -1063,7 +1102,7 @@ export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "swit
  * dialog for; a dispatch of `openNewAgent` there is refused against its
  * `needs`, the way the overview refuses a deck overlay.
  */
-export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration">;
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration">;
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
 export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "startNewAgent" | "discardNewAgent";
@@ -1083,7 +1122,7 @@ export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "
  * (see `AgentOverview`), which is what keeps "the dialog closed during the
  * round trip" a refusal with a sentence rather than a `needs` miss.
  */
-export type NewAgentVoice = Pick<VoiceActionContext, "openDirectory" | "goToParentDirectory" | "useThisDirectory" | NewAgentFormMember> & {
+export type NewAgentVoice = Pick<VoiceActionContext, "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember> & {
   directories: import("./bridge").VoiceDirectoriesDto | undefined;
   /**
    * The dialog's own declaration — present for as long as it is mounted, with

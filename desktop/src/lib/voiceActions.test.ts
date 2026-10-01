@@ -166,6 +166,9 @@ describe("VOICE_ACTIONS", () => {
       "openDirectory",
       "goToParentDirectory",
       "useThisDirectory",
+      // PR #1451 round 3, change 5: the browser's Filter box.
+      "filterDirectories",
+      "clearDirectoryFilter",
     ];
 
     expect(Array.isArray(VOICE_ACTIONS)).toBe(false);

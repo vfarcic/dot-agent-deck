@@ -43,6 +43,7 @@
 pub mod capture;
 pub mod choice;
 pub mod dictation;
+mod filter;
 pub mod hold;
 pub mod http;
 pub mod openai;

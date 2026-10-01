@@ -358,6 +358,8 @@ mod tests {
                 "open_dir".to_string(),
                 "go_to_parent".to_string(),
                 "use_this_directory".to_string(),
+                "filter_directories".to_string(),
+                "clear_directory_filter".to_string(),
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),
@@ -431,6 +433,8 @@ mod tests {
                 "open_dir",
                 "go_to_parent",
                 "use_this_directory",
+                "filter_directories",
+                "clear_directory_filter",
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
@@ -485,8 +489,14 @@ mod tests {
             annotate_with(table(), screen, directories, None)
                 .into_iter()
                 .filter(|command| {
-                    ["open_dir", "go_to_parent", "use_this_directory"]
-                        .contains(&command.id.as_str())
+                    [
+                        "open_dir",
+                        "go_to_parent",
+                        "use_this_directory",
+                        "filter_directories",
+                        "clear_directory_filter",
+                    ]
+                    .contains(&command.id.as_str())
                 })
                 .map(|command| (command.id, command.callable))
                 .collect::<Vec<_>>()
@@ -499,6 +509,8 @@ mod tests {
                 ("open_dir".to_string(), true),
                 ("go_to_parent".to_string(), true),
                 ("use_this_directory".to_string(), true),
+                ("filter_directories".to_string(), true),
+                ("clear_directory_filter".to_string(), true),
             ]
         );
         assert_eq!(
@@ -507,6 +519,8 @@ mod tests {
                 ("open_dir".to_string(), true),
                 ("go_to_parent".to_string(), false),
                 ("use_this_directory".to_string(), true),
+                ("filter_directories".to_string(), true),
+                ("clear_directory_filter".to_string(), true),
             ]
         );
         for screen in [Screen::Deck, Screen::Agent] {
@@ -523,8 +537,14 @@ mod tests {
             annotate_with(table(), Screen::Overview, directories, None)
                 .into_iter()
                 .filter(|command| {
-                    !["open_dir", "go_to_parent", "use_this_directory"]
-                        .contains(&command.id.as_str())
+                    ![
+                        "open_dir",
+                        "go_to_parent",
+                        "use_this_directory",
+                        "filter_directories",
+                        "clear_directory_filter",
+                    ]
+                    .contains(&command.id.as_str())
                 })
                 .map(|command| (command.id, command.callable))
                 .collect::<Vec<_>>()
@@ -600,6 +620,8 @@ mod tests {
                 ("open_dir".to_string(), false),
                 ("go_to_parent".to_string(), false),
                 ("use_this_directory".to_string(), false),
+                ("filter_directories".to_string(), false),
+                ("clear_directory_filter".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
@@ -635,6 +657,8 @@ mod tests {
                 ("open_dir".to_string(), false),
                 ("go_to_parent".to_string(), false),
                 ("use_this_directory".to_string(), false),
+                ("filter_directories".to_string(), false),
+                ("clear_directory_filter".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
@@ -669,6 +693,8 @@ mod tests {
                 ("open_dir".to_string(), false),
                 ("go_to_parent".to_string(), false),
                 ("use_this_directory".to_string(), false),
+                ("filter_directories".to_string(), false),
+                ("clear_directory_filter".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),

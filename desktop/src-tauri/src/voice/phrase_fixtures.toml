@@ -911,6 +911,45 @@ screen = "overview"
 action = "open_dir"
 outcome = "unavailable"
 
+# PR #1451 round 3, change 5 — the directory Filter box by voice. The model
+# extracts the text and the app holds it to the transcript, so
+# `resolved_filter` is what the box would be set to: the user's word, or the
+# letter they named inside a longer sentence, lowercased.
+[[fixtures]]
+name = "filter-directories-word"
+utterance = "filter docs"
+screen = "overview"
+listing = true
+action = "filter_directories"
+outcome = "dispatch"
+resolved_filter = "docs"
+
+[[fixtures]]
+name = "filter-directories-letter-in-a-sentence"
+utterance = "show only those starting with letter D"
+screen = "overview"
+listing = true
+action = "filter_directories"
+outcome = "dispatch"
+resolved_filter = "d"
+
+[[fixtures]]
+name = "filter-directories-clear"
+utterance = "clear filter"
+screen = "overview"
+listing = true
+action = "clear_directory_filter"
+outcome = "dispatch"
+
+# The negative: with no listing on screen there is no Filter box, so the filter
+# is refused as not available here and nothing is set.
+[[fixtures]]
+name = "filter-directories-dialog-closed"
+utterance = "filter docs"
+screen = "overview"
+action = "filter_directories"
+outcome = "unavailable"
+
 # PRD #1223 — the rest of the New agent form by voice. `form = true` plants a
 # live form (it implies the dialog is open): Mode chips No mode, Orch:
 # billing-run, schedule and dispatcher — NO `schedule: issues`, because the
