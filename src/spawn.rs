@@ -3795,10 +3795,9 @@ mod tests {
     /// establishes it.
     fn attempt_slice(bytes: &[u8], attempt: usize) -> Vec<u8> {
         let index = attempt.saturating_sub(1);
-        let line_ends: Vec<usize> = (0..bytes.len().saturating_sub(1))
-            .filter(|&at| &bytes[at..at + 2] == b"\r\n")
-            .map(|at| at + 2)
-            .collect();
+        // The same line ends `completed_lines` counts, ConPTY's cursor jumps
+        // included, so the wait and the slice agree about where a line ended.
+        let line_ends = crate::test_pty_wait::line_ends(bytes);
         assert!(
             line_ends.len() >= 2 * index,
             "attempt {attempt} is not complete in this buffer: {:?}",

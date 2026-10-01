@@ -56,8 +56,83 @@ use std::time::{Duration, Instant};
 ///
 /// Callers in `spawn.rs` count DELIVERY ATTEMPTS with it, one line each; the
 /// `ui.rs` and `state.rs` callers count writes. The unit is the same.
+///
+/// On Windows the count is [`line_ends`]'s, which also reads ConPTY's cursor
+/// jumps — see there for why a `\r\n` count alone undercounts on ConPTY.
 pub(crate) fn completed_lines(bytes: &[u8]) -> usize {
-    bytes.windows(2).filter(|window| *window == b"\r\n").count()
+    line_ends(bytes).len()
+}
+
+/// Where each line advance in `bytes` ends: the offset just past it, one entry
+/// per line, in order. [`completed_lines`] is its length, and `spawn.rs`'s
+/// `attempt_slice` cuts delivery attempts at these offsets, so the count and
+/// the slice cannot disagree about where a line ended.
+///
+/// **On Unix a line advance is a `\r\n` and nothing else.** On Windows it is
+/// also a downward cursor jump, because ConPTY does not always draw a blank line
+/// as one: it repaints, and a run of empty rows can arrive as a single
+/// `ESC[<row>;<col>H` that moves the cursor past them instead. Measured on
+/// `build-windows` (PR #1474's first run, `scheduler/dispatch/016`): four
+/// payload lines as `\r\n`, then the two submit-only probes' four blank lines
+/// as `ESC[7;1H` and `ESC[9;1H` — so a `\r\n` count stopped at 4 of the 6
+/// terminators the wait needed, and no deadline could have reached 6. A jump to
+/// a row below the cursor counts one advance per row skipped, all ending where
+/// the jump does; a jump up, or to the row the cursor is on, counts none.
+///
+/// The row is tracked from the top of the screen and never clamped, which holds
+/// while a buffer stays inside one screen — every caller writes a handful of
+/// lines into a 24-row pane, and a buffer that scrolled would undercount, which
+/// makes a wait slower to return, never early.
+pub(crate) fn line_ends(bytes: &[u8]) -> Vec<usize> {
+    line_ends_reading_cursor_jumps(bytes, cfg!(windows))
+}
+
+/// [`line_ends`] with the platform choice made explicit, so the ConPTY branch is
+/// testable on every platform and the Unix one stays byte-for-byte what it was.
+fn line_ends_reading_cursor_jumps(bytes: &[u8], cursor_jumps: bool) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut row: usize = 1;
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at..].starts_with(b"\r\n") {
+            at += 2;
+            ends.push(at);
+            row += 1;
+            continue;
+        }
+        if cursor_jumps && let Some((target_row, length)) = cursor_position(&bytes[at..]) {
+            at += length;
+            for _ in row..target_row.max(row) {
+                ends.push(at);
+            }
+            row = target_row;
+            continue;
+        }
+        at += 1;
+    }
+    ends
+}
+
+/// A CUP sequence at the start of `bytes` — `ESC[H`, `ESC[<row>H` or
+/// `ESC[<row>;<col>H` — as its 1-based target row and its length in bytes.
+fn cursor_position(bytes: &[u8]) -> Option<(usize, usize)> {
+    let params = bytes.strip_prefix(b"\x1b[")?;
+    let end = params
+        .iter()
+        .position(|byte| !(byte.is_ascii_digit() || *byte == b';'))?;
+    if params[end] != b'H' {
+        return None;
+    }
+    let row_digits = params[..end]
+        .split(|byte| *byte == b';')
+        .next()
+        .unwrap_or_default();
+    let row = std::str::from_utf8(row_digits)
+        .ok()?
+        .parse::<usize>()
+        .unwrap_or(1)
+        .max(1);
+    Some((row, 2 + end + 1))
 }
 
 /// Block until `lines` completed input lines have finished round-tripping,
@@ -340,4 +415,66 @@ pub(crate) async fn type_user_draft(
         lines_already_written,
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The buffer `scheduler/dispatch/016` held when it timed out on
+    /// `build-windows` (PR #1474's first run), verbatim: four payload lines
+    /// drawn as `\r\n`, then two submit-only probes whose four blank lines
+    /// ConPTY drew as two cursor jumps.
+    const CONPTY_SNAPSHOT: &[u8] = b"\x1b[?9001h\x1b[?1004h\x1b[?25l\x1b[2J\x1b[m\x1b[H\x1b]0;C:\\Windows\\system32\\more.com\x07\x1b[?25h\x1b[79XISSUE-666-ARMED-THIRD-PAYLOAD\r\nISSUE-666-ARMED-THIRD-PAYLOAD\r\nISSUE-666-ARMED-THIRD-PAYLOAD\r\nISSUE-666-ARMED-THIRD-PAYLOAD\r\n\x1b[?25l\x1b[7;1H\x1b[?25h\x1b[?25l\x1b[9;1H\x1b[?25h";
+
+    #[test]
+    fn conpty_blank_lines_drawn_as_cursor_jumps_are_counted() {
+        let ends = line_ends_reading_cursor_jumps(CONPTY_SNAPSHOT, true);
+        assert_eq!(
+            ends.len(),
+            8,
+            "four `\\r\\n` lines and four blank rows skipped by two jumps: {ends:?}"
+        );
+        // Counting `\r\n` alone is what the wait did, and it stops at 4 of the
+        // 6 the test needed — the timeout, reproduced.
+        assert_eq!(
+            line_ends_reading_cursor_jumps(CONPTY_SNAPSHOT, false).len(),
+            4
+        );
+        // Each skipped row ends where its jump does, so a probe's slice runs
+        // from the previous line end through the jump: non-empty, no payload.
+        let first_jump = CONPTY_SNAPSHOT
+            .windows(b"\x1b[7;1H".len())
+            .position(|window| window == b"\x1b[7;1H")
+            .expect("the first jump")
+            + b"\x1b[7;1H".len();
+        assert_eq!(ends[4], first_jump);
+        assert_eq!(ends[5], first_jump);
+    }
+
+    #[test]
+    fn a_jump_up_or_to_the_current_row_advances_nothing() {
+        // Row 1 → `\r\n` → row 2. `ESC[2;5H` stays on row 2 and `ESC[H` goes
+        // home, so neither advances; the closing `ESC[3H` jumps from row 1 to
+        // row 3, two advances ending where it does.
+        let bytes = b"one\r\n\x1b[2;5Hx\x1b[Hy\x1b[3H";
+        assert_eq!(
+            line_ends_reading_cursor_jumps(bytes, true),
+            vec![5, bytes.len(), bytes.len()]
+        );
+    }
+
+    #[test]
+    fn without_cursor_jumps_only_crlf_counts() {
+        // The Unix arm is the old `\r\n` count, cursor sequences or not.
+        let bytes = b"a\r\n\x1b[9;1Hb\r\n\r\n";
+        assert_eq!(
+            line_ends_reading_cursor_jumps(bytes, false),
+            vec![3, 12, 14]
+        );
+        assert_eq!(
+            line_ends_reading_cursor_jumps(bytes, false).len(),
+            bytes.windows(2).filter(|window| *window == b"\r\n").count()
+        );
+    }
 }
