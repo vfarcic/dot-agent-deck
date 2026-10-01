@@ -559,7 +559,7 @@ impl DirPickerState {
 /// PRD #127 M3.2: display name of the built-in "schedule" authoring option in
 /// the new-deck dialog's Mode cycler. It is appended to the end of the cycle
 /// and spawns a throwaway authoring agent pre-seeded with
-/// [`SCHEDULE_AUTHORING_SEED_PROMPT`](crate::authoring_seeds::SCHEDULE_AUTHORING_SEED_PROMPT).
+/// [`schedule_authoring_seed_prompt`](crate::authoring_seeds::schedule_authoring_seed_prompt).
 const SCHEDULE_MODE_NAME: &str = "schedule";
 
 /// PRD #120: display name of the flag-gated issue-dispatch authoring option in
@@ -567,7 +567,7 @@ const SCHEDULE_MODE_NAME: &str = "schedule";
 /// appended AFTER `schedule` and shown only when
 /// [`crate::features::show_issue_dispatch_authoring`] is true. Selecting it
 /// spawns a throwaway authoring agent seeded with
-/// [`ISSUE_DISPATCH_AUTHORING_SEED_PROMPT`](crate::authoring_seeds::ISSUE_DISPATCH_AUTHORING_SEED_PROMPT), which calls `schedule add --repo …`.
+/// [`issue_dispatch_authoring_seed_prompt`](crate::authoring_seeds::issue_dispatch_authoring_seed_prompt), which calls `schedule add --repo …`.
 const ISSUE_DISPATCH_MODE_NAME: &str = "schedule: issues";
 
 /// PRD #170 round 2 (reviewer finding 1): the fallback agent command for a
@@ -635,7 +635,7 @@ impl BuiltinOption {
 }
 
 /// PRD #220: build the dispatcher seed — the prompt that teaches the agent the
-/// `dispatch` verb (see [`DISPATCHER_SEED_PROMPT`](crate::authoring_seeds::DISPATCHER_SEED_PROMPT)).
+/// `dispatch` verb (see [`dispatcher_seed_prompt`](crate::authoring_seeds::dispatcher_seed_prompt)).
 ///
 /// Appends the pane's own `working_dir`, since the seed's `../<repo>-dispatch-…`
 /// layout is relative to it and the agent otherwise has to infer it.
@@ -679,7 +679,7 @@ fn schedule_next_fire_display(task: &crate::config::ScheduledTask) -> String {
 
 /// Build the "schedule" authoring seed for the manager's add/edit
 /// actions (PRD #127 M3.3). Both reuse the 3B-i seeded authoring agent. For
-/// **add**, the seed is the base [`SCHEDULE_AUTHORING_SEED_PROMPT`](crate::authoring_seeds::SCHEDULE_AUTHORING_SEED_PROMPT). For
+/// **add**, the seed is the base [`schedule_authoring_seed_prompt`](crate::authoring_seeds::schedule_authoring_seed_prompt). For
 /// **edit**, the existing entry's current values are injected so the agent
 /// starts from them and calls `schedule update` (NOT `add`); renaming is
 /// forbidden (the `name` is the reuse-registry key — to rename, remove + add).
@@ -702,7 +702,7 @@ fn build_schedule_authoring_seed(
 }
 
 /// PRD #120: build the issue-dispatch authoring seed (base
-/// [`ISSUE_DISPATCH_AUTHORING_SEED_PROMPT`](crate::authoring_seeds::ISSUE_DISPATCH_AUTHORING_SEED_PROMPT) + the picked dir as the workspace
+/// [`issue_dispatch_authoring_seed_prompt`](crate::authoring_seeds::issue_dispatch_authoring_seed_prompt) + the picked dir as the workspace
 /// `working_dir` DEFAULT). Like the plain-schedule seed, the picked directory is
 /// appended so the agent's `schedule add --repo …` naturally targets it unless
 /// the user names another. There is no Edit variant — the manager's Add/Edit is
@@ -23484,7 +23484,7 @@ mod tests {
         );
     }
     use crate::authoring_seeds::{
-        AuthoringKind, DISPATCHER_SEED_PROMPT, SCHEDULE_AUTHORING_SEED_PROMPT,
+        AuthoringKind, dispatcher_seed_prompt, schedule_authoring_seed_prompt,
     };
     use crate::event::{AgentEvent, AgentType, EventType};
     use crate::orchestrator_context::build_orchestrator_context;
@@ -33420,11 +33420,11 @@ mod tests {
     fn dispatcher_mode_name_and_seed_constants() {
         assert_eq!(DISPATCHER_MODE_NAME, "dispatcher");
         assert!(
-            DISPATCHER_SEED_PROMPT.contains("dispatch"),
+            dispatcher_seed_prompt().contains("dispatch"),
             "seed must contain 'dispatch'"
         );
         assert!(
-            DISPATCHER_SEED_PROMPT.contains("worktree"),
+            dispatcher_seed_prompt().contains("worktree"),
             "seed must contain 'worktree'"
         );
     }
@@ -33433,7 +33433,7 @@ mod tests {
     fn build_dispatcher_seed_carries_the_working_dir() {
         let seed = build_dispatcher_seed(std::path::Path::new("/tmp/test-repo"));
         assert!(
-            seed.starts_with(DISPATCHER_SEED_PROMPT),
+            seed.starts_with(&dispatcher_seed_prompt()),
             "seed must start with the constant prompt, got:\n{seed}"
         );
         assert!(
@@ -33461,13 +33461,21 @@ mod tests {
             "NEVER do the work yourself",
         ] {
             assert!(
-                !DISPATCHER_SEED_PROMPT.contains(banned),
+                !dispatcher_seed_prompt().contains(banned),
                 "the dispatcher seed must not carry work-methodology copy, found {banned:?}"
             );
         }
         // The mechanics it MUST still carry.
+        // Issue #1385: the verb is named by the running deck's path, which an
+        // agent's `$PATH` cannot redirect, not by the bare name.
+        let bin = crate::platform::paths::binary_name();
+        let dispatch_verb = format!("{bin} dispatch <name>");
+        assert!(
+            !dispatcher_seed_prompt().contains("dot-agent-deck dispatch <name>"),
+            "the dispatcher seed must not name the deck by its bare name"
+        );
         for required in [
-            "dot-agent-deck dispatch <name>",
+            dispatch_verb.as_str(),
             "SELF-CONTAINED",
             "../<repo>-dispatch-<name>",
             "single-use",
@@ -33503,7 +33511,7 @@ mod tests {
             "RELATIVE to the repo root",
         ] {
             assert!(
-                DISPATCHER_SEED_PROMPT.contains(required),
+                dispatcher_seed_prompt().contains(required),
                 "the dispatcher seed must still teach {required:?}"
             );
         }
@@ -33527,7 +33535,7 @@ mod tests {
     fn dispatcher_seed_quotes_the_opening_the_daemon_actually_sends() {
         const QUOTED_OPENING: &str = "dispatch: a unit you dispatched has completed";
         assert!(
-            DISPATCHER_SEED_PROMPT.contains(QUOTED_OPENING),
+            dispatcher_seed_prompt().contains(QUOTED_OPENING),
             "the seed must quote the opening of the completion turn"
         );
         let delivered = crate::dispatch_return::compose_completion_report(
@@ -33545,7 +33553,7 @@ mod tests {
         // repository's words as data, so pin it against the real frames too.
         for frame in ["UNTRUSTED-ROLE-LABEL", "UNTRUSTED-WORKER-REPORT"] {
             assert!(
-                DISPATCHER_SEED_PROMPT.contains(frame),
+                dispatcher_seed_prompt().contains(frame),
                 "the seed must name the {frame:?} frame the agent will actually see"
             );
             assert!(
@@ -33568,16 +33576,16 @@ mod tests {
     #[test]
     fn dispatcher_seed_says_the_exit_status_is_not_the_outcome() {
         assert!(
-            DISPATCHER_SEED_PROMPT.contains(crate::dispatch::SPAWNED_OPENING),
+            dispatcher_seed_prompt().contains(crate::dispatch::SPAWNED_OPENING),
             "the seed must quote the opening the daemon's success reply actually uses, {:?}",
             crate::dispatch::SPAWNED_OPENING
         );
         assert!(
-            DISPATCHER_SEED_PROMPT.contains("exit status says only that the daemon ACCEPTED"),
+            dispatcher_seed_prompt().contains("exit status says only that the daemon ACCEPTED"),
             "the seed must say what the exit status does and does not assert"
         );
         assert!(
-            !DISPATCHER_SEED_PROMPT.contains("Returns immediately and reports what was started"),
+            !dispatcher_seed_prompt().contains("Returns immediately and reports what was started"),
             "the pre-#530 sentence read the return as the report of what started"
         );
     }
@@ -33594,12 +33602,12 @@ mod tests {
     #[test]
     fn dispatcher_seed_asks_the_shape_once_per_unit() {
         assert!(
-            DISPATCHER_SEED_PROMPT.contains("ONCE PER UNIT"),
+            dispatcher_seed_prompt().contains("ONCE PER UNIT"),
             "the dispatcher seed must ask the shape per unit"
         );
         for banned in ["before the FIRST dispatch", "Reuse the answer"] {
             assert!(
-                !DISPATCHER_SEED_PROMPT.contains(banned),
+                !dispatcher_seed_prompt().contains(banned),
                 "the dispatcher seed must not ask the shape once per batch, found {banned:?}"
             );
         }
@@ -33675,7 +33683,7 @@ mod tests {
             .as_deref()
             .expect("the dispatcher card must carry its seed on the request");
         assert!(
-            seed.starts_with(DISPATCHER_SEED_PROMPT),
+            seed.starts_with(&dispatcher_seed_prompt()),
             "the card's seed must be the dispatcher seed, got:\n{seed}"
         );
         assert!(
@@ -33771,7 +33779,7 @@ mod tests {
         // Add starts from the base seed (invokes `schedule add`, no edit block) —
         // PRD #170 appends the picked-dir working_dir DEFAULT line.
         assert!(
-            seed.starts_with(SCHEDULE_AUTHORING_SEED_PROMPT),
+            seed.starts_with(&schedule_authoring_seed_prompt()),
             "add seed must begin with the base authoring seed"
         );
         assert!(seed.contains("schedule add"));
@@ -33813,9 +33821,13 @@ mod tests {
             "edit seed must carry the row's name"
         );
         // Edit drives `schedule update`, never `add`-as-rename, and forbids rename.
+        // Issue #1385: named by the running deck's path, not the bare name.
         assert!(
-            seed.contains("schedule update"),
-            "edit seed must instruct `schedule update`"
+            seed.contains(&format!(
+                "{} schedule update --name digest",
+                crate::platform::paths::binary_name()
+            )),
+            "edit seed must instruct `schedule update` through the running deck, got:\n{seed}"
         );
         assert!(
             seed.to_lowercase().contains("rename is forbidden"),
