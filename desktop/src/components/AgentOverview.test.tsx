@@ -36,9 +36,12 @@ vi.mock("./TerminalViewport", () => ({
   },
 }));
 
-import { DeckShell } from "../App";
+import { DeckShell, DeckSurface } from "../App";
+import { VoiceOn } from "../hooks/useVoiceOn";
+import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import logoUrl from "../assets/logo.svg";
 import { agentDomKey, agentKey, AgentOverview, ALL_OVERVIEW_COLUMNS, OVERVIEW_CLOCK_TICK_MS, anonymousOrchestrationKey, DEFAULT_OVERVIEW_COLUMNS, gridTemplateFor, groupAgents, groupKey, hoistedCwdOf, orderedColumns, OVERVIEW_COLUMNS_STORAGE_KEY, PERMANENT_COLUMN, readStoredColumns, type OverviewAgent, type OverviewColumnId, type OverviewGroupKind, toOverviewAgent } from "./AgentOverview";
+import { DeckSelector } from "./DeckSelector";
 
 // Existing overview/deck navigation cases exercise the experimental surface.
 // Each shipped-default case below removes this query parameter explicitly.
@@ -121,6 +124,37 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     fleet: overrides.fleet ?? [overrides.snapshot ?? base],
   };
 }
+
+describe.each(["selector", "overview", "deck"] as const)("%s voice toggle", (surface) => {
+  /// Scenario: Turning voice on and off keeps this numbered desktop surface mounted without React reporting a changed hook order.
+  /// The selector, overview, and deck each have hooks after their voice-number visibility check.
+  it("keeps the hook order stable off, on, and off", () => {
+    const deck = runtime();
+    const settings: DesktopSettingsState = {
+      settings: structuredClone(DEFAULT_DESKTOP_SETTINGS),
+      loaded: true,
+      chosen: true,
+      save: () => undefined,
+    };
+    const body = surface === "overview"
+      ? <AgentOverview runtime={deck} settings={settings} onNavigate={vi.fn()} />
+      : surface === "deck"
+        ? <DeckSurface runtime={deck} settings={settings} />
+        : <DeckSelector settings={settings} connection={deck.snapshot.connection} />;
+    const errors: string[] = [];
+    const error = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    try {
+      const { rerender } = render(<VoiceOn.Provider value={false}>{body}</VoiceOn.Provider>);
+      rerender(<VoiceOn.Provider value={true}>{body}</VoiceOn.Provider>);
+      rerender(<VoiceOn.Provider value={false}>{body}</VoiceOn.Provider>);
+      expect(errors.filter((message) => /order of Hooks|Rendered (more|fewer) hooks/i.test(message))).toEqual([]);
+    } finally {
+      error.mockRestore();
+    }
+  });
+});
 
 /**
  * The overview with EVERY column on screen, which is what most of this file is
