@@ -429,6 +429,9 @@ fn is_backstop_armed_signal(event: &AgentEvent) -> bool {
 /// test stalls past [`ARMED_CAP_SECS`] + grace after the arm, the cap ends the
 /// child before the wrapper is ever killed, and the armed assertion would then
 /// pass without a reaper having outlived anything.
+///
+/// Every failure, the event socket's own included, comes back as `Err` rather
+/// than a panic, so the caller's cleanup still runs before it reports one.
 fn ready_to_strand(listener: &UnixListener, pid: libc::pid_t) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut events: Vec<AgentEvent> = Vec::new();
@@ -436,11 +439,15 @@ fn ready_to_strand(listener: &UnixListener, pid: libc::pid_t) -> Result<(), Stri
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let mut json = String::new();
-                stream
-                    .read_to_string(&mut json)
-                    .expect("read probe wrapper event");
-                let event: AgentEvent =
-                    serde_json::from_str(json.trim()).expect("parse probe wrapper event");
+                if let Err(error) = stream.read_to_string(&mut json) {
+                    return Err(format!("read probe wrapper event: {error}"));
+                }
+                let event: AgentEvent = match serde_json::from_str(json.trim()) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        return Err(format!("parse probe wrapper event {json:?}: {error}"));
+                    }
+                };
                 let matched = is_backstop_armed_signal(&event);
                 events.push(event);
                 if matched {
@@ -453,7 +460,7 @@ fn ready_to_strand(listener: &UnixListener, pid: libc::pid_t) -> Result<(), Stri
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(error) => panic!("accept probe wrapper event: {error}"),
+            Err(error) => return Err(format!("accept probe wrapper event: {error}")),
         }
     };
     if !armed {
@@ -475,7 +482,8 @@ fn ready_to_strand(listener: &UnixListener, pid: libc::pid_t) -> Result<(), Stri
 }
 
 /// SIGKILL a probe's wrapper and collect it. Shared by the success path and the
-/// cleanup paths, so no failure leaves a wrapper running.
+/// cleanup that follows a failed [`ready_to_strand`], so neither leaves the
+/// wrapper running.
 fn kill_wrapper(wrapper: &mut Child) {
     let wrapper_pid = wrapper.id() as libc::pid_t;
     // SAFETY: the wrapper pid came from this test's live `Child`; ending it
