@@ -2189,6 +2189,21 @@ fn pump_reader(
             Err(_) => break,
         }
     }
+    // Issue #868: must run regardless of whether `pane_id_env` is set — a
+    // dashboard pane crashes just as much as an orchestration one, and the
+    // block below (release/sweep/notify) only fires when a pane id exists.
+    //
+    // And BEFORE `exited` is published, so the crash verdict is settled by the
+    // time anyone can see the agent as gone: a reader that observes `exited`
+    // (a `SeqCst` load) and then takes the registry lock sees `crashed` too.
+    // The other order left a window in which an exited agent read as not
+    // crashed — measured as
+    // `pump_reader_marks_natural_exit_as_crashed_but_not_deliberate_close`
+    // failing under plain `cargo test`, and reachable by a `pane restart`
+    // refusal check landing in it.
+    if let Some(registry) = registry.upgrade() {
+        registry.mark_agent_crashed(&agent_id);
+    }
     exited.store(true, Ordering::SeqCst);
     change_notify.notify_one();
     // Issue #584: release anyone waiting on THIS agent's liveness before the
@@ -2197,12 +2212,6 @@ fn pump_reader(
     // a fixed 30 s window. A dropped registry leaves nothing to wake.
     if let Some(registry) = registry.upgrade() {
         registry.signal_agent_exit(&agent_id);
-    }
-    // Issue #868: must run regardless of whether `pane_id_env` is set — a
-    // dashboard pane crashes just as much as an orchestration one, and the
-    // block below (release/sweep/notify) only fires when a pane id exists.
-    if let Some(registry) = registry.upgrade() {
-        registry.mark_agent_crashed(&agent_id);
     }
     if let Some(pane_id) = pane_id_env.as_deref()
         && let Some(registry) = registry.upgrade()
@@ -20072,25 +20081,22 @@ mod spawn_tests {
             !registry.draft_pending(PANE),
             "the user's Enter after our paste closed was read as paste content"
         );
-        // Asserted on the time the write spent waiting for a draft, not on its
-        // wall clock: a write with nothing pending still pays `SUBMIT_DELAY`
-        // and the echo gate, which on a loaded box alone ran past `CAP` and
-        // failed this with no draft wait at all.
+        let started = Instant::now();
         let next = registry
-            .write_and_submit_guarded_first_write_detailed(
+            .write_and_submit_guarded_first_write_capped(
                 PANE,
                 "ISSUE-544-NEXT",
                 &agent,
                 || async { true },
                 Instant::now(),
+                CAP,
             )
             .await
             .expect("next write");
-        assert_eq!(next.detail.outcome(), GuardedSend::Applied);
+        assert_eq!(next, GuardedSend::Applied);
         assert!(
-            next.deferred.is_zero(),
-            "the next first write waited {:?} for a draft the agent already submitted",
-            next.deferred
+            started.elapsed() < CAP,
+            "the next first write waited for a draft the agent already submitted"
         );
         registry.shutdown_all();
     }
