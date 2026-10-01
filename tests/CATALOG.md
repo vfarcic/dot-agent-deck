@@ -5979,8 +5979,8 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 ##### scheduler/dispatch/023 — An unsent worker draft holds a production delegate pointer until the user submits it (issue #544).
 - **Layer:** fast integration (production `handle_delegate` into a real `cat` PTY).
-- **Agent:** none; `cat` observes the submitted PTY bytes.
-- **Asserts:** a draft typed through the attached writer remains separate from the delegate pointer; the pointer stays absent during a one-second unsent window while additional user keystrokes still reach the PTY promptly, and arrives after Enter as its own submitted line. Sibling controls assert Ctrl+U release, that forwarded terminal reports do not defer, that cap expiry delivers, publishes one `DeliveryNotice`, and clears the bit for a later first write, and that closing the target during the wait sends no pointer bytes.
+- **Agent:** none. The headline test's worker is `cat >/dev/null`, so its snapshot is the PTY's echo alone — the input bytes in the order the PTY received them — because `cat`'s write-back of a submitted line can land inside the echo of the next one on a starved machine; the sibling controls use plain `cat`.
+- **Asserts:** a draft typed through the attached writer remains separate from the delegate pointer; the pointer stays absent during a one-second unsent window while additional user keystrokes are written without waiting behind the delegate (and reach the PTY), and arrives after Enter as its own submitted line. Sibling controls assert Ctrl+U release, that forwarded terminal reports do not defer, that cap expiry delivers, publishes one `DeliveryNotice`, and clears the bit for a later first write, and that closing the target during the wait sends no pointer bytes.
 - **Does not assert:** an agent's native editor occupancy, a real agent's interpretation of the pointer, or the daemon-to-TUI rendering of the capped-delivery notice.
 - **Platform coverage:** mac+linux.
 
