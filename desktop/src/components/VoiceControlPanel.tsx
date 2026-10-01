@@ -1493,6 +1493,29 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       setProblem(sentenceOf(cause));
     }
   }, [sendTerminalInput]);
+  /**
+   * Press Enter once every typed write since the last send has landed — the
+   * guarded half of a spoken send, shared by "send it" and a trailing send
+   * sentence (PR #1451 round 3).
+   *
+   * PR #1451 (Qodo) — a write that failed has already said so (and ended
+   * typing mode); the Enter is then dropped rather than submitting what was in
+   * the prompt before, and so is one whose pane or mode moved while it waited.
+   */
+  const submitAfterWrites = useCallback((aim: Pending) => {
+    const written = lastWrite.current;
+    lastWrite.current = undefined;
+    if (written === undefined) {
+      void submitDictation(aim);
+      return;
+    }
+    const declared = current();
+    const generation = modeGeneration.current;
+    void written.then((ok) => {
+      if (!ok || modeGeneration.current !== generation || contextLost(declared, current(), { pane: aim })) return;
+      void submitDictation(aim);
+    });
+  }, [current, submitDictation]);
 
   /**
    * Start the visible countdown to a send, replacing any already running.
@@ -2329,14 +2352,19 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
          it, and a same-id replacement ends the mode, so it names the pane's
          incarnation as well. */
       const generation = modeGeneration.current;
+      /* PR #1451 round 3 — the utterance ended with a separate send sentence
+         ("… Send it."), which Rust left out of `typed`: Enter follows these
+         words through the same guarded path as a spoken "send it", so it is
+         pressed only once they have landed. */
+      const sends = target.thenSubmit === true;
       const write = sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed);
       trackWrite(write);
       void write.then(
         /* PR #1451 — words are in the prompt and unsent: start the pause
            clock for the nudge to send. A write from a mode that has since
-           ended arms nothing. */
+           ended arms nothing, and neither does one about to be sent. */
         () => {
-          if (modeGeneration.current !== generation) return;
+          if (modeGeneration.current !== generation || sends) return;
           unsent.current = true;
           armNudge();
         },
@@ -2353,6 +2381,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
           setProblem(sentenceOf(cause));
         },
       );
+      if (sends) {
+        stopNudge(true);
+        submitAfterWrites(aim);
+      }
       return;
     }
     cancelPendingSend();
@@ -2378,7 +2410,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         setProblem(sentenceOf(cause));
       },
     );
-  }, [armNudge, armSend, callOffLostSend, cancelPendingSend, current, endDictation, paneLost, reportRefused, sendTerminalInput, setPanelState, setPending, trackWrite]);
+  }, [armNudge, armSend, callOffLostSend, cancelPendingSend, current, endDictation, paneLost, reportRefused, sendTerminalInput, setPanelState, setPending, stopNudge, submitAfterWrites, trackWrite]);
 
   /**
    * Press Enter in the open agent's prompt, because the user said to.
@@ -2397,24 +2429,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       reportRefused(answerRefusal(lost));
       return;
     }
-    const aim = { deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId };
-    /* PR #1451 (Qodo) — after the words this Enter is meant to send. A write
-       that failed has already said so (and ended typing mode); the Enter is
-       then dropped rather than submitting what was in the prompt before, and
-       so is one whose pane or mode moved while it waited. */
-    const written = lastWrite.current;
-    lastWrite.current = undefined;
-    if (written === undefined) {
-      void submitDictation(aim);
-      return;
-    }
-    const declared = current();
-    const generation = modeGeneration.current;
-    void written.then((ok) => {
-      if (!ok || modeGeneration.current !== generation || contextLost(declared, current(), { pane: aim })) return;
-      void submitDictation(aim);
-    });
-  }, [cancelPendingSend, current, paneLost, reportRefused, setPending, stopNudge, submitDictation]);
+    /* After the words this Enter is meant to send. */
+    submitAfterWrites({ deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId });
+  }, [cancelPendingSend, paneLost, reportRefused, setPending, stopNudge, submitAfterWrites]);
 
   /** Say there was nothing on top to close. See {@link VOICE_NOTHING_TO_CLOSE}. */
   const reportNothingToClose = useCallback(() => setProblem(VOICE_NOTHING_TO_CLOSE), []);

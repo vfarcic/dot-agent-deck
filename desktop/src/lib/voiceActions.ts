@@ -997,6 +997,13 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    */
   text?: string;
   /**
+   * Press Enter after {@link text} has been typed — the utterance ended with a
+   * separate send sentence in typing mode (PR #1451 round 3), which Rust
+   * decided and the outcome's `thenSubmit` carries. Read by `typeIntoAgent`
+   * alone.
+   */
+  thenSubmit?: boolean;
+  /**
    * Whether an agent's pane is open over the screen.
    *
    * Read by {@link closeTopmost} to decide whether there is anything under the

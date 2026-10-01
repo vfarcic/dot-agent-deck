@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
+import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID, resolveFixtureVoice } from "../data/fixture";
 import {
   DEFAULT_DESKTOP_SETTINGS,
   fixtureDesktopFeatures,
@@ -1953,6 +1953,29 @@ describe("sticky dictation in the open agent pane", () => {
     voice.deliver("one more prompt");
     await completeUtterance();
     expect(deck.sendTerminalInput).toHaveBeenLastCalledWith({ deckId, agentId: coderId }, "one more prompt ");
+  });
+
+  /** Scenario: one utterance ends with a separate send sentence in typing mode. The panel writes only the prompt, waits for that write, then presses Enter through the spoken-send path. */
+  it("types a trailing-send prompt before pressing Enter", async () => {
+    const said = "What's the weather over there? Send it.";
+    const prompt = "What's the weather over there?";
+    const resolveVoice = vi.fn(async (utterance: string) => utterance === "type on"
+      ? modeOn
+      : resolveFixtureVoice(utterance, "agent", true));
+    const { voice, deck } = start({}, resolveVoice);
+    let finishWrite!: () => void;
+    (deck.sendTerminalInput as ReturnType<typeof vi.fn>).mockImplementation(async (_target: unknown, data: string) => {
+      if (data === `${prompt} `) await new Promise<void>((resolve) => { finishWrite = resolve; });
+    });
+    await enter(voice);
+    voice.deliver(said);
+    await completeUtterance();
+    expect(deck.sendTerminalInput).toHaveBeenNthCalledWith(1, { deckId, agentId: coderId }, `${prompt} `);
+    expect(deck.sendTerminalInput).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
+    await act(async () => { finishWrite(); });
+    await flush();
+    expect(deck.sendTerminalInput).toHaveBeenNthCalledWith(2, { deckId, agentId: coderId }, VOICE_DICTATION_SUBMIT);
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(2);
   });
 
   /** Scenario: in typing mode the user dictates a sentence and then says

@@ -112,6 +112,20 @@ pub const DICTATION_OPENERS: [&str; 4] = ["type", "write", "say", "dictate"];
 /// typed.
 pub const SUBMIT_PHRASES: [&str; 6] = ["end", "send", "send it", "submit", "enter", "press enter"];
 
+/// What sends the prompt when said as a SEPARATE FINAL SENTENCE of an
+/// utterance in the dictation mode (PR #1451 round 3): *"What's the weather
+/// over there? Send it."* types the question and then presses Enter.
+///
+/// **Narrower than [`SUBMIT_PHRASES`] on purpose.** A sentence of its own is
+/// still a trailing rule, so it carries the false positive that list's doc
+/// describes; these four are the words that say *send* and nothing else.
+/// *"end"*, *"enter"*, *"finished"* and *"go ahead"* are ordinary closing words
+/// of a dictated sentence (*"…and stop at the end."*, *"Go ahead."* answering
+/// an agent's question), so they keep sending only as the whole utterance. A
+/// send phrase inside a sentence is never one: *"tell him to send it"* is
+/// typed.
+pub const TRAILING_SEND_PHRASES: [&str; 4] = ["send", "send it", "submit", "press enter"];
+
 /// What enters the dictation mode (PRD #1260), said as the whole utterance.
 ///
 /// **Whole-utterance equality only**, for the reason [`SUBMIT_PHRASES`] is:

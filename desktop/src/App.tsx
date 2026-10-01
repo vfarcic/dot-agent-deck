@@ -756,6 +756,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          notice they were typing into the wrong one. */
       agentLabel: agent?.label ?? paneAgent?.displayName,
       text: dictated?.value,
+      ...(outcome.thenSubmit ? { thenSubmit: true } : {}),
       agentViewOpen: agentView !== undefined,
       ...(namedDeck
         ? (outcome.invoke === SWITCH_DECK_INVOKE

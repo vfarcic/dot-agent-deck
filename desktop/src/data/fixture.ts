@@ -1277,7 +1277,10 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
      `dictation_intercept`'s order: the biggest stop first. */
   if (dictating) {
     const reserved = fixtureReserved(utterance, ["voice_off", "dictation_off", "submit_prompt"]);
-    const text = utterance.trim();
+    /* PR #1451 round 3 — `trailing_send`: a separate final send sentence types
+       what precedes it and asks the panel to send after it. */
+    const prompt = reserved ? undefined : fixtureTrailingSend(utterance);
+    const text = prompt ?? utterance.trim();
     return {
       ...stub,
       outcome: reserved
@@ -1288,7 +1291,8 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
           action: "dictate_to_agent",
           invoke: "dictateToAgent",
           params: [{ name: "prefix", kind: "spoken_prefix", spoken: "", value: text, label: text }],
-          sentence: `Typed: “${text}”.`,
+          sentence: prompt === undefined ? `Typed: “${text}”.` : `Typed: “${text}”. Sent.`,
+          ...(prompt === undefined ? {} : { thenSubmit: true }),
         },
     };
   }
@@ -1381,6 +1385,33 @@ function fixtureSaidWhole(utterance: string, phrases: readonly string[]): boolea
   const end = words.length - [...words].reverse().findIndex((word) => !polite(word));
   const said = words.slice(start, end).join(" ");
   return phrases.some((phrase) => fixtureSpokenWords(phrase).join(" ") === said);
+}
+
+/**
+ * `voice::dictation::TRAILING_SEND_PHRASES` — the send phrases that also count
+ * as a separate final sentence of a longer utterance in typing mode. The wider
+ * `submit_prompt` list ("end", "enter", "finished", "go ahead") sends only as
+ * the whole utterance.
+ */
+const FIXTURE_TRAILING_SEND_PHRASES: readonly string[] = ["send", "send it", "submit", "press enter"];
+
+/**
+ * `voice::outcome::trailing_send`: the words before a separate final sentence
+ * that, less an edge politeness word, IS one of
+ * {@link FIXTURE_TRAILING_SEND_PHRASES}. The final sentence follows the last
+ * `.`, `?` or `!` that is followed by whitespace, once the utterance's own
+ * closing punctuation is set aside; what precedes it must carry a word.
+ */
+function fixtureTrailingSend(utterance: string): string | undefined {
+  const body = utterance.replace(/[\s.?!]+$/u, "");
+  let cut = -1;
+  for (let at = 0; at + 1 < body.length; at += 1) {
+    if (".?!".includes(body[at]) && /\s/u.test(body[at + 1])) cut = at + 1;
+  }
+  if (cut < 0) return undefined;
+  const prompt = body.slice(0, cut).trim();
+  if (!fixtureSaidWhole(body.slice(cut), FIXTURE_TRAILING_SEND_PHRASES)) return undefined;
+  return /[\p{L}\p{N}]/u.test(prompt) ? prompt : undefined;
 }
 
 /** The first of `actions`, in order, whose row's phrases the whole utterance is. */

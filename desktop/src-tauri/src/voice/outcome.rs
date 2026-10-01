@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use super::choice::{ChoiceLive, MAX_CHOICES};
 use super::dictation::{
     DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS, SUBMIT_PHRASES,
-    VOICE_OFF_PHRASES, opening_with, strip_opening,
+    TRAILING_SEND_PHRASES, VOICE_OFF_PHRASES, opening_with, strip_opening,
 };
 use super::filter::grounded_filter_text;
 use super::resolver::{IntentError, IntentRequest, IntentResolver};
@@ -189,6 +189,13 @@ pub enum VoiceOutcome {
         invoke: String,
         params: Vec<ResolvedParam>,
         sentence: String,
+        /// PR #1451 round 3 — on a dictation dispatch made in the dictation
+        /// mode alone: the utterance ended with a separate send sentence
+        /// ([`super::dictation::TRAILING_SEND_PHRASES`]), so the frontend
+        /// presses Enter once the typed words have landed. `false` everywhere
+        /// else, and absent from the wire then.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        then_submit: bool,
     },
     /// The action exists and the current screen cannot run it. Carries the
     /// table's own hint, which names the prerequisite.
@@ -831,6 +838,7 @@ pub async fn handle_utterance_with_dictation(
                 action: target.id.clone(),
                 invoke: target.invoke.clone(),
                 params: Vec::new(),
+                then_submit: false,
             });
         }
     };
@@ -992,6 +1000,7 @@ pub async fn handle_utterance_with_dictation(
         action: row.id.clone(),
         invoke: row.invoke.clone(),
         params: resolved,
+        then_submit: false,
     })
 }
 
@@ -1945,6 +1954,7 @@ fn local_intercept(
             action: row.id.clone(),
             invoke: row.invoke.clone(),
             params,
+            then_submit: false,
         }
     };
 
@@ -2037,10 +2047,13 @@ fn said_whole<'a>(transcript: &str, phrases: impl IntoIterator<Item = &'a str>) 
 /// 2. [`DICTATION_OFF_PHRASES`] — end the mode;
 /// 3. a submit — [`SUBMIT_PHRASES`] or one of `submit_prompt`'s own
 ///    `heard_as_whole` entries ("go ahead");
-/// 4. anything else is typed, whole.
+/// 4. a trailing send — the utterance ends with a separate sentence that is
+///    one of [`TRAILING_SEND_PHRASES`] ([`trailing_send`]): what precedes it
+///    is typed and the dispatch asks for a send after it (`then_submit`);
+/// 5. anything else is typed, whole.
 ///
-/// Each of the first three is a whole-utterance comparison, so a phrase said
-/// inside a longer sentence is typed. The lists are disjoint (linkage-check
+/// Each of the first three is a whole-utterance comparison, and the fourth a
+/// whole-SENTENCE one, so a phrase said inside a longer sentence is typed. The lists are disjoint (linkage-check
 /// rule 14), so the order decides nothing; it is #802's decided one — the
 /// bigger stop first — so a future overlap cannot leave a live microphone
 /// after a user asked for it to stop.
@@ -2068,6 +2081,7 @@ fn dictation_intercept(
             action: row.id.clone(),
             invoke: row.invoke.clone(),
             params,
+            then_submit: false,
         }
     };
     let text = transcript.text();
@@ -2096,19 +2110,67 @@ fn dictation_intercept(
         .params
         .iter()
         .find(|spec| spec.name == DICTATE_PARAM && spec.kind == ParamKind::SpokenPrefix)?;
-    let typed = text.trim();
-    Some(dispatch(
-        row,
-        vec![ResolvedParam {
-            name: spec.name.clone(),
-            kind: spec.kind,
-            spoken: String::new(),
-            value: typed.to_string(),
-            label: typed.to_string(),
-            deck_identity: None,
-            names: Vec::new(),
-        }],
-    ))
+    // A trailing send needs the submit row to say what it did; a table without
+    // one types the whole utterance, as it did before the rule existed.
+    let submit = table.row(SUBMIT_ROW);
+    let (typed, then_submit) = match trailing_send(text) {
+        Some(prompt) if submit.is_some() => (prompt, true),
+        _ => (text.trim(), false),
+    };
+    let params = vec![ResolvedParam {
+        name: spec.name.clone(),
+        kind: spec.kind,
+        spoken: String::new(),
+        value: typed.to_string(),
+        label: typed.to_string(),
+        deck_identity: None,
+        names: Vec::new(),
+    }];
+    let mut outcome = dispatch(row, params);
+    if let (
+        VoiceOutcome::Dispatch {
+            sentence,
+            then_submit: sends,
+            ..
+        },
+        true,
+        Some(submit),
+    ) = (&mut outcome, then_submit, submit)
+    {
+        *sends = true;
+        sentence.push(' ');
+        sentence.push_str(&report(submit, &[]));
+    }
+    Some(outcome)
+}
+
+/// The words before a separate final sentence asking to send, when the
+/// utterance ends with one — *"What's the weather over there? Send it."* is
+/// `Some("What's the weather over there?")` — and `None` otherwise.
+///
+/// **A sentence, never a suffix.** The final sentence is what follows the last
+/// `.`, `?` or `!` that is itself followed by whitespace, so *"tell him to send
+/// it"* has no final sentence of its own, and *"version 1.2 send it"* does not
+/// split inside the number. That sentence, less an edge politeness word (the
+/// rule [`whole_utterance`] applies to a whole-utterance send), must BE one of
+/// [`TRAILING_SEND_PHRASES`]. What precedes it is returned trimmed and must
+/// carry a word: there is no prompt to type in *"… Send it."*.
+fn trailing_send(text: &str) -> Option<&str> {
+    let body = text.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '.' | '?' | '!'));
+    let cut = body
+        .char_indices()
+        .zip(body.chars().skip(1))
+        .filter(|((_, end), next)| matches!(end, '.' | '?' | '!') && next.is_whitespace())
+        .map(|((at, end), _)| at + end.len_utf8())
+        .last()?;
+    let (prompt, last) = body.split_at(cut);
+    let said = whole_utterance(last);
+    let sends = !said.is_empty()
+        && TRAILING_SEND_PHRASES
+            .iter()
+            .any(|phrase| spoken_words(phrase) == said);
+    let prompt = prompt.trim();
+    (sends && prompt.chars().any(char::is_alphanumeric)).then_some(prompt)
 }
 
 /// Whole milliseconds, saturating.
@@ -3828,6 +3890,7 @@ mod tests {
                 invoke: "openNewAgent".to_string(),
                 params: Vec::new(),
                 sentence: "Opening the New agent dialog.".to_string(),
+                then_submit: false,
             }
         );
     }
@@ -3869,6 +3932,7 @@ mod tests {
                 // heard rather than found later on a deck they did not choose.
                 sentence: "Opening the New agent dialog. Preselected daemon: Local deck."
                     .to_string(),
+                then_submit: false,
             }
         );
     }
@@ -3943,6 +4007,7 @@ mod tests {
                 invoke: "openNewAgent".to_string(),
                 params: Vec::new(),
                 sentence: "Opening the New agent dialog. No daemon matches \u{201c}ghost box\u{201d}, so none is preselected.".to_string(),
+                then_submit: false,
             }
         );
 
@@ -3975,6 +4040,7 @@ mod tests {
                 invoke: "openNewAgent".to_string(),
                 params: Vec::new(),
                 sentence: "Opening the New agent dialog. \u{201c}build\u{201d} matches more than one daemon, so none is preselected: deploy@build-box.example.com:2222, ci@build-farm.".to_string(),
+                then_submit: false,
             }
         );
 
@@ -4295,6 +4361,7 @@ mod tests {
                     names: Vec::new(),
                 }],
                 sentence: "Opening billing-api.".to_string(),
+                then_submit: false,
             }
         );
     }
@@ -4318,6 +4385,7 @@ mod tests {
                 names: Vec::new(),
             }],
             sentence: format!("Filtering by \u{201c}{text}\u{201d}."),
+            then_submit: false,
         }
     }
 
@@ -4410,6 +4478,7 @@ mod tests {
                 invoke: "clearDirectoryFilter".to_string(),
                 params: Vec::new(),
                 sentence: "Filter cleared.".to_string(),
+                then_submit: false,
             }
         );
     }
@@ -4772,6 +4841,7 @@ mod tests {
                     sentence: "Confirm closing dot-agent-deck-orchestrator-1 \u{2014} nothing has \
                                been stopped yet."
                         .to_string(),
+                    then_submit: false,
                 },
                 "{answered:?}"
             );
@@ -5388,6 +5458,7 @@ mod tests {
                     invoke: invoke.to_string(),
                     params: Vec::new(),
                     sentence: sentence.to_string(),
+                    then_submit: false,
                 }
             );
         }
@@ -5652,6 +5723,7 @@ mod tests {
                     names: Vec::new(),
                 }],
                 sentence: "Mode: dispatcher.".to_string(),
+                then_submit: false,
             }
         );
     }
@@ -6029,6 +6101,7 @@ mod tests {
                     invoke: "startNewAgent".to_string(),
                     params: Vec::new(),
                     sentence: "Starting the agent.".to_string(),
+                    then_submit: false,
                 }
             );
         }
@@ -6043,6 +6116,7 @@ mod tests {
                 invoke: "openNewAgent".to_string(),
                 params: Vec::new(),
                 sentence: "Opening the New agent dialog.".to_string(),
+                then_submit: false,
             }
         );
         // Off the overview neither row can run, and the start's own hint stands.
@@ -6936,6 +7010,7 @@ mod tests {
                 invoke: row.invoke.clone(),
                 sentence: report(row, std::slice::from_ref(&param)),
                 params: vec![param],
+                then_submit: false,
             },
             VoiceOutcome::unavailable(transcript.clone(), row),
             VoiceOutcome::no_match(transcript.clone()),
@@ -7022,6 +7097,7 @@ mod tests {
                 names: Vec::new(),
             }],
             sentence: "Opening tester.".to_string(),
+            then_submit: false,
         };
         let json = serde_json::to_value(&outcome).expect("serializes");
         assert_eq!(json["kind"], "dispatch");
@@ -7329,7 +7405,7 @@ mod tests {
 
     /// Scenario: a declared dictation target keeps every utterance local to
     /// Rust. Reserved whole utterances control the mode; ordinary text,
-    /// including a `type` opener and embedded stop words, is returned whole.
+    /// including embedded stop words and wider send phrases, is returned whole.
     #[tokio::test]
     async fn voice_outcome_dictating_classifies_reserved_words_before_verbatim_text_without_resolving()
      {
@@ -7342,6 +7418,7 @@ mod tests {
             ("type off", "dictation_off", None),
             ("send it", "submit_prompt", None),
             ("go ahead", "submit_prompt", None),
+            ("finished", "submit_prompt", None),
             ("okay, send it please", "submit_prompt", None),
             (
                 "type fix the bug",
@@ -7357,6 +7434,31 @@ mod tests {
                 "and then send it to the reviewer",
                 "dictate_to_agent",
                 Some("and then send it to the reviewer"),
+            ),
+            (
+                "please send it to the reviewer",
+                "dictate_to_agent",
+                Some("please send it to the reviewer"),
+            ),
+            (
+                "What's the weather over there? Go ahead.",
+                "dictate_to_agent",
+                Some("What's the weather over there? Go ahead."),
+            ),
+            (
+                "What's the weather over there? Finished.",
+                "dictate_to_agent",
+                Some("What's the weather over there? Finished."),
+            ),
+            (
+                "What's the weather over there? Enter.",
+                "dictate_to_agent",
+                Some("What's the weather over there? Enter."),
+            ),
+            (
+                "What's the weather over there? End.",
+                "dictate_to_agent",
+                Some("What's the weather over there? End."),
             ),
         ] {
             let resolver = NoCommandsResolver;
@@ -7383,6 +7485,104 @@ mod tests {
                 assert_eq!(typed(&answer.outcome), text, "{said}");
             }
             assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+        }
+    }
+
+    /// Scenario: in typing mode a separate final sentence asking to send leaves
+    /// only the preceding words for the terminal and triggers a send after them.
+    /// Case, final punctuation, and edge politeness do not change that answer.
+    #[tokio::test]
+    async fn voice_outcome_dictating_trailing_send_keeps_only_the_prompt_text() {
+        let target = VoiceDictationTarget {
+            deck_id: "deck-one".to_string(),
+            agent_id: "tester".to_string(),
+        };
+        let prompt = "What's the weather over there?";
+        for said in [
+            "What's the weather over there? Send it.",
+            "What's the weather over there? Send.",
+            "What's the weather over there? Submit.",
+            "What's the weather over there? Press enter.",
+            "What's the weather over there? OKAY, SEND IT PLEASE!",
+        ] {
+            let resolver = NoCommandsResolver;
+            let answer = handle_utterance_with_dictation(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &[],
+                None,
+                None,
+                Some(&target),
+                Transcript::new(said),
+                LabelSharing::Shared,
+                true,
+            )
+            .await;
+            assert_eq!(
+                typed(&answer.outcome),
+                prompt,
+                "{said}: {:?}",
+                answer.outcome
+            );
+            assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+        }
+    }
+
+    /// Scenario: in typing mode a trailing send sentence marks the dictation
+    /// dispatch as followed by a send, says so in its sentence, and carries
+    /// `thenSubmit` on the wire; a wider-list closing word, a send phrase
+    /// inside a sentence and a decimal point before the phrase do not.
+    #[tokio::test]
+    async fn voice_outcome_dictating_trailing_send_asks_the_frontend_to_send_after_typing() {
+        let target = VoiceDictationTarget {
+            deck_id: "deck-one".to_string(),
+            agent_id: "tester".to_string(),
+        };
+        let run = |said: &'static str| {
+            let target = target.clone();
+            async move {
+                handle_utterance_with_dictation(
+                    &NoCommandsResolver,
+                    table(),
+                    Screen::Agent,
+                    &fleet(),
+                    &[],
+                    None,
+                    None,
+                    Some(&target),
+                    Transcript::new(said),
+                    LabelSharing::Shared,
+                    true,
+                )
+                .await
+                .outcome
+            }
+        };
+        let sends = |outcome: &VoiceOutcome| {
+            matches!(outcome, VoiceOutcome::Dispatch { action, then_submit, .. }
+                if action == DICTATE_ROW && *then_submit)
+        };
+
+        let outcome = run("Fix the login bug. Send it.").await;
+        assert!(sends(&outcome), "{outcome:?}");
+        assert_eq!(typed(&outcome), "Fix the login bug.");
+        assert_eq!(outcome.sentence(), "Typed: “Fix the login bug.”. Sent.");
+        let wire = serde_json::to_value(&outcome).expect("serialize");
+        assert_eq!(wire["thenSubmit"], serde_json::json!(true), "{wire}");
+
+        for said in [
+            "Fix the login bug. Finished.",
+            "Fix the login bug. Go ahead.",
+            "please send it to the reviewer",
+            "Version 1.2 send it",
+        ] {
+            let outcome = run(said).await;
+            assert!(!sends(&outcome), "{said}: {outcome:?}");
+            assert_eq!(typed(&outcome), said.trim(), "{said}");
+            let wire = serde_json::to_value(&outcome).expect("serialize");
+            assert!(wire.get("thenSubmit").is_none(), "{said}: {wire}");
         }
     }
 
@@ -8743,6 +8943,7 @@ mod tests {
                 deck_identity: None,
                 names: Vec::new(),
             }],
+            then_submit: false,
         };
         let value = |outcome: &VoiceOutcome| match outcome {
             VoiceOutcome::Dispatch { params, .. } => params[0].value.clone(),

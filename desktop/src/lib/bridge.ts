@@ -919,7 +919,13 @@ function withDeckIdentityKeys(result: VoiceResultDto): VoiceResultDto {
  * `params`.
  */
 export type VoiceOutcomeDto =
-  | { kind: "dispatch"; transcript: string; action: string; invoke: string; params: VoiceResolvedParamDto[]; sentence: string }
+  /*
+    PR #1451 round 3 — `thenSubmit` is set on a dictation dispatch made in
+    typing mode whose utterance ended with a separate send sentence ("… Send
+    it."): the panel types `params`' text and then presses Enter, once that
+    write has landed. Absent everywhere else.
+  */
+  | { kind: "dispatch"; transcript: string; action: string; invoke: string; params: VoiceResolvedParamDto[]; sentence: string; thenSubmit?: boolean }
   | { kind: "unavailable"; transcript: string; action: string; hint: string; sentence: string }
   | { kind: "no_match"; transcript: string; sentence: string }
   | { kind: "unknown_action"; transcript: string; action: string; sentence: string }

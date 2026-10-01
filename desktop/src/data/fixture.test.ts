@@ -54,6 +54,21 @@ describe("browser fixture voice in typing mode", () => {
     });
   });
 
+  /** Scenario: a separate final send sentence in typing mode leaves the preceding sentence as the prompt text, with a send instruction for the panel. */
+  it.each([
+    "What's the weather over there? Send it.",
+    "What's the weather over there? Send.",
+    "What's the weather over there? Submit.",
+    "What's the weather over there? Press enter.",
+    "What's the weather over there? OKAY, SEND IT PLEASE!",
+  ])("types the prompt and sends for a trailing send sentence: %s", (said) => {
+    const outcome = resolveFixtureVoice(said, "agent", true).outcome;
+    expect(outcome).toMatchObject({
+      kind: "dispatch",
+      params: [{ value: "What's the weather over there?" }],
+    });
+  });
+
   /** Scenario: each Rust voice-off phrase stops listening in typing mode, including aliases absent from the preview's current list. */
   it("turns voice off for every reserved voice-off phrase", () => {
     const wrong = rustPhrases("VOICE_OFF_PHRASES").filter((phrase) =>
@@ -61,12 +76,24 @@ describe("browser fixture voice in typing mode", () => {
     expect(wrong).toEqual([]);
   });
 
-  /** Scenario: a sentence containing a reserved word is typed whole because it is not itself a send command. */
+  /** Scenario: a sentence containing a send phrase or ending in a wider-list phrase is typed whole, while whole-utterance send phrases still submit. */
   it("types a sentence that merely mentions send", () => {
-    expect(resolveFixtureVoice("please send it to the tester later", "agent", true).outcome).toMatchObject({
-      kind: "dispatch", action: "dictate_to_agent",
-      params: [{ value: "please send it to the tester later" }],
-    });
+    for (const said of [
+      "please send it to the tester later",
+      "What's the weather over there? Go ahead.",
+      "What's the weather over there? Finished.",
+      "What's the weather over there? Enter.",
+      "What's the weather over there? End.",
+    ]) {
+      expect(resolveFixtureVoice(said, "agent", true).outcome).toMatchObject({
+        kind: "dispatch", action: "dictate_to_agent", params: [{ value: said }],
+      });
+    }
+    for (const said of ["send it", "go ahead", "finished"]) {
+      expect(resolveFixtureVoice(said, "agent", true).outcome).toMatchObject({
+        kind: "dispatch", action: "submit_prompt", params: [],
+      });
+    }
   });
 });
 
