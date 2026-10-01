@@ -59,4 +59,5 @@ One flag reaches the desktop app from the daemon instead: the **schedule: issues
 - **Nothing on the Dashboard, or a daemon section with a title instead of agents:** see [Dashboard → When a daemon is not there](dashboard.md#when-a-daemon-is-not-there).
 - **A remote daemon will not connect:** press **Test connection** in **Settings → Daemons** and follow the sentence it prints; [Daemons → Test connection](daemons.md#test-connection) lists every result.
 - **The app says it cannot read its settings file:** see [Settings → The settings file](settings.md#the-settings-file).
-- **Messages from the app itself:** the desktop app prints its diagnostics to standard error. On Linux, run `dot-agent-deck-desktop` from a terminal to see them. The daemon's own log is described in [Troubleshooting](../troubleshooting.md).
+- **Messages from the app itself:** the desktop app prints its diagnostics to standard error. On Linux, run `dot-agent-deck-desktop` from a terminal to see them.
+- **Collecting a log for a bug report:** the app writes no log file of its own, so start the daemon it connects to with logging turned on. See [Troubleshooting → With the desktop app](../troubleshooting.md#with-the-desktop-app).
