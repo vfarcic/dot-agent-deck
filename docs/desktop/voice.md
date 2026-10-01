@@ -50,19 +50,22 @@ Nothing is typed or sent, and the app says why, if a confirmation is open, if th
 
 ## When a command matches several things
 
-If what you said names more than one thing on screen, for example "open the agent" with several agents on the dashboard, the app does not guess. It lists the matches as numbered buttons beside the Voice button, with a **Cancel** button and a countdown, and waits for you to choose:
+If what you said names more than one thing on screen, for example "open the agent" with several agents on the dashboard, the app does not guess. A dialog opens in the middle of the screen, over whatever is there (an agent's pane or the New agent dialog included), asking which one you meant. It lists the matches as a numbered list, with a **Cancel** button and a countdown, and waits for you to choose. The row at the bottom keeps showing what the app heard.
 
-![The agent dashboard with voice on and "open the agent" heard: beside the Voice button, the sentence saying "agent" matches more than one agent, and under it the numbered buttons 1. Plan / architecture and 2. Desktop implementation, a Cancel button and a 20 s countdown](/img/voice-choice-desktop.png)
+![The agent dashboard with voice on and "open the agent" heard: a dialog in the middle of the screen asks "Which agent?", lists 1. Plan / architecture and 2. Desktop implementation, and shows a 20 s countdown and a Cancel button, while the row at the bottom says what was heard](/img/voice-choice-desktop.png)
 
 - **Say the number**: "two", "2", "number two", "option two", "the second one" or "the last one", on its own.
 - **Say the name** of one of the listed entries on its own, such as "Desktop implementation". A sentence that only contains a listed name, such as "stop Planner", is not an answer: the list closes and that sentence runs as a new command.
+- **Press its number** on the keyboard, such as `2`. A number that is not on the list does nothing.
 - **Click** an entry, or reach it with `Tab` and press `Enter`.
+
+The dialog takes the keyboard while it is open, starting on the first entry, so the keys you press go to it rather than to an agent's terminal. When it closes, the keyboard goes back to where it was.
 
 If an entry's name is itself a number or a way of cancelling, for example an agent called "two" or "cancel", saying just that name chooses nothing: the list closes and the app says why. Say the command again, then say "number" and the entry's position, such as "number one", or click the entry.
 
 The command you first gave then runs with the entry you chose; what you said is not sent to the Commands service again. Choosing does not skip a confirmation: if the command stops an agent or closes an orchestration, the confirmation still opens, and you answer it by hand.
 
-To choose nothing, say "cancel", "cancel that", "never mind", "none", "none of them", "neither" or "no" on its own, press **Cancel**, or press `Escape` while an entry has focus. The list also closes on its own after 20 seconds, and when you turn voice off; nothing runs.
+To choose nothing, say "cancel", "cancel that", "never mind", "none", "none of them", "neither" or "no" on its own, press **Cancel**, press `Escape`, or click outside the dialog. `Escape` closes only the dialog: a pane or the New agent dialog behind it stays open. The dialog also closes on its own when its countdown reaches zero after 20 seconds, and when you turn voice off; nothing runs.
 
 If you say something else while the list is open, the list closes and what you said is treated as a new command. A number that is not on the list, a name that matches more than one entry, or on its own the name of something on screen that is not on the list, closes the list without running anything; say the command again, more specifically.
 

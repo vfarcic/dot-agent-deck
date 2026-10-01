@@ -36,7 +36,7 @@ Each image is named `<scenario>-<client>.png`, so the `dashboard` scenario produ
 | `settings-daemons` | desktop | Daemons settings with one configured remote. The browser fixture cannot produce a successful Test connection result. |
 | `settings-voice` | desktop | Voice settings. |
 | `voice-typing-mode` | desktop | Agent pane with voice typing mode on, entered through the fixture's scripted microphone (`?voice=type%20on`). |
-| `voice-choice` | desktop | Dashboard with a numbered voice choice open over two agents, entered through the fixture's scripted microphone (`?voice=open%20the%20agent`). |
+| `voice-choice` | desktop | Dashboard with the numbered voice choice dialog open over two agents, centred above the screen with its countdown, and the voice row below saying what was heard; entered through the fixture's scripted microphone (`?voice=open%20the%20agent`). |
 | `schedules` | TUI | Schedules manager with one disabled task, keeping the next-fire field stable. |
 | `help` | TUI | The `?` keyboard shortcut overlay. |
 

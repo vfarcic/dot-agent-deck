@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { enterDeck } from "./support/overview";
+import { enterDeck, selectOverview } from "./support/overview";
 
 const SETTINGS_KEY = "dot-agent-deck.desktop-settings";
 
@@ -86,11 +86,35 @@ test.describe("numbered voice choices through the browser fixture", () => {
   async function offerChoice(page: Page) {
     await openWithSpeech(page, choicePath);
     await voiceButton(page).click();
-    const choice = page.getByTestId("voice-choice");
+    const choice = page.getByRole("dialog", { name: "Which agent?" });
     await expect(choice.getByRole("button", { name: firstLabel })).toBeVisible();
     await expect(choice.getByRole("button", { name: secondLabel })).toBeVisible();
     return choice;
   }
+
+  /** The dialog's box sits in the middle of the window horizontally, and in
+   * the middle of the space above the voice row vertically. */
+  async function expectCentred(page: Page, choice: ReturnType<Page["getByRole"]>) {
+    const box = await choice.boundingBox();
+    const row = await page.getByTestId("voice-row").boundingBox();
+    const viewport = page.viewportSize();
+    if (!box || !row || !viewport) throw new Error("the choice dialog, the voice row or the viewport has no box");
+    expect(Math.abs(box.x + box.width / 2 - viewport.width / 2)).toBeLessThanOrEqual(2);
+    expect(Math.abs(box.y + box.height / 2 - row.y / 2)).toBeLessThanOrEqual(2);
+  }
+
+  /** Scenario: the tie opens a centred dialog asking which agent, with the
+   * numbered entries, a countdown and Cancel inside it; the voice row below
+   * still says what was heard, and the dialog's first entry has focus. */
+  test("the choice is a centred dialog with its countdown inside", async ({ page }) => {
+    const choice = await offerChoice(page);
+    await expect(choice).toHaveAttribute("aria-modal", "true");
+    await expect(choice.getByRole("timer")).toHaveText(/\d+\s*s/);
+    await expect(page.getByTestId("voice-report").getByRole("timer")).toHaveCount(0);
+    await expect(page.getByTestId("voice-report")).toContainText("open the agent");
+    await expect(choice.getByRole("button", { name: firstLabel })).toBeFocused();
+    await expectCentred(page, choice);
+  });
 
   for (const [label, agentId, report] of [
     [firstLabel, "planner", "Opening Plan / architecture."],
@@ -109,13 +133,12 @@ test.describe("numbered voice choices through the browser fixture", () => {
     });
   }
 
-  /** Scenario: a keyboard user can tab between numbered entries and activate
-   * the second one with Enter, opening its pane without a pointer. */
+  /** Scenario: a keyboard user can tab from the focused first entry to the
+   * second and activate it with Enter, opening its pane without a pointer. */
   test("numbered entries are tabbable and keyboard-activatable", async ({ page }) => {
     const choice = await offerChoice(page);
     const first = choice.getByRole("button", { name: firstLabel });
     const second = choice.getByRole("button", { name: secondLabel });
-    await first.focus();
     await expect(first).toBeFocused();
     await page.keyboard.press("Tab");
     await expect(second).toBeFocused();
@@ -123,6 +146,29 @@ test.describe("numbered voice choices through the browser fixture", () => {
     await expect(page.getByText("Opening Desktop implementation.")).toBeVisible();
     await expect(page.getByTestId("agent-pane-overlay").getByTestId("terminal-builder")).toBeVisible();
     await expect(choice).toHaveCount(0);
+  });
+
+  /** Scenario: pressing 9 (no ninth entry) leaves the dialog open; pressing 2
+   * opens the second agent's pane and closes the dialog. */
+  test("a number key answers the pending choice", async ({ page }) => {
+    const choice = await offerChoice(page);
+    await page.keyboard.press("9");
+    await expect(choice).toBeVisible();
+    await page.keyboard.press("2");
+    await expect(page.getByText("Opening Desktop implementation.")).toBeVisible();
+    await expect(page.getByTestId("agent-pane-overlay").getByTestId("terminal-builder")).toBeVisible();
+    await expect(choice).toHaveCount(0);
+  });
+
+  /** Scenario: Escape closes the dialog, opens neither pane, reports the
+   * cancellation and leaves voice listening. */
+  test("Escape cancels the choice", async ({ page }) => {
+    const choice = await offerChoice(page);
+    await page.keyboard.press("Escape");
+    await expect(choice).toHaveCount(0);
+    await expect(page.getByTestId("agent-pane-overlay")).toHaveCount(0);
+    await expect(page.getByTestId("voice-report")).toContainText(/cancelled/i);
+    await expect(voiceButton(page)).toHaveAttribute("aria-pressed", "true");
   });
 
   /** Scenario: Cancel dismisses an offered choice; it opens neither pane and
@@ -145,8 +191,45 @@ test.describe("numbered voice choices through the browser fixture", () => {
     await voiceButton(page).click();
     await expect(page.getByText("Opening Desktop implementation.")).toBeVisible();
     await expect(page.getByTestId("agent-pane-overlay").getByTestId("terminal-builder")).toBeVisible();
-    await expect(page.getByTestId("voice-choice")).toHaveCount(0);
+    await expect(page.getByRole("dialog", { name: "Which agent?" })).toHaveCount(0);
     await expect(voiceButton(page)).toHaveAttribute("aria-pressed", "true");
+  });
+
+  /** Scenario: on the dashboard, open the New agent dialog, then turn voice on
+   * from the keyboard (the Voice button stays reachable behind the dialog). The
+   * tie's dialog is drawn centred ABOVE the New agent dialog with its entries
+   * clickable there; Escape closes only the choice and the New agent dialog
+   * stays open. */
+  test("the choice opens above the New agent dialog and Escape leaves that dialog open", async ({ page }) => {
+    await page.addInitScript((key) => {
+      window.localStorage.setItem(key, JSON.stringify({
+        version: 1,
+        appearance: { mode: "light" },
+        voice: { activation: "toggle", intent: "claude", transcription: "remote" },
+        zoom: { level: 1 },
+      }));
+    }, SETTINGS_KEY);
+    await page.goto(choicePath);
+    await selectOverview(page);
+    await page.getByTestId("overview-new-agent").click();
+    const newAgent = page.getByTestId("new-agent-dialog");
+    await expect(newAgent).toBeVisible();
+
+    await voiceButton(page).focus();
+    await page.keyboard.press("Enter");
+
+    const choice = page.getByRole("dialog", { name: "Which agent?" });
+    const first = choice.getByRole("button", { name: firstLabel });
+    await expect(first).toBeVisible();
+    await expect(first).toBeFocused();
+    await first.click({ trial: true });
+    await choice.getByRole("button", { name: secondLabel }).click({ trial: true });
+    await expectCentred(page, choice);
+
+    await page.keyboard.press("Escape");
+    await expect(choice).toHaveCount(0);
+    await expect(newAgent).toBeVisible();
+    await expect(page.getByTestId("voice-report")).toContainText(/cancelled/i);
   });
 });
 

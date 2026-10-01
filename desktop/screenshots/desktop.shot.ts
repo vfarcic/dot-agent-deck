@@ -129,7 +129,8 @@ desktopScenario("voice-typing-mode", async (page) => {
 // fixture's scripted microphone says "open the agent" once the Voice button is
 // pressed on the dashboard, which the preview answers with a canned tie between
 // the two agents labelled Plan / architecture and Desktop implementation; the
-// image shows the numbered entries, Cancel and the countdown in the voice row.
+// image shows the choice dialog centred over the dashboard — its numbered
+// entries, countdown and Cancel — with the voice row below saying what was heard.
 desktopScenario("voice-choice", async (page) => {
   await page.addInitScript(() => {
     window.localStorage.setItem("dot-agent-deck.desktop-settings", JSON.stringify({
@@ -144,7 +145,9 @@ desktopScenario("voice-choice", async (page) => {
   await page.getByTestId("open-overview").click();
   await expect(page.locator(".overview-row")).toHaveCount(4);
   await page.getByTestId("voice-trigger").click();
-  const choice = page.getByTestId("voice-choice");
+  const choice = page.getByRole("dialog", { name: "Which agent?" });
   await expect(choice.getByRole("button", { name: "1. Plan / architecture" })).toBeVisible();
   await expect(choice.getByRole("button", { name: "2. Desktop implementation" })).toBeVisible();
+  await expect(choice.getByRole("timer")).toBeVisible();
+  await expect(page.getByTestId("voice-report")).toContainText("open the agent");
 });

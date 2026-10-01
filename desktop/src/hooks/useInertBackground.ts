@@ -106,9 +106,11 @@
  * cannot widen by accident: it is matched on the sibling itself, so a marked
  * element nested inside a background region is still inert with its region.
  *
- * The two surfaces do not fight over `Escape` either: the voice surface binds
- * no key at all — it is a button and a report, not a dialog — so `DeckShell`'s
- * window listener for the pane is the only thing that sees one.
+ * The two surfaces do not fight over `Escape` either. The voice surface binds
+ * no WINDOW key: its one keyboard surface is the numbered choice's dialog
+ * (PRD #1261), which handles `Escape` and the digits on its own element and
+ * stops them there, so `DeckShell`'s window listener for the pane sees an
+ * `Escape` only when focus is outside that dialog.
  *
  * **`setAttribute` rather than the `inert` IDL property, and that is not
  * style.** Measured against this repo's jsdom (30.x): `"inert" in
@@ -179,7 +181,12 @@ export function useInertBackground<T extends HTMLElement>(open: boolean) {
     // it, leaving focus on `<body>` and the first Tab landing wherever the
     // document happens to start. Moving it into the pane is what makes the
     // dialog behave like one.
-    if (!node.contains(document.activeElement)) node.focus();
+    //
+    // Focus on a voice peer is left where it is: the numbered choice's dialog
+    // takes focus while it is open (PRD #1261), and this walk runs on every
+    // commit, so pulling focus back here would take it from the dialog mid-answer.
+    const active = document.activeElement;
+    if (!node.contains(active) && !active?.closest(VOICE_PEER_SELECTOR)) node.focus();
 
     return () => {
       for (const element of marked) element.removeAttribute("inert");

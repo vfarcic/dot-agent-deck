@@ -2561,7 +2561,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       now. The trigger and the Undo inside the report stay reachable behind an
       open pane, which is what the exemption exists for.
     */
-    <div ref={rowRef} className="voice-row" data-testid="voice-row" data-voice={on ? "on" : "off"} {...VOICE_PEER_PROPS}>
+    <div ref={rowRef} className="voice-row" data-testid="voice-row" data-voice={on ? "on" : "off"} data-choice={choice ? "open" : undefined} {...VOICE_PEER_PROPS}>
       <button
         type="button"
         className="voice-trigger"
@@ -2753,46 +2753,6 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
                 </div>
               </>
             )}
-            {/*
-              PRD #1261 — the numbered choice, under the sentence that names
-              the tie. Real buttons inside the row, so they carry the row's
-              `VOICE_PEER_PROPS` exemption and stay reachable behind the agent
-              pane's modal fence. `Escape` cancels while focus is inside the
-              list — and only there: the pane and the New agent dialog own that
-              key at window level, and a second window listener would close
-              both at once. The list does not take focus when it opens (the
-              PRD's Open Question 1): a choice arises from speech, and the user
-              may be typing into a terminal. Its countdown is its own `timer`,
-              for the dictation countdown's reason.
-            */}
-            {choice && (
-              <div
-                className="voice-choice"
-                data-testid="voice-choice"
-                role="group"
-                aria-label="Choose one"
-                onKeyDown={(event) => {
-                  if (event.key !== "Escape") return;
-                  event.preventDefault();
-                  event.stopPropagation();
-                  closeChoice(VOICE_CHOICE_CANCELLED);
-                }}
-              >
-                <ol className="voice-choice-list">
-                  {choice.outcome.candidates.map((candidate, at) => (
-                    <li key={candidate.value}>
-                      <button type="button" className="button secondary compact" onClick={() => dispatchChoice(choice, candidate)}>
-                        {`${at + 1}. ${displayText(candidate.label, DISPLAY_LIMITS.name)}`}
-                      </button>
-                    </li>
-                  ))}
-                </ol>
-                <button type="button" className="button secondary compact" aria-label="Cancel" onClick={() => { closeChoice(VOICE_CHOICE_CANCELLED); }}>
-                  <X size={13} /> Cancel
-                </button>
-                {choiceIn !== undefined && <span className="voice-choice-timer" role="timer">{`${choiceIn} s`}</span>}
-              </div>
-            )}
           </div>
         )}
       </div>
@@ -2819,6 +2779,26 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         list is up must still work — and claiming modality the DOM does not have
         is the false claim `useInertBackground`'s own note is about.
       */}
+      {/*
+        PRD #1261 — the numbered choice, as a dialog centred over the screen
+        (PR #1451 round 3; it used to be a strip of buttons in this row). A
+        CHILD of the row for the discovery overlay's reason below: the row
+        carries `VOICE_PEER_PROPS`, so the choice stays reachable behind the
+        agent pane's and the New agent dialog's fences. The row is raised
+        above those dialogs while it is open (`data-choice` in the
+        stylesheet), since a child cannot leave its parent's stacking context.
+        The report above keeps saying what was heard; the dialog says what to
+        choose between.
+      */}
+      {choice && (
+        <VoiceChoiceDialog
+          key={choice.deadline}
+          offer={choice}
+          secondsLeft={choiceIn}
+          onPick={(candidate) => dispatchChoice(choice, candidate)}
+          onCancel={() => { closeChoice(VOICE_CHOICE_CANCELLED); }}
+        />
+      )}
       {vocabulary && (
         <div className="voice-help-backdrop" data-testid="voice-help" onClick={closeVocabulary}>
           <div
@@ -2840,6 +2820,112 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/** PRD #1261 — what a tie is between, named for the dialog's heading, by the kind of the offered entries. */
+const VOICE_CHOICE_NOUNS: Record<string, string> = {
+  agent_ref: "agent",
+  deck_ref: "daemon",
+  dir_ref: "directory",
+  mode_ref: "mode",
+  agent_type_ref: "agent type",
+  orchestration_ref: "orchestration",
+};
+
+/**
+ * PRD #1261 — the numbered choice, as a modal dialog in `ConfirmDialog`'s
+ * look (PR #1451 round 3, the maintainer's call).
+ *
+ * **It takes focus, which reverses the PRD's Open Question 1.** The in-row
+ * strip left focus where it was, because a choice arises from speech and the
+ * user may be typing into a terminal. The maintainer asked for a dialog like
+ * the app's others that a number key answers, and a key reaches only the
+ * element with focus — the alternative, a window listener, would also close
+ * the agent pane and the New agent dialog on `Escape` and fire the Daemons
+ * screen's `1`–`4`. So it moves focus to entry 1 when it opens and gives it
+ * back to whatever had it when it closes, however it closes — unless the
+ * close itself moved focus somewhere (a chosen agent's pane), which then
+ * keeps it. Typing mode and a choice never coexist (PRD #1260's precedence),
+ * so this cannot swallow dictation.
+ *
+ * Every key is handled HERE and stopped here: a digit 1–9 picks that entry (one
+ * past the list does nothing), `Escape` cancels, and nothing else reaches the
+ * window's shortcuts while the dialog has focus. Clicking the scrim cancels,
+ * as `ConfirmDialog`'s does.
+ */
+function VoiceChoiceDialog({ offer, secondsLeft, onPick, onCancel }: {
+  offer: VoiceChoiceOffer;
+  secondsLeft: number | undefined;
+  onPick: (candidate: VoiceResolvedParamDto) => void;
+  onCancel: () => void;
+}) {
+  const panel = useRef<HTMLElement>(null);
+  const firstEntry = useRef<HTMLButtonElement>(null);
+  const titleId = `voice-choice-title-${offer.deadline}`;
+  const candidates = offer.outcome.candidates;
+  const noun = VOICE_CHOICE_NOUNS[candidates[0]?.kind ?? ""];
+  /* Layout effects, so the opener is read before anything else on this commit
+     moves focus, and given back before the passive effects of whatever the
+     close opened (a pane takes focus in one) run after it. */
+  useLayoutEffect(() => {
+    const opener = document.activeElement;
+    firstEntry.current?.focus();
+    const node = panel.current;
+    return () => {
+      const now = document.activeElement;
+      const stillHere = now === null || now === document.body || (node?.contains(now) ?? false);
+      if (stillHere && opener instanceof HTMLElement && opener !== document.body && opener.isConnected) opener.focus();
+    };
+  }, []);
+  return (
+    <div className="voice-choice-backdrop" role="presentation" onMouseDown={onCancel}>
+      <section
+        ref={panel}
+        className="confirm-dialog voice-choice"
+        data-testid="voice-choice"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        onMouseDown={(event) => event.stopPropagation()}
+        onKeyDown={(event) => {
+          event.stopPropagation();
+          if (event.key === "Escape") {
+            event.preventDefault();
+            onCancel();
+            return;
+          }
+          if (event.ctrlKey || event.metaKey || event.altKey || !/^[0-9]$/.test(event.key)) return;
+          event.preventDefault();
+          const candidate = candidates[Number(event.key) - 1];
+          if (candidate !== undefined) onPick(candidate);
+        }}
+      >
+        <h2 id={titleId}>{noun ? `Which ${noun}?` : "Which one?"}</h2>
+        <p>
+          {`“${displayText(offer.outcome.spoken, DISPLAY_LIMITS.name)}” matches more than one${noun ? ` ${noun}` : ""}. `}
+          {"Say or press its number, say its name, or click it."}
+        </p>
+        <ol className="voice-choice-list">
+          {candidates.map((candidate, at) => (
+            <li key={candidate.value}>
+              <button ref={at === 0 ? firstEntry : undefined} type="button" className="button secondary" onClick={() => onPick(candidate)}>
+                {`${at + 1}. ${displayText(candidate.label, DISPLAY_LIMITS.name)}`}
+              </button>
+            </li>
+          ))}
+        </ol>
+        <div>
+          {/* Its own `timer` rather than the row's `status` region: it changes
+              every second, and a polite live region re-announcing it each tick
+              would be unusable. */}
+          {secondsLeft !== undefined && <span className="voice-choice-timer" role="timer">{`${secondsLeft} s`}</span>}
+          <button type="button" className="button secondary" onClick={onCancel}>
+            <X size={13} /> Cancel
+          </button>
+        </div>
+      </section>
     </div>
   );
 }

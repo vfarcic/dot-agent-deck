@@ -118,7 +118,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "voice-choice",
-        description: "The desktop dashboard with a numbered voice choice open: two agents offered as numbered entries in the voice row, with Cancel and the countdown.",
+        description: "The desktop dashboard with the numbered voice choice open: a dialog centred over the screen offering two agents as a numbered list, with its countdown and Cancel, and the voice row below saying what was heard.",
         clients: &[Client::Desktop],
     },
     Scenario {

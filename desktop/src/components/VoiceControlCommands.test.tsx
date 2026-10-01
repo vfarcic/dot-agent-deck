@@ -358,25 +358,38 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
 
   function setup(voice: ReturnType<typeof microphone>, answer: (utterance: string) => VoiceResultDto = selected,
     configure?: (snapshot: ReturnType<typeof createFixtureSnapshot>) => void,
-    answerVoiceChoice?: NonNullable<DeckRuntimeState["answerVoiceChoice"]>, offered = candidates) {
+    answerVoiceChoice?: NonNullable<DeckRuntimeState["answerVoiceChoice"]>, offered = candidates, extra: Partial<DeckRuntimeState> = {}) {
     const snapshot = createFixtureSnapshot("connected");
     configure?.(snapshot);
     for (const id of [first.value, second.value]) {
       if (!snapshot.agents.find((agent) => agent.id === id)) throw new Error(`fixture agent ${id} missing`);
     }
     const resolveVoice: ResolveVoice = vi.fn(async (utterance) => utterance === "open the agent" ? choice("open_agent", "openAgent", offered) : answer(utterance));
-    const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot], answerVoiceChoice });
+    const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot], answerVoiceChoice, ...extra });
     const view = render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
     return { resolveVoice, snapshot, deck, ...view };
   }
 
-  /** Scenario: the voice row lists the two real agents in order; clicking the second
+  /** Scenario: a tie opens a centred dialog asking “Which agent?”, listing the
+   * two real agents as a numbered list with its own 20-second countdown, while
+   * the status row below keeps saying what was heard; clicking the second
    * entry opens exactly that agent through the original openAgent row. */
   it("renders numbered entries and dispatches the clicked agent value once", async () => {
     const voice = microphone(["open the agent"]);
     const { resolveVoice } = setup(voice);
     await turnVoiceOn();
     await completeUtterance();
+    const dialog = screen.getByRole("dialog", { name: "Which agent?" });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    expect(dialog).toHaveTextContent("“agent”");
+    const items = within(within(dialog).getByRole("list")).getAllByRole("listitem");
+    expect(items.map((item) => item.textContent)).toEqual([`1. ${first.label}`, `2. ${second.label}`]);
+    expect(within(dialog).getByRole("timer")).toHaveTextContent(/20\s*s/i);
+    const report = screen.getByTestId("voice-report");
+    expect(report.contains(dialog)).toBe(false);
+    expect(within(report).queryByRole("timer")).toBeNull();
+    expect(within(report).queryByRole("button", { name: `1. ${first.label}` })).toBeNull();
+    expect(report).toHaveTextContent("open the agent");
     expect(entry(1, first.label)).toBeVisible();
     expect(entry(2, second.label)).toBeVisible();
     await act(async () => { fireEvent.click(entry(2, second.label)); await Promise.resolve(); });
@@ -504,20 +517,110 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId(`terminal-${first.value}`)).toBeVisible();
   });
 
-  /** Scenario: the user can cancel the list by voice, by its Cancel button, or
-   * with Escape while focus is inside it; none opens an agent. */
-  it.each(["voice", "button", "escape"])("cancels the choice by %s", async (route) => {
+  /** Scenario: the user can cancel the dialog by voice, by its Cancel button,
+   * with Escape, or by letting the countdown run out; none opens an agent,
+   * and focus goes back to the control that had it before the dialog opened
+   * (here the rail's Daemons button), the dialog having taken it to its first
+   * entry while open. */
+  it.each(["voice", "button", "escape", "expiry"])("cancels the choice by %s and gives focus back", async (route) => {
     const voice = microphone(["open the agent"]);
     const { resolveVoice } = setup(voice, noMatch);
+    const before = screen.getByTestId("open-deck");
+    before.focus();
     await turnVoiceOn();
     await completeUtterance();
     expect(entry(2, second.label)).toBeVisible();
+    await flush();
+    expect(entry(1, first.label)).toHaveFocus();
     if (route === "voice") { voice.deliver("never mind"); await completeUtterance(); }
     if (route === "button") fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    if (route === "escape") { entry(1, first.label).focus(); fireEvent.keyDown(entry(1, first.label), { key: "Escape" }); }
+    if (route === "escape") fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    if (route === "expiry") await act(async () => { await vi.advanceTimersByTimeAsync(20_100); });
+    expect(screen.queryByRole("dialog", { name: "Which agent?" })).toBeNull();
     expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
     expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(before).toHaveFocus();
     if (route === "voice") expect(resolveVoice).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: with the dialog open, pressing 2 opens the second agent, the
+   * same as clicking it; pressing 7 — no seventh entry — does nothing and the
+   * dialog stays open. */
+  it("selects an entry by its number key and ignores a number past the list", async () => {
+    const voice = microphone(["open the agent"]);
+    const { resolveVoice } = setup(voice);
+    await turnVoiceOn();
+    await completeUtterance();
+    const dialog = screen.getByRole("dialog", { name: "Which agent?" });
+    await flush();
+    expect(entry(1, first.label)).toHaveFocus();
+
+    fireEvent.keyDown(document.activeElement ?? dialog, { key: "7" });
+    fireEvent.keyDown(document.activeElement ?? dialog, { key: "0" });
+    expect(screen.getByRole("dialog", { name: "Which agent?" })).toBeVisible();
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+
+    await act(async () => { fireEvent.keyDown(document.activeElement ?? dialog, { key: "2" }); await Promise.resolve(); });
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId(`terminal-${second.value}`)).toBeVisible();
+    expect(screen.queryByRole("dialog", { name: "Which agent?" })).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(`Chose ${second.label}.`);
+    expect(resolveVoice).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: an agent pane is open with focus in it when a tie arrives. The
+   * dialog takes focus; Escape closes only the dialog — the pane stays open —
+   * and focus returns to the pane. */
+  it("closes only the dialog on Escape over an open agent pane, and gives the pane its focus back", async () => {
+    const voice = microphone([]);
+    setup(voice, noMatch);
+    fireEvent.click(screen.getByRole("button", { name: `Open ${first.label} agent` }));
+    const pane = screen.getByTestId("agent-pane-overlay");
+    await flush();
+    expect(pane.contains(document.activeElement)).toBe(true);
+    const before = document.activeElement;
+    await turnVoiceOn();
+    voice.deliver("open the agent");
+    await completeUtterance();
+    await flush();
+    expect(entry(1, first.label)).toHaveFocus();
+
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+    expect(screen.queryByRole("dialog", { name: "Which agent?" })).toBeNull();
+    expect(screen.getByTestId("agent-pane-overlay")).toBe(pane);
+    expect(within(pane).getByTestId(`terminal-${first.value}`)).toBeVisible();
+    await flush();
+    expect(document.activeElement).toBe(before);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/cancelled/i);
+  });
+
+  /** Scenario: the New agent dialog is open with focus inside it when a tie
+   * arrives. Escape closes the numbered choice and leaves the New agent dialog
+   * open, with focus back on the control in it that had focus. */
+  it("closes only the choice on Escape over the New agent dialog", async () => {
+    const voice = microphone([]);
+    setup(voice, noMatch, undefined, undefined, candidates, {
+      listDirectories: vi.fn(async () => ({ kind: "listing" as const, path: "/home/dev", displayPath: "/home/dev", entries: [], truncated: false })),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], experimental: false, authoringKinds: [] })),
+    });
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    const newAgent = screen.getByTestId("new-agent-dialog");
+    await flush();
+    const before = document.activeElement;
+    expect(before).not.toBe(document.body);
+    expect(newAgent.contains(before)).toBe(true);
+    await turnVoiceOn();
+    voice.deliver("open the agent");
+    await completeUtterance();
+    await flush();
+    expect(entry(1, first.label)).toHaveFocus();
+
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+    expect(screen.queryByRole("dialog", { name: "Which agent?" })).toBeNull();
+    expect(screen.getByTestId("new-agent-dialog")).toBe(newAgent);
+    await flush();
+    expect(document.activeElement).toBe(before);
   });
 
   /** Scenario: the list is offered on the overview, then the user walks to the
@@ -544,8 +647,9 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     await turnVoiceOn();
     await completeUtterance();
     expect(entry(2, second.label)).toBeVisible();
-    expect(within(screen.getByTestId("voice-report")).getByRole("timer")).toHaveTextContent(/20\s*s/i);
+    expect(within(screen.getByRole("dialog", { name: "Which agent?" })).getByRole("timer")).toHaveTextContent(/20\s*s/i);
     await act(async () => { await vi.advanceTimersByTimeAsync(20_100); });
+    expect(screen.queryByRole("dialog", { name: "Which agent?" })).toBeNull();
     expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
     expect(screen.getByTestId("voice-report")).toHaveTextContent(/expir/i);
     expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();

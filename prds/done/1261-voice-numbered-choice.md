@@ -149,6 +149,8 @@ Answers are local, so the fixtures cover only the first utterance (reaching `par
 - [x] **M2 — The chooser.** `voice::choice::answer`, the panel state, rendering, click/ordinal/name answers, staleness through the existing layers, expiry, cancel, the non-answer rule, the D5 hand-off, `refusedRef` coverage. Rust, vitest and Playwright tests.
 - [x] **M3 — Fixtures, docs, changelog.** Fixture run (local, credentialed); `docs/desktop/voice.md` (what the user sees and says — rule 21), `docs/develop/voice-first-design.md` (the offered-list check as distinct from grounding; the "genuine ties" note; the list of refusals that never become a choice), `docs/develop/desktop-gui.md`; `changelog.d/1261.feature.md`. Run `docs-screenshots-review`.
 
+- [x] **Round 3, change 2 — The choice as a dialog.** The numbered choice moves out of the voice row into a modal dialog centred over the screen, in `ConfirmDialog`'s look: what was ambiguous, the entries as a numbered list, the 20 s countdown and Cancel. It takes focus on entry 1 and gives it back on close (Open Question 1 reversed); number keys pick, Escape cancels, both on the dialog element. Drawn above the agent pane and the New agent dialog. vitest and Playwright tests; docs screenshot regenerated.
+
 - [x] **Round 3, change 6 — Only usable daemons in the New agent dialog.** The deck field lists only daemons that can take a new agent; the others, and their long explanations and buttons, stay on the overview and the Daemons screen. Voice (`choose_deck`, `open_new_agent`) still refuses a hidden daemon by name, in one line with a short reason class. Rust, vitest and Playwright tests.
 
 **Deferred.**
@@ -167,7 +169,8 @@ Recorded here so the sections above can be read as the design and this as what s
 - **A tie is offered only on the row's LAST param.** Every shipped row has one param, so this changes nothing today; a tie on an earlier param would dispatch the chosen entry without the params after it, so it keeps its sentence and offers no choice.
 - **The 20 s window shipped as written** (`VOICE_CHOICE_WINDOW_MS`), still a starting value (Open Question 2).
 - **The chooser has its own staleness sentences.** The design reused `SCREEN_MOVED_ON` / `DIALOG_MOVED_ON`, whose "while that was being worked out" describes a round trip — wrong for a click, which makes none. The same checks now refuse with `VOICE_CHOICE_SCREEN_MOVED_ON` / `VOICE_CHOICE_DIALOG_MOVED_ON` ("…after the choice was offered…").
-- **The list is never squeezed by the sentence beside it.** The docs screenshot showed the second entry cut mid-word by a long "matches more than one" sentence; the choice group no longer shrinks and is capped at 60% of the row instead, so the sentence is elided first and a long list scrolls inside its cap.
+- **The list is never squeezed by the sentence beside it.** The docs screenshot showed the second entry cut mid-word by a long "matches more than one" sentence; the choice group no longer shrinks and is capped at 60% of the row instead, so the sentence is elided first and a long list scrolls inside its cap. *(Superseded by PR #1451 round 3, change 2: the choice is no longer in the row at all — see the Work Log.)*
+- **The chooser is a dialog that takes focus (PR #1451 round 3).** The "Keyboard and pointer" design above put real buttons in the voice row and left focus alone (Open Question 1). As built after round 3, the choice is a modal dialog centred over the screen that focuses entry 1 and restores focus on close, answers number keys, and cancels on Escape; the Work Log entry for 2026-10-01 has why.
 
 ## Risks
 
@@ -179,7 +182,7 @@ Recorded here so the sections above can be read as the design and this as what s
 
 ## Open Questions
 
-1. **Should the chooser take focus when it opens?** Default here: no, because a choice arises from speech and the user may be typing into a terminal; the entries are reachable by Tab. Revisit with use.
+1. ~~**Should the chooser take focus when it opens?** Default here: no, because a choice arises from speech and the user may be typing into a terminal; the entries are reachable by Tab. Revisit with use.~~ **Reversed in PR #1451 round 3 (change 2): yes.** The chooser is now a modal dialog that takes focus and gives it back when it closes; see the Work Log entry for 2026-10-01.
 2. **The expiry window** — 20 s is a starting value.
 3. **The cap of nine** — a starting value.
 
@@ -235,6 +238,15 @@ Written from issue #1261 by a dispatched unit, alongside PRDs #1260 and #1184, a
 ### 2026-09-30 — Closed; D1 moved to PRD #1184
 
 Everything but D1 is built and ships in the PR that closes #1261. D1 needs the multi-action response schema that PRD #1184 would introduce, and #1184's M1 measured NO-GO (not now), so D1 moved into [PRD #1184](../1184-voice-command-chains.md) as a dependent follow-up rather than staying open here.
+
+### 2026-10-01 — PR #1451 round 3, change 2: the numbered choice becomes a dialog
+
+- **Out of the row, into a centred dialog.** The maintainer asked for the choice as an overlay over the current screen, consistent with the app's other dialogs (`ConfirmDialog`), plus number keys. `VoiceChoiceDialog` (`VoiceControlPanel.tsx`) renders a `role="dialog"`, `aria-modal` card using `.confirm-dialog`: a heading naming what was ambiguous ("Which agent?", by the offered entries' kind), the spoken word that matched several, the entries as a numbered list of buttons, the countdown (`role="timer"`) and Cancel. The voice row goes back to reporting what was heard. Clicking the scrim cancels, as `ConfirmDialog`'s does.
+- **Open Question 1 reversed: the dialog takes focus.** A number key reaches only the focused element, and the alternative — a window `keydown` listener — would also fire the agent pane's and the Daemons screen's own window listeners (`Escape` closing the pane, `1`–`4` focusing tiles). So the dialog focuses entry 1 when it opens and, in the same layout effect's cleanup, gives focus back to whatever had it, however it closes — unless the close moved focus itself (a chosen agent's pane takes it). Typing mode and a choice never coexist (a choice is offered only from `idle`, PRD #1260's precedence), so this cannot take keys from dictation. The cost the old default avoided — keys meant for a terminal going to the chooser — is bounded by the 20 s window and by focus coming back on close.
+- **Keys on the element, stopped there.** A digit `1`–`9` picks that entry through `dispatchChoice`, as a click does (a digit past the list does nothing); `Escape` cancels; every key is stopped at the dialog, so `Escape` over an agent pane or the New agent dialog closes only the choice. No window listener was added.
+- **Above the New agent dialog, still behind no fence.** The dialog stays a DOM child of `.voice-row` (its `VOICE_PEER_PROPS` exemption), and the row is raised over `.dialog-backdrop` while a choice is open (`.voice-row[data-choice="open"]`), since a child cannot be drawn above its parent's stacking context; Playwright checks the entries are clickable over the New agent dialog, and fails without the raise. The scrim stops at the row's top edge.
+- **`useInertBackground` no longer pulls focus off a voice peer.** Its walk runs on every commit and moved focus into the fence whenever it was outside; with the choice holding focus, the New agent dialog's next render took it back (measured in WebKit). It now leaves focus on an element inside a voice peer. Its stale note that "the voice surface binds no key at all" was corrected.
+- Tests: vitest `VoiceControlCommands.test.tsx` (the dialog's structure and countdown, number keys, every cancel route restoring focus, Escape over an agent pane and over the New agent dialog), Playwright `voice-control.spec.ts` (centred, number key, Escape, above the New agent dialog). The `voice-choice` docs screenshot was regenerated.
 
 ### 2026-10-01 — PR #1451 round 3, change 6: unusable daemons leave the New agent dialog
 
