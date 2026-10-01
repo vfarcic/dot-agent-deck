@@ -1475,6 +1475,25 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
     );
   }
 
+  /*
+    An `error` no daemon answered is the app's own bridge failing — a connect
+    or subscription that failed before any handshake — not a daemon this build
+    refused. Calling it incompatible, or advising a version update, would send
+    the user after a mismatch that does not exist (Qodo on PR #1451). Same
+    title as the Daemons-screen banner gives it.
+  */
+  if (connection.status === "error" && !connection.daemonDetected) {
+    return (
+      <OverviewNote className={noteClass} testId="overview-bridge-error" icon={<ShieldAlert size={24} />} title="Desktop bridge error">
+        <p>{message ?? "The app could not open its connection to this daemon."}</p>
+        <p className="overview-note-hint">The app could not read this daemon's agents, so nothing is listed rather than guessed. Reconnect tries again.</p>
+        <div>
+          <button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button>
+        </div>
+      </OverviewNote>
+    );
+  }
+
   if (connection.status === "error") {
     return (
       <OverviewNote className={noteClass} testId="overview-incompatible" icon={<ShieldAlert size={24} />} title="Incompatible daemon">

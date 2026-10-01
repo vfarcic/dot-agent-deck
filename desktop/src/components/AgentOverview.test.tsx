@@ -1699,6 +1699,23 @@ describe("AgentOverview", () => {
     expect(screen.getByTestId("overview-loading")).toBeVisible();
   });
 
+  /** Scenario: the app's own connection fails before any daemon answers. The dashboard says so and offers Reconnect, without calling the daemon incompatible or advising a version update (Qodo on PR #1451). */
+  it("does not give version advice for a bridge failure no daemon answered", () => {
+    const snapshot = createFixtureSnapshot("error");
+    snapshot.connection = { status: "error", socketPath: FIXTURE_DAEMON_ID, message: "The control channel could not be opened." };
+    renderOverview({ snapshot });
+
+    expect(screen.queryByTestId("overview-incompatible")).not.toBeInTheDocument();
+    const note = screen.getByTestId("overview-bridge-error");
+    expect(note).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Desktop bridge error" })).toBeVisible();
+    expect(note).toHaveTextContent("The control channel could not be opened.");
+    expect(note.textContent).not.toMatch(/version|older|incompatible|match/i);
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Connect anyway" })).not.toBeInTheDocument();
+    expect(rows(document.body)).toHaveLength(0);
+  });
+
   /** Scenario: Refuses to imply a fleet it cannot read from an incompatible daemon. */
   it("refuses to imply a fleet it cannot read from an incompatible daemon", () => {
     const snapshot = createFixtureSnapshot("error");
