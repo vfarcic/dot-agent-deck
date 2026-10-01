@@ -56,9 +56,11 @@ import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRecord";
 import { useZoom } from "./hooks/useZoom";
 import { useShellOverlays, type RailScreen, type ScreenOverlays } from "./hooks/useShellOverlays";
-import { VoiceOn } from "./hooks/useVoiceOn";
-import { useNumberedList, useNumbersShown, VoiceChoiceOpen, VoiceNumberingContext, type NumberedLayer, type VoiceNumbering } from "./hooks/useVoiceNumbers";
+import { useVoiceOn, VoiceOn } from "./hooks/useVoiceOn";
+import { DialogNumbered, useNumberedList, useNumbersShown, VoiceChoiceOpen, VoiceNumberingContext, type NumberedLayer, type VoiceNumbering } from "./hooks/useVoiceNumbers";
+import { usePager, VoicePagingContext, type VoicePaging } from "./hooks/useVoicePages";
 import { NO_NUMBERED_LIST, sameNumberedEntries, type VoiceNumberedEntryDto, type VoiceNumberedListDto } from "./lib/voiceNumbers";
+import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
 import { agentKey } from "./lib/agentKey";
 import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
@@ -704,6 +706,20 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * aimed: it types one utterance into the pane that is already open, so there
    * is no navigation to observe and nothing for the flag to suppress.
    */
+  /**
+   * PR #1451 round 3, change 4 — the lists on screen split into pages, by
+   * layer (`useVoicePages`). "next page" turns the dialog layer's while the
+   * dialog layer declares anything — the New agent dialog, the open Daemon
+   * selector — and the screen's otherwise, so a page hidden behind a dialog
+   * is never turned.
+   */
+  const pagerLayers = useRef<Partial<Record<NumberedLayer, VoicePager>>>({});
+  const paging = useMemo<VoicePaging>(() => ({
+    publish: (layer, pager) => { pagerLayers.current[layer] = pager; },
+  }), []);
+  const readPager = useCallback((): VoicePager | undefined => (
+    numberedLayers.current.dialog !== undefined || pagerLayers.current.dialog !== undefined ? pagerLayers.current.dialog : pagerLayers.current.screen
+  ), []);
   const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto, declaredNewAgent?: VoiceNewAgentDto) => {
     const previous = view;
     /*
@@ -797,6 +813,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
       /* The Deck selector's own write, which its menu calls too (PRD #1195). */
       switchDeck: (selection, identity) => chooseDeckSelection(latestSettings.current, selection, identity),
+      /* The page of whichever list on screen pages (PR #1451 round 3, change 4). */
+      turnPage: (delta) => {
+        const pager = readPager();
+        const refused = pageTurnRefusal(pager, delta);
+        if (refused === undefined) pager?.turn(delta);
+        return refused;
+      },
       navigate: (next) => { moved = true; setView(next); },
       closeAgentView: () => { moved = true; closeAgent(); },
     };
@@ -806,10 +829,20 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
        the dispatch seam, for an answer that arrives anyway. Refused like any
        dispatch the host cannot serve, so the report says nothing ran. */
     if (outcome.invoke === OPEN_DECK_INVOKE && !features.showDeck) return undefined;
+    /* PR #1451 round 3, change 4 — voice acts only on what is on screen. An
+       answer naming an item a paged list shows on another page (an agent on
+       the dashboard's page 2, resolved by Rust against the whole deck) is
+       refused with that page, and nothing runs. */
+    const pager = readPager();
+    const offPage = pager && offPageTarget(outcome.params, pager.elsewhere);
+    if (pager && offPage) {
+      panelVoiceContext.current?.reportRefused?.(offPageSentence(offPage.label, offPage.page, pager.page));
+      return {};
+    }
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, features.showDeck, overlaysOpen.settings, paneAgent, railContext, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, features.showDeck, overlaysOpen.settings, paneAgent, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
@@ -835,8 +868,16 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    */
   const numberedLayers = useRef<Partial<Record<NumberedLayer, readonly VoiceNumberedEntryDto[]>>>({});
   const numberedRead = useRef<VoiceNumberedListDto>(NO_NUMBERED_LIST);
+  /* Whether the dialog layer numbers anything — the New agent dialog, or the
+     open Daemon selector — so the screen under it shows no numbers then: a
+     number names one item on screen (change 4). */
+  // voice-registry-exempt: a mirror of which layer is numbered, written only by the lists' own declarations so the screen can hide its numbers under a dialog's
+  const [dialogNumbered, setDialogNumbered] = useState(false);
   const numbering = useMemo<VoiceNumbering>(() => ({
-    publish: (layer, entries) => { numberedLayers.current[layer] = entries; },
+    publish: (layer, entries) => {
+      numberedLayers.current[layer] = entries;
+      if (layer === "dialog") setDialogNumbered(entries !== undefined);
+    },
   }), []);
   const readNumbered = useCallback((): VoiceNumberedListDto => {
     const layers = numberedLayers.current;
@@ -909,15 +950,19 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   return (
     <VoiceOn.Provider value={voiceOn}>
       <VoiceNumberingContext.Provider value={numbering}>
+      <VoicePagingContext.Provider value={paging}>
+      <DialogNumbered.Provider value={dialogNumbered}>
       <VoiceChoiceOpen.Provider value={choiceOpen}>
       <PaneDictation.Provider value={paneDictation}>
         {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
         <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
         {screenNode}
-        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} onDictationChange={setDictating} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} onChoiceChange={setChoiceOpen} />
+        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} onDictationChange={setDictating} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} />
         <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
       </PaneDictation.Provider>
       </VoiceChoiceOpen.Provider>
+      </DialogNumbered.Provider>
+      </VoicePagingContext.Provider>
       </VoiceNumberingContext.Provider>
     </VoiceOn.Provider>
   );
@@ -1057,6 +1102,13 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
 }
 
 /**
+ * PR #1451 round 3, change 4 — how many tiles the Daemons screen shows per
+ * page while voice pages them: the 2 × 2 grid the 1–4 focus keys reach, so the
+ * numbers on a page and the keys agree.
+ */
+const TILE_PAGE = 4;
+
+/**
  * PRD #1105 M3 — the pane's WRAPPER, and the reason it is rendered whether or
  * not the pane is open.
  *
@@ -1079,7 +1131,7 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
  * Closed, the wrapper is `display: contents`, so `.agent-tile` remains the
  * grid item it has always been and the deck's layout is untouched.
  */
-function AgentPaneFrame({ open, onOpen, onClose, ...tile }: Omit<AgentTileProps, "presentation"> & { open: boolean }) {
+function AgentPaneFrame({ open, offPage, onOpen, onClose, ...tile }: Omit<AgentTileProps, "presentation"> & { open: boolean; offPage?: boolean }) {
   /*
     The `aria-modal` below is a claim about the whole interface, and until the
     PRD's security audit it was false: the base screen is deliberately still
@@ -1100,6 +1152,8 @@ function AgentPaneFrame({ open, onOpen, onClose, ...tile }: Omit<AgentTileProps,
       ref={paneRef}
       className={open ? "agent-pane-overlay" : "agent-pane-slot"}
       data-testid={open ? "agent-pane-overlay" : undefined}
+      /* On another page of tiles while voice pages them (change 4): mounted, not shown. */
+      style={offPage && !open ? { display: "none" } : undefined}
       role={open ? "dialog" : undefined}
       aria-modal={open ? "true" : undefined}
       aria-label={open ? `${tile.agent.role} agent` : undefined}
@@ -1203,9 +1257,34 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     agree. Declared whenever the grid is on screen and no pane covers it.
   */
   const tilesShown = !allDecks && snapshot.agents.length > 0;
+  /*
+    PR #1451 round 3, change 4 — while voice is on and no pane is open, more
+    tiles than one page are shown a page at a time: the 2 × 2 grid the 1–4
+    keys reach ({@link TILE_PAGE}), so a tile's number, its key and what voice
+    can act on are the same four. The tiles on other pages stay mounted and
+    hidden, so their terminals keep their state.
+  */
+  const voiceOn = useVoiceOn();
+  const tilesPageable = tilesShown && paneAgentId === undefined;
+  // voice-registry-exempt: which page of tiles is showing — turned by `nextPage` / `previousPage` through the shell's pager registry
+  const [tilePage, setTilePage] = useState(1);
+  const tileSlice = pageSlice(snapshot.agents.length, TILE_PAGE, tilePage);
+  const tilesPaged = voiceOn && tilesPageable && tileSlice.pages > 1;
+  const shownTiles = useMemo(() => (tilesPaged ? snapshot.agents.slice(tileSlice.start, tileSlice.end) : snapshot.agents), [snapshot.agents, tileSlice.end, tileSlice.start, tilesPaged]);
+  const tilePager = useMemo<VoicePager | undefined>(() => (tilesPaged
+    ? {
+      page: tileSlice.page,
+      pages: tileSlice.pages,
+      turn: (delta) => setTilePage(tileSlice.page + delta),
+      elsewhere: snapshot.agents.flatMap((agent, index): VoiceOffPageItem[] => (index >= tileSlice.start && index < tileSlice.end
+        ? []
+        : [{ kind: "agent", value: agent.id, deckId: agent.daemonId, label: agent.role, page: Math.floor(index / TILE_PAGE) + 1 }])),
+    }
+    : undefined), [snapshot.agents, tileSlice, tilesPaged]);
+  usePager("screen", tilePager);
   const numberedTiles = useMemo(() => (
-    tilesShown && paneAgentId === undefined
-      ? snapshot.agents.map((agent): VoiceNumberedEntryDto => ({
+    tilesPageable
+      ? shownTiles.map((agent): VoiceNumberedEntryDto => ({
         kind: "agent",
         value: agent.id,
         deckId: agent.daemonId,
@@ -1213,9 +1292,9 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         names: [agent.displayName, agent.cli].filter((name): name is string => Boolean(name) && name !== agent.role),
       }))
       : undefined
-  ), [paneAgentId, snapshot.agents, tilesShown]);
+  ), [shownTiles, tilesPageable]);
   useNumberedList("screen", numberedTiles);
-  const tileNumbers = useNumbersShown() && numberedTiles !== undefined;
+  const tileNumbers = useNumbersShown("screen") && numberedTiles !== undefined;
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
   const [selectedEvidenceId, setSelectedEvidenceId] = useState(""); // voice-registry-exempt: which evidence item the drawer shows — a selection within the drawer, which the drawer's rows and J/K set
@@ -1588,7 +1667,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       if (target instanceof Element && target.matches("input, textarea, select, [contenteditable='true'], .xterm-helper-textarea")) return;
       if (event.key === "?") { event.preventDefault(); setHelpOpen(true); return; }
       if (/^[1-4]$/.test(event.key)) {
-        const agent = snapshot.agents[Number(event.key) - 1];
+        /* The tiles showing: the page, while they page (change 4). */
+        const agent = shownTiles[Number(event.key) - 1];
         // Through the registry, because this is the SAME capability the
         // palette's `Focus <role>` entries dispatch and a second path to one
         // capability is what PRD #802's first risk is about. Safe from the
@@ -1605,7 +1685,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedEvidenceId, snapshot.agents, snapshot.evidence]);
+  }, [selectedEvidenceId, shownTiles, snapshot.evidence]);
 
   const moveStage = (id: string, direction: -1 | 1) => {
     setProfileOrder((current) => {
@@ -1984,7 +2064,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         {!allDecks && <section className="workspace-section" aria-label="Agent terminals">
           <header className="workspace-header">
             <div><span className="section-kicker">AGENT DECK</span><h2>Live work surfaces</h2></div>
-            <div className="workspace-tools"><span>{snapshot.agents.length} agents</span><span>{snapshot.agents.filter((agent) => agent.status === "running").length} active</span><button className={evidenceOpen ? "is-active" : ""} onClick={() => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext)}><PanelRight size={14} /> Events</button></div>
+            <div className="workspace-tools">{tilesPaged && <span className="workspace-page" data-testid="deck-tiles-page">{pageMarker(tileSlice)}</span>}<span>{snapshot.agents.length} agents</span><span>{snapshot.agents.filter((agent) => agent.status === "running").length} active</span><button className={evidenceOpen ? "is-active" : ""} onClick={() => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext)}><PanelRight size={14} /> Events</button></div>
           </header>
           {snapshot.connection.status === "loading" && !snapshot.agents.length ? <LoadingDeck /> : snapshot.agents.length ? (
             <div className="agent-grid">
@@ -2012,7 +2092,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                   evidence={snapshot.evidence}
                   inputResult={runtime.terminalInputResults?.[agentKey(agent.daemonId, agent.id)]}
                   terminalFocusToken={terminalFocus?.agentId === agent.id ? terminalFocus.token : 0}
-                  voiceNumber={tileNumbers ? index + 1 : undefined}
+                  voiceNumber={tileNumbers && index >= (tilesPaged ? tileSlice.start : 0) && index < (tilesPaged ? tileSlice.end : snapshot.agents.length) ? index - (tilesPaged ? tileSlice.start : 0) + 1 : undefined}
+                  offPage={tilesPaged && (index < tileSlice.start || index >= tileSlice.end)}
                   onSelect={() => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id })}
                   // voice-registry-exempt: a tile's own tab strip, a control inside one tile; `focusTerminal` writes the same map only to show the terminal it focuses
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}

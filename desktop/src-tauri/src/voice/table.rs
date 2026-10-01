@@ -1356,6 +1356,10 @@ mod tests {
                     "clearDirectoryFilter",
                     vec!["overview"]
                 ),
+                // Turning the page of a list shown a page at a time while
+                // voice is on (PR #1451 round 3, change 4).
+                ("next_page", "nextPage", vec!["deck", "overview"]),
+                ("previous_page", "previousPage", vec!["deck", "overview"]),
                 // The rest of the New agent form — `overview`, plus
                 // `requires = ["new_agent_form"]` (PRD #1223).
                 ("choose_mode", "chooseNewAgentMode", vec!["overview"]),
@@ -2367,7 +2371,9 @@ mod tests {
                 "open_settings",
                 "switch_deck",
                 "voice_off",
-                "list_commands"
+                "list_commands",
+                "next_page",
+                "previous_page"
             ]
         );
         assert_eq!(
@@ -2382,6 +2388,8 @@ mod tests {
                 "voice_off",
                 "list_commands",
                 "open_new_agent",
+                "next_page",
+                "previous_page",
                 // PRD #802 D5's two stops: on the overview, where their
                 // controls are. Each only opens a confirmation.
                 "stop_agent",
@@ -2533,6 +2541,7 @@ mod tests {
             path: "/home/dev".to_string(),
             has_parent,
             entries: Vec::new(),
+            paging: None,
         }
     }
 
@@ -2637,6 +2646,7 @@ mod tests {
                 modes: Vec::new(),
                 agent_types: Vec::new(),
                 withheld_modes: Vec::new(),
+                mode_paging: None,
             }),
         }
     }
@@ -3133,6 +3143,46 @@ mod tests {
             form_rows,
             vec!["choose_mode", "choose_agent_type", "name_new_agent"],
             "a new form row is a decision about the Command field too — see commands.toml"
+        );
+    }
+
+    /// PR #1451 round 3, change 4: turning the page of whatever list on screen
+    /// is split into pages while voice is on — the dashboard's agents, the
+    /// Daemons screen's tiles, the New agent dialog's directories and modes.
+    /// Pinned by value; neither takes a param or needs a declaration, because
+    /// the app answers "nothing here has pages" itself, and neither is
+    /// callable over an agent's pane, where nothing pages.
+    #[test]
+    fn voice_table_page_rows_are_pinned_by_value() {
+        let table = super::table();
+        for (id, invoke, report, word) in [
+            ("next_page", "nextPage", "Next page.", "next"),
+            (
+                "previous_page",
+                "previousPage",
+                "Previous page.",
+                "previous",
+            ),
+        ] {
+            let row = table
+                .row(id)
+                .unwrap_or_else(|| panic!("{id} is in the table"));
+            assert_eq!(row.invoke, invoke, "{id}");
+            assert_eq!(row.screens, vec![Screen::Deck, Screen::Overview], "{id}");
+            assert!(row.requires.is_empty(), "{id}");
+            assert!(row.params.is_empty(), "{id}");
+            assert_eq!(row.report, report, "{id}");
+            let ActionGrounding::HeardAs(heard_as) = &row.grounding else {
+                panic!("{id} is grounded by `heard_as`");
+            };
+            assert!(heard_as.iter().any(|heard| heard == word), "{id}");
+            assert!(row.callable(Screen::Overview, None, None), "{id}");
+            assert!(row.callable(Screen::Deck, None, None), "{id}");
+            assert!(!row.callable(Screen::Agent, None, None), "{id}");
+        }
+        let back = table.row("previous_page").expect("present");
+        assert!(
+            matches!(&back.grounding, ActionGrounding::HeardAs(heard_as) if heard_as.iter().any(|heard| heard == "back"))
         );
     }
 

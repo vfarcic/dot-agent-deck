@@ -1,0 +1,213 @@
+import { expect, test, type Page } from "@playwright/test";
+import { enterDeck, selectOverview } from "./support/overview";
+
+const SETTINGS_KEY = "dot-agent-deck.desktop-settings";
+
+async function open(page: Page, state: string, utterance?: string) {
+  await page.addInitScript((key) => {
+    window.localStorage.setItem(key, JSON.stringify({
+      version: 1,
+      appearance: { mode: "light" },
+      voice: { activation: "toggle", intent: "claude", transcription: "remote" },
+      zoom: { level: 1 },
+    }));
+  }, SETTINGS_KEY);
+  await page.goto(`/?fixture=1&state=${state}${utterance ? `&voice=${encodeURIComponent(utterance)}` : ""}`);
+  await selectOverview(page);
+}
+
+async function turnOnVoice(page: Page) {
+  const trigger = page.getByTestId("voice-trigger");
+  await trigger.focus();
+  await page.keyboard.press("Enter");
+  await expect(trigger).toHaveAttribute("aria-pressed", "true");
+}
+
+async function openCrowdedDialog(page: Page, voice: boolean) {
+  await open(page, "voice-pages");
+  await page.getByTestId("overview-new-agent").click();
+  if (voice) await turnOnVoice(page);
+  const decks = page.getByTestId("new-agent-deck-list").getByRole("option");
+  await expect(decks).toHaveCount(6);
+  return decks;
+}
+
+async function useDocsDirectory(page: Page) {
+  await page.getByTestId("new-agent-filter").fill("docs");
+  await page.getByTestId("new-agent-directory-list").getByRole("option").filter({ hasText: "docs" }).click();
+  await page.getByTestId("new-agent-use-directory").click();
+  await expect(page.getByTestId("new-agent-modes")).toBeVisible();
+}
+
+test.describe("visible pages for voice-selected lists", () => {
+  /** Scenario: with Voice off, the New agent directory keeps its ordinary scrollable list and shows no page marker. */
+  test("voice-off directory keeps scrolling without a page marker", async ({ page }) => {
+    const decks = await openCrowdedDialog(page, false);
+    await decks.first().click();
+    const list = page.getByTestId("new-agent-directory-list");
+    await expect(list.getByRole("option")).toHaveCount(31);
+    await expect(page.getByTestId("new-agent-dialog").getByText(/Page \d+ of \d+/i)).toHaveCount(0);
+    expect(await list.evaluate((element) => getComputedStyle(element).overflowY)).toBe("auto");
+    expect(await list.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+  });
+
+  for (const voice of [false, true]) {
+    /** Scenario: all six usable daemons fit inside the New agent dialog and viewport, and neither their list nor an ancestor scrolls. The disconnected seventh daemon is absent from this chooser. */
+    test(`New agent daemon options stay fully visible with Voice ${voice ? "on" : "off"}`, async ({ page }) => {
+      await page.setViewportSize({ width: 1280, height: 900 });
+      const decks = await openCrowdedDialog(page, voice);
+      const geometry = await decks.first().evaluate((first) => {
+        const list = first.parentElement!;
+        const dialog = first.closest<HTMLElement>("[data-testid='new-agent-dialog']")!;
+        const dialogBox = dialog.getBoundingClientRect();
+        const options = [...list.querySelectorAll<HTMLElement>("[role='option']")];
+        let ancestor: HTMLElement | null = list;
+        const scrolling: string[] = [];
+        while (ancestor && dialog.contains(ancestor)) {
+          if (ancestor.scrollHeight > ancestor.clientHeight + 1) scrolling.push(ancestor.className);
+          ancestor = ancestor.parentElement;
+        }
+        return {
+          count: options.length,
+          clipped: options.some((option) => {
+            const box = option.getBoundingClientRect();
+            return box.top < dialogBox.top || box.bottom > dialogBox.bottom || box.top < 0 || box.bottom > innerHeight;
+          }),
+          scrolling,
+        };
+      });
+      expect(geometry.count).toBe(6);
+      expect(geometry.clipped).toBe(false);
+      expect(geometry.scrolling).toEqual([]);
+    });
+  }
+
+  /** Scenario: Voice shows a wide crowded directory as a full, non-scrolling multi-column page. The page marker is visible and fewer than one row of usable height is wasted. */
+  test("voice-on directory fills a wide page without a scrollbar", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 720 });
+    const decks = await openCrowdedDialog(page, true);
+    await decks.first().click();
+    const list = page.getByTestId("new-agent-directory-list");
+    await expect(page.getByTestId("new-agent-dialog").getByText(/Page 1 of [2-9]\d*/i)).toBeVisible();
+    const geometry = await list.evaluate((element) => {
+      const rows = [...element.querySelectorAll<HTMLElement>("[role='option']")];
+      const boxes = rows.map((row) => row.getBoundingClientRect());
+      const bottom = Math.max(...boxes.map((box) => box.bottom));
+      return {
+        count: rows.length,
+        columns: new Set(boxes.map((box) => Math.round(box.left))).size,
+        scrolls: element.scrollHeight > element.clientHeight + 1,
+        spare: element.getBoundingClientRect().bottom - bottom,
+        rowHeight: boxes[0]?.height ?? 0,
+      };
+    });
+    expect(geometry.count).toBeLessThan(31);
+    expect(geometry.columns).toBeGreaterThanOrEqual(2);
+    expect(geometry.scrolls).toBe(false);
+    expect(geometry.spare).toBeGreaterThanOrEqual(0);
+    expect(geometry.spare).toBeLessThan(geometry.rowHeight);
+  });
+
+  /** Scenario: after a spoken page turn, the directory choices change and the visible numbering starts again at one. */
+  test("directory numbers restart on page two", async ({ page }) => {
+    await page.setViewportSize({ width: 900, height: 500 });
+    await open(page, "voice-pages", "next page");
+    await page.getByTestId("overview-new-agent").click();
+    await page.getByTestId("new-agent-deck-list").getByRole("option").first().click();
+    await turnOnVoice(page);
+    await expect(page.getByTestId("new-agent-dialog").getByText(/Page 2 of \d+/i)).toBeVisible();
+    const rows = page.getByTestId("new-agent-directory-list").getByRole("option");
+    await expect(rows.first()).toHaveAccessibleName(/^1\./);
+    await expect(rows.nth(1)).toHaveAccessibleName(/^2\./);
+  });
+
+  /** Scenario: on a crowded dashboard, Voice exposes only agents that fit the current page. A page marker changes when the window gains enough height to fit more rows. */
+  test("crowded dashboard recomputes its voice page after resize", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 480 });
+    await open(page, "voice-pages");
+    await turnOnVoice(page);
+    const marker = page.getByText(/Page \d+ of \d+/i);
+    await expect(marker).toBeVisible();
+    const smallPage = (await marker.textContent())!;
+    const smallCount = await page.locator(".overview-row:visible").count();
+    expect(smallCount).toBeLessThan(25);
+
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await expect.poll(async () => marker.textContent()).not.toBe(smallPage);
+    const tallCount = await page.locator(".overview-row:visible").count();
+    expect(tallCount).toBeGreaterThan(smallCount);
+  });
+
+  /** Scenario: in a short New agent window, every mode is either in the visible dialog or reached through a visible page indicator while Voice is on. */
+  test("voice-on modes are visible or paged in a short window", async ({ page }) => {
+    await page.setViewportSize({ width: 720, height: 360 });
+    const decks = await openCrowdedDialog(page, true);
+    await decks.first().click();
+    await useDocsDirectory(page);
+    const modes = page.getByTestId("new-agent-modes");
+    const geometry = await modes.evaluate((element) => {
+      const dialog = element.closest<HTMLElement>("[data-testid='new-agent-dialog']")!;
+      const body = element.closest<HTMLElement>(".new-agent-body")!;
+      const dialogBox = dialog.getBoundingClientRect();
+      const bodyBox = body.getBoundingClientRect();
+      const chips = [...element.querySelectorAll<HTMLElement>("button")];
+      return {
+        count: chips.length,
+        clipped: chips.some((chip) => {
+          const box = chip.getBoundingClientRect();
+          return box.top < bodyBox.top || box.bottom > bodyBox.bottom || box.top < dialogBox.top || box.bottom > dialogBox.bottom || box.bottom > innerHeight;
+        }),
+      };
+    });
+    expect(geometry.count).toBeGreaterThan(0);
+    expect(geometry.clipped).toBe(false);
+    await expect(page.getByTestId("new-agent-dialog").getByText(/Page 1 of [2-9]\d*/i)).toBeVisible();
+  });
+
+  /** Scenario: a short dialog pages the crowded project's modes, while a small set of ordinary modes fits without any marker. */
+  test("fitting modes have no page marker", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const decks = await openCrowdedDialog(page, true);
+    await decks.first().click();
+    await page.getByTestId("new-agent-use-directory").click();
+    await expect(page.getByTestId("new-agent-modes").getByRole("button")).toHaveCount(3);
+    await expect(page.getByTestId("new-agent-dialog").getByText(/Page \d+ of \d+/i)).toHaveCount(0);
+  });
+
+  /** Scenario: the Daemons screen pages its fifteen tiles with Voice on, and the four tiles on page one bear the same numbers as their focus keys. */
+  test("Daemons tiles page and agree with focus keys", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await open(page, "voice-pages");
+    await enterDeck(page);
+    await turnOnVoice(page);
+    await expect(page.getByText(/Page 1 of [2-9]\d*/i)).toBeVisible();
+    const tiles = page.locator(".agent-grid .agent-tile:visible");
+    await expect(tiles).toHaveCount(4);
+    for (let index = 0; index < 4; index += 1) await expect(tiles.nth(index)).toHaveAccessibleName(new RegExp(`^${index + 1}\\.`));
+    await page.keyboard.press("3");
+    await expect(tiles.nth(2)).toHaveClass(/is-selected/);
+  });
+
+  /** Scenario: every daemon in the selector menu remains within the viewport and menu when Voice is off. */
+  test("DeckSelector shows every fixture daemon without clipping", async ({ page }) => {
+    await open(page, "fleet");
+    await page.getByTestId("deck-selector-toggle").click();
+    const menu = page.getByTestId("deck-selector-menu");
+    await expect(menu).toBeVisible();
+    const geometry = await menu.evaluate((element) => {
+      const menuBox = element.getBoundingClientRect();
+      const options = [...element.querySelectorAll<HTMLElement>("[data-testid^='deck-selector-option-']")];
+      return {
+        count: options.length,
+        clipped: options.some((option) => {
+          const box = option.getBoundingClientRect();
+          return box.top < menuBox.top || box.bottom > menuBox.bottom || box.top < 0 || box.bottom > innerHeight;
+        }),
+        scrolls: element.scrollHeight > element.clientHeight,
+      };
+    });
+    expect(geometry.count).toBeGreaterThanOrEqual(2);
+    expect(geometry.clipped).toBe(false);
+    expect(geometry.scrolls).toBe(false);
+  });
+});

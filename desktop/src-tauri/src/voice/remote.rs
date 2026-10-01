@@ -664,6 +664,8 @@ mod tests {
                 "use_this_directory",
                 "filter_directories",
                 "clear_directory_filter",
+                "next_page",
+                "previous_page",
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",

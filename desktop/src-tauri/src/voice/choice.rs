@@ -193,27 +193,54 @@ impl Ordinal {
 
 /// `words` read as an ordinal, or `None` when they are anything else: "two",
 /// "2", "number two", "option 2", "the second", "the second one", "2nd", "the
-/// last one". Whole-utterance, so "open the second tab" is not one; `words`
-/// are what [`whole_utterance`] makes of the transcript.
+/// last one" — and, past nine (PR #1451 round 3, change 4, where a page can
+/// show more numbers than that), "twelve", "number twenty-three", "the
+/// twelfth", "twentieth", "the twenty-first one", up to ninety-nine.
+/// Whole-utterance, so "open the second tab" is not one; `words` are what
+/// [`whole_utterance`] makes of the transcript, which splits "twenty-three"
+/// into two words.
 pub(crate) fn ordinal(words: &[String]) -> Option<Ordinal> {
-    let word = ordinal_word(words)?;
-    if word == "last" {
+    let said = ordinal_words(words)?;
+    if let [word] = said
+        && word == "last"
+    {
         return Some(Ordinal::Last);
     }
-    let named = |list: &[&str]| list.iter().position(|entry| *entry == word);
-    if let Some(at) = named(&CARDINALS).or_else(|| named(&ORDINALS)) {
-        return Some(Ordinal::Nth(at + 1));
-    }
-    let digits = ["st", "nd", "rd", "th"]
-        .iter()
-        .find_map(|suffix| word.strip_suffix(suffix))
-        .unwrap_or(word);
-    digits.parse::<usize>().ok().map(Ordinal::Nth)
+    number_said(said).map(|(number, _)| Ordinal::Nth(number))
+}
+
+/// Whether the ordinal `words` say is said as a count — "twelve", "12",
+/// "number twenty-three" — rather than as a position ("twelfth", "12th",
+/// "the last one"), which `voice::numbers` needs to know before it lets the
+/// number collide with a name.
+pub(crate) fn said_as_count(words: &[String]) -> bool {
+    ordinal_words(words)
+        .and_then(number_said)
+        .is_some_and(|(_, count)| count)
 }
 
 /// The number words [`ordinal`] reads as a count: "one" to "nine".
-pub(crate) const CARDINALS: [&str; 9] = [
+const CARDINALS: [&str; 9] = [
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+];
+
+/// The counts from ten to nineteen.
+const TEENS: [&str; 10] = [
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+];
+
+/// The tens from twenty to ninety, which a unit may follow: "twenty three".
+const TENS: [&str; 8] = [
+    "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
 ];
 
 /// The number words [`ordinal`] reads as a position: "first" to "ninth".
@@ -221,12 +248,100 @@ const ORDINALS: [&str; 9] = [
     "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth",
 ];
 
-/// The one word an ordinal utterance turns on, once a leading "the", one of
-/// [`ORDINAL_LEADS`] and a trailing filler "one" are set aside — "three" in
-/// "number three", "third" in "the third one" — or `None` when more than one
-/// word is left. [`ordinal`] reads it; `voice::numbers` also asks whether it
-/// was said as a count.
-pub(crate) fn ordinal_word(words: &[String]) -> Option<&str> {
+/// The positions from tenth to nineteenth.
+const TEEN_ORDINALS: [&str; 10] = [
+    "tenth",
+    "eleventh",
+    "twelfth",
+    "thirteenth",
+    "fourteenth",
+    "fifteenth",
+    "sixteenth",
+    "seventeenth",
+    "eighteenth",
+    "nineteenth",
+];
+
+/// The positions twentieth to ninetieth.
+const TENS_ORDINALS: [&str; 8] = [
+    "twentieth",
+    "thirtieth",
+    "fortieth",
+    "fiftieth",
+    "sixtieth",
+    "seventieth",
+    "eightieth",
+    "ninetieth",
+];
+
+/// Whether one word is a count in words — "one" to "nine", "ten" to
+/// "nineteen", or a ten — or plain digits.
+pub(crate) fn is_count_word(word: &str) -> bool {
+    CARDINALS.contains(&word)
+        || TEENS.contains(&word)
+        || TENS.contains(&word)
+        || (!word.is_empty() && word.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// One word as a number: its value and whether it is a count (`true`) or a
+/// position (`false`). Digits are a count, digits with "st", "nd", "rd" or
+/// "th" a position.
+fn number_word(word: &str) -> Option<(usize, bool)> {
+    let at = |list: &[&str]| list.iter().position(|entry| *entry == word);
+    if let Some(at) = at(&CARDINALS) {
+        return Some((at + 1, true));
+    }
+    if let Some(at) = at(&TEENS) {
+        return Some((at + 10, true));
+    }
+    if let Some(at) = at(&TENS) {
+        return Some((at * 10 + 20, true));
+    }
+    if let Some(at) = at(&ORDINALS) {
+        return Some((at + 1, false));
+    }
+    if let Some(at) = at(&TEEN_ORDINALS) {
+        return Some((at + 10, false));
+    }
+    if let Some(at) = at(&TENS_ORDINALS) {
+        return Some((at * 10 + 20, false));
+    }
+    if !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_digit()) {
+        return word.parse().ok().map(|number| (number, true));
+    }
+    ["st", "nd", "rd", "th"]
+        .iter()
+        .find_map(|suffix| word.strip_suffix(suffix))
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|digits| digits.parse().ok())
+        .map(|number| (number, false))
+}
+
+/// One or two words as a number: one word ([`number_word`]), or a ten
+/// followed by a unit — "twenty three" (a count), "twenty third" (a position).
+fn number_said(words: &[String]) -> Option<(usize, bool)> {
+    match words {
+        [word] => number_word(word),
+        [tens, unit] => {
+            let tens = TENS.iter().position(|entry| entry == tens)? * 10 + 20;
+            if let Some(at) = CARDINALS.iter().position(|entry| entry == unit) {
+                return Some((tens + at + 1, true));
+            }
+            ORDINALS
+                .iter()
+                .position(|entry| entry == unit)
+                .map(|at| (tens + at + 1, false))
+        }
+        _ => None,
+    }
+}
+
+/// The words an ordinal utterance turns on — one, or a ten and a unit —
+/// once a leading "the", one of [`ORDINAL_LEADS`] and a trailing filler
+/// "one" after a position are set aside: "three" in "number three", "third"
+/// in "the third one", "twenty first" in "the twenty-first one". `None` when
+/// more than two words are left. [`ordinal`] reads them.
+fn ordinal_words(words: &[String]) -> Option<&[String]> {
     let mut rest: &[String] = words;
     if rest.first().is_some_and(|word| word == "the") {
         rest = &rest[1..];
@@ -237,15 +352,17 @@ pub(crate) fn ordinal_word(words: &[String]) -> Option<&str> {
     {
         rest = &rest[1..];
     }
-    // "the second one": a trailing "one" after an ordinal word is filler. On
-    // its own, "one" is the number.
-    if rest.len() == 2 && rest[1] == "one" {
-        rest = &rest[..1];
+    // "the second one": a trailing "one" after a POSITION is filler. On its
+    // own, "one" is the number, and after a ten ("twenty one") it is a unit.
+    if let [head @ .., last] = rest
+        && last == "one"
+        && !head.is_empty()
+        && (matches!(head, [word] if word == "last")
+            || number_said(head).is_some_and(|(_, count)| !count))
+    {
+        rest = head;
     }
-    let [word] = rest else {
-        return None;
-    };
-    Some(word.as_str())
+    (!rest.is_empty() && rest.len() <= 2).then_some(rest)
 }
 
 /// The name half of [`answer`]: the utterance resolved among the offered

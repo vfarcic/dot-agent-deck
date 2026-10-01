@@ -360,6 +360,8 @@ mod tests {
                 "use_this_directory".to_string(),
                 "filter_directories".to_string(),
                 "clear_directory_filter".to_string(),
+                "next_page".to_string(),
+                "previous_page".to_string(),
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),
@@ -435,6 +437,8 @@ mod tests {
                 "use_this_directory",
                 "filter_directories",
                 "clear_directory_filter",
+                "next_page",
+                "previous_page",
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
@@ -476,6 +480,7 @@ mod tests {
             path: "/home/dev".to_string(),
             has_parent,
             entries: Vec::new(),
+            paging: None,
         }
     }
 
@@ -622,6 +627,9 @@ mod tests {
                 ("use_this_directory".to_string(), false),
                 ("filter_directories".to_string(), false),
                 ("clear_directory_filter".to_string(), false),
+                // Turning a page: on the two screens that show lists (PR #1451 round 3, change 4).
+                ("next_page".to_string(), true),
+                ("previous_page".to_string(), true),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
@@ -659,6 +667,9 @@ mod tests {
                 ("use_this_directory".to_string(), false),
                 ("filter_directories".to_string(), false),
                 ("clear_directory_filter".to_string(), false),
+                // Turning a page: on the two screens that show lists (PR #1451 round 3, change 4).
+                ("next_page".to_string(), true),
+                ("previous_page".to_string(), true),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
@@ -695,6 +706,9 @@ mod tests {
                 ("use_this_directory".to_string(), false),
                 ("filter_directories".to_string(), false),
                 ("clear_directory_filter".to_string(), false),
+                // Turning a page: on the two screens that show lists (PR #1451 round 3, change 4).
+                ("next_page".to_string(), false),
+                ("previous_page".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),

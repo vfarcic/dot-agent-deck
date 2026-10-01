@@ -169,6 +169,9 @@ describe("VOICE_ACTIONS", () => {
       // PR #1451 round 3, change 5: the browser's Filter box.
       "filterDirectories",
       "clearDirectoryFilter",
+      // PR #1451 round 3, change 4: turning the page of a paged list.
+      "nextPage",
+      "previousPage",
     ];
 
     expect(Array.isArray(VOICE_ACTIONS)).toBe(false);

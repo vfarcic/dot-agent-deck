@@ -29,10 +29,10 @@
  * production answers with.
  */
 import type { VoiceOutcomeDto, VoiceResolvedParamDto } from "./bridge";
-import { CARDINALS, ordinal, ordinalWord, spokenWords, wholeUtterance } from "./voiceChoice";
+import { isCountWord, ordinal, saidAsCount, spokenWords, wholeUtterance } from "./voiceChoice";
 
 /** What a numbered item is, which decides what choosing it does (`voice::numbers::NumberedKind`). */
-export type VoiceNumberedKind = "agent" | "deck" | "directory" | "parent" | "mode";
+export type VoiceNumberedKind = "agent" | "deck" | "deck_switch" | "directory" | "parent" | "mode";
 
 /** One numbered item as the screen shows it (`voice::numbers::VoiceNumberedEntry`). */
 export interface VoiceNumberedEntryDto {
@@ -64,16 +64,11 @@ export type VoiceNumberAnswerDto =
 /** No numbered list: what a screen with nothing numbered declares. */
 export const NO_NUMBERED_LIST: VoiceNumberedListDto = { generation: 0, entries: [] };
 
-/** `voice::numbers::is_count`: a cardinal or plain digits, never a position. */
-function isCount(word: string): boolean {
-  return CARDINALS.includes(word) || /^\d+$/.test(word);
-}
-
 /** `voice::numbers::ends_in`: one of the entry's names is, or ends in, `number`. */
 function endsIn(entry: VoiceNumberedEntryDto, number: number): boolean {
   return [entry.label, ...entry.names].some((name) => {
     const last = spokenWords(name).at(-1);
-    return last !== undefined && isCount(last) && ordinal([last]) === number;
+    return last !== undefined && isCountWord(last) && ordinal([last]) === number;
   });
 }
 
@@ -89,8 +84,7 @@ export function answerNumberLocally(utterance: string, heard: VoiceNumberedListD
   if (heard.generation !== now) return { kind: "stale" };
   const number = said === "last" ? heard.entries.length : said;
   if (number < 1 || number > heard.entries.length) return { kind: "out_of_range", number: said === "last" ? 0 : said };
-  const word = ordinalWord(words);
-  const counted = said !== "last" && word !== undefined && isCount(word);
+  const counted = said !== "last" && saidAsCount(words);
   const numbers = [number];
   if (counted) heard.entries.forEach((entry, at) => { if (at !== number - 1 && endsIn(entry, number)) numbers.push(at + 1); });
   return numbers.length > 1 ? { kind: "ambiguous", numbers } : { kind: "selected", number };
@@ -100,6 +94,8 @@ export function answerNumberLocally(utterance: string, heard: VoiceNumberedListD
 const ROWS: Record<VoiceNumberedKind, { action: string; invoke: string; param?: { name: string; kind: string }; report: (label: string) => string }> = {
   agent: { action: "open_agent", invoke: "openAgent", param: { name: "agent", kind: "agent_ref" }, report: (label) => `Opening ${label}.` },
   deck: { action: "choose_deck", invoke: "chooseNewAgentDeck", param: { name: "deck", kind: "deck_ref" }, report: (label) => `Daemon: ${label}.` },
+  /* The Daemon selector's menu, numbered while it is open (PR #1451 round 3, change 4). */
+  deck_switch: { action: "switch_deck", invoke: "switchDeck", param: { name: "deck", kind: "deck_ref" }, report: (label) => `Showing ${label}.` },
   directory: { action: "open_dir", invoke: "openDirectory", param: { name: "dir", kind: "dir_ref" }, report: (label) => `Opening ${label}.` },
   parent: { action: "go_to_parent", invoke: "goToParentDirectory", report: () => "Going up." },
   mode: { action: "choose_mode", invoke: "chooseNewAgentMode", param: { name: "mode", kind: "mode_ref" }, report: (label) => `Mode: ${label}.` },

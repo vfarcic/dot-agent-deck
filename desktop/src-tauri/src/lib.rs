@@ -3066,7 +3066,15 @@ const MAX_VOICE_DECK_ID_BYTES: usize = 256;
 /// reach it.
 fn validate_voice_directories(directories: &voice::VoiceDirectories) -> Result<(), String> {
     let too_long = |value: &str, limit: usize| value.len() > limit;
-    if directories.entries.len() > MAX_VOICE_DIRECTORY_ENTRIES
+    // A paged listing's other pages are children of the same directory, so
+    // the pages together are bounded as one listing is (PR #1451 round 3,
+    // change 4).
+    let elsewhere = directories
+        .paging
+        .as_ref()
+        .map_or(&[][..], |paging| paging.elsewhere.as_slice());
+    if directories.entries.len() + elsewhere.len() > MAX_VOICE_DIRECTORY_ENTRIES
+        || !voice_paging_is_sound(directories.paging.as_ref(), MAX_VOICE_DIRECTORY_NAME_BYTES)
         || too_long(&directories.deck_id, MAX_VOICE_DECK_ID_BYTES)
         || too_long(&directories.path, MAX_VOICE_DIRECTORY_PATH_BYTES)
         || directories.entries.iter().any(|entry| {
@@ -3080,6 +3088,19 @@ fn validate_voice_directories(directories: &voice::VoiceDirectories) -> Result<(
         );
     }
     Ok(())
+}
+
+/// Whether a declared [`voice::VoicePaging`] is one a real paged list could
+/// have produced: pages counted from 1 and every name within `name_limit`.
+/// Absent paging is sound. How many items it may carry is the caller's bound.
+fn voice_paging_is_sound(paging: Option<&voice::VoicePaging>, name_limit: usize) -> bool {
+    paging.is_none_or(|paging| {
+        paging.page >= 1
+            && paging
+                .elsewhere
+                .iter()
+                .all(|item| item.page >= 1 && item.name.len() <= name_limit)
+    })
 }
 
 /// The bounds on the New agent form a webview may declare (PRD #1223), checked
@@ -3110,6 +3131,11 @@ fn validate_voice_new_agent(new_agent: &voice::VoiceNewAgent) -> Result<(), Stri
         || oversized(&form.modes)
         || oversized(&form.agent_types)
         || oversized(&form.withheld_modes)
+        || form
+            .mode_paging
+            .as_ref()
+            .is_some_and(|paging| paging.elsewhere.len() > MAX_VOICE_FORM_CHOICES)
+        || !voice_paging_is_sound(form.mode_paging.as_ref(), MAX_VOICE_FORM_CHOICE_BYTES)
     {
         return Err(
             "the New agent form sent with that command is larger than any form shows".to_string(),
@@ -5422,6 +5448,7 @@ mod tests {
                     path: format!("/home/dev/dir-{index}"),
                 })
                 .collect(),
+            paging: None,
         }
     }
 
@@ -5450,6 +5477,82 @@ mod tests {
         let mut long_deck = voice_listing(1);
         long_deck.deck_id = "d".repeat(MAX_VOICE_DECK_ID_BYTES + 1);
         assert!(validate_voice_directories(&long_deck).is_err());
+    }
+
+    /// PR #1451 round 3, change 4: a paged listing's other pages are part of
+    /// the same declaration and bounded with it — together never more children
+    /// than a deck lists, each name as short as an entry's, and a page counted
+    /// from 1. The webview's shape parses; an unknown key does not.
+    #[test]
+    fn voice_paged_declarations_are_bounded_and_webview_shaped() {
+        let parsed: voice::VoiceDirectories = serde_json::from_value(serde_json::json!({
+            "deckId": "deck-1",
+            "path": "/home/dev",
+            "hasParent": true,
+            "entries": [{ "name": "a", "path": "/home/dev/a" }],
+            "paging": { "page": 1, "elsewhere": [{ "name": "docs", "page": 3 }] },
+        }))
+        .expect("parses");
+        assert!(validate_voice_directories(&parsed).is_ok());
+        assert!(
+            serde_json::from_value::<voice::VoiceDirectories>(serde_json::json!({
+                "deckId": "deck-1", "path": "/home/dev", "hasParent": true, "entries": [],
+                "paging": { "page": 1, "elsewhere": [], "extra": true },
+            }))
+            .is_err()
+        );
+        let off_page = |count: usize, name: &str, page: u32| {
+            let mut listing = voice_listing(1);
+            listing.paging = Some(voice::VoicePaging {
+                page: 1,
+                elsewhere: (0..count)
+                    .map(|_| voice::VoiceOffPage {
+                        name: name.to_string(),
+                        page,
+                    })
+                    .collect(),
+            });
+            listing
+        };
+        assert!(
+            validate_voice_directories(&off_page(MAX_VOICE_DIRECTORY_ENTRIES - 1, "d", 2)).is_ok()
+        );
+        assert!(
+            validate_voice_directories(&off_page(MAX_VOICE_DIRECTORY_ENTRIES, "d", 2)).is_err()
+        );
+        assert!(
+            validate_voice_directories(&off_page(
+                1,
+                &"x".repeat(MAX_VOICE_DIRECTORY_NAME_BYTES + 1),
+                2
+            ))
+            .is_err()
+        );
+        assert!(validate_voice_directories(&off_page(1, "d", 0)).is_err());
+        let mut no_page = off_page(1, "d", 2);
+        no_page.paging.as_mut().expect("paged").page = 0;
+        assert!(validate_voice_directories(&no_page).is_err());
+
+        let form = |count: usize| voice::VoiceNewAgent {
+            form: Some(voice::VoiceNewAgentForm {
+                deck_id: "deck-1".to_string(),
+                path: "/home/dev".to_string(),
+                modes: Vec::new(),
+                agent_types: Vec::new(),
+                withheld_modes: Vec::new(),
+                mode_paging: Some(voice::VoicePaging {
+                    page: 1,
+                    elsewhere: (0..count)
+                        .map(|_| voice::VoiceOffPage {
+                            name: "Orch: x".to_string(),
+                            page: 2,
+                        })
+                        .collect(),
+                }),
+            }),
+        };
+        assert!(validate_voice_new_agent(&form(MAX_VOICE_FORM_CHOICES)).is_ok());
+        assert!(validate_voice_new_agent(&form(MAX_VOICE_FORM_CHOICES + 1)).is_err());
     }
 
     /// PRD #1223: a New agent form declaration is bounded like a listing —

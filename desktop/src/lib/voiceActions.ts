@@ -251,6 +251,17 @@ export type VoiceActionContext = {
    */
   switchDeck: (selection: string, identity?: VoiceDeckIdentityDto) => string | undefined;
   /**
+   * PR #1451 round 3, change 4 — turn the page of the list on screen that is
+   * split into pages while voice is on: the New agent dialog's while it has
+   * one, else the dashboard's or the Daemons screen's. Answers `undefined`
+   * when it turned, or the sentence saying why not (nothing pages, or this is
+   * the last or the first page).
+   *
+   * **Served by the SHELL**, which holds the registry every paged list
+   * publishes to (`useVoicePages`), for the reason {@link switchDeck} is.
+   */
+  turnPage: (delta: 1 | -1) => string | undefined;
+  /**
    * Close the Settings sheet (issue #1197).
    *
    * **Served by the SHELL, and only while Settings is OPEN**, for
@@ -599,6 +610,28 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "switchDeck"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: Pick<VoiceDispatchTarget, "deckSelection" | "deckIdentity">) => {
       const refused = context.switchDeck(target.deckSelection ?? "", target.deckIdentity);
       if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  /* PR #1451 round 3, change 4 — a page turn changes which items of a list
+     are showing and nothing else. Voice-only: with voice off nothing pages. */
+  nextPage: {
+    label: "Show the next page of the list on screen",
+    voice: true,
+    needs: ["turnPage", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "turnPage" | "reportRefused">) => {
+      const refused = context.turnPage(1);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  previousPage: {
+    label: "Show the previous page of the list on screen",
+    voice: true,
+    needs: ["turnPage", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "turnPage" | "reportRefused">) => {
+      const refused = context.turnPage(-1);
+      if (refused !== undefined) context.reportRefused(refused);
     },
   },
 
@@ -1099,7 +1132,7 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * {@link VoiceActionContext.closeSettings} — and switching deck (PRD #1195),
  * whose selector sits on both screens and writes the shell's settings.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "switchDeck">;
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "switchDeck" | "turnPage">;
 
 /**
  * The members only the OVERVIEW serves (PRD #1223): opening the New agent

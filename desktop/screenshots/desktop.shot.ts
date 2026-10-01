@@ -174,3 +174,28 @@ desktopScenario("voice-numbers", async (page) => {
   await expect(page.getByTestId("voice-trigger")).toHaveAttribute("aria-pressed", "true");
   for (let index = 0; index < 6; index += 1) await expect(rows.nth(index)).toHaveAccessibleName(new RegExp(`^${index + 1}\\.`));
 });
+
+// PR #1451 round 3, change 4 — a directory too long for the dialog, shown a
+// page at a time while voice is on. The fixture's crowded `voice-pages` state:
+// its microphone says nothing, so the page is the first one, as opened.
+desktopScenario("voice-pages", async (page) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("dot-agent-deck.desktop-settings", JSON.stringify({
+      version: 1,
+      appearance: { mode: "system" },
+      voice: { activation: "toggle", intent: "claude", transcription: "remote" },
+      zoom: { level: 1 },
+    }));
+  });
+  await page.goto("/?fixture=1&state=voice-pages");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await page.getByTestId("overview-new-agent").click();
+  // The dialog's backdrop covers the voice row for the pointer; the keyboard reaches it.
+  await page.getByTestId("voice-trigger").focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("voice-trigger")).toHaveAttribute("aria-pressed", "true");
+  await page.getByTestId("new-agent-deck-list").getByRole("option").first().click();
+  await expect(page.getByTestId("new-agent-directory-page")).toHaveText(/^Page 1 of [2-9]/);
+  await expect(page.getByTestId("new-agent-directory-list").getByRole("option").first()).toHaveAccessibleName(/^1\./);
+});

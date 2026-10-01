@@ -40,8 +40,12 @@ export type VoiceChoiceAnswerDto =
 /* `voice::choice`'s closed lists, spelled the same. */
 const CANCEL_PHRASES = ["cancel", "cancel that", "never mind", "nevermind", "none", "none of them", "neither", "no"];
 const ORDINAL_LEADS = ["number", "option", "choice", "entry", "item"];
-export const CARDINALS = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
+const CARDINALS = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
+const TEENS = ["ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"];
+const TENS = ["twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
 const ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth"];
+const TEEN_ORDINALS = ["tenth", "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth", "eighteenth", "nineteenth"];
+const TENS_ORDINALS = ["twentieth", "thirtieth", "fortieth", "fiftieth", "sixtieth", "seventieth", "eightieth", "ninetieth"];
 /* `WHOLE_UTTERANCE_POLITENESS` in `voice/outcome.rs`. */
 const POLITENESS = ["okay", "ok", "alright", "yes", "yeah", "please", "just", "now", "thanks"];
 
@@ -60,28 +64,62 @@ export function wholeUtterance(text: string): string[] {
   return words.slice(start, end);
 }
 
+/** `voice::choice::is_count_word`: a count in words — one to nineteen, or a ten — or plain digits. */
+export function isCountWord(word: string): boolean {
+  return CARDINALS.includes(word) || TEENS.includes(word) || TENS.includes(word) || /^\d+$/.test(word);
+}
+
+/** `voice::choice::number_word`: one word as `[value, isCount]`. */
+function numberWord(word: string): [number, boolean] | undefined {
+  const lists: [string[], number, boolean][] = [[CARDINALS, 1, true], [TEENS, 10, true], [ORDINALS, 1, false], [TEEN_ORDINALS, 10, false]];
+  for (const [list, base, count] of lists) if (list.includes(word)) return [list.indexOf(word) + base, count];
+  if (TENS.includes(word)) return [TENS.indexOf(word) * 10 + 20, true];
+  if (TENS_ORDINALS.includes(word)) return [TENS_ORDINALS.indexOf(word) * 10 + 20, false];
+  if (/^\d+$/.test(word)) return [Number(word), true];
+  const digits = /^(\d+)(st|nd|rd|th)$/.exec(word);
+  return digits ? [Number(digits[1]), false] : undefined;
+}
+
+/** `voice::choice::number_said`: one word, or a ten and a unit ("twenty three", "twenty third"). */
+function numberSaid(words: string[]): [number, boolean] | undefined {
+  if (words.length === 1) return numberWord(words[0]);
+  if (words.length !== 2 || !TENS.includes(words[0])) return undefined;
+  const tens = TENS.indexOf(words[0]) * 10 + 20;
+  if (CARDINALS.includes(words[1])) return [tens + CARDINALS.indexOf(words[1]) + 1, true];
+  if (ORDINALS.includes(words[1])) return [tens + ORDINALS.indexOf(words[1]) + 1, false];
+  return undefined;
+}
+
 /**
- * `voice::choice::ordinal_word`: the one word an ordinal utterance turns on,
- * once a leading "the", an ordinal lead and a trailing filler "one" are set
- * aside, or `undefined` when more than one word is left.
+ * `voice::choice::ordinal_words`: the one or two words an ordinal utterance
+ * turns on, once a leading "the", an ordinal lead and a trailing filler "one"
+ * after a position are set aside, or `undefined` when more than two are left.
  */
-export function ordinalWord(words: string[]): string | undefined {
+function ordinalWords(words: string[]): string[] | undefined {
   let rest = words;
   if (rest[0] === "the") rest = rest.slice(1);
   if (rest[0] !== undefined && ORDINAL_LEADS.includes(rest[0])) rest = rest.slice(1);
-  if (rest.length === 2 && rest[1] === "one") rest = rest.slice(0, 1);
-  return rest.length === 1 ? rest[0] : undefined;
+  const head = rest.slice(0, -1);
+  if (rest.length >= 2 && rest.at(-1) === "one" && ((head.length === 1 && head[0] === "last") || numberSaid(head)?.[1] === false)) rest = head;
+  return rest.length >= 1 && rest.length <= 2 ? rest : undefined;
 }
 
-/** A whole-utterance ordinal, 1-based, `"last"`, or `undefined` for none (`voice::choice::ordinal`). */
+/**
+ * A whole-utterance ordinal, 1-based, `"last"`, or `undefined` for none
+ * (`voice::choice::ordinal`): "two", "number twelve", "the twenty-first one",
+ * "23rd", up to ninety-nine in words.
+ */
 export function ordinal(words: string[]): number | "last" | undefined {
-  const word = ordinalWord(words);
-  if (word === undefined) return undefined;
-  if (word === "last") return "last";
-  const named = CARDINALS.indexOf(word) >= 0 ? CARDINALS.indexOf(word) : ORDINALS.indexOf(word);
-  if (named >= 0) return named + 1;
-  const digits = word.replace(/(st|nd|rd|th)$/, "");
-  return /^\d+$/.test(digits) ? Number(digits) : undefined;
+  const said = ordinalWords(words);
+  if (said === undefined) return undefined;
+  if (said.length === 1 && said[0] === "last") return "last";
+  return numberSaid(said)?.[0];
+}
+
+/** `voice::choice::said_as_count`: whether the ordinal is said as a count ("twelve", "12") rather than a position. */
+export function saidAsCount(words: string[]): boolean {
+  const said = ordinalWords(words);
+  return said !== undefined && numberSaid(said)?.[1] === true;
 }
 
 /*

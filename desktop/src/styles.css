@@ -1057,8 +1057,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* The single surface (PRD #1223): deck, directory browser and form stacked in one scrolling body. */
 .new-agent-section { display: flex; flex-direction: column; gap: 7px; }
 .new-agent-section + .new-agent-section { padding-top: 9px; border-top: 1px solid var(--line); }
-.new-agent-section > h3 { margin: 0; color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
-.new-agent-list.is-decks { max-height: 132px; }
+.new-agent-section > h3, .new-agent-section-head > h3 { margin: 0; color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
+/* PR #1451 round 3, change 4: the daemons are always shown in full. */
+.new-agent-list.is-decks { max-height: none; overflow: visible; }
 .new-agent-list.is-directories { max-height: 200px; }
 .new-agent-list[aria-disabled="true"] { opacity: .6; }
 .new-agent-current .new-agent-keys { flex: 1; }
@@ -1071,6 +1072,24 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .new-agent-chip { min-height: 26px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 13px; color: var(--ink); background: var(--paper); cursor: pointer; font-size: 10px; font-weight: 650; }
 .new-agent-chip.is-active { border-color: var(--teal-deep); color: var(--on-accent); background: var(--teal); }
 .new-agent-chip.is-disabled { border-style: dashed; color: var(--faint); cursor: not-allowed; }
+/*
+  PR #1451 round 3, change 4 — while voice is on, the dialog takes its full
+  height and the directory rows fill what the body leaves, as a grid of as many
+  columns as fit (`NewAgentDialog` measures the list and pages it to what it
+  holds), so nothing voice can choose is scrolled out of sight. The list never
+  scrolls then: its height comes from the space, not from its rows. The Mode
+  chips become a grid of the field's width, paged to the rows the body shows.
+*/
+.new-agent-dialog.is-voice-pages { width: min(880px, 100%); height: calc(100vh - 11vh - 40px); }
+.new-agent-dialog.is-voice-pages .new-agent-body { flex: 1 1 auto; }
+.new-agent-dialog.is-voice-pages .new-agent-directory-panel { flex: 1 0 auto; }
+.new-agent-list.is-directories.is-paged { flex: 1 1 0; min-height: 106px; max-height: none; overflow: hidden; display: grid; grid-auto-flow: column; gap: 2px; align-content: stretch; }
+.new-agent-list.is-paged .new-agent-row { min-width: 0; flex-wrap: nowrap; }
+.new-agent-chips.is-paged { display: grid; gap: 5px; }
+.new-agent-chips.is-paged .new-agent-chip { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.new-agent-section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 9px; }
+.new-agent-page { color: var(--muted); font-size: 9.5px; font-weight: 650; white-space: nowrap; }
+.new-agent-field > span .new-agent-page { display: block; margin-top: 2px; font-weight: 500; }
 /* The overview's own line for what the New agent flow could not finish on
    screen — an agent that started and has not been listed yet. */
 .overview-banner { padding: 8px 10px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); font-size: 10px; }
@@ -1219,6 +1238,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    fleet view; the gap is what separates two decks' cards from each other now
    that there can be several, and with one deck it changes nothing. */
 .overview-body { padding: 14px 16px 20px; display: flex; flex-direction: column; gap: 12px; }
+/* PR #1451 round 3, change 4: the dashboard's voice page, beside its title. */
+.overview-page { margin-left: 4px; color: var(--muted); font-size: 10px; font-weight: 650; white-space: nowrap; }
+.workspace-page { color: var(--ink); font-weight: 700; }
 .daemon-group { border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); }
 /* A deck that is not answering, sitting beside decks that are. Dimmed rather
    than alarming: an unreachable deck in a fleet is a fact about that deck, and

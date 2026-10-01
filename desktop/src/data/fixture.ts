@@ -1232,6 +1232,24 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     unavailableHint: "clearing the filter needs the New agent dialog's directory listing; say “new agent” and choose a daemon first",
     report: "Filter cleared.",
   },
+  {
+    // PR #1451 round 3, change 4 — turning the page of a list voice shows a
+    // page at a time. The app refuses a turn with nothing to turn to itself.
+    phrases: ["next page", "go to the next page", "the next page", "page forward", "forward a page", "show more"],
+    action: "next_page",
+    invoke: "nextPage",
+    screens: ["deck", "overview"],
+    unavailableHint: "turning a page works on the agent dashboard, the Daemons screen and the New agent dialog, once the agent's pane is closed",
+    report: "Next page.",
+  },
+  {
+    phrases: ["previous page", "go to the previous page", "go back a page", "back a page", "the page before", "page back"],
+    action: "previous_page",
+    invoke: "previousPage",
+    screens: ["deck", "overview"],
+    unavailableHint: "turning a page works on the agent dashboard, the Daemons screen and the New agent dialog, once the agent's pane is closed",
+    report: "Previous page.",
+  },
 ];
 
 /**
@@ -1620,8 +1638,14 @@ export const FIXTURE_VOICE_UTTERANCE = FIXTURE_VOICE_COMMANDS[0].phrases[0];
  * had, so every existing page and test sees exactly what it saw before.
  */
 export function fixtureVoiceScript(search: string): string[] {
-  const spoken = new URLSearchParams(search).getAll("voice").filter((phrase) => phrase.trim() !== "");
-  return spoken.length > 0 ? spoken : [FIXTURE_VOICE_UTTERANCE];
+  const query = new URLSearchParams(search);
+  const spoken = query.getAll("voice").filter((phrase) => phrase.trim() !== "");
+  if (spoken.length > 0) return spoken;
+  /* PR #1451 round 3, change 4 — the crowded paging state is about what voice
+     SHOWS (pages, numbers, markers), so its microphone says nothing unless a
+     spec scripts it: the default line would navigate away from the screen
+     under test the moment voice turns on. */
+  return query.get("state") === "voice-pages" ? [] : [FIXTURE_VOICE_UTTERANCE];
 }
 
 /**

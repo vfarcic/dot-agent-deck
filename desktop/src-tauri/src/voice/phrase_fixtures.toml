@@ -1408,3 +1408,51 @@ utterance = "Close"
 screen = "overview"
 action = "close"
 outcome = "dispatch"
+
+# PR #1451 round 3, change 4 — turning the page of a list voice shows a page
+# at a time. The rows need no declaration (the app answers "nothing pages"
+# itself), so they are callable on the dashboard and the Daemons screen and
+# never over an agent's pane. A "go back" that names a page is a page turn; a
+# "go back" that names a screen is not.
+[[fixtures]]
+name = "next-page"
+utterance = "next page"
+screen = "overview"
+action = "next_page"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "next-page-go-to-the-next-page"
+utterance = "Go to the next page."
+screen = "deck"
+action = "next_page"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "previous-page"
+utterance = "previous page"
+screen = "overview"
+dialog = true
+action = "previous_page"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "previous-page-go-back-a-page"
+utterance = "go back a page"
+screen = "overview"
+action = "previous_page"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "page-turn-negative-back-to-the-daemons-is-a-screen"
+utterance = "go back to the daemons"
+screen = "overview"
+action = "open_deck"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "page-turn-negative-over-an-agent-pane"
+utterance = "next page"
+screen = "agent"
+action = "next_page"
+outcome = "unavailable"

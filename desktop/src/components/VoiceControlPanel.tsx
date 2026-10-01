@@ -87,6 +87,7 @@ import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type V
 import type { EndpointSettingsDto, VoiceCommandDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
 import { answerChoiceLocally, collidingChoiceEntry, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
 import { answerNumberLocally, numberedOutcome, numberedParam, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto } from "../lib/voiceNumbers";
+import { offPageNamed, offPageSentence, type VoicePager } from "../lib/voicePages";
 import { desktopFeaturesOf, type DeckRuntimeState } from "../types";
 
 /**
@@ -961,6 +962,12 @@ interface VoiceControlPanelProps {
    * a list that has since changed is refused.
    */
   numbered?: () => VoiceNumberedListDto;
+  /**
+   * PR #1451 round 3, change 4 — the list on screen split into pages, if one
+   * is: read when an utterance matched nothing, so a name said for an item on
+   * another page is told that page instead of "no matching action".
+   */
+  pages?: () => VoicePager | undefined;
   /** PR #1451 round 3 — told when the numbered choice opens or closes, so the lists behind it can hide their numbers. */
   onChoiceChange?: (open: boolean) => void;
 }
@@ -1008,7 +1015,7 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, selectedDeckId, confirmationOpen = false, onDictationChange, onVoiceChange, agentIncarnations, numbered, onChoiceChange }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, selectedDeckId, confirmationOpen = false, onDictationChange, onVoiceChange, agentIncarnations, numbered, pages, onChoiceChange }: VoiceControlPanelProps) {
   /* Held in a ref so the resolve and the overlay read the host's latest getter
      without either callback being rebuilt when the host re-renders. */
   const directoriesRef = useRef(directories);
@@ -1023,6 +1030,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   agentIncarnationsRef.current = agentIncarnations;
   const numberedRef = useRef(numbered);
   numberedRef.current = numbered;
+  const pagesRef = useRef(pages);
+  pagesRef.current = pages;
   /**
    * PR #1451 round 3, change 3 — the numbered list as it stood when the user
    * began to speak: read when the microphone opens and refreshed by every
@@ -1280,6 +1289,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       return onDispatch(outcome, declared.directories, declared.newAgent);
     } finally {
       dispatching.current = outer;
+      /* PR #1451 round 3, change 4 — what voice just did may have changed the
+         numbered list ("next page" renumbers it), and the user's next words
+         are about the screen that command produced. So the list is taken
+         again once that render has landed, as it is at every silent poll. */
+      window.setTimeout(() => { heardNumbers.current = numberedRef.current?.(); }, 0);
     }
   }, [onDispatch]);
   /** The pane seams' gate: the dispatch's declaration against now, for writes to `aim`. */
@@ -2042,6 +2056,19 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
          not be swallowed by them (Qodo on the PR). If those match nothing
          either, the joined sentence is the report, since it is everything the
          user said. */
+      /* PR #1451 round 3, change 4 — an utterance nothing showing answered,
+         that names an item a paged list shows on another page: said at once,
+         with that page, rather than held or reported as matching nothing.
+         Voice acts only on what is on screen, so nothing runs. */
+      const pager = pagesRef.current?.();
+      const offPage = declaredDictation === undefined && pager && (HOLDABLE_OUTCOMES.has(answer.outcome.kind) || answer.outcome.kind === "param_unresolved")
+        ? offPageNamed(utterance, pager.elsewhere)
+        : undefined;
+      if (pager && offPage) {
+        clearHeld();
+        setResult({ ...answer, outcome: { ...answer.outcome, sentence: `Heard: “${utterance}” — ${offPageSentence(offPage.label, offPage.page, pager.page)}` } });
+        return;
+      }
       let final = answer;
       if (declaredDictation === undefined && HOLDABLE_OUTCOMES.has(answer.outcome.kind)) {
         if (alone === undefined) {

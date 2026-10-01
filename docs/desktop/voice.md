@@ -38,7 +38,7 @@ What you can do by voice, by screen:
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; start; discard |
 | An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off |
 
-While voice is on, the agents, daemons, directories and modes on screen are numbered, and saying a number chooses one; see [Choosing by number](#choosing-by-number). When what you said matches more than one thing on screen, the app lists the matches for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things).
+While voice is on, the agents, daemons, directories and modes on screen are numbered, and saying a number chooses one; see [Choosing by number](#choosing-by-number). A list too long for the window is shown a page at a time, so everything you can choose is on screen; see [Long lists are shown in pages](#long-lists-are-shown-in-pages). When what you said matches more than one thing on screen, the app lists the matches for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things).
 
 A command that names an agent, such as "stop the planner" or "close the review orchestration", runs nothing, and the app says why, if you switch daemons or that agent is replaced by a new one under the same name while the app is still working out what you said (which the app can tell only when the daemon reports when each agent started). Say it again to act on the agent that is there now.
 
@@ -54,13 +54,13 @@ While the New agent dialog shows a directory, say "filter" followed by what to l
 
 ## Choosing by number
 
-While voice is on, the lists you can choose from by voice show a number before each item: the agents on the dashboard, the agent tiles on the Daemons screen, and the daemons, directories and modes in the New agent dialog. With voice off, they look as they always do.
+While voice is on, the lists you can choose from by voice show a number before each item: the agents on the dashboard, the agent tiles on the Daemons screen, the daemons, directories and modes in the New agent dialog, and the daemons in the **Daemon** selector while its menu is open. With voice off, they look as they always do.
 
-Each number belongs to one item on screen. When several lists are visible together, as in the New agent dialog, they are numbered in one sequence in reading order: the daemons first, then the directories (with `..` for the folder above), then the modes. On the dashboard the agents of every daemon are numbered in one sequence, top to bottom. While an agent's pane or the New agent dialog is open, only what is in front is numbered.
+Each number belongs to one item on screen. When several lists are visible together, as in the New agent dialog, they are numbered in one sequence in reading order: the daemons first, then the directories (with `..` for the folder above), then the modes. On the dashboard the agents of every daemon are numbered in one sequence, top to bottom. While an agent's pane, the New agent dialog or the **Daemon** menu is open, only what is in front is numbered. A list shown in pages is numbered from 1 on every page; see [Long lists are shown in pages](#long-lists-are-shown-in-pages).
 
 ![The agent dashboard with voice on: each agent row starts with a number, 1 to 6, counting on from one daemon's agents to the next](/img/voice-numbers-desktop.png)
 
-- **Say the number** on its own: "three", "3", "number three", "the third one" or "the last one". The item showing it is chosen as if you had clicked it: an agent opens, a daemon or mode is chosen, a directory opens (`..` goes up).
+- **Say the number** on its own: "three", "3", "number three", "the third one" or "the last one". Numbers above nine work the same way, in words or digits: "twelve", "number twenty-three", "the twelfth", "23". The item showing it is chosen as if you had clicked it: an agent opens, a daemon or mode is chosen, a directory opens (`..` goes up).
 - **Press the number key**, such as `3`, on a list that shows numbers. On the Daemons screen the `1`–`4` keys already select the tile with that number. A digit typed into a text field, such as the directory **Filter**, is just typed.
 
 The numbers follow the list. When it changes, for example a directory opens, you filter it or an agent finishes, the numbers change straight away. If the list changed while you were saying a number, nothing is chosen and the app says so, because the number may now belong to another item; say it again. A number that no item shows chooses nothing, and the app says so.
@@ -68,6 +68,18 @@ The numbers follow the list. When it changes, for example a directory opens, you
 If the number you said could also be an item's name, for example "one" with an agent called `orchestrator-1`, the app does not guess: it asks which one you meant, as described below.
 
 A spoken number is worked out on your computer and is not sent to the Commands service. Anything longer, such as "open number three", is a command like any other.
+
+## Long lists are shown in pages
+
+While voice is on, a list that does not fit in the window is shown a page at a time instead of scrolling, so everything you can choose by voice is on screen. This applies to the directories and the modes in the New agent dialog, the agents on the dashboard and the agent tiles on the Daemons screen. A list that fits is shown whole, as before. With voice off, every list scrolls as it always has. The daemons in the New agent dialog are never split into pages: every daemon that can take a new agent is always shown in full.
+
+![The New agent dialog with voice on: the directories fill the dialog in five numbered columns, and "Page 1 of 3" shows beside the Directory heading](/img/voice-pages-desktop.png)
+
+- **Each page fills the space the list has.** Directories and modes are laid out in as many columns as fit. The dashboard shows as many agents as fit the window and works the pages out again when you resize it. The Daemons screen shows four tiles per page, the four the `1`–`4` keys select.
+- **"Page 2 of 3"** shows beside a list that has pages: next to the **Directory** heading or under **Mode** in the New agent dialog, next to the dashboard's title, and above the tiles on the Daemons screen.
+- **Say "next page" or "previous page"** to turn it ("go to the next page" and "go back a page" work too). On the last page, the first page, or a screen with no pages, nothing moves and the app says why. In the New agent dialog, the directories turn until you choose one, and then the modes do.
+- **Numbers start at 1 on every page** and refer to the page showing. Turning the page changes the numbers, so a number you began to say before the page turned chooses nothing and the app asks you to say it again.
+- **Voice works only on the page showing.** Naming something on another page, such as "open docs", chooses nothing; the app tells you where it is, for example *“docs” is on page 3: say “next page”*. Clicking, the keyboard and the **Filter** box work as usual: moving the selection with the arrow keys or `j` and `k` turns to the page it lands on.
 
 ## When a command matches several things
 
@@ -171,6 +183,7 @@ What went wrong is shown beside the Voice button.
 | Commands that name agents or directories never work | **Names** is set to **Withheld**. | Set it to **Shared**, or use the screen instead. |
 | A command runs nothing and says the agent, daemon, screen or list changed | What it was about changed while the app was working out what you said, or after a numbered list appeared. | Say the command again. |
 | A spoken number chooses nothing and says the numbers on screen changed | The list changed while you were saying it. | Look at the new numbers and say it again. |
+| A name is refused with "is on page 2: say “next page”" | The item is on another page of a list shown in pages. | Turn to that page and say it again, or narrow a directory list with "filter …". |
 | "type off" was typed into the prompt instead of stopping typing mode | The app misheard it. | Nothing was sent: press **Stop typing** and delete the words. |
 | A command you paused in the middle of was answered in two halves | You paused for longer than the app waits for the rest, which is a few seconds. | Say the whole command again, with a shorter pause. |
 | You said something and nothing happened, with nothing shown | The app took it for noise rather than speech, usually because it was very short or quiet. | Say it again a little louder or closer to the microphone. |

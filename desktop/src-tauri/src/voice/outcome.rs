@@ -1052,6 +1052,16 @@ enum Unmet {
     /// "instead", "from" — so it may exclude a deck as well as name one, and
     /// the model is not trusted to have honoured which ([`switch_target`]).
     Contrast(String),
+    /// What it names is on another page of a list split into pages while
+    /// voice is on (PR #1451 round 3, change 4): `label` is the name the list
+    /// shows, `page` the page it is on, `current` the page showing. Voice acts
+    /// only on what is on screen, so it is named back with its page and
+    /// nothing is chosen ([`resolve_paged`]).
+    OffPage {
+        label: String,
+        page: u32,
+        current: u32,
+    },
 }
 
 impl Unmet {
@@ -1159,6 +1169,11 @@ impl Unmet {
             Unmet::DeckUnavailable { label, reason } => {
                 unresolved(deck_unavailable(&label, &reason))
             }
+            Unmet::OffPage {
+                label,
+                page,
+                current,
+            } => unresolved(off_page(&label, page, current)),
         }
     }
 
@@ -1229,6 +1244,14 @@ impl Unmet {
                     format!("\u{201c}{marker}\u{201d} could mean a {noun} you do not want"),
                     None,
                 ),
+                // Produced only for the directory and Mode params, which are
+                // required and so never dropped; spelled out for the same
+                // reason.
+                Unmet::OffPage {
+                    label,
+                    page,
+                    current,
+                } => (capitalised(&off_page(label, *page, *current)), None),
             }
         };
         match (implied, detail) {
@@ -1828,11 +1851,38 @@ fn resolve_param(
         // listing; the `None` arm of the resolver answers no match rather
         // than trusting that, so a future row that forgot the requirement
         // refuses instead of resolving against nothing.
-        ParamKind::DirRef => match resolve_dir_ref(spoken, directories) {
-            DirRefMatch::One { path, name } => Ok(param(path, name)),
-            DirRefMatch::None => Err(Unmet::NoMatch),
-            DirRefMatch::Ambiguous(names) => Err(Unmet::Ambiguous(names)),
-        },
+        // A paged listing resolves against every page, so that a name on
+        // another one is told its page instead of matching nothing — and
+        // acts only on the page showing ([`resolve_paged`]).
+        ParamKind::DirRef => {
+            let paging = directories.and_then(|listing| listing.paging.as_ref());
+            let every_page = directories.map(|listing| VoiceDirectories {
+                entries: listing
+                    .entries
+                    .iter()
+                    .cloned()
+                    .chain(paging.into_iter().flat_map(|paging| {
+                        paging.elsewhere.iter().enumerate().map(|(at, item)| {
+                            super::VoiceDirectoryEntry {
+                                name: item.name.clone(),
+                                path: off_page_key(at),
+                            }
+                        })
+                    }))
+                    .collect(),
+                paging: None,
+                ..listing.clone()
+            });
+            let found = match resolve_dir_ref(spoken, every_page.as_ref()) {
+                DirRefMatch::One { path, name } => ChoiceMatch::One {
+                    id: path,
+                    label: name,
+                },
+                DirRefMatch::None => ChoiceMatch::None,
+                DirRefMatch::Ambiguous(names) => ChoiceMatch::Ambiguous(names),
+            };
+            resolve_paged(found, paging).map(|(path, name)| param(path, name))
+        }
         // PRD #1223 — an orchestration, as the overview's card for it:
         // resolved against the live agents grouped the way `groupAgents`
         // groups them, and the same two refusals. `value` is one of its
@@ -1866,7 +1916,23 @@ fn resolve_param(
                 {
                     return Err(Unmet::WithheldChoice(label));
                 }
-                resolve_mode_ref(spoken, choices)
+                let paging = form.and_then(|form| form.mode_paging.as_ref());
+                let every_page: Vec<VoiceChoice> = choices
+                    .iter()
+                    .cloned()
+                    .chain(paging.into_iter().flat_map(|paging| {
+                        paging
+                            .elsewhere
+                            .iter()
+                            .enumerate()
+                            .map(|(at, item)| VoiceChoice {
+                                id: off_page_key(at),
+                                label: item.name.clone(),
+                            })
+                    }))
+                    .collect();
+                return resolve_paged(resolve_mode_ref(spoken, &every_page), paging)
+                    .map(|(id, label)| param(id, label));
             } else {
                 resolve_agent_type_ref(spoken, choices)
             };
@@ -3139,6 +3205,93 @@ pub(super) fn dir_names(name: &str) -> Vec<String> {
     names
 }
 
+/// The value an item on another page stands in under while a paged list is
+/// resolved against every page ([`resolve_paged`]): `at` is its index in
+/// [`super::VoicePaging::elsewhere`]. A NUL never occurs in a deck's path or a
+/// chip's id, so it cannot be taken for one, and it never leaves this module:
+/// an off-page match is refused, never dispatched.
+fn off_page_key(at: usize) -> String {
+    format!("\u{0}off-page:{at}")
+}
+
+/// Which item on another page `value` stands for, if it is an
+/// [`off_page_key`].
+fn off_page_index(value: &str) -> Option<usize> {
+    value.strip_prefix("\u{0}off-page:")?.parse().ok()
+}
+
+/// What a reference resolved against EVERY page of a paged list comes to
+/// (PR #1451 round 3, change 4) — the list's own resolver having run over the
+/// page showing and, under [`off_page_key`]s, the items on the others.
+///
+/// Voice acts only on what is on screen. So a match on the page showing is
+/// the answer, whatever else matches elsewhere; a match only on other pages
+/// is [`Unmet::OffPage`], naming the item and the nearest page it is on, and
+/// chooses nothing. Resolving against every page rather than the page alone
+/// is what lets "docs site" be told its page when a plain `docs` is showing,
+/// instead of loosely becoming that `docs`. With no paging, `found` passes
+/// through as the plain resolver's answer.
+fn resolve_paged(
+    found: ChoiceMatch,
+    paging: Option<&super::VoicePaging>,
+) -> Result<(String, String), Unmet> {
+    let elsewhere = |value: &str| {
+        paging
+            .zip(off_page_index(value))
+            .and_then(|(paging, at)| paging.elsewhere.get(at))
+    };
+    let refuse = |items: Vec<&super::VoiceOffPage>| {
+        let current = paging.map_or(1, |paging| paging.page);
+        let item = items
+            .into_iter()
+            .min_by_key(|item| item.page.abs_diff(current))
+            .expect("one item at least");
+        Unmet::OffPage {
+            label: item.name.clone(),
+            page: item.page,
+            current,
+        }
+    };
+    match found {
+        ChoiceMatch::One { id, label } => match elsewhere(&id) {
+            Some(item) => Err(refuse(vec![item])),
+            None => Ok((id, label)),
+        },
+        ChoiceMatch::None => Err(Unmet::NoMatch),
+        ChoiceMatch::Ambiguous(candidates) => {
+            let (off, mut shown): (Vec<_>, Vec<_>) = candidates
+                .into_iter()
+                .partition(|candidate| elsewhere(&candidate.value).is_some());
+            match shown.len() {
+                0 => Err(refuse(
+                    off.iter()
+                        .filter_map(|candidate| elsewhere(&candidate.value))
+                        .collect(),
+                )),
+                1 => {
+                    let only = shown.remove(0);
+                    Ok((only.value, only.label))
+                }
+                _ => Err(Unmet::Ambiguous(shown)),
+            }
+        }
+    }
+}
+
+/// The sentence for [`Unmet::OffPage`]: the item, the page it is on, and the
+/// words that turn to it — "“docs” is on page 3: say “next page”".
+fn off_page(label: &str, page: u32, current: u32) -> String {
+    let turn = if page > current {
+        "next page"
+    } else {
+        "previous page"
+    };
+    format!(
+        "\u{201c}{}\u{201d} is on page {page}: say \u{201c}{turn}\u{201d}",
+        safe_message(label)
+    )
+}
+
 /// What a spoken reference to one entry of a closed set on screen resolved to
 /// — a Mode chip or an agent entry (PRD #1223).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4130,6 +4283,7 @@ mod tests {
             path: "/home/dev/code".to_string(),
             has_parent,
             entries: names.iter().map(|name| entry(name)).collect(),
+            paging: None,
         }
     }
 
@@ -4529,6 +4683,165 @@ mod tests {
                 nothing_matched: true,
             }
         );
+    }
+
+    /// `level` split into pages while voice is on: `page` showing, and the
+    /// children named in `elsewhere` on the pages beside them.
+    fn paged(
+        mut level: VoiceDirectories,
+        page: u32,
+        elsewhere: &[(&str, u32)],
+    ) -> VoiceDirectories {
+        level.paging = Some(crate::voice::VoicePaging {
+            page,
+            elsewhere: elsewhere
+                .iter()
+                .map(|(name, page)| crate::voice::VoiceOffPage {
+                    name: name.to_string(),
+                    page: *page,
+                })
+                .collect(),
+        });
+        level
+    }
+
+    /// Scenario: with voice on, the directory listing is split into pages and
+    /// "docs" is on page 3. "open dir docs" said on page 1 opens nothing; the
+    /// report names the page it is on and how to get there.
+    #[tokio::test]
+    async fn voice_outcome_open_dir_refuses_a_name_on_another_page() {
+        let said = "open dir docs";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_dir").with_param("dir", "docs"),
+        );
+        let level = paged(
+            listing(&["billing", "infra.config"], true),
+            1,
+            &[("web-frontend", 2), ("docs", 3)],
+        );
+        let outcome = run_with(&resolver, Screen::Overview, Some(&level), said).await;
+        assert_eq!(
+            outcome,
+            VoiceOutcome::ParamUnresolved {
+                transcript: Transcript::new(said),
+                action: "open_dir".to_string(),
+                param: "dir".to_string(),
+                spoken: "docs".to_string(),
+                sentence: "Heard: \u{201c}open dir docs\u{201d} — \u{201c}docs\u{201d} is on page 3: say \u{201c}next page\u{201d}.".to_string(),
+                nothing_matched: false,
+            }
+        );
+
+        // From a later page, the way back is the previous page.
+        let said = "open billing";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_dir").with_param("dir", "billing"),
+        );
+        let level = paged(
+            listing(&["docs"], true),
+            3,
+            &[("billing", 1), ("infra.config", 2)],
+        );
+        let VoiceOutcome::ParamUnresolved { sentence, .. } =
+            run_with(&resolver, Screen::Overview, Some(&level), said).await
+        else {
+            panic!("an off-page name is refused");
+        };
+        assert!(
+            sentence.ends_with(
+                "\u{201c}billing\u{201d} is on page 1: say \u{201c}previous page\u{201d}."
+            ),
+            "{sentence}"
+        );
+    }
+
+    /// Scenario: while the listing pages, a name on the page showing is still
+    /// opened — including when a longer name on another page shares its words —
+    /// and a name on no page at all is refused as before.
+    #[tokio::test]
+    async fn voice_outcome_open_dir_on_a_paged_listing_opens_what_the_page_shows() {
+        let level = paged(listing(&["billing", "docs"], true), 1, &[("docs-site", 2)]);
+        let said = "open docs";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_dir").with_param("dir", "docs"),
+        );
+        let VoiceOutcome::Dispatch { params, .. } =
+            run_with(&resolver, Screen::Overview, Some(&level), said).await
+        else {
+            panic!("the visible docs is opened");
+        };
+        assert_eq!(params[0].value, "/home/dev/code/docs");
+
+        // "docs site" is exactly the child on page 2, not the visible "docs".
+        let said = "open docs site";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_dir").with_param("dir", "docs site"),
+        );
+        let VoiceOutcome::ParamUnresolved { sentence, .. } =
+            run_with(&resolver, Screen::Overview, Some(&level), said).await
+        else {
+            panic!("the off-page docs-site is refused");
+        };
+        assert!(sentence.contains("is on page 2"), "{sentence}");
+
+        let said = "open payments";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_dir").with_param("dir", "payments"),
+        );
+        let VoiceOutcome::ParamUnresolved {
+            nothing_matched,
+            sentence,
+            ..
+        } = run_with(&resolver, Screen::Overview, Some(&level), said).await
+        else {
+            panic!("a name on no page is refused");
+        };
+        assert!(nothing_matched);
+        assert!(!sentence.contains("page"), "{sentence}");
+    }
+
+    /// Scenario: "next page" and "previous page" over the dashboard or the
+    /// New agent dialog dispatch the page turn; over an agent's pane, where
+    /// nothing pages, they are not available.
+    #[tokio::test]
+    async fn voice_outcome_page_turns_dispatch_where_lists_page() {
+        for (said, id, invoke, sentence) in [
+            ("next page", "next_page", "nextPage", "Next page."),
+            (
+                "go back a page",
+                "previous_page",
+                "previousPage",
+                "Previous page.",
+            ),
+        ] {
+            let resolver = StubResolver::new().answering(said, IntentAnswer::new(id));
+            for screen in [Screen::Overview, Screen::Deck] {
+                assert_eq!(
+                    run_with(&resolver, screen, None, said).await,
+                    VoiceOutcome::Dispatch {
+                        transcript: Transcript::new(said),
+                        action: id.to_string(),
+                        invoke: invoke.to_string(),
+                        params: Vec::new(),
+                        sentence: sentence.to_string(),
+                        then_submit: false,
+                    },
+                    "{said} on {screen}"
+                );
+            }
+            assert!(
+                matches!(
+                    run_with(&resolver, Screen::Agent, None, said).await,
+                    VoiceOutcome::Unavailable { .. }
+                ),
+                "{said} over a pane"
+            );
+        }
     }
 
     /// Scenario: an ambiguous required directory offers dispatchable paths in
@@ -5565,6 +5878,7 @@ mod tests {
                     choice("pi", "Pi"),
                 ],
                 withheld_modes: vec![choice("schedule-issues", "schedule: issues")],
+                mode_paging: None,
             }),
         }
     }
@@ -5604,6 +5918,51 @@ mod tests {
             ChoiceMatch::None
         );
         assert_eq!(one("the schedule mode"), "schedule");
+    }
+
+    /// Scenario: with voice on and the Mode row split into pages, "use the
+    /// loop seven orchestration" on page 1 chooses nothing while that chip is
+    /// on page 2; the report names its page.
+    #[tokio::test]
+    async fn voice_outcome_choose_mode_refuses_a_chip_on_another_page() {
+        let mut dialog = new_agent_form();
+        let form = dialog.form.as_mut().expect("a form");
+        form.mode_paging = Some(crate::voice::VoicePaging {
+            page: 1,
+            elsewhere: vec![crate::voice::VoiceOffPage {
+                name: "Orch: loop-7".to_string(),
+                page: 2,
+            }],
+        });
+        let said = "use the loop 7 orchestration";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("choose_mode").with_param("mode", "loop 7"),
+        );
+        let outcome = run_form(&resolver, Screen::Overview, Some(&dialog), said).await;
+        let VoiceOutcome::ParamUnresolved {
+            sentence, action, ..
+        } = outcome
+        else {
+            panic!("an off-page chip is refused: {outcome:?}");
+        };
+        assert_eq!(action, "choose_mode");
+        assert!(
+            sentence.ends_with(
+                "\u{201c}Orch: loop-7\u{201d} is on page 2: say \u{201c}next page\u{201d}."
+            ),
+            "{sentence}"
+        );
+        // A chip on the page showing is still chosen.
+        let said = "schedule";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("choose_mode").with_param("mode", "schedule"),
+        );
+        assert!(matches!(
+            run_form(&resolver, Screen::Overview, Some(&dialog), said).await,
+            VoiceOutcome::Dispatch { .. }
+        ));
     }
 
     #[test]

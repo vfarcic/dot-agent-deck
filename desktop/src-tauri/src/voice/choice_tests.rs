@@ -40,6 +40,7 @@ fn listing() -> VoiceDirectories {
                 path: format!("/code/{name}"),
             })
             .collect(),
+        paging: None,
     }
 }
 
@@ -81,6 +82,34 @@ fn choice_answers_whole_ordinals_and_refuses_out_of_range() {
         answer("open the second tab", &offered, &live),
         ChoiceAnswer::NotAnswer
     );
+}
+
+/// Scenario: numbers past nine are understood everywhere, and a numbered choice
+/// still offers at most nine entries — "twelve" or "the twenty-first" against a
+/// three-entry choice is refused rather than read as anything else.
+#[test]
+fn choice_keeps_its_nine_cap_while_numbers_past_nine_parse() {
+    assert_eq!(super::choice::MAX_CHOICES, 9);
+    let offered = directories();
+    let listing = listing();
+    let live = ChoiceLive {
+        agents: &[],
+        decks: &[],
+        directories: Some(&listing),
+        new_agent: None,
+    };
+    for said in [
+        "twelve",
+        "number twenty-three",
+        "the twenty-first one",
+        "tenth",
+    ] {
+        assert_eq!(
+            answer(said, &offered, &live),
+            ChoiceAnswer::Refused,
+            "{said}"
+        );
+    }
 }
 
 /// Scenario: a spoken name selects one of the offered entries only. A live but

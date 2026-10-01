@@ -5,7 +5,10 @@ import { CleanupWarning } from "./CleanupWarning";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { useInertBackground } from "../hooks/useInertBackground";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
+import { useMeasuredBox, usePager } from "../hooks/useVoicePages";
+import { useVoiceOn } from "../hooks/useVoiceOn";
 import { numberKey, type VoiceNumberedEntryDto } from "../lib/voiceNumbers";
+import { gridFit, offPageSentence, pageMarker, pageSlice, type PageSlice, type VoiceOffPageItem, type VoicePager } from "../lib/voicePages";
 import { VoiceNumber } from "./VoiceNumber";
 import {
   ambiguousOrchestrationReason,
@@ -211,6 +214,21 @@ export const NO_NEW_AGENT_FORM = "The New agent form has no daemon and directory
 export const FORM_MOVED_ON = "The New agent form moved on while that was being worked out, so nothing was changed. Say it again.";
 /** The chip is not in the Mode row any more. */
 export const MODE_NOT_OFFERED = "That mode is not offered on this form any more, so the mode was not changed.";
+
+/*
+  PR #1451 round 3, change 4 — the two lists this dialog pages while voice is
+  on. A directory row is one cell of a grid that fills the space the browser
+  has left (`gridFit` over the list's measured box); a Mode chip is one cell of
+  a grid as wide as the Mode field and as tall as the dialog body can show
+  beside Dir and Name. The fallbacks are the page sizes used where nothing is
+  laid out (jsdom), which is what the component tests page by.
+*/
+const DIRECTORY_CELL = { rowHeight: 30, minColumnWidth: 160, gap: 2 };
+const MODE_CELL = { rowHeight: 26, minColumnWidth: 150, gap: 5 };
+/** What the dialog body keeps for the form's other rows while the Mode chips page. */
+const MODE_ROWS_RESERVE = 70;
+const FALLBACK_DIRECTORY_PAGE = 12;
+const FALLBACK_MODE_PAGE = 8;
 /** The agent is not among the ones this deck offers any more. */
 export const AGENT_TYPE_NOT_OFFERED = "That agent is not offered on this daemon any more, so the Command was not changed.";
 /** An orchestration is selected, so there is no Command field to fill. */
@@ -439,6 +457,9 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
 
   const deckListRef = useRef<HTMLUListElement>(null);
   const directoryListRef = useRef<HTMLUListElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const chipsRef = useRef<HTMLDivElement>(null);
+  const modeFieldRef = useRef<HTMLDivElement>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
   const commandRef = useRef<HTMLInputElement>(null);
@@ -1059,6 +1080,10 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     const index = rows.findIndex((row) => row.kind === "entry" && row.entry.path === target.directoryPath);
     const row = rows[index];
     if (row?.kind !== "entry") return DIRECTORY_NOT_LISTED;
+    // Voice acts only on what is on screen: a row on another page is named
+    // back with its page (PR #1451 round 3, change 4).
+    const offPage = offPageRefusal(directoryElsewhere, row.entry.path, directorySlice);
+    if (offPage !== undefined) return offPage;
     // A click on the row: the cursor lands on it, then the deck lists it.
     setCursor(index);
     void loadListing(deck.deckId, row.entry.path);
@@ -1125,6 +1150,8 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     if (refused !== undefined) return refused;
     const chip = modes.find((candidate) => candidate.id === dispatch.modeId);
     if (!chip) return MODE_NOT_OFFERED;
+    const offPage = offPageRefusal(modeElsewhere, chip.id, modeSlice);
+    if (offPage !== undefined) return offPage;
     selectMode(chip.id);
     return undefined;
   };
@@ -1194,7 +1221,13 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
           deckId: deck.deckId,
           path: listing.path,
           hasParent: listing.parent !== undefined,
-          entries: rows.flatMap((row) => (row.kind === "entry" ? [{ name: row.entry.displayName, path: row.entry.path }] : [])),
+          entries: shownRows.flatMap((row) => (row.kind === "entry" ? [{ name: row.entry.displayName, path: row.entry.path }] : [])),
+          /* PR #1451 round 3, change 4 — while the rows page, the entries are
+             the page showing and the others ride here, so a name said for
+             one is told its page instead of matching nothing. */
+          ...(directoriesPaged
+            ? { paging: { page: directorySlice.page, elsewhere: directoryElsewhere.flatMap((item) => (item.kind === "directory" ? [{ name: item.label, page: item.page }] : [])) } }
+            : {}),
         }
         : undefined,
       openDirectory: voiceOpenDirectory,
@@ -1211,7 +1244,8 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
           ? {
             deckId: deck.deckId,
             path: target.path,
-            modes: modes.map(({ id, label }) => ({ id, label })),
+            modes: shownModes.map(({ id, label }) => ({ id, label })),
+            ...(modesPaged ? { modePaging: { page: modeSlice.page, elsewhere: modeElsewhere.map((item) => ({ name: item.label, page: item.page })) } } : {}),
             agentTypes: agents.map((agent) => ({ id: agent.id, label: agent.displayName })),
             /* The authoring chips this form withholds — for a deck that cannot
                compose them, or `schedule: issues` with its flag off — so a
@@ -1277,6 +1311,87 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   const selectedOrchestration: DaemonOrchestration | undefined = orchestrationChips.find((chip) => chip.id === mode)?.orchestration;
   const authoringKind: AuthoringKind | undefined = AUTHORING_MODES.find((candidate) => candidate.kind === mode)?.kind;
   const defaultCommand = options?.kind === "deck" ? options.defaultCommand : undefined;
+
+  /*
+    PR #1451 round 3, change 4 — while voice is on, the directory rows and
+    the Mode chips that do not fit are split into pages instead of scrolling,
+    so every item voice can act on is on screen. Each page is a grid filling
+    the space its list has; "Page N of M" is shown beside a list that pages,
+    and a list that fits is shown whole. A page is reset to the first when
+    what it lists changes (another directory, filter or Mode row). The rows'
+    and chips' indexes stay their indexes in the whole list — the cursor, the
+    row ids and the keyboard move over every row, and the page follows the
+    cursor.
+  */
+  const voiceOn = useVoiceOn();
+  const directoryBox = useMeasuredBox(directoryListRef, voiceOn && listing !== undefined);
+  const directoryFit = directoryBox ? gridFit(directoryBox.width, directoryBox.height, DIRECTORY_CELL) : undefined;
+  const directoryCapacity = directoryFit ? directoryFit.columns * directoryFit.rows : FALLBACK_DIRECTORY_PAGE;
+  const directoryPageKey = `${deck?.deckId ?? ""}\u0000${listing?.path ?? ""}\u0000${filter}\u0000${showHidden}\u0000${searchedHere ? "searched" : ""}`;
+  const [directoryPage, setDirectoryPage] = useState({ key: "", page: 1 });
+  const directorySlice = pageSlice(rows.length, directoryCapacity, directoryPage.key === directoryPageKey ? directoryPage.page : 1);
+  const directoriesPaged = voiceOn && directorySlice.pages > 1;
+  const rowOffset = directoriesPaged ? directorySlice.start : 0;
+  const shownRows = directoriesPaged ? rows.slice(directorySlice.start, directorySlice.end) : rows;
+  const bodyBox = useMeasuredBox(bodyRef, voiceOn);
+  const chipsBox = useMeasuredBox(chipsRef, voiceOn);
+  const modeFit = bodyBox && chipsBox ? gridFit(chipsBox.width, bodyBox.height - MODE_ROWS_RESERVE, MODE_CELL) : undefined;
+  const modeCapacity = modeFit ? modeFit.columns * modeFit.rows : FALLBACK_MODE_PAGE;
+  const modePageKey = `${target?.path ?? ""}\u0000${modes.map((candidate) => candidate.id).join("\u0000")}`;
+  const [modePage, setModePage] = useState({ key: "", page: 1 });
+  const modeSlice = pageSlice(modes.length, modeCapacity, modePage.key === modePageKey ? modePage.page : 1);
+  const modesPaged = voiceOn && modeSlice.pages > 1;
+  const modeOffset = modesPaged ? modeSlice.start : 0;
+  const shownModes = modesPaged ? modes.slice(modeSlice.start, modeSlice.end) : modes;
+  /**
+   * Which list "next page" turns and the numbers count on: the Mode row once
+   * a directory is chosen and it pages, else the directory rows when they
+   * page, else the Mode row when it pages — never both, so a turn is never
+   * ambiguous and a number names one item.
+   */
+  const pagedList: "directories" | "modes" | undefined = modesPaged && target ? "modes" : directoriesPaged ? "directories" : modesPaged ? "modes" : undefined;
+  /** The page `index` of a list of `capacity`-sized pages is on. */
+  const pageOfIndex = (index: number, capacity: number) => Math.floor(index / Math.max(1, capacity)) + 1;
+  const turnDirectories = (delta: 1 | -1) => {
+    const page = directorySlice.page + delta;
+    setDirectoryPage({ key: directoryPageKey, page });
+    setCursor(pageSlice(rows.length, directoryCapacity, page).start);
+  };
+  const turnModes = (delta: 1 | -1) => setModePage({ key: modePageKey, page: modeSlice.page + delta });
+  /* The keyboard moves the cursor over every row; the page follows it. */
+  useEffect(() => {
+    if (!directoriesPaged || (cursor >= directorySlice.start && cursor < directorySlice.end)) return;
+    setDirectoryPage({ key: directoryPageKey, page: pageOfIndex(cursor, directoryCapacity) });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- follows the cursor only; a page turn moves the cursor itself
+  }, [cursor]);
+  /* A paged Mode row is brought into the body's view, where its chips can be seen. */
+  useEffect(() => {
+    if (modesPaged && target) modeFieldRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [modesPaged, modeSlice.page, target]);
+  const directoryElsewhere: VoiceOffPageItem[] = directoriesPaged
+    ? rows.flatMap((row, index) => (index >= directorySlice.start && index < directorySlice.end ? [] : [{
+      kind: row.kind === "up" ? "parent" as const : "directory" as const,
+      value: row.kind === "up" ? row.path : row.entry.path,
+      label: row.kind === "up" ? ".." : row.entry.displayName,
+      page: pageOfIndex(index, directoryCapacity),
+    }]))
+    : [];
+  const modeElsewhere: VoiceOffPageItem[] = modesPaged
+    ? modes.flatMap((chip, index) => (index >= modeSlice.start && index < modeSlice.end ? [] : [{ kind: "mode" as const, value: chip.id, label: chip.label, page: pageOfIndex(index, modeCapacity) }]))
+    : [];
+  const activeSlice: PageSlice | undefined = pagedList === "modes" ? modeSlice : pagedList === "directories" ? directorySlice : undefined;
+  const pager: VoicePager | undefined = activeSlice && {
+    page: activeSlice.page,
+    pages: activeSlice.pages,
+    turn: pagedList === "modes" ? turnModes : turnDirectories,
+    elsewhere: [...directoryElsewhere, ...modeElsewhere],
+  };
+  usePager("dialog", pager);
+  /** The refusal for a dispatch naming a directory row or a Mode chip on a page that is not showing. */
+  const offPageRefusal = (items: readonly VoiceOffPageItem[], value: string | undefined, slice: PageSlice): string | undefined => {
+    const item = items.find((candidate) => candidate.value === value);
+    return item && offPageSentence(item.label, item.page, slice.page);
+  };
 
   // PRD #1223 M6 — the TUI's Name rules, against the CHOSEN deck's own fleet
   // entry: never another deck's orchestrations, and never the selected deck's.
@@ -1524,39 +1639,56 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     one item in the whole dialog, and the numbers move whenever a list does —
     another directory, another filter. Declared for voice whether or not voice
     is on; shown only while it is.
+
+    Change 4: while a list is split into pages, ITS page is what is numbered,
+    from 1 on every page, and the dialog's other lists carry no numbers — a
+    number still names one item, and turning the page renumbers it.
   */
-  const numberedEntries: VoiceNumberedEntryDto[] = [
-    ...usable.map((choice): VoiceNumberedEntryDto => ({ kind: "deck", value: choice.deckId, label: choice.name, names: [] })),
-    ...rows.map((row): VoiceNumberedEntryDto => (row.kind === "up"
-      ? { kind: "parent", value: row.path, label: "..", names: [] }
-      : { kind: "directory", value: row.entry.path, label: row.entry.displayName, names: [] })),
-    ...modes.map((chip): VoiceNumberedEntryDto => ({ kind: "mode", value: chip.id, label: chip.label, names: [] })),
-  ];
+  const rowEntry = (row: DirectoryRow): VoiceNumberedEntryDto => (row.kind === "up"
+    ? { kind: "parent", value: row.path, label: "..", names: [] }
+    : { kind: "directory", value: row.entry.path, label: row.entry.displayName, names: [] });
+  const modeEntry = (chip: { id: ModeId; label: string }): VoiceNumberedEntryDto => ({ kind: "mode", value: chip.id, label: chip.label, names: [] });
+  const numberedEntries: VoiceNumberedEntryDto[] = pagedList === "directories"
+    ? shownRows.map(rowEntry)
+    : pagedList === "modes"
+      ? shownModes.map(modeEntry)
+      : [
+        ...usable.map((choice): VoiceNumberedEntryDto => ({ kind: "deck", value: choice.deckId, label: choice.name, names: [] })),
+        ...rows.map(rowEntry),
+        ...modes.map(modeEntry),
+      ];
   useNumberedList("dialog", numberedEntries);
   const numbersShown = useNumbersShown();
-  const firstRowNumber = usable.length + 1;
-  const firstModeNumber = usable.length + rows.length + 1;
+  /** The number the deck at `index`, the row at `index` and the chip at `index` show, if any. */
+  const deckNumber = numbersShown && pagedList === undefined ? (index: number) => index + 1 : () => undefined;
+  const rowNumber = !numbersShown
+    ? () => undefined
+    : pagedList === "directories" ? (index: number) => index - rowOffset + 1 : pagedList === undefined ? (index: number) => usable.length + index + 1 : () => undefined;
+  const modeNumber = !numbersShown
+    ? () => undefined
+    : pagedList === "modes" ? (index: number) => index - modeOffset + 1 : pagedList === undefined ? (index: number) => usable.length + rows.length + index + 1 : () => undefined;
   /**
    * The item showing `number`, as a click on it would choose it: a daemon,
    * a directory row (entered, or `..` gone up), or a Mode chip while the form
    * is live.
    */
   const chooseNumbered = (number: number) => {
-    const at = number - 1;
-    if (at < usable.length) {
-      chooseDeck(usable[at]);
+    const entry = numberedEntries[number - 1];
+    if (!entry) return;
+    if (entry.kind === "deck") {
+      chooseDeck(usable.find((choice) => choice.deckId === entry.value));
       return;
     }
-    const rowAt = at - usable.length;
-    const row = rows[rowAt];
-    if (row) {
-      setCursor(rowAt);
-      if (row.kind === "up") goUp();
-      else if (deck) void loadListing(deck.deckId, row.entry.path);
+    if (entry.kind === "mode") {
+      if (!formDisabled) selectMode(entry.value as ModeId);
       return;
     }
-    const chip = modes[rowAt - rows.length];
-    if (chip && !formDisabled) selectMode(chip.id);
+    const index = rows.findIndex((row) => (row.kind === "up" ? entry.kind === "parent" && row.path === entry.value : entry.kind === "directory" && row.entry.path === entry.value));
+    const row = rows[index];
+    if (!row) return;
+    setCursor(index);
+    if (row.kind === "up") goUp();
+    else if (deck) void loadListing(deck.deckId, row.entry.path);
   };
   /** A digit on one of the numbered lists, while voice shows the numbers; never in a field. */
   const onNumberKey = (event: KeyboardEvent<HTMLElement>): boolean => {
@@ -1670,9 +1802,15 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
     event.preventDefault();
     const index = modes.findIndex((candidate) => candidate.id === mode);
-    const next = modes[(index + (event.key === "ArrowRight" ? 1 : modes.length - 1)) % modes.length];
+    const nextIndex = (index + (event.key === "ArrowRight" ? 1 : modes.length - 1)) % modes.length;
+    const next = modes[nextIndex];
     selectMode(next.id);
-    event.currentTarget.querySelector<HTMLButtonElement>(`[data-mode="${next.id}"]`)?.focus();
+    const focusChip = () => chipsRef.current?.querySelector<HTMLButtonElement>(`[data-mode="${next.id}"]`)?.focus();
+    // A paged Mode row turns to the chip the arrow reached (change 4), which renders on the next frame.
+    if (modesPaged && (nextIndex < modeSlice.start || nextIndex >= modeSlice.end)) {
+      setModePage({ key: modePageKey, page: pageOfIndex(nextIndex, modeCapacity) });
+      window.requestAnimationFrame(focusChip);
+    } else focusChip();
   };
 
   const onDialogKeyDown = (event: KeyboardEvent<HTMLElement>) => {
@@ -1721,7 +1859,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
               data-chosen={chosen || undefined}
               onClick={() => chooseDeck(choice)}
             >
-              <VoiceNumber number={numbersShown ? index + 1 : undefined} />
+              <VoiceNumber number={deckNumber(index)} />
               {chosen ? <Check size={13} aria-hidden="true" /> : <Server size={13} aria-hidden="true" />}
               <span className="new-agent-row-name">{choice.name}</span>
               <span className="new-agent-row-tag">{choice.deckKind}</span>
@@ -1735,8 +1873,11 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   );
 
   const directoryPanel = (
-    <section className="new-agent-section" aria-labelledby={`${titleId}-directory`} data-testid="new-agent-directory-panel">
-      <h3 id={`${titleId}-directory`}>Directory</h3>
+    <section className="new-agent-section new-agent-directory-panel" aria-labelledby={`${titleId}-directory`} data-testid="new-agent-directory-panel">
+      <div className="new-agent-section-head">
+        <h3 id={`${titleId}-directory`}>Directory</h3>
+        {directoriesPaged && <span className="new-agent-page" data-testid="new-agent-directory-page">{pageMarker(directorySlice)}</span>}
+      </div>
       {!deck && <p className="new-agent-hint" data-testid="new-agent-directory-idle">Choose a daemon to browse its directories.</p>}
       {listingState === "unsupported" && <p className="new-agent-hint" data-testid="new-agent-no-browse">This daemon cannot list directories, so no directory can be chosen on it here. Choose another daemon.</p>}
       {listingError && <p className="new-agent-error" role="alert" data-testid="new-agent-directory-error">{displayText(listingError, DISPLAY_LIMITS.message)}</p>}
@@ -1767,7 +1908,11 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
           </div>
           <ul
             ref={directoryListRef}
-            className="new-agent-list is-directories"
+            className={`new-agent-list is-directories${voiceOn ? " is-paged" : ""}`}
+            /* While voice is on the rows are a grid that fills the browser's
+               space, a page at a time (change 4): as many columns as fit,
+               filled top to bottom. */
+            style={voiceOn && directoryFit ? { gridTemplateColumns: `repeat(${directoryFit.columns}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${directoryFit.rows}, minmax(${DIRECTORY_CELL.rowHeight}px, 1fr))` } : undefined}
             role="listbox"
             aria-label="Directories"
             aria-disabled={busy || undefined}
@@ -1776,7 +1921,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
             aria-activedescendant={rows[cursor] ? activeRowId : undefined}
             onKeyDown={onDirectoryKeyDown}
           >
-            {rows.map((row, index) => (
+            {shownRows.map((row, at) => ({ row, index: rowOffset + at })).map(({ row, index }) => (
               <li
                 // Name and path: a symlink shares its target's path (issue #1240).
                 key={row.kind === "up" ? ".." : `${row.entry.displayName}\u0000${row.entry.path}`}
@@ -1792,7 +1937,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
                   else if (deck) void loadListing(deck.deckId, row.entry.path);
                 }}
               >
-                <VoiceNumber number={numbersShown ? firstRowNumber + index : undefined} />
+                <VoiceNumber number={rowNumber(index)} />
                 {row.kind === "up"
                   ? <><ArrowUp size={13} aria-hidden="true" /><span className="new-agent-row-name">..</span></>
                   : (
@@ -1836,10 +1981,18 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
         <span>Dir</span>
         <strong data-testid="new-agent-dir" title={target ? displayText(target.displayPath, DISPLAY_LIMITS.message) : undefined}>{target ? displayText(target.displayPath, DISPLAY_LIMITS.path) : <span className="new-agent-unset">No directory chosen yet</span>}</strong>
       </div>
-      <div className="new-agent-field">
-        <span id={`${titleId}-mode`}>Mode</span>
-        <div className="new-agent-chips" role="group" aria-labelledby={`${titleId}-mode`} data-testid="new-agent-modes" onKeyDown={formDisabled ? undefined : onModeKeyDown}>
-          {modes.map((candidate, index) => (
+      <div className="new-agent-field" ref={modeFieldRef}>
+        <span id={`${titleId}-mode`}>Mode{modesPaged && <small className="new-agent-page" data-testid="new-agent-mode-page">{pageMarker(modeSlice)}</small>}</span>
+        <div
+          ref={chipsRef}
+          className={`new-agent-chips${voiceOn ? " is-paged" : ""}`}
+          style={voiceOn && modeFit ? { gridTemplateColumns: `repeat(${modeFit.columns}, minmax(0, 1fr))` } : undefined}
+          role="group"
+          aria-labelledby={`${titleId}-mode`}
+          data-testid="new-agent-modes"
+          onKeyDown={formDisabled ? undefined : onModeKeyDown}
+        >
+          {shownModes.map((candidate, at) => ({ candidate, index: modeOffset + at })).map(({ candidate, index }) => (
             <Fragment key={candidate.id}>
               {index === orchestrationEnd && ambiguousChipButtons}
               <button
@@ -1851,12 +2004,12 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
                 disabled={formDisabled}
                 onClick={() => selectMode(candidate.id)}
               >
-                <VoiceNumber number={numbersShown ? firstModeNumber + index : undefined} />
+                <VoiceNumber number={modeNumber(index)} />
                 {candidate.label}
               </button>
             </Fragment>
           ))}
-          {orchestrationEnd >= modes.length && ambiguousChipButtons}
+          {orchestrationEnd >= modes.length && (!modesPaged || modeSlice.end === modes.length) && ambiguousChipButtons}
         </div>
       </div>
       {ambiguousReasons.map((reason) => <p key={reason} className="new-agent-hint" data-testid="new-agent-orchestration-ambiguous">{reason}</p>)}
@@ -1940,7 +2093,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     <div className="dialog-backdrop" role="presentation" data-testid="new-agent-backdrop" onMouseDown={requestClose}>
       <section
         ref={dialogRef}
-        className="new-agent-dialog"
+        className={`new-agent-dialog${voiceOn ? " is-voice-pages" : ""}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -1961,7 +2114,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
         </header>
         {/* Top to bottom in the tab order the wizard's steps had: deck, the
             directory browser, then Mode, Name, Command and Start. */}
-        <div className="new-agent-body">
+        <div className="new-agent-body" ref={bodyRef}>
           {restoreNotes && (
             <div className="new-agent-restored" role="status" data-testid="new-agent-restored">
               {restoreNotes.map((note) => <p key={note} className="new-agent-hint">{note}</p>)}

@@ -199,8 +199,39 @@ pub struct VoiceDirectories {
     /// Whether the listing has a parent, i.e. whether `..` is on screen.
     pub has_parent: bool,
     /// The children on screen, in the order the browser shows them — after
-    /// the filter, because a spoken name means one the user can see.
+    /// the filter, because a spoken name means one the user can see. While
+    /// the listing is split into pages (voice on, more children than fit),
+    /// these are the CURRENT page's only.
     pub entries: Vec<VoiceDirectoryEntry>,
+    /// The listing's pages, present only while it is split into them (PR
+    /// #1451 round 3, change 4): which page is showing and the children on the
+    /// others, so a name said for one of those is refused with the page it is
+    /// on rather than as a name nothing matches.
+    #[serde(default)]
+    pub paging: Option<VoicePaging>,
+}
+
+/// A list split into pages while voice is on (PR #1451 round 3, change 4),
+/// as the webview declared it: the page showing, and every item on another
+/// page. Voice acts only on what is on screen, so an item here is never
+/// resolved — it is named back with its page ([`VoiceOffPage`]).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoicePaging {
+    /// The page showing, counted from 1.
+    pub page: u32,
+    /// The items on every other page, in list order.
+    pub elsewhere: Vec<VoiceOffPage>,
+}
+
+/// One item of a paged list that is not on the page showing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceOffPage {
+    /// The name the list renders for it, which is what a user says.
+    pub name: String,
+    /// The page it is on, counted from 1.
+    pub page: u32,
 }
 
 /// One child directory on screen.
@@ -262,6 +293,11 @@ pub struct VoiceNewAgentForm {
     /// measured substituting `schedule` for "schedule issues").
     #[serde(default)]
     pub withheld_modes: Vec<VoiceChoice>,
+    /// The Mode row's pages, present only while it is split into them (PR
+    /// #1451 round 3, change 4); `modes` is then the page showing. See
+    /// [`VoicePaging`].
+    #[serde(default)]
+    pub mode_paging: Option<VoicePaging>,
 }
 
 /// The agent the voice panel is in the dictation mode for (PRD #1260), declared

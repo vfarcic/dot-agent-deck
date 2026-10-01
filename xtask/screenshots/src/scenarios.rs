@@ -127,6 +127,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "voice-pages",
+        description: "The desktop New agent dialog with voice on over a long directory: the directories fill the dialog as numbered columns, one page at a time, with the page marker beside the Directory heading.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "schedules",
         description: "The TUI Schedules manager with one configured task.",
         clients: &[Client::Tui],

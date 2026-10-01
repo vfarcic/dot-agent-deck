@@ -45,7 +45,18 @@ export function useNumberedList(layer: NumberedLayer, entries: readonly VoiceNum
  */
 export const VoiceChoiceOpen = createContext(false);
 
-/** Whether lists render their numbers: voice is on and no numbered choice is open. */
-export function useNumbersShown(): boolean {
-  return useVoiceOn() && !useContext(VoiceChoiceOpen);
+/**
+ * Whether the dialog layer declares a numbered list — the New agent dialog, or
+ * the open Daemon selector (PR #1451 round 3, change 4). The screen under it
+ * shows no numbers then, since a number names one item on screen.
+ */
+export const DialogNumbered = createContext(false);
+
+/**
+ * Whether lists render their numbers: voice is on, no numbered choice is open,
+ * and — for the `screen` layer — no dialog over it numbers its own.
+ */
+export function useNumbersShown(layer: NumberedLayer = "dialog"): boolean {
+  const covered = useContext(DialogNumbered) && layer === "screen";
+  return useVoiceOn() && !useContext(VoiceChoiceOpen) && !covered;
 }

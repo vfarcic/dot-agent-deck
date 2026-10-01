@@ -31,19 +31,21 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::choice::{CARDINALS, Ordinal, ordinal, ordinal_word};
+use super::choice::{Ordinal, is_count_word, ordinal, said_as_count};
 use super::outcome::whole_utterance;
 use super::table::spoken_words;
 
 /// What one numbered item is, which decides what choosing it does. The
 /// webview maps each to the row a spoken name would have run: `agent` opens
-/// it, `deck` chooses the New agent dialog's daemon, `directory` enters it,
-/// `parent` goes up, `mode` chooses the chip.
+/// it, `deck` chooses the New agent dialog's daemon, `deck_switch` switches
+/// to the daemon in the open Daemon selector (PR #1451 round 3, change 4),
+/// `directory` enters it, `parent` goes up, `mode` chooses the chip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NumberedKind {
     Agent,
     Deck,
+    DeckSwitch,
     Directory,
     Parent,
     Mode,
@@ -129,7 +131,7 @@ pub fn answer(utterance: &str, heard: &VoiceNumberedList, now: u64) -> NumberAns
         return NumberAnswer::OutOfRange { number };
     };
     let number = at + 1;
-    let counted = matches!(said, Ordinal::Nth(_)) && ordinal_word(&words).is_some_and(is_count);
+    let counted = matches!(said, Ordinal::Nth(_)) && said_as_count(&words);
     let mut numbers = vec![number];
     if counted {
         numbers.extend(
@@ -148,13 +150,6 @@ pub fn answer(utterance: &str, heard: &VoiceNumberedList, now: u64) -> NumberAns
     }
 }
 
-/// Whether `word` says a count — a cardinal or plain digits — rather than a
-/// position ("third", "3rd", "last").
-fn is_count(word: &str) -> bool {
-    CARDINALS.contains(&word)
-        || (!word.is_empty() && word.bytes().all(|byte| byte.is_ascii_digit()))
-}
-
 /// Whether one of `entry`'s names is, or ends in, `number`: "orchestrator-1",
 /// "worker 2", an agent whose role is "three".
 fn ends_in(entry: &VoiceNumberedEntry, number: usize) -> bool {
@@ -162,7 +157,8 @@ fn ends_in(entry: &VoiceNumberedEntry, number: usize) -> bool {
         .chain(&entry.names)
         .any(|name| {
             spoken_words(name).last().is_some_and(|last| {
-                is_count(last) && ordinal(std::slice::from_ref(last)) == Some(Ordinal::Nth(number))
+                is_count_word(last)
+                    && ordinal(std::slice::from_ref(last)) == Some(Ordinal::Nth(number))
             })
         })
 }
@@ -328,6 +324,107 @@ mod tests {
         );
     }
 
+    /// A page longer than nine items, labelled so no name ends in a number.
+    fn long_page(len: usize) -> VoiceNumberedList {
+        VoiceNumberedList {
+            generation: 7,
+            entries: (0..len)
+                .map(|at| {
+                    entry(&format!(
+                        "dir {}{}",
+                        char::from(b'a' + (at / 26) as u8),
+                        char::from(b'a' + (at % 26) as u8)
+                    ))
+                })
+                .collect(),
+        }
+    }
+
+    /// Scenario: a page shows more than nine numbers, so every number on it can
+    /// be said in words as well as digits: "twelve", "number twenty-three",
+    /// "the twelfth", "twentieth", "thirty-fifth".
+    #[test]
+    fn numbers_past_nine_are_understood_in_words() {
+        let heard = long_page(40);
+        for (said, number) in [
+            ("ten", 10),
+            ("eleven", 11),
+            ("twelve", 12),
+            ("number twelve", 12),
+            ("nineteen", 19),
+            ("twenty", 20),
+            ("twenty one", 21),
+            ("twenty three", 23),
+            ("twenty-three", 23),
+            ("Number twenty-three.", 23),
+            ("the twenty-three", 23),
+            ("23", 23),
+            ("number 23", 23),
+            ("23rd", 23),
+            ("tenth", 10),
+            ("the twelfth", 12),
+            ("the twelfth one", 12),
+            ("nineteenth", 19),
+            ("twentieth", 20),
+            ("the twentieth one", 20),
+            ("twenty first", 21),
+            ("the twenty-first one", 21),
+            ("thirty", 30),
+            ("thirty-fifth", 35),
+            ("forty", 40),
+        ] {
+            assert_eq!(
+                answer(said, &heard, 7),
+                NumberAnswer::Selected { number },
+                "{said}"
+            );
+        }
+        assert_eq!(
+            answer("ninety-nine", &heard, 7),
+            NumberAnswer::OutOfRange { number: 99 }
+        );
+        assert_eq!(
+            answer("fiftieth", &heard, 7),
+            NumberAnswer::OutOfRange { number: 50 }
+        );
+        for said in [
+            "twenty agents",
+            "three twenty",
+            "twenty twenty",
+            "ten three",
+            "twenty tenth",
+            "one hundred",
+        ] {
+            assert_eq!(answer(said, &heard, 7), NumberAnswer::NotNumber, "{said}");
+        }
+    }
+
+    /// Scenario: "twelve" said as a count collides with another item whose
+    /// name ends in 12, as "one" does with `orchestrator-1`; "the twelfth" is a
+    /// position and does not.
+    #[test]
+    fn a_count_past_nine_collides_with_a_name_ending_in_it() {
+        let mut heard = long_page(14);
+        heard.entries[13].label = "worker 12".to_string();
+        assert_eq!(
+            answer("twelve", &heard, 7),
+            NumberAnswer::Ambiguous {
+                numbers: vec![12, 14]
+            }
+        );
+        assert_eq!(
+            answer("the twelfth", &heard, 7),
+            NumberAnswer::Selected { number: 12 }
+        );
+        heard.entries[13].label = "worker twelve".to_string();
+        assert_eq!(
+            answer("12", &heard, 7),
+            NumberAnswer::Ambiguous {
+                numbers: vec![12, 14]
+            }
+        );
+    }
+
     #[test]
     fn the_declaration_reads_the_webviews_shape() {
         let heard: VoiceNumberedList = serde_json::from_str(
@@ -336,6 +433,12 @@ mod tests {
         .expect("the webview's declaration parses");
         assert_eq!(heard.entries[0].kind, NumberedKind::Parent);
         assert_eq!(heard.entries[1].deck_id.as_deref(), Some("deck-x"));
+        // The Daemon selector's menu, numbered while it is open.
+        let menu: VoiceNumberedEntry = serde_json::from_str(
+            r#"{"kind":"deck_switch","value":"deck-build","label":"build box"}"#,
+        )
+        .expect("a selector entry parses");
+        assert_eq!(menu.kind, NumberedKind::DeckSwitch);
         assert!(
             serde_json::from_str::<VoiceNumberedList>(r#"{"generation":3,"entries":[],"extra":1}"#)
                 .is_err()

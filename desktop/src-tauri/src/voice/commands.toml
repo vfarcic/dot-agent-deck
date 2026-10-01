@@ -877,6 +877,52 @@ asks_to     = "clear the filter"
 try_saying  = "clear filter"
 heard_as    = ["clear", "remove", "reset", "no filter", "show all"]
 
+# PR #1451 round 3, change 4 — turning the page of a list voice selects from.
+#
+# While voice is on, a list that does not fit on screen is split into pages
+# instead of scrolling — the agent dashboard's agents, the Daemons screen's
+# tiles, the New agent dialog's directories and its Mode row — so everything
+# voice can act on is visible, and a number or a name refers to the page
+# showing. These two rows turn it. Neither needs a declaration: which list
+# pages is the webview's to know, and it answers "nothing on screen has pages",
+# "this is the last page" and "this is the first page" itself, in the voice
+# report, without moving anything. Not callable over an agent's pane, where no
+# list is showing. A page turn moves the view only, and the next turn undoes it.
+#
+# `heard_as` carries "back" for "go back a page", which `open_deck` and `close`
+# also carry for a bare "go back"; the descriptions separate them — a "page"
+# said with it means this row.
+[[commands]]
+id          = "next_page"
+description = """Show the next page of the list on screen that is split into pages — the agent
+dashboard's agents, the Daemons screen's agent tiles, or the New agent dialog's directories or Mode
+chips, which are shown a page at a time while voice is on. Use for next page, go to the next page,
+the next page, page forward, forward a page, more, or show more. It changes which items are showing
+and nothing else: it opens, chooses, starts and stops nothing."""
+invoke      = "nextPage"
+screens     = ["deck", "overview"]
+unavailable_hint = "turning a page works on the agent dashboard, the Daemons screen and the New agent dialog, once the agent's pane is closed"
+report      = "Next page."
+asks_to     = "show the next page"
+try_saying  = "next page"
+heard_as    = ["next", "forward", "more"]
+
+[[commands]]
+id          = "previous_page"
+description = """Show the previous page of the list on screen that is split into pages — the
+agent dashboard's agents, the Daemons screen's agent tiles, or the New agent dialog's directories or
+Mode chips, which are shown a page at a time while voice is on. Use for previous page, go to the
+previous page, go back a page, back a page, the page before, or page back. A "go back" that names a
+page means THIS one, not leaving the screen. It changes which items are showing and nothing else: it
+opens, chooses, starts and stops nothing."""
+invoke      = "previousPage"
+screens     = ["deck", "overview"]
+unavailable_hint = "turning a page works on the agent dashboard, the Daemons screen and the New agent dialog, once the agent's pane is closed"
+report      = "Previous page."
+asks_to     = "show the previous page"
+try_saying  = "previous page"
+heard_as    = ["previous", "back", "before"]
+
 # PRD #1223 — the rest of the New agent form by voice: Mode, the agent's
 # command, and Name.
 #

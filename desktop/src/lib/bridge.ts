@@ -754,6 +754,23 @@ export interface VoiceDirectoriesDto {
   path: string;
   hasParent: boolean;
   entries: { name: string; path: string }[];
+  /**
+   * PR #1451 round 3, change 4 — present only while voice is on and the rows
+   * are split into pages: `entries` is then the page showing, and this names
+   * the page and the children on the others (`voice::VoicePaging`).
+   */
+  paging?: VoicePagingDto;
+}
+
+/**
+ * A list split into pages while voice is on, as declared to Rust
+ * (`voice::VoicePaging`): the page showing, and each item on another page by
+ * the name it shows and its page — so a name said for one is refused with its
+ * page, never chosen.
+ */
+export interface VoicePagingDto {
+  page: number;
+  elsewhere: { name: string; page: number }[];
 }
 
 /**
@@ -803,6 +820,8 @@ export interface VoiceNewAgentDto {
      * than answered with the nearest chip that is.
      */
     withheldModes?: { id: string; label: string }[];
+    /** PR #1451 round 3, change 4 — the Mode row's pages while it pages; `modes` is then the page showing. */
+    modePaging?: VoicePagingDto;
   };
 }
 

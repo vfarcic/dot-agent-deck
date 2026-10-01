@@ -467,6 +467,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 path: format!("/home/dev/code/{name}"),
             })
             .collect(),
+        paging: None,
     };
     let mut hostile_directories = directories.clone();
     for name in [
@@ -504,6 +505,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             ],
             // What the dialog withholds with the flag off (PRD #1223).
             withheld_modes: vec![choice("schedule-issues", "schedule: issues")],
+            mode_paging: None,
         }),
     };
     let form_choices = new_agent_form.form.as_ref().expect("planted");

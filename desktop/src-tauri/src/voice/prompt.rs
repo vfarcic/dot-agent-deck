@@ -511,6 +511,8 @@ pub(crate) mod tests {
                 "use_this_directory".to_string(),
                 "filter_directories".to_string(),
                 "clear_directory_filter".to_string(),
+                "next_page".to_string(),
+                "previous_page".to_string(),
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),
@@ -612,6 +614,7 @@ pub(crate) mod tests {
                 path: format!("/home/dev/code/{name}"),
             })
             .collect(),
+            paging: None,
         }
     }
 
@@ -764,6 +767,7 @@ pub(crate) mod tests {
                 modes: vec![choice("none", "No mode"), choice("schedule", "schedule")],
                 agent_types: vec![choice("claude", "Claude Code"), choice("pi", "Pi")],
                 withheld_modes: vec![choice("schedule-issues", "schedule: issues")],
+                mode_paging: None,
             }),
         };
         let closed_form = crate::voice::VoiceNewAgent { form: None };
@@ -822,6 +826,7 @@ pub(crate) mod tests {
                     path: format!("/home/secret-user/code/dir-{index:03}"),
                 })
                 .collect(),
+            paging: None,
         };
         let rendered = state(&request(Some(&listing)));
         let entries = rendered["directories"]["entries"]
