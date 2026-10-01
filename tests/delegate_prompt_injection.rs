@@ -2476,8 +2476,13 @@ async fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_fli
     // A cooked-mode `cat` named `codex`, so the respawn resolves it to a
     // Wrapper-strategy agent and runs it under a REAL `dot-agent-deck wrap` —
     // which is what makes the pane a wrapper host in the deck's own launch
-    // record. This registry has no hook socket, so that wrapper reports nothing
-    // and the two interface facts below are the test's to place in time.
+    // record. This registry has no hook socket, so nothing the wrapper reports
+    // reaches THIS test, and the two interface facts below are the test's to
+    // place in time. It does still report: with no endpoint in its environment
+    // it resolves the platform default and posts a fork-time `SessionStart`
+    // there. Until issue #1473 that default was the developer's live deck —
+    // the ghost "Codex" card — and it now lands on the harness's redirected,
+    // listener-less `XDG_RUNTIME_DIR` (`common::detach_before_main`).
     // `app-server` is the hook-listing probe; see `scheduler/spawn/010`.
     write_executable(
         &bin_dir.join("codex"),

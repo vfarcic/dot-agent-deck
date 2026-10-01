@@ -14,15 +14,40 @@
 //! nextest gives every test its own process, so mutating this process's
 //! environment cannot affect another test.
 //!
-//! **Necessary, not sufficient, and the difference matters.** Scrubbing THIS
-//! process only stops a child from *inheriting* an endpoint. A child that emits
-//! hook events resolves the endpoint itself when the variable is absent, and
-//! [`crate::platform::paths::socket_path`]'s fallback is
-//! `$XDG_RUNTIME_DIR/dot-agent-deck.sock` — the developer's live daemon. So an
-//! unpinned emitter reaches a real deck whether or not the variable was
-//! inherited, and `agent_pty::spawn`'s `env_remove` of the same four variables
-//! cannot help either. Two things actually close that path, and a fixture that
-//! spawns an emitter needs one of them:
+//! **Scrubbing alone was necessary, not sufficient.** Scrubbing THIS process
+//! only stops a child from *inheriting* an endpoint. With the variable absent,
+//! both endpoint resolvers fall back to an address they compute for themselves —
+//! [`crate::platform::paths::socket_path`]'s is
+//! `$XDG_RUNTIME_DIR/dot-agent-deck.sock`, else
+//! `${TMPDIR:-/tmp}/dot-agent-deck-<uid>/hook.sock`, and the client side then
+//! also tries the legacy `/tmp/dot-agent-deck-<uid>.sock` spellings — and on a
+//! developer's machine the first of those is the live daemon. Issue #1473
+//! measured both kinds of leak with every variable scrubbed: a wrapped Codex
+//! worker spawned by `orchestration/delegate/039` posted its fork-time
+//! `SessionStart` there (a ghost "Codex" card that vanishes when selected), and
+//! `dashboard/selection/016` — this process, not a child — asked the live
+//! daemon for a close preview.
+//!
+//! **So the guard now also closes the fallback, and does it before `main`.**
+//! [`detach_before_main`] runs as a constructor in every unit-test process:
+//! it scrubs the variables above and points `XDG_RUNTIME_DIR` at a per-process
+//! directory nobody creates ([`unreachable_runtime_dir`]). With
+//! `XDG_RUNTIME_DIR` set, the resolvers take its arm and never consult the
+//! `TMPDIR` or legacy `/tmp` rungs, so all three are closed at once — for this
+//! process's own resolution and for every child that inherits its environment,
+//! whether or not the test calls anything. Doing it before `main` is what
+//! makes "a test written later" covered and also what makes the environment
+//! write sound: no thread exists yet. The pins below remain for a child
+//! started with a cleared environment, which inherits neither half.
+//!
+//! What it does not cover: a test that sets `XDG_RUNTIME_DIR` back, or removes
+//! it, and then connects (it chose that address); a child spawned with
+//! `env_clear` that is given neither a pin nor a runtime dir; and Windows,
+//! where the default endpoints are per-user named pipes with no runtime-dir
+//! rung to redirect.
+//!
+//! Two things close the remaining child path, for a fixture that spawns an
+//! emitter with a cleared environment:
 //!
 //! * do not spawn a process that emits (a bare `/bin/cat` byte sink emits
 //!   nothing — this is what `scheduler/dispatch/016` does since #666), or
@@ -63,16 +88,68 @@ pub const DECK_ENDPOINT_VARS: [&str; 5] = [
     "DOT_AGENT_DECK_PANE_CAPABILITY",
 ];
 
-/// Clear every inherited deck endpoint from this test process. Idempotent, and
-/// safe to call from any unit test that spawns a pane or posts synthetic hook
-/// events.
-pub fn detach_from_any_live_deck() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let leaked: Vec<&str> = DECK_ENDPOINT_VARS
+/// Where [`detach_before_main`] points `XDG_RUNTIME_DIR`: a per-process path
+/// under the OS temp dir that nothing creates, so a connect to an endpoint
+/// inside it fails unless the test itself bound one there — no live deck can
+/// be behind it.
+///
+/// Never created here. A test that does create something beneath it — a lock
+/// root under `lock_root_default`, say — gets a directory private to this pid
+/// instead of the developer's real runtime dir, and the `dad-unit-` prefix is
+/// on `cargo xtask clean-e2e-tmp`'s owned list, so a leftover is reapable. The
+/// pid keeps two concurrent test processes from sharing one.
+#[cfg(unix)]
+fn unreachable_runtime_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("dad-unit-no-live-deck-{}", std::process::id()))
+}
+
+/// The identity variables [`detach_before_main`] found set, so the note in
+/// [`detach_from_any_live_deck`] can still name them.
+static CLEARED_BEFORE_MAIN: OnceLock<Vec<&'static str>> = OnceLock::new();
+
+ctor::declarative::ctor! {
+    /// Detach every unit-test process from any live deck before `main` — issue
+    /// #1473. See the module docs for why this cannot wait for a test to call
+    /// [`detach_from_any_live_deck`].
+    ///
+    /// Prints nothing: stderr is not promised to be usable before `main`.
+    #[ctor(unsafe)]
+    fn detach_before_main() {
+        let leaked: Vec<&'static str> = DECK_ENDPOINT_VARS
             .into_iter()
             .filter(|v| std::env::var_os(v).is_some())
             .collect();
+        // SAFETY: a constructor runs before `main`, while this process has one
+        // thread, so nothing can observe the environment mid-write.
+        unsafe {
+            for var in DECK_ENDPOINT_VARS {
+                std::env::remove_var(var);
+            }
+            #[cfg(unix)]
+            std::env::set_var("XDG_RUNTIME_DIR", unreachable_runtime_dir());
+        }
+        let _ = CLEARED_BEFORE_MAIN.set(leaked);
+    }
+}
+
+/// Clear every inherited deck endpoint from this test process. Idempotent, and
+/// safe to call from any unit test that spawns a pane or posts synthetic hook
+/// events.
+///
+/// [`detach_before_main`] has already done this — and redirected
+/// `XDG_RUNTIME_DIR` — before the test began, so in an ordinary run this only
+/// prints the note. It still scrubs the identity variables, for a test that
+/// set them itself, and leaves `XDG_RUNTIME_DIR` alone, so a test that chose
+/// its own runtime dir before calling it keeps it.
+pub fn detach_from_any_live_deck() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let mut leaked: Vec<&str> = CLEARED_BEFORE_MAIN.get().cloned().unwrap_or_default();
+        for var in DECK_ENDPOINT_VARS {
+            if std::env::var_os(var).is_some() && !leaked.contains(&var) {
+                leaked.push(var);
+            }
+        }
         if !leaked.is_empty() {
             // Loud on purpose, matching the harness: the run is now safe, but
             // the contributor should know their shell was pointed at a live
@@ -132,6 +209,9 @@ fn unreachable_endpoint(var: &str) -> String {
 /// PRESENT the resolver takes the override arm and never reaches the fallback,
 /// so the emit fails closed. Issue #688 measured the difference: the scrub
 /// alone still produced 3 foreign `SessionStart`s in 8 runs of one fixture.
+/// Since issue #1473 [`detach_before_main`] redirects `XDG_RUNTIME_DIR` for
+/// every child that inherits this process's environment; the pin is what still
+/// holds for a child that does not.
 ///
 /// For a `std::process::Command` / `tokio::process::Command`, pass this to
 /// `.envs(…)`. For a `SpawnOptions`, use [`pin_unreachable_endpoints`], which
@@ -359,6 +439,159 @@ mod tests {
             !std::path::Path::new(attach[0]).exists(),
             "the pinned endpoint must not exist, or a connect could succeed"
         );
+    }
+
+    /// Set only on the re-executed child of
+    /// [`a_unit_test_cannot_reach_a_live_deck_through_the_endpoint_fallback`];
+    /// its value is the control endpoint.
+    #[cfg(unix)]
+    const PROBE_CONTROL_ENV: &str = "DAD_UNIT_LIVE_DECK_PROBE_CONTROL";
+
+    /// A listening Unix socket standing in for a daemon, owner-only in an
+    /// owner-only directory the way the daemon makes its own, so a client's
+    /// trust check cannot be the reason nothing arrived.
+    #[cfg(unix)]
+    fn stand_in(path: &std::path::Path) -> std::os::unix::net::UnixListener {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = path.parent().expect("endpoint has a parent");
+        std::fs::create_dir_all(dir).expect("create stand-in endpoint dir");
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod stand-in endpoint dir");
+        let listener = std::os::unix::net::UnixListener::bind(path)
+            .unwrap_or_else(|e| panic!("bind stand-in {}: {e}", path.display()));
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod stand-in endpoint");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking stand-in");
+        listener
+    }
+
+    /// Everything that connected to `listener`, one string per connection.
+    #[cfg(unix)]
+    fn drain(listener: &std::os::unix::net::UnixListener) -> Vec<String> {
+        use std::io::Read;
+        let mut seen = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept() {
+            stream.set_nonblocking(false).ok();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                .ok();
+            let mut buf = Vec::new();
+            let _ = stream.read_to_end(&mut buf);
+            seen.push(String::from_utf8_lossy(&buf).into_owned());
+        }
+        seen
+    }
+
+    /// Scenario: Stand a fake "live deck" up at `$XDG_RUNTIME_DIR/dot-agent-deck.sock`
+    /// and `…-attach.sock`, start a unit-test process that inherits that runtime
+    /// dir but none of the deck endpoint variables and calls no guard, and have
+    /// it resolve and connect to both endpoints the way
+    /// `dashboard/selection/016`'s close preview did (issue #1473). A write to a
+    /// control socket proves the child ran; nothing may reach the fake live deck.
+    /// Then the same with `XDG_RUNTIME_DIR` unset and the fake deck under
+    /// `$TMPDIR/dot-agent-deck-<uid>/`.
+    #[cfg(unix)]
+    #[test]
+    fn a_unit_test_cannot_reach_a_live_deck_through_the_endpoint_fallback() {
+        for runtime_dir_set in [true, false] {
+            let root = crate::test_temp::tempdir().expect("disk-backed scratch dir");
+            let live_dir = if runtime_dir_set {
+                root.path().join("run")
+            } else {
+                root.path().join("tmp").join(format!(
+                    "dot-agent-deck-{}",
+                    crate::platform::paths::current_uid()
+                ))
+            };
+            let (hook_name, attach_name) = if runtime_dir_set {
+                ("dot-agent-deck.sock", "dot-agent-deck-attach.sock")
+            } else {
+                ("hook.sock", "attach.sock")
+            };
+            let hook = stand_in(&live_dir.join(hook_name));
+            let attach = stand_in(&live_dir.join(attach_name));
+            let control_path = root.path().join("control").join("probe.sock");
+            let control = stand_in(&control_path);
+
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("unit-test binary path"));
+            child
+                .args([
+                    "--exact",
+                    "test_isolation::tests::reexec_child_resolves_the_deck_endpoints",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(PROBE_CONTROL_ENV, &control_path)
+                // What the existing detach already clears — #1473 is the half
+                // left once these are gone, so start from there.
+                .env_remove("DOT_AGENT_DECK_SOCKET")
+                .env_remove("DOT_AGENT_DECK_ATTACH_SOCKET")
+                .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY");
+            if runtime_dir_set {
+                child.env("XDG_RUNTIME_DIR", root.path().join("run"));
+            } else {
+                child
+                    .env_remove("XDG_RUNTIME_DIR")
+                    .env("TMPDIR", root.path().join("tmp"));
+            }
+            let output = child.output().expect("re-execute the probe child");
+            let child_log = format!(
+                "child status {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.status.success(),
+                "the probe child failed\n{child_log}"
+            );
+            assert!(
+                !drain(&control).is_empty(),
+                "control: the probe child never reached its control socket, so it did not run \
+                 the probe and the absence below would prove nothing\n{child_log}"
+            );
+            let leaked_hook = drain(&hook);
+            let leaked_attach = drain(&attach);
+            assert!(
+                leaked_hook.is_empty() && leaked_attach.is_empty(),
+                "a unit-test process reached the stand-in LIVE deck at {} through the endpoint \
+                 fallback (issue #1473; XDG_RUNTIME_DIR set: {runtime_dir_set}) — on a \
+                 developer's machine that is their running daemon.\n  hook received \
+                 {leaked_hook:?}\n  attach received {leaked_attach:?}",
+                live_dir.display()
+            );
+        }
+    }
+
+    /// The re-executed half of
+    /// [`a_unit_test_cannot_reach_a_live_deck_through_the_endpoint_fallback`]; a
+    /// no-op unless that test started this process.
+    ///
+    /// Scenario: Only when re-executed by the parent above, and without calling
+    /// any isolation guard: connect to the hook and attach endpoints the client
+    /// resolvers return, as `dashboard/selection/016`'s close preview did, then
+    /// write to the parent's control socket to prove the probe ran.
+    #[cfg(unix)]
+    #[test]
+    fn reexec_child_resolves_the_deck_endpoints() {
+        use std::io::Write;
+        let Some(control) = std::env::var_os(PROBE_CONTROL_ENV) else {
+            return;
+        };
+        for endpoint in [
+            crate::endpoint_resolve::client_socket_path(),
+            crate::endpoint_resolve::client_attach_socket_path(),
+        ] {
+            if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&endpoint) {
+                let _ = writeln!(stream, "in-process probe from {}", std::process::id());
+            }
+        }
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(control).expect("reach the control socket");
+        let _ = writeln!(stream, "probe ran");
     }
 
     /// Scenario: Ask for the bare pins and assert both endpoint variables are
