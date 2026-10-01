@@ -212,6 +212,25 @@ fn preserve_disabled_button_is_inert() {
 
     // The dashboard bar renders [Generate g] dimmed (no cards → disabled).
     let (col, row) = deck.wait_for_in_grid("Generate");
+
+    // What a dispatched click would put on screen: the status RequestConfigGen
+    // sets on an empty dashboard, matched verbatim, because a bare "No active
+    // agent" is also a prefix of the empty dashboard's own "No active agents.
+    // Press …" line. Every grid read from the click onward goes through this,
+    // not only the last one. The status lives 15s (`STATUS_MESSAGE_TTL`), so
+    // a check made only at the end could miss it on a machine that stalled
+    // that long; checked on every poll, the first frame that shows it fails
+    // the test.
+    let assert_no_side_effect = |grid: &str| {
+        assert!(
+            !grid.contains("No orchestration config found"),
+            "clicking the disabled Generate button must not open the config-gen prompt:\n{grid}"
+        );
+        assert!(
+            !grid.contains("No active agent to send prompt to"),
+            "clicking the disabled Generate button must be a true no-op (no RequestConfigGen side effect):\n{grid}"
+        );
+    };
     deck.click(col, row);
 
     // Anchor: open the help overlay (?). It renders only from Normal mode, so
@@ -219,32 +238,21 @@ fn preserve_disabled_button_is_inert() {
     // order and (b) the disabled click did NOT open the config-gen prompt
     // (from which `?` would do nothing and this wait would time out).
     deck.send_bytes(b"?");
-    deck.wait_for_string("works from any pane");
+    deck.wait_until_grid("help overlay open", |g| {
+        assert_no_side_effect(g);
+        g.contains("works from any pane")
+    });
 
     // Close the overlay and wait for the dashboard's own empty-state line to
     // be painted back over it. The deck writes one frame at a time, top row
     // first, so seeing ANY cell of this later frame proves the whole help
-    // frame — bottom status row included — has already landed. Snapshotting
-    // the help frame itself is the race this test used to lose under load: a
-    // half-drawn overlay could leave rows unwritten, so nothing read from it
+    // frame — bottom status row included — has already landed. A check made
+    // on the help frame alone is the race this test used to lose under load:
+    // a half-drawn overlay could leave rows unwritten, so nothing read from it
     // was a complete picture of the state after the click.
     deck.send_bytes(b"?");
     deck.wait_until_grid("help closed and the empty dashboard repainted", |g| {
+        assert_no_side_effect(g);
         !g.contains("works from any pane") && g.contains("No active agents. Press")
     });
-
-    // Match the status RequestConfigGen sets on an empty dashboard verbatim:
-    // a bare "No active agent" is also a prefix of the empty dashboard's own
-    // "No active agents. Press …" line, which is on screen right now. The
-    // status lives 15s (`STATUS_MESSAGE_TTL`) and replaces the bottom bar, so
-    // had the click fired it, it would still be on screen here.
-    let grid = deck.snapshot_grid();
-    assert!(
-        !grid.contains("No orchestration config found"),
-        "clicking the disabled Generate button must not open the config-gen prompt:\n{grid}"
-    );
-    assert!(
-        !grid.contains("No active agent to send prompt to"),
-        "clicking the disabled Generate button must be a true no-op (no RequestConfigGen side effect):\n{grid}"
-    );
 }
