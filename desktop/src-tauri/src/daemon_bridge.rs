@@ -1240,10 +1240,17 @@ pub(crate) async fn connect_anyway(links: &DaemonLinks, endpoint: &Endpoint) -> 
 /// is the sentence for the button the user just pressed, so it says what went
 /// wrong and what to do rather than repeating the handshake.
 pub(crate) fn connect_anyway_failure(connection: &DesktopConnection) -> Option<String> {
+    // No sentence sends the user to Reconnect: on the overview that button
+    // re-establishes the SELECTED deck, which in a fleet is usually not this
+    // one. What retries this deck is its own watcher, every
+    // `WATCH_RETRY_DELAY`, under the allowance just armed — so a deck that
+    // starts answering connects without another click, and the sentence says
+    // so. A `Disconnected` here is either the handshake or the agent-list
+    // request failing; the deck's card shows which, from the snapshot's error.
     match connection.status {
         ConnectionStatus::Connected => None,
         ConnectionStatus::Disconnected => Some(
-            "Could not connect to this daemon: it stopped answering. Check that it is still running, then press Reconnect."
+            "Could not connect to this daemon: it did not respond as expected, and its card shows what went wrong. The app keeps trying and connects to it as soon as it responds."
                 .into(),
         ),
         ConnectionStatus::Incompatible if !connection.build_stamp_mismatch_only => Some(
@@ -1251,7 +1258,7 @@ pub(crate) fn connect_anyway_failure(connection: &DesktopConnection) -> Option<S
                 .into(),
         ),
         ConnectionStatus::Incompatible => Some(
-            "Could not connect to this daemon. Press Reconnect to try again; if it is still refused, run a daemon from the same release as the app."
+            "Could not connect to this daemon, and its card shows what it reported. Run a daemon from the same release as the app."
                 .into(),
         ),
     }
@@ -6667,7 +6674,7 @@ start = true
 
     /// Issue #1472: a deck that stopped answering by the time the user
     /// confirmed is reported, in words that say what to do — never announced
-    /// as connected.
+    /// as connected, and never pointed at a Reconnect that retries another deck.
     #[cfg(unix)]
     #[tokio::test]
     async fn connect_anyway_reports_a_deck_that_stopped_answering() {
@@ -6679,8 +6686,11 @@ start = true
 
         assert_eq!(snapshot.connection.status, ConnectionStatus::Disconnected);
         let failure = connect_anyway_failure(&snapshot.connection).expect("a failure is reported");
-        assert!(failure.contains("stopped answering"), "{failure}");
-        assert!(failure.contains("Reconnect"), "{failure}");
+        assert!(failure.contains("did not respond"), "{failure}");
+        assert!(failure.contains("keeps trying"), "{failure}");
+        // The overview's Reconnect re-establishes the SELECTED deck, so the
+        // sentence must not send the user to it for this one.
+        assert!(!failure.contains("Reconnect"), "{failure}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

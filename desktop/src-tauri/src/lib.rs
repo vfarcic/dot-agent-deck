@@ -4820,6 +4820,12 @@ async fn desktop_run_action(
             // rather than on its watcher's next retry, and a deck that still
             // did not connect is reported as a failure instead of announced as
             // connected.
+            //
+            // It returns here rather than through the tail's
+            // `refresh_and_emit`, which would fetch the SELECTED deck too: on
+            // the overview that is usually another deck, and a slow one would
+            // hold the confirmation open after this one had connected. Every
+            // other deck re-reads the allowance on its own watcher's next pass.
             let scope = crate::dto::DeckScope::resolve(deck_id.as_deref())?;
             let snapshot =
                 crate::daemon_bridge::connect_anyway(&state.daemon, scope.endpoint()).await;
@@ -4829,8 +4835,17 @@ async fn desktop_run_action(
             {
                 return Err(failure.into());
             }
-            result_message =
-                Some("Connected anyway for this session; the mismatch stays on screen.".into());
+            return Ok(DesktopActionResult {
+                ok: true,
+                agent_id: None,
+                agent_ids: Vec::new(),
+                send_result: None,
+                terminal: None,
+                message: Some(
+                    "Connected anyway for this session; the mismatch stays on screen.".into(),
+                ),
+                snapshot,
+            });
         }
         DesktopAction::RenameAgent {
             agent_id,

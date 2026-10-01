@@ -997,6 +997,17 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * under the selection was rendered on a group nobody had clicked.
    */
   const [overrideError, setOverrideError] = useState<{ deckId: string | undefined; message: string }>();
+  /*
+    The reason describes one attempt, so a newer state of that deck supersedes
+    it: once the deck reports connected the sentence is stale, and it must not
+    come back on a later disconnected note as if it explained that one.
+    Reconnect clears it too, below.
+  */
+  const overrideDeckConnected = overrideError !== undefined
+    && fleet.some((deck) => deck.connection.deckId === overrideError.deckId && deck.connection.status === "connected");
+  useEffect(() => {
+    if (overrideDeckConnected) setOverrideError(undefined);
+  }, [overrideDeckConnected]);
   /**
    * PRD #1223 U4 — see {@link StopControlsContext}. The deck an agent is on is
    * `daemonId`, the wire id every deck-targeted action names; the connection
@@ -1155,7 +1166,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               columns={columns}
               fleetSize={decks.length}
               onOpenDeck={openDeck}
-              onReconnect={() => void runtime.reconnect()}
+              onReconnect={() => {
+                setOverrideError(undefined);
+                void runtime.reconnect();
+              }}
               overrideError={overrideError && deck.snapshot.connection.deckId === overrideError.deckId ? overrideError.message : undefined}
               onConnectAnyway={mode === "live" && deck.snapshot.connection.buildStampMismatchOnly ? () => requestConnectAnyway(deck.snapshot.connection) : undefined}
               onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId }) : undefined}

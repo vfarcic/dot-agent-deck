@@ -2957,13 +2957,52 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
   it("says why on the refused deck's own group when connecting anyway fails", async () => {
     const fleet = fleetWithARefusedDeck();
     const runAction = vi.fn(async () => {
-      throw new Error("Could not connect to this daemon: it stopped answering. Check that it is still running, then press Reconnect.");
+      throw new Error("Could not connect to this daemon: it did not respond as expected, and its card shows what went wrong. The app keeps trying and connects to it as soon as it responds.");
     });
     render(<AgentOverview runtime={runtime({ mode: "live", snapshot: fleet[0], fleet, runAction })} onNavigate={vi.fn()} />);
 
     fireEvent.click(within(refusedGroup()).getByTestId("overview-connect-anyway"));
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Connect anyway" }));
 
-    expect(await within(refusedGroup()).findByTestId("overview-connect-anyway-error")).toHaveTextContent("it stopped answering");
+    expect(await within(refusedGroup()).findByTestId("overview-connect-anyway-error")).toHaveTextContent("it did not respond as expected");
+  });
+
+  /**
+   * Scenario: Connect anyway fails on a refused, non-selected deck and its
+   * reason is shown; the deck later connects, then stops answering. The old
+   * reason is gone rather than reappearing on the disconnected note, and
+   * pressing Reconnect clears a reason the same way.
+   */
+  it("drops a Connect anyway failure once that deck has moved on", async () => {
+    const fleet = fleetWithARefusedDeck();
+    const runAction = vi.fn(async () => {
+      throw new Error("Could not connect to this daemon: it did not respond as expected.");
+    });
+    const reconnect = vi.fn(async () => undefined);
+    const view = (decks: DeckSnapshot[]) => <AgentOverview runtime={runtime({ mode: "live", snapshot: decks[0], fleet: decks, runAction, reconnect })} onNavigate={vi.fn()} />;
+    const { rerender } = render(view(fleet));
+
+    const fail = async () => {
+      fireEvent.click(within(refusedGroup()).getByTestId("overview-connect-anyway"));
+      fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Connect anyway" }));
+      expect(await within(refusedGroup()).findByTestId("overview-connect-anyway-error")).toBeVisible();
+    };
+    await fail();
+
+    const connected = createFixtureFleet("fleet");
+    rerender(view(connected));
+    await waitFor(() => expect(screen.queryByTestId("overview-connect-anyway-error")).not.toBeInTheDocument());
+
+    const down = createFixtureFleet("fleet");
+    down[1] = { ...down[1], connection: { ...down[1].connection, status: "disconnected", message: "No daemon is listening on the configured socket." } };
+    rerender(view(down));
+    expect(within(refusedGroup()).getByTestId("overview-disconnected")).toBeVisible();
+    expect(screen.queryByTestId("overview-connect-anyway-error")).not.toBeInTheDocument();
+
+    rerender(view(fleet));
+    await fail();
+    fireEvent.click(within(refusedGroup()).getByRole("button", { name: /Reconnect/ }));
+    expect(reconnect).toHaveBeenCalled();
+    expect(screen.queryByTestId("overview-connect-anyway-error")).not.toBeInTheDocument();
   });
 });

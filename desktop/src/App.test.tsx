@@ -1577,7 +1577,7 @@ describe("ControlDeck", () => {
       buildStampMismatchOnly: true,
     };
     const runAction = vi.fn(async () => {
-      throw new Error("Could not connect to this daemon: it stopped answering. Check that it is still running, then press Reconnect.");
+      throw new Error("Could not connect to this daemon: it did not respond as expected, and its card shows what went wrong. The app keeps trying and connects to it as soon as it responds.");
     });
     render(<ControlDeck runtime={runtime({ mode: "live", snapshot: incompatible, runAction })} />);
 
@@ -1585,7 +1585,7 @@ describe("ControlDeck", () => {
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Connect anyway" }));
 
     await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch", deckId: "local:/tmp/dot-agent-deck.sock" }));
-    expect(await screen.findByText(/it stopped answering/)).toBeVisible();
+    expect(await screen.findByText(/it did not respond as expected/)).toBeVisible();
     expect(screen.queryByText(/Connected to the differently-built daemon/)).not.toBeInTheDocument();
   });
 
