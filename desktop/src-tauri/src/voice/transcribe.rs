@@ -16,7 +16,7 @@
 //! `cargo test-fast`. The provider-selection work found the route that argument
 //! had missed: **a container on loopback, over the same HTTP this file already
 //! spoke.** Measured — `ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu` on
-//! `127.0.0.1:18000`, the same three multipart parts, the same `text` field
+//! `127.0.0.1:18000`, the same multipart parts, the same `text` field
 //! back, 0.653 s median warm, and no credential anywhere.
 //!
 //! So there is **no `off` variant and no second implementation**.
@@ -537,7 +537,12 @@ pub fn content_type(boundary: &str) -> String {
     format!("multipart/form-data; boundary={boundary}")
 }
 
-/// The whole request body: the WAV, the model, and nothing else.
+/// The ISO-639-1 language every transcription request names. A constant
+/// rather than a setting for now; making it one is issue #1458.
+pub const TRANSCRIPTION_LANGUAGE: &str = "en";
+
+/// The whole request body: the WAV, the model, the response format and the
+/// language, and nothing else.
 ///
 /// **Assembled by hand rather than through `reqwest`'s `multipart` feature**,
 /// and that is a dependency decision rather than a preference. Turning the
@@ -545,7 +550,7 @@ pub fn content_type(boundary: &str) -> String {
 /// whose reqwest spec is copied verbatim from the root package's — so cargo
 /// would resolve one feature-unified build for both, and the root crate's
 /// `src/version.rs` would start carrying a multipart encoder it has no use for.
-/// What it would buy is the forty lines below, for a body with two parts, no
+/// What it would buy is the lines below, for a body with four parts, no
 /// nested multipart and no filename this build does not choose itself.
 ///
 /// `\r\n` throughout, and not `\n`: RFC 2046 says CRLF, and a server that
@@ -567,6 +572,17 @@ pub fn multipart_body(audio: &Pcm16, model: &str, boundary: &str) -> Vec<u8> {
     part(&format!("--{boundary}\r\n"));
     part("content-disposition: form-data; name=\"response_format\"\r\n\r\n");
     part("json");
+    part("\r\n");
+
+    // Named rather than detected: with no `language`, Whisper-family models
+    // guess it per utterance, and a short command in an accent is what they
+    // guess wrong — "Select the directory …" spoken with a Serbian accent came
+    // back as "Selectajte directory …", which action grounding then refused.
+    // Every command this app recognises is English, so English is the right
+    // pin until the language is a setting.
+    part(&format!("--{boundary}\r\n"));
+    part("content-disposition: form-data; name=\"language\"\r\n\r\n");
+    part(TRANSCRIPTION_LANGUAGE);
     part("\r\n");
 
     // The filename is what tells the service the container, and `.wav` is what
@@ -1232,6 +1248,22 @@ mod tests {
         );
     }
 
+    /// Reported 2026-10-01 while testing PR #1451: "Select the directory
+    /// dot-agent-deck", spoken with a Serbian accent, came back as
+    /// "Selectajte directory dot-agent-deck" — a Serbian imperative ending
+    /// glued onto an English verb — because a request naming no language
+    /// leaves Whisper-family models to guess it per utterance, and a short
+    /// accented command is exactly what they guess wrong. Action grounding
+    /// then refused it, correctly, since no word of it asks for anything.
+    #[test]
+    fn voice_transcribe_request_pins_the_language_to_english() {
+        let rendered = text_of(&body(&audio(8)));
+        assert!(
+            rendered.contains("name=\"language\"\r\n\r\nen\r\n"),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn voice_transcribe_request_carries_a_wav_named_by_a_constant() {
         let pcm = audio(8);
@@ -1257,10 +1289,10 @@ mod tests {
         let rendered = text_of(&raw);
         assert!(rendered.starts_with("--TESTBOUNDARY\r\n"), "{rendered}");
         assert!(rendered.ends_with("\r\n--TESTBOUNDARY--\r\n"), "{rendered}");
-        // Three parts: model, response_format, file.
+        // Four parts: model, response_format, language, file.
         assert_eq!(
             rendered.matches("content-disposition: form-data").count(),
-            3
+            4
         );
 
         // CRLF everywhere — a bare LF is the mistake a hand-written encoder
