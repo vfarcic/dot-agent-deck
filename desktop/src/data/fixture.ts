@@ -1358,10 +1358,18 @@ export const FIXTURE_VOICE_UTTERANCE = FIXTURE_VOICE_COMMANDS[0].phrases[0];
  *
  * With no parameter it is the single canned utterance the preview has always
  * had, so every existing page and test sees exactly what it saw before.
+ *
+ * Blank phrases are dropped, and a `?voice=` that held only blank ones is an
+ * EMPTY script: a microphone that hears nothing at all. It used to fall back to
+ * the canned utterance instead, so the browser spec that asks for silence to
+ * read the empty-state hint got a real utterance on the first status poll. The
+ * hint was then replaced, and the spec passed only when it read the hint
+ * before that poll landed.
  */
 export function fixtureVoiceScript(search: string): string[] {
-  const spoken = new URLSearchParams(search).getAll("voice").filter((phrase) => phrase.trim() !== "");
-  return spoken.length > 0 ? spoken : [FIXTURE_VOICE_UTTERANCE];
+  const params = new URLSearchParams(search);
+  if (!params.has("voice")) return [FIXTURE_VOICE_UTTERANCE];
+  return params.getAll("voice").filter((phrase) => phrase.trim() !== "");
 }
 
 /**
