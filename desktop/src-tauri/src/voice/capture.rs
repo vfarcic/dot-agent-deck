@@ -1957,13 +1957,18 @@ impl CaptureSession {
         inner.state = CaptureState::Transcribing;
         // PR #1451: the device stays open, so whatever is said while this
         // utterance is transcribed and resolved is the start of the next one
-        // rather than lost. Only a device the cap already closed is let go.
+        // rather than lost. A device the cap already closed is let go, and so
+        // is one whose buffer reached the cap before the cap's timer got to
+        // close it (Qodo on the PR): `split` would clear its "full" and the
+        // next start's ticket would outrun the old timer, so the cap would
+        // never close it.
         if let Live {
             open: true,
             sink,
             began,
             ..
         } = &mut live
+            && !sink.is_full()
         {
             let audio = sink.split();
             *began = Instant::now();
@@ -3570,6 +3575,34 @@ mod tests {
             kept.remaining() <= MAX_UTTERANCE - working,
             "the time spent working on the last utterance was not counted: {:?} left",
             kept.remaining()
+        );
+    }
+
+    /// Scenario: an utterance fills the buffer to the length cap, and the app
+    /// takes it before the cap's timer has closed the device. The device is
+    /// closed then, as the cap would have done, rather than kept open for the
+    /// next utterance (Qodo on PR #1451).
+    #[test]
+    fn voice_capture_a_full_buffer_is_not_kept_open_when_the_timer_has_not_fired() {
+        let source = Arc::new(StubSource::new(mono(TARGET_SAMPLE_RATE), Vec::new()));
+        let stopped = source.stopped();
+        let session = CaptureSession::new(Arc::clone(&source) as Arc<dyn AudioSource>);
+        session.start().expect("starts");
+        let over_the_cap = (MAX_UTTERANCE.as_secs() as usize + 1) * TARGET_SAMPLE_RATE as usize;
+        source.speak(&vec![0.25; over_the_cap]);
+        assert!(session.status().capped, "the buffer reached the cap");
+
+        session.stop().expect("the capped utterance is taken");
+        assert!(
+            stopped.load(Ordering::Relaxed),
+            "a microphone that reached the cap was kept open for the next utterance"
+        );
+        session.settle(true);
+        session.start().expect("listens again");
+        assert_eq!(
+            source.opened(),
+            2,
+            "the next utterance opens the device again"
         );
     }
 
