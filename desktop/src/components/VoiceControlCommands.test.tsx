@@ -33,7 +33,7 @@ beforeEach(() => window.history.replaceState({}, "", "/?fixture=1&experimental=1
 function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
   return <AppDeckShell initialView={{ kind: "deck" }} {...props} />;
 }
-import { COMMAND_HIDDEN_BY_ORCHESTRATION, DECK_CANNOT_TAKE_AGENT, DECK_NOT_LISTED, DIRECTORY_MOVED_ON, DRAFT_RESTORED, DIRECTORY_NOT_LISTED, FORM_MOVED_ON, MODE_NOT_OFFERED, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, NO_PARENT_DIRECTORY, spokenName, START_IN_FLIGHT, START_NEEDS_DIRECTORY, STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
+import { COMMAND_HIDDEN_BY_ORCHESTRATION, deckCannotTakeAgent, DECK_NOT_LISTED, DIRECTORY_MOVED_ON, DRAFT_RESTORED, DIRECTORY_NOT_LISTED, FORM_MOVED_ON, MODE_NOT_OFFERED, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, NO_PARENT_DIRECTORY, spokenName, START_IN_FLIGHT, START_NEEDS_DIRECTORY, STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
 import { CONFIRMATION_ALREADY_OPEN, STOP_BEHIND_NEW_AGENT, STOP_TARGET_GONE } from "./AgentOverview";
 import {
   DIALOG_MOVED_ON,
@@ -4401,12 +4401,14 @@ describe("the New agent deck field and Discard, by voice (issues 1263 and 1247)"
   });
 
   /**
-   * Scenario: a deck resolved against the fleet reaches a dialog whose field
-   * shows it disabled, or no longer lists it at all. Each is refused in the
-   * dialog's words and nothing is chosen.
+   * Scenario: a deck resolved against the fleet reaches a dialog that cannot
+   * use it — the runner, which is not connected and so is not on screen in the
+   * dialog (PR #1451 round 3, change 6), or a deck that has left the fleet.
+   * The runner is refused in one line that names it and says why in a few
+   * words; the other in the dialog's words. Nothing is chosen either way.
    */
   it.each([
-    ["deck runner", DECK_CANNOT_TAKE_AGENT],
+    ["deck runner", deckCannotTakeAgent("ci@runner-7", "it is not connected")],
     ["deck gone", DECK_NOT_LISTED],
   ])("refuses %s rather than choosing it", async (utterance, refusal) => {
     const voice = microphone([]);
@@ -4421,6 +4423,12 @@ describe("the New agent deck field and Discard, by voice (issues 1263 and 1247)"
     expect(chosenDeck()).toBeUndefined();
     expect(screen.getByTestId("voice-report")).toHaveTextContent(refusal);
     expect(deck.newAgentOptions).not.toHaveBeenCalled();
+    expect(screen.getByTestId("new-agent-deck-list").querySelector(`[data-deck-id="${DECKS["deck runner"].value}"]`)).toBeNull();
+  });
+
+  /** Scenario: the refusal for a hidden daemon is one sentence — its name in quotes, then the short reason class. */
+  it("names the hidden daemon and a short reason in one line", () => {
+    expect(deckCannotTakeAgent("ci@runner-7", "it is not connected")).toBe("\u201cci@runner-7\u201d can't take a new agent: it is not connected.");
   });
 
   /**

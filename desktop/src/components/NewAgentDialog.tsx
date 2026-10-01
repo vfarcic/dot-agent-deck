@@ -165,8 +165,17 @@ export const draftDeckGone = (savedDeck: string, hadDirectory: boolean) => `${sa
 export const DECK_CHANGE_IN_FLIGHT = "A start is under way, so the daemon was not changed.";
 /** The deck is not in the field's list any more. */
 export const DECK_NOT_LISTED = "That daemon is not in the New agent dialog's daemon list any more, so the daemon was not changed.";
-/** The deck is listed, disabled. */
-export const DECK_CANNOT_TAKE_AGENT = "That daemon cannot take a new agent now, so the daemon was not changed.";
+/**
+ * The deck cannot take a new agent, so the field does not list it (PR #1451
+ * round 3): one line naming it, with its short reason class
+ * (`deckUnavailableShort`) — the same shape the desktop crate's
+ * `deck_unavailable` gives a deck Rust refuses before dispatch.
+ */
+export const deckCannotTakeAgent = (deck: string, reason: string) => `\u201c${deck}\u201d can't take a new agent: ${reason}.`;
+/** The deck field's one line when the fleet has no deck at all. */
+export const NO_DECK_CONFIGURED = "No daemon is configured.";
+/** The deck field's one line when every deck in the fleet cannot take a new agent (PR #1451 round 3). */
+export const NO_DECK_CAN_TAKE_AGENT = "No daemon can take a new agent now.";
 /** The dialog closed during the round trip (served by the overview). */
 export const NO_DIALOG_FOR_DECK = "The New agent dialog is not open, so no daemon was chosen.";
 /** The dialog closed during the round trip, so there was nothing to discard. */
@@ -246,13 +255,14 @@ function messageOf(cause: unknown): string {
  * deck → listing and options; directory → orchestration chips; agent →
  * Command.
  *
- * 1. **Deck** — every deck in the fleet; the ones that cannot take a spawn are
- *    listed disabled with the reason the overview gives for them.
+ * 1. **Deck** — the decks in the fleet that can take a spawn. One that cannot
+ *    is not listed at all (PR #1451 round 3): its explanation and buttons
+ *    stay on the overview and the Daemons screen, and voice names it with a
+ *    short reason if the user asks for it.
  * 2. **Directory** — that deck's filesystem, browsed one level per request with
  *    the TUI picker's keys, in a panel of its own. Browsing is the only way to
  *    choose one (PRD #1223 U1 removed the typed path), so a deck without the
- *    listing verb is disabled in the deck field with the crate's
- *    `newAgentReason`.
+ *    listing verb cannot take a spawn and is left out of the deck field.
  * 3. **Form** — Mode, Name and Command, prefilled in the TUI's order and
  *    enabled once a directory is chosen.
  *    Mode offers a plain agent; one `Orch: <name>` chip per orchestration the
@@ -298,6 +308,13 @@ function messageOf(cause: unknown): string {
 export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppeared, onNotAppeared, appearTimeoutMs = NEW_AGENT_APPEAR_TIMEOUT_MS, closeRequest, voice }: NewAgentDialogProps) {
   const titleId = useId();
   const choices = useMemo(() => deckChoices(runtime.fleet), [runtime.fleet]);
+  /**
+   * What the deck field LISTS: only the decks that can take a spawn (PR #1451
+   * round 3, change 6). Filtered here, at render, and nowhere upstream —
+   * `choices` stays whole for voice (`voiceChooseDeck`, `voiceDeckStep`), so
+   * a deck the user names that cannot take one is refused for what it is.
+   */
+  const usable = useMemo(() => choices.filter((choice) => choice.reason === undefined), [choices]);
   /** The draft this mount was opened with (#1247) — read once, by the open effect. */
   const savedDraft = useRef(draft);
   /**
@@ -1137,9 +1154,11 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    */
   const voiceChooseDeck = (dispatch: VoiceDispatchTarget): string | undefined => {
     if (phase !== "idle") return DECK_CHANGE_IN_FLIGHT;
+    // Against every deck, not only the listed ones: a deck the field hides is
+    // refused with its own short reason rather than as one that has left.
     const choice = choices.find((candidate) => candidate.deckId === dispatch.preselectDeckId);
     if (!choice) return DECK_NOT_LISTED;
-    if (choice.reason !== undefined) return DECK_CANNOT_TAKE_AGENT;
+    if (choice.reason !== undefined) return deckCannotTakeAgent(choice.name, choice.reason);
     chooseDeck(choice);
     return undefined;
   };
@@ -1486,14 +1505,13 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   // -- keys --------------------------------------------------------------------
   const onDeckKeyDown = (event: KeyboardEvent<HTMLUListElement>) => {
     if (busy) return;
-    const eligible = choices.filter((choice) => choice.reason === undefined);
-    const index = eligible.findIndex((choice) => choice.deckId === highlight);
+    const index = usable.findIndex((choice) => choice.deckId === highlight);
     if (event.key === "ArrowDown" || event.key === "j") {
       event.preventDefault();
-      if (eligible.length) setHighlight(eligible[(index + 1) % eligible.length].deckId);
+      if (usable.length) setHighlight(usable[(index + 1) % usable.length].deckId);
     } else if (event.key === "ArrowUp" || event.key === "k") {
       event.preventDefault();
-      if (eligible.length) setHighlight(eligible[(index <= 0 ? eligible.length : index) - 1].deckId);
+      if (usable.length) setHighlight(usable[(index <= 0 ? usable.length : index) - 1].deckId);
     } else if (event.key === "Enter") {
       event.preventDefault();
       chooseDeck(choices.find((choice) => choice.deckId === highlight));
@@ -1603,7 +1621,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     </button>
   ));
 
-  const highlighted = choices.find((choice) => choice.deckId === highlight);
+  const highlighted = usable.find((choice) => choice.deckId === highlight);
   const noSubdirectories = listing !== undefined && listing.entries.length === 0;
   /** The form's fields wait for a directory: until one is chosen there is nothing to start in. */
   const formDisabled = busy || !target;
@@ -1620,11 +1638,11 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
         aria-disabled={busy || undefined}
         tabIndex={busy ? -1 : 0}
         data-testid="new-agent-deck-list"
-        aria-activedescendant={highlighted ? `${titleId}-deck-${choices.indexOf(highlighted)}` : undefined}
+        aria-activedescendant={highlighted ? `${titleId}-deck-${usable.indexOf(highlighted)}` : undefined}
+        aria-describedby={usable.length === 0 ? `${titleId}-no-deck` : undefined}
         onKeyDown={onDeckKeyDown}
       >
-        {choices.map((choice, index) => {
-          const disabled = choice.reason !== undefined;
+        {usable.map((choice, index) => {
           const chosen = choice.deckId === deck?.deckId;
           return (
             <li
@@ -1632,24 +1650,21 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
               id={`${titleId}-deck-${index}`}
               role="option"
               aria-selected={choice.deckId === highlight}
-              aria-disabled={disabled || undefined}
               aria-current={chosen || undefined}
-              className={`new-agent-row${choice.deckId === highlight ? " is-active" : ""}${chosen ? " is-chosen" : ""}${disabled ? " is-disabled" : ""}`}
+              className={`new-agent-row${choice.deckId === highlight ? " is-active" : ""}${chosen ? " is-chosen" : ""}`}
               data-deck-id={choice.deckId}
               data-chosen={chosen || undefined}
-              onClick={() => {
-                if (!disabled) chooseDeck(choice);
-              }}
+              onClick={() => chooseDeck(choice)}
             >
               {chosen ? <Check size={13} aria-hidden="true" /> : <Server size={13} aria-hidden="true" />}
               <span className="new-agent-row-name">{choice.name}</span>
               <span className="new-agent-row-tag">{choice.deckKind}</span>
-              {disabled && <span className="new-agent-row-reason">{choice.reason}</span>}
             </li>
           );
         })}
       </ul>
-      {choices.length === 0 && <p className="new-agent-hint">No daemon is configured.</p>}
+      {/* The list stays mounted when empty, so it still takes the dialog's opening focus and Escape still reaches the dialog. */}
+      {usable.length === 0 && <p id={`${titleId}-no-deck`} className="new-agent-hint" data-testid="new-agent-no-deck">{choices.length === 0 ? NO_DECK_CONFIGURED : NO_DECK_CAN_TAKE_AGENT}</p>}
     </section>
   );
 

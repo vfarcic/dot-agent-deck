@@ -84,9 +84,10 @@ const API_KEY_ENV: &str = "OPENAI_API_KEY";
 const MIN_FIXTURE_COUNT: usize = 30;
 const PENDING_OPEN_SETTINGS_ACTION: &str = "open_settings";
 const PER_FIXTURE_GRACE: Duration = Duration::from_secs(15);
-/// The deck step's reason for the planted disabled deck — the fallback the
-/// webview shows for a deck whose daemon is not listening.
-const STALE_BOX_REASON: &str = "No deck is listening on the configured socket.";
+/// The short reason class the webview declares for the planted deck that
+/// cannot take a new agent — `DECK_SHORT_REASON.disconnected` in
+/// `desktop/src/lib/newAgent.ts` (PR #1451 round 3, change 6).
+const STALE_BOX_REASON: &str = "it is not connected";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,9 +113,9 @@ struct PhraseFixture {
     #[serde(default)]
     resolved_deck: Option<String>,
     /// The report must say the deck the user named cannot take a new agent
-    /// (PRD #1223): the planted `ci@stale-box` is disabled at the New agent
-    /// dialog's deck step, so it is never offered to the model and never
-    /// preselected, and naming it must be answered with the step's reason.
+    /// (PRD #1223): the planted `ci@stale-box` cannot take one, so the New
+    /// agent dialog does not list it, it is never offered to the model and
+    /// never preselected, and naming it must be answered with its short reason.
     #[serde(default)]
     names_unavailable_deck: bool,
     /// Whether the New agent dialog's directory browser is showing the
@@ -793,8 +794,8 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     });
                 let unavailable_named = !fixture.names_unavailable_deck
                     || answer.outcome.sentence().contains(&format!(
-                        "Daemon ci@stale-box cannot take a new agent, so none is preselected: {}",
-                        STALE_BOX_REASON.trim_end_matches('.')
+                        "\u{201c}ci@stale-box\u{201d} can't take a new agent: {STALE_BOX_REASON}, \
+                         so none is preselected."
                     ));
                 let deck_named = !preselects
                     || resolved_label(&answer.outcome, ParamKind::DeckRef).is_none_or(|label| {

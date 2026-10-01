@@ -694,9 +694,9 @@ heard_as_whole = [
 # none is preselected."); one that resolves is preselected — whether or not the
 # user said it — and the report names it ("Preselected daemon: Local daemon."), so
 # a deck the model guessed is heard before anything starts on it. Only a deck
-# the dialog can preselect: one its deck step disables is never offered to the
-# model, and one the user names is answered with the step's reason instead
-# (`voice::VoiceDeckChoice`). With exactly one eligible deck the dialog
+# the dialog can preselect: one that cannot take a new agent is never offered to
+# the model (nor listed in the dialog), and one the user names is answered in one
+# line with its short reason instead (`voice::VoiceDeckChoice`). With exactly one eligible deck the dialog
 # preselects it anyway, so voice dispatches it even for a bare "new agent" —
 # naming it only after a dropped deck's note or when a deck was referred to, so
 # "none is preselected" is said only when it is true and a single-deck user's

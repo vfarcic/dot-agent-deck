@@ -7,9 +7,11 @@ import {
   authoringModes,
   cleanupWarning,
   CLEANUP_WARNING_MAX_NAMES,
+  DECK_SHORT_REASON,
   DECK_STATE_FALLBACK,
   deckChoices,
   deckUnavailableReason,
+  deckUnavailableShort,
   directoryLabel,
   filterDirectoryEntries,
   fleetLists,
@@ -61,7 +63,7 @@ describe("New agent rules (PRD #1223 M4)", () => {
     expect(deckUnavailableReason({ status: "connected", deckId: "deck-a", newAgentReason: reason })).toBe(reason);
     const fleet: DeckFleet = createFixtureFleet("fleet").map((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID ? { ...deck, connection: { ...deck.connection, newAgentReason: reason } } : deck);
     const choices = deckChoices(fleet);
-    expect(choices.find((choice) => choice.deckId === FIXTURE_REMOTE_DAEMON_ID)?.reason).toBe(reason);
+    expect(choices.find((choice) => choice.deckId === FIXTURE_REMOTE_DAEMON_ID)?.reason).toBe(DECK_SHORT_REASON.noBrowse);
     expect(choices.find((choice) => choice.deckId === FIXTURE_DAEMON_ID)?.reason).toBeUndefined();
     expect(preselectedDeck(choices, FIXTURE_REMOTE_DAEMON_ID)).toBe(FIXTURE_DAEMON_ID);
   });
@@ -78,23 +80,60 @@ describe("New agent rules (PRD #1223 M4)", () => {
     expect(choices.map((choice) => choice.deckId)).toEqual([FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID, FIXTURE_PENDING_DAEMON_ID]);
     expect(choices.map((choice) => choice.reason === undefined)).toEqual([true, true, false, false]);
     expect(choices[1]).toMatchObject({ deckKind: "remote" });
-    expect(choices[2].reason).toBe("No daemon is listening on the configured socket.");
+    expect(choices[2].reason).toBe(DECK_SHORT_REASON.disconnected);
   });
 
   /**
-   * Scenario: what voice is told about the daemon step (PRD #1223) is the step
-   * itself — every listed deck by id, and each one it disables with the exact
-   * sentence it shows — so a spoken "new agent" can only preselect a daemon the
-   * dialog would, and names a disabled one in the step's own words.
+   * Scenario (PR #1451 round 3, change 6): the New agent dialog no longer
+   * shows a daemon that cannot take a new agent, so voice names one with a
+   * short reason class rather than the overview's long explanation. Each
+   * state gets its own class, an incompatible daemon says which side is
+   * older, and a deck is short of a reason exactly when it is short of the
+   * overview's long one — the two never disagree about eligibility.
    */
-  it("declares the daemon step to voice as ids and the step's own reasons", () => {
+  it("gives every deck that cannot take a spawn a short reason class", () => {
+    const connection = (patch: Partial<ConnectionView>): ConnectionView => ({ status: "connected", deckId: "deck-a", ...patch });
+    const cases: [Partial<ConnectionView>, string | undefined][] = [
+      [{}, undefined],
+      [{ buildStampMismatchOnly: true, message: "Built from different commits." }, undefined],
+      [{ status: "disconnected" }, "it is not connected"],
+      [{ status: "disconnected", message: "ssh: connect to host build-box port 22: refused" }, "it is not connected"],
+      [{ status: "error", daemonDetected: true, message: "This daemon is older than this app. The app has not connected, because it could misread some of what this daemon reports. Update the daemon to this app's version." }, "it is older than this app"],
+      [{ status: "error", daemonDetected: true, message: "This daemon is older than this app, and the two cannot work together. Update the daemon to this app's version." }, "it is older than this app"],
+      [{ status: "error", daemonDetected: true, message: "This app is older than the daemon, and the two cannot work together. Update the app to the daemon's version." }, "it is newer than this app"],
+      [{ status: "error", daemonDetected: true, message: "This daemon and this app are different versions, and the two cannot work together. Run the same version of both." }, "it is a different version from this app"],
+      [{ status: "error", daemonDetected: true }, "it is a different version from this app"],
+      [{ status: "error", daemonDetected: true, message: "The daemon turned this app away. Try again in a moment, and restart the daemon if it keeps happening." }, "it turned this app away"],
+      [{ status: "error", message: "The control channel could not be opened." }, "it is not connected"],
+      [{ status: "loading", pending: true }, "it has not reported yet"],
+      [{ status: "disconnected", unconfigured: true }, "it has no address yet"],
+      [{ status: "loading" }, "it is still connecting"],
+      [{ newAgentReason: "This deck does not advertise list-directories." }, "it cannot list its directories"],
+    ];
+    for (const [patch, expected] of cases) {
+      const view = connection(patch);
+      expect(deckUnavailableShort(view), JSON.stringify(patch)).toBe(expected);
+      expect(deckUnavailableShort(view) === undefined, JSON.stringify(patch)).toBe(deckUnavailableReason(view) === undefined);
+      if (expected !== undefined) expect(expected).not.toMatch(/\.$/);
+    }
+  });
+
+  /**
+   * Scenario: what voice is told about the daemon step (PRD #1223) is every
+   * deck by id — the ones the dialog hides included — and each one that cannot
+   * take a spawn with its short reason class (PR #1451 round 3), so a spoken
+   * "new agent" can only preselect a daemon the dialog would, and names one
+   * it hides with a short, honest reason.
+   */
+  it("declares the daemon step to voice as ids and short reasons", () => {
     const reason = "This deck does not advertise list-directories, so it cannot be browsed for a directory to start in.";
     const fleet: DeckFleet = createFixtureFleet("fleet").map((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID ? { ...deck, connection: { ...deck.connection, newAgentReason: reason } } : deck);
     const step = voiceDeckStep(fleet);
     expect(step.map((row) => row.deckId)).toEqual(deckChoices(fleet).map((choice) => choice.deckId));
     expect(step).toContainEqual({ deckId: FIXTURE_DAEMON_ID });
-    expect(step).toContainEqual({ deckId: FIXTURE_REMOTE_DAEMON_ID, reason });
-    expect(step).toContainEqual({ deckId: FIXTURE_UNREACHABLE_DAEMON_ID, reason: "No daemon is listening on the configured socket." });
+    expect(step).toContainEqual({ deckId: FIXTURE_REMOTE_DAEMON_ID, reason: DECK_SHORT_REASON.noBrowse });
+    expect(step).toContainEqual({ deckId: FIXTURE_UNREACHABLE_DAEMON_ID, reason: DECK_SHORT_REASON.disconnected });
+    expect(step).toContainEqual({ deckId: FIXTURE_PENDING_DAEMON_ID, reason: DECK_SHORT_REASON.pending });
     expect(step.find((row) => row.deckId === FIXTURE_PENDING_DAEMON_ID)?.reason).toBe(deckChoices(fleet).find((choice) => choice.deckId === FIXTURE_PENDING_DAEMON_ID)?.reason);
     expect(Object.keys(step[0])).toEqual(["deckId"]);
   });

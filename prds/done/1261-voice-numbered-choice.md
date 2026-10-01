@@ -149,6 +149,8 @@ Answers are local, so the fixtures cover only the first utterance (reaching `par
 - [x] **M2 — The chooser.** `voice::choice::answer`, the panel state, rendering, click/ordinal/name answers, staleness through the existing layers, expiry, cancel, the non-answer rule, the D5 hand-off, `refusedRef` coverage. Rust, vitest and Playwright tests.
 - [x] **M3 — Fixtures, docs, changelog.** Fixture run (local, credentialed); `docs/desktop/voice.md` (what the user sees and says — rule 21), `docs/develop/voice-first-design.md` (the offered-list check as distinct from grounding; the "genuine ties" note; the list of refusals that never become a choice), `docs/develop/desktop-gui.md`; `changelog.d/1261.feature.md`. Run `docs-screenshots-review`.
 
+- [x] **Round 3, change 6 — Only usable daemons in the New agent dialog.** The deck field lists only daemons that can take a new agent; the others, and their long explanations and buttons, stay on the overview and the Daemons screen. Voice (`choose_deck`, `open_new_agent`) still refuses a hidden daemon by name, in one line with a short reason class. Rust, vitest and Playwright tests.
+
 **Deferred.**
 
 D1 below is deferred, not done: "close the agent" and every other reading the Commands backend settles into ONE action still never offers a choice, because the backend's answer cannot carry a second action until PRD #1184's schema lands.
@@ -233,3 +235,10 @@ Written from issue #1261 by a dispatched unit, alongside PRDs #1260 and #1184, a
 ### 2026-09-30 — Closed; D1 moved to PRD #1184
 
 Everything but D1 is built and ships in the PR that closes #1261. D1 needs the multi-action response schema that PRD #1184 would introduce, and #1184's M1 measured NO-GO (not now), so D1 moved into [PRD #1184](../1184-voice-command-chains.md) as a dependent follow-up rather than staying open here.
+
+### 2026-10-01 — PR #1451 round 3, change 6: unusable daemons leave the New agent dialog
+
+- **The dialog lists only daemons that can take a new agent.** A daemon that is not connected, has not reported, has no address, was refused as a different version, or cannot list directories is no longer shown greyed out with the overview's explanation, which took too much of the dialog (one incompatible daemon's sentence ran to three lines). The explanation and its buttons are unchanged on the overview and the Daemons screen. With none usable the field says "No daemon can take a new agent now." instead of an empty list; with none configured it still says so.
+- **Hidden at render only (orchestrator decision D6).** `deckChoices` keeps every deck, so `voiceDeckStep` still declares each one to Rust and `voiceChooseDeck` still finds a hidden one — filtering upstream would have turned the refusal into "has not reported yet" (Rust's `DECK_NOT_REPORTED` for an undeclared deck) or `DECK_NOT_LISTED`.
+- **Voice refuses a hidden daemon in one short line.** The declared reason is now a short class (`deckUnavailableShort`: "it is not connected", "it is older than this app", "it is newer than this app", "it is a different version from this app", "it has not reported yet", …), and both refusals read "“build box” can't take a new agent: it is older than this app." — Rust's `deck_unavailable` before dispatch, and the dialog's `deckCannotTakeAgent` for a deck that stopped being usable during the round trip. Which side is older is read from the lead of the crate's own refusal sentence (`OlderSide::who`); an unknown lead reads as "a different version". The phrase-fixture assertion for `open-new-agent-on-a-deck-that-cannot-take-one` follows the new wording.
+- **The browser fixture's `error` scenario now carries a deck id**, as a live incompatible daemon does, so the New agent dialog can see it and the Playwright spec can assert the one-line empty state over it.

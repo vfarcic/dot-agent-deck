@@ -68,6 +68,65 @@ export function deckUnavailableReason(connection: ConnectionView): string | unde
   }
 }
 
+/**
+ * Why a deck cannot take a spawn, as a short reason class — what voice says
+ * about a deck the New agent dialog does not list (PR #1451 round 3, change 6):
+ * "“build box” can't take a new agent: it is older than this app." Each reads
+ * after a colon, so none starts with a capital or ends with a full stop.
+ * `pending` and `unconfigured` are mirrored by the desktop crate's
+ * `DECK_NOT_REPORTED` and `DECK_NO_ADDRESS` (`src-tauri/src/voice/mod.rs`),
+ * which it uses for decks the webview did not declare.
+ */
+export const DECK_SHORT_REASON = {
+  pending: "it has not reported yet",
+  loading: "it is still connecting",
+  unconfigured: "it has no address yet",
+  disconnected: "it is not connected",
+  older: "it is older than this app",
+  newer: "it is newer than this app",
+  incompatible: "it is a different version from this app",
+  turnedAway: "it turned this app away",
+  noBrowse: "it cannot list its directories",
+} as const;
+
+/**
+ * The leads of the crate's sentences for a daemon it refused
+ * (`handshake_info` and `OlderSide::who` in `src-tauri/src/daemon_bridge.rs`),
+ * each with the short class it reads as. A refusal that starts with none of
+ * them — "different versions" on both sides, or wording the crate does not
+ * produce — reads as {@link DECK_SHORT_REASON.incompatible}.
+ */
+const REFUSED_LEADS: readonly (readonly [string, string])[] = [
+  ["This daemon is older than this app", DECK_SHORT_REASON.older],
+  ["This app is older than the daemon", DECK_SHORT_REASON.newer],
+  ["The daemon turned this app away", DECK_SHORT_REASON.turnedAway],
+];
+
+/**
+ * {@link deckUnavailableReason}, as a short reason class: `undefined` exactly
+ * when that is, so the two never disagree about which decks can take a spawn.
+ * An `error` no daemon answered is the app's own connection failing, which
+ * from here is a daemon that is not connected.
+ */
+export function deckUnavailableShort(connection: ConnectionView): string | undefined {
+  if (deckUnavailableReason(connection) === undefined) return undefined;
+  if (connection.pending) return DECK_SHORT_REASON.pending;
+  if (connection.unconfigured) return DECK_SHORT_REASON.unconfigured;
+  switch (connection.status) {
+    case "connected":
+      return DECK_SHORT_REASON.noBrowse;
+    case "loading":
+      return DECK_SHORT_REASON.loading;
+    case "disconnected":
+      return DECK_SHORT_REASON.disconnected;
+    case "error": {
+      if (!connection.daemonDetected) return DECK_SHORT_REASON.disconnected;
+      const message = connection.message ?? "";
+      return REFUSED_LEADS.find(([lead]) => message.startsWith(lead))?.[1] ?? DECK_SHORT_REASON.incompatible;
+    }
+  }
+}
+
 /** One row of the deck step. */
 export interface DeckChoice {
   /** The wire `connection.deckId` — the value every later request carries. */
@@ -75,7 +134,11 @@ export interface DeckChoice {
   /** What the deck is called, as display text. */
   name: string;
   deckKind: "local" | "remote";
-  /** Why it cannot take a spawn; absent when it can. */
+  /**
+   * Why it cannot take a spawn, as a short reason class
+   * ({@link deckUnavailableShort}); absent when it can. The dialog does not
+   * list a deck that has one (PR #1451 round 3) — only voice says it.
+   */
   reason?: string;
   /**
    * Issue #1240 — the deck honours the directory browser's listing options
@@ -85,25 +148,31 @@ export interface DeckChoice {
 }
 
 /**
- * Every deck in the fleet, in fleet order, with the reason each ineligible one
- * gives. An entry with no `deckId` is a placeholder for a fleet that has not
- * arrived, not a deck, and is left out.
+ * Every deck in the fleet, in fleet order, with the short reason each
+ * ineligible one gives. An entry with no `deckId` is a placeholder for a fleet
+ * that has not arrived, not a deck, and is left out.
+ *
+ * **The ineligible ones stay in this list.** The dialog leaves them off screen
+ * at render time, but voice is told about every deck ({@link voiceDeckStep})
+ * and `voiceChooseDeck` looks a spoken deck up here, so a daemon the user names
+ * that cannot take a new agent is refused with its own short reason — not as a
+ * daemon that has not reported, or one the dialog has never heard of.
  */
 export function deckChoices(fleet: DeckFleet): DeckChoice[] {
   return fleet.flatMap((deck) => {
     const deckId = deck.connection.deckId;
     if (deckId === undefined) return [];
-    const reason = deckUnavailableReason(deck.connection);
+    const reason = deckUnavailableShort(deck.connection);
     return [{ deckId, name: deckName(deck.connection), deckKind: deck.connection.deckKind ?? "local", ...(reason === undefined ? {} : { reason }), ...(deck.connection.listingOptions ? { listingOptions: true as const } : {}) }];
   });
 }
 
 /**
  * The deck step as voice is told it (PRD #1223): each deck's id and, for one
- * that cannot take a spawn, the reason the step shows — {@link deckChoices},
- * less what Rust already reads for itself (names and kinds). It is what lets a
- * spoken "new agent" preselect only a deck the dialog would, and name a
- * disabled one by the step's own words.
+ * that cannot take a spawn, its short reason class — {@link deckChoices}, less
+ * what Rust already reads for itself (names and kinds), and including the decks
+ * the dialog does not list. It is what lets a spoken "new agent" preselect only
+ * a deck the dialog would, and refuse one it hides in a short, honest line.
  */
 export function voiceDeckStep(fleet: DeckFleet): VoiceDeckChoiceDto[] {
   return deckChoices(fleet).map(({ deckId, reason }) => (reason === undefined ? { deckId } : { deckId, reason }));

@@ -3530,9 +3530,9 @@ fn answer_declared_choice(
 /// path — so a deck that later connects keeps its key, and labelled the way the
 /// overview labels it. It is appended as unable to take a new agent, since the
 /// New agent dialog lists only decks the app is connected to: with the deck
-/// step's own reason when the step names one, otherwise
-/// [`voice::DECK_NOT_CONNECTED`], or the fleet view's "not configured"
-/// sentence for a row with no address. That keeps the New agent flow exactly
+/// step's own short reason when the step names one, otherwise
+/// [`voice::DECK_NOT_CONNECTED`], or [`voice::DECK_NO_ADDRESS`] for a row with
+/// no address. That keeps the New agent flow exactly
 /// as it was — it never offers or preselects such a deck — while
 /// `switch_deck`, which ignores that reason, can switch to it.
 ///
@@ -3592,7 +3592,7 @@ fn selector_voice_decks(
             None => (
                 crate::dto::unconfigured_deck_id(&row.id),
                 crate::dto::safe_display_text(row.describe()),
-                crate::dto::UNCONFIGURED_DECK_REASON,
+                voice::DECK_NO_ADDRESS,
             ),
         };
         let unavailable = Some(step_reason(&id).unwrap_or_else(|| fallback.to_string()));
@@ -3661,8 +3661,9 @@ fn selector_voice_decks(
 ///
 /// **Eligibility is the webview's `deck_step`**, the New agent dialog's deck
 /// step as it stands ([`voice::VoiceDeckChoice`] says why that one piece is
-/// declared): a deck it gives a reason keeps that reason, word for word, and a
-/// deck it does not list at all is one the webview's fleet has not heard from
+/// declared): a deck it gives a short reason keeps that reason, word for word,
+/// and a deck it does not declare at all is one the webview's fleet has not
+/// heard from
 /// ([`voice::DECK_NOT_REPORTED`]). With no declaration every deck is taken as
 /// eligible, which is what voice assumed before it was told.
 fn voice_decks(
@@ -5806,7 +5807,7 @@ mod tests {
         assert_eq!(find(&build_key).label, "build-box");
         assert_eq!(
             find("unconfigured-newbox01").unavailable.as_deref(),
-            Some(crate::dto::UNCONFIGURED_DECK_REASON)
+            Some(voice::DECK_NO_ADDRESS)
         );
         let token = |key: &str| {
             selections
@@ -5982,7 +5983,7 @@ mod tests {
         ];
         let step: Vec<voice::VoiceDeckChoice> = serde_json::from_value(serde_json::json!([
             { "deckId": "deck-local" },
-            { "deckId": "deck-build", "reason": "No deck is listening on the configured socket." },
+            { "deckId": "deck-build", "reason": "it is not connected" },
             { "deckId": "deck-elsewhere", "reason": "not in this fleet" },
         ]))
         .expect("the webview's shape parses");
@@ -6005,7 +6006,7 @@ mod tests {
         assert_eq!(unavailable("deck-local"), None);
         assert_eq!(
             unavailable("deck-build").as_deref(),
-            Some("No deck is listening on the configured socket.")
+            Some("it is not connected")
         );
         assert_eq!(
             unavailable("deck-new").as_deref(),

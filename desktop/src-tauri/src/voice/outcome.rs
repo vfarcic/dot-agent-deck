@@ -708,9 +708,10 @@ pub async fn handle_utterance_with_dictation(
 
     let commands = annotate_for(table, screen, directories, new_agent, labels, show_deck);
     // Only the decks the New agent dialog could preselect (PRD #1223): a deck
-    // it shows disabled is not offered, so the model cannot pick one. The full
-    // fleet is still what a supplied deck resolves against, so a deck the user
-    // NAMED that cannot take an agent is reported as that, with its reason,
+    // that cannot take one is not offered, so the model cannot pick one. The
+    // full fleet is still what a supplied deck resolves against, so a deck the
+    // user NAMED that cannot take an agent is reported as that, with its short
+    // reason,
     // rather than as a deck that does not exist.
     let offered: Vec<VoiceDeck> = decks
         .iter()
@@ -1014,13 +1015,10 @@ enum Unmet {
     /// supplies for one is resolved (PRD #1223, audit finding A1).
     LabelsWithheld,
     /// The one deck it names cannot take a new agent (PRD #1223): the New
-    /// agent dialog shows it disabled, for `reason` — the words the deck step
-    /// shows beside it ([`VoiceDeck::unavailable`]).
-    DeckUnavailable {
-        label: String,
-        local: bool,
-        reason: String,
-    },
+    /// agent dialog does not list it (PR #1451 round 3), and `reason` is the
+    /// short reason class the webview declared for it
+    /// ([`VoiceDeck::unavailable`]).
+    DeckUnavailable { label: String, reason: String },
     /// The user did not say the reference the model supplied — held only for
     /// [`SWITCH_DECK_ROW`]'s deck (see [`resolve_param`]). Never quoted back:
     /// the value is the model's, not the user's.
@@ -1149,16 +1147,8 @@ impl Unmet {
                  did not switch; say just the {noun} you want",
                 noun = spec.kind.noun()
             )),
-            Unmet::DeckUnavailable {
-                label,
-                local,
-                reason,
-            } => {
-                let (head, detail) = deck_unavailable(&label, local, &reason);
-                unresolved(match detail {
-                    Some(detail) => format!("{head}: {detail}"),
-                    None => head,
-                })
+            Unmet::DeckUnavailable { label, reason } => {
+                unresolved(deck_unavailable(&label, &reason))
             }
         }
     }
@@ -1202,11 +1192,7 @@ impl Unmet {
                     format!("Settings \u{2192} Voice \u{2192} Names withholds {noun} names"),
                     None,
                 ),
-                Unmet::DeckUnavailable {
-                    label,
-                    local,
-                    reason,
-                } => deck_unavailable(label, *local, reason),
+                Unmet::DeckUnavailable { label, reason } => (deck_unavailable(label, reason), None),
                 // Produced only when `said` failed, so the branch above has
                 // it; spelled out rather than left to a wildcard.
                 Unmet::NotSaid => (format!("I did not catch which {noun}"), None),
@@ -1247,21 +1233,26 @@ impl Unmet {
     }
 }
 
-/// "Deck X cannot take a new agent", and the deck step's reason for it as the
-/// detail — scrubbed, since it is display text that came through the webview,
-/// and without its closing full stop, which the caller's sentence supplies.
-/// The local daemon's label already says "daemon", so only a remote one, whose
-/// label is an address, is introduced as one.
-fn deck_unavailable(label: &str, local: bool, reason: &str) -> (String, Option<String>) {
-    let label = safe_message(label);
-    let head = if local {
-        format!("{label} cannot take a new agent")
-    } else {
-        format!("Daemon {label} cannot take a new agent")
-    };
+/// "“X” can't take a new agent: <reason>" — one short line (PR #1451 round 3,
+/// change 6). The New agent dialog no longer lists a deck that cannot take a
+/// new agent, so this line is all the user hears about it there: its label,
+/// quoted, and the short reason class the webview declared
+/// (`deckUnavailableShort` in `desktop/src/lib/newAgent.ts`) — never the
+/// overview's long explanation. The reason is scrubbed, since it is display
+/// text that came through the webview, and loses any closing full stop, which
+/// the caller's sentence supplies; a blank one leaves the line without it.
+fn deck_unavailable(label: &str, reason: &str) -> String {
+    let head = format!(
+        "\u{201c}{}\u{201d} can't take a new agent",
+        safe_message(label)
+    );
     let reason = safe_message(reason);
     let reason = reason.trim().trim_end_matches('.').trim_end();
-    (head, (!reason.is_empty()).then(|| reason.to_string()))
+    if reason.is_empty() {
+        head
+    } else {
+        format!("{head}: {reason}")
+    }
 }
 
 /// The deck the New agent dialog preselects when voice gives it none it can
@@ -1792,9 +1783,10 @@ fn resolve_param(
         // the observed fleet, and the same two refusals: no new outcome
         // variant, because from where the user stands "no deck matches" and
         // "no agent matches" are the same situation about different things.
-        // A deck the dialog shows disabled resolves too — the user named it —
-        // and is then answered with the reason the deck step gives, never
-        // preselected ([`VoiceDeck::unavailable`]). Only for the dialog: the
+        // A deck that cannot take a new agent resolves too — the user named
+        // it, though the dialog does not list it — and is then answered in one
+        // line with its short reason class, never preselected
+        // ([`VoiceDeck::unavailable`], [`deck_unavailable`]). Only for the dialog: the
         // Deck selector switches to a disabled deck as readily as to any other
         // (PRD #1195, [`SWITCH_DECK_ROW`]).
         // Checked before resolving, so a deck the model invented is never
@@ -1806,14 +1798,13 @@ fn resolve_param(
             DeckRefMatch::One { id, label } => {
                 // Reached only for the New agent dialog: the guard above
                 // took every other `deck_ref`.
-                let disabled = decks
+                let unavailable = decks
                     .iter()
                     .find(|deck| deck.id == id)
-                    .and_then(|deck| deck.unavailable.as_ref().map(|reason| (deck, reason)));
-                match disabled {
-                    Some((deck, reason)) => Err(Unmet::DeckUnavailable {
+                    .and_then(|deck| deck.unavailable.as_ref());
+                match unavailable {
+                    Some(reason) => Err(Unmet::DeckUnavailable {
                         label,
-                        local: deck.local,
                         reason: reason.clone(),
                     }),
                     None => Ok(param(id, label)),
@@ -3659,7 +3650,7 @@ mod tests {
         }
     }
 
-    /// A deck the New agent dialog shows disabled, for `reason`.
+    /// A deck that cannot take a new agent, for the short reason class `reason`.
     fn unavailable_deck(id: &str, label: &str, local: bool, reason: &str) -> VoiceDeck {
         VoiceDeck {
             unavailable: Some(reason.to_string()),
@@ -5035,14 +5026,39 @@ mod tests {
         (outcome, data)
     }
 
-    const NOT_LISTENING: &str = "No deck is listening on the configured socket.";
+    /// The short reason class the webview declares for a deck that is not
+    /// connected (`DECK_SHORT_REASON.disconnected` in
+    /// `desktop/src/lib/newAgent.ts`) — PR #1451 round 3, change 6.
+    const NOT_CONNECTED: &str = "it is not connected";
 
-    /// Scenario: the New agent dialog shows a deck disabled — here the build
-    /// box, whose daemon is not listening — and the user says "new agent on
-    /// the build box". The model was never shown that deck, and when its
-    /// answer names it anyway the report says it cannot take a new agent, with
-    /// the reason the dialog's deck step shows, instead of "Preselected daemon:"
-    /// for a deck the dialog will not preselect. A deck the user did not name
+    /// Scenario (PR #1451 round 3, change 6): a deck that cannot take a new
+    /// agent is refused in one short line — its label in quotes, then the
+    /// short reason class the webview declared, with no closing full stop of
+    /// its own (the caller's sentence supplies one) and nothing when the
+    /// reason is blank. The local deck reads exactly like a remote one.
+    #[test]
+    fn voice_outcome_deck_unavailable_is_one_short_line() {
+        assert_eq!(
+            deck_unavailable("build box", "it is older than this app"),
+            "\u{201c}build box\u{201d} can't take a new agent: it is older than this app"
+        );
+        assert_eq!(
+            deck_unavailable("Local daemon", "it is not connected."),
+            "\u{201c}Local daemon\u{201d} can't take a new agent: it is not connected"
+        );
+        assert_eq!(
+            deck_unavailable("ci@stale-box", "  "),
+            "\u{201c}ci@stale-box\u{201d} can't take a new agent"
+        );
+    }
+
+    /// Scenario: the New agent dialog does not list a deck — here the build
+    /// box, which is not connected — and the user says "new agent on the build
+    /// box". The model was never shown that deck, and when its answer names it
+    /// anyway the report says in one line that it can't take a new agent, with
+    /// the short reason class the webview declared for it (PR #1451 round 3,
+    /// change 6), instead of "Preselected daemon:" for a deck the dialog will
+    /// not preselect. A deck the user did not name
     /// is not caught, as before.
     #[tokio::test]
     async fn voice_outcome_new_agent_never_offers_or_preselects_a_deck_that_cannot_take_one() {
@@ -5052,7 +5068,7 @@ mod tests {
                 "deck-build",
                 "deploy@build-box.example.com:2222",
                 false,
-                NOT_LISTENING,
+                NOT_CONNECTED,
             ),
             deck("deck-build-two", "ci@build-farm", false),
         ];
@@ -5077,8 +5093,8 @@ mod tests {
         );
         assert_eq!(
             outcome.sentence(),
-            "Opening the New agent dialog. Daemon deploy@build-box.example.com:2222 cannot take a \
-             new agent, so none is preselected: No deck is listening on the configured socket."
+            "Opening the New agent dialog. \u{201c}deploy@build-box.example.com:2222\u{201d} \
+             can't take a new agent: it is not connected, so none is preselected."
         );
 
         // The model's own invention of it is not caught, like any invented deck.
@@ -5094,13 +5110,13 @@ mod tests {
             format!("Opening the New agent dialog. {NOT_CAUGHT_DECK}")
         );
 
-        // The local deck is its own name, so it is not introduced as "Deck".
+        // The local deck is named the same way.
         let local_disabled = [
             unavailable_deck(
                 "deck-local",
                 "Local deck",
                 true,
-                "This deck does not list directories, so a new agent cannot be started on it from here.",
+                "it cannot list its directories",
             ),
             deck("deck-build", "deploy@build-box.example.com:2222", false),
             deck("deck-build-two", "ci@build-farm", false),
@@ -5117,9 +5133,8 @@ mod tests {
         );
         assert_eq!(
             outcome.sentence(),
-            "Opening the New agent dialog. Local deck cannot take a new agent, so none is \
-             preselected: This deck does not list directories, so a new agent cannot be started \
-             on it from here."
+            "Opening the New agent dialog. \u{201c}Local deck\u{201d} can't take a new agent: it \
+             cannot list its directories, so none is preselected."
         );
     }
 
@@ -5139,13 +5154,13 @@ mod tests {
                 "deck-build",
                 "deploy@build-box.example.com:2222",
                 false,
-                NOT_LISTENING,
+                NOT_CONNECTED,
             ),
             unavailable_deck(
                 "deck-build-two",
                 "ci@build-farm",
                 false,
-                "This deck has not reported yet.",
+                "it has not reported yet",
             ),
         ];
         let dispatched_local = |outcome: &VoiceOutcome| {
@@ -5178,9 +5193,8 @@ mod tests {
             (
                 "new agent on the build box",
                 IntentAnswer::new("open_new_agent").with_param("deck", "build box"),
-                "Opening the New agent dialog. Daemon deploy@build-box.example.com:2222 cannot \
-                 take a new agent: No deck is listening on the configured socket. Preselected \
-                 daemon: Local deck.",
+                "Opening the New agent dialog. \u{201c}deploy@build-box.example.com:2222\u{201d} \
+                 can't take a new agent: it is not connected. Preselected daemon: Local deck.",
             ),
             (
                 "new agent on the ghost box",
@@ -5207,7 +5221,7 @@ mod tests {
         let several_eligible = [
             deck("deck-local", "Local deck", true),
             deck("deck-build", "deploy@build-box.example.com:2222", false),
-            unavailable_deck("deck-build-two", "ci@build-farm", false, NOT_LISTENING),
+            unavailable_deck("deck-build-two", "ci@build-farm", false, NOT_CONNECTED),
         ];
         let (outcome, _) = open_new_agent_over(
             &several_eligible,
@@ -5235,12 +5249,12 @@ mod tests {
         // A fleet with nothing that can take one preselects nothing, and says
         // nothing about a deck the user did not ask for.
         let none_eligible = [
-            unavailable_deck("deck-local", "Local deck", true, NOT_LISTENING),
+            unavailable_deck("deck-local", "Local deck", true, NOT_CONNECTED),
             unavailable_deck(
                 "deck-build",
                 "deploy@build-box.example.com:2222",
                 false,
-                NOT_LISTENING,
+                NOT_CONNECTED,
             ),
         ];
         let (outcome, _) = open_new_agent_over(
@@ -8572,7 +8586,9 @@ mod tests {
         )
         .await;
         assert!(
-            refused.sentence().contains("cannot take a new agent"),
+            refused
+                .sentence()
+                .contains("can't take a new agent: the app is not connected to it"),
             "{refused:?}"
         );
     }
@@ -8836,7 +8852,6 @@ mod tests {
             Unmet::WithheldChoice("hidden".to_string()),
             Unmet::DeckUnavailable {
                 label: "ops@build-box".to_string(),
-                local: false,
                 reason: "offline".to_string(),
             },
             Unmet::LabelsWithheld,
@@ -9697,9 +9712,10 @@ mod tests {
         );
     }
 
-    /// Scenario: the user names a deck the dialog's field shows disabled. The
-    /// deck is REQUIRED on this row, unlike `open_new_agent`'s, so nothing is
-    /// dispatched and the refusal gives the field's own reason; a deck that
+    /// Scenario: the user names a deck the dialog does not list because it
+    /// cannot take a new agent. The deck is REQUIRED on this row, unlike
+    /// `open_new_agent`'s, so nothing is dispatched and the refusal is one line
+    /// naming it with its short reason class (PR #1451 round 3); a deck that
     /// matches nothing, or two, is refused the same way rather than guessed.
     #[tokio::test]
     async fn voice_outcome_choose_deck_refuses_a_deck_it_cannot_choose() {
@@ -9708,7 +9724,7 @@ mod tests {
             "deck-stale",
             "ci@stale-box",
             false,
-            "No deck is listening on the configured socket.",
+            NOT_CONNECTED,
         ));
         let dialog = VoiceNewAgent { form: None };
         let ask = |said: &'static str, spoken: &'static str| {
@@ -9735,9 +9751,13 @@ mod tests {
         };
         let stale = ask("use the stale box deck", "stale box").await;
         assert!(
-            matches!(&stale, VoiceOutcome::ParamUnresolved { sentence, .. }
-                if sentence.contains("cannot take a new agent") && sentence.contains("No deck is listening")),
+            matches!(&stale, VoiceOutcome::ParamUnresolved { .. }),
             "{stale:?}"
+        );
+        assert_eq!(
+            stale.sentence(),
+            "Heard: \u{201c}use the stale box deck\u{201d} \u{2014} \u{201c}ci@stale-box\u{201d} \
+             can't take a new agent: it is not connected."
         );
         let ghost = ask("use the ghost deck", "ghost").await;
         assert!(
