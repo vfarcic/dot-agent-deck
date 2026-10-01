@@ -39,7 +39,7 @@ Wait for the check-runs. `gh pr checks <n>` reports both CI and the reviewer's o
 
 So: give the reviewer a budget (~15 minutes from PR creation is ample; it normally lands in 3–5). If no reviewer check-run exists when the budget expires, **proceed and say so explicitly in your report** — "no automated review was obtained" is a result. Do not hang, and do not report the gate as passed. Never block on a reviewer that is not configured here at all.
 
-**A check that goes red here falls under the same rule as one met locally** (step 1): a test that fails in CI and then passes on `gh run rerun` is a flaky test you have now met, so it gets a fix or a quarantine in this PR, not just the green rerun.
+**A check that goes red here falls under the same rule as one met locally** (step 1): a test that fails in CI and then passes on `gh run rerun` is a flaky test you have now met, so it gets a fix or a quarantine in this PR, not just the green rerun. The PR body was written before this wait, so add the red and its exit to it (`gh pr edit <n> --body-file <file>`) once you have taken one — the body, not only your report, is what step 1 asks to carry it.
 
 **A green check-run is not the review.** The findings live only in the inline comments:
 
