@@ -196,6 +196,37 @@ impl Ordinal {
 /// last one". Whole-utterance, so "open the second tab" is not one; `words`
 /// are what [`whole_utterance`] makes of the transcript.
 pub(crate) fn ordinal(words: &[String]) -> Option<Ordinal> {
+    let word = ordinal_word(words)?;
+    if word == "last" {
+        return Some(Ordinal::Last);
+    }
+    let named = |list: &[&str]| list.iter().position(|entry| *entry == word);
+    if let Some(at) = named(&CARDINALS).or_else(|| named(&ORDINALS)) {
+        return Some(Ordinal::Nth(at + 1));
+    }
+    let digits = ["st", "nd", "rd", "th"]
+        .iter()
+        .find_map(|suffix| word.strip_suffix(suffix))
+        .unwrap_or(word);
+    digits.parse::<usize>().ok().map(Ordinal::Nth)
+}
+
+/// The number words [`ordinal`] reads as a count: "one" to "nine".
+pub(crate) const CARDINALS: [&str; 9] = [
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+];
+
+/// The number words [`ordinal`] reads as a position: "first" to "ninth".
+const ORDINALS: [&str; 9] = [
+    "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth",
+];
+
+/// The one word an ordinal utterance turns on, once a leading "the", one of
+/// [`ORDINAL_LEADS`] and a trailing filler "one" are set aside — "three" in
+/// "number three", "third" in "the third one" — or `None` when more than one
+/// word is left. [`ordinal`] reads it; `voice::numbers` also asks whether it
+/// was said as a count.
+pub(crate) fn ordinal_word(words: &[String]) -> Option<&str> {
     let mut rest: &[String] = words;
     if rest.first().is_some_and(|word| word == "the") {
         rest = &rest[1..];
@@ -214,24 +245,7 @@ pub(crate) fn ordinal(words: &[String]) -> Option<Ordinal> {
     let [word] = rest else {
         return None;
     };
-    const CARDINALS: [&str; 9] = [
-        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
-    ];
-    const ORDINALS: [&str; 9] = [
-        "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth",
-    ];
-    if word == "last" {
-        return Some(Ordinal::Last);
-    }
-    let named = |list: &[&str]| list.iter().position(|entry| entry == word);
-    if let Some(at) = named(&CARDINALS).or_else(|| named(&ORDINALS)) {
-        return Some(Ordinal::Nth(at + 1));
-    }
-    let digits = ["st", "nd", "rd", "th"]
-        .iter()
-        .find_map(|suffix| word.strip_suffix(suffix))
-        .unwrap_or(word);
-    digits.parse::<usize>().ok().map(Ordinal::Nth)
+    Some(word.as_str())
 }
 
 /// The name half of [`answer`]: the utterance resolved among the offered

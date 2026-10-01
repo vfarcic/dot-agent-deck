@@ -37,6 +37,7 @@ Each image is named `<scenario>-<client>.png`, so the `dashboard` scenario produ
 | `settings-voice` | desktop | Voice settings. |
 | `voice-typing-mode` | desktop | Agent pane with voice typing mode on, entered through the fixture's scripted microphone (`?voice=type%20on`). |
 | `voice-choice` | desktop | Dashboard with the numbered voice choice dialog open over two agents, centred above the screen with its countdown, and the voice row below saying what was heard; entered through the fixture's scripted microphone (`?voice=open%20the%20agent`). |
+| `voice-numbers` | desktop | Two-daemon dashboard with voice on and no utterance: every agent row shows its number, one sequence across both daemons. |
 | `schedules` | TUI | Schedules manager with one disabled task, keeping the next-fire field stable. |
 | `help` | TUI | The `?` keyboard shortcut overlay. |
 

@@ -4,6 +4,9 @@ import { LaunchCleanupError } from "../lib/actionError";
 import { CleanupWarning } from "./CleanupWarning";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { useInertBackground } from "../hooks/useInertBackground";
+import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
+import { numberKey, type VoiceNumberedEntryDto } from "../lib/voiceNumbers";
+import { VoiceNumber } from "./VoiceNumber";
 import {
   ambiguousOrchestrationReason,
   AUTHORING_MODES,
@@ -1501,10 +1504,63 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   }, [activeRowId, rows]);
 
   const busy = phase !== "idle";
+  /** The form's fields wait for a directory: until one is chosen there is nothing to start in. */
+  const formDisabled = busy || !target;
+
+  /*
+    PR #1451 round 3, change 3 — the dialog's three lists as ONE numbered
+    sequence in reading order: the daemons it lists, the directory rows on
+    screen (after the filter, `..` first), then the Mode chips. A number names
+    one item in the whole dialog, and the numbers move whenever a list does —
+    another directory, another filter. Declared for voice whether or not voice
+    is on; shown only while it is.
+  */
+  const numberedEntries: VoiceNumberedEntryDto[] = [
+    ...usable.map((choice): VoiceNumberedEntryDto => ({ kind: "deck", value: choice.deckId, label: choice.name, names: [] })),
+    ...rows.map((row): VoiceNumberedEntryDto => (row.kind === "up"
+      ? { kind: "parent", value: row.path, label: "..", names: [] }
+      : { kind: "directory", value: row.entry.path, label: row.entry.displayName, names: [] })),
+    ...modes.map((chip): VoiceNumberedEntryDto => ({ kind: "mode", value: chip.id, label: chip.label, names: [] })),
+  ];
+  useNumberedList("dialog", numberedEntries);
+  const numbersShown = useNumbersShown();
+  const firstRowNumber = usable.length + 1;
+  const firstModeNumber = usable.length + rows.length + 1;
+  /**
+   * The item showing `number`, as a click on it would choose it: a daemon,
+   * a directory row (entered, or `..` gone up), or a Mode chip while the form
+   * is live.
+   */
+  const chooseNumbered = (number: number) => {
+    const at = number - 1;
+    if (at < usable.length) {
+      chooseDeck(usable[at]);
+      return;
+    }
+    const rowAt = at - usable.length;
+    const row = rows[rowAt];
+    if (row) {
+      setCursor(rowAt);
+      if (row.kind === "up") goUp();
+      else if (deck) void loadListing(deck.deckId, row.entry.path);
+      return;
+    }
+    const chip = modes[rowAt - rows.length];
+    if (chip && !formDisabled) selectMode(chip.id);
+  };
+  /** A digit on one of the numbered lists, while voice shows the numbers; never in a field. */
+  const onNumberKey = (event: KeyboardEvent<HTMLElement>): boolean => {
+    if (!numbersShown || busy) return false;
+    const number = numberKey(event.nativeEvent);
+    if (number === undefined || number > numberedEntries.length) return false;
+    event.preventDefault();
+    chooseNumbered(number);
+    return true;
+  };
 
   // -- keys --------------------------------------------------------------------
   const onDeckKeyDown = (event: KeyboardEvent<HTMLUListElement>) => {
-    if (busy) return;
+    if (busy || onNumberKey(event)) return;
     const index = usable.findIndex((choice) => choice.deckId === highlight);
     if (event.key === "ArrowDown" || event.key === "j") {
       event.preventDefault();
@@ -1519,7 +1575,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   };
 
   const onDirectoryKeyDown = (event: KeyboardEvent<HTMLUListElement>) => {
-    if (busy || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (busy || event.ctrlKey || event.metaKey || event.altKey || onNumberKey(event)) return;
     switch (event.key) {
       case "ArrowDown":
       case "j":
@@ -1600,6 +1656,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
 
   /** The TUI form's Left / Right on the Mode row: move to the previous or next chip, wrapping. */
   const onModeKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (onNumberKey(event)) return;
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
     event.preventDefault();
     const index = modes.findIndex((candidate) => candidate.id === mode);
@@ -1623,8 +1680,6 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
 
   const highlighted = usable.find((choice) => choice.deckId === highlight);
   const noSubdirectories = listing !== undefined && listing.entries.length === 0;
-  /** The form's fields wait for a directory: until one is chosen there is nothing to start in. */
-  const formDisabled = busy || !target;
 
   const deckField = (
     <section className="new-agent-section" aria-labelledby={`${titleId}-deck`} data-testid="new-agent-deck-field">
@@ -1656,6 +1711,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
               data-chosen={chosen || undefined}
               onClick={() => chooseDeck(choice)}
             >
+              <VoiceNumber number={numbersShown ? index + 1 : undefined} />
               {chosen ? <Check size={13} aria-hidden="true" /> : <Server size={13} aria-hidden="true" />}
               <span className="new-agent-row-name">{choice.name}</span>
               <span className="new-agent-row-tag">{choice.deckKind}</span>
@@ -1726,6 +1782,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
                   else if (deck) void loadListing(deck.deckId, row.entry.path);
                 }}
               >
+                <VoiceNumber number={numbersShown ? firstRowNumber + index : undefined} />
                 {row.kind === "up"
                   ? <><ArrowUp size={13} aria-hidden="true" /><span className="new-agent-row-name">..</span></>
                   : (
@@ -1784,6 +1841,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
                 disabled={formDisabled}
                 onClick={() => selectMode(candidate.id)}
               >
+                <VoiceNumber number={numbersShown ? firstModeNumber + index : undefined} />
                 {candidate.label}
               </button>
             </Fragment>

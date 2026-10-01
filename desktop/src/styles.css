@@ -1634,3 +1634,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* Amber for the dictation countdown's reason — it is the one thing here that
    says something is about to END. */
 .voice-choice-timer { color: var(--amber-ink); font-size: 13px; font-weight: 600; white-space: nowrap; }
+
+/* PR #1451 round 3, change 3 — the number an item shows while voice is on,
+   before its name. One look on every numbered list: the dashboard's rows, the
+   Daemons screen's tiles, and the New agent dialog's daemons, directories and
+   modes. Tabular figures, so 9 and 10 take the same width down a list. */
+.voice-number { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; min-width: 20px; height: 16px; padding: 0 4px; border-radius: 3px; color: var(--teal-deep); background: var(--teal-soft); font-family: "JetBrains Mono", monospace; font-size: 10px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1; }

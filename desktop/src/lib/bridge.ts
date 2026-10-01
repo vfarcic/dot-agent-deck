@@ -9,6 +9,7 @@ import { describeEndpoint } from "./endpoints";
 import { ambiguousOrchestrationReason } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
 import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
+import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListDto } from "./voiceNumbers";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBlocked,
@@ -862,6 +863,13 @@ export interface VoiceResolvedParamDto {
    * label, never `value`. Rust omits it when empty.
    */
   names?: string[];
+  /**
+   * PR #1451 round 3, change 3 — on an `agent_ref` chosen by its number on
+   * the dashboard alone: the deck that agent is on, since those rows span
+   * every deck where a resolved agent is the selected deck's. Never sent by
+   * Rust.
+   */
+  deckId?: string;
 }
 
 /**
@@ -1706,6 +1714,14 @@ export interface DeckBridge {
    * dispatch meets.
    */
   answerVoiceChoice(utterance: string, action: string, offered: VoiceResolvedParamDto[]): Promise<VoiceChoiceAnswerDto>;
+  /**
+   * PR #1451 round 3, change 3 — answer a bare number said against the
+   * numbered list on screen (`desktop_voice_number`): `heard` is the list as
+   * it stood when the user began to speak, `generation` the list's generation
+   * on screen now. **No Commands backend call**: `voice::numbers::answer`
+   * decides it, and what runs is the panel's to dispatch.
+   */
+  answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto>;
   /**
    * Every row of the command table, annotated for `screen`
    * (`desktop_voice_commands`).
@@ -2749,6 +2765,12 @@ class FixtureDeckBridge implements DeckBridge {
   async answerVoiceChoice(utterance: string, _action: string, offered: VoiceResolvedParamDto[]): Promise<VoiceChoiceAnswerDto> {
     await Promise.resolve();
     return answerChoiceLocally(utterance, offered);
+  }
+
+  /** PR #1451 round 3 — likewise for a spoken number, against the numbered list on screen. */
+  async answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto> {
+    await Promise.resolve();
+    return answerNumberLocally(utterance, heard, generation);
   }
 
   /**
@@ -4342,6 +4364,11 @@ export class TauriDeckBridge implements DeckBridge {
     if (answer.kind !== "selected") return answer;
     const candidate = offered.find((entry) => entry.value === answer.candidate.value);
     return candidate ? { kind: "selected", candidate } : { kind: "refused" };
+  }
+
+  async answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto> {
+    const invoke = await this.getInvoke();
+    return invoke<VoiceNumberAnswerDto>("desktop_voice_number", { utterance, heard, generation });
   }
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {

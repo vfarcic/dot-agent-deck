@@ -122,6 +122,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "voice-numbers",
+        description: "The desktop agent dashboard with voice on: a number before each agent row, one sequence across the daemons, ready to be said or pressed.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "schedules",
         description: "The TUI Schedules manager with one configured task.",
         clients: &[Client::Tui],

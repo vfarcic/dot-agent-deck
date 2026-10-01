@@ -40,18 +40,18 @@ export type VoiceChoiceAnswerDto =
 /* `voice::choice`'s closed lists, spelled the same. */
 const CANCEL_PHRASES = ["cancel", "cancel that", "never mind", "nevermind", "none", "none of them", "neither", "no"];
 const ORDINAL_LEADS = ["number", "option", "choice", "entry", "item"];
-const CARDINALS = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
+export const CARDINALS = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
 const ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth"];
 /* `WHOLE_UTTERANCE_POLITENESS` in `voice/outcome.rs`. */
 const POLITENESS = ["okay", "ok", "alright", "yes", "yeah", "please", "just", "now", "thanks"];
 
 /** `spoken_words`: lower case, every run of non-alphanumerics a break. */
-function spokenWords(text: string): string[] {
+export function spokenWords(text: string): string[] {
   return text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((word) => word !== "");
 }
 
 /** `whole_utterance`: the words less politeness at either end. */
-function wholeUtterance(text: string): string[] {
+export function wholeUtterance(text: string): string[] {
   const words = spokenWords(text);
   let start = 0;
   let end = words.length;
@@ -60,14 +60,23 @@ function wholeUtterance(text: string): string[] {
   return words.slice(start, end);
 }
 
-/** A whole-utterance ordinal, 1-based, `"last"`, or `undefined` for none. */
-function ordinal(words: string[]): number | "last" | undefined {
+/**
+ * `voice::choice::ordinal_word`: the one word an ordinal utterance turns on,
+ * once a leading "the", an ordinal lead and a trailing filler "one" are set
+ * aside, or `undefined` when more than one word is left.
+ */
+export function ordinalWord(words: string[]): string | undefined {
   let rest = words;
   if (rest[0] === "the") rest = rest.slice(1);
   if (rest[0] !== undefined && ORDINAL_LEADS.includes(rest[0])) rest = rest.slice(1);
   if (rest.length === 2 && rest[1] === "one") rest = rest.slice(0, 1);
-  if (rest.length !== 1) return undefined;
-  const [word] = rest;
+  return rest.length === 1 ? rest[0] : undefined;
+}
+
+/** A whole-utterance ordinal, 1-based, `"last"`, or `undefined` for none (`voice::choice::ordinal`). */
+export function ordinal(words: string[]): number | "last" | undefined {
+  const word = ordinalWord(words);
+  if (word === undefined) return undefined;
   if (word === "last") return "last";
   const named = CARDINALS.indexOf(word) >= 0 ? CARDINALS.indexOf(word) : ORDINALS.indexOf(word);
   if (named >= 0) return named + 1;

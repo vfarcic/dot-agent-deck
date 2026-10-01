@@ -151,3 +151,26 @@ desktopScenario("voice-choice", async (page) => {
   await expect(choice.getByRole("timer")).toBeVisible();
   await expect(page.getByTestId("voice-report")).toContainText("open the agent");
 });
+
+// PR #1451 round 3, change 3 — numbers on lists while voice is on,
+// desktop-only. The two-daemon docs fleet's dashboard with the Voice button
+// pressed and nothing said: each agent row shows its number, one sequence
+// across both daemons.
+desktopScenario("voice-numbers", async (page) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("dot-agent-deck.desktop-settings", JSON.stringify({
+      version: 1,
+      appearance: { mode: "system" },
+      voice: { activation: "toggle", intent: "claude", transcription: "remote" },
+      zoom: { level: 1 },
+    }));
+  });
+  await page.goto("/?fixture=1&state=docs-fleet");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  const rows = page.locator(".overview-row");
+  await expect(rows).toHaveCount(6);
+  await page.getByTestId("voice-trigger").click();
+  await expect(page.getByTestId("voice-trigger")).toHaveAttribute("aria-pressed", "true");
+  for (let index = 0; index < 6; index += 1) await expect(rows.nth(index)).toHaveAccessibleName(new RegExp(`^${index + 1}\\.`));
+});

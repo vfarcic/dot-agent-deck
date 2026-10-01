@@ -1331,6 +1331,13 @@ export interface DeckRuntimeState {
    */
   answerVoiceChoice?: (utterance: string, action: string, offered: import("./lib/bridge").VoiceResolvedParamDto[]) => Promise<import("./lib/voiceChoice").VoiceChoiceAnswerDto>;
   /**
+   * PR #1451 round 3, change 3 — answer a bare number against the numbered
+   * list on screen, locally (`DeckBridge.answerVoiceNumber`). Optional like
+   * the rest: a panel on a runtime without it answers with
+   * `answerNumberLocally`, the webview's port of the same rule.
+   */
+  answerVoiceNumber?: (utterance: string, heard: import("./lib/voiceNumbers").VoiceNumberedListDto, generation: number) => Promise<import("./lib/voiceNumbers").VoiceNumberAnswerDto>;
+  /**
    * Every command in the table, annotated for one screen (PRD #802 D7) — what
    * the discovery overlay lists.
    *

@@ -38,7 +38,7 @@ What you can do by voice, by screen:
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; choose a Mode chip or the agent to run; set the Name; start; discard |
 | An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off |
 
-When what you said matches more than one thing on screen, the app lists the matches for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things).
+While voice is on, the agents, daemons, directories and modes on screen are numbered, and saying a number chooses one; see [Choosing by number](#choosing-by-number). When what you said matches more than one thing on screen, the app lists the matches for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things).
 
 A command that names an agent, such as "stop the planner" or "close the review orchestration", runs nothing, and the app says why, if you switch daemons or that agent is replaced by a new one under the same name while the app is still working out what you said (which the app can tell only when the daemon reports when each agent started). Say it again to act on the agent that is there now.
 
@@ -47,6 +47,23 @@ A command that names an agent, such as "stop the planner" or "close the review o
 Nothing is typed or sent, and the app says why, if a confirmation is open, if the pane is showing another tab instead of the agent's terminal, or if the pane on screen is no longer the one you were looking at when you spoke — for example because you opened another agent while the app was still working out what you said. Once the words are typed, the send is called off, and the app says so, if before it happens you close the pane, open another screen or agent, switch daemons, or a confirmation opens: the words stay in the agent's prompt, unsent. It is also called off if the agent in the pane is replaced by a new one. Telling a replacement apart needs a daemon that reports when each agent started; with one that does not, the app cannot tell a replacement from the original agent.
 
 **While voice is on, the app keeps the computer from going to sleep from inactivity**, because speaking produces no keyboard or mouse input. The display can still turn off. On Linux this goes through systemd-logind; a desktop environment whose power manager ignores logind may still suspend.
+
+## Choosing by number
+
+While voice is on, the lists you can choose from by voice show a number before each item: the agents on the dashboard, the agent tiles on the Daemons screen, and the daemons, directories and modes in the New agent dialog. With voice off, they look as they always do.
+
+Each number belongs to one item on screen. When several lists are visible together, as in the New agent dialog, they are numbered in one sequence in reading order: the daemons first, then the directories (with `..` for the folder above), then the modes. On the dashboard the agents of every daemon are numbered in one sequence, top to bottom. While an agent's pane or the New agent dialog is open, only what is in front is numbered.
+
+![The agent dashboard with voice on: each agent row starts with a number, 1 to 6, counting on from one daemon's agents to the next](/img/voice-numbers-desktop.png)
+
+- **Say the number** on its own: "three", "3", "number three", "the third one" or "the last one". The item showing it is chosen as if you had clicked it: an agent opens, a daemon or mode is chosen, a directory opens (`..` goes up).
+- **Press the number key**, such as `3`, on a list that shows numbers. On the Daemons screen the `1`–`4` keys already select the tile with that number. A digit typed into a text field, such as the directory **Filter**, is just typed.
+
+The numbers follow the list. When it changes, for example a directory opens, you filter it or an agent finishes, the numbers change straight away. If the list changed while you were saying a number, nothing is chosen and the app says so, because the number may now belong to another item; say it again. A number that no item shows chooses nothing, and the app says so.
+
+If the number you said could also be an item's name, for example "one" with an agent called `orchestrator-1`, the app does not guess: it asks which one you meant, as described below.
+
+A spoken number is worked out on your computer and is not sent to the Commands service. Anything longer, such as "open number three", is a command like any other.
 
 ## When a command matches several things
 
@@ -149,6 +166,7 @@ What went wrong is shown beside the Voice button.
 | A command is refused as not available here | It works on another screen. | Say "what can I say?" to see where each command works. |
 | Commands that name agents or directories never work | **Names** is set to **Withheld**. | Set it to **Shared**, or use the screen instead. |
 | A command runs nothing and says the agent, daemon, screen or list changed | What it was about changed while the app was working out what you said, or after a numbered list appeared. | Say the command again. |
+| A spoken number chooses nothing and says the numbers on screen changed | The list changed while you were saying it. | Look at the new numbers and say it again. |
 | "type off" was typed into the prompt instead of stopping typing mode | The app misheard it. | Nothing was sent: press **Stop typing** and delete the words. |
 | A command you paused in the middle of was answered in two halves | You paused for longer than the app waits for the rest, which is a few seconds. | Say the whole command again, with a shorter pause. |
 | You said something and nothing happened, with nothing shown | The app took it for noise rather than speech, usually because it was very short or quiet. | Say it again a little louder or closer to the microphone. |

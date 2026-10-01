@@ -3468,6 +3468,58 @@ async fn desktop_voice_choice(
     ))
 }
 
+/// The most items a numbered list may declare ([`validate_voice_numbered`]):
+/// the directory listing's own bound, which is the longest list voice numbers.
+const MAX_VOICE_NUMBERED_ENTRIES: usize = MAX_VOICE_DIRECTORY_ENTRIES;
+
+/// Refuse a numbered list no screen could show: more items than the longest
+/// list voice numbers, or text longer than any name.
+fn validate_voice_numbered(heard: &voice::numbers::VoiceNumberedList) -> Result<(), String> {
+    let too_long = |entry: &voice::numbers::VoiceNumberedEntry| {
+        [&entry.value, &entry.label]
+            .into_iter()
+            .chain(entry.deck_id.as_ref())
+            .chain(&entry.names)
+            .any(|text| text.len() > MAX_VOICE_CHOICE_TEXT_BYTES)
+            || entry.names.len() > MAX_VOICE_NUMBERED_NAMES
+    };
+    if heard.entries.len() > MAX_VOICE_NUMBERED_ENTRIES || heard.entries.iter().any(too_long) {
+        return Err(
+            "the numbered list sent with that answer is larger than any screen shows".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The most other names one numbered item may carry: an agent's role, CLI
+/// name and id, with room to spare.
+const MAX_VOICE_NUMBERED_NAMES: usize = 8;
+
+/// PR #1451 round 3, change 3 (PRD #1261): answer a bare number said against
+/// the numbered list on screen, locally.
+///
+/// **No Commands backend call**, as for [`desktop_voice_choice`]: the
+/// utterance is read by [`voice::numbers::answer`] against `heard` — the list
+/// as it stood when the user spoke — and `generation`, the list's generation
+/// on screen now. The webview dispatches the item chosen itself, through the
+/// same checks a resolved dispatch meets.
+#[tauri::command]
+async fn desktop_voice_number(
+    webview: Webview,
+    utterance: String,
+    heard: voice::numbers::VoiceNumberedList,
+    generation: u64,
+) -> Result<voice::numbers::NumberAnswer, String> {
+    ensure_main_webview(&webview)?;
+    if utterance.len() > MAX_UTTERANCE_BYTES {
+        return Err(format!(
+            "that answer is too long to send — {MAX_UTTERANCE_BYTES} bytes at most"
+        ));
+    }
+    validate_voice_numbered(&heard)?;
+    Ok(voice::numbers::answer(&utterance, &heard, generation))
+}
+
 /// [`desktop_voice_choice`] once the live state is read. The decks are the
 /// ones a resolve would have offered; for [`voice::SWITCH_DECK_ROW`] they are
 /// keyed by the Deck selector's token, as that row's candidates are, and a
@@ -5309,6 +5361,7 @@ pub fn run() {
             desktop_voice_cancel,
             desktop_voice_resolve,
             desktop_voice_choice,
+            desktop_voice_number,
             desktop_voice_commands,
         ])
         .build(tauri::generate_context!())
@@ -6043,6 +6096,44 @@ mod tests {
             reason: None,
         }];
         assert!(validate_voice_deck_step(&long_id).is_err());
+    }
+
+    /// PR #1451 round 3 — a numbered list is bounded like the listing it can
+    /// carry: no more items than a listing, no name longer than any name.
+    #[test]
+    fn voice_numbered_lists_are_bounded() {
+        let item = |label: String| voice::numbers::VoiceNumberedEntry {
+            kind: voice::numbers::NumberedKind::Directory,
+            value: format!("/home/{label}"),
+            deck_id: None,
+            label,
+            names: Vec::new(),
+        };
+        let list = |entries| voice::numbers::VoiceNumberedList {
+            generation: 1,
+            entries,
+        };
+        let fits = list(
+            (0..MAX_VOICE_NUMBERED_ENTRIES)
+                .map(|at| item(format!("d{at}")))
+                .collect(),
+        );
+        assert!(validate_voice_numbered(&fits).is_ok());
+        let many = list(
+            (0..=MAX_VOICE_NUMBERED_ENTRIES)
+                .map(|at| item(format!("d{at}")))
+                .collect(),
+        );
+        assert!(validate_voice_numbered(&many).is_err());
+        assert!(
+            validate_voice_numbered(&list(vec![item(
+                "x".repeat(MAX_VOICE_CHOICE_TEXT_BYTES + 1)
+            )]))
+            .is_err()
+        );
+        let mut named = item("docs".to_string());
+        named.names = vec!["n".to_string(); MAX_VOICE_NUMBERED_NAMES + 1];
+        assert!(validate_voice_numbered(&list(vec![named])).is_err());
     }
 
     /// The declaration's wire shape is the webview's: camelCase, and nothing

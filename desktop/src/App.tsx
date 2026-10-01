@@ -57,6 +57,8 @@ import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRe
 import { useZoom } from "./hooks/useZoom";
 import { useShellOverlays, type RailScreen, type ScreenOverlays } from "./hooks/useShellOverlays";
 import { VoiceOn } from "./hooks/useVoiceOn";
+import { useNumberedList, useNumbersShown, VoiceChoiceOpen, VoiceNumberingContext, type NumberedLayer, type VoiceNumbering } from "./hooks/useVoiceNumbers";
+import { NO_NUMBERED_LIST, sameNumberedEntries, type VoiceNumberedEntryDto, type VoiceNumberedListDto } from "./lib/voiceNumbers";
 import { agentKey } from "./lib/agentKey";
 import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
@@ -630,6 +632,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   /** PR #1451, round 3 — whether voice is on, shared with the lists that render differently while it is. */
   // voice-registry-exempt: a mirror of the voice panel's own toggle, written only by its report so lists can render for it; voice itself is turned on by the panel's button
   const [voiceOn, setVoiceOn] = useState(false);
+  /* PR #1451 round 3 — whether the numbered choice is open, so lists hide their numbers under it. */
+  // voice-registry-exempt: a mirror of the voice panel's numbered choice, written only by its report so lists can hide their numbers under it; the choice itself is the panel's
+  const [choiceOpen, setChoiceOpen] = useState(false);
   /**
    * PRD #802 M6 — run one resolved voice command, and answer with how to undo it.
    *
@@ -743,7 +748,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          agent param and is `screens = ["agent"]`, so `agentView` is defined
          whenever one of them dispatches. The `agent_ref` value still wins where
          a row resolved one, which is every row that takes an agent. */
-      deckId: agent ? (selectedDeckId ?? "") : (agentView?.deckId ?? selectedDeckId ?? ""),
+      /* A numbered dashboard row names its own deck (PR #1451 round 3): the
+         rows span every deck, where a resolved agent is the selected deck's. */
+      deckId: agent ? (agent.deckId ?? selectedDeckId ?? "") : (agentView?.deckId ?? selectedDeckId ?? ""),
       agentId: agent?.value ?? agentView?.agentId ?? "",
       from: base === "overview" ? "overview" : "deck",
       /* What the DECK calls it, which is what Rust resolved the spoken words
@@ -819,6 +826,26 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const latestAgents = useRef(runtime.snapshot.agents);
   latestAgents.current = runtime.snapshot.agents;
   const readAgentIncarnations = useCallback(() => Object.fromEntries(latestAgents.current.map((agent) => [agent.id, agent.spawnedAtMs])), []);
+  /**
+   * PR #1451 round 3, change 3 — the numbered list on screen: the New agent
+   * dialog's while it declares one, the screen's otherwise (see
+   * `useVoiceNumbers`). The generation moves whenever what is read differs
+   * from the last read, so the panel can tell a list that changed between
+   * the moment the user began to speak and the answer.
+   */
+  const numberedLayers = useRef<Partial<Record<NumberedLayer, readonly VoiceNumberedEntryDto[]>>>({});
+  const numberedRead = useRef<VoiceNumberedListDto>(NO_NUMBERED_LIST);
+  const numbering = useMemo<VoiceNumbering>(() => ({
+    publish: (layer, entries) => { numberedLayers.current[layer] = entries; },
+  }), []);
+  const readNumbered = useCallback((): VoiceNumberedListDto => {
+    const layers = numberedLayers.current;
+    const entries = layers.dialog ?? layers.screen ?? [];
+    if (!sameNumberedEntries(entries, numberedRead.current.entries)) {
+      numberedRead.current = { generation: numberedRead.current.generation + 1, entries: [...entries] };
+    }
+    return numberedRead.current;
+  }, []);
   /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
      and `DeckSurface`'s own promotion condition. */
   const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId } : undefined;
@@ -881,13 +908,17 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   */
   return (
     <VoiceOn.Provider value={voiceOn}>
+      <VoiceNumberingContext.Provider value={numbering}>
+      <VoiceChoiceOpen.Provider value={choiceOpen}>
       <PaneDictation.Provider value={paneDictation}>
         {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
         <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
         {screenNode}
-        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} onDictationChange={setDictating} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} />
+        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} onDictationChange={setDictating} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} onChoiceChange={setChoiceOpen} />
         <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
       </PaneDictation.Provider>
+      </VoiceChoiceOpen.Provider>
+      </VoiceNumberingContext.Provider>
     </VoiceOn.Provider>
   );
 }
@@ -1166,6 +1197,25 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const paneAgentId = openAgent && snapshot.agents.some((agent) => agent.id === openAgent.agentId && agent.daemonId === openAgent.deckId)
     ? openAgent.agentId
     : undefined;
+  /*
+    PR #1451 round 3, change 3 — the tiles, numbered in grid order while voice
+    is on: the same order the 1–4 keys focus, so a tile's number and its key
+    agree. Declared whenever the grid is on screen and no pane covers it.
+  */
+  const tilesShown = !allDecks && snapshot.agents.length > 0;
+  const numberedTiles = useMemo(() => (
+    tilesShown && paneAgentId === undefined
+      ? snapshot.agents.map((agent): VoiceNumberedEntryDto => ({
+        kind: "agent",
+        value: agent.id,
+        deckId: agent.daemonId,
+        label: agent.role,
+        names: [agent.displayName, agent.cli].filter((name): name is string => Boolean(name) && name !== agent.role),
+      }))
+      : undefined
+  ), [paneAgentId, snapshot.agents, tilesShown]);
+  useNumberedList("screen", numberedTiles);
+  const tileNumbers = useNumbersShown() && numberedTiles !== undefined;
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
   const [selectedEvidenceId, setSelectedEvidenceId] = useState(""); // voice-registry-exempt: which evidence item the drawer shows — a selection within the drawer, which the drawer's rows and J/K set
@@ -1949,7 +1999,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                 viewport would overwrite the first's registration and the
                 first's unmount would then clean up nothing.
               */}
-              {snapshot.agents.map((agent) => (
+              {snapshot.agents.map((agent, index) => (
                 <AgentPaneFrame
                   key={agent.id}
                   open={agent.id === paneAgentId}
@@ -1962,6 +2012,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                   evidence={snapshot.evidence}
                   inputResult={runtime.terminalInputResults?.[agentKey(agent.daemonId, agent.id)]}
                   terminalFocusToken={terminalFocus?.agentId === agent.id ? terminalFocus.token : 0}
+                  voiceNumber={tileNumbers ? index + 1 : undefined}
                   onSelect={() => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id })}
                   // voice-registry-exempt: a tile's own tab strip, a control inside one tile; `focusTerminal` writes the same map only to show the terminal it focuses
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}

@@ -86,6 +86,7 @@ import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
 import type { EndpointSettingsDto, VoiceCommandDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
 import { answerChoiceLocally, collidingChoiceEntry, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
+import { answerNumberLocally, numberedOutcome, numberedParam, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto } from "../lib/voiceNumbers";
 import { desktopFeaturesOf, type DeckRuntimeState } from "../types";
 
 /**
@@ -289,6 +290,22 @@ export const VOICE_CHOICE_AGENT_GONE = "The agent you chose is gone since the ch
 export const VOICE_CHOICE_DECK_MOVED_ON = "The selected deck changed after the choice was offered, so nothing ran. Say the command again.";
 export const VOICE_CHOICE_SCREEN_MOVED_ON = "You moved to another screen after the choice was offered, so nothing ran. Say the command again here.";
 export const VOICE_CHOICE_DIALOG_MOVED_ON = "The New agent dialog changed after the choice was offered, so nothing ran. Say the command again.";
+
+/**
+ * PR #1451 round 3, change 3 — a spoken number refused because the numbered
+ * list it was said about changed: an item came, went or moved between the
+ * moment the user began to speak and the answer, so the number may now be
+ * another item's. The second is the same for a numbered choice that list
+ * offered.
+ */
+export const VOICE_NUMBERS_MOVED_ON = "The numbers on screen changed while you were saying that, so nothing ran. Say the number again.";
+export const VOICE_NUMBERS_CHOICE_MOVED_ON = "The numbers on screen changed after the choice was offered, so nothing ran. Say the number again.";
+/** What a numbered answer's report names as having answered it: the app itself, with no backend asked. */
+const NUMBERS_BACKEND = "local";
+/** A spoken number no item on screen shows. */
+export function voiceNumberNotShown(number: number): string {
+  return number < 1 ? "No item on screen shows that number, so nothing ran." : `No item on screen shows number ${number}, so nothing ran.`;
+}
 
 /**
  * What a press gets when there is no transcription backend to listen with.
@@ -518,7 +535,7 @@ export function dictationRefused(label: string, reason: string): string {
 }
 
 /** The voice half of the runtime, which a runtime may not have at all. */
-type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "answerVoiceChoice" | "voiceCommands" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel" | "sendTerminalInput" | "desktopFeatures">;
+type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "answerVoiceChoice" | "answerVoiceNumber" | "voiceCommands" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel" | "sendTerminalInput" | "desktopFeatures">;
 
 /** The command table's row for the deck, whose screen issue #1198 hides by default. */
 const OPEN_DECK_COMMAND = "open_deck";
@@ -749,6 +766,14 @@ type VoiceChoiceOffer = {
    * cannot stretch the window.
    */
   deadline: number;
+  /**
+   * PR #1451 round 3, change 3 — set when the choice is between items of the
+   * numbered list on screen (a number that is also an item's name): the list
+   * as it was heard, and the item each candidate is, in the same order. Such a
+   * choice is answered by the webview's own rule and dispatched as its item's
+   * row, and refused if the list has changed since.
+   */
+  numbered?: { heard: VoiceNumberedListDto; entries: VoiceNumberedEntryDto[] };
 };
 
 const IDLE: VoicePanelState = { kind: "idle" };
@@ -929,6 +954,15 @@ interface VoiceControlPanelProps {
    * chosen agent entry whose agent was replaced since is refused.
    */
   agentIncarnations?: () => Readonly<Record<string, number | undefined>>;
+  /**
+   * PR #1451 round 3, change 3 — the numbered list on screen now, with its
+   * generation. Read when the microphone opens, again while nobody has spoken
+   * yet, and once more when a bare number is answered, so a number said about
+   * a list that has since changed is refused.
+   */
+  numbered?: () => VoiceNumberedListDto;
+  /** PR #1451 round 3 — told when the numbered choice opens or closes, so the lists behind it can hide their numbers. */
+  onChoiceChange?: (open: boolean) => void;
 }
 
 /**
@@ -974,7 +1008,7 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, selectedDeckId, confirmationOpen = false, onDictationChange, onVoiceChange, agentIncarnations }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, selectedDeckId, confirmationOpen = false, onDictationChange, onVoiceChange, agentIncarnations, numbered, onChoiceChange }: VoiceControlPanelProps) {
   /* Held in a ref so the resolve and the overlay read the host's latest getter
      without either callback being rebuilt when the host re-renders. */
   const directoriesRef = useRef(directories);
@@ -987,7 +1021,16 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   endpointsRef.current = endpoints;
   const agentIncarnationsRef = useRef(agentIncarnations);
   agentIncarnationsRef.current = agentIncarnations;
-  const { declareVoiceScreen, resolveVoice, answerVoiceChoice, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
+  const numberedRef = useRef(numbered);
+  numberedRef.current = numbered;
+  /**
+   * PR #1451 round 3, change 3 — the numbered list as it stood when the user
+   * began to speak: read when the microphone opens and refreshed by every
+   * poll that has heard nobody yet, then held. A bare number is answered
+   * against it.
+   */
+  const heardNumbers = useRef<VoiceNumberedListDto | undefined>(undefined);
+  const { declareVoiceScreen, resolveVoice, answerVoiceChoice, answerVoiceNumber, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
   /* Issue #1198 — the list of what can be said leaves out the deck while the
      deck is hidden, even from its "elsewhere" half: it is not somewhere else,
      it is not there. The crate withholds the row from the model as well
@@ -1652,6 +1695,122 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   }, [setPanelState]);
 
   /**
+   * PR #1451 round 3, change 3 — run what choosing a numbered item runs: the
+   * row a spoken name for it would have run, with the item as its param,
+   * through the same dispatch and the same target checks. No backend was
+   * asked anything, so no timing is shown.
+   */
+  const runNumbered = useCallback((entry: VoiceNumberedEntryDto, transcript: string) => {
+    const outcome = numberedOutcome(entry, transcript);
+    setResult({ outcome, resolveMs: null, backend: NUMBERS_BACKEND });
+    refusedRef.current = false;
+    const dispatched = dispatchDeclared(outcome, current());
+    if (refusedRef.current) setResult(undefined);
+    else if (!dispatched) setProblem(NOTHING_DISPATCHED);
+    else if (dispatched.undo) setUndo({ run: dispatched.undo });
+  }, [current, dispatchDeclared]);
+
+  /**
+   * PR #1451 round 3, change 3 — a numbered choice's entry, chosen: refused
+   * when the screen or dialog moved on, or when the numbered list it was
+   * offered from has changed since, and otherwise run as its item.
+   */
+  const dispatchNumbered = useCallback((offer: VoiceChoiceOffer, candidate: VoiceResolvedParamDto) => {
+    const numbered = offer.numbered;
+    if (!numbered) return;
+    const entry = numbered.entries[offer.outcome.candidates.indexOf(candidate)];
+    const lost = contextLost(offer.declared, current(), { answer: true });
+    if (lost) {
+      setProblem(choiceRefusal(lost));
+      return;
+    }
+    if (entry === undefined || numberedRef.current?.().generation !== numbered.heard.generation) {
+      setProblem(VOICE_NUMBERS_CHOICE_MOVED_ON);
+      return;
+    }
+    runNumbered(entry, offer.outcome.transcript);
+  }, [current, runNumbered]);
+
+  /**
+   * PR #1451 round 3, change 3 — a number that is also another item's name:
+   * the items it could mean, offered as the numbered choice, the one showing
+   * the number first. With a confirmation open, or more items than a choice
+   * shows, it is only refused.
+   */
+  const offerNumbered = useCallback((utterance: string, heard: VoiceNumberedListDto, numbers: number[]) => {
+    const entries = numbers.flatMap((number) => heard.entries[number - 1] ?? []);
+    const first = entries[0];
+    const labels = entries.map((entry) => `“${entry.label}”`).join(" or ");
+    const sentence = `“${utterance}” could mean ${labels}.`;
+    if (first === undefined || entries.length > VOICE_CHOICE_MAX || confirmationRef.current) {
+      setProblem(`${sentence} Nothing ran.`);
+      return;
+    }
+    const row = numberedOutcome(first, utterance);
+    /* Each candidate's `value` is its number: unique, where two decks'
+       agents can share an id. The item itself rides in `numbered`. */
+    const candidates = entries.map((entry, at) => ({ ...numberedParam(entry, utterance), value: String(numbers[at]) }));
+    const outcome: VoiceChoiceOffer["outcome"] = {
+      kind: "param_ambiguous",
+      transcript: utterance,
+      action: row.action,
+      invoke: row.invoke,
+      param: candidates[0].name,
+      spoken: utterance,
+      matches: entries.map((entry) => entry.label),
+      candidates,
+      params: [],
+      sentence,
+    };
+    setResult({ outcome, resolveMs: null, backend: NUMBERS_BACKEND });
+    setPanelState({
+      kind: "awaitingChoice",
+      offer: { outcome, backend: NUMBERS_BACKEND, declared: current(), deadline: Date.now() + VOICE_CHOICE_WINDOW_MS, numbered: { heard, entries } },
+    });
+  }, [current, setPanelState]);
+
+  /**
+   * PR #1451 round 3, change 3 — answer `utterance` if it is a bare number
+   * said about the numbered list on screen, locally: no Commands backend
+   * call, Rust's `voice::numbers::answer` where the runtime has it and the
+   * webview's port where it does not. Answers whether the utterance was
+   * handled here; `false` means it is not a number (or nothing is numbered)
+   * and is to be resolved as usual.
+   *
+   * The list is the one heard — as it stood when the user began to speak —
+   * and it is compared with the list on screen both when the answer is
+   * worked out and again when it comes back, so a number said about a list
+   * that moved in either window is refused rather than read against the new
+   * one.
+   */
+  const answerNumber = useCallback(async (utterance: string, ours: () => boolean): Promise<boolean> => {
+    const heard = heardNumbers.current;
+    const read = numberedRef.current;
+    if (heard === undefined || read === undefined || heard.entries.length === 0) return false;
+    setPhase("resolving");
+    let verdict: VoiceNumberAnswerDto;
+    try {
+      const now = read().generation;
+      verdict = answerVoiceNumber ? await answerVoiceNumber(utterance, heard, now) : answerNumberLocally(utterance, heard, now);
+    } catch (cause) {
+      if (ours()) setProblem(sentenceOf(cause));
+      return true;
+    }
+    if (!ours()) return true;
+    if (verdict.kind === "not_number") return false;
+    if (verdict.kind !== "stale" && read().generation !== heard.generation) verdict = { kind: "stale" };
+    if (verdict.kind === "stale") setProblem(VOICE_NUMBERS_MOVED_ON);
+    else if (verdict.kind === "out_of_range") setProblem(voiceNumberNotShown(verdict.number));
+    else if (verdict.kind === "ambiguous") offerNumbered(utterance, heard, verdict.numbers);
+    else {
+      const entry = heard.entries[verdict.number - 1];
+      if (entry === undefined) setProblem(voiceNumberNotShown(verdict.number));
+      else runNumbered(entry, utterance);
+    }
+    return true;
+  }, [answerVoiceNumber, offerNumbered, runNumbered, setPhase]);
+
+  /**
    * PRD #1261 — run the ORIGINAL command with the chosen entry, once.
    *
    * No second resolve: the row and every other param are the ones Rust
@@ -1678,6 +1837,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     }
     setPanelState(IDLE);
     forget();
+    if (offer.numbered) {
+      dispatchNumbered(offer, candidate);
+      return;
+    }
     const at = offer.outcome.candidates.findIndex((entry) => entry.value === candidate.value);
     const chosen = offer.outcome.candidates[at];
     /* The one place both a click and a spoken answer pass, so neither can run
@@ -1711,13 +1874,18 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (refusedRef.current) setResult(undefined);
     else if (!dispatched) setProblem(NOTHING_DISPATCHED);
     else if (dispatched.undo) setUndo({ run: dispatched.undo });
-  }, [closeChoice, current, dispatchDeclared, forget, setPanelState]);
+  }, [closeChoice, current, dispatchDeclared, dispatchNumbered, forget, setPanelState]);
 
   /*
     PRD #1261 — the choice's countdown, and its expiry, which runs nothing.
     Keyed on the offer, so a new offer restarts it and a closed one stops it.
   */
   const offered = panelState.kind === "awaitingChoice" ? panelState.offer : undefined;
+  const choiceChanged = useRef(onChoiceChange);
+  choiceChanged.current = onChoiceChange;
+  const choiceShown = offered !== undefined;
+  useEffect(() => { choiceChanged.current?.(choiceShown); }, [choiceShown]);
+  useEffect(() => () => { choiceChanged.current?.(false); }, []);
   useEffect(() => {
     if (!offered) {
       setChoiceIn(undefined);
@@ -1762,6 +1930,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     try {
       await voiceStart();
       if (!ours()) return;
+      heardNumbers.current = numberedRef.current?.();
       setPhase("listening");
     } catch (cause) {
       if (!ours()) return;
@@ -1793,7 +1962,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       let verdict: VoiceChoiceAnswerDto;
       try {
         declareVoiceScreen?.(screenRef.current, directoriesRef.current?.(), newAgentRef.current?.(), endpointsRef.current?.());
-        verdict = answerVoiceChoice
+        /* A choice between numbered items is answered by the webview's rule:
+           its entries may be other decks' agents, which Rust's liveness
+           check reads against the selected deck alone. What stands behind
+           it is the numbered list's own generation, at dispatch. */
+        verdict = answerVoiceChoice && offer.numbered === undefined
           ? await answerVoiceChoice(utterance, offer.outcome.action, offer.outcome.candidates)
           : answerChoiceLocally(utterance, offer.outcome.candidates);
       } catch (cause) {
@@ -1818,6 +1991,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       }
       closeChoice(VOICE_CHOICE_CLOSED);
     }
+    /* PR #1451 round 3, change 3 — a bare number said about the numbered list
+       on screen is answered here, locally, with no Commands backend call. Not
+       while typing, where a number is the user's words. Anything else falls
+       through to be resolved. */
+    if (panelStateRef.current.kind === "idle" && await answerNumber(utterance, ours)) return;
+    if (!ours()) return;
     /* The context this utterance is JUDGED against, declared once and held
        for the round trip: `unavailable` means "not on that screen", so an
        outcome is only an answer about the context declared with it. */
@@ -1906,7 +2085,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     } catch (cause) {
       if (ours()) setProblem(sentenceOf(cause));
     }
-  }, [answerVoiceChoice, clearHeld, closeChoice, current, declareVoiceScreen, dispatchChoice, dispatchDeclared, offerChoice, reportHeld, resolveVoice, setPhase]);
+  }, [answerNumber, answerVoiceChoice, clearHeld, closeChoice, current, declareVoiceScreen, dispatchChoice, dispatchDeclared, offerChoice, reportHeld, resolveVoice, setPhase]);
 
   /**
    * One whole utterance: take it, transcribe, resolve, listen again.
@@ -2030,6 +2209,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     // Re-read AFTER the await: voice may have been turned off, or a cycle may
     // already be running, in the round trip this answer took.
     if (!onRef.current || phaseRef.current !== "listening") return;
+    /* PR #1451 round 3, change 3 — nobody has spoken into this recording yet,
+       so what is on screen now is still what the coming words are about. */
+    if (status.speech === false) heardNumbers.current = numberedRef.current?.();
     /*
       PRD #802 D6 — *"a visible countdown the user can cancel by continuing to
       speak"*, and this is the seam that notices the speaking.

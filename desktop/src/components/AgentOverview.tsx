@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
+import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { Blocks, Boxes, CircleStop, Columns3, LayoutList, Layers, Maximize2, Network, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
@@ -12,6 +12,9 @@ import { NewAgentDialog, NO_DIALOG_FOR_DECK, NO_DIALOG_TO_DISCARD, NO_DIRECTORY_
 import type { NewAgentDraft } from "../lib/newAgentDraft";
 import { DeckSelector } from "./DeckSelector";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
+import { VoiceNumber } from "./VoiceNumber";
+import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
+import { numberKey, type VoiceNumberedEntryDto } from "../lib/voiceNumbers";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 
 /**
@@ -636,6 +639,24 @@ interface OverviewStopControls {
 
 const StopControlsContext = createContext<OverviewStopControls | undefined>(undefined);
 
+/**
+ * PR #1451 round 3, change 3 — the number each row shows while voice is on,
+ * by {@link agentKey}: one sequence across every deck's rows, in the order
+ * they render. Absent while voice is off, and while a pane or the New agent
+ * dialog covers the rows.
+ */
+const RowNumbersContext = createContext<ReadonlyMap<string, number> | undefined>(undefined);
+
+/**
+ * Whether `DaemonBody` renders a deck's agent rows rather than a note about
+ * the deck: connected, reported, and configured. Its early returns, as one
+ * question, so the numbered rows are exactly the rows on screen.
+ */
+function rendersAgentRows(connection: ConnectionView): boolean {
+  return connection.status === "connected" && !connection.pending && !connection.unconfigured;
+}
+
+
 /*
   PRD #802 D5 — why a spoken stop opened no confirmation. Each says nothing
   was stopped, because nothing was.
@@ -1001,6 +1022,46 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "overview" });
   }, [voiceContext]);
   const [confirm, setConfirm] = useState<ConfirmState>();
+  /**
+   * PR #1451 round 3, change 3 — the rows, numbered: every deck's, in the
+   * order they render, as one sequence. Declared whenever they are on screen
+   * — not while a pane or the New agent dialog covers them — and numbered
+   * visibly only while voice is on.
+   */
+  const numberedAgents = useMemo(() => (
+    agentPaneOpen || newAgent
+      ? undefined
+      : decks.filter((deck) => rendersAgentRows(deck.snapshot.connection)).flatMap((deck) => deck.groups.flatMap((group) => group.agents))
+  ), [agentPaneOpen, decks, newAgent]);
+  const numberedEntries = useMemo(() => numberedAgents?.map((agent): VoiceNumberedEntryDto => ({
+    kind: "agent",
+    value: agent.id,
+    deckId: agent.daemonId,
+    label: agent.displayName,
+    /* The names a spoken number can also be: the role and the CLI. Not the
+       id, which nobody reads off the row and which often ends in a digit. */
+    names: [agent.tab.kind === "orchestration" ? agent.tab.roleName : undefined, agent.cli].filter((name): name is string => Boolean(name)),
+  })), [numberedAgents]);
+  useNumberedList("screen", numberedEntries);
+  const voiceOn = useNumbersShown();
+  const rowNumbers = useMemo(() => (
+    voiceOn && numberedAgents ? new Map(numberedAgents.map((agent, at) => [agentKey(agent), at + 1])) : undefined
+  ), [numberedAgents, voiceOn]);
+  /* The number keys, while the rows are numbered: a digit opens the row
+     showing it, as saying it would. Nothing else on this screen takes a bare
+     digit, and a field or terminal keeps its own. */
+  useEffect(() => {
+    if (!rowNumbers || !numberedAgents || confirm) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const number = numberKey(event);
+      const agent = number === undefined ? undefined : numberedAgents[number - 1];
+      if (!agent) return;
+      event.preventDefault();
+      openAgent(agent);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [confirm, numberedAgents, openAgent, rowNumbers]);
   const confirmationOpen = confirm !== undefined;
   const confirmationChanged = useRef(onConfirmationChange);
   confirmationChanged.current = onConfirmationChange;
@@ -1198,7 +1259,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       )}
     </div>
   );
-  return <OpenAgentContext.Provider value={openAgent}><StopControlsContext.Provider value={stopControls}>{overviewScreen}</StopControlsContext.Provider></OpenAgentContext.Provider>;
+  return <OpenAgentContext.Provider value={openAgent}><StopControlsContext.Provider value={stopControls}><RowNumbersContext.Provider value={rowNumbers}>{overviewScreen}</RowNumbersContext.Provider></StopControlsContext.Provider></OpenAgentContext.Provider>;
 }
 
 /** One deck of the fleet, as {@link AgentOverview} prepares it for rendering. */
@@ -2053,6 +2114,9 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
     hover. The row stays out of the tab order because the control is already
     in it, and a second stop per agent would only repeat it.
   */
+  /* PR #1451 round 3, change 3 — the number this row shows while voice is
+     on, first in the row and first in its accessible name. */
+  const number = useContext(RowNumbersContext)?.get(agentKey(agent));
   const openFromRow = openAgent && ((event: MouseEvent<HTMLTableRowElement>) => {
     if (clickLandedOnRowControl(event) || clickFinishedSelection(event.currentTarget)) return;
     openAgent(agent);
@@ -2063,11 +2127,19 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
       role="row"
       data-testid={`overview-agent-${agentDomKey(agent)}`}
       data-status={agent.status}
+      aria-label={number === undefined ? undefined : `${number}. ${name}`}
+      data-voice-number={number}
       onClick={openFromRow}
     >
-      {columns.map(cell)}
+      {columns.map((column, at) => (at === 0 && number !== undefined ? numberedCell(cell(column), number) : cell(column)))}
     </tr>
   );
+}
+
+/** `cell` with the row's voice number before its content, so the number leads the row whichever column is first. */
+function numberedCell(cell: ReactNode, number: number): ReactNode {
+  if (!isValidElement<{ children?: ReactNode }>(cell)) return cell;
+  return cloneElement(cell, undefined, <VoiceNumber key="voice-number" number={number} hidden />, ...Children.toArray(cell.props.children));
 }
 
 /**
