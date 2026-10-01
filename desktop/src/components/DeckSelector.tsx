@@ -258,6 +258,7 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
                   aria-checked={chosen}
                   className={chosen ? "deck-selector-option is-selected" : "deck-selector-option"}
                   data-testid={`deck-selector-option-${choice.token}`}
+                  title={choice.address ? displayText(choice.address, DISPLAY_LIMITS.name) : undefined}
                   onClick={() => choose(choice.selection)}
                 >
                   <span>{displayText(choice.label, DISPLAY_LIMITS.name)}</span>

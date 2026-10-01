@@ -2864,6 +2864,15 @@ fn deck_reference(spoken: &str) -> String {
 /// Every name this deck answers to. See [`resolve_deck_ref`] for the rule.
 fn deck_spoken_names(deck: &VoiceDeck) -> Vec<String> {
     let mut names = vec![deck.label.clone()];
+    if let Some(address) = &deck.address {
+        // The label is the deck's name (issue #1426). A name may hold `.`,
+        // which nobody says, so it also answers with those spoken as spaces;
+        // `-` and `_` already are ([`normalize`]).
+        if deck.label.contains('.') {
+            names.push(deck.label.replace('.', " "));
+        }
+        names.push(address.clone());
+    }
     if deck.local {
         names.push("local".to_string());
         names.push("this machine".to_string());
@@ -2883,21 +2892,23 @@ fn deck_spoken_names(deck: &VoiceDeck) -> Vec<String> {
     names
 }
 
-/// A remote deck's host: `user@host[:port]` → `host`. The label is
-/// `RemoteEndpoint::describe()`, whose shape this undoes; a label that is not
-/// in that shape yields no host rather than a wrong one. `None` for the local
-/// deck.
+/// A remote deck's host: `user@host[:port]` → `host`. The address is
+/// [`VoiceDeck::address`] for a named deck and the label otherwise — either way
+/// `RemoteEndpoint::describe()`, whose shape this undoes; an address that is
+/// not in that shape yields no host rather than a wrong one. `None` for the
+/// local deck.
 fn remote_host(deck: &VoiceDeck) -> Option<String> {
     if deck.local {
         return None;
     }
-    let without_user = deck.label.rsplit('@').next().unwrap_or(&deck.label);
+    let address = deck.address.as_deref().unwrap_or(&deck.label);
+    let without_user = address.rsplit('@').next().unwrap_or(address);
     let host = without_user
         .split(':')
         .next()
         .unwrap_or(without_user)
         .trim();
-    (!host.is_empty() && host != deck.label).then(|| host.to_string())
+    (!host.is_empty() && host != address).then(|| host.to_string())
 }
 
 /// Every name this agent answers to.
@@ -3054,6 +3065,7 @@ mod tests {
         VoiceDeck {
             id: id.to_string(),
             label: label.to_string(),
+            address: None,
             local,
             unavailable: None,
         }
@@ -7645,6 +7657,102 @@ mod tests {
                     if params[0].value == expected),
                 "{said}: {outcome:?}"
             );
+        }
+    }
+
+    /// A remote deck called by its name in the shared deck list (issue #1426),
+    /// still answering to `address`.
+    fn named_deck(id: &str, name: &str, address: &str) -> VoiceDeck {
+        VoiceDeck {
+            address: Some(address.to_string()),
+            ..deck(id, name, false)
+        }
+    }
+
+    /// Scenario: with a remote deck named `production` (its host is
+    /// `build-box.example.com`) and another named `db.internal`, "switch deck
+    /// to production" switches to the first, "switch deck to db internal" to
+    /// the second — a `.` in a name is spoken as a space — and "switch deck to
+    /// the build box" still reaches the first by its host. A report names the
+    /// deck by its name, the way the screen does.
+    #[tokio::test]
+    async fn voice_outcome_switch_deck_resolves_a_deck_by_its_name() {
+        let decks = [
+            deck("deck-local", "Local deck", true),
+            named_deck(
+                "deck-prod",
+                "production",
+                "deploy@build-box.example.com:2222",
+            ),
+            named_deck("deck-db", "db.internal", "ops@db.example.com"),
+        ];
+        for (said, spoken, expected) in [
+            ("switch deck to production", "production", "deck-prod"),
+            ("switch deck to db internal", "db internal", "deck-db"),
+            ("switch deck to the build box", "build box", "deck-prod"),
+            ("switch deck to local", "local", "deck-local"),
+        ] {
+            let outcome = switched_over(&decks, said, spoken).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
+                    if params[0].value == expected),
+                "{said}: {outcome:?}"
+            );
+        }
+        assert!(matches!(
+            resolve_deck_ref("production", &decks),
+            DeckRefMatch::One { label, .. } if label == "production"
+        ));
+    }
+
+    /// Scenario: with labels withheld, a named deck's name is not sent — the
+    /// request carries no data turn, so neither the name nor the address the
+    /// deck still answers to reaches the Commands endpoint — while with labels
+    /// shared the deck is shown by its name.
+    #[tokio::test]
+    async fn voice_outcome_withheld_labels_withhold_a_deck_s_name() {
+        let decks = [
+            deck("deck-local", "Local deck", true),
+            named_deck("deck-prod", "zephyr-prod", "deploy@quartz-host.example.com"),
+        ];
+        for labels in [LabelSharing::Withheld, LabelSharing::Shared] {
+            let resolver = Recording::answering(IntentAnswer::new("go_to_parent"));
+            handle_utterance_with(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                &decks,
+                None,
+                None,
+                Transcript::new("switch deck to zephyr prod"),
+                labels,
+                true,
+            )
+            .await;
+            let (data, commands) = resolver.sent();
+            let rendered = format!(
+                "{}{}",
+                data.as_ref().map(ToString::to_string).unwrap_or_default(),
+                serde_json::to_string(&commands).expect("serialize")
+            );
+            if labels == LabelSharing::Withheld {
+                assert_eq!(data, None, "nothing observed may be sent");
+                for observed in ["zephyr", "quartz-host"] {
+                    assert!(
+                        !rendered.contains(observed),
+                        "`{observed}` leaked: {rendered}"
+                    );
+                }
+                let switch = commands
+                    .iter()
+                    .find(|command| command.id == "switch_deck")
+                    .expect("switch_deck");
+                assert!(!switch.callable);
+                assert_eq!(switch.unavailable_hint, LABELS_WITHHELD_HINT);
+            } else {
+                assert!(rendered.contains("zephyr-prod"), "{rendered}");
+            }
         }
     }
 

@@ -333,6 +333,7 @@ async fn handle_connection(
                         spawned_at_ms: None,
                         cli_name: None,
                         crashed: None,
+                        orchestrator_context_path: None,
                     }]
                 })
                 .unwrap_or_default();

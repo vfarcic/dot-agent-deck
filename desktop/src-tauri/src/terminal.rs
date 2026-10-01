@@ -1459,6 +1459,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn registry_keeps_only_one_session_per_agent() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let lease = fixture_lease().await;
         let state = DesktopState::default();
         state
@@ -1543,6 +1546,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_deck_id_resolves_to_its_own_observed_endpoint() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let settings = fleet_settings(&["build-box.example.com", "laptop.example.com"]);
         crate::dto::apply_settings_selection(&settings);
 
@@ -1576,6 +1582,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn an_unobserved_deck_id_is_refused_rather_than_falling_back() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let settings = fleet_settings(&["build-box.example.com"]);
         crate::dto::apply_settings_selection(&settings);
 
@@ -1602,6 +1611,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_session_registry_keeps_one_session_per_agent_per_deck() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let lease = fixture_lease().await;
         let state = DesktopState::default();
         let deck_a = fixture_deck("/tmp/dot-agent-deck-registry-a.sock");
@@ -1737,6 +1749,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn detaching_one_decks_agent_leaves_the_other_decks_namesake() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let lease = fixture_lease().await;
         let state = DesktopState::default();
         let deck_a = fixture_deck("/tmp/dot-agent-deck-detach-agent-a.sock");
@@ -1772,6 +1787,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn only_the_departed_decks_sessions_are_detached() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let lease = fixture_lease().await;
         let state = DesktopState::default();
         let staying = fixture_deck("/tmp/dot-agent-deck-retain-staying.sock");
@@ -1805,6 +1823,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn detaching_one_deck_leaves_every_other_decks_sessions() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let lease = fixture_lease().await;
         let state = DesktopState::default();
         let stopped = fixture_deck("/tmp/dot-agent-deck-stop-local.sock");
@@ -1844,6 +1865,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_selection_move_keeps_a_still_observed_decks_terminal() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         use crate::settings::{EndpointId, Selection};
 
         let hosts = ["build-box.example.com", "laptop.example.com"];
@@ -1891,6 +1915,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_deck_leaving_the_fleet_loses_its_terminal_without_the_selection_moving() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let both = ["build-box.example.com", "laptop.example.com"];
         let build_box = row_endpoint(&both, 0);
         let laptop = row_endpoint(&both, 1);
@@ -1942,6 +1969,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_resize_reaches_the_deck_its_session_was_attached_over() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         use crate::settings::{EndpointId, Selection};
 
         let hosts = ["build-box.example.com"];
@@ -1989,6 +2019,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_live_terminal_session_holds_its_own_transport_lease() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         use dot_agent_deck::daemon_client::{Endpoint, LocalEndpoint};
         let tunnels = crate::endpoint_tunnels::EndpointTunnels::default();
         let endpoint = Endpoint::Local(LocalEndpoint::at(
@@ -2026,8 +2059,8 @@ mod tests {
     // Issue #1116 — the two await-races the third identity audit found, tested
     // at their CALLERS.
     //
-    // # Why these need a scripted daemon and an env var, when the nine tests
-    // above needed neither
+    // # Why these need a scripted daemon and a moved local deck, when the nine
+    // tests above needed neither
     //
     // Both defects are a second read of the applied selection on the far side
     // of a daemon round trip. A test that never reaches a daemon cannot put
@@ -2036,32 +2069,35 @@ mod tests {
     // proved the helper and said nothing about the caller that misused it.
     //
     // So the local deck's address has to be a socket this test controls, and
-    // `DOT_AGENT_DECK_ATTACH_SOCKET` is the only way to move it: the local
-    // endpoint is resolved from config and no settings document can name it.
-    // Under nextest each test owns its process, which is what makes writing a
-    // process-global variable safe here — the same reason the selection tests
-    // in this file can write `APPLIED_SELECTION` without a lock, and the
-    // reason this crate's five selection-touching tests fail under a plain
-    // `cargo test` (one process, threads) while passing under `cargo
-    // test-fast`.
+    // no settings document can name the local deck. These tests move it with
+    // `crate::local_deck`'s per-thread test seam. They used to write
+    // `DOT_AGENT_DECK_ATTACH_SOCKET`, which was safe under nextest's
+    // process-per-test model and moved the local deck for every sibling test
+    // under a plain `cargo test` (issue #1078). The applied selection they
+    // write is still process-global, which is what `dto::SELECTION_LOCK`
+    // serialises.
     // -----------------------------------------------------------------------
 
-    /// Point the LOCAL deck at `socket` and bind a listener on it, owner-only.
+    /// Point this test's LOCAL deck at `socket` and bind a listener on it,
+    /// owner-only. The local deck moves back when the returned guard drops.
     ///
     /// The 0o600 restatement is `daemon_bridge`'s `bind_trusted` reason
     /// verbatim: the client refuses a socket the ambient umask left group- or
     /// world-accessible, and flipping the process umask around `bind(2)` is the
     /// wrong tool in a shared-process test run.
     #[cfg(unix)]
-    fn bind_local_deck(socket: &std::path::Path) -> tokio::net::UnixListener {
+    fn bind_local_deck(
+        socket: &std::path::Path,
+    ) -> (
+        tokio::net::UnixListener,
+        crate::local_deck::test_override::LocalDeckOverride,
+    ) {
         use std::os::unix::fs::PermissionsExt;
-        // SAFETY: under nextest this test owns its process, so no other thread
-        // is reading the environment here. See the module comment above.
-        unsafe { std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", socket) };
+        let local_deck = crate::local_deck::test_override::point_local_deck_at(socket);
         let listener = tokio::net::UnixListener::bind(socket).expect("bind the scripted deck");
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
             .expect("restate 0o600 on the socket inode");
-        listener
+        (listener, local_deck)
     }
 
     /// A short socket path in a fresh temp dir. Deliberately short — a Unix
@@ -2162,8 +2198,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_selection_move_during_a_stop_detaches_the_stopped_decks_session() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let (_dir, socket) = scratch_socket("dad-stop-race");
-        let listener = bind_local_deck(&socket);
+        let (listener, _local_deck) = bind_local_deck(&socket);
 
         // A fleet: the local (scripted) deck A plus one remote row B.
         let fleet = fleet_settings(&["build-box.example.com"]);
@@ -2293,8 +2332,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn an_attach_whose_deck_is_removed_mid_handshake_publishes_no_session() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let (_dir, socket) = scratch_socket("dad-attach-race");
-        let listener = bind_local_deck(&socket);
+        let (listener, _local_deck) = bind_local_deck(&socket);
 
         let fleet = fleet_settings(&["build-box.example.com"]);
         crate::dto::apply_settings_selection(&fleet);
@@ -2382,8 +2424,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn an_attach_queued_behind_the_gate_never_reaches_a_deck_removed_while_it_waited() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let (_dir, socket) = scratch_socket("dad-gate-race");
-        let listener = bind_local_deck(&socket);
+        let (listener, _local_deck) = bind_local_deck(&socket);
 
         let fleet = fleet_settings(&["build-box.example.com"]);
         crate::dto::apply_settings_selection(&fleet);
@@ -2441,7 +2486,8 @@ mod tests {
     // was never sent.
     // -----------------------------------------------------------------------
 
-    /// One real daemon over a scratch socket, bound by production code.
+    /// One real daemon over a scratch socket: the production attach server,
+    /// on a listener [`crate::test_listener::bind_owner_only`] made.
     #[cfg(unix)]
     struct FocusDeck {
         _dir: tempfile::TempDir,
@@ -2455,10 +2501,13 @@ mod tests {
     impl FocusDeck {
         fn start(tag: &str) -> Self {
             use dot_agent_deck::daemon_client::LocalEndpoint;
-            use dot_agent_deck::daemon_protocol::{bind_attach_listener, serve_attach};
+            use dot_agent_deck::daemon_protocol::serve_attach;
             let (dir, socket) = scratch_socket(tag);
             let registry = Arc::new(dot_agent_deck::agent_pty::AgentPtyRegistry::new());
-            let listener = bind_attach_listener(&socket).expect("bind the real attach socket");
+            // Owner-only without the process-umask flip `bind_attach_listener`
+            // does, which races sibling tests under a plain `cargo test`.
+            let listener = crate::test_listener::bind_owner_only(&socket)
+                .expect("bind the real attach socket");
             let server = {
                 let registry = Arc::clone(&registry);
                 tokio::spawn(async move {
@@ -2645,18 +2694,19 @@ mod tests {
     }
 
     /// Point the selected deck at `deck`'s socket, so [`establish`] with no
-    /// deck id attaches there — the production path a pane takes.
+    /// deck id attaches there — the production path a pane takes. The local
+    /// deck moves back when the returned guard drops; the selection stays
+    /// applied, so the caller holds `SELECTION_LOCK`.
     #[cfg(unix)]
-    fn select_local_deck(deck: &FocusDeck) {
-        // SAFETY: under nextest this test owns its process, so no other thread
-        // is reading the environment here. See `bind_local_deck`.
-        unsafe { std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &deck.socket) };
+    fn select_local_deck(deck: &FocusDeck) -> crate::local_deck::test_override::LocalDeckOverride {
+        let local_deck = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
         crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
         assert_eq!(
             crate::dto::selected_endpoint().identity(),
             deck.endpoint.identity(),
             "fixture: the selected deck is the real daemon under test"
         );
+        local_deck
     }
 
     /// Scenario: the desktop attaches a pane on deck A through the production
@@ -2667,6 +2717,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn every_attach_on_every_deck_names_the_one_desktop_client() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let desktop = crate::daemon_bridge::desktop_client_id();
         assert_eq!(desktop, crate::daemon_bridge::desktop_client_id());
         assert!(dot_agent_deck::daemon_protocol::is_valid_client_id(desktop));
@@ -2674,7 +2727,7 @@ mod tests {
         let deck_a = FocusDeck::start("dad-focus-id-a");
         let deck_b = FocusDeck::start("dad-focus-id-b");
         let (agent_a, agent_b) = (deck_a.spawn_agent("pane-a"), deck_b.spawn_agent("pane-b"));
-        select_local_deck(&deck_a);
+        let _local_deck = select_local_deck(&deck_a);
         let state = DesktopState::default();
 
         let channel = fixture_channel();
@@ -2733,6 +2786,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn gaining_window_focus_claims_focus_on_every_deck_with_a_viewer() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         use dot_agent_deck::daemon_client::{DaemonClient, generate_client_id};
         let desktop = crate::daemon_bridge::desktop_client_id();
         let (deck_a, deck_b, deck_c) = (
@@ -2806,6 +2862,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_deck_that_does_not_advertise_focus_gained_is_never_sent_the_claim() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         use dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS;
         let current = FocusDeck::start("dad-focus-cur");
         let lease = fixture_lease().await;
@@ -2857,6 +2916,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_claim_still_unsent_when_the_window_focus_changes_is_never_sent() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         use dot_agent_deck::daemon_protocol::CAP_FOCUS_GAINED;
         let lease = fixture_lease().await;
 
@@ -2920,10 +2982,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_pane_opened_while_the_window_is_focused_claims_focus_on_its_deck() {
+        // Every session publish revalidates against the applied selection, a
+        // process-global (issue #1078) — see `dto::SELECTION_LOCK`.
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let desktop = crate::daemon_bridge::desktop_client_id();
         let deck = FocusDeck::start("dad-focus-open");
         let agent = deck.spawn_agent("pane-open");
-        select_local_deck(&deck);
+        let _local_deck = select_local_deck(&deck);
         let state = DesktopState::default();
         let channel = fixture_channel();
 

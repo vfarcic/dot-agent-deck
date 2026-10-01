@@ -27,13 +27,20 @@ import {
 	buildDelegateArgv,
 	buildGetSeedArgv,
 	buildWorkDoneArgv,
-	DECK_BIN,
 	execFailureMessage,
 	piEventToAgentState,
+	resolveDeckBin,
 	SEED_DELIVER_AS,
 	seedToDeliver,
 	spawnFailureMessage,
 } from "./orchestrator.ts";
+
+/**
+ * The deck CLI this pane shells: the absolute path the spawning deck exported
+ * in `DOT_AGENT_DECK_EXE`, or the bare name for an older deck that did not
+ * (issue #1385). Read once — the value is fixed for the life of the process.
+ */
+const deckBin = resolveDeckBin(process.env);
 
 /**
  * Shell `dot-agent-deck <argv>` via Pi's exec helper. Throws a clear Error on a
@@ -47,11 +54,11 @@ async function runDeck(
 ) {
 	let outcome: { code: number; stdout: string; stderr: string; killed: boolean };
 	try {
-		outcome = await pi.exec(DECK_BIN, argv, { signal });
+		outcome = await pi.exec(deckBin, argv, { signal });
 	} catch (err) {
-		throw new Error(spawnFailureMessage(argv, err));
+		throw new Error(spawnFailureMessage(argv, err, deckBin));
 	}
-	const failure = execFailureMessage(argv, outcome);
+	const failure = execFailureMessage(argv, outcome, deckBin);
 	if (failure) {
 		throw new Error(failure);
 	}
@@ -143,14 +150,14 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		const argv = buildGetSeedArgv();
 		let outcome: { code: number; stdout: string; stderr: string; killed: boolean };
 		try {
-			outcome = await pi.exec(DECK_BIN, argv, { signal: ctx.signal });
+			outcome = await pi.exec(deckBin, argv, { signal: ctx.signal });
 		} catch {
 			// Spawn failure (missing binary / socket) — safety net covers it.
 			return;
 		}
 		// `get-seed` exits 0 even with no seed; a non-zero exit means the
 		// request failed, so treat it as "no seed" and let the fallback deliver.
-		if (execFailureMessage(argv, outcome)) {
+		if (execFailureMessage(argv, outcome, deckBin)) {
 			return;
 		}
 		const seed = seedToDeliver(outcome.stdout);

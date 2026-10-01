@@ -613,11 +613,12 @@ pub fn prepare_orchestrator_prompt(
 /// arrangement before PRD #819 M4 split the composer out.
 const TASK_SECTION_MARKER: &str = "\n## Your task\n\n";
 
-/// Read an existing orchestrator context file's own `## Your task` section and
-/// its attendance back off disk.
+/// Recover an orchestrator context's own `## Your task` section and its
+/// attendance from the file's `content`.
 ///
-/// A `None` task covers every case where there is nothing to carry forward: the
-/// file does not exist yet, cannot be read, or was written with no task (the
+/// A `None` task covers every case where there is nothing to carry forward:
+/// no file could be read (`content` is `None` — see [`reassert_orchestrator_prompt`]
+/// for which files are tried and how), or it was written with no task (the
 /// interactive `Ctrl+n` path, which never carries one).
 ///
 /// Exists so a re-assertion (compaction or `/clear`) can re-supply the SAME
@@ -633,15 +634,11 @@ const TASK_SECTION_MARKER: &str = "\n## Your task\n\n";
 /// because the composer always writes three more sections after the template and
 /// the task always follows the marker. Two degradations remain, both toward
 /// `Attended`, which is the direction that keeps a gate rather than removing
-/// one: a context file pruned before the re-arm, and a `prompt_template`
+/// one: no readable context file at the re-arm, and a `prompt_template`
 /// containing the literal `## Your task` marker (which already misdirects the
 /// task read today).
-///
-/// `file_path` is the context the re-arming tab was published with, or the
-/// compatibility mirror when the tab does not know its own (issue #1233; see
-/// [`reassert_orchestrator_prompt`]).
-fn read_back_context(file_path: &std::path::Path) -> (Option<String>, Attendance) {
-    let Ok(content) = std::fs::read_to_string(file_path) else {
+fn read_back_context(content: Option<&str>) -> (Option<String>, Attendance) {
+    let Some(content) = content else {
         return (None, Attendance::Attended);
     };
     let (before_task, task) = match content.split_once(TASK_SECTION_MARKER) {
@@ -649,7 +646,7 @@ fn read_back_context(file_path: &std::path::Path) -> (Option<String>, Attendance
             let task = after.trim();
             (before, (!task.is_empty()).then(|| task.to_string()))
         }
-        None => (content.as_str(), None),
+        None => (content, None),
     };
     let attendance = if before_task.ends_with(&composer_tail(task.is_some())) {
         Attendance::Unattended
@@ -657,6 +654,83 @@ fn read_back_context(file_path: &std::path::Path) -> (Option<String>, Attendance
         Attendance::Attended
     };
     (task, attendance)
+}
+
+/// The file name of `context_path` when it is exactly
+/// `<project_dir>/.dot-agent-deck/orchestrator-context-<32 hex>.md`, compared
+/// **lexically** (issue #1395 audit round 2).
+///
+/// Component-wise [`std::path::Path`] equality, so a doubled or trailing
+/// separator does not matter and a `..` does: `/p/x/../.dot-agent-deck/…` is not
+/// under `/p`. Nothing is resolved, so a symlink anywhere in the path is neither
+/// followed nor detected here — the read that uses the name
+/// ([`read_context_file`]) opens it relative to `project_dir`, which is what
+/// keeps a link from choosing the file. The [`CONTEXT_FILE_NAME`] mirror is
+/// never accepted: [`is_unique_context_file_name`] refuses it.
+pub(crate) fn own_context_file_name<'a>(
+    project_dir: &std::path::Path,
+    context_path: &'a std::path::Path,
+) -> Option<&'a str> {
+    let name = context_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| is_unique_context_file_name(n))?;
+    (context_path.parent() == Some(context_dir_of(project_dir).as_path())).then_some(name)
+}
+
+/// Read `<project_dir>/.dot-agent-deck/<name>` for a re-arm, **bounded on every
+/// platform, and on Unix never following a link at the last two components nor
+/// blocking on a non-regular file** (issue #1395 audit round 2).
+///
+/// On Unix: the project directory is opened once ([`open_project_dir`], which
+/// follows a symlinked project path as every other publish step does),
+/// `.dot-agent-deck` is opened relative to it with `O_NOFOLLOW | O_DIRECTORY`
+/// ([`open_context_dir`]), and `name` relative to that with
+/// `O_NOFOLLOW | O_NONBLOCK` — the flags [`crate::project_resolve`]'s own
+/// published-context read uses. `O_NONBLOCK` makes the open of a FIFO return
+/// at once instead of waiting for a writer; the `fstat` of the opened
+/// descriptor then refuses anything but a regular file, before a byte is read.
+/// The read is capped at [`MAX_CONTEXT_BYTES`], the bound every publish
+/// enforces, so a file this process or the daemon wrote always fits.
+///
+/// Off Unix the same checks are separate `symlink_metadata` lookups ahead of a
+/// path open, so an entry swapped between the two is not caught — the narrower
+/// guarantee [`open_context_dir`] already states for that platform. The size
+/// cap holds on both.
+fn read_context_file(project_dir: &std::path::Path, name: &str) -> std::io::Result<String> {
+    let max = MAX_CONTEXT_BYTES as u64;
+    let project = open_project_dir(project_dir)?;
+    let dir = open_context_dir(&project).map_err(|e| match e {
+        ContextPublishError::ContextDirUnusable(e) => e,
+        other => std::io::Error::other(other.detail()),
+    })?;
+    #[cfg(unix)]
+    let file = openat_file(
+        &dir,
+        &single_component(name)?,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    )?;
+    #[cfg(not(unix))]
+    let file = {
+        let _ = dir;
+        let path = context_dir_of(project_dir).join(name);
+        if !std::fs::symlink_metadata(&path)?.file_type().is_file() {
+            return Err(std::io::Error::other("not a regular file"));
+        }
+        std::fs::File::open(path)?
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    if metadata.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("longer than {max} bytes"),
+        ));
+    }
+    read_bounded(file, max)
 }
 
 /// Re-run `prepare_orchestrator_prompt` for a re-assertion (compaction or
@@ -684,25 +758,65 @@ fn read_back_context(file_path: &std::path::Path) -> (Option<String>, Attendance
 /// instead would re-arm this orchestration with whatever task another
 /// preparation in the same project last left there. The re-arm then publishes a
 /// **new** file — published files are never rewritten — and returns its path,
-/// which the tab keeps in place of `known`. `None` covers a tab whose path is
-/// unknown (one re-hydrated after a reattach, or opened by a daemon-side
-/// launch); it falls back to the compatibility mirror, which is exactly the
-/// pre-#1233 behaviour and races as it did. Giving those tabs their path is
-/// follow-up #1395.
+/// which the tab keeps in place of `known`. A tab re-hydrated after a reattach,
+/// or built from a live surface, gets its path from the daemon's record of its
+/// start role (issue #1395).
+///
+/// **Issue #1395 audit round 2: `known` is used only when it names a
+/// per-publish file directly under THIS tab's `cwd`** ([`own_context_file_name`]),
+/// and it is read through [`read_context_file`] — bounded, `O_NOFOLLOW`,
+/// regular files only — so neither a path naming another project's file nor a
+/// link or FIFO planted under the right name can supply the task. The mirror is
+/// read through the same function.
+///
+/// **The compatibility mirror is read in exactly two cases**: `known` is `None`
+/// (an older daemon, or a TUI-launched tab whose publish failed), or `known`
+/// names anything other than a per-publish file directly under this tab's
+/// `cwd` — a path that was never this tab's own. That is the pre-#1233
+/// behaviour, and it races as it did: the mirror may hold another
+/// preparation's task. With no readable mirror either, the re-arm carries no
+/// task and degrades to `Attended` ([`read_back_context`]).
+///
+/// **A valid own path whose read fails never falls back to the mirror** —
+/// whether the file is missing (pruned by the 14-day sweep or by hand) or
+/// refused (a link, a FIFO, a directory, over the cap). The tab knows which
+/// preparation it belongs to, and the mirror holds the latest publish in the
+/// project, which may be another orchestration's brief: re-arming from it would
+/// hand this coordinator someone else's task (#1233's race). The re-arm then
+/// carries no task and degrades to `Attended`, as a missing own file did before
+/// the mirror fallback existed, and logs a `warn!` naming the reason.
 pub fn reassert_orchestrator_prompt(
     config: &OrchestrationConfig,
     cwd: &str,
     known: Option<&std::path::Path>,
 ) -> Option<PublishedPrompt> {
-    let mirror;
-    let source = match known {
-        Some(path) => path,
-        None => {
-            mirror = context_dir_of(std::path::Path::new(cwd)).join(CONTEXT_FILE_NAME);
-            mirror.as_path()
+    let project_dir = std::path::Path::new(cwd);
+    let own = known.and_then(|path| {
+        let name = own_context_file_name(project_dir, path);
+        if name.is_none() {
+            tracing::warn!(
+                path = %path.display(),
+                cwd,
+                "re-arm: the tab's context path is not a context file of its own project; \
+                 reading the compatibility mirror instead"
+            );
         }
+        name.map(|name| (path, name))
+    });
+    let content = match own {
+        Some((path, name)) => read_context_file(project_dir, name)
+            .inspect_err(|e| {
+                tracing::warn!(
+                    path = %path.display(),
+                    reason = %e,
+                    "re-arm: could not read the tab's own context file; carrying no task \
+                     (the compatibility mirror may hold another orchestration's brief)"
+                );
+            })
+            .ok(),
+        None => read_context_file(project_dir, CONTEXT_FILE_NAME).ok(),
     };
-    let (task, attendance) = read_back_context(source);
+    let (task, attendance) = read_back_context(content.as_deref());
     prepare_orchestrator_prompt(config, cwd, task.as_deref(), attendance)
 }
 
@@ -735,8 +849,10 @@ pub const CONTEXT_DIR_NAME: &str = ".dot-agent-deck";
 /// bytes, best effort ([`mirror_orchestrator_context`]), for readers that
 /// predate #1233: an older TUI's compaction re-arm reads the task back from here,
 /// and so do role commands and templates that hard-code the path. So does this
-/// build's re-arm of a tab whose own path it does not know
-/// ([`reassert_orchestrator_prompt`] with `known: None`). Within one process
+/// build's re-arm of a tab whose own file it does not know
+/// ([`reassert_orchestrator_prompt`]: `known` is `None` or names a file outside
+/// the tab's project — a known own file that cannot be read is NOT replaced by
+/// this one). Within one process
 /// it holds the latest publish mirrored into it — a mirror write never lands
 /// over a later publish's from the same process ([`mirror_into`]) — but the
 /// daemon, a TUI's `Ctrl+n` and `dispatch --orchestration` each mirror from
@@ -1065,13 +1181,114 @@ type ContextDirGuard = std::fs::File;
 #[derive(Debug)]
 struct ContextDirGuard;
 
+/// The project directory a publish writes under, **held open** so that
+/// `.dot-agent-deck` is created and opened relative to it rather than by
+/// re-resolving the project pathname (issue #1395 item 5).
+///
+/// On Unix an open directory descriptor; on other platforms the path itself,
+/// for the narrower guarantee [`open_context_dir`] states.
+#[cfg(unix)]
+type ProjectDirGuard = std::fs::File;
+#[cfg(not(unix))]
+#[derive(Debug)]
+struct ProjectDirGuard(std::path::PathBuf);
+
+/// Open the project directory for [`create_context_dir`], [`open_context_dir`]
+/// and the git-exclude discovery to work relative to.
+///
+/// `O_DIRECTORY` but **not** `O_NOFOLLOW`: a project reached through a
+/// symlinked path (a TUI started in a linked checkout) is the project, and the
+/// path-based open this replaces followed every component of it too — what
+/// changes is only that the lookup happens **once**, here, and not again for
+/// each later step. `O_CLOEXEC` so the descriptor never reaches a spawned
+/// child.
+#[cfg(unix)]
+fn open_project_dir(project_dir: &std::path::Path) -> std::io::Result<ProjectDirGuard> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(project_dir)
+}
+
+#[cfg(not(unix))]
+fn open_project_dir(project_dir: &std::path::Path) -> std::io::Result<ProjectDirGuard> {
+    Ok(ProjectDirGuard(project_dir.to_path_buf()))
+}
+
+/// `openat(2)` relative to `dir`, answered as an owned `File`. `O_CLOEXEC` is
+/// always added.
+#[cfg(unix)]
+fn openat_file(
+    dir: &std::fs::File,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+    mode: libc::c_uint,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    // SAFETY: `dir` is an open descriptor for the duration of the call and
+    // `name` is NUL-terminated. The mode is passed as the promoted `c_uint` the
+    // variadic `openat` reads, and is ignored without `O_CREAT`.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC,
+            mode,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` just returned this descriptor and nothing else owns it.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// `fstatat(2)` of the entry `name` of `dir` itself — a symlink is reported as
+/// a symlink, never followed.
+#[cfg(unix)]
+fn fstatat_nofollow(dir: &std::fs::File, name: &std::ffi::CStr) -> std::io::Result<libc::stat> {
+    use std::os::fd::AsRawFd as _;
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `st` is written by a successful `fstatat` and read only then.
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fstatat` returned 0, so it filled `st`.
+    Ok(unsafe { st.assume_init() })
+}
+
+/// The file-type bits of a `stat`, for comparison against `libc::S_IF*`.
+#[cfg(unix)]
+fn file_type_bits(st: &libc::stat) -> libc::mode_t {
+    st.st_mode & libc::S_IFMT
+}
+
+/// [`CONTEXT_DIR_NAME`] as a C string, for the `*at` calls on the project
+/// descriptor.
+#[cfg(unix)]
+fn context_dir_name_c() -> std::ffi::CString {
+    std::ffi::CString::new(CONTEXT_DIR_NAME).expect("CONTEXT_DIR_NAME has no NUL")
+}
+
 /// Create `<project>/.dot-agent-deck` **owner-only** if it is not there.
 ///
-/// `DirBuilder::mode(0o700)` rather than a `chmod` afterwards: the mode is
-/// applied by `mkdir(2)` itself, so there is no window in which the directory
-/// exists group- or world-readable. A permissive umask cannot widen it either —
-/// a umask only *removes* bits, so the result is `0o700 & !umask`, which is
-/// owner-only or narrower whatever the caller's umask is.
+/// On Unix this is `mkdirat(2)` relative to the held project descriptor with
+/// mode `0o700`: the mode is applied by the `mkdir` itself, so there is no
+/// window in which the directory exists group- or world-readable. A permissive
+/// umask cannot widen it either — a umask only *removes* bits, so the result is
+/// `0o700 & !umask`, which is owner-only or narrower whatever the caller's
+/// umask is. `mkdirat` never follows a symlink at the final component: an
+/// existing entry of any kind, a symlink included, is `EEXIST`, and it is
+/// [`open_context_dir`]'s `O_NOFOLLOW` that then refuses the symlink.
 ///
 /// **A directory that already exists is left exactly as it is by THIS
 /// function** — it re-permissions nothing, so the owner-only claim here is about
@@ -1090,20 +1307,25 @@ struct ContextDirGuard;
 /// Non-recursive on purpose: the project directory is the caller's to establish
 /// (the daemon verb canonicalises it first, which proves it exists), and
 /// `create_dir_all` would silently invent an entire chain for a typo.
-fn create_context_dir(dir: &std::path::Path) -> Result<(), ContextPublishError> {
-    // The only mutation is the `.mode()` call below, which is Unix-only, so on a
-    // platform without `DirBuilderExt` the binding is genuinely never mutated and
-    // `unused_mut` fires. Allowed there rather than restructured: dropping the
-    // `mut` would take the owner-only-at-creation mode with it, and that is PRD
-    // #819's audit fix, not a lint's business.
-    #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
+#[cfg(unix)]
+fn create_context_dir(project: &ProjectDirGuard) -> Result<(), ContextPublishError> {
+    use std::os::fd::AsRawFd as _;
+    let name = context_dir_name_c();
+    // SAFETY: an open directory descriptor and a NUL-terminated component.
+    if unsafe { libc::mkdirat(project.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
+        return Ok(());
     }
-    match builder.create(dir) {
+    match std::io::Error::last_os_error() {
+        e if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        e => Err(ContextPublishError::ContextDirUnusable(e)),
+    }
+}
+
+/// The non-Unix arm of [`create_context_dir`]: a plain path `mkdir`, with no
+/// mode applied — see [`open_context_dir`]'s narrower guarantee.
+#[cfg(not(unix))]
+fn create_context_dir(project: &ProjectDirGuard) -> Result<(), ContextPublishError> {
+    match std::fs::create_dir(project.0.join(CONTEXT_DIR_NAME)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(ContextPublishError::ContextDirUnusable(e)),
@@ -1112,12 +1334,17 @@ fn create_context_dir(dir: &std::path::Path) -> Result<(), ContextPublishError> 
 
 /// Open `.dot-agent-deck`, refusing a symlinked final component.
 ///
-/// On Unix the open carries `O_NOFOLLOW | O_DIRECTORY`, following
+/// On Unix the open is `openat(2)` of the single name [`CONTEXT_DIR_NAME`]
+/// relative to the held project descriptor (issue #1395 item 5), carrying
+/// `O_NOFOLLOW | O_DIRECTORY`, following
 /// [`crate::project_resolve::read_config_file`]'s precedent: the refusal is a
-/// property of the `open(2)` itself rather than of a check-then-open pair, and
+/// property of the open itself rather than of a check-then-open pair, and
 /// `O_DIRECTORY` additionally refuses a `.dot-agent-deck` that is a regular
-/// file. The handle is kept so the publish can compare it against the path
-/// afterwards.
+/// file. Because the lookup starts from the project **object**, a project path
+/// renamed and replaced after [`open_project_dir`] cannot change which
+/// `.dot-agent-deck` this opens. `dir` is only the pathname the result is
+/// announced under. The handle is kept so the publish can compare it against
+/// that path afterwards.
 ///
 /// **On a platform without those flags the guarantee is narrower**, and is
 /// stated rather than papered over: the check is a separate `symlink_metadata`
@@ -1147,40 +1374,43 @@ fn create_context_dir(dir: &std::path::Path) -> Result<(), ContextPublishError> 
 /// Windows; it is deliberately not done here, because Windows desktop is out of
 /// PRD #819's scope and a refusal is a true statement where a half-built DACL
 /// would be a false one.
-fn open_context_dir(dir: &std::path::Path) -> Result<ContextDirGuard, ContextPublishError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-            .open(dir)
-            .map_err(|e| {
-                // Consulting the path here cannot reintroduce a TOCTOU the open
-                // handle exists to avoid: the open has ALREADY failed, so
-                // nothing is written on this branch either way, and the only
-                // thing a race can change is the wording of an error returned
-                // regardless. Same recovery, for the same reason, as
-                // `project_resolve::read_config_file`.
-                if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
-                    ContextPublishError::ContextDirIsSymlink
-                } else {
-                    ContextPublishError::ContextDirUnusable(e)
-                }
-            })
-    }
-    #[cfg(not(unix))]
-    {
-        if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(ContextPublishError::ContextDirIsSymlink);
+#[cfg(unix)]
+fn open_context_dir(project: &ProjectDirGuard) -> Result<ContextDirGuard, ContextPublishError> {
+    let name = context_dir_name_c();
+    openat_file(
+        project,
+        &name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        0,
+    )
+    .map_err(|e| {
+        // Consulting the entry again here cannot reintroduce a TOCTOU the
+        // open handle exists to avoid: the open has ALREADY failed, so
+        // nothing is written on this branch either way, and the only thing
+        // a race can change is the wording of an error returned regardless.
+        // Same recovery, for the same reason, as
+        // `project_resolve::read_config_file` — relative to the same held
+        // project descriptor, so it describes the entry the open refused.
+        if fstatat_nofollow(project, &name).is_ok_and(|st| file_type_bits(&st) == libc::S_IFLNK) {
+            ContextPublishError::ContextDirIsSymlink
+        } else {
+            ContextPublishError::ContextDirUnusable(e)
         }
-        if !std::fs::metadata(dir).is_ok_and(|m| m.is_dir()) {
-            return Err(ContextPublishError::ContextDirUnusable(
-                std::io::Error::other(format!("{CONTEXT_DIR_NAME} is not a directory")),
-            ));
-        }
-        Ok(ContextDirGuard)
+    })
+}
+
+#[cfg(not(unix))]
+fn open_context_dir(project: &ProjectDirGuard) -> Result<ContextDirGuard, ContextPublishError> {
+    let dir = project.0.join(CONTEXT_DIR_NAME);
+    if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(ContextPublishError::ContextDirIsSymlink);
     }
+    if !std::fs::metadata(&dir).is_ok_and(|m| m.is_dir()) {
+        return Err(ContextPublishError::ContextDirUnusable(
+            std::io::Error::other(format!("{CONTEXT_DIR_NAME} is not a directory")),
+        ));
+    }
+    Ok(ContextDirGuard)
 }
 
 /// Whether the directory `guard` was opened on is still the one at `dir`.
@@ -1211,30 +1441,53 @@ fn context_dir_unchanged(_guard: &ContextDirGuard, _dir: &std::path::Path) -> bo
 
 /// The `.dot-agent-deck` directory a publish checked, **held open**, and the
 /// handle the later creates, renames and removals of context and mirror files
-/// in it go through (issue #1233 audit). The retention sweep is the exception,
-/// below.
+/// in it — and the publish's retention sweep — go through (issue #1233 audit,
+/// issue #1395).
 ///
 /// On Unix every operation is `*at(2)` relative to the descriptor
 /// [`open_context_dir`] opened with `O_NOFOLLOW | O_DIRECTORY` — `openat` with
 /// `O_CREAT | O_EXCL | O_NOFOLLOW`, `renameat`, `unlinkat`, `fstatat` with
 /// `AT_SYMLINK_NOFOLLOW` — and each takes a **single name**, never a path. So
-/// once the checks have passed, no mutating operation through this handle
-/// re-traverses the project pathname: a project renamed and replaced under a shared parent
+/// once the checks have passed, no operation through this handle re-traverses
+/// the project pathname: a project renamed and replaced under a shared parent
 /// afterwards cannot redirect a create, the mirror's rename, a failure's
-/// cleanup or a withdrawal into another directory. Before the
-/// audit each of those joined a name onto the path again, after the identity
-/// check, which is exactly the window it named.
+/// cleanup, a withdrawal or the sweep ([`sweep_coordination_files`], which
+/// lists the directory through `fdopendir` on its own `openat(".")` of this
+/// descriptor) into another directory. Before the #1233 audit each of those
+/// joined a name onto the path again, after the identity check, which is
+/// exactly the window it named; the sweep did until #1395.
 ///
-/// **What it does not anchor.** The descriptor itself is opened by pathname,
-/// so which `.dot-agent-deck` it is still depends on the project path at that
-/// moment; [`context_dir_unchanged`] then *detects* (does not prevent) the path
-/// moving before the write, and refuses rather than announcing a path that
-/// names another directory. The publish's housekeeping still works by path:
-/// the retention sweep ([`sweep_coordination_files`]) and the clone-local git
-/// exclude ([`ensure_git_excludes_context_dir`]). Off Unix the handle is the
-/// path and every operation is a path operation — the narrower guarantee
-/// [`open_context_dir`] states, and the reason the daemon verb is refused
-/// there.
+/// **How the descriptor is reached.** The publish resolves the project
+/// pathname once, in [`open_project_dir`], and holds that directory open;
+/// `.dot-agent-deck` is then created with `mkdirat` and opened with `openat`
+/// relative to it (issue #1395 item 5), and the publish's git-exclude
+/// housekeeping ([`ensure_git_excludes_in`]) starts from the same held project
+/// descriptor rather than from the path.
+///
+/// **What it still does not anchor, stated precisely.**
+///
+/// * **The project open itself is by pathname**, and follows symlinks in every
+///   component, as the path-based open it replaced did. A project path swapped
+///   *before* [`open_project_dir`] runs is therefore not prevented from
+///   choosing which project this is. A swap *after* it no longer changes which
+///   `.dot-agent-deck` is opened, and [`context_dir_unchanged`] still
+///   *detects* the announced path no longer naming the held directory before
+///   the write, refusing rather than announcing a path that names another one.
+/// * **The git exclude follows the repository's own pointers by name.** The
+///   walk up to `.git` is `openat(.., "..")` from the held project object, but
+///   a linked worktree's `gitdir:` file and its `commondir` name a path, and
+///   [`open_pointed_dir`] resolves an absolute one from the root and a relative
+///   one from the held directory it was read in, following intermediate
+///   symlinks as git does.
+/// * **Within the held directory, a stat and the removal it justifies are two
+///   calls.** An entry replaced by another of the same name between the sweep's
+///   `fstatat` and its `unlinkat` is removed in its place; doing that needs
+///   write access to the directory, from which
+///   [`ensure_context_dir_owner_writable_only`] removes group and other.
+///
+/// Off Unix the handle is the path and every operation is a path operation —
+/// the narrower guarantee [`open_context_dir`] states, and the reason the
+/// daemon verb is refused there.
 #[derive(Clone)]
 pub struct ContextDir {
     path: std::path::PathBuf,
@@ -1355,23 +1608,7 @@ impl ContextDir {
     /// followed), or `None` when there is none.
     #[cfg(unix)]
     fn identity_of(&self, name: &str) -> Option<crate::prep_token::InodeIdentity> {
-        use std::os::fd::AsRawFd as _;
-        let name = single_component(name).ok()?;
-        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: `st` is written by a successful `fstatat` and read only then.
-        let rc = unsafe {
-            libc::fstatat(
-                self.guard.as_raw_fd(),
-                name.as_ptr(),
-                st.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if rc != 0 {
-            return None;
-        }
-        // SAFETY: `fstatat` returned 0, so it filled `st`.
-        let st = unsafe { st.assume_init() };
+        let st = self.stat_of(name).ok()?;
         // The same widening `MetadataExt::{dev, ino}` apply, so this compares
         // equal to `prep_token::inode_identity` of the same file.
         #[allow(clippy::unnecessary_cast)]
@@ -1379,6 +1616,13 @@ impl ContextDir {
             dev: st.st_dev as u64,
             ino: st.st_ino as u64,
         })
+    }
+
+    /// `fstatat` of the entry `name` of the held directory, a symlink reported
+    /// as itself rather than followed.
+    #[cfg(unix)]
+    fn stat_of(&self, name: &str) -> std::io::Result<libc::stat> {
+        fstatat_nofollow(&self.guard, &single_component(name)?)
     }
 
     #[cfg(not(unix))]
@@ -1618,25 +1862,43 @@ fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs::Fi
 
 /// Every check a write into `.dot-agent-deck` makes before it creates anything:
 /// the size bound, the owner-only directory creation, the symlink-refusing open
-/// and the group/other-write repair. Answers the directory, held open, that
-/// every later operation goes through ([`ContextDir`]).
+/// and the group/other-write repair. Answers the project directory and the
+/// directory under it, both held open: every later operation on the context
+/// directory goes through the second ([`ContextDir`]), and the publish's
+/// git-exclude housekeeping starts from the first.
+///
+/// The project pathname is resolved **once**, by [`open_project_dir`]; the
+/// create and the open of `.dot-agent-deck` are relative to that descriptor
+/// (issue #1395 item 5).
 fn open_publish_dir(
     project_dir: &std::path::Path,
     content: &str,
-) -> Result<ContextDir, ContextPublishError> {
+) -> Result<(ProjectDirGuard, ContextDir), ContextPublishError> {
     if content.len() > MAX_CONTEXT_BYTES {
         return Err(ContextPublishError::ContextTooLarge(content.len()));
     }
-    let dir = project_dir.join(CONTEXT_DIR_NAME);
-    create_context_dir(&dir)?;
-    let guard = open_context_dir(&dir)?;
+    let project = open_project_dir(project_dir).map_err(ContextPublishError::ContextDirUnusable)?;
+    let dir = open_publish_dir_in(&project, project_dir)?;
+    Ok((project, dir))
+}
+
+/// [`open_publish_dir`] past the project open: create and open
+/// `.dot-agent-deck` relative to `project`, repair its mode, and hold it.
+/// `project_dir` is the pathname the result is announced under and that
+/// [`ContextDir::unchanged`] later compares against — never what is resolved.
+fn open_publish_dir_in(
+    project: &ProjectDirGuard,
+    project_dir: &std::path::Path,
+) -> Result<ContextDir, ContextPublishError> {
+    create_context_dir(project)?;
+    let guard = open_context_dir(project)?;
     // Before anything is created inside it: an existing directory that group or
     // other can write has those bits cleared on the descriptor we hold, and is
     // refused only if that fails — because a 0600 file's directory entry is only
     // as protected as the directory holding it.
     ensure_context_dir_owner_writable_only(&guard)?;
     Ok(ContextDir {
-        path: dir,
+        path: context_dir_of(project_dir),
         guard: std::sync::Arc::new(guard),
     })
 }
@@ -1730,7 +1992,7 @@ pub fn publish_orchestrator_context(
     project_dir: &std::path::Path,
     content: &str,
 ) -> Result<PublishedContext, ContextPublishError> {
-    let dir = open_publish_dir(project_dir, content)?;
+    let (project, dir) = open_publish_dir(project_dir, content)?;
     let name = unique_context_file_name();
     let final_path = dir.path().join(&name);
     let publish_seq = next_publish_seq();
@@ -1747,7 +2009,7 @@ pub fn publish_orchestrator_context(
 
     match outcome {
         Ok((identity, file)) => {
-            tidy_context_dir(project_dir, dir.path());
+            tidy_context_dir(&project, &dir);
             Ok(PublishedContext {
                 path: final_path,
                 identity,
@@ -1808,6 +2070,135 @@ pub fn withdraw_published_context(published: &PublishedContext) {
     }
 }
 
+/// Whether `name` has the exact shape [`unique_context_file_name`] mints:
+/// [`CONTEXT_FILE_PREFIX`], 32 lowercase hex digits, `.md`.
+///
+/// Narrower than [`is_sweepable_coordination_name`] on purpose: this gates
+/// [`remove_ended_orchestration_context`], which acts on a recorded path rather
+/// than on an age, so it accepts nothing but a per-publish context — never the
+/// [`CONTEXT_FILE_NAME`] mirror, a task file, or anything else under the dot
+/// directory.
+pub(crate) fn is_unique_context_file_name(name: &str) -> bool {
+    name.strip_prefix(CONTEXT_FILE_PREFIX)
+        .and_then(|rest| rest.strip_suffix(".md"))
+        .is_some_and(|hex| {
+            hex.len() == 32
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+/// Why [`remove_ended_orchestration_context`] removed nothing.
+#[derive(Debug)]
+pub enum ContextRemovalError {
+    /// The path is not `<project>/.dot-agent-deck/orchestrator-context-<32 hex>.md`.
+    NotAContextFile,
+    /// Opening the project or its `.dot-agent-deck` failed.
+    Dir(ContextPublishError),
+    /// The entry is there but is not a regular file.
+    NotARegularFile,
+    /// The unlink itself failed (a missing entry is not an error).
+    Unlink(std::io::Error),
+}
+
+impl std::fmt::Display for ContextRemovalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAContextFile => f.write_str("not a per-publish orchestrator context path"),
+            Self::Dir(e) => write!(f, "{e}"),
+            Self::NotARegularFile => f.write_str("the entry is not a regular file"),
+            Self::Unlink(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Delete the per-publish context an orchestration was started with, once
+/// that orchestration has ended (issue #1395 item 2).
+///
+/// `context_path` is the path the daemon recorded from its own preparation
+/// binding ([`crate::state::AppState::record_orchestration_context`]), never a
+/// value a client supplied — and it is validated anyway, because this deletes a
+/// file: the file name must be [`is_unique_context_file_name`] and its parent
+/// must be named [`CONTEXT_DIR_NAME`]. The [`CONTEXT_FILE_NAME`] mirror
+/// therefore can never be removed here.
+///
+/// The removal goes through the same held-descriptor discipline as the publish:
+/// the project directory is opened once, `.dot-agent-deck` is opened relative
+/// to it with `O_NOFOLLOW | O_DIRECTORY`, the entry is `fstatat`ed without
+/// following and must be a regular file, and the unlink is an `unlinkat` of that
+/// single name. Nothing is created and no mode is repaired.
+///
+/// **Why deleting without a repair is safe enough.** The `fstatat` and the
+/// `unlinkat` are two calls, so the entry can be replaced between them — but
+/// only by an account that can write `.dot-agent-deck`. On Unix the publish
+/// that wrote this file ran [`ensure_context_dir_owner_writable_only`] on the
+/// same directory first, so as of that publish group and other could not write
+/// it; this function neither re-checks nor repairs that, so a mode widened
+/// since the last publish widens the window with it. A replacement cannot turn
+/// the removal into anything but the removal of one name in that directory:
+/// `unlinkat` with no flags removes a symlink itself rather than its target and
+/// fails on a directory. Off Unix there is no mode model and no such bound.
+///
+/// A missing file is success: the 14-day sweep, or the user, got there first.
+/// Whether another live orchestration still references the file is the
+/// caller's question to answer, under the state lock, before calling this —
+/// see [`crate::state::AppState::take_ended_orchestration_context`].
+///
+/// **Blocking.** Called off the state lock, from a blocking task.
+pub fn remove_ended_orchestration_context(
+    context_path: &std::path::Path,
+) -> Result<(), ContextRemovalError> {
+    let name = context_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| is_unique_context_file_name(n))
+        .ok_or(ContextRemovalError::NotAContextFile)?;
+    let context_dir = context_path
+        .parent()
+        .filter(|dir| dir.file_name() == Some(std::ffi::OsStr::new(CONTEXT_DIR_NAME)))
+        .ok_or(ContextRemovalError::NotAContextFile)?;
+    let project_dir = context_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or(ContextRemovalError::NotAContextFile)?;
+    let project = open_project_dir(project_dir)
+        .map_err(|e| ContextRemovalError::Dir(ContextPublishError::ContextDirUnusable(e)))?;
+    let guard = match open_context_dir(&project) {
+        Ok(guard) => guard,
+        // No `.dot-agent-deck` at all: nothing left to remove.
+        Err(ContextPublishError::ContextDirUnusable(e))
+            if e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(ContextRemovalError::Dir(e)),
+    };
+    let dir = ContextDir {
+        path: context_dir.to_path_buf(),
+        guard: std::sync::Arc::new(guard),
+    };
+    #[cfg(unix)]
+    match dir.stat_of(name) {
+        Ok(st) if file_type_bits(&st) == libc::S_IFREG => {}
+        Ok(_) => return Err(ContextRemovalError::NotARegularFile),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(ContextRemovalError::Unlink(e)),
+    }
+    #[cfg(not(unix))]
+    match std::fs::symlink_metadata(context_dir.join(name)) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => return Err(ContextRemovalError::NotARegularFile),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(ContextRemovalError::Unlink(e)),
+    }
+    match dir.unlink(name) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ContextRemovalError::Unlink(e)),
+    }
+}
+
 /// Refresh the fixed [`CONTEXT_FILE_NAME`] with `content`, **best effort**
 /// (issue #1233's compatibility mirror).
 ///
@@ -1815,14 +2206,14 @@ pub fn withdraw_published_context(published: &PublishedContext) {
 /// bytes. A failure logs a `warn!` and is not returned: the launch's own
 /// coordinator is pointed at its own file, not at the mirror, so it is no
 /// reason to fail a launch whose own file is already published — though a
-/// reader of the mirror, this build's re-arm of a tab whose path it does not
-/// know included, then gets an older publish's task. See [`CONTEXT_FILE_NAME`] for who still reads it.
+/// reader of the mirror, this build's re-arm of a tab whose own file it does
+/// not know included, then gets an older publish's task. See [`CONTEXT_FILE_NAME`] for who still reads it.
 ///
 /// **Blocking.** Async callers go through [`crate::project_resolve::run_bounded`].
 pub fn mirror_orchestrator_context(project_dir: &std::path::Path, content: &str) {
     let publish_seq = next_publish_seq();
     match open_publish_dir(project_dir, content) {
-        Ok(dir) => mirror_into(&dir, publish_seq, content),
+        Ok((_, dir)) => mirror_into(&dir, publish_seq, content),
         Err(e) => tracing::warn!(
             project = %project_dir.display(),
             reason = %e,
@@ -1953,7 +2344,8 @@ fn mirror_order_slot(key: MirrorDirKey) -> std::sync::Arc<std::sync::Mutex<u64>>
 /// reply carries does not read it: it names the per-preparation file this
 /// preparation published before answering. The mirror serves only
 /// compatibility readers — a pre-#1233 TUI's compaction re-arm, a TUI tab
-/// hydrated from the daemon's records without a path (#1395), and role
+/// whose path is unknown (hydrated from an older daemon's records, or built
+/// from a live orchestration surface), and role
 /// commands or templates that hard-code the fixed path.
 #[derive(Debug)]
 pub struct PendingMirror {
@@ -2320,8 +2712,10 @@ pub struct SweepReport {
 ///   residual, stated: a coordinator that re-reads its own file on its own
 ///   initiative more than the window after its last publish, with no re-arm in
 ///   between (a re-arm publishes a fresh file), finds it gone. It then reads
-///   nothing rather than something wrong. Deleting them when the orchestration
-///   ends is follow-up #1395.
+///   nothing rather than something wrong. A daemon-started orchestration's file
+///   is also deleted when the orchestration ends
+///   ([`remove_ended_orchestration_context`], issue #1395); this sweep is the
+///   backstop for every file that path does not reach.
 /// * the mirror's own leftover temp files, `.orchestrator-context.md.<pid>.<seq>.tmp`,
 ///   which are removed on a failed mirror write but survive a process killed
 ///   between the create and the rename.
@@ -2343,25 +2737,40 @@ pub(crate) fn is_sweepable_coordination_name(name: &str) -> bool {
     name.ends_with(".md")
 }
 
-/// Remove coordination files in `dir` last modified more than `keep` before
-/// `now` (issue #329 §3).
+/// Remove coordination files in the held directory `dir` last modified more
+/// than `keep` before `now` (issue #329 §3).
 ///
 /// **This deletes files, so what it will not touch is stated as rules and
 /// asserted at runtime rather than left to reading.** It is non-recursive (one
-/// `read_dir`, no descent); it consults `symlink_metadata` and acts only on
-/// **regular files**, so a directory is never removed and a symlink is never
-/// followed *or* removed; it removes only names
+/// directory listing, no descent); it stats each entry without following it
+/// and acts only on **regular files**, so a directory is never removed and a
+/// symlink is never followed *or* removed; it removes only names
 /// [`is_sweepable_coordination_name`] accepts; it never removes
 /// [`CONTEXT_FILE_NAME`]; and it removes nothing whose mtime is inside the
 /// window or unreadable. A file whose mtime is in the future is kept — a clock
 /// that ran backwards must not read as "ancient".
+///
+/// **Through the held descriptor, not the pathname (issue #1395 item 4).** On
+/// Unix the listing, the per-entry stat and the removal are all relative to the
+/// descriptor the publish opened and checked: the listing is a fresh
+/// `openat(dir, ".")` handed to `fdopendir`, each entry is `fstatat`ed with
+/// `AT_SYMLINK_NOFOLLOW`, and each removal is `unlinkat` of that single name.
+/// So a `.dot-agent-deck` renamed away and replaced — by a symlink to another
+/// directory, say — after the publish cannot redirect the sweep into the
+/// replacement. What remains is the gap every stat-then-unlink pair has within
+/// one directory: an entry swapped for another file **of the same name, inside
+/// the held directory**, between the `fstatat` and the `unlinkat` is removed in
+/// its place. Doing that needs write access to that directory, from which
+/// [`ensure_context_dir_owner_writable_only`] removes group and other. Off Unix
+/// the sweep is path-based, as [`open_context_dir`]'s narrower guarantee
+/// states.
 ///
 /// **Best-effort by construction.** Every failure is counted and none is
 /// returned: the caller has just published an orchestrator context successfully,
 /// and housekeeping that could not run is not a reason to fail a launch that
 /// did.
 pub fn sweep_coordination_files(
-    dir: &std::path::Path,
+    dir: &ContextDir,
     keep: std::time::Duration,
     now: std::time::SystemTime,
 ) -> SweepReport {
@@ -2372,26 +2781,177 @@ pub fn sweep_coordination_files(
     report
 }
 
+/// A listing of the held directory, read with `readdir(3)` from a descriptor of
+/// its own (issue #1395 item 4).
+///
+/// The descriptor is `openat(held, ".", O_DIRECTORY)` rather than a `dup` of
+/// the held one: a `dup` shares the open file description, and with it the
+/// directory read position, with every other clone of the [`ContextDir`] —
+/// so two sweeps, or a sweep and a later one, would each resume wherever the
+/// other left off. `"."` resolved relative to the held descriptor is that same
+/// directory object, whatever its pathname names by now.
+///
+/// Yields each entry's name except `.` and `..`. **A `readdir` failure ends
+/// the listing** rather than being reported: telling it apart from the end of
+/// the stream needs `errno` cleared first, which `libc` exposes under a
+/// different name on each Unix. For a best-effort sweep the difference is only
+/// which entries this window reached; a short window restarts the rotation
+/// from zero on the next publish either way.
+#[cfg(unix)]
+struct HeldDirListing(std::ptr::NonNull<libc::DIR>);
+
+#[cfg(unix)]
+impl HeldDirListing {
+    fn open(dir: &ContextDir) -> std::io::Result<Self> {
+        use std::os::fd::IntoRawFd as _;
+        let fresh = openat_file(&dir.guard, c".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let fd = fresh.into_raw_fd();
+        // SAFETY: `fd` is an open directory descriptor we own; on success
+        // `fdopendir` takes ownership of it and `closedir` (in `Drop`) closes it.
+        let stream = unsafe { libc::fdopendir(fd) };
+        match std::ptr::NonNull::new(stream) {
+            Some(stream) => Ok(Self(stream)),
+            None => {
+                let e = std::io::Error::last_os_error();
+                // SAFETY: `fdopendir` failed, so `fd` is still ours to close.
+                unsafe { libc::close(fd) };
+                Err(e)
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Iterator for HeldDirListing {
+    type Item = std::ffi::CString;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // SAFETY: `self.0` is an open `DIR*` owned by this value. The entry
+            // it returns is valid until the next `readdir`/`closedir` on the same
+            // stream, and its name is copied out before either.
+            let entry = unsafe { libc::readdir(self.0.as_ptr()) };
+            if entry.is_null() {
+                return None;
+            }
+            // SAFETY: `d_name` is a NUL-terminated name inside `*entry`.
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            return Some(name.to_owned());
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HeldDirListing {
+    fn drop(&mut self) {
+        // SAFETY: the stream is open and owned by this value; it is not used
+        // again after this.
+        unsafe { libc::closedir(self.0.as_ptr()) };
+    }
+}
+
+/// A `stat`'s modification time as a `SystemTime`, or `None` when it cannot be
+/// represented.
+#[cfg(unix)]
+fn stat_mtime(st: &libc::stat) -> Option<std::time::SystemTime> {
+    #[allow(clippy::unnecessary_cast)]
+    let (secs, nanos) = (st.st_mtime as i64, st.st_mtime_nsec as i64);
+    let nanos = u32::try_from(nanos).ok().filter(|n| *n < 1_000_000_000)?;
+    let whole = std::time::Duration::from_secs(secs.unsigned_abs());
+    let base = if secs >= 0 {
+        std::time::UNIX_EPOCH.checked_add(whole)?
+    } else {
+        std::time::UNIX_EPOCH.checked_sub(whole)?
+    };
+    base.checked_add(std::time::Duration::from_nanos(u64::from(nanos)))
+}
+
+/// Whether an mtime makes a file old enough to sweep: strictly more than
+/// `keep` before `now`, and never when it is in the future or unknown.
+fn aged_out(
+    mtime: Option<std::time::SystemTime>,
+    keep: std::time::Duration,
+    now: std::time::SystemTime,
+) -> bool {
+    mtime
+        .and_then(|mtime| now.duration_since(mtime).ok())
+        .is_some_and(|age| age > keep)
+}
+
 /// One window of [`sweep_coordination_files`], with the bound and the starting
 /// offset supplied.
 ///
 /// Split out so the rotation is testable against a window of two entries rather
 /// than of ten thousand. Answers the report and the offset the **next** window
 /// should start from: one window further on, or back to zero when this window
-/// ran short — which means `read_dir` was exhausted inside it and there is
+/// ran short — which means the listing was exhausted inside it and there is
 /// nothing beyond.
+#[cfg(unix)]
 fn sweep_window(
-    dir: &std::path::Path,
+    dir: &ContextDir,
     keep: std::time::Duration,
     now: std::time::SystemTime,
     window: usize,
     offset: usize,
 ) -> (SweepReport, usize) {
     let mut report = SweepReport::default();
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(listing) = HeldDirListing::open(dir) else {
         // Nothing was examined, so nothing is beyond the window either: start
         // the next sweep from the beginning rather than advancing past a
         // directory that could not be opened at all.
+        return (report, 0);
+    };
+    let mut examined = 0usize;
+    for name in listing.skip(offset).take(window) {
+        examined += 1;
+        let Some(name) = name.to_str().ok() else {
+            report.kept += 1;
+            continue;
+        };
+        if !is_sweepable_coordination_name(name) {
+            report.kept += 1;
+            continue;
+        }
+        // `AT_SYMLINK_NOFOLLOW`, so a symlink reports as a symlink rather than
+        // as whatever it points at. Anything that is not a regular file is
+        // kept, which covers directories, symlinks, FIFOs and devices in one
+        // rule.
+        let Ok(st) = dir.stat_of(name) else {
+            report.kept += 1;
+            continue;
+        };
+        if file_type_bits(&st) != libc::S_IFREG {
+            report.kept += 1;
+            continue;
+        }
+        if !aged_out(stat_mtime(&st), keep, now) {
+            report.kept += 1;
+            continue;
+        }
+        match dir.unlink(name) {
+            Ok(()) => report.removed += 1,
+            Err(_) => report.failed += 1,
+        }
+    }
+    (
+        report,
+        next_sweep_offset(examined, window, offset, report.removed),
+    )
+}
+
+#[cfg(not(unix))]
+fn sweep_window(
+    dir: &ContextDir,
+    keep: std::time::Duration,
+    now: std::time::SystemTime,
+    window: usize,
+    offset: usize,
+) -> (SweepReport, usize) {
+    let mut report = SweepReport::default();
+    let Ok(entries) = std::fs::read_dir(dir.path()) else {
         return (report, 0);
     };
     let mut examined = 0usize;
@@ -2410,11 +2970,7 @@ fn sweep_window(
             report.kept += 1;
             continue;
         }
-        let path = entry.path();
-        // `symlink_metadata`, so a symlink reports as a symlink rather than as
-        // whatever it points at. Anything that is not a regular file is kept,
-        // which covers directories, symlinks, FIFOs and devices in one rule.
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
             report.kept += 1;
             continue;
         };
@@ -2422,34 +2978,48 @@ fn sweep_window(
             report.kept += 1;
             continue;
         }
-        let old_enough = metadata
-            .modified()
-            .ok()
-            .and_then(|mtime| now.duration_since(mtime).ok())
-            .is_some_and(|age| age > keep);
-        if !old_enough {
+        if !aged_out(metadata.modified().ok(), keep, now) {
             report.kept += 1;
             continue;
         }
-        match std::fs::remove_file(&path) {
+        match dir.unlink(name) {
             Ok(()) => report.removed += 1,
             Err(_) => report.failed += 1,
         }
     }
-    // Advance by the entries that SURVIVED the window, not by the window. A
-    // removal vacates its position, so everything after it shifts down by one;
-    // adding the full window would step over exactly `removed` unexamined
-    // entries each time. `offset + (examined - removed)` lands on the first one
-    // this window did not look at. The regression is
-    // `a_bounded_sweep_rotates_so_no_entry_is_starved`, which removed three of
-    // four files in four windows before this line was right.
-    let next = if examined < window {
+    (
+        report,
+        next_sweep_offset(examined, window, offset, report.removed),
+    )
+}
+
+/// Where the window after this one starts.
+///
+/// Advance by the entries that SURVIVED the window, not by the window. A
+/// removal vacates its position, so everything after it shifts down by one;
+/// adding the full window would step over exactly `removed` unexamined entries
+/// each time. `offset + (examined - removed)` lands on the first one this
+/// window did not look at. The regression is
+/// `a_bounded_sweep_rotates_so_no_entry_is_starved`, which removed three of
+/// four files in four windows before this was right. A window that ran short
+/// exhausted the listing, so the next one starts over.
+fn next_sweep_offset(examined: usize, window: usize, offset: usize, removed: usize) -> usize {
+    if examined < window {
         0
     } else {
-        offset.saturating_add(examined - report.removed)
-    };
-    (report, next)
+        offset.saturating_add(examined - removed)
+    }
 }
+
+/// A `gitdir:` pointer file is a single short line; anything larger is not one
+/// and is not read. The same bound applies to a `commondir` file.
+const MAX_GITDIR_FILE_BYTES: u64 = 4 * 1024;
+/// How many directories, starting with the project's own, are searched for a
+/// `.git`.
+const MAX_DISCOVERY_DEPTH: usize = 64;
+/// An `info/exclude` larger than this is not read or appended to. It is a
+/// hand-maintained list of glob lines; a megabyte of them is not one.
+const MAX_EXCLUDE_BYTES: u64 = 1024 * 1024;
 
 /// What [`ensure_git_excludes_context_dir`] found or did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2493,13 +3063,12 @@ pub enum GitExcludeOutcome {
 /// Symlinks are refused at `.git` rather than followed: appending to a file
 /// through a link the daemon did not place is a write to somewhere it never
 /// decided to write.
+///
+/// This is the **non-Unix** arm, and it works by pathname: the walk is over
+/// the path's lexical ancestors. On Unix [`git_common_dir_at`] makes the same
+/// decisions relative to a held project descriptor (issue #1395 item 4).
+#[cfg(not(unix))]
 pub(crate) fn git_common_dir(project_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    /// A `gitdir:` pointer file is a single short line; anything larger is not
-    /// one and is not read.
-    const MAX_GITDIR_FILE_BYTES: u64 = 4 * 1024;
-    /// How far up the tree a repository is looked for.
-    const MAX_DISCOVERY_DEPTH: usize = 64;
-
     let (dot_git, project_dir) =
         project_dir
             .ancestors()
@@ -2555,6 +3124,138 @@ pub(crate) fn git_common_dir(project_dir: &std::path::Path) -> Option<std::path:
     }
 }
 
+/// Read the whole of `file`, refusing one longer than `max` bytes.
+///
+/// The length is checked on the raw bytes before they are decoded, so an
+/// over-cap file reports as over-cap even when the `max + 1`-th byte splits a
+/// UTF-8 sequence; only a file within the cap can fail as invalid UTF-8.
+fn read_bounded(file: impl std::io::Read, max: u64) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut raw = Vec::new();
+    file.take(max + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("longer than {max} bytes"),
+        ));
+    }
+    String::from_utf8(raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Open the directory a git pointer file names, as git resolves it: an
+/// absolute pointer by its pathname, a relative one **relative to `base`**, the
+/// held directory the pointer was read from.
+///
+/// This is the one place the discovery follows a name it did not take from a
+/// held descriptor, because that is what a pointer is: `gitdir:` and
+/// `commondir` name a path, and git itself resolves them as one. Intermediate
+/// components are followed, as git follows them; the pointer's contents are
+/// the repository's own.
+#[cfg(unix)]
+fn open_pointed_dir(base: &std::fs::File, target: &str) -> Option<std::fs::File> {
+    let candidate = std::path::Path::new(target);
+    if candidate.is_absolute() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        return std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(candidate)
+            .ok();
+    }
+    let target = std::ffi::CString::new(target).ok()?;
+    openat_file(base, &target, libc::O_RDONLY | libc::O_DIRECTORY, 0).ok()
+}
+
+/// [`git_common_dir`]'s decisions, made relative to the held project
+/// descriptor `project` rather than to a pathname (issue #1395 item 4), and
+/// answered as an open descriptor on the common git directory.
+///
+/// * **The walk goes up by `..` from the held object**, not along the
+///   lexical ancestors of a path: each level is `openat(current, "..")`, and
+///   `.git` is looked up with `fstatat(current, ".git", AT_SYMLINK_NOFOLLOW)`.
+///   So the directories searched are the project object's real parents at the
+///   time of the walk — the ones git itself would search from inside it — and a
+///   project path swapped after the publish cannot send the search into
+///   another tree. It stops at the filesystem root (where `..` is the
+///   directory itself) and after [`MAX_DISCOVERY_DEPTH`] levels.
+/// * **A symlinked `.git` is refused**, as before; so, now, is a symlinked
+///   `commondir`. A `commondir` that is absent means an ordinary clone; one
+///   that cannot be read for any other reason answers `None` rather than
+///   guessing that the per-worktree directory is the common one.
+/// * **Pointer targets are followed by name** — see [`open_pointed_dir`].
+#[cfg(unix)]
+fn git_common_dir_at(project: &ProjectDirGuard) -> Option<std::fs::File> {
+    let dot_git = c".git";
+    let mut current = project.try_clone().ok()?;
+    let mut found = None;
+    for _ in 0..MAX_DISCOVERY_DEPTH {
+        if let Ok(st) = fstatat_nofollow(&current, dot_git) {
+            found = Some(st);
+            break;
+        }
+        let parent = openat_file(&current, c"..", libc::O_RDONLY | libc::O_DIRECTORY, 0).ok()?;
+        let (here, up) = (current.metadata().ok()?, parent.metadata().ok()?);
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if here.dev() == up.dev() && here.ino() == up.ino() {
+                return None;
+            }
+        }
+        current = parent;
+    }
+    let st = found?;
+
+    let git_dir = match file_type_bits(&st) {
+        libc::S_IFDIR => openat_file(
+            &current,
+            dot_git,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            0,
+        )
+        .ok()?,
+        libc::S_IFREG => {
+            let pointer = openat_file(
+                &current,
+                dot_git,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                0,
+            )
+            .ok()?;
+            let pointer = read_bounded(pointer, MAX_GITDIR_FILE_BYTES).ok()?;
+            let target = pointer
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("gitdir:"))?
+                .trim();
+            if target.is_empty() {
+                return None;
+            }
+            open_pointed_dir(&current, target)?
+        }
+        // A symlink, a FIFO, a device: not a `.git` this follows.
+        _ => return None,
+    };
+
+    // `commondir` is present in a linked worktree's gitdir and absent in an
+    // ordinary clone, so its absence is the answer rather than a failure.
+    match openat_file(
+        &git_dir,
+        c"commondir",
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    ) {
+        Ok(file) => {
+            let raw = read_bounded(file, MAX_GITDIR_FILE_BYTES).ok()?;
+            let common = raw.trim();
+            if common.is_empty() {
+                return None;
+            }
+            open_pointed_dir(&git_dir, common)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(git_dir),
+        Err(_) => None,
+    }
+}
+
 /// Put `.dot-agent-deck/` in the clone-local `.git/info/exclude` (issue #329 §2).
 ///
 /// **The committed `.gitignore` is deliberately not touched.** It is the
@@ -2580,14 +3281,139 @@ pub(crate) fn git_common_dir(project_dir: &std::path::Path) -> Option<std::path:
 /// pattern, and the next call sees the rule and stops — so the state is
 /// self-correcting rather than accumulating. Locking a file in the user's git
 /// directory to avoid a harmless repeated line would be the larger imposition.
+///
+/// **The project directory is opened once, by `project_dir`, and must exist**;
+/// everything after that is [`ensure_git_excludes_in`] relative to the held
+/// directory. A publish does not come through here: it passes the project
+/// descriptor it already holds straight to [`ensure_git_excludes_in`], so its
+/// exclude write does not re-resolve the project path at all (issue #1395).
 pub fn ensure_git_excludes_context_dir(
     project_dir: &std::path::Path,
 ) -> std::io::Result<GitExcludeOutcome> {
-    /// An `info/exclude` larger than this is not read or appended to. It is a
-    /// hand-maintained list of glob lines; a megabyte of them is not one.
-    const MAX_EXCLUDE_BYTES: u64 = 1024 * 1024;
+    ensure_git_excludes_in(&open_project_dir(project_dir)?)
+}
 
-    let Some(common) = git_common_dir(project_dir) else {
+/// Whether `existing` already carries a rule for the context directory, in any
+/// of its spellings.
+fn exclude_has_context_rule(existing: &str) -> bool {
+    let bare = CONTEXT_DIR_NAME.trim_end_matches('/');
+    existing.lines().any(|line| {
+        let line = line.trim();
+        line == bare || line == format!("{bare}/") || line == format!("/{bare}/")
+    })
+}
+
+/// The bytes appended to an `exclude` whose current contents are `existing`.
+fn exclude_rule_to_append(existing: &str) -> String {
+    let bare = CONTEXT_DIR_NAME.trim_end_matches('/');
+    let mut appended = String::new();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        appended.push('\n');
+    }
+    appended.push_str(&format!(
+        "# dot-agent-deck coordination files — per-clone, never committed (issue #329).\n{bare}/\n"
+    ));
+    appended
+}
+
+/// [`ensure_git_excludes_context_dir`] for a project directory already held
+/// open — the one a publish created its context directory under (issue #1395
+/// item 4).
+///
+/// On Unix every step after discovery ([`git_common_dir_at`]) is relative to a
+/// held descriptor: `info` is opened (and, when missing, created with
+/// `mkdirat`) relative to the common git directory with `O_NOFOLLOW`, and
+/// `exclude` is `fstatat`ed, read and appended to relative to `info`, the
+/// append's open itself carrying `O_NOFOLLOW`. So the refusal of a symlinked
+/// `exclude` — or, now, a symlinked `info` — is a property of the open, not of
+/// a lookup before it.
+#[cfg(unix)]
+fn ensure_git_excludes_in(project: &ProjectDirGuard) -> std::io::Result<GitExcludeOutcome> {
+    let Some(common) = git_common_dir_at(project) else {
+        return Ok(GitExcludeOutcome::NotAGitRepo);
+    };
+    let (info_name, exclude_name) = (c"info", c"exclude");
+    let open_info = || {
+        openat_file(
+            &common,
+            info_name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            0,
+        )
+    };
+
+    let info = match open_info() {
+        Ok(info) => Some(info),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let existing = match &info {
+        None => String::new(),
+        Some(info) => match fstatat_nofollow(info, exclude_name) {
+            Ok(st) if file_type_bits(&st) == libc::S_IFLNK => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "info/exclude is a symlink; refusing to append",
+                ));
+            }
+            #[allow(clippy::unnecessary_cast)]
+            Ok(st) if st.st_size as u64 > MAX_EXCLUDE_BYTES => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("info/exclude is larger than {MAX_EXCLUDE_BYTES} bytes"),
+                ));
+            }
+            Ok(_) => read_bounded(
+                openat_file(
+                    info,
+                    exclude_name,
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                    0,
+                )?,
+                MAX_EXCLUDE_BYTES,
+            )?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e),
+        },
+    };
+
+    if exclude_has_context_rule(&existing) {
+        return Ok(GitExcludeOutcome::AlreadyExcluded);
+    }
+
+    let info = match info {
+        Some(info) => info,
+        None => {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: an open directory descriptor and a NUL-terminated
+            // component. `0o777` is what `create_dir_all` asked for; the umask
+            // narrows it exactly as it did there.
+            if unsafe { libc::mkdirat(common.as_raw_fd(), info_name.as_ptr(), 0o777) } != 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(e);
+                }
+            }
+            open_info()?
+        }
+    };
+
+    use std::io::Write as _;
+    let mut file = openat_file(
+        &info,
+        exclude_name,
+        libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0o666,
+    )?;
+    file.write_all(exclude_rule_to_append(&existing).as_bytes())?;
+    Ok(GitExcludeOutcome::Added)
+}
+
+/// The non-Unix arm of [`ensure_git_excludes_in`]: the pre-#1395 pathname
+/// implementation, unchanged.
+#[cfg(not(unix))]
+fn ensure_git_excludes_in(project: &ProjectDirGuard) -> std::io::Result<GitExcludeOutcome> {
+    let Some(common) = git_common_dir(&project.0) else {
         return Ok(GitExcludeOutcome::NotAGitRepo);
     };
     let info = common.join("info");
@@ -2614,29 +3440,17 @@ pub fn ensure_git_excludes_context_dir(
         Err(e) => return Err(e),
     };
 
-    let bare = CONTEXT_DIR_NAME.trim_end_matches('/');
-    if existing.lines().any(|line| {
-        let line = line.trim();
-        line == bare || line == format!("{bare}/") || line == format!("/{bare}/")
-    }) {
+    if exclude_has_context_rule(&existing) {
         return Ok(GitExcludeOutcome::AlreadyExcluded);
     }
 
     std::fs::create_dir_all(&info)?;
-    let mut appended = String::new();
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        appended.push('\n');
-    }
-    appended.push_str(&format!(
-        "# dot-agent-deck coordination files — per-clone, never committed (issue #329).\n{bare}/\n"
-    ));
-
     use std::io::Write as _;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&exclude)?;
-    file.write_all(appended.as_bytes())?;
+    file.write_all(exclude_rule_to_append(&existing).as_bytes())?;
     Ok(GitExcludeOutcome::Added)
 }
 
@@ -2649,27 +3463,30 @@ pub fn ensure_git_excludes_context_dir(
 ///
 /// The sweep is the app tidying its own working directory, not a service performed
 /// on the user's files — see [`COORDINATION_RETENTION_ENV`]. Setting that var to
-/// `0` turns it off, and `read_dir` is then not even reached.
-fn tidy_context_dir(project_dir: &std::path::Path, dir: &std::path::Path) {
+/// `0` turns it off, and the directory is then not even listed.
+///
+/// Both halves work from what the publish holds open — the sweep through `dir`,
+/// the git exclude from `project` — rather than from a pathname (issue #1395).
+fn tidy_context_dir(project: &ProjectDirGuard, dir: &ContextDir) {
     if let Some(keep) = coordination_retention() {
         let report = sweep_coordination_files(dir, keep, std::time::SystemTime::now());
         if report.removed > 0 || report.failed > 0 {
             tracing::info!(
-                dir = %dir.display(),
+                dir = %dir.path().display(),
                 removed = report.removed,
                 failed = report.failed,
                 "swept coordination files past the retention window"
             );
         }
     }
-    match ensure_git_excludes_context_dir(project_dir) {
+    match ensure_git_excludes_in(project) {
         Ok(GitExcludeOutcome::Added) => tracing::info!(
-            project = %project_dir.display(),
+            dir = %dir.path().display(),
             "added {CONTEXT_DIR_NAME}/ to the clone-local git exclude"
         ),
         Ok(_) => {}
         Err(e) => tracing::debug!(
-            project = %project_dir.display(),
+            dir = %dir.path().display(),
             error = %e,
             "could not record {CONTEXT_DIR_NAME}/ in the clone-local git exclude"
         ),
@@ -3026,6 +3843,228 @@ mod tests {
             a.context_path.is_file(),
             "the re-arm does not delete the file it read, and neither does the tab (PR #1407 review)"
         );
+    }
+
+    /// A per-publish name no publish in these tests mints, so a test can plant
+    /// whatever it likes under it.
+    const PLANTED_NAME: &str = "orchestrator-context-0123456789abcdef0123456789abcdef.md";
+
+    /// A context file carrying `task`, in the shape the composer writes.
+    fn context_with_task(task: &str) -> String {
+        format!("# Orchestrator{TASK_SECTION_MARKER}{task}\n")
+    }
+
+    /// Run a re-arm on its own thread with a deadline, so a read that blocks
+    /// (a FIFO opened without `O_NONBLOCK`) fails the test instead of hanging
+    /// it.
+    fn reassert_within_deadline(cwd: &str, known: &std::path::Path) -> PublishedPrompt {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cwd, known) = (cwd.to_string(), known.to_path_buf());
+        std::thread::spawn(move || {
+            let _ = tx.send(reassert_orchestrator_prompt(&config(), &cwd, Some(&known)));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the re-arm must not block")
+            .expect("re-armed")
+    }
+
+    /// Issue #1395 audit round 2: a known path is honoured only when it names a
+    /// per-publish file directly under the tab's own project — lexically, with
+    /// no `..` detour and never the mirror.
+    #[test]
+    fn own_context_file_name_accepts_only_a_file_directly_under_the_project() {
+        let project = std::path::Path::new("/work/a");
+        let own = format!("/work/a/.dot-agent-deck/{PLANTED_NAME}");
+        assert_eq!(
+            own_context_file_name(project, std::path::Path::new(&own)),
+            Some(PLANTED_NAME)
+        );
+        assert_eq!(
+            own_context_file_name(std::path::Path::new("/work/a/"), std::path::Path::new(&own)),
+            Some(PLANTED_NAME),
+            "a trailing separator on the project is the same project"
+        );
+        for bad in [
+            format!("/work/b/.dot-agent-deck/{PLANTED_NAME}"),
+            format!("/work/a/sub/../.dot-agent-deck/{PLANTED_NAME}"),
+            format!("/work/a/.dot-agent-deck/../../b/.dot-agent-deck/{PLANTED_NAME}"),
+            format!("/work/a/sub/.dot-agent-deck/{PLANTED_NAME}"),
+            format!("/work/a/{PLANTED_NAME}"),
+            "/work/a/.dot-agent-deck/orchestrator-context.md".to_string(),
+        ] {
+            assert_eq!(
+                own_context_file_name(project, std::path::Path::new(&bad)),
+                None,
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// Issue #1395 audit round 2 (blocker): a known path into ANOTHER project
+    /// must not supply the task. Project B holds a real published context with
+    /// its own task; A's re-arm handed B's path reads A's mirror instead.
+    #[test]
+    fn reassert_with_a_foreign_projects_path_reads_its_own_mirror() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let cwd_a = a.path().to_string_lossy().to_string();
+        let cwd_b = b.path().to_string_lossy().to_string();
+        prepare_orchestrator_prompt(&config(), &cwd_a, Some("TASK-ALPHA"), Attendance::Attended)
+            .expect("A published");
+        let foreign = prepare_orchestrator_prompt(
+            &config(),
+            &cwd_b,
+            Some("TASK-BRAVO"),
+            Attendance::Attended,
+        )
+        .expect("B published");
+        let dotted = a
+            .path()
+            .join("sub/../.dot-agent-deck")
+            .join(foreign.context_path.file_name().unwrap());
+        for known in [foreign.context_path.clone(), dotted] {
+            let rearmed = reassert_within_deadline(&cwd_a, &known);
+            let c = std::fs::read_to_string(&rearmed.context_path).unwrap();
+            assert!(c.contains("TASK-ALPHA"), "{known:?}: A's mirror task:\n{c}");
+            assert!(
+                !c.contains("TASK-BRAVO"),
+                "{known:?}: B's task leaked:\n{c}"
+            );
+        }
+    }
+
+    /// Assert a re-arm carried no task and the attended text: neither the
+    /// mirror's task nor its `Unattended` notice reached it.
+    fn assert_rearmed_without_the_mirror(case: &str, rearmed: &PublishedPrompt) {
+        let c = std::fs::read_to_string(&rearmed.context_path).unwrap();
+        assert!(
+            !c.contains("TASK-MIRROR"),
+            "{case}: the mirror's task must not re-arm a tab that knows its own file:\n{c}"
+        );
+        assert!(
+            !c.contains(UNATTENDED_SECTION_HEADING),
+            "{case}: the mirror's attendance must not ride back either:\n{c}"
+        );
+        assert!(
+            rearmed.prompt.contains("wait for instructions"),
+            "{case}: no task, attended: {:?}",
+            rearmed.prompt
+        );
+    }
+
+    /// Issue #1395 audit round 2: the tab's own file is read with
+    /// `O_NOFOLLOW | O_NONBLOCK`, regular files only, bounded — so a symlink, a
+    /// FIFO, a directory or an over-cap file planted under the tab's own name
+    /// is refused (without blocking). The path is a valid own path, so the
+    /// re-arm does NOT read the mirror, which may be another orchestration's
+    /// brief: it carries no task and degrades to `Attended`.
+    #[cfg(unix)]
+    #[test]
+    fn reassert_refuses_an_unsafe_own_context_file_without_reading_the_mirror() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("elsewhere.md");
+        std::fs::write(&target, context_with_task("TASK-EVIL")).unwrap();
+
+        for case in ["symlink", "fifo", "directory", "over-cap"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let cwd = tmp.path().to_string_lossy().to_string();
+            prepare_orchestrator_prompt(
+                &config(),
+                &cwd,
+                Some("TASK-MIRROR"),
+                Attendance::Unattended,
+            )
+            .expect("mirror published");
+            assert!(
+                published(&cwd).contains("TASK-MIRROR"),
+                "{case}: the premise: the mirror holds a task"
+            );
+            let own = tmp.path().join(CONTEXT_DIR_NAME).join(PLANTED_NAME);
+            match case {
+                "symlink" => std::os::unix::fs::symlink(&target, &own).unwrap(),
+                "fifo" => {
+                    let c = std::ffi::CString::new(own.as_os_str().as_encoded_bytes()).unwrap();
+                    // SAFETY: a NUL-terminated path.
+                    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+                }
+                "directory" => std::fs::create_dir(&own).unwrap(),
+                "over-cap" => {
+                    std::fs::write(&own, context_with_task("TASK-EVIL")).unwrap();
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&own)
+                        .unwrap()
+                        .set_len(MAX_CONTEXT_BYTES as u64 + 1)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                read_context_file(tmp.path(), PLANTED_NAME).is_err(),
+                "{case}: the read must refuse it"
+            );
+            let rearmed = reassert_within_deadline(&cwd, &own);
+            let c = std::fs::read_to_string(&rearmed.context_path).unwrap();
+            assert!(!c.contains("TASK-EVIL"), "{case}: the planted task leaked");
+            assert_rearmed_without_the_mirror(case, &rearmed);
+        }
+    }
+
+    /// Issue #1395: a tab whose own file is gone (the 14-day sweep, or by hand)
+    /// while the mirror holds ANOTHER orchestration's brief must not be re-armed
+    /// with that brief — #1233's race. It carries no task instead.
+    #[test]
+    fn reassert_with_a_missing_own_file_does_not_deliver_the_mirrors_brief() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let a =
+            prepare_orchestrator_prompt(&config(), &cwd, Some("TASK-ALPHA"), Attendance::Attended)
+                .expect("A published");
+        prepare_orchestrator_prompt(&config(), &cwd, Some("TASK-MIRROR"), Attendance::Unattended)
+            .expect("B published");
+        assert!(
+            published(&cwd).contains("TASK-MIRROR"),
+            "the premise: the mirror is B's"
+        );
+        std::fs::remove_file(&a.context_path).unwrap();
+
+        let rearmed = reassert_within_deadline(&cwd, &a.context_path);
+        let c = std::fs::read_to_string(&rearmed.context_path).unwrap();
+        assert!(!c.contains("TASK-ALPHA"), "A's file is gone:\n{c}");
+        assert_rearmed_without_the_mirror("missing", &rearmed);
+    }
+
+    /// The cap is inclusive: a file exactly [`MAX_CONTEXT_BYTES`] long is read.
+    #[test]
+    fn read_context_file_reads_a_file_at_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(CONTEXT_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+        let mut content = context_with_task("TASK-AT-CAP");
+        content.push_str(&" ".repeat(MAX_CONTEXT_BYTES - content.len()));
+        std::fs::write(dir.join(PLANTED_NAME), &content).unwrap();
+        let read = read_context_file(tmp.path(), PLANTED_NAME).expect("at the cap");
+        assert_eq!(read.len(), MAX_CONTEXT_BYTES);
+    }
+
+    /// The mirror goes through the same read, so a symlinked mirror supplies no
+    /// task either: the re-arm degrades to the no-task, attended text.
+    #[cfg(unix)]
+    #[test]
+    fn reassert_refuses_a_symlinked_mirror() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("elsewhere.md");
+        std::fs::write(&target, context_with_task("TASK-EVIL")).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let dir = tmp.path().join(CONTEXT_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(CONTEXT_FILE_NAME)).unwrap();
+
+        let line = reassert_orchestrator_prompt(&config(), &cwd, None)
+            .expect("re-armed")
+            .prompt;
+        assert!(line.contains("wait for instructions"), "got {line:?}");
     }
 
     /// Issue #1233 item 4's withdrawal removes the file it published, and
@@ -3634,6 +4673,86 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod ended_context_removal_tests {
+    use super::*;
+
+    const UNIQUE: &str = "orchestrator-context-0123456789abcdef0123456789abcdef.md";
+
+    #[test]
+    fn only_the_minted_per_publish_shape_is_a_unique_context_name() {
+        assert!(is_unique_context_file_name(UNIQUE));
+        assert!(is_unique_context_file_name(&unique_context_file_name()));
+        for refused in [
+            CONTEXT_FILE_NAME,
+            "orchestrator-context-.md",
+            "orchestrator-context-0123456789ABCDEF0123456789abcdef.md",
+            "orchestrator-context-0123456789abcdef0123456789abcde.md",
+            "orchestrator-context-0123456789abcdef0123456789abcdef.md.bak",
+            "orchestrator-context-0123456789abcdef0123456789abcdeg.md",
+            "worker-task-coder.md",
+            "../orchestrator-context-0123456789abcdef0123456789abcdef.md",
+        ] {
+            assert!(!is_unique_context_file_name(refused), "{refused}");
+        }
+    }
+
+    /// Issue #1395 item 2: the helper removes a recorded per-publish context
+    /// and refuses every other shape — the mirror, a task file, a unique name
+    /// outside `.dot-agent-deck` — leaving each of them on disk.
+    #[test]
+    fn removal_refuses_a_non_matching_name_and_never_touches_the_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(CONTEXT_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+        let unique = dir.join(UNIQUE);
+        let mirror = dir.join(CONTEXT_FILE_NAME);
+        let task = dir.join("worker-task-coder.md");
+        let outside = tmp.path().join(UNIQUE);
+        for f in [&unique, &mirror, &task, &outside] {
+            std::fs::write(f, "x").unwrap();
+        }
+
+        for refused in [&mirror, &task, &outside] {
+            assert!(
+                matches!(
+                    remove_ended_orchestration_context(refused),
+                    Err(ContextRemovalError::NotAContextFile)
+                ),
+                "{} must be refused",
+                refused.display()
+            );
+            assert!(refused.is_file(), "{} must survive", refused.display());
+        }
+
+        remove_ended_orchestration_context(&unique).expect("the recorded file is removed");
+        assert!(!unique.exists());
+        assert!(mirror.is_file() && task.is_file());
+        // Already gone is not an error.
+        remove_ended_orchestration_context(&unique).expect("a missing file is success");
+    }
+
+    /// A directory or symlink under a valid name is refused, never removed or
+    /// followed.
+    #[cfg(unix)]
+    #[test]
+    fn removal_refuses_an_entry_that_is_not_a_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(CONTEXT_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+        let target = tmp.path().join("precious.txt");
+        std::fs::write(&target, "keep").unwrap();
+        let link = dir.join(UNIQUE);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(matches!(
+            remove_ended_orchestration_context(&link),
+            Err(ContextRemovalError::NotARegularFile)
+        ));
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+    }
+}
+
+#[cfg(test)]
 mod hygiene_tests {
     use std::time::{Duration, SystemTime};
 
@@ -3951,12 +5070,13 @@ mod hygiene_tests {
         for n in 0..4 {
             std::fs::write(dir.join(format!("task-{n}.md")), "x").unwrap();
         }
+        let held = held_context_dir(tmp.path());
         let now = SystemTime::now() + Duration::from_secs(86_400);
 
         let mut offset = 0usize;
         let mut removed = 0usize;
         for _ in 0..4 {
-            let (report, next) = sweep_window(&dir, Duration::from_secs(1), now, 1, offset);
+            let (report, next) = sweep_window(&held, Duration::from_secs(1), now, 1, offset);
             removed += report.removed;
             offset = next;
         }
@@ -3969,7 +5089,7 @@ mod hygiene_tests {
 
         // A window that runs short means `read_dir` was exhausted inside it, so
         // the next sweep starts over rather than advancing past the end.
-        let (_, next) = sweep_window(&dir, Duration::from_secs(1), now, 8, 0);
+        let (_, next) = sweep_window(&held, Duration::from_secs(1), now, 8, 0);
         assert_eq!(next, 0);
     }
 
@@ -4093,7 +5213,11 @@ mod hygiene_tests {
             age(path, Duration::from_secs(86_400));
         }
 
-        let report = sweep_coordination_files(&dir, Duration::from_secs(7200), now);
+        let report = sweep_coordination_files(
+            &held_context_dir(tmp.path()),
+            Duration::from_secs(7200),
+            now,
+        );
         assert_eq!(
             report.removed, 3,
             "the three aged coordination files: {report:?}"
@@ -4126,17 +5250,16 @@ mod hygiene_tests {
         }
     }
 
-    /// A sweep of a directory that is not there is a no-op, not a panic — the
-    /// publish that calls it has just succeeded and must not be undone by
-    /// housekeeping.
+    /// A sweep of a directory that is no longer there is a no-op, not a panic —
+    /// the publish that calls it has just succeeded and must not be undone by
+    /// housekeeping. Since #1395 the sweep lists the held directory rather than
+    /// a path, so "not there" is a directory removed after it was opened.
     #[test]
     fn a_sweep_of_a_missing_directory_reports_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let report = sweep_coordination_files(
-            &tmp.path().join("absent"),
-            Duration::from_secs(1),
-            SystemTime::now(),
-        );
+        let held = held_context_dir(tmp.path());
+        std::fs::remove_dir(held.path()).unwrap();
+        let report = sweep_coordination_files(&held, Duration::from_secs(1), SystemTime::now());
         assert_eq!(report, SweepReport::default());
     }
 
@@ -4374,5 +5497,264 @@ mod hygiene_tests {
             );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "second delegation");
         }
+    }
+
+    /// The project's `.dot-agent-deck`, created if missing and held the way a
+    /// publish holds it — through [`open_project_dir`] and
+    /// [`open_publish_dir_in`].
+    fn held_context_dir(project: &std::path::Path) -> ContextDir {
+        let guard = open_project_dir(project).expect("open the project dir");
+        open_publish_dir_in(&guard, project).expect("open the context dir")
+    }
+
+    /// Issue #1395 item 4: the sweep lists and removes through the directory the
+    /// publish holds, not through the pathname.
+    ///
+    /// The held `.dot-agent-deck` is renamed away and the name replaced by a
+    /// symlink to another directory full of aged `*.md` files. A path-based
+    /// sweep would follow the new name and delete them; this one must remove
+    /// only the aged file in the directory it was handed, now at its new name.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_goes_through_the_held_directory_not_the_swapped_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let held = held_context_dir(&project);
+        std::fs::write(held.path().join("ours.md"), "x").unwrap();
+
+        let moved = project.join("moved");
+        std::fs::rename(held.path(), &moved).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("precious.md"), "must survive").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, context_dir_of(&project)).unwrap();
+
+        let now = SystemTime::now() + Duration::from_secs(86_400);
+        let report = sweep_coordination_files(&held, Duration::from_secs(3600), now);
+
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(
+            !moved.join("ours.md").exists(),
+            "the aged file in the HELD directory is swept, wherever it now sits"
+        );
+        assert_eq!(
+            std::fs::read_to_string(elsewhere.join("precious.md")).unwrap(),
+            "must survive",
+            "the directory the path now names is never touched"
+        );
+    }
+
+    /// The descriptor-based sweep keeps the pre-#1395 envelope on the cases the
+    /// older test does not reach: an mtime in the future is not "ancient", a
+    /// FIFO and a dangling symlink are not regular files, and a subdirectory is
+    /// not descended into even when it holds an aged `*.md`.
+    #[cfg(unix)]
+    #[test]
+    fn the_held_sweep_keeps_future_mtimes_and_non_regular_entries_and_never_descends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let held = held_context_dir(tmp.path());
+        let dir = held.path().to_path_buf();
+
+        let future = dir.join("future.md");
+        std::fs::write(&future, "x").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&future)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(10 * 86_400))
+            .unwrap();
+
+        let fifo =
+            std::ffi::CString::new(dir.join("pipe.md").into_os_string().into_encoded_bytes())
+                .unwrap();
+        // SAFETY: a NUL-terminated path; `mkfifo` only creates the node.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), dir.join("dangling.md")).unwrap();
+        std::fs::create_dir(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/inner.md"), "x").unwrap();
+        std::fs::write(dir.join("aged.md"), "x").unwrap();
+
+        let now = SystemTime::now() + Duration::from_secs(86_400);
+        let report = sweep_coordination_files(&held, Duration::from_secs(3600), now);
+
+        assert_eq!(report.removed, 1, "only aged.md: {report:?}");
+        assert_eq!(report.failed, 0, "{report:?}");
+        assert!(!dir.join("aged.md").exists());
+        assert!(future.exists(), "a future mtime is kept");
+        assert!(
+            std::fs::symlink_metadata(dir.join("pipe.md")).is_ok(),
+            "a FIFO is kept"
+        );
+        assert!(
+            std::fs::symlink_metadata(dir.join("dangling.md")).is_ok(),
+            "a symlink is kept"
+        );
+        assert!(
+            dir.join("nested/inner.md").exists(),
+            "the sweep does not descend"
+        );
+    }
+
+    /// Issue #1395 item 4: a publish's git-exclude write starts from the
+    /// project directory it holds, so a project path swapped afterwards for a
+    /// link to another repository does not redirect the append.
+    #[cfg(unix)]
+    #[test]
+    fn the_publish_git_exclude_follows_the_held_project_not_the_swapped_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let guard = open_project_dir(&project).unwrap();
+
+        let moved = tmp.path().join("moved");
+        std::fs::rename(&project, &moved).unwrap();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        std::os::unix::fs::symlink(&other, &project).unwrap();
+
+        assert_eq!(
+            ensure_git_excludes_in(&guard).unwrap(),
+            GitExcludeOutcome::Added
+        );
+        assert!(
+            std::fs::read_to_string(moved.join(".git/info/exclude"))
+                .unwrap()
+                .lines()
+                .any(|l| l.trim() == ".dot-agent-deck/"),
+            "the rule lands in the held project's repository"
+        );
+        assert!(
+            !other.join(".git/info").exists(),
+            "and nothing is written into the repository the path now names"
+        );
+        assert_eq!(
+            ensure_git_excludes_in(&guard).unwrap(),
+            GitExcludeOutcome::AlreadyExcluded,
+            "idempotent through the held descriptor too"
+        );
+    }
+
+    /// The exclude's `info` directory is opened with `O_NOFOLLOW` relative to
+    /// the common git directory, so a symlinked `info` is refused rather than
+    /// appended through — the same rule a symlinked `exclude` already had.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_git_info_directory_is_refused_and_never_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, project.join(".git/info")).unwrap();
+
+        assert!(
+            ensure_git_excludes_context_dir(&project).is_err(),
+            "a symlinked info directory must be refused"
+        );
+        assert!(
+            !elsewhere.join("exclude").exists(),
+            "and nothing written through it"
+        );
+    }
+
+    /// Issue #1395 item 5: `.dot-agent-deck` is created and opened relative to
+    /// the held project directory, so a project path renamed and replaced after
+    /// that open cannot choose which `.dot-agent-deck` a publish writes into —
+    /// and the publish then refuses to announce a path that no longer names it.
+    #[cfg(unix)]
+    #[test]
+    fn the_context_dir_is_opened_under_the_held_project_not_the_swapped_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let guard = open_project_dir(&project).unwrap();
+
+        let moved = tmp.path().join("moved");
+        std::fs::rename(&project, &moved).unwrap();
+        std::fs::create_dir(&project).unwrap();
+
+        let dir = open_publish_dir_in(&guard, &project).expect("opened under the held project");
+        assert_eq!(
+            dir.path(),
+            context_dir_of(&project),
+            "announced by the path"
+        );
+        assert!(
+            moved.join(CONTEXT_DIR_NAME).is_dir(),
+            "created inside the held project"
+        );
+        assert!(
+            !context_dir_of(&project).exists(),
+            "not inside the directory the path now names"
+        );
+
+        let mut file = dir.create_new("probe.md").unwrap();
+        assert!(
+            moved.join(CONTEXT_DIR_NAME).join("probe.md").exists(),
+            "the create went through the held chain"
+        );
+        assert!(
+            matches!(
+                write_context_file(&mut file, &dir, "content"),
+                Err(ContextPublishError::ContextDirReplaced)
+            ),
+            "and a path that no longer names the held directory is refused, not announced"
+        );
+    }
+
+    /// The anchored open still refuses a symlinked `.dot-agent-deck` in the
+    /// held project, and creates nothing at the link's target.
+    #[cfg(unix)]
+    #[test]
+    fn the_anchored_context_dir_open_refuses_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, context_dir_of(&project)).unwrap();
+
+        let guard = open_project_dir(&project).unwrap();
+        assert!(matches!(
+            open_publish_dir_in(&guard, &project),
+            Err(ContextPublishError::ContextDirIsSymlink)
+        ));
+        assert!(
+            matches!(
+                publish_orchestrator_context(&project, "content"),
+                Err(ContextPublishError::ContextDirIsSymlink)
+            ),
+            "and so does the whole publish"
+        );
+        assert_eq!(
+            std::fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "nothing is created through the link"
+        );
+    }
+
+    /// A file over the cap whose `max + 1`-th byte splits a UTF-8 sequence
+    /// reports as over-cap, not as invalid UTF-8 (issue #1395 review).
+    #[cfg(unix)]
+    #[test]
+    fn read_bounded_over_cap_split_utf8_reports_over_cap() {
+        // "é" is two bytes; with max = 3 the take(4) cut lands inside it.
+        let raw = "abcé".as_bytes();
+        let err = read_bounded(raw, 3).expect_err("over the cap");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "longer than 3 bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_bounded_at_cap_reads_and_invalid_utf8_within_cap_is_invalid_data() {
+        assert_eq!(
+            read_bounded("abé".as_bytes(), 4).expect("at the cap"),
+            "abé"
+        );
+        let err = read_bounded(&b"ab\xff"[..], 4).expect_err("invalid UTF-8");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!err.to_string().starts_with("longer than"), "{err}");
     }
 }

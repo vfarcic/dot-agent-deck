@@ -692,7 +692,7 @@ An orchestrator that runs `work-done` without `--done` reports to nobody; it sho
 
 ### The orchestrator is told a report was "unsolicited"
 
-A `work-done` that answers no task the orchestrator delegated reaches it labelled as unsolicited, and `.dot-agent-deck/work-done-<role>.md` is not updated. Causes:
+A `work-done` the deck cannot match to a task the orchestrator delegated reaches it labelled as unsolicited, and `.dot-agent-deck/work-done-<role>.md` is not updated. Causes:
 
 - you gave the worker a task directly by typing in its pane, and it reported again. Give tasks through the orchestrator instead;
 - the task never reached the worker (the orchestrator saw `⚠ delegated worker respawn failed` or `⚠ delegated worker never came up`);

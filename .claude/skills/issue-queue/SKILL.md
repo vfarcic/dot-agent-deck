@@ -339,62 +339,15 @@ A name is single-use: removing a worktree keeps its branch, so `agent/dispatch-<
 
 ## Step 7 — Choose the shape, by criteria
 
-A unit starts either as **one agent** or as a **multi-role orchestration**. **Choose it yourself, from the criteria below, and say which you chose and why.** Do not ask per unit, and do not fall back to a default without applying the test.
+**Choose each unit's shape with the [`dispatch-shape`](../dispatch-shape/SKILL.md) skill, and say which you chose and why.** It holds the whole rule — the divisibility criteria, "when close, take `--single`", deciding per unit rather than once per batch, the worked examples, the one-line reason, the runner's override, the explicit flag, running `--list-targets` once and what to do when it errors, and which orchestration to name (`mixed` by default; the provider is a session property). It used to live here; issue #1425 moved it so that every dispatch in this repo applies the same criteria, not only the units this skill starts.
 
-**The criterion is DIVISIBILITY, not size.** A large issue confined to one function is a single agent; a medium one spread across separate modules with a decision to argue may be a team. Asking "how big is this?" produces teams on hard problems that do not divide, which is the failure this step now guards against from the other side.
+**The conflict with the dispatcher prompt is resolved there, and it is no longer scoped to this skill.** Dispatcher mode seeds every pane with `DISPATCHER_SEED_PROMPT` (`src/authoring_seeds.rs`), and [`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md) carries the product's "ask, do not guess" contract. `dispatch-shape` is the maintainer's standing answer to that question for all dispatching in this repo — a bare ad-hoc dispatch included — so do not read the prompt as a reason to ask per issue here, and do not read the old limit ("this skill wins for units dispatched *through it*") as still in force.
 
-Take **`--single`** when any of these holds:
+What stays specific to this queue:
 
-- the change is confined to **one function, one file, or one tightly-coupled pair** — two agents would collide in the same code;
-- it is **one decision to argue** plus its implementation (a policy question, a trade-off, a classification), however subtle;
-- it is **mechanical across many call sites** — a sweep is serial work, and splitting it makes the sites inconsistent;
-- the issue names the fix, or an existing helper/pattern in the tree is the answer.
-
-Take **`--orchestration 'mixed'`** only when the work genuinely splits:
-
-- it touches **separate modules or components** that can progress independently (e.g. both socket paths *and* the hook-endpoint writers *and* a permission helper);
-- it carries a **design or transition decision plus implementation plus its own verification**, each substantial;
-- it is a **PRD or a user-facing feature** with milestones rather than a defect;
-- independent review inside the unit would genuinely catch something — not merely "this feels big".
-
-**When the two readings are close, take `--single`.** A team in one file produces internal conflicts and a longer path to the same diff; a single agent on a divisible issue merely takes longer. The failure modes are not symmetric.
-
-**Record the choice in the report** (step 9) with the one-line reason, so a runner who disagrees can see the criterion that produced it rather than having to infer it.
-
-**The runner can still override, and their word wins.** If they name a shape — for one issue or for the batch — take it and stop applying the criteria to that unit.
-
-**Pass the matching flag explicitly on every dispatch** (`--single` or `--orchestration '<name>'`). With neither, the shape falls back to whatever the repo's config implies, which is a guess even when it happens to match.
-
-```bash
-dot-agent-deck dispatch --list-targets
-```
-
-Run that **once** — it is a read-only daemon round-trip and its answer describes the repo, not the unit — to learn which orchestrations exist before naming one.
-
-**Per unit, never once for the batch — the criteria are applied to each issue on its own.** This is the half of the old rule that survives, and the measurement behind it is why. On the 2026-08-24 batch: #669 is an `lstat` guard of roughly ten lines in one function, with a reference implementation already sitting on a fork; #668 is an audit of every harness spawn path #661 does not reach, plus a reaping mechanism and its coverage. Those are not the same shape, and 2–3 issues off this backlog routinely mix kinds. **What changed is who decides, not that the decision varies** — so applying one shape across a batch is still wrong, whether it comes from a runner's single answer or from your own shortcut.
-
-**Worked examples, from the 2026-09-19 loop.** `--single`: a mixed-separator path fix and a log-path default (two one-function fixes, bundled); ~23 tracing call sites needing the same escape helper (mechanical sweep); a delegate readiness race (one decision, one seam); a desktop pane's staleness affordance (one product call). `--orchestration 'mixed'`: a voice-control PRD (new user-facing feature with milestones); a product website (design exploration, build, content, publish); and the `/tmp` endpoint squat, which moves two socket paths *and* the hook-endpoint writers *and* needs a transition strategy plus a versioning decision.
-
-**An older build's pane seed and the dispatcher docs both say to ask, in the same context you are reading this in.** Dispatcher mode seeds every pane with `DISPATCHER_SEED_PROMPT` (`src/authoring_seeds.rs`), and [`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md) carries the product's own "ask, do not guess" contract. **Those are not wrong — they govern a bare `dispatch` with no skill in front of it, where there are no criteria and no queue.** Inside this skill the criteria above supply what the ask was for. Where they conflict, this skill wins for units dispatched *through it*; do not generalise that to dispatching outside it.
-
-The reasoning behind this is in [`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md), which is where it stays — it is the product's contract, not this skill's.
-
-**If `--list-targets` errors**, the message says which case it is: `DOT_AGENT_DECK_PANE_ID environment variable not set` means nothing can be dispatched from here at all (see the prerequisite above), and `the daemon did not answer list-targets` means no daemon or an older build. In the second case you still have the criteria, and `--single` is a safe shape for anything they select — so **dispatch `--single` and say that the orchestration list was unavailable**, rather than stalling. Only take it to the runner when the criteria select a team and you cannot confirm the orchestration's name, since `--orchestration` needs one.
-
-### Which orchestration — `mixed` by default, and the provider is a SESSION property
-
-Since issue #705 this repo defines **three** orchestrations rather than one: `mixed`, `anthropic` and `GPT`. They run the identical six roles with the identical prompts; only which agent each role launches differs.
-
-**Keep shape and provider separate — they are different kinds of decision:**
-
-- **Shape** (single vs team) is a property of **the work** — is it divisible? You decide it per unit, from the criteria above.
-- **Provider** (`mixed` / `anthropic` / `GPT`) is a property of **the session** — which credits are healthy today, which stack the runner wants exercised. It does not vary with the issue at all.
-
-**Default to `mixed` and do not ask**, because it is the repo's default and exercises the most providers. Say which you used. Re-ask only if the runner raises it, or if a dispatch fails on that provider's credentials — a credential failure is a session fact, so carry the new answer forward to every later unit rather than re-deciding each time.
-
-**Pass the name explicitly, always: `--orchestration 'mixed'`, never a bare `--orchestration=`.** The bare form opens whichever orchestration the repo declares as its default, which is currently `mixed` — a fact about the config file, not a choice the runner made in this conversation. `--list-targets` shows which one that is with a `[default]` marker; that marker is there to inform the question, not to answer it.
-
-If the runner has no preference, say which one you are taking and why (`mixed` is the default and exercises the most providers) rather than silently omitting the flag.
+- **Apply it to each issue on its own.** 2–3 issues off this backlog routinely mix kinds, so one shape across the batch is wrong unless the runner states it.
+- **Record the shape in step 5's ledger** alongside the issue, and **give it with its one-line reason in step 9's report**.
+- **Step 8's template takes the flag chosen here** for this unit, never a default carried in the template.
 
 ## Step 8 — Compose the task in a FILE, and dispatch one unit per issue
 
